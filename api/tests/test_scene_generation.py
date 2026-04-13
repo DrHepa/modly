@@ -10,7 +10,8 @@ from unittest.mock import patch
 from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
 
-import routers.generation as generation
+import routers.generation as generation_router
+import services.generation_jobs as generation
 import services.generator_registry as registry
 from schemas.generation import GenerateFromArtifactRequest
 
@@ -43,7 +44,7 @@ class SceneGenerationTests(unittest.TestCase):
 
     def test_generic_route_queues_typed_scene_and_strips_reserved_params(self):
         tasks = BackgroundTasks()
-        result = asyncio.run(generation.generate_from_artifact(GenerateFromArtifactRequest(
+        result = asyncio.run(generation_router.generate_from_artifact(GenerateFromArtifactRequest(
             input_kind="scene", input_path="Workflows/room", model_id="demo/scene",
             params={"artifact_path": "/etc/passwd", "input_kind": "image", "quality": "high"},
         ), tasks))
@@ -64,13 +65,13 @@ class SceneGenerationTests(unittest.TestCase):
                     input_kind=kind, input_path="Workflows/room", model_id="demo/scene")
         self.registry.get_manifest = lambda _model_id: {"input": "image"}
         with self.assertRaises(HTTPException) as caught:
-            asyncio.run(generation.generate_from_artifact(GenerateFromArtifactRequest(
+            asyncio.run(generation_router.generate_from_artifact(GenerateFromArtifactRequest(
                 input_kind="scene", input_path="Workflows/room", model_id="demo/image"), BackgroundTasks()))
         self.assertEqual(caught.exception.status_code, 400)
 
     def test_rejects_traversal_before_switch_or_queue(self):
         with self.assertRaises(HTTPException):
-            asyncio.run(generation.generate_from_artifact(GenerateFromArtifactRequest(
+            asyncio.run(generation_router.generate_from_artifact(GenerateFromArtifactRequest(
                 input_kind="scene", input_path="../outside", model_id="demo/scene"), BackgroundTasks()))
         self.assertFalse(self.registry.switched)
 
@@ -202,7 +203,7 @@ class SceneGenerationTests(unittest.TestCase):
             self.assertTrue(started)
             await asyncio.sleep(0.05)
             self.assertFalse(registry_stub.generators["demo/b"].started.is_set())
-            await generation.cancel_job("job-a")
+            generation.cancel_job("job-a")
             await asyncio.gather(first, second)
 
         with patch.object(generation, "generator_registry", registry_stub):

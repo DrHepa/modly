@@ -5,9 +5,10 @@ import time
 import unittest
 from pathlib import Path
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Response
 
-import routers.generation as generation
+import routers.generation as generation_router
+import services.generation_jobs as generation
 import routers.workflow_runs as workflow_runs
 import services.generator_registry as registry_module
 from schemas.generation import JobStatus
@@ -57,12 +58,12 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
     automation leaks a JobStatus + Event per run forever."""
 
     def setUp(self) -> None:
-        self._prev = workflow_runs.generator_registry
-        workflow_runs.generator_registry = _FakeRegistry()
+        self._prev = generation.generator_registry
+        generation.generator_registry = _FakeRegistry()
         _clear_job_stores()
 
     def tearDown(self) -> None:
-        workflow_runs.generator_registry = self._prev
+        generation.generator_registry = self._prev
         _clear_job_stores()
 
     def test_create_run_purges_terminal_jobs_past_ttl(self) -> None:
@@ -73,7 +74,7 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
 
         background = BackgroundTasks()
         asyncio.run(
-            workflow_runs.create_run_from_image(
+            workflow_runs.create_from_image_run(
                 background,
                 image=_FakeUpload(),
                 model_id="sf3d",
@@ -92,7 +93,7 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
         generation._jobs[run_id] = JobStatus(job_id=run_id, status="running", progress=10)
         generation._cancel_events[run_id] = threading.Event()
 
-        asyncio.run(workflow_runs.cancel_run(run_id))
+        asyncio.run(workflow_runs.cancel_workflow_run(run_id, Response()))
 
         self.assertEqual(generation._jobs[run_id].status, "cancelled")
         # Without a _completed_at stamp the purge sweep can never evict a cancelled run.
@@ -154,20 +155,18 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
 
         fake_registry = Registry()
         previous_generation_registry = generation.generator_registry
-        previous_workflow_registry = workflow_runs.generator_registry
         previous_workspace = registry_module.WORKSPACE_DIR
         with tempfile.TemporaryDirectory() as tmp:
             registry_module.WORKSPACE_DIR = Path(tmp)
             generation.generator_registry = fake_registry
-            workflow_runs.generator_registry = fake_registry
 
             async def run_cross_route_jobs():
                 workflow_background = BackgroundTasks()
-                workflow_response = await workflow_runs.create_run_from_image(
+                workflow_response = await workflow_runs.create_from_image_run(
                     workflow_background, _FakeUpload(), "demo/workflow", "Workflows", "{}",
                 )
                 generate_background = BackgroundTasks()
-                generate_response = await generation.generate_from_image(
+                generate_response = await generation_router.generate_from_image(
                     generate_background, _FakeUpload(), "demo/generate", "Workflows",
                     "quad", False, 1024, "{}",
                 )
@@ -182,15 +181,14 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
                 self.assertTrue(started)
                 await asyncio.sleep(0.05)
                 self.assertFalse(fake_registry.generators["demo/generate"].started.is_set())
-                await workflow_runs.cancel_run(workflow_response["run_id"])
+                await workflow_runs.cancel_workflow_run(workflow_response.run_id, Response())
                 await asyncio.gather(first, second)
-                return workflow_response["run_id"], generate_response["job_id"]
+                return workflow_response.run_id, generate_response["job_id"]
 
             try:
                 workflow_job_id, generate_job_id = asyncio.run(run_cross_route_jobs())
             finally:
                 generation.generator_registry = previous_generation_registry
-                workflow_runs.generator_registry = previous_workflow_registry
                 registry_module.WORKSPACE_DIR = previous_workspace
 
         self.assertTrue(fake_registry.generators["demo/workflow"].killed)

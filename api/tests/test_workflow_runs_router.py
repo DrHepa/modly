@@ -4,7 +4,8 @@ import unittest
 from fastapi import BackgroundTasks, HTTPException
 
 import routers.workflow_runs as workflow_runs
-from routers.generation import sanitize_collection
+import services.generation_jobs as generation
+from services.generation_jobs import sanitize_collection
 
 
 class _FakeUpload:
@@ -65,16 +66,16 @@ class CreateRunCollectionTests(unittest.TestCase):
     """The canonical /workflow-runs/from-image must file a run where the caller asked (#238)."""
 
     def setUp(self) -> None:
-        self._previous = workflow_runs.generator_registry
-        workflow_runs.generator_registry = _FakeRegistry()
+        self._previous = generation.generator_registry
+        generation.generator_registry = _FakeRegistry()
 
     def tearDown(self) -> None:
-        workflow_runs.generator_registry = self._previous
+        generation.generator_registry = self._previous
 
     def _collection_forwarded(self, collection: str) -> str:
         background = BackgroundTasks()
         asyncio.run(
-            workflow_runs.create_run_from_image(
+            workflow_runs.create_from_image_run(
                 background,
                 image=_FakeUpload(),
                 model_id="sf3d",
@@ -112,17 +113,17 @@ class CreateRunRemeshValidationTests(unittest.TestCase):
     """/generate/from-image rejects an invalid remesh with a 400; this endpoint must too."""
 
     def setUp(self) -> None:
-        self._previous = workflow_runs.generator_registry
-        workflow_runs.generator_registry = _FakeRegistry()
+        self._previous = generation.generator_registry
+        generation.generator_registry = _FakeRegistry()
 
     def tearDown(self) -> None:
-        workflow_runs.generator_registry = self._previous
+        generation.generator_registry = self._previous
 
     def test_invalid_remesh_is_rejected(self) -> None:
         background = BackgroundTasks()
         with self.assertRaises(HTTPException) as ctx:
             asyncio.run(
-                workflow_runs.create_run_from_image(
+                workflow_runs.create_from_image_run(
                     background,
                     image=_FakeUpload(),
                     model_id="sf3d",
@@ -137,11 +138,11 @@ class CreateRunRemeshValidationTests(unittest.TestCase):
         # subprocess-backed extensions), so a request doomed to a 400 anyway must not pay for
         # -- or force a reload after -- evicting it.
         registry = _SwitchTrackingRegistry()
-        workflow_runs.generator_registry = registry
+        generation.generator_registry = registry
         background = BackgroundTasks()
         with self.assertRaises(HTTPException):
             asyncio.run(
-                workflow_runs.create_run_from_image(
+                workflow_runs.create_from_image_run(
                     background,
                     image=_FakeUpload(),
                     model_id="sf3d",

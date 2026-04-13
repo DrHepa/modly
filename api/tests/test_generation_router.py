@@ -7,7 +7,8 @@ from pathlib import Path
 from fastapi import BackgroundTasks
 
 import services.generator_registry as registry
-import routers.generation as generation
+import routers.generation as generation_router
+import services.generation_jobs as generation
 from schemas.generation import JobStatus
 
 
@@ -154,7 +155,7 @@ class GenerateFromImageWorkspaceTests(unittest.TestCase):
     def test_request_is_filed_after_the_workspace_moves(self) -> None:
         background = BackgroundTasks()
         response = asyncio.run(
-            generation.generate_from_image(
+            generation_router.generate_from_image(
                 background,
                 image=_FakeUpload(),
                 model_id="sf3d",

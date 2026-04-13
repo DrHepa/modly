@@ -4,12 +4,12 @@ Runs locally within the Electron app to provide AI inference endpoints.
 """
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi import HTTPException
 
-from routers import generation, model, optimize, status, settings, extensions, export, workflow_runs, agent
+from routers import agent, export, extensions, generation, model, optimize, settings, status, workflow_runs
 
 
 @asynccontextmanager

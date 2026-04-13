@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
 
-from routers import generation, model, optimize, status, settings, extensions, export
+from routers import export, extensions, generation, model, optimize, settings, status, workflow_runs
 
 
 @asynccontextmanager
@@ -38,6 +38,7 @@ app.include_router(status.router)
 app.include_router(settings.router)
 app.include_router(model.router,      prefix="/model")
 app.include_router(generation.router, prefix="/generate")
+app.include_router(workflow_runs.router, prefix="/workflow-runs")
 app.include_router(optimize.router,    prefix="/optimize")
 app.include_router(extensions.router, prefix="/extensions")
 app.include_router(export.router,     prefix="/export")

@@ -3,6 +3,7 @@
     "composite": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "noEmit": true,
     "target": "ES2022",
     "lib": ["ES2022"],
     "strict": true,
@@ -12,5 +13,9 @@
       "@main/*": ["./electron/main/*"]
     }
   },
-  "include": ["electron.vite.config.*", "electron/**/*"]
+  "include": [
+    "electron.vite.config.*",
+    "electron/**/*",
+    "src/areas/workflows/nodes/mesh-exporter/output-path.ts"
+  ]
 }

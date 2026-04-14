@@ -13,7 +13,12 @@ export default tseslint.config(
       'api/**',
       'arch/**',
       'docs/**',
-      '**/*.test.mjs'
+      '**/*.test.mjs',
+      '**/*.d.ts',
+      'electron/**/*.js',
+      'src/**/*.js',
+      'electron.vite.config.js',
+      '**/*.tsbuildinfo'
     ]
   },
   js.configs.recommended,
@@ -34,7 +39,7 @@ export default tseslint.config(
   },
   // Main / preload / scripts (Node environment)
   {
-    files: ['electron/**/*.{ts,mts,mjs}', 'scripts/**/*.{js,mjs,cjs}', 'tools/**/*.{ts,mjs}'],
+    files: ['electron/**/*.{ts,mts,mjs}', 'scripts/**/*.{js,mjs,cjs}', 'tools/**/*.{ts,mjs}', 'electron.vite.config.ts'],
     languageOptions: {
       globals: { ...globals.node }
     }
@@ -50,7 +55,7 @@ export default tseslint.config(
   // Project-wide rule tuning
   {
     rules: {
-      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' }],
       '@typescript-eslint/no-explicit-any': 'off',
       // require() is used intentionally in Electron main and Node build scripts
       '@typescript-eslint/no-require-imports': 'off',

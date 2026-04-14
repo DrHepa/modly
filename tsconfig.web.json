@@ -1,16 +1,18 @@
 {
   "compilerOptions": {
     "composite": true,
+    "baseUrl": ".",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "noEmit": true,
     "target": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "strict": true,
     "skipLibCheck": true,
     "paths": {
-      "@/*":       ["./src/*"],
-      "@areas/*":  ["./src/areas/*"],
+      "@/*": ["./src/*"],
+      "@areas/*": ["./src/areas/*"],
       "@shared/*": ["./src/shared/*"],
       "@styles/*": ["./src/styles/*"]
     }

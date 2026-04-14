@@ -23,6 +23,11 @@ import ChatPanel from './ChatPanel'
 
 type PanelMode = 'basic' | 'chat'
 
+const toFlowNodes = (nodes: WFNode[]): FlowNode[] => nodes as unknown as FlowNode[]
+const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
+const toWorkflowNodes = (nodes: FlowNode[]): WFNode[] => nodes as unknown as WFNode[]
+const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TYPE_COLOR: Record<string, string> = {
@@ -432,8 +437,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   workflow:      Workflow
   allExtensions: ReturnType<typeof buildAllWorkflowExtensions>
 }) {
-  const [nodes, setNodes] = useNodesState(workflow.nodes as FlowNode[])
-  const [edges, setEdges] = useEdgesState(workflow.edges as FlowEdge[])
+  const [nodes, setNodes] = useNodesState(toFlowNodes(workflow.nodes))
+  const [edges, setEdges] = useEdgesState(toFlowEdges(workflow.edges))
   const { updateNodeData }               = useReactFlow()
   const { navigate }                     = useNavStore()
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -456,8 +461,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   // Sync local state when Workflows tab saves to the store (Workflows→Generate)
   useEffect(() => {
     if (workflow.updatedAt === lastSyncedAtRef.current) return
-    setNodes(workflow.nodes as FlowNode[])
-    setEdges(workflow.edges as FlowEdge[])
+    setNodes(toFlowNodes(workflow.nodes))
+    setEdges(toFlowEdges(workflow.edges))
     lastSyncedAtRef.current = workflow.updatedAt
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on updatedAt only; adding nodes/edges would resync on every local edit
   }, [workflow.updatedAt])
@@ -483,8 +488,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
       saveTimer.current = null
       saveAndClaim({
         ...workflow,
-        nodes: nodes as WFNode[],
-        edges: edges as WFEdge[],
+        nodes: toWorkflowNodes(nodes),
+        edges: toWorkflowEdges(edges),
         updatedAt: new Date().toISOString(),
       })
     }, 500)
@@ -505,7 +510,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   }, [runState.status, runState.outputUrl])
 
   const preflightIssues = useMemo(() => {
-    const wf: Workflow = { ...workflow, nodes: nodes as WFNode[], edges: edges as WFEdge[] }
+    const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
     return validateWorkflowPreflight(wf, allExtensions, { currentMeshUrl })
   }, [workflow, nodes, edges, allExtensions, currentMeshUrl])
 
@@ -513,7 +518,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
 
   // Ordered nodes for params list — only those marked showInGenerate
   const sortedNodes = useMemo(
-    () => topoSortNodes(nodes as WFNode[], edges as WFEdge[]),
+    () => topoSortNodes(toWorkflowNodes(nodes), toWorkflowEdges(edges)),
     [nodes, edges],
   )
 
@@ -532,8 +537,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
     const wf: Workflow = {
       ...workflow,
-      nodes: nodes as WFNode[],
-      edges: edges as WFEdge[],
+      nodes: toWorkflowNodes(nodes),
+      edges: toWorkflowEdges(edges),
       updatedAt: new Date().toISOString(),
     }
     saveAndClaim(wf)

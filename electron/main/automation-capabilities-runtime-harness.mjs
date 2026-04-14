@@ -4,9 +4,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import axios from 'axios'
 import { register } from 'node:module'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
 
 register('../../scripts/node-ts-extensionless-loader.mjs', import.meta.url)
 const { buildAutomationCapabilities } = await import('./automation-capabilities.ts')
+const { AUTOMATION_HTTP_BRIDGE_PATH, AutomationHttpBridge } = await import('./automation-http-bridge.ts')
 
 async function withTempExtensions(run) {
   const root = await mkdtemp(join(tmpdir(), 'modly-automation-capabilities-harness-'))
@@ -34,7 +37,7 @@ async function main() {
     full_payload_backend_healthy: null,
     partial_payload_backend_healthy: null,
     excluded_ui_only_nodes: null,
-    bridge_logging_and_bind: 'NOT RUN: HTTP bridge belongs to the next replay pick',
+    bridge_logging_and_bind: null,
   }
 
   await withTempExtensions(async ({ builtinDir, userExtensionsDir }) => {
@@ -134,6 +137,84 @@ async function main() {
       axios.get = originalGet
     }
   })
+
+  const loggerMessages = { info: [], warn: [], error: [] }
+  const bridge = new AutomationHttpBridge({
+    host: '127.0.0.1',
+    port: 0,
+    getAutomationCapabilities: async () => ({
+      backend_ready: false,
+      models: [],
+      processes: [],
+      excluded: {
+        ui_only_nodes: [
+          {
+            kind: 'ui_only',
+            source: 'ui-only',
+            id: 'outputNode',
+            type: 'outputNode',
+            label: 'Add to Scene',
+            reason: 'Canvas output node from WorkflowsPage; it targets desktop scene composition only and is intentionally excluded from automation discovery.',
+          },
+        ],
+      },
+      errors: [{ source: 'backend-runtime', code: 'BACKEND_NOT_READY', message: 'GET /health failed', retryable: true }],
+    }),
+    logger: {
+      info: (message) => loggerMessages.info.push(message),
+      warn: (message) => loggerMessages.warn.push(message),
+      error: (message) => loggerMessages.error.push(message),
+    },
+  })
+
+  await bridge.start()
+  try {
+    const origin = bridge.getOrigin()
+    assert.ok(origin)
+    const response = await fetch(`${origin}${AUTOMATION_HTTP_BRIDGE_PATH}`)
+    assert.equal(response.status, 200)
+    const payload = await response.json()
+    assert.equal(payload.backend_ready, false)
+    assert.ok(payload.excluded.ui_only_nodes.some((node) => node.label === 'Add to Scene'))
+  } finally {
+    await bridge.stop()
+  }
+
+  const occupiedServer = createServer()
+  occupiedServer.listen(0, '127.0.0.1')
+  await once(occupiedServer, 'listening')
+  const occupiedAddress = occupiedServer.address()
+  assert.ok(occupiedAddress && typeof occupiedAddress !== 'string')
+
+  const bindProbe = new AutomationHttpBridge({
+    host: '127.0.0.1',
+    port: occupiedAddress.port,
+    getAutomationCapabilities: async () => ({ backend_ready: true, models: [], processes: [], excluded: { ui_only_nodes: [] } }),
+    logger: {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+    },
+  })
+
+  try {
+    await assert.rejects(() => bindProbe.start(), /EADDRINUSE|listen/i)
+  } finally {
+    occupiedServer.close()
+    await once(occupiedServer, 'close')
+  }
+
+  summary.bridge_logging_and_bind = {
+    info_messages: loggerMessages.info,
+    warn_messages: loggerMessages.warn,
+    bind_failure_verified: true,
+  }
+
+  assert.equal(loggerMessages.info.length, 1)
+  assert.match(loggerMessages.info[0], /listening on http:\/\/127\.0\.0\.1:/)
+  assert.deepEqual(loggerMessages.warn, ['Automation HTTP bridge returned partial capabilities payload with backend_ready=false'])
+  assert.deepEqual(loggerMessages.error, [])
+  assert.equal(bindProbe.getOrigin(), null)
 
   process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`)
 }

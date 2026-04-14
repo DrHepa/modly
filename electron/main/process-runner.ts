@@ -1,5 +1,5 @@
 import { Worker }      from 'worker_threads'
-import { spawn }       from 'child_process'
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { existsSync }  from 'fs'
 import { join }        from 'path'
 import { app }         from 'electron'
@@ -70,6 +70,20 @@ export interface IProcessRunner {
   terminate(): void
 }
 
+export type CreateRunScopedProcessRunnerOptions = {
+  extDir: string
+  entry: string
+  workspaceDir: string
+  tempDir: string
+  pythonExe?: string
+}
+
+type QueuedProcessRun = {
+  execute: () => Promise<ProcessResult>
+  resolve: (result: ProcessResult) => void
+  reject: (error: unknown) => void
+}
+
 // ─── JS ProcessRunner (Worker thread) ────────────────────────────────────────
 
 export class ProcessRunner implements IProcessRunner {
@@ -79,6 +93,9 @@ export class ProcessRunner implements IProcessRunner {
   private entry:    string
   private workspaceDir: string
   private tempDir:  string
+  private activeReject: ((error: Error) => void) | null = null
+  private readonly queuedRuns: QueuedProcessRun[] = []
+  private executing = false
 
   constructor(extDir: string, entry: string, workspaceDir: string, tempDir: string) {
     this.extDir       = extDir
@@ -101,43 +118,98 @@ export class ProcessRunner implements IProcessRunner {
         },
       })
 
-      worker.once('message', (msg) => {
+      // Keep ownership while loading too: cancellation may arrive before ready.
+      this.worker = worker
+      const settleStartup = () => {
+        worker.off('message', onMessage)
+        if (this.activeReject === rejectStartup) this.activeReject = null
+      }
+      const rejectStartup = (error: Error) => {
+        settleStartup()
+        this.discardWorker(worker)
+        reject(error)
+      }
+      this.activeReject = rejectStartup
+      const onMessage = (msg: { type: string; message?: string }) => {
+        if (this.worker !== worker) return
         if (msg.type === 'ready') {
-          this.worker = worker
+          settleStartup()
           this.ready  = true
           resolve()
         } else if (msg.type === 'error') {
-          worker.terminate()
-          reject(new Error(msg.message))
+          rejectStartup(new Error(msg.message))
+          void worker.terminate()
         }
-      })
+      }
+      worker.on('message', onMessage)
 
-      worker.once('error', (err) => {
-        reject(err)
-      })
+      // Retain an error listener after ready for failures while idle.
+      worker.once('error', rejectStartup)
 
       // A worker can also die between runs (e.g. a timer the processor left
       // behind throws after it returned). Forget it whenever it exits, so the
       // next run starts a fresh one instead of posting into a dead thread.
-      worker.once('exit', () => this.discardWorker(worker))
+      worker.once('exit', (code) => {
+        rejectStartup(new Error(`Process extension worker exited with code ${code}`))
+      })
     })
   }
 
-  async run(
+  run(
+    input: ProcessInput,
+    params: Record<string, unknown>,
+    onProgress?: (percent: number, label: string) => void,
+    onLog?: (message: string) => void,
+  ): Promise<ProcessResult> {
+    // Worker messages are untagged. Serialize whole invocations, including
+    // startup, so each call owns its result, callbacks and cancellation target.
+    return new Promise((resolve, reject) => {
+      this.queuedRuns.push({ execute: () => this.runOne(input, params, onProgress, onLog), resolve, reject })
+      this.startNextRun()
+    })
+  }
+
+  private startNextRun(): void {
+    if (this.executing) return
+    const next = this.queuedRuns.shift()
+    if (!next) return
+    this.executing = true
+    void next.execute().then(
+      (result) => {
+        this.executing = false
+        next.resolve(result)
+        this.startNextRun()
+      },
+      (error: unknown) => {
+        this.executing = false
+        next.reject(error)
+        this.startNextRun()
+      },
+    )
+  }
+
+  private async runOne(
     input:  ProcessInput,
     params: Record<string, unknown>,
     onProgress?: (percent: number, label: string) => void,
     onLog?:      (message: string) => void,
   ): Promise<ProcessResult> {
     await this.ensureReady()
-    const worker = this.worker!
+    const worker = this.worker
+    if (!worker) throw new Error('Process run terminated.')
 
     return new Promise((resolve, reject) => {
       const settle = () => {
         worker.off('message', handler)
         worker.off('error', onError)
         worker.off('exit', onExit)
+        if (this.activeReject === rejectRun) this.activeReject = null
       }
+      const rejectRun = (error: unknown) => {
+        settle()
+        reject(error)
+      }
+      this.activeReject = rejectRun
       const handler = (msg: { type: string; result?: ProcessResult; message?: string; percent?: number; label?: string }) => {
         if (msg.type === 'progress') {
           onProgress?.(msg.percent ?? 0, msg.label ?? '')
@@ -169,7 +241,13 @@ export class ProcessRunner implements IProcessRunner {
       worker.on('message', handler)
       worker.on('error', onError)
       worker.on('exit', onExit)
-      worker.postMessage({ action: 'run', input, params })
+      try {
+        worker.postMessage({ action: 'run', input, params })
+      } catch (error) {
+        // A structured-clone failure rejects the submission, not the healthy
+        // thread. Retain ownership for the next queued run or terminate().
+        rejectRun(error)
+      }
     })
   }
 
@@ -180,7 +258,12 @@ export class ProcessRunner implements IProcessRunner {
   }
 
   terminate(): void {
-    this.worker?.terminate()
+    const error = new Error('Process run terminated.')
+    for (const pending of this.queuedRuns.splice(0)) pending.reject(error)
+    const worker = this.worker
+    this.activeReject?.(error)
+    this.activeReject = null
+    void worker?.terminate()
     this.worker = null
     this.ready  = false
   }
@@ -197,6 +280,8 @@ export class PythonProcessRunner implements IProcessRunner {
   private scriptPath:   string
   private workspaceDir: string
   private tempDir:      string
+  private currentProc: ChildProcessWithoutNullStreams | null = null
+  private activeReject: ((error: Error) => void) | null = null
 
   constructor(pythonExe: string, extDir: string, entry: string, workspaceDir: string, tempDir: string) {
     this.pythonExe    = pythonExe
@@ -232,6 +317,20 @@ export class PythonProcessRunner implements IProcessRunner {
           TEMP_DIR: this.tempDir,
         },
       })
+      this.currentProc = proc
+      let resolved = false
+      const settle = (error?: Error, result: ProcessResult = {}) => {
+        if (resolved) return
+        resolved = true
+        if (this.activeReject === cancel) this.activeReject = null
+        if (error) reject(error)
+        else resolve(result)
+      }
+      const cancel = (error: Error) => settle(error)
+      this.activeReject = cancel
+      // Keep currentProc until close so run-scoped cleanup can terminate a
+      // child that emits done but still owns timers or other resources.
+      proc.stdin.on('error', (error) => settle(error))
 
       // Send input as a single JSON line on stdin
       proc.stdin.write(JSON.stringify({
@@ -244,14 +343,15 @@ export class PythonProcessRunner implements IProcessRunner {
       proc.stdin.end()
 
       let stdoutBuf = ''
-      let resolved  = false
 
       proc.stdout.on('data', (chunk: Buffer) => {
+        if (resolved) return
         stdoutBuf += chunk.toString()
         const lines = stdoutBuf.split('\n')
         stdoutBuf = lines.pop() ?? ''
 
         for (const line of lines) {
+          if (resolved) break
           const trimmed = line.trim()
           if (!trimmed) continue
           try {
@@ -261,11 +361,9 @@ export class PythonProcessRunner implements IProcessRunner {
             } else if (msg.type === 'log') {
               onLog?.(msg.message ?? '')
             } else if (msg.type === 'done') {
-              resolved = true
-              resolve(msg.result ?? {})
+              settle(undefined, msg.result ?? {})
             } else if (msg.type === 'error') {
-              resolved = true
-              reject(new Error(msg.message ?? 'Unknown error'))
+              settle(new Error(msg.message ?? 'Unknown error'))
             }
           } catch {
             // Non-JSON stdout line — treat as a log message
@@ -280,26 +378,47 @@ export class PythonProcessRunner implements IProcessRunner {
       })
 
       proc.on('close', (code) => {
-        if (!resolved) {
-          if (code === 0) {
-            resolve({})
-          } else {
-            reject(new Error(stderrBuf.trim() || `Python process exited with code ${code}`))
-          }
-        }
+        // A previous child may close after the next run has already started.
+        if (this.currentProc === proc) this.currentProc = null
+        settle(code === 0 ? undefined : new Error(stderrBuf.trim() || `Python process exited with code ${code}`))
       })
 
       proc.on('error', (err) => {
-        if (!resolved) {
-          resolved = true
-          reject(err)
-        }
+        if (this.currentProc === proc) this.currentProc = null
+        settle(err)
       })
     })
   }
 
-  // Python processes are spawned per run — nothing persistent to terminate
-  terminate(): void {}
+  terminate(): void {
+    this.activeReject?.(new Error('Process run terminated.'))
+    this.activeReject = null
+    this.currentProc?.kill('SIGTERM')
+    this.currentProc = null
+  }
+}
+
+export function createRunScopedProcessRunner(options: CreateRunScopedProcessRunnerOptions): IProcessRunner {
+  if (options.entry.endsWith('.py')) {
+    if (!options.pythonExe) {
+      throw new Error(`Python executable is required for process entry '${options.entry}'.`)
+    }
+
+    return new PythonProcessRunner(
+      options.pythonExe,
+      options.extDir,
+      options.entry,
+      options.workspaceDir,
+      options.tempDir,
+    )
+  }
+
+  return new ProcessRunner(
+    options.extDir,
+    options.entry,
+    options.workspaceDir,
+    options.tempDir,
+  )
 }
 
 // ─── Helper: find Python executable for an extension ─────────────────────────

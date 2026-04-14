@@ -10,8 +10,9 @@ import {
   useEdgesState,
   useReactFlow,
   type Connection,
-  type Node,
-  type Edge,
+  type Node as FlowNode,
+  type Edge as FlowEdge,
+  type OnConnectStart,
   type OnConnectStartParams,
 } from '@xyflow/react'
 import { useWorkflowsStore, NODE_TYPES_WITHOUT_TARGET, NODE_TYPES_WITHOUT_SOURCE, FOLDER_COLORS } from '@shared/stores/workflowsStore'
@@ -47,17 +48,10 @@ const EDGE_TYPES = { workflowEdge: WorkflowEdge }
 
 const DEFAULT_EDGE_OPTS = { type: 'workflowEdge' }
 
-// The While container whose bounds contain a flow-space point, if any. Used to
-// auto-parent nodes dropped (or created) inside a While so they join its loop body.
-function findWhileContainerAt(nodes: Node[], pos: { x: number; y: number }): Node | undefined {
-  return nodes.find((n) => {
-    if (!isContainerType(n.type)) return false
-    const gw = (n.measured?.width  ?? n.width  ?? (n.style?.width  as number)) || 0
-    const gh = (n.measured?.height ?? n.height ?? (n.style?.height as number)) || 0
-    return pos.x >= n.position.x && pos.x <= n.position.x + gw
-        && pos.y >= n.position.y && pos.y <= n.position.y + gh
-  })
-}
+const toFlowNodes = (nodes: WFNode[]): FlowNode<WFNodeData>[] => nodes as unknown as FlowNode<WFNodeData>[]
+const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
+const toWorkflowNodes = (nodes: FlowNode<WFNodeData>[]): WFNode[] => nodes as unknown as WFNode[]
+const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +81,87 @@ const _nodeClipboard: { current: { nodes: Node[]; edges: Edge[]; pastes: number 
 function newWorkflow(): Workflow {
   const now = new Date().toISOString()
   return { id: newId(), name: 'New Workflow', description: '', nodes: [], edges: [], createdAt: now, updatedAt: now }
+}
+
+function newWorkflowFromTemplate(): Workflow {
+  const now         = new Date().toISOString()
+  const imageNodeId = newId()
+  const outputNodeId = newId()
+  return {
+    id:          newId(),
+    name:        'New Workflow',
+    description: '',
+    nodes: [
+      { id: imageNodeId,  type: 'imageNode',  position: { x: 150, y: 180 }, data: { enabled: true, params: {}, showInGenerate: true } },
+      { id: outputNodeId, type: 'outputNode', position: { x: 500, y: 180 }, data: { enabled: true, params: {} } },
+    ],
+    edges: [
+      { id: newId(), source: imageNodeId, target: outputNodeId },
+    ],
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+// ─── New workflow modal ───────────────────────────────────────────────────────
+
+function NewWorkflowModal({ onBlank, onTemplate, onClose }: {
+  onBlank:    () => void
+  onTemplate: () => void
+  onClose:    () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px]"
+      onMouseDown={onClose}
+    >
+      <div
+        className="w-80 bg-zinc-900 border border-zinc-700/80 rounded-2xl shadow-2xl overflow-hidden"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-zinc-800">
+          <h2 className="text-sm font-semibold text-zinc-100">New Workflow</h2>
+          <p className="text-[11px] text-zinc-500 mt-0.5">Choose how to start</p>
+        </div>
+
+        <div className="p-4 grid grid-cols-2 gap-3">
+          {/* Blank */}
+          <button
+            onClick={onBlank}
+            className="flex flex-col items-center gap-3 px-3 py-5 rounded-xl border border-zinc-800 hover:border-zinc-600 hover:bg-zinc-800/40 transition-all"
+          >
+            <div className="w-10 h-10 rounded-xl bg-zinc-800 border border-zinc-700/60 flex items-center justify-center text-zinc-500">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+              </svg>
+            </div>
+            <div className="text-center">
+              <p className="text-xs font-semibold text-zinc-200">Blank</p>
+              <p className="text-[10px] text-zinc-500 mt-0.5 leading-relaxed">Empty canvas</p>
+            </div>
+          </button>
+
+          {/* Starter template */}
+          <button
+            onClick={onTemplate}
+            className="flex flex-col items-center gap-3 px-3 py-5 rounded-xl border border-zinc-800 hover:border-accent/40 hover:bg-accent/5 transition-all"
+          >
+            <div className="w-10 h-10 rounded-xl bg-accent/10 border border-accent/25 flex items-center justify-center text-accent-light">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <rect x="3" y="3" width="6" height="5" rx="1"/>
+                <path d="M9 5.5h6"/>
+                <rect x="15" y="3" width="6" height="5" rx="1"/>
+              </svg>
+            </div>
+            <div className="text-center">
+              <p className="text-xs font-semibold text-zinc-200">Starter</p>
+              <p className="text-[10px] text-zinc-500 mt-0.5 leading-relaxed">Image → Scene</p>
+            </div>
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // ─── Extensions panel ────────────────────────────────────────────────────────
@@ -739,8 +814,9 @@ function WorkflowCanvasInner({
   const showToast = useAppStore((s) => s.showToast)
   const isRunning = runState.status === 'running' || runState.status === 'paused'
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes as Node[])
-  const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges as Edge[])
+  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<WFNodeData>>(toFlowNodes(workflow.nodes))
+  const [edges, setEdges, onEdgesChange] = useEdgesState(toFlowEdges(workflow.edges))
+  const [name, setName]       = useState(workflow.name)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
 
@@ -754,17 +830,18 @@ function WorkflowCanvasInner({
   const didMountRef = useRef(false)
 
   // ─── Undo / Redo ──────────────────────────────────────────────────────────
-  type Snapshot = { nodes: Node[]; edges: Edge[] }
-  const historyRef  = useRef<Snapshot[]>([{ nodes: workflow.nodes as Node[], edges: workflow.edges as Edge[] }])
+  type Snapshot = { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[]; name: string }
+  const historyRef  = useRef<Snapshot[]>([{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges), name: workflow.name }])
   const histIdxRef  = useRef(0)
   const [histIdx, setHistIdx] = useState(0)
   const skipPushRef = useRef(true) // skip the initial autosave-triggered push
 
   // Re-sync when workflow switches
   useEffect(() => {
-    setNodes(workflow.nodes as Node[])
-    setEdges(workflow.edges as Edge[])
-    historyRef.current = [{ nodes: workflow.nodes as Node[], edges: workflow.edges as Edge[] }]
+    setNodes(toFlowNodes(workflow.nodes))
+    setEdges(toFlowEdges(workflow.edges))
+    setName(workflow.name)
+    historyRef.current = [{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges), name: workflow.name }]
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
@@ -777,8 +854,9 @@ function WorkflowCanvasInner({
     saveTimer.current = setTimeout(() => {
       const updated: Workflow = {
         ...workflow,
-        nodes: nodes as WFNode[],
-        edges: edges as WFEdge[],
+        name,
+        nodes: toWorkflowNodes(nodes),
+        edges: toWorkflowEdges(edges),
         updatedAt: new Date().toISOString(),
       }
       onSave(updated)
@@ -853,24 +931,11 @@ function WorkflowCanvasInner({
   const isValidConnection = useCallback((connection: Edge | Connection) => {
     const srcType = getNodeOutputType(getNode(connection.source) as Node, allExtensions)
     const tgtType = getNodeInputType(getNode(connection.target) as Node, connection.targetHandle, allExtensions)
-    if (srcType && tgtType && srcType !== tgtType) return false  // type mismatch (unknown types allowed)
-    // Reject connections that would create a cycle: if the target can already
-    // reach the source, adding source→target closes a loop.
-    if (connection.source && connection.target) {
-      const stack = [connection.target]
-      const seen  = new Set<string>()
-      while (stack.length > 0) {
-        const id = stack.pop()!
-        if (id === connection.source) return false
-        if (seen.has(id)) continue
-        seen.add(id)
-        for (const e of edges) if (e.source === id) stack.push(e.target)
-      }
-    }
-    return true
-  }, [getNode, allExtensions, edges])
+    if (!srcType || !tgtType) return true
+    return srcType === tgtType
+  }, [getNode, allExtensions])
 
-  const onConnectStart = useCallback((_: MouseEvent | TouchEvent, params: OnConnectStartParams) => {
+  const onConnectStart: OnConnectStart = useCallback((_, params: OnConnectStartParams) => {
     pendingConnectionRef.current  = params
     connectionCompletedRef.current = false
   }, [])
@@ -911,34 +976,19 @@ function WorkflowCanvasInner({
 
     const nodeType = e.dataTransfer.getData(DRAG_NODE_KEY)
     if (nodeType) {
-      const isContainer = isContainerType(nodeType)
-      setNodes((nds) => {
-        const parent = isContainer ? undefined : findWhileContainerAt(nds, position)
-        const node: Node = {
-          id: newId(), type: nodeType,
-          position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-          data: { enabled: true, params: {} } as WFNodeData,
-          ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
-          ...(parent ? { parentId: parent.id } : {}),
-        }
-        // Containers must sit before their future children in the array → prepend.
-        return isContainer ? [node, ...nds] : [...nds, node]
-      })
+      setNodes((nds) => [...nds, {
+        id: newId(), type: nodeType, position,
+        data: { enabled: true, params: {} },
+      }])
       return
     }
 
     const extensionId = e.dataTransfer.getData(DRAG_KEY)
     if (!extensionId) return
-    setNodes((nds) => {
-      const parent = findWhileContainerAt(nds, position)
-      const node: Node = {
-        id: newId(), type: 'extensionNode',
-        position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-        data: { extensionId, enabled: true, params: {} } as WFNodeData,
-        ...(parent ? { parentId: parent.id } : {}),
-      }
-      return [...nds, node]
-    })
+    setNodes((nds) => [...nds, {
+      id: newId(), type: 'extensionNode', position,
+      data: { extensionId, enabled: true, params: {} },
+    }])
   }, [screenToFlowPosition, setNodes])
 
   // Keyboard shortcuts (Space, Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z)
@@ -1032,19 +1082,10 @@ function WorkflowCanvasInner({
       pendingDropPos ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     )
     const newNodeId = newId()
-    const isContainer = isContainerType(type)
-    setNodes((nds) => {
-      const parent = isContainer ? undefined : findWhileContainerAt(nds, position)
-      const node: Node = {
-        id: newNodeId, type,
-        position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-        data: { extensionId, enabled: true, params: {} } as WFNodeData,
-        ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
-        ...(parent ? { parentId: parent.id } : {}),
-      }
-      // Containers must sit before their future children in the array → prepend.
-      return isContainer ? [node, ...nds] : [...nds, node]
-    })
+    setNodes((nds) => [...nds, {
+      id: newNodeId, type, position,
+      data: { extensionId, enabled: true, params: {} },
+    }])
 
     // If palette was opened from a connection drag, wire the edge automatically.
     // ExtensionNodes use id'd handles (input-0 / output), not the default null
@@ -1135,11 +1176,7 @@ function WorkflowCanvasInner({
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
-    if (preflightIssues.length > 0) {
-      showToast(preflightIssues[0].message)
-      return
-    }
-    const wf: Workflow = { ...workflow, nodes: nodes as WFNode[], edges: edges as WFEdge[], updatedAt: new Date().toISOString() }
+    const wf: Workflow = { ...workflow, name, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     onSave(wf)
     runWorkflow(wf, allExtensions)
   }, [workflow, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel, preflightIssues, showToast])
@@ -1287,7 +1324,7 @@ function WorkflowCanvasInner({
           <PanelToggleIcon open={panelOpen} />
         </button>
 
-        <ReactFlow
+        <ReactFlow<FlowNode<WFNodeData>, FlowEdge>
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}

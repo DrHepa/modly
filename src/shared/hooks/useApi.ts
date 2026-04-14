@@ -116,18 +116,5 @@ export function useApi() {
     return { url: data.url }
   }
 
-  // Bakes a world-space 4x4 transform into the GLB geometry.
-  // `matrix` is row-major (4 rows of 4), matching the backend's reshape.
-  async function transformMesh(
-    path: string,
-    matrix: number[][],
-  ): Promise<{ url: string }> {
-    const { data } = await client.post<{ url: string }>('/optimize/transform', {
-      path,
-      matrix,
-    })
-    return { url: data.url }
-  }
-
-  return { generateFromImage, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh, transformMesh }
+  return { generateFromImage, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh }
 }

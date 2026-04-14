@@ -88,13 +88,7 @@ export class PythonBridge {
       this.ready = false
       this.process = null
       if (wasReady && !this.intentionalStop) {
-        const getWindow = this.getWindow
-        if (!getWindow) return
-        const win = getWindow()
-        const contents = win?.webContents
-        if (contents && !contents.isDestroyed()) {
-          contents.send('python:crashed', { code })
-        }
+        this.getWindow?.()?.webContents.send('python:crashed', { code })
       }
     })
 
@@ -135,13 +129,7 @@ export class PythonBridge {
   private emitTqdmLog(raw: string): void {
     if (/INFO/.test(raw)) return
     if (!raw.trim()) return
-    const getWindow = this.getWindow
-    if (!getWindow) return
-    const win = getWindow()
-    const contents = win?.webContents
-    if (contents && !contents.isDestroyed()) {
-      contents.send('python:log', raw.trim())
-    }
+    this.getWindow?.()?.webContents.send('python:log', raw.trim())
   }
 
   isReady(): boolean { return this.ready }

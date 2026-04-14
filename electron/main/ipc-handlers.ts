@@ -19,22 +19,10 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { spawn, execFile } from 'child_process'
-import {
-  EXT_BACKUP_PREFIX,
-  EXT_INCOMPLETE_MARKER,
-  EXT_STAGING_PREFIX,
-  assertSafeExtensionId,
-  buildExtensionBackupPath,
-  buildExtensionStagingPath,
-  isInternalExtensionDirName,
-  parseExtensionBackupName,
-  resolveExtensionPathWithinRoot,
-  resolvePathWithinRoot,
-} from './extension-path-guard'
-import { validateInstallManifest } from './extension-install-utils'
-import { registerWorkspaceAssetLibraryIpcHandlers } from './artifact-registry-service'
-import { updatesSupported } from './updater'
+import { listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { getAutomationCapabilities } from './automation-capabilities-service'
+import { spawn } from 'child_process'
+import { fetchTrustedRepos } from './trusted-repos'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -356,7 +344,11 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.on('window:maximize', () => {
     const win = getWindow()
     if (!win) return
-    win.isMaximized() ? win.restore() : win.maximize()
+    if (win.isMaximized()) {
+      win.restore()
+      return
+    }
+    win.maximize()
   })
   ipcMain.on('window:close', () => getWindow()?.close())
   ipcMain.handle('window:isMaximized', () => getWindow()?.isMaximized() ?? false)
@@ -850,98 +842,6 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  // Remote registry — list of trusted GitHub repo URLs
-  const REGISTRY_URL = 'https://raw.githubusercontent.com/lightningpixel/modly-official-extension/main/registry.json'
-  const REGISTRY_TTL = 5 * 60 * 1000 // 5 minutes
-
-  let registryCache: { repos: Set<string>; fetchedAt: number } | null = null
-
-  async function fetchTrustedRepos(): Promise<Set<string>> {
-    const now = Date.now()
-    if (registryCache && now - registryCache.fetchedAt < REGISTRY_TTL) {
-      return registryCache.repos
-    }
-    try {
-      const { net } = require('electron')
-      const res = await net.fetch(REGISTRY_URL)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json() as { trusted_repos?: string[] }
-      const repos = new Set(
-        (data.trusted_repos ?? []).map((r: string) => r.toLowerCase().replace(/\/$/, ''))
-      )
-      registryCache = { repos, fetchedAt: now }
-      return repos
-    } catch {
-      // Offline or fetch failed — keep previous cache, or empty
-      return registryCache?.repos ?? new Set()
-    }
-  }
-
-  function isTrustedSource(source: string | undefined, trustedRepos: Set<string>): boolean {
-    if (!source) return false
-    return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
-  }
-
-  type ParsedManifest = {
-    id?: string; name?: string; displayName?: string; version?: string
-    description?: string; author?: string | { name?: string }
-    source?: string; generator_class?: string
-    // extension type
-    type?:  'model' | 'process'
-    entry?: string
-    // Optional top-level fallbacks — applied to each node if not set on the node
-    params_schema?:  unknown[]
-    param_defaults?: Record<string, unknown>
-    nodes?: {
-      id:                string
-      name?:             string
-      input?:            'mesh' | 'image' | 'text' | 'audio'
-      inputs?:           ('mesh' | 'image' | 'text' | 'audio')[]
-      input_labels?:     string[]
-      output?:           'mesh' | 'image' | 'text' | 'audio'
-      params_schema?:    unknown[]
-      param_defaults?:   Record<string, unknown>
-      hf_repo?:          string
-      download_check?:   string
-      hf_skip_prefixes?: string[]
-      hf_include_prefixes?: string[]
-    }[]
-  }
-
-  function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
-    const common = {
-      id:          parsed.id          ?? fallbackId,
-      name:        parsed.displayName ?? parsed.name ?? fallbackId,
-      version:     parsed.version,
-      description: parsed.description,
-      author:      typeof parsed.author === 'string' ? parsed.author : parsed.author?.name,
-      trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
-      source:      parsed.source,
-      builtin,
-    }
-
-    const nodes = (parsed.nodes ?? []).map(n => ({
-      id:             n.id,
-      name:           n.name ?? n.id,
-      input:          n.input  ?? 'image' as const,
-      inputs:         n.inputs,
-      inputLabels:    n.input_labels,
-      output:         n.output ?? 'mesh'  as const,
-      paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
-      paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
-      hfRepo:         n.hf_repo,
-      downloadCheck:  n.download_check,
-      hfSkipPrefixes: n.hf_skip_prefixes,
-      hfIncludePrefixes: n.hf_include_prefixes,
-    }))
-
-    if (parsed.type === 'process') {
-      return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
-    }
-
-    return { ...common, type: 'model' as const, nodes }
-  }
-
   // Extensions — reads user extensions directory + built-in extensions directory
   ipcMain.handle('extensions:list', async () => {
     const userData      = app.getPath('userData')
@@ -950,74 +850,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
     const trustedRepos = await fetchTrustedRepos()
 
-    async function readExtensionsFromDir(dir: string, isBuiltin: boolean) {
-      if (!existsSync(dir)) return []
-      try {
-        const entries = await readdir(dir, { withFileTypes: true })
-        // On Windows, junction points are reported by Node.js as isSymbolicLink()=true,
-        // isDirectory()=false. Use statSync (which follows links) as the authoritative check.
-        const dirs = entries.filter(e => {
-          // Staging/backup dirs are never extensions (ids can't start with '.')
-          if (isInternalExtensionDirName(e.name)) return false
-          if (e.isDirectory()) return true
-          if (e.isSymbolicLink()) {
-            try { return statSync(join(dir, e.name)).isDirectory() } catch { return false }
-          }
-          return false
-        })
-        const results = await Promise.all(dirs.map(async (entry) => {
-          const entryPath = join(dir, entry.name)
-          const skeleton  = { type: 'model' as const, id: entry.name, name: entry.name, trusted: isBuiltin, builtin: isBuiltin, nodes: [], corrupted: true }
-
-          // Marker still present → an install of this folder never completed.
-          // Hidden entirely while that install is still in flight.
-          if (existsSync(join(entryPath, EXT_INCOMPLETE_MARKER))) {
-            if (activeExtensionInstalls.has(entry.name)) return null
-            return { ...skeleton, manifestError: 'incomplete' as const }
-          }
-
-          // Detect local extensions: check for .modly-local sentinel
-          let localSourcePath: string | undefined
-          if (!isBuiltin) {
-            const sentinelPath = join(entryPath, '.modly-local')
-            if (existsSync(sentinelPath)) {
-              try {
-                localSourcePath = (await readFile(sentinelPath, 'utf-8')).trim()
-              } catch { /* ignore */ }
-            }
-          }
-
-          // 'missing' = no manifest at all (gutted folder); 'invalid' = a manifest
-          // exists but doesn't parse (fixable by hand, don't push deletion only)
-          let manifestError: 'missing' | 'invalid' = 'missing'
-          for (const manifestFile of ['manifest.json', 'package.json']) {
-            const p = join(entryPath, manifestFile)
-            if (existsSync(p)) {
-              try {
-                const raw    = await readFile(p, 'utf-8')
-                const parsed = JSON.parse(raw) as ParsedManifest
-                // Inject local:// source so the UI shows the Local badge
-                if (localSourcePath) parsed.source = `local://${localSourcePath}`
-                return parseExtensionManifest(parsed, entry.name, trustedRepos, isBuiltin)
-              } catch { manifestError = 'invalid' }
-            }
-          }
-          return { ...skeleton, manifestError }
-        }))
-        return results.filter((e): e is Exclude<typeof e, null> => e !== null)
-      } catch {
-        return []
-      }
-    }
-
-    const [userExts, builtinExts] = await Promise.all([
-      readExtensionsFromDir(extensionsDir, false),
-      readExtensionsFromDir(builtinDir,    true),
-    ])
-
-    // Built-ins come first, then user extensions
-    return [...builtinExts, ...userExts]
+    return listVisibleExtensions({
+      builtinDir,
+      userExtensionsDir: extensionsDir,
+      trustedRepos,
+    })
   })
+
+  ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {
@@ -1106,17 +946,61 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         await cp(extractDir, stagingDir, { recursive: true })
         await writeFile(join(stagingDir, EXT_INCOMPLETE_MARKER), new Date().toISOString(), 'utf-8')
 
-        // Compile TypeScript entry to JS at install time (once, no runtime overhead)
-        if (isProcess && entryFile.endsWith('.ts')) {
-          emit({ step: 'setting_up', message: 'Compiling TypeScript entry…' })
-          const compiledEntry = entryFile.replace(/\.ts$/, '.js')
-          buildSync({
-            entryPoints: [join(stagingDir, entryFile)],
-            outfile:     join(stagingDir, compiledEntry),
-            bundle:      true,
-            platform:    'node',
-            format:      'cjs',
-            external:    ['electron'],
+      // Compile TypeScript entry to JS at install time (once, no runtime overhead)
+      if (isProcess && entryFile.endsWith('.ts')) {
+        emit({ step: 'setting_up', message: 'Compiling TypeScript entry…' })
+        const compiledEntry = entryFile.replace(/\.ts$/, '.js')
+        buildSync({
+          entryPoints: [join(destDir, entryFile)],
+          outfile:     join(destDir, compiledEntry),
+          bundle:      true,
+          platform:    'node',
+          format:      'cjs',
+          external:    ['electron'],
+        })
+        manifest.entry = compiledEntry
+        await writeFile(join(destDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
+      }
+
+      if (isPythonProcess) {
+        // 6a. Python process extension: run setup.py if present (same as model extensions)
+        if (existsSync(join(destDir, 'setup.py'))) {
+          emit({ step: 'setting_up', message: 'Setting up Python environment…' })
+          const { sm: gpuSm, cudaVersion } = await detectGpuInfo()
+          try {
+            await runExtensionSetup(destDir, gpuSm, cudaVersion, (line) => {
+              logger.info(`[ext-setup] ${line}`)
+              emit({ step: 'setting_up', message: line })
+            })
+          } catch (err) {
+            logger.warn(`[ext-setup] setup.py failed: ${err}`)
+            emit({ step: 'setting_up', message: `Warning: setup failed — ${err}` })
+          }
+        }
+      } else if (isProcess) {
+        // 6b. JS process extension: npm install if package.json present
+        if (existsSync(join(destDir, 'package.json'))) {
+          emit({ step: 'setting_up', message: 'Installing dependencies…' })
+          await new Promise<void>((resolve, reject) => {
+            const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+            const child = spawn(npm, ['install', '--omit=dev', '--no-audit', '--no-fund'], {
+              cwd:   destDir,
+              stdio: 'pipe',
+            })
+            let buf = ''
+            const onData = (chunk: Buffer) => {
+              buf += chunk.toString()
+              const lines = buf.split('\n')
+              buf = lines.pop() ?? ''
+              for (const raw of lines) {
+                const line = raw.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g'), '').trim()
+                if (line) emit({ step: 'setting_up', message: line })
+              }
+            }
+            child.stdout?.on('data', onData)
+            child.stderr?.on('data', onData)
+            child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`npm install failed (exit ${code})`)))
+            child.on('error', reject)
           })
           manifest.entry = compiledEntry
           await writeFile(join(stagingDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')

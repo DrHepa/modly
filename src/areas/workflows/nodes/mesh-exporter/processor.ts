@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
 import path = require('path')
 import fs   = require('fs')
+import { resolveWorkspaceOutputDir } from './output-path'
 
 interface ProcessInput  { filePath?: string; text?: string }
 interface ProcessResult { filePath?: string; text?: string }
@@ -200,15 +200,9 @@ const processor = async (
   context.progress(20, 'Loading mesh…')
   const doc = await io.read(input.filePath)
 
-  let outPath: string
-  if (outputPath) {
-    fs.mkdirSync(outputPath, { recursive: true })
-    outPath = path.join(outputPath, `export-${Date.now()}${ext}`)
-  } else {
-    const exportsDir = path.join(context.workspaceDir, 'Exports')
-    fs.mkdirSync(exportsDir, { recursive: true })
-    outPath = path.join(exportsDir, `export-${Date.now()}${ext}`)
-  }
+  const outputDir = resolveWorkspaceOutputDir(context.workspaceDir, outputPath)
+  const outPath = path.join(outputDir, `export-${Date.now()}${ext}`)
+  fs.mkdirSync(outputDir, { recursive: true })
   fs.mkdirSync(path.dirname(outPath), { recursive: true })
 
   context.progress(50, `Exporting as ${format.toUpperCase()}…`)
@@ -228,4 +222,10 @@ const processor = async (
   return { filePath: outPath }
 }
 
-export = processor
+const exportedProcessor = Object.assign(processor, {
+  __test: {
+    resolveWorkspaceOutputDir,
+  },
+})
+
+export = exportedProcessor

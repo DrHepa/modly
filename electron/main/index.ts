@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell, session } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { setupIpcHandlers } from './ipc-handlers'
+import { AutomationHttpBridge } from './automation-http-bridge'
 import { PythonBridge } from './python-bridge'
 import { logger, archiveCurrentSession } from './logger'
 import { initAutoUpdater } from './updater'
@@ -9,6 +10,8 @@ import { syncBuiltinExtensions } from './builtin-sync'
 
 let mainWindow: BrowserWindow | null = null
 let pythonBridge: PythonBridge | null = null
+let automationHttpBridge: AutomationHttpBridge | null = null
+let isQuitting = false
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -78,6 +81,10 @@ app.whenReady().then(async () => {
   pythonBridge = new PythonBridge()
   pythonBridge.setWindowGetter(() => mainWindow)
   setupIpcHandlers(pythonBridge, () => mainWindow)
+  automationHttpBridge = new AutomationHttpBridge()
+  void automationHttpBridge.start().catch((error) => {
+    logger.warn(`Automation HTTP bridge failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+  })
   initAutoUpdater(() => mainWindow)
 
   createWindow()
@@ -92,9 +99,21 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
-  if (!pythonBridge) return
+  if (isQuitting || (!pythonBridge && !automationHttpBridge)) return
+
   event.preventDefault()
-  pythonBridge.stop().finally(() => {
+
+  isQuitting = true
+
+  void Promise.allSettled([
+    automationHttpBridge?.stop().catch((error) => {
+      logger.warn(`Automation HTTP bridge failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+    }),
+    pythonBridge?.stop().catch((error) => {
+      logger.warn(`Python bridge failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+    }),
+  ]).finally(() => {
+    automationHttpBridge = null
     pythonBridge = null
     app.quit()
   })

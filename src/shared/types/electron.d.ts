@@ -71,6 +71,7 @@ export interface ProcessResult {
 }
 
 export interface WFNodeData {
+  [key: string]: unknown
   extensionId?:    string
   inputType?:      'image' | 'text'
   enabled:         boolean
@@ -101,6 +102,78 @@ export interface Workflow {
   edges:       WFEdge[]
   createdAt:   string
   updatedAt:   string
+}
+
+export type AutomationCapabilitySource = 'backend-runtime' | 'electron-manifest' | 'ui-only'
+
+export interface AutomationModelCapability {
+  kind: 'model'
+  source: 'backend-runtime'
+  id: string
+  name: string
+  description?: string
+  version?: string
+  hf_repo?: string
+  tags?: string[]
+  downloaded?: boolean
+  loaded?: boolean
+  active?: boolean
+  vram_gb?: number
+  params_schema: unknown
+}
+
+export interface AutomationProcessCapability {
+  kind: 'process'
+  source: 'electron-manifest'
+  id: string
+  extension_id: string
+  node_id: string
+  name: string
+  extension_name: string
+  description?: string
+  version?: string
+  builtin: boolean
+  trusted: boolean
+  entry: string
+  input?: 'image' | 'text' | 'mesh'
+  output?: 'image' | 'text' | 'mesh'
+  params_schema?: unknown
+  ready?: boolean | null
+}
+
+export interface AutomationUiOnlyCapability {
+  kind: 'ui_only'
+  source: 'ui-only'
+  id: string
+  type?: string
+  label: string
+  reason: string
+}
+
+export interface AutomationCapabilityError {
+  source: 'backend-runtime' | 'electron-manifest'
+  code: string
+  message: string
+  retryable: boolean
+  context?: Record<string, unknown>
+}
+
+export interface AutomationCapabilitiesResponse {
+  /**
+   * Canonical contrato compartido entre `window.electron.automation.capabilities()`
+   * y el bridge HTTP localhost `GET /automation/capabilities`.
+   *
+   * Mantiene el ownership en Electron main y describe sólo el surface read-only del MVP:
+   * no implica writes, workflow management, process execution ni soporte headless para
+   * operaciones exclusivas de Electron/UI.
+   */
+  backend_ready: boolean
+  models: AutomationModelCapability[]
+  processes: AutomationProcessCapability[]
+  excluded: {
+    ui_only_nodes: AutomationUiOnlyCapability[]
+  }
+  errors?: AutomationCapabilityError[]
 }
 
 declare global {
@@ -143,6 +216,9 @@ declare global {
       }
       api: {
         updatePaths: (patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string }) => Promise<{ success: boolean; error?: string }>
+      }
+      automation: {
+        capabilities: () => Promise<AutomationCapabilitiesResponse>
       }
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>

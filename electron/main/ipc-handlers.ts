@@ -17,7 +17,10 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
+import { listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { getAutomationCapabilities } from './automation-capabilities-service'
 import { spawn } from 'child_process'
+import { fetchTrustedRepos } from './trusted-repos'
 
 type WindowGetter = () => BrowserWindow | null
 
@@ -136,7 +139,11 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.on('window:maximize', () => {
     const win = getWindow()
     if (!win) return
-    win.isMaximized() ? win.restore() : win.maximize()
+    if (win.isMaximized()) {
+      win.restore()
+      return
+    }
+    win.maximize()
   })
   ipcMain.on('window:close', () => getWindow()?.close())
 
@@ -519,89 +526,6 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  // Remote registry — list of trusted GitHub repo URLs
-  const REGISTRY_URL = 'https://raw.githubusercontent.com/lightningpixel/modly-official-extension/main/registry.json'
-  const REGISTRY_TTL = 5 * 60 * 1000 // 5 minutes
-
-  let registryCache: { repos: Set<string>; fetchedAt: number } | null = null
-
-  async function fetchTrustedRepos(): Promise<Set<string>> {
-    const now = Date.now()
-    if (registryCache && now - registryCache.fetchedAt < REGISTRY_TTL) {
-      return registryCache.repos
-    }
-    try {
-      const { net } = require('electron')
-      const res = await net.fetch(REGISTRY_URL)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json() as { trusted_repos?: string[] }
-      const repos = new Set(
-        (data.trusted_repos ?? []).map((r: string) => r.toLowerCase().replace(/\/$/, ''))
-      )
-      registryCache = { repos, fetchedAt: now }
-      return repos
-    } catch {
-      // Offline or fetch failed — keep previous cache, or empty
-      return registryCache?.repos ?? new Set()
-    }
-  }
-
-  function isTrustedSource(source: string | undefined, trustedRepos: Set<string>): boolean {
-    if (!source) return false
-    return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
-  }
-
-  type ParsedManifest = {
-    id?: string; name?: string; displayName?: string; version?: string
-    description?: string; author?: string | { name?: string }
-    source?: string; generator_class?: string
-    // extension type
-    type?:  'model' | 'process'
-    entry?: string
-    nodes?: {
-      id:                string
-      name?:             string
-      input?:            'mesh' | 'image' | 'text'
-      inputs?:           ('mesh' | 'image' | 'text')[]
-      output?:           'mesh' | 'image' | 'text'
-      params_schema?:    unknown[]
-      hf_repo?:          string
-      download_check?:   string
-      hf_skip_prefixes?: string[]
-    }[]
-  }
-
-  function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
-    const common = {
-      id:          parsed.id          ?? fallbackId,
-      name:        parsed.displayName ?? parsed.name ?? fallbackId,
-      version:     parsed.version,
-      description: parsed.description,
-      author:      typeof parsed.author === 'string' ? parsed.author : parsed.author?.name,
-      trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
-      source:      parsed.source,
-      builtin,
-    }
-
-    const nodes = (parsed.nodes ?? []).map(n => ({
-      id:             n.id,
-      name:           n.name ?? n.id,
-      input:          n.input  ?? 'image' as const,
-      inputs:         n.inputs,
-      output:         n.output ?? 'mesh'  as const,
-      paramsSchema:   n.params_schema ?? [],
-      hfRepo:         n.hf_repo,
-      downloadCheck:  n.download_check,
-      hfSkipPrefixes: n.hf_skip_prefixes,
-    }))
-
-    if (parsed.type === 'process') {
-      return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
-    }
-
-    return { ...common, type: 'model' as const, nodes }
-  }
-
   // Extensions — reads user extensions directory + built-in extensions directory
   ipcMain.handle('extensions:list', async () => {
     const userData      = app.getPath('userData')
@@ -610,38 +534,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
     const trustedRepos = await fetchTrustedRepos()
 
-    async function readExtensionsFromDir(dir: string, isBuiltin: boolean) {
-      if (!existsSync(dir)) return []
-      try {
-        const entries = await readdir(dir, { withFileTypes: true })
-        const dirs    = entries.filter(e => e.isDirectory())
-        return Promise.all(dirs.map(async (entry) => {
-          const base = { type: 'model' as const, id: entry.name, name: entry.name, trusted: isBuiltin, builtin: isBuiltin, nodes: [] }
-          for (const manifestFile of ['manifest.json', 'package.json']) {
-            const p = join(dir, entry.name, manifestFile)
-            if (existsSync(p)) {
-              try {
-                const raw    = await readFile(p, 'utf-8')
-                const parsed = JSON.parse(raw) as ParsedManifest
-                return parseExtensionManifest(parsed, entry.name, trustedRepos, isBuiltin)
-              } catch { /* ignore parse errors, fall through */ }
-            }
-          }
-          return base
-        }))
-      } catch {
-        return []
-      }
-    }
-
-    const [userExts, builtinExts] = await Promise.all([
-      readExtensionsFromDir(extensionsDir, false),
-      readExtensionsFromDir(builtinDir,    true),
-    ])
-
-    // Built-ins come first, then user extensions
-    return [...builtinExts, ...userExts]
+    return listVisibleExtensions({
+      builtinDir,
+      userExtensionsDir: extensionsDir,
+      trustedRepos,
+    })
   })
+
+  ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {
@@ -775,7 +675,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
               const lines = buf.split('\n')
               buf = lines.pop() ?? ''
               for (const raw of lines) {
-                const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim()
+                const line = raw.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g'), '').trim()
                 if (line) emit({ step: 'setting_up', message: line })
               }
             }

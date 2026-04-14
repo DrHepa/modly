@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.invoke('api:updatePaths', patch),
   },
 
+  automation: {
+    capabilities: () => ipcRenderer.invoke('automation:capabilities'),
+  },
+
   // Model management
   model: {
     export:         (args: { outputUrl: string; format: string }) => ipcRenderer.invoke('model:export', args),

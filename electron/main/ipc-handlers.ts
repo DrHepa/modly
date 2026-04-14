@@ -28,17 +28,11 @@ import {
   installedWeightVariants,
   listWeightVariantFiles,
   modelHasLocalData,
-  normalizeModelSources,
-  normalizeWeightGroupReferences,
-  normalizeWeightGroups,
-  normalizeWeightVariants,
-  validateModelNodeIds,
   removePartialDownloadArtifacts,
   resolveExtensionModelRoot,
   resolveModelRoot,
   resolveWeightGroupRoot,
   resolveWeightStorageRoot,
-  safeModelSourceId,
   weightStorageHasLocalData,
 } from './model-sources'
 import { getSettings, setSettings } from './settings-store'
@@ -46,6 +40,9 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
+import { activeExtensionInstalls, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { getAutomationCapabilities } from './automation-capabilities-service'
+import { fetchTrustedRepos } from './trusted-repos'
 import { spawn, execFile } from 'child_process'
 import {
   EXT_INCOMPLETE_MARKER,
@@ -54,7 +51,6 @@ import {
   assertSafeExtensionId,
   buildExtensionBackupPath,
   buildExtensionStagingPath,
-  isInternalExtensionDirName,
   resolveExtensionPathWithinRoot,
 } from './extension-path-guard'
 import { detectGpuInfo, describeGpuInfo, torchFlavorFor, type GpuInfo } from './gpu-detect'
@@ -67,14 +63,12 @@ import {
   validateExtensionReloadPayload,
   validateExistingExtensionReplacement,
   validateInstallManifest,
-  assertSupportedSceneNodeShape,
 } from './extension-install-utils'
 import {
   beginExtensionRegistrationTransaction,
   clearExtensionRegistrationTransaction,
   cleanupValidatedExtensionBackups,
   quarantineExtensionRegistrationFailure,
-  parseExtensionRegistrationPendingName,
   removeExtensionWithBackups,
   renameWithRetry as renameExtensionWithRetry,
   restoreExtensionBackup,
@@ -161,10 +155,6 @@ function runExtensionSetup(
   })
 }
 
-// Extension ids with an install currently in flight. Their folder carries the
-// incomplete marker during setup — extensions:list must not report it as
-// corrupted while the install is legitimately running.
-const activeExtensionInstalls = new Set<string>()
 const rmWithRetry = (path: string, label: string) =>
   removeExtensionWithRetry(path, label, logger)
 const renameWithRetry = (from: string, to: string, label: string) =>
@@ -1122,165 +1112,6 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  // Remote registry — list of trusted GitHub repo URLs
-  const REGISTRY_URL = 'https://raw.githubusercontent.com/lightningpixel/modly-official-extension/main/registry.json'
-  const REGISTRY_TTL = 5 * 60 * 1000 // 5 minutes
-
-  let registryCache: { repos: Set<string>; fetchedAt: number } | null = null
-
-  async function fetchTrustedRepos(): Promise<Set<string>> {
-    const now = Date.now()
-    if (registryCache && now - registryCache.fetchedAt < REGISTRY_TTL) {
-      return registryCache.repos
-    }
-    try {
-      const { net } = require('electron')
-      const res = await net.fetch(REGISTRY_URL)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json() as { trusted_repos?: string[] }
-      const repos = new Set(
-        (data.trusted_repos ?? []).map((r: string) => r.toLowerCase().replace(/\/$/, ''))
-      )
-      registryCache = { repos, fetchedAt: now }
-      return repos
-    } catch {
-      // Offline or fetch failed — keep previous cache, or empty
-      return registryCache?.repos ?? new Set()
-    }
-  }
-
-  function isTrustedSource(source: string | undefined, trustedRepos: Set<string>): boolean {
-    if (!source) return false
-    return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
-  }
-
-  type ParsedManifest = {
-    id?: string; name?: string; displayName?: string; version?: string
-    description?: string; author?: string | { name?: string }
-    source?: string; generator_class?: string
-    // extension type
-    type?:  'model' | 'process'
-    entry?: string
-    model_sources?: unknown
-    weight_groups?: unknown
-    // Optional top-level fallbacks — applied to each node if not set on the node
-    params_schema?:  unknown[]
-    param_defaults?: Record<string, unknown>
-    nodes?: {
-      id:                string
-      name?:             string
-      input?:            string
-      inputs?:           string[]
-      input_labels?:     string[]
-      output?:           string
-      params_schema?:    unknown[]
-      param_defaults?:   Record<string, unknown>
-      hf_repo?:          string
-      download_check?:   string
-      hf_skip_prefixes?: string[]
-      hf_include_prefixes?: string[]
-      model_sources?: unknown
-      weight_groups?: unknown
-      weight_variants?: unknown
-    }[]
-  }
-
-  function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
-    const common = {
-      id:          parsed.id          ?? fallbackId,
-      name:        parsed.displayName ?? parsed.name ?? fallbackId,
-      version:     parsed.version,
-      description: parsed.description,
-      author:      typeof parsed.author === 'string' ? parsed.author : parsed.author?.name,
-      trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
-      source:      parsed.source,
-      builtin,
-    }
-
-    if (parsed.model_sources !== undefined) {
-      throw new Error('manifest.json: model_sources must be declared on a model node')
-    }
-    if (parsed.type === 'process' && parsed.weight_groups !== undefined) {
-      throw new Error('manifest.json: weight_groups is supported only for model extensions')
-    }
-    const weightGroups = normalizeWeightGroups(parsed)
-    if (weightGroups || parsed.nodes?.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
-      validateModelNodeIds(parsed.nodes ?? [])
-    }
-    const nodes = (parsed.nodes ?? []).map(n => {
-      const declaredInputs = Array.isArray(n.inputs) ? n.inputs : [n.input ?? 'image']
-      const output = n.output ?? 'mesh'
-      assertSupportedSceneNodeShape(parsed.type === 'process' ? 'process' : 'model', n, declaredInputs, output)
-      const usesManagedWeights = weightGroups !== undefined
-        || n.model_sources !== undefined
-        || n.weight_groups !== undefined
-      if (weightGroups !== undefined && typeof n.id === 'string' && n.id.toLowerCase() === '_shared') {
-        throw new Error('manifest.json: model node id "_shared" is reserved')
-      }
-      const nodeId = usesManagedWeights ? safeModelSourceId(n.id, 'model node id') : n.id
-      if (parsed.type === 'process' && (n.model_sources !== undefined || n.weight_groups !== undefined)) {
-        throw new Error('manifest.json: model_sources and weight_groups are supported only for model nodes')
-      }
-      if (parsed.type === 'process' && n.weight_variants !== undefined) {
-        throw new Error('manifest.json: weight_variants is supported only for model nodes')
-      }
-      const modelSources = normalizeModelSources(n)
-      const weightVariants = normalizeWeightVariants(n, n.params_schema ?? parsed.params_schema)
-      const groupRefs = normalizeWeightGroupReferences(
-        n,
-        weightGroups,
-        `nodes[${n.id}].weight_groups`,
-      )
-      if (groupRefs && n.hf_repo !== undefined) {
-        throw new Error(
-          `manifest.json: model node "${nodeId}" must use model_sources for private weights when weight_groups are declared`,
-        )
-      }
-      return {
-        id:             nodeId,
-        name:           n.name ?? n.id,
-        input:          n.input  ?? 'image' as const,
-        inputs:         n.inputs,
-        inputLabels:    n.input_labels,
-        output:         n.output ?? 'mesh'  as const,
-        paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
-        paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
-        hfRepo:         n.hf_repo,
-        downloadCheck:  n.download_check,
-        hfSkipPrefixes: n.hf_skip_prefixes,
-        hfIncludePrefixes: n.hf_include_prefixes,
-        hasModelSources: modelSources !== undefined,
-        weightGroups: groupRefs,
-        weightVariants: weightVariants && {
-          param:   weightVariants.param,
-          default: weightVariants.default,
-          options: weightVariants.options.map((option) => ({
-            id:     option.id,
-            label:  option.label,
-            sizeGb: option.size_gb,
-            vramGb: option.vram_gb,
-          })),
-        },
-      }
-    })
-
-    if (parsed.type === 'process') {
-      return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
-    }
-
-    return {
-      ...common,
-      type: 'model' as const,
-      nodes,
-      weightGroups: (weightGroups ?? []).map((group) => ({
-        id: group.id,
-        dependentNodeIds: nodes
-          .filter((node) => node.weightGroups?.includes(group.id))
-          .map((node) => node.id),
-      })),
-    }
-  }
-
   async function reloadAndValidateModelExtension(
     manifest: ParsedManifest,
     extensionId: string,
@@ -1402,92 +1233,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
     const trustedRepos = await fetchTrustedRepos()
 
-    async function readExtensionsFromDir(dir: string, isBuiltin: boolean) {
-      if (!existsSync(dir)) return []
-      try {
-        const entries = await readdir(dir, { withFileTypes: true })
-        const pendingRegistrationIds = new Set(
-          isBuiltin
-            ? []
-            : entries
-              .map((entry) => parseExtensionRegistrationPendingName(entry.name)?.extensionId)
-              .filter((extensionId): extensionId is string => Boolean(extensionId)),
-        )
-        // On Windows, junction points are reported by Node.js as isSymbolicLink()=true,
-        // isDirectory()=false. Use statSync (which follows links) as the authoritative check.
-        const dirs = entries.filter(e => {
-          // Staging/backup dirs are never extensions (ids can't start with '.')
-          if (isInternalExtensionDirName(e.name)) return false
-          if (e.isDirectory()) return true
-          if (e.isSymbolicLink()) {
-            try { return statSync(join(dir, e.name)).isDirectory() } catch { return false }
-          }
-          return false
-        })
-        const results = await Promise.all(dirs.map(async (entry) => {
-          const entryPath = join(dir, entry.name)
-          const skeleton  = { type: 'model' as const, id: entry.name, name: entry.name, trusted: isBuiltin, builtin: isBuiltin, nodes: [], corrupted: true }
-
-          // A setup/registration marker still present means this folder is not
-          // safe to expose. Hide it only while the current install owns it;
-          // after a failed startup recovery, surface it as Repairable instead.
-          const installInterrupted = (
-            existsSync(join(entryPath, EXT_INCOMPLETE_MARKER))
-            || existsSync(join(entryPath, EXT_REGISTRATION_PENDING_MARKER))
-            || pendingRegistrationIds.has(entry.name)
-          )
-          if (installInterrupted && activeExtensionInstalls.has(entry.name)) return null
-
-          // Detect local extensions: check for .modly-local sentinel
-          let localSourcePath: string | undefined
-          if (!isBuiltin) {
-            const sentinelPath = join(entryPath, '.modly-local')
-            if (existsSync(sentinelPath)) {
-              try {
-                localSourcePath = (await readFile(sentinelPath, 'utf-8')).trim()
-              } catch { /* ignore */ }
-            }
-          }
-
-          // 'missing' = no manifest at all (gutted folder); 'invalid' = a manifest
-          // exists but doesn't parse (fixable by hand, don't push deletion only)
-          let manifestError: 'missing' | 'invalid' = 'missing'
-          for (const manifestFile of ['manifest.json', 'package.json']) {
-            const p = join(entryPath, manifestFile)
-            if (existsSync(p)) {
-              try {
-                const raw    = await readFile(p, 'utf-8')
-                const parsed = JSON.parse(raw) as ParsedManifest
-                // Inject local:// source so the UI shows the Local badge
-                if (localSourcePath) parsed.source = `local://${localSourcePath}`
-                const extension = parseExtensionManifest(
-                  parsed,
-                  entry.name,
-                  trustedRepos,
-                  isBuiltin,
-                )
-                return markExtensionInstallationInterrupted(extension, installInterrupted)
-              } catch { manifestError = 'invalid' }
-            }
-          }
-          return installInterrupted
-            ? markExtensionInstallationInterrupted(skeleton, true)
-            : { ...skeleton, manifestError }
-        }))
-        return results.filter((e): e is Exclude<typeof e, null> => e !== null)
-      } catch {
-        return []
-      }
-    }
-
-    const [userExts, builtinExts] = await Promise.all([
-      readExtensionsFromDir(extensionsDir, false),
-      readExtensionsFromDir(builtinDir,    true),
-    ])
-
-    // Built-ins come first, then user extensions
-    return [...builtinExts, ...userExts]
+    return listVisibleExtensions({ builtinDir, userExtensionsDir: extensionsDir, trustedRepos })
   })
+
+  ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {

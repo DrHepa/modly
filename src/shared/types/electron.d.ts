@@ -163,6 +163,77 @@ export interface Workflow {
   updatedAt:   string
 }
 
+export type AutomationCapabilitySource = 'backend-runtime' | 'electron-manifest' | 'ui-only'
+
+export interface AutomationModelCapability {
+  kind: 'model'
+  source: 'backend-runtime'
+  id: string
+  name: string
+  description?: string
+  version?: string
+  hf_repo?: string
+  tags?: string[]
+  downloaded?: boolean
+  loaded?: boolean
+  active?: boolean
+  vram_gb?: number
+  params_schema: unknown
+}
+
+export interface AutomationProcessCapability {
+  kind: 'process'
+  source: 'electron-manifest'
+  id: string
+  extension_id: string
+  node_id: string
+  name: string
+  extension_name: string
+  description?: string
+  version?: string
+  builtin: boolean
+  trusted: boolean
+  entry: string
+  input?: string
+  inputs?: string[]
+  input_labels?: string[]
+  output?: string
+  param_defaults?: Record<string, unknown>
+  params_schema?: unknown
+  ready?: boolean | null
+}
+
+export interface AutomationUiOnlyCapability {
+  kind: 'ui_only'
+  source: 'ui-only'
+  id: string
+  type?: string
+  label: string
+  reason: string
+}
+
+export interface AutomationCapabilityError {
+  source: 'backend-runtime' | 'electron-manifest'
+  code: string
+  message: string
+  retryable: boolean
+  context?: Record<string, unknown>
+}
+
+export interface AutomationCapabilitiesResponse {
+  /**
+   * Read-only capability discovery owned by Electron main. Manifest presence does
+   * not establish runtime readiness or support for UI-only/headless operations.
+   */
+  backend_ready: boolean
+  models: AutomationModelCapability[]
+  processes: AutomationProcessCapability[]
+  excluded: {
+    ui_only_nodes: AutomationUiOnlyCapability[]
+  }
+  errors?: AutomationCapabilityError[]
+}
+
 declare global {
   interface Window {
     electron: {
@@ -230,6 +301,9 @@ declare global {
       }
       api: {
         updatePaths: (patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string }) => Promise<{ success: boolean; error?: string }>
+      }
+      automation: {
+        capabilities: () => Promise<AutomationCapabilitiesResponse>
       }
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>

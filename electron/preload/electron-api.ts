@@ -1,3 +1,4 @@
+import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
   AssetLibraryListResult,
   AssetLibraryOpenRequest,
@@ -21,6 +22,11 @@ export type WebUtilsLike = Pick<typeof import('electron').webUtils, 'getPathForF
 
 export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFrameLike, webUtils: WebUtilsLike) {
   return {
+    automation: {
+      capabilities: (): Promise<AutomationCapabilitiesResponse> =>
+        ipcRenderer.invoke('automation:capabilities') as Promise<AutomationCapabilitiesResponse>,
+    },
+
     // Window controls
     window: {
       minimize:     () => ipcRenderer.send('window:minimize'),

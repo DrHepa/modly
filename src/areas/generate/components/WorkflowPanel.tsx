@@ -17,6 +17,11 @@ import ChatPanel from './ChatPanel'
 
 type PanelMode = 'basic' | 'chat'
 
+const toFlowNodes = (nodes: WFNode[]): FlowNode[] => nodes as unknown as FlowNode[]
+const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
+const toWorkflowNodes = (nodes: FlowNode[]): WFNode[] => nodes as unknown as WFNode[]
+const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TYPE_COLOR: Record<string, string> = {
@@ -433,8 +438,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   workflow:      Workflow
   allExtensions: ReturnType<typeof buildAllWorkflowExtensions>
 }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes as FlowNode[])
-  const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges as FlowEdge[])
+  const [nodes, setNodes, onNodesChange] = useNodesState(toFlowNodes(workflow.nodes))
+  const [edges, setEdges, onEdgesChange] = useEdgesState(toFlowEdges(workflow.edges))
   const { updateNodeData }               = useReactFlow()
   const { navigate }                     = useNavStore()
 
@@ -486,7 +491,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
 
   // Ordered nodes for params list — only those marked showInGenerate
   const sortedNodes = useMemo(
-    () => topoSortNodes(nodes as WFNode[], edges as WFEdge[]),
+    () => topoSortNodes(toWorkflowNodes(nodes), toWorkflowEdges(edges)),
     [nodes, edges],
   )
 
@@ -496,7 +501,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   )
 
   const handleGenerate = useCallback(() => {
-    const wf: Workflow = { ...workflow, nodes: nodes as WFNode[], edges: edges as WFEdge[] }
+    const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
     run(wf, allExtensions)
   }, [nodes, edges, workflow, allExtensions, run])
 

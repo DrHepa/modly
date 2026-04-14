@@ -10,8 +10,9 @@ import {
   useEdgesState,
   useReactFlow,
   type Connection,
-  type Node,
-  type Edge,
+  type Node as FlowNode,
+  type Edge as FlowEdge,
+  type OnConnectStart,
   type OnConnectStartParams,
 } from '@xyflow/react'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
@@ -38,6 +39,11 @@ const NODE_TYPES = { extensionNode: ExtensionNode, imageNode: ImageNode, textNod
 const EDGE_TYPES = { workflowEdge: WorkflowEdge }
 
 const DEFAULT_EDGE_OPTS = { type: 'workflowEdge' }
+
+const toFlowNodes = (nodes: WFNode[]): FlowNode<WFNodeData>[] => nodes as unknown as FlowNode<WFNodeData>[]
+const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
+const toWorkflowNodes = (nodes: FlowNode<WFNodeData>[]): WFNode[] => nodes as unknown as WFNode[]
+const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
@@ -77,7 +83,7 @@ function newWorkflowFromTemplate(): Workflow {
       { id: outputNodeId, type: 'outputNode', position: { x: 500, y: 180 }, data: { enabled: true, params: {} } },
     ],
     edges: [
-      { id: newId(), source: imageNodeId, target: outputNodeId, type: 'workflowEdge' },
+      { id: newId(), source: imageNodeId, target: outputNodeId },
     ],
     createdAt: now,
     updatedAt: now,
@@ -783,8 +789,8 @@ function WorkflowCanvasInner({
   const { runState, run: runWorkflow, cancel } = useWorkflowRunStore()
   const isRunning = runState.status === 'running' || runState.status === 'paused'
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes as Node[])
-  const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges as Edge[])
+  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<WFNodeData>>(toFlowNodes(workflow.nodes))
+  const [edges, setEdges, onEdgesChange] = useEdgesState(toFlowEdges(workflow.edges))
   const [name, setName]       = useState(workflow.name)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
@@ -797,18 +803,18 @@ function WorkflowCanvasInner({
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ─── Undo / Redo ──────────────────────────────────────────────────────────
-  type Snapshot = { nodes: Node[]; edges: Edge[]; name: string }
-  const historyRef  = useRef<Snapshot[]>([{ nodes: workflow.nodes as Node[], edges: workflow.edges as Edge[], name: workflow.name }])
+  type Snapshot = { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[]; name: string }
+  const historyRef  = useRef<Snapshot[]>([{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges), name: workflow.name }])
   const histIdxRef  = useRef(0)
   const [histIdx, setHistIdx] = useState(0)
   const skipPushRef = useRef(true) // skip the initial autosave-triggered push
 
   // Re-sync when workflow switches
   useEffect(() => {
-    setNodes(workflow.nodes as Node[])
-    setEdges(workflow.edges as Edge[])
+    setNodes(toFlowNodes(workflow.nodes))
+    setEdges(toFlowEdges(workflow.edges))
     setName(workflow.name)
-    historyRef.current = [{ nodes: workflow.nodes as Node[], edges: workflow.edges as Edge[], name: workflow.name }]
+    historyRef.current = [{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges), name: workflow.name }]
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
@@ -821,8 +827,8 @@ function WorkflowCanvasInner({
       const updated: Workflow = {
         ...workflow,
         name,
-        nodes: nodes as WFNode[],
-        edges: edges as WFEdge[],
+        nodes: toWorkflowNodes(nodes),
+        edges: toWorkflowEdges(edges),
         updatedAt: new Date().toISOString(),
       }
       onSave(updated)
@@ -873,11 +879,11 @@ function WorkflowCanvasInner({
   const isValidConnection = useCallback((connection: Connection) => {
     const srcType = getNodeOutputType(getNode(connection.source) as Node, allExtensions)
     const tgtType = getNodeInputType(getNode(connection.target) as Node, connection.targetHandle, allExtensions)
-    if (!srcType || !tgtType) return true  // unknown type — allow
+    if (!srcType || !tgtType) return true
     return srcType === tgtType
   }, [getNode, allExtensions])
 
-  const onConnectStart = useCallback((_: React.MouseEvent | React.TouchEvent, params: OnConnectStartParams) => {
+  const onConnectStart: OnConnectStart = useCallback((_, params: OnConnectStartParams) => {
     pendingConnectionRef.current  = params
     connectionCompletedRef.current = false
   }, [])
@@ -916,7 +922,7 @@ function WorkflowCanvasInner({
     if (nodeType) {
       setNodes((nds) => [...nds, {
         id: newId(), type: nodeType, position,
-        data: { enabled: true, params: {} } as WFNodeData,
+        data: { enabled: true, params: {} },
       }])
       return
     }
@@ -925,7 +931,7 @@ function WorkflowCanvasInner({
     if (!extensionId) return
     setNodes((nds) => [...nds, {
       id: newId(), type: 'extensionNode', position,
-      data: { extensionId, enabled: true, params: {} } as WFNodeData,
+      data: { extensionId, enabled: true, params: {} },
     }])
   }, [screenToFlowPosition, setNodes])
 
@@ -960,7 +966,7 @@ function WorkflowCanvasInner({
     const newNodeId = newId()
     setNodes((nds) => [...nds, {
       id: newNodeId, type, position,
-      data: { extensionId, enabled: true, params: {} } as WFNodeData,
+      data: { extensionId, enabled: true, params: {} },
     }])
 
     // If palette was opened from a connection drag, wire the edge automatically
@@ -980,7 +986,7 @@ function WorkflowCanvasInner({
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
-    const wf: Workflow = { ...workflow, name, nodes: nodes as WFNode[], edges: edges as WFEdge[], updatedAt: new Date().toISOString() }
+    const wf: Workflow = { ...workflow, name, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     onSave(wf)
     runWorkflow(wf, allExtensions)
   }, [workflow, name, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel])
@@ -1163,7 +1169,7 @@ function WorkflowCanvasInner({
           <PanelToggleIcon open={panelOpen} />
         </button>
 
-        <ReactFlow
+        <ReactFlow<FlowNode<WFNodeData>, FlowEdge>
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}

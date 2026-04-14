@@ -82,7 +82,7 @@ export class PythonBridge {
       this.ready = false
       this.process = null
       if (wasReady && !this.intentionalStop) {
-        this.getWindow()?.webContents.send('python:crashed', { code })
+        this.getWindow?.()?.webContents.send('python:crashed', { code })
       }
     })
 
@@ -114,7 +114,7 @@ export class PythonBridge {
   private emitTqdmLog(raw: string): void {
     if (/INFO/.test(raw)) return
     if (!raw.trim()) return
-    this.getWindow()?.webContents.send('python:log', raw.trim())
+    this.getWindow?.()?.webContents.send('python:log', raw.trim())
   }
 
   isReady(): boolean { return this.ready }

@@ -9,7 +9,7 @@ interface WorkflowsStore {
   load:          () => Promise<void>
   save:          (workflow: Workflow) => Promise<{ success: boolean; error?: string }>
   remove:        (id: string) => Promise<{ success: boolean; error?: string }>
-  importFile:    () => Promise<{ success: boolean; error?: string }>
+  importFile:    () => Promise<{ success: boolean; error?: string; workflow?: Workflow }>
   exportFile:    (workflow: Workflow) => Promise<{ success: boolean; error?: string }>
   setActive:     (id: string | null) => void
 }

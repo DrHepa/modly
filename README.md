@@ -139,31 +139,30 @@ Join the [Discord server](https://discord.gg/BvjDCvS3yr) to stay up to date with
 
 ---
 
-## Sponsors
+## Automation and companion tooling
 
-<p align="center">
-  Thanks to our early sponsors for believing in Modly and helping make local AI 3D generation more accessible.
-</p>
+In this fork/branch, Modly is also being exercised as a headless automation target for external tooling.
 
-<p align="center">
-  <kbd>
-    <img src="https://images.weserv.nl/?url=github.com/DrHepa.png&w=96&h=96&fit=cover&mask=circle" width="40" height="40" alt="DrHepa" />
-    <br />
-    <sub><a href="https://github.com/DrHepa">DrHepa</a></sub>
-  </kbd>
-  &nbsp;&nbsp;
-  <kbd>
-    <img src="https://images.weserv.nl/?url=github.com/benjapenjamin.png&w=96&h=96&fit=cover&mask=circle" width="40" height="40" alt="benjapenjamin" />
-    <br />
-    <sub><a href="https://github.com/benjapenjamin">benjapenjamin</a></sub>
-  </kbd>
-  &nbsp;&nbsp;
-  <kbd>
-    <img src="https://images.weserv.nl/?url=github.com/iammojogo-sudo.png&w=96&h=96&fit=cover&mask=circle" width="40" height="40" alt="iammojogo-sudo" />
-    <br />
-    <sub><a href="https://github.com/iammojogo-sudo">iammojogo-sudo</a></sub>
-  </kbd>
-</p>
+The current direction is to support a practical automation flow around:
+
+- capabilities discovery
+- workflow runs from image input
+- process runs for mesh-only operations such as export and optimization
+- external CLI / MCP orchestration layered on top of Modly
+
+That companion tooling lives here:
+
+- [DrHepa/modly_CLI_MCP](https://github.com/DrHepa/modly_CLI_MCP)
+
+The goal of that repository is to provide an installable CLI and MCP server that can drive real Modly capabilities without duplicating product logic inside the tooling layer.
+
+At this stage, that companion project already supports:
+
+- capability discovery against Modly
+- workflow-run create / status / wait / cancel
+- process-run create / status / wait / cancel
+
+while keeping UI-only surfaces such as **Add to Scene** outside the automation contract.
 
 ---
 

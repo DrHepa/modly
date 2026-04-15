@@ -50,6 +50,12 @@ export interface ProcessInput {
   filePath?: string
   text?:     string
   nodeId?:   string
+  inputs?:   Record<string, {
+    type: 'image' | 'text' | 'mesh'
+    filePath?: string
+    text?: string
+    sourceNodeId: string
+  }>
 }
 
 export interface ProcessResult {

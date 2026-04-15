@@ -4,6 +4,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { getWorkflowExtension } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import { buildProcessExecutionInput } from './processExecution.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -287,13 +288,22 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           // ── Process extension → IPC ─────────────────────────────────────
           const parts  = (node.data.extensionId ?? '').split('/')
           const extId  = parts[0]
-          const nodeId = parts[1] ?? ''
+          const processInput = buildProcessExecutionInput({
+            node,
+            nodes: workflow.nodes,
+            edges: workflow.edges,
+            allExtensions,
+            nodeOutputs,
+            previousNodeOutput: i > 0 ? nodeOutputs.get(execNodes[i - 1].id) : undefined,
+          })
           const result = await window.electron.extensions.runProcess(
             extId,
-            { filePath: nodeInputPath, text: nodeInputText, nodeId },
+            processInput,
             node.data.params as Record<string, unknown>,
           )
           if (!result.success) throw new Error(result.error ?? 'Process extension failed')
+          nodeInputPath = processInput.filePath
+          nodeInputText = processInput.text
           nodeInputPath = result.result?.filePath ?? nodeInputPath
           nodeInputText = result.result?.text     ?? nodeInputText
           set((s) => ({ runState: { ...s.runState, blockProgress: 100, blockStep: 'Done' } }))

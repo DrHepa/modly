@@ -4,7 +4,7 @@ import axios from 'axios'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { buildAutomationCapabilities } from './automation-capabilities.ts'
+import { buildAutomationCapabilities, parseExtensionManifest } from './automation-capabilities.ts'
 import {
   getAutomationCapabilitiesWithDeps,
   resolveAutomationCapabilitiesContextWithDeps,
@@ -299,6 +299,154 @@ test('buildAutomationCapabilities keeps backend_ready=true on partial model para
         'Load 3D Mesh',
         'Add to Scene',
       ])
+    } finally {
+      axios.get = originalGet
+    }
+  })
+})
+
+test('parseExtensionManifest preserves legacy process nodes without inputs[]', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'mesh-tools',
+      displayName: 'Mesh Tools',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'optimize',
+          name: 'Optimize Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          params_schema: [{ key: 'ratio', type: 'number' }],
+        },
+      ],
+    },
+    'mesh-tools',
+    new Set(),
+    true,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.deepEqual(extension.nodes, [
+    {
+      id: 'optimize',
+      name: 'Optimize Mesh',
+      input: 'mesh',
+      output: 'mesh',
+      paramsSchema: [{ key: 'ratio', type: 'number' }],
+      hfRepo: undefined,
+      downloadCheck: undefined,
+      hfSkipPrefixes: undefined,
+    },
+  ])
+})
+
+test('parseExtensionManifest normalizes optional process inputs[] with required=true by default', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'mesh-refiners',
+      displayName: 'Mesh Refiners',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'refine',
+          name: 'Refine Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          inputs: [
+            { name: 'reference_image', type: 'image' },
+            { name: 'coarse_mesh', type: 'mesh', required: false },
+          ],
+          params_schema: [{ key: 'strength', type: 'number' }],
+        },
+      ],
+    },
+    'mesh-refiners',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.deepEqual(extension.nodes[0], {
+    id: 'refine',
+    name: 'Refine Mesh',
+    input: 'mesh',
+    output: 'mesh',
+    inputs: [
+      { name: 'reference_image', type: 'image', required: true },
+      { name: 'coarse_mesh', type: 'mesh', required: false },
+    ],
+    paramsSchema: [{ key: 'strength', type: 'number' }],
+    hfRepo: undefined,
+    downloadCheck: undefined,
+    hfSkipPrefixes: undefined,
+  })
+})
+
+test('buildAutomationCapabilities emits normalized inputs[] for process nodes without breaking legacy io', async () => {
+  await withTempExtensions(async ({ builtinDir, userExtensionsDir }) => {
+    await createProcessManifest(userExtensionsDir, 'mesh-refiners', {
+      id: 'mesh-refiners',
+      displayName: 'Mesh Refiners',
+      version: '1.2.0',
+      description: 'Refine mesh with multiple named inputs',
+      source: 'acme/mesh-refiners',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'refine',
+          name: 'Refine Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          inputs: [
+            { name: 'reference_image', type: 'image' },
+            { name: 'coarse_mesh', type: 'mesh', required: false },
+          ],
+          params_schema: [{ key: 'strength', type: 'number' }],
+        },
+      ],
+    })
+
+    const originalGet = axios.get
+    axios.get = async (url) => {
+      if (url.endsWith('/health')) return { data: { ok: true } }
+      if (url.endsWith('/model/all')) return { data: [] }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+
+    try {
+      const response = await buildAutomationCapabilities({
+        builtinDir,
+        userExtensionsDir,
+        trustedRepos: new Set(['acme/mesh-refiners']),
+      })
+
+      assert.equal(response.processes.length, 1)
+      assert.deepEqual(response.processes[0], {
+        kind: 'process',
+        source: 'electron-manifest',
+        id: 'mesh-refiners/refine',
+        extension_id: 'mesh-refiners',
+        node_id: 'refine',
+        name: 'Refine Mesh',
+        extension_name: 'Mesh Refiners',
+        description: 'Refine mesh with multiple named inputs',
+        version: '1.2.0',
+        builtin: false,
+        trusted: true,
+        entry: 'processor.js',
+        input: 'mesh',
+        output: 'mesh',
+        inputs: [
+          { name: 'reference_image', type: 'image', required: true },
+          { name: 'coarse_mesh', type: 'mesh', required: false },
+        ],
+        params_schema: [{ key: 'strength', type: 'number' }],
+        ready: null,
+      })
     } finally {
       axios.get = originalGet
     }

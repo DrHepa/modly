@@ -21,6 +21,11 @@ import { useNavStore } from '@shared/stores/navStore'
 import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions, getWorkflowExtension } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import {
+  validateProcessConnection,
+  validateWorkflowProcessRun,
+  type ProcessConnectionRuleIssue,
+} from './processConnectionRules'
 import { useWorkflowRunStore } from './workflowRunStore'
 import ExtensionNode    from './nodes/ExtensionNode'
 import ImageNode        from './nodes/ImageNode'
@@ -794,6 +799,7 @@ function WorkflowCanvasInner({
   const [name, setName]       = useState(workflow.name)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [connectionIssue, setConnectionIssue] = useState<ProcessConnectionRuleIssue | null>(null)
 
   // Pending connection: set when user drags a handle and releases on empty canvas
   const pendingConnectionRef  = useRef<OnConnectStartParams | null>(null)
@@ -814,11 +820,16 @@ function WorkflowCanvasInner({
     setNodes(toFlowNodes(workflow.nodes))
     setEdges(toFlowEdges(workflow.edges))
     setName(workflow.name)
+    setConnectionIssue(null)
     historyRef.current = [{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges), name: workflow.name }]
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
   }, [workflow.id])
+
+  useEffect(() => {
+    setConnectionIssue(null)
+  }, [nodes, edges])
 
   // Auto-save + history push debounced
   useEffect(() => {
@@ -875,6 +886,30 @@ function WorkflowCanvasInner({
 
   const canUndo = histIdx > 0
   const canRedo = histIdx < historyRef.current.length - 1
+  const runValidationIssue = useMemo(() => validateWorkflowProcessRun({
+    nodes: toWorkflowNodes(nodes),
+    edges: toWorkflowEdges(edges),
+    allExtensions,
+  }), [nodes, edges, allExtensions])
+  const activeValidationIssue = connectionIssue ?? runValidationIssue
+
+  const appendValidatedEdge = useCallback((connection: Connection, nextNodes = toWorkflowNodes(nodes)) => {
+    const issue = validateProcessConnection({
+      connection,
+      nodes: nextNodes,
+      edges: toWorkflowEdges(edges),
+      allExtensions,
+    })
+
+    if (issue) {
+      setConnectionIssue(issue)
+      return false
+    }
+
+    setConnectionIssue(null)
+    setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
+    return true
+  }, [nodes, edges, allExtensions, setEdges])
 
   const isValidConnection = useCallback((connection: Connection) => {
     const srcType = getNodeOutputType(getNode(connection.source) as Node, allExtensions)
@@ -890,8 +925,8 @@ function WorkflowCanvasInner({
 
   const onConnect = useCallback((params: Connection) => {
     connectionCompletedRef.current = true
-    setEdges((eds) => addEdge({ ...params, ...DEFAULT_EDGE_OPTS }, eds))
-  }, [setEdges])
+    appendValidatedEdge(params)
+  }, [appendValidatedEdge])
 
   const onConnectEnd = useCallback((event: MouseEvent | TouchEvent) => {
     if (connectionCompletedRef.current || !pendingConnectionRef.current?.nodeId) {
@@ -964,32 +999,38 @@ function WorkflowCanvasInner({
       pendingDropPos ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     )
     const newNodeId = newId()
-    setNodes((nds) => [...nds, {
+    const newNode = {
       id: newNodeId, type, position,
       data: { extensionId, enabled: true, params: {} },
-    }])
+    }
+    const nextNodes = toWorkflowNodes([...nodes, newNode])
+    setNodes((nds) => [...nds, newNode])
 
     // If palette was opened from a connection drag, wire the edge automatically
     const pending = pendingConnectionRef.current
     if (pending?.nodeId) {
       const isSource = pending.handleType === 'source'
-      const edge = isSource
-        ? { id: newId(), source: pending.nodeId, sourceHandle: pending.handleId ?? undefined, target: newNodeId }
-        : { id: newId(), source: newNodeId, target: pending.nodeId, targetHandle: pending.handleId ?? undefined }
-      setEdges((eds) => addEdge({ ...edge, ...DEFAULT_EDGE_OPTS }, eds))
+      const connection = isSource
+        ? { id: newId(), source: pending.nodeId, sourceHandle: pending.handleId ?? null, target: newNodeId, targetHandle: null }
+        : { id: newId(), source: newNodeId, sourceHandle: null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
+      appendValidatedEdge(connection, nextNodes)
     }
 
     pendingConnectionRef.current = null
     setPendingDropPos(null)
     setPaletteOpen(false)
-  }, [screenToFlowPosition, setNodes, setEdges, pendingDropPos])
+  }, [screenToFlowPosition, setNodes, pendingDropPos, nodes, appendValidatedEdge])
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
+    if (runValidationIssue) {
+      setConnectionIssue(runValidationIssue)
+      return
+    }
     const wf: Workflow = { ...workflow, name, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     onSave(wf)
     runWorkflow(wf, allExtensions)
-  }, [workflow, name, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel])
+  }, [workflow, name, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel, runValidationIssue])
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -1077,10 +1118,12 @@ function WorkflowCanvasInner({
           {/* Run / Stop */}
           <button
             onClick={handleRun}
+            disabled={!isRunning && Boolean(runValidationIssue)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors
               ${isRunning
                 ? 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20 hover:border-red-500/50'
-                : 'bg-accent/10 border-accent/30 text-accent-light hover:bg-accent/20 hover:border-accent/50'}`}
+                : 'bg-accent/10 border-accent/30 text-accent-light hover:bg-accent/20 hover:border-accent/50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent/10 disabled:hover:border-accent/30'}`}
+            title={!isRunning && runValidationIssue ? runValidationIssue.message : 'Run workflow'}
           >
             {isRunning ? (
               <>
@@ -1145,9 +1188,20 @@ function WorkflowCanvasInner({
       {/* React Flow canvas */}
       <div className="flex-1 relative" onDragOver={onDragOver} onDrop={onDrop}>
 
+        {activeValidationIssue && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10 border border-red-500/20 text-red-300 whitespace-nowrap max-w-[90vw]">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" className="shrink-0">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 5h2v6h-2V7zm0 8h2v2h-2v-2z"/>
+              </svg>
+              <span className="text-[10px] font-medium truncate">{activeValidationIssue.message}</span>
+            </div>
+          </div>
+        )}
+
         {/* No model node warning */}
         {!nodes.some((n) => n.type === 'extensionNode' && allExtensions.find((e) => e.id === (n.data as WFNodeData).extensionId && e.type === 'model')) && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+          <div className={`absolute left-1/2 -translate-x-1/2 z-10 pointer-events-none ${activeValidationIssue ? 'top-12' : 'top-3'}`}>
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-accent/10 border border-accent/20 text-accent-light whitespace-nowrap">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" className="shrink-0">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>

@@ -4,16 +4,11 @@ import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
 import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
+import { getProcessTargetPorts, PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
 import { useWorkflowRunStore } from '../workflowRunStore'
 import BaseNode from './BaseNode'
 
 // ─── Handle colors ────────────────────────────────────────────────────────────
-
-const HANDLE_COLOR: Record<string, string> = {
-  image: '#38bdf8',
-  mesh:  '#a78bfa',
-  text:  '#fbbf24',
-}
 
 const TAG_CLS: Record<string, string> = {
   image: 'border-sky-500/30 bg-sky-500/10 text-sky-400',
@@ -51,7 +46,6 @@ function IntInput({ value, onChange, className }: { value: number; onChange: (v:
 
 function FloatInput({ value, onChange, className }: { value: number; onChange: (v: number) => void; className: string }) {
   const [text, setText] = useState(String(value))
-  // Sync when external value changes (e.g. reset)
   const prevValue = useRef(value)
   if (prevValue.current !== value && parseFloat(text.replace(',', '.')) !== value) {
     prevValue.current = value
@@ -110,7 +104,6 @@ function ParamControl({ param, value, onChange }: {
   if (param.type === 'float') {
     return <FloatInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
   }
-  // int
   return <IntInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
 }
 
@@ -119,34 +112,25 @@ function ParamControl({ param, value, onChange }: {
 export default function ExtensionNode({ id, data, selected }: { id: string; data: WFNodeData; selected?: boolean }) {
   const { updateNodeData } = useReactFlow()
   const running = useWorkflowRunStore((s) => s.activeNodeId === id)
+  const ioRowRef = useRef<HTMLDivElement>(null)
+  const [handleTop, setHandleTop] = useState('50%')
 
-  // Refs for handle alignment — support up to 2 inputs
-  const ioRowRef  = useRef<HTMLDivElement>(null)
-  const ioRow2Ref = useRef<HTMLDivElement>(null)
-  const [handleTop,  setHandleTop]  = useState('50%')
-  const [handle2Top, setHandle2Top] = useState('50%')
-
-  const { modelExtensions, processExtensions } = useExtensionsStore()
-  const ext = buildAllWorkflowExtensions(modelExtensions, processExtensions)
-    .find((e) => e.id === data.extensionId)
-
-  const inputs      = ext?.inputs  // defined → multi-input mode
-  const isMulti     = inputs && inputs.length > 1
-  const isTerminal  = ext?.id === 'mesh-exporter'
-  const outputColor = HANDLE_COLOR[ext?.output ?? 'mesh']
-  const hasParams   = (ext?.params.length ?? 0) > 0
-
-  // Align handles with their respective IO rows after mount
   useLayoutEffect(() => {
     if (ioRowRef.current) {
       const center = ioRowRef.current.offsetTop + ioRowRef.current.offsetHeight / 2
       setHandleTop(`${center}px`)
     }
-    if (ioRow2Ref.current) {
-      const center = ioRow2Ref.current.offsetTop + ioRow2Ref.current.offsetHeight / 2
-      setHandle2Top(`${center}px`)
-    }
-  }, [isMulti])
+  }, [])
+
+  const { modelExtensions, processExtensions } = useExtensionsStore()
+  const ext = buildAllWorkflowExtensions(modelExtensions, processExtensions)
+    .find((e) => e.id === data.extensionId)
+
+  const isTerminal = ext?.id === 'mesh-exporter'
+  const targetPorts = getProcessTargetPorts({ input: ext?.input ?? 'image', inputs: ext?.inputs })
+  const hasNamedTargetPorts = targetPorts.length > 1 || targetPorts.some((port) => !port.isLegacy)
+  const outputColor = PROCESS_PORT_HANDLE_COLOR[ext?.output ?? 'mesh']
+  const hasParams = (ext?.params.length ?? 0) > 0
 
   const patchParam = useCallback((key: string, val: number | string) => {
     updateNodeData(id, { params: { ...data.params, [key]: val } })
@@ -161,82 +145,6 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       return Array.isArray(expected) ? expected.includes(current as string | number) : current === expected
     })
   }
-
-  // ── IO subheader ─────────────────────────────────────────────────────────
-  const ioSubheader = isMulti ? (
-    // Multi-input layout: one row per input, output on first row
-    <div className="flex flex-col divide-y divide-zinc-800/40">
-      <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
-        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputs[0]] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-          {inputs[0]}
-        </span>
-        {!isTerminal && (
-          <>
-            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
-              <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
-            </svg>
-            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-              {ext?.output ?? '—'}
-            </span>
-          </>
-        )}
-      </div>
-      <div ref={ioRow2Ref} className="flex items-center px-3 py-2">
-        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputs[1]] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-          {inputs[1]}
-        </span>
-      </div>
-    </div>
-  ) : (
-    // Single-input layout (existing behavior)
-    <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
-      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-        {ext?.input ?? '—'}
-      </span>
-      {!isTerminal && (
-        <>
-          <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
-            <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
-          </svg>
-          <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-            {ext?.output ?? '—'}
-          </span>
-        </>
-      )}
-    </div>
-  )
-
-  // ── Handles ──────────────────────────────────────────────────────────────
-  const handlesEl = (
-    <>
-      {/* Primary input handle */}
-      <Handle
-        id="input-0"
-        type="target"
-        position={Position.Left}
-        style={{ background: HANDLE_COLOR[isMulti ? inputs[0] : (ext?.input ?? 'image')], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
-      />
-      {/* Secondary input handle (multi-input only) */}
-      {isMulti && (
-        <Handle
-          id="input-1"
-          type="target"
-          position={Position.Left}
-          style={{ background: HANDLE_COLOR[inputs[1]], width: 14, height: 14, border: '2.5px solid #18181b', top: handle2Top }}
-        />
-      )}
-      {/* Output handle */}
-      {!isTerminal && (
-        <Handle
-          id="output"
-          type="source"
-          position={Position.Right}
-          style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
-        />
-      )}
-    </>
-  )
-
   return (
     <BaseNode
       id={id}
@@ -247,8 +155,73 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       showInGenerate={data.showInGenerate ?? false}
       collapsible={hasParams}
       minWidth={200}
-      subheader={ioSubheader}
-      handles={handlesEl}
+      subheader={
+        hasNamedTargetPorts ? (
+          <div ref={ioRowRef} className="flex items-start justify-between gap-3 px-3 py-2">
+            <div className="min-w-0 flex-1 flex flex-col gap-1">
+              {targetPorts.map((port) => (
+                <div key={port.name ?? '__legacy-target'} className="flex items-center gap-1.5 min-w-0">
+                  <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[port.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                    {port.type}
+                  </span>
+                  <span className="text-[9px] text-zinc-400 truncate">{port.name ?? 'input'}</span>
+                  {!port.required && <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>}
+                </div>
+              ))}
+            </div>
+            {!isTerminal && (
+              <div className="flex shrink-0 items-center gap-1.5 self-start pt-0.5">
+                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
+                  <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+                </svg>
+                <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                  {ext?.output ?? '—'}
+                </span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
+            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+              {ext?.input ?? '—'}
+            </span>
+            {!isTerminal && (
+              <>
+                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
+                  <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+                </svg>
+                <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                  {ext?.output ?? '—'}
+                </span>
+              </>
+            )}
+          </div>
+        )
+      }
+      handles={<>
+        {targetPorts.map((port, index) => (
+          <Handle
+            key={port.name ?? '__legacy-target'}
+            {...(port.name ? { id: port.name } : {})}
+            type="target"
+            position={Position.Left}
+            style={{
+              background: PROCESS_PORT_HANDLE_COLOR[port.type],
+              width: 14,
+              height: 14,
+              border: '2.5px solid #18181b',
+              top: hasNamedTargetPorts ? `${((index + 1) / (targetPorts.length + 1)) * 100}%` : handleTop,
+            }}
+          />
+        ))}
+        {!isTerminal && (
+          <Handle
+            type="source"
+            position={Position.Right}
+            style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
+          />
+        )}
+      </>}
     >
       {hasParams && (
         <div className="px-3 pb-3 pt-2.5 flex flex-col gap-2">

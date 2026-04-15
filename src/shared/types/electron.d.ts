@@ -9,10 +9,24 @@ export interface ExtensionNode {
   input:            'image' | 'text' | 'mesh'
   inputs?:          ('image' | 'text' | 'mesh')[]   // multi-input nodes; overrides input when set
   output:           'image' | 'text' | 'mesh'
+  inputs?:          ProcessPort[]
   paramsSchema:     ParamSchema[]
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
+}
+
+export interface ProcessPort {
+  name:     string
+  type:     'image' | 'text' | 'mesh'
+  required?: boolean
+}
+
+export interface NamedProcessInput {
+  type:         'image' | 'text' | 'mesh'
+  filePath?:    string
+  text?:        string
+  sourceNodeId: string
 }
 
 export interface ModelExtension {
@@ -63,6 +77,7 @@ export interface ProcessInput {
   filePath?: string
   text?:     string
   nodeId?:   string
+  inputs?:   Record<string, NamedProcessInput>
 }
 
 export interface ProcessResult {
@@ -137,6 +152,7 @@ export interface AutomationProcessCapability {
   entry: string
   input?: 'image' | 'text' | 'mesh'
   output?: 'image' | 'text' | 'mesh'
+  inputs?: ProcessPort[]
   params_schema?: unknown
   ready?: boolean | null
 }

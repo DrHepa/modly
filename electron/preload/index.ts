@@ -1,4 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { ProcessInput } from '../../src/shared/types/electron.d'
+import { invokeExtensionsRunProcess } from './run-process-ipc'
 
 // Expose a typed API to the renderer process via window.electron
 contextBridge.exposeInMainWorld('electron', {
@@ -152,10 +154,10 @@ contextBridge.exposeInMainWorld('electron', {
 
     runProcess: (
       extensionId: string,
-      input:       { filePath?: string; text?: string; nodeId?: string },
+      input:       ProcessInput,
       params:      Record<string, unknown>,
     ): Promise<{ success: boolean; result?: { filePath?: string; text?: string }; error?: string }> =>
-      ipcRenderer.invoke('extensions:runProcess', extensionId, input, params),
+      invokeExtensionsRunProcess(ipcRenderer.invoke.bind(ipcRenderer), extensionId, input, params),
 
     onInstallProgress: (cb: (data: {
       step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'

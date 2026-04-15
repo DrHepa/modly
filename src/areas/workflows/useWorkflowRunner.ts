@@ -53,6 +53,10 @@ function topoSort(nodes: WFNode[], edges: WFEdge[]): WFNode[] {
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
+// Legacy parity note: workflowRunStore is the sole active workflow execution path.
+// Batch 5 intentionally leaves this hook inactive/unreferenced; multi-input process
+// payload assembly now lives in buildProcessExecutionInput via workflowRunStore.
+
 export function useWorkflowRunner(allExtensions: WorkflowExtension[]) {
   const apiUrl      = useAppStore((s) => s.apiUrl)
   const [runState, setRunState] = useState<WorkflowRunState>(IDLE)

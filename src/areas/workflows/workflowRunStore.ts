@@ -4,7 +4,7 @@ import { validateWorkflowProcessRun } from './processConnectionRules'
 import { create } from 'zustand'
 import axios, { AxiosInstance } from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
-import { getWorkflowExtension } from './mockExtensions'
+import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import type { WorkflowExtension } from './mockExtensions'
@@ -310,8 +310,8 @@ async function executeExtensionNode(
   const { workflow, allExtensions, client, workspaceDir, nodeOutputs, nodeMap,
           selectedImagePath, selectedImageData } = ctx
 
-  const ext = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
-  if (ext && hasUnsupportedSceneShape(ext)) {
+  const { ext, mode } = resolveWorkflowDispatch(node, allExtensions)
+  if (hasUnsupportedSceneShape(ext)) {
     throw new Error(`${ext.name} uses an unsupported scene input or output declaration`)
   }
   // Freshest params at the moment the node starts (so loop iterations / Retry pick
@@ -372,9 +372,7 @@ async function executeExtensionNode(
     }
   }
 
-  const isModelNode = ext?.type === 'model'
-
-  if (isModelNode) {
+  if (mode === 'model') {
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
@@ -474,10 +472,6 @@ async function executeExtensionNode(
     if (!hasNamedInputs && ext?.input === 'audio' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming audio connection`)
     if (!hasNamedInputs && ext?.input === 'text'  && !nodeInputText) throw new Error(`${ext.name} needs an incoming text connection`)
 
-    const parts  = (node.data.extensionId ?? '').split('/')
-    const extId  = parts[0]
-    const nid    = parts[1] ?? ''
-
     // Freshest params (liveParams), same as the model-node branch above, so a
     // multi-image process node re-run inside a loop also picks up edits made while
     // paused rather than the snapshot captured at run start.
@@ -495,7 +489,7 @@ async function executeExtensionNode(
       filePath: nodeInputMeshPath ?? nodeInputPath,
       text: nodeInputText,
       texts: nodeInputTexts.length > 0 ? nodeInputTexts : undefined,
-      nodeId: nid,
+      nodeId: ext.nodeId,
     }
     if (hasNamedInputs) {
       const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
@@ -507,14 +501,14 @@ async function executeExtensionNode(
       nodeInputPath = undefined
       nodeInputText = undefined
     }
-    const result = await window.electron.extensions.runProcess(extId, processInput, processParams)
+    const result = await window.electron.extensions.runProcess(ext.extensionId, processInput, processParams)
     if (!result.success) throw new Error(result.error ?? 'Process extension failed')
     nodeInputPath = result.result?.filePath ?? nodeInputPath
     nodeInputText = result.result?.text     ?? nodeInputText
     setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Done' }))
   }
 
-  const outputType = ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
+  const outputType = ext.output
   nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
 
   const output = nodeOutputs.get(node.id)

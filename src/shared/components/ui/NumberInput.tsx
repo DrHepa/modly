@@ -4,9 +4,10 @@ import { useRef, useState } from 'react'
  * Text-based numeric inputs for extension params. They keep the raw text the
  * user is typing (so "-", "0." or "1," don't get swallowed) and only emit once
  * it parses. External value changes (e.g. reset) re-sync the text.
+ * Saved string values stay visible verbatim; rendering never rewrites params.
  */
 
-export function IntInput({ value, onChange, className }: { value: number; onChange: (v: number) => void; className: string }) {
+export function IntInput({ value, onChange, className, label }: { value: number | string; onChange: (v: number) => void; className: string; label?: string }) {
   const [text, setText] = useState(String(value))
   const prevValue = useRef(value)
   if (prevValue.current !== value && parseInt(text, 10) !== value) {
@@ -17,6 +18,7 @@ export function IntInput({ value, onChange, className }: { value: number; onChan
     <input
       type="text"
       inputMode="numeric"
+      aria-label={label}
       value={text}
       onChange={(e) => {
         const raw = e.target.value
@@ -35,7 +37,7 @@ export function IntInput({ value, onChange, className }: { value: number; onChan
  * shown next to the text field; typed values are clamped to those bounds.
  */
 export function FloatInput({ value, onChange, className, min, max, step, label }: {
-  value:     number
+  value:     number | string
   onChange:  (v: number) => void
   className: string
   min?:      number
@@ -61,6 +63,7 @@ export function FloatInput({ value, onChange, className, min, max, step, label }
     <input
       type="text"
       inputMode="decimal"
+      aria-label={label}
       value={text}
       onChange={(e) => {
         const raw = e.target.value.replace(',', '.')
@@ -84,7 +87,7 @@ export function FloatInput({ value, onChange, className, min, max, step, label }
         min={min}
         max={max}
         step={step && step > 0 ? step : (max - min) / 100}
-        value={Number.isFinite(value) ? clamp(value) : min}
+        value={typeof value === 'number' && Number.isFinite(value) ? clamp(value) : min}
         onChange={(e) => {
           const num = e.currentTarget.valueAsNumber
           if (Number.isFinite(num)) { setText(String(num)); emit(num) }

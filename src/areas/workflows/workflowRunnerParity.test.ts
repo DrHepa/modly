@@ -235,3 +235,14 @@ test('actual palette preserves positional handles and unresolved-source first-po
   assert.equal(unresolved.issue, null)
   assert.equal(unresolved.addedEdge?.targetHandle, 'reference')
 })
+
+test('display-unsupported and unknown supplied params survive the actual PROCESS executor unchanged', async () => {
+  const { normalizeWorkflowParams } = await import('./workflowParamSchema.ts')
+  const { store, calls } = storeFixture()
+  const ext = extension('run', undefined, 'mesh')
+  ext.params = normalizeWorkflowParams([{ id: 'custom', label: 'Custom', type: 'json', default: '{}' }])
+  const supplied = { custom: { nested: [1, false] }, unknown: 'keep', enabled: false, zero: 0, empty: '' }
+  await store.getState().run(workflow([node('mesh', 'meshNode', { filePath: '/mesh.glb' }), node('run', 'extensionNode', supplied)], [edge('mesh', 'run')]), [ext])
+  assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
+  assert.deepEqual(calls[0].params, supplied)
+})

@@ -90,14 +90,19 @@ test('PICKER_LABELS names every intent, so the browse button always has an acces
 // The bug in #155 was not in a resolver (there wasn't one) — it was the string
 // param's browse button calling selectDirectory() unconditionally. There is no
 // DOM harness in this repo, so guard the wiring at the source level instead.
+// Controls are now shared; keep the original routing assertion at that owner.
 
 for (const file of [
   'src/areas/workflows/nodes/ExtensionNode.tsx',
   'src/areas/generate/components/WorkflowPanel.tsx',
 ]) {
-  test(`${file} routes its string param browse button through openParamPicker`, () => {
+  test(`${file} uses the shared control that routes legacy intents through openParamPicker`, () => {
     const src = readFileSync(resolve(file), 'utf8')
-    assert.match(src, /openParamPicker\(param, window\.electron\.fs\)/)
+    assert.match(src, /<WorkflowParamControl[\s>]/)
+    const control = readFileSync(resolve('src/areas/workflows/components/WorkflowParamControl.tsx'), 'utf8')
+    const state = readFileSync(resolve('src/areas/workflows/components/workflowParamControlState.ts'), 'utf8')
+    assert.match(control, /selectWorkflowParamPath\(window\.electron\.fs, param, textValue\)/)
+    assert.match(state, /openParamPicker\(param, fs\)/)
     assert.doesNotMatch(src, /const p = await window\.electron\.fs\.selectDirectory\(\)/)
   })
 }

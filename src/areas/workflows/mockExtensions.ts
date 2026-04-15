@@ -1,6 +1,7 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import { normalizeWorkflowParams } from './workflowParamSchema.ts'
+import type { ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -21,15 +22,17 @@ export interface WorkflowExtension {
 }
 
 function applyParamDefaults(
-  schema:   ParamSchema[],
-  defaults: Record<string, number | string> | undefined,
+  schema: RawParamSchema[],
+  defaults: Record<string, boolean | number | string> | undefined,
 ): ParamSchema[] {
-  if (!defaults || Object.keys(defaults).length === 0) return schema
-  return schema.map((p) =>
-    Object.prototype.hasOwnProperty.call(defaults, p.id)
-      ? { ...p, default: defaults[p.id]! }
-      : p,
-  )
+  // Apply root/node overrides before narrowing the display schema. Display
+  // normalization must never be used to filter the supplied runtime params.
+  if (!Array.isArray(schema)) return normalizeWorkflowParams(schema)
+  return normalizeWorkflowParams(schema.map((param) =>
+    param && typeof param === 'object' && typeof param.id === 'string' && defaults && Object.prototype.hasOwnProperty.call(defaults, param.id)
+      ? { ...param, default: defaults[param.id] }
+      : param,
+  ))
 }
 
 export function normalizeWorkflowProcessInputs(inputs?: string[] | ProcessPort[]): string[] | ProcessPort[] | undefined {
@@ -59,7 +62,7 @@ export function buildAllWorkflowExtensions(
         inputs:          normalizeWorkflowProcessInputs(node.inputs),
         inputLabels:     node.inputLabels,
         output:          node.output,
-        params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
+        params:          applyParamDefaults(node.paramsSchema, node.paramDefaults),
         builtin:         ext.builtin,
         type:            'process',
       })
@@ -81,7 +84,7 @@ export function buildAllWorkflowExtensions(
         inputs:          node.inputs,
         inputLabels:     node.inputLabels,
         output:          node.output,
-        params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
+        params:          applyParamDefaults(node.paramsSchema, node.paramDefaults),
         builtin:         ext.builtin,
         type:            'model',
         weightVariants:  node.weightVariants,

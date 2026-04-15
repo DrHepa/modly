@@ -15,9 +15,9 @@ import { buildAllWorkflowExtensions, getWorkflowExtension } from '@areas/workflo
 import { validateWorkflowPreflight } from '@areas/workflows/preflight'
 import { mimeFromPath } from '@areas/workflows/nodes/imageUtils'
 import type { WorkflowExtension } from '@areas/workflows/mockExtensions'
-import type { Workflow, WFNode, WFEdge, ParamSchema } from '@shared/types/electron.d'
-import { PICKER_LABELS, openParamPicker, resolvePickerIntent } from '@shared/utils/paramPicker'
-import { FloatInput, IntInput, PickerIcon } from '@shared/components/ui'
+import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import WorkflowParamControl from '@areas/workflows/components/WorkflowParamControl'
+import { isWorkflowParamVisible, resolveWorkflowParamValues } from '@areas/workflows/components/workflowParamControlState'
 import { isMissingWeightVariant, withWeightVariantAvailability } from '@shared/utils/weightVariants'
 import ChatPanel from './ChatPanel'
 
@@ -61,48 +61,6 @@ function topoSortNodes(nodes: Workflow['nodes'], edges: Workflow['edges']): WFNo
     }
   }
   return result
-}
-
-// ─── Param field ──────────────────────────────────────────────────────────────
-
-const inputCls = 'w-full bg-zinc-800 border border-zinc-700/80 rounded-md px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-accent/60'
-
-function ParamField({ param, value, onChange }: {
-  param:    ParamSchema
-  value:    number | string
-  onChange: (v: number | string) => void
-}) {
-  if (param.type === 'select') {
-    return (
-      <select value={value} onChange={(e) => onChange(e.target.value)} className={inputCls}>
-        {param.options?.map((o) => (
-          <option key={String(o.value)} value={o.value}>{o.label ?? String(o.value)}</option>
-        ))}
-      </select>
-    )
-  }
-  if (param.type === 'string') {
-    const intent = resolvePickerIntent(param)
-    return (
-      <div className="flex items-center gap-1">
-        <input type="text" value={value as string} placeholder={param.tooltip ?? ''}
-          onChange={(e) => onChange(e.target.value)} className={`${inputCls} flex-1`} />
-        <button onClick={async () => {
-          const p = await openParamPicker(param, window.electron.fs)
-          if (p) onChange(p)
-        }} title={PICKER_LABELS[intent]} aria-label={PICKER_LABELS[intent]}
-          className="shrink-0 flex items-center justify-center w-6 h-6 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-400 hover:text-zinc-200 transition-colors">
-          <PickerIcon intent={intent} />
-        </button>
-      </div>
-    )
-  }
-  if (param.type === 'float') {
-    return <FloatInput value={value as number} onChange={(v) => onChange(v)} className={inputCls}
-      min={param.min} max={param.max} step={param.step} label={param.label} />
-  }
-  // int
-  return <IntInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
 }
 
 // ─── Workflow dropdown ────────────────────────────────────────────────────────
@@ -367,6 +325,7 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
   const data    = node?.data as { enabled: boolean; params: Record<string, unknown> } | undefined
   const enabled = data?.enabled ?? true
 
+  const resolvedParams = resolveWorkflowParamValues(ext.params, data?.params ?? {})
   const inputColor  = TYPE_COLOR[ext.input]  ?? '#71717a'
   const outputColor = TYPE_COLOR[ext.output] ?? '#71717a'
 
@@ -404,13 +363,13 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
 
       {expanded && ext.params.length > 0 && (
         <div className="mt-2 flex flex-col gap-2">
-          {ext.params.map((param) => {
-            const val = ((data?.params[param.id] ?? param.default) as number | string)
+          {ext.params.filter((param) => isWorkflowParamVisible(param, resolvedParams)).map((param) => {
+            const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
             return (
               <div key={param.id} className="flex items-center gap-2">
                 <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate">{param.label}</label>
                 <div className="flex-1">
-                  <ParamField param={withWeightVariantAvailability(param, ext.weightVariants, installedVariants)} value={val}
+                  <WorkflowParamControl resolvedParams={resolvedParams} param={withWeightVariantAvailability(param, ext.weightVariants, installedVariants)} value={val}
                     onChange={(v) => onPatch(nodeId, { params: { ...(data?.params ?? {}), [param.id]: v } })} />
                   {/* Offer the install instead of leaving the panel on selection. */}
                   {isMissingWeightVariant(param.id, val, ext.weightVariants, installedVariants) && (

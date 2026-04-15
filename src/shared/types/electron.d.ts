@@ -18,8 +18,8 @@ export interface ExtensionNode {
   inputs?:          string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
   output:           string
-  paramsSchema:     ParamSchema[]
-  paramDefaults?:   Record<string, number | string>
+  paramsSchema:     RawParamSchema[]
+  paramDefaults?:   Record<string, boolean | number | string>
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
@@ -74,25 +74,86 @@ export interface ModelExtension {
 
 export type PickerIntent = 'folder' | 'image' | 'mesh' | 'text'
 
-export interface ParamSchema {
-  id:       string
-  label:    string
-  type:     'select' | 'int' | 'float' | 'string' | 'file-select'
-  default:  number | string
-  options?: { value: number | string; label: string }[]
-  min?:     number
-  max?:     number
-  step?:    number
-  tooltip?: string
-  show_if?: Record<string, string | number | (string | number)[]>
-  // string: which native dialog the browse button opens (default: 'folder')
-  pickerIntent?:  PickerIntent
-  /** snake_case alias of pickerIntent, for manifests that follow show_if/dir_from. */
-  picker_intent?: PickerIntent
-  // file-select: dropdown of the files inside the folder held by another param
-  dir_from?:   string     // id of the (string) param holding the folder path
-  extensions?: string[]   // file extensions to list (e.g. ["json"])
+export type WorkflowPickerIntent = PickerIntent | 'directory' | 'save-path' | 'generic-file'
+
+export interface WorkflowParamFilter {
+  name: string
+  extensions: string[]
 }
+
+export interface WorkflowParamOption {
+  value: number | string
+  label: string
+}
+
+interface WorkflowParamSchemaBase {
+  id: string
+  label: string
+  tooltip?: string
+  show_if?: Record<string, boolean | number | string | (boolean | number | string)[]>
+  // Kept on the common shape for existing picker/variant metadata consumers.
+  pickerIntent?: WorkflowPickerIntent
+  picker_intent?: WorkflowPickerIntent
+  options?: WorkflowParamOption[]
+}
+
+export interface SelectParamSchema extends WorkflowParamSchemaBase {
+  type: 'select'
+  default: number | string
+}
+
+export interface IntParamSchema extends WorkflowParamSchemaBase {
+  type: 'int'
+  default: number
+  min?: number
+  max?: number
+  step?: number
+}
+
+export interface FloatParamSchema extends WorkflowParamSchemaBase {
+  type: 'float'
+  default: number
+  min?: number
+  max?: number
+  step?: number
+}
+
+export interface StringParamSchema extends WorkflowParamSchemaBase {
+  type: 'string'
+  default: string
+  filters?: WorkflowParamFilter[]
+}
+
+export interface FileSelectParamSchema extends WorkflowParamSchemaBase {
+  type: 'file-select'
+  default: string
+  dir_from?: string
+  extensions?: string[]
+}
+
+export interface BooleanParamSchema extends WorkflowParamSchemaBase {
+  type: 'boolean'
+  default: boolean
+}
+
+export interface UnsupportedParamSchema extends WorkflowParamSchemaBase {
+  type: 'unsupported'
+  // The runner consumes defaults independently of whether this UI can edit them.
+  default: unknown
+  reason: string
+  rawType?: string
+}
+
+export type ParamSchema =
+  | SelectParamSchema
+  | IntParamSchema
+  | FloatParamSchema
+  | StringParamSchema
+  | FileSelectParamSchema
+  | BooleanParamSchema
+  | UnsupportedParamSchema
+
+export type RawParamSchema = ParamSchema | Record<string, unknown>
 
 export interface ProcessExtension {
   type:         'process'

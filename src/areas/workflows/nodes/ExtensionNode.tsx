@@ -1,13 +1,12 @@
 import { getProcessTargetPorts } from '../processPorts'
-import { useCallback, useEffect, useRef, useLayoutEffect, useState } from 'react'
+import { useCallback, useRef, useLayoutEffect, useState } from 'react'
 import { Handle, Position, useReactFlow } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useNavStore } from '@shared/stores/navStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
-import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
-import { PICKER_LABELS, openParamPicker, resolvePickerIntent } from '@shared/utils/paramPicker'
-import { FloatInput, IntInput, PickerIcon } from '@shared/components/ui'
+import WorkflowParamControl from '../components/WorkflowParamControl'
+import { isWorkflowParamVisible, resolveWorkflowParamValues } from '../components/workflowParamControlState'
 import { isMissingWeightVariant, withWeightVariantAvailability } from '@shared/utils/weightVariants'
 import { useWorkflowRunStore } from '../workflowRunStore'
 import BaseNode from './BaseNode'
@@ -28,90 +27,6 @@ const TAG_CLS: Record<string, string> = {
   mesh:  'border-violet-500/30 bg-violet-500/10 text-violet-400',
   text:  'border-amber-500/30 bg-amber-500/10 text-amber-400',
   scene: 'border-pink-500/30 bg-pink-500/10 text-pink-400',
-}
-
-// ─── Param control ────────────────────────────────────────────────────────────
-
-// nodrag — without it, React Flow starts dragging the node on mousedown inside
-// these fields, so click-drag text selection (or opening a <select>) moves the
-// node instead.
-const inputCls = 'nodrag w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-accent/60'
-
-/** Dropdown of the files inside the folder held by another param (dir_from). */
-function FileSelectControl({ param, value, dirValue, onChange }: {
-  param:    ParamSchema
-  value:    string
-  dirValue: string
-  onChange: (v: string) => void
-}) {
-  const [files, setFiles] = useState<string[]>([])
-  const extsKey = (param.extensions ?? []).join(',')
-  useEffect(() => {
-    let alive = true
-    if (!dirValue) { setFiles([]); return }
-    window.electron.fs.listFiles(dirValue, param.extensions ?? undefined).then((list) => {
-      if (alive) setFiles(list)
-    }).catch(() => { if (alive) setFiles([]) })
-    return () => { alive = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirValue, extsKey])
-
-  return (
-    <select value={value} disabled={!dirValue} onChange={(e) => onChange(e.target.value)}
-      className={`${inputCls} ${!dirValue ? 'opacity-50 cursor-not-allowed' : ''}`}>
-      <option value="">{!dirValue ? 'Pick a folder first…' : files.length === 0 ? 'No files found' : 'Select…'}</option>
-      {/* Keep a saved value visible even if it's no longer in the folder listing. */}
-      {value && !files.includes(value) && <option value={value}>{value} (missing)</option>}
-      {files.map((f) => <option key={f} value={f}>{f}</option>)}
-    </select>
-  )
-}
-
-function ParamControl({ param, value, onChange, resolvedParams }: {
-  param:          ParamSchema
-  value:          number | string
-  onChange:       (v: number | string) => void
-  resolvedParams: Record<string, unknown>
-}) {
-  if (param.type === 'file-select') {
-    const dirValue = String(resolvedParams[param.dir_from ?? ''] ?? '')
-    return <FileSelectControl param={param} value={String(value ?? '')} dirValue={dirValue} onChange={onChange} />
-  }
-  if (param.type === 'select') {
-    return (
-      <select value={value} onChange={(e) => onChange(e.target.value)} className={inputCls}>
-        {param.options?.map((o) => (
-          <option key={String(o.value)} value={o.value}>{o.label ?? String(o.value)}</option>
-        ))}
-      </select>
-    )
-  }
-  if (param.type === 'string') {
-    const intent = resolvePickerIntent(param)
-    return (
-      <div className="flex items-center gap-1">
-        <input type="text" value={value as string} placeholder={param.tooltip ?? ''}
-          onChange={(e) => onChange(e.target.value)} className={`${inputCls} flex-1`} />
-        <button
-          onClick={async () => {
-            const p = await openParamPicker(param, window.electron.fs)
-            if (p) onChange(p)
-          }}
-          title={PICKER_LABELS[intent]}
-          aria-label={PICKER_LABELS[intent]}
-          className="nodrag shrink-0 flex items-center justify-center w-6 h-6 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-400 hover:text-zinc-200 transition-colors"
-        >
-          <PickerIcon intent={intent} />
-        </button>
-      </div>
-    )
-  }
-  if (param.type === 'float') {
-    return <FloatInput value={value as number} onChange={(v) => onChange(v)} className={inputCls}
-      min={param.min} max={param.max} step={param.step} label={param.label} />
-  }
-  // int
-  return <IntInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
 }
 
 // ─── ExtensionNode ────────────────────────────────────────────────────────────
@@ -146,22 +61,14 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     }))
   }, [isMulti, inputs?.length])
 
-  const patchParam = useCallback((key: string, val: number | string) => {
+  const patchParam = useCallback((key: string, val: boolean | number | string) => {
     const params = { ...data.params, [key]: val }
     updateNodeData(id, { params })
     // Push live so a paused/looping run picks up the change on the next node start.
     useWorkflowRunStore.getState().setLiveNodeParams(id, params)
   }, [id, data.params, updateNodeData])
 
-  const paramById = new Map(ext?.params.map((p) => [p.id, p]))
-
-  const isVisible = (param: ParamSchema): boolean => {
-    if (!param.show_if) return true
-    return Object.entries(param.show_if).every(([key, expected]) => {
-      const current = data.params[key] ?? paramById.get(key)?.default
-      return Array.isArray(expected) ? expected.includes(current as string | number) : current === expected
-    })
-  }
+  const resolvedParams = resolveWorkflowParamValues(ext?.params ?? [], data.params)
 
   // ── IO subheader ─────────────────────────────────────────────────────────
   const ioSubheader = isMulti ? (
@@ -261,18 +168,13 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       {hasParams && (
         <div className="px-3 pb-3 pt-2.5 flex flex-col gap-2">
           {(() => {
-            // Effective values of every param (user value or schema default) —
-            // lets file-select params resolve their source folder (dir_from).
-            const resolvedParams = Object.fromEntries(
-              (ext?.params ?? []).map((p) => [p.id, data.params[p.id] ?? p.default]),
-            )
-            return ext!.params.filter(isVisible).map((param) => {
-              const val = (data.params[param.id] ?? param.default) as number | string
+            return ext!.params.filter((param) => isWorkflowParamVisible(param, resolvedParams)).map((param) => {
+              const val = (data.params[param.id] ?? param.default) as boolean | number | string
               return (
                 <div key={param.id} className="flex items-center gap-2">
                   <label className="text-[10px] text-zinc-500 w-24 shrink-0 leading-tight">{param.label}</label>
                   <div className="flex-1">
-                    <ParamControl
+                    <WorkflowParamControl
                       param={withWeightVariantAvailability(param, ext?.weightVariants, installedVariants)}
                       value={val}
                       onChange={(v) => patchParam(param.id, v)}

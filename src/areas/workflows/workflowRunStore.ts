@@ -1,3 +1,6 @@
+import { buildProcessExecutionInput } from './processExecution'
+import { getPositionalInputTypes, getProcessTargetPorts, hasNamedProcessInputs } from './processPorts'
+import { validateWorkflowProcessRun } from './processConnectionRules'
 import { create } from 'zustand'
 import axios, { AxiosInstance } from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
@@ -332,12 +335,14 @@ async function executeExtensionNode(
   const extraImagePaths: string[] = []
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
+  const positionalInputs = ext && getPositionalInputTypes(ext)
+  const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
 
-  if (ext?.inputs && ext.inputs.length > 1) {
+  if (positionalInputs && positionalInputs.length > 1) {
     // Scene is intentionally a single-input-only model contract. The guard
     // above rejects it before this multi-slot path, and filtering it here also
     // narrows the remaining declarations to assignSlotFilePaths' exact ABI.
-    const inputTypes: SlotInputType[] = ext.inputs.filter((input) => input !== 'scene')
+    const inputTypes = positionalInputs.filter((input) => input !== 'scene') as SlotInputType[]
     // Resolved by target handle first, then typed by that slot's declared input --
     // not by the arrival order of `incomingEdges`, which does not match slot order.
     const inputPaths  = new Array<string | undefined>(inputTypes.length).fill(undefined)
@@ -370,8 +375,8 @@ async function executeExtensionNode(
   const isModelNode = ext?.type === 'model'
 
   if (isModelNode) {
-    const isSceneInput = ext?.inputs ? ext.inputs.includes('scene') : ext?.input === 'scene'
-    const isTextInput = ext?.inputs ? ext.inputs.every((i) => i === 'text') : ext?.input === 'text'
+    const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
+    const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
     const activeImagePath = (isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
     if (!isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
@@ -464,10 +469,10 @@ async function executeExtensionNode(
       useAppStore.getState().updateCurrentJob({ status: 'generating', progress: st.progress, step: st.step })
     }
   } else {
-    if (ext?.input === 'mesh'  && !nodeInputPath) throw new Error(`${ext.name} needs an incoming mesh connection`)
-    if (ext?.input === 'image' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming image connection`)
-    if (ext?.input === 'audio' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming audio connection`)
-    if (ext?.input === 'text'  && !nodeInputText) throw new Error(`${ext.name} needs an incoming text connection`)
+    if (!hasNamedInputs && ext?.input === 'mesh'  && !nodeInputMeshPath && !nodeInputPath) throw new Error(`${ext.name} needs an incoming mesh connection`)
+    if (!hasNamedInputs && ext?.input === 'image' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming image connection`)
+    if (!hasNamedInputs && ext?.input === 'audio' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming audio connection`)
+    if (!hasNamedInputs && ext?.input === 'text'  && !nodeInputText) throw new Error(`${ext.name} needs an incoming text connection`)
 
     const parts  = (node.data.extensionId ?? '').split('/')
     const extId  = parts[0]
@@ -484,16 +489,25 @@ async function executeExtensionNode(
       processParams.extra_image_paths = extraImagePaths
     }
 
-    const result = await window.electron.extensions.runProcess(
-      extId,
-      {
-        filePath: nodeInputMeshPath ?? nodeInputPath,
-        text:     nodeInputText,
-        texts:    nodeInputTexts.length > 0 ? nodeInputTexts : undefined,
-        nodeId:   nid,
-      },
-      processParams,
-    )
+    const processInput = hasNamedInputs ? buildProcessExecutionInput({
+      node, nodes: workflow.nodes, edges: workflow.edges, allExtensions, nodeOutputs,
+    }) : {
+      filePath: nodeInputMeshPath ?? nodeInputPath,
+      text: nodeInputText,
+      texts: nodeInputTexts.length > 0 ? nodeInputTexts : undefined,
+      nodeId: nid,
+    }
+    if (hasNamedInputs) {
+      const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
+      if (issue) throw new Error(issue.message)
+      for (const port of getProcessTargetPorts(ext!)) {
+        if (port.required && !Object.hasOwn(processInput.inputs ?? {}, port.name!)) throw new Error(`Required port "${port.name}" has no input data.`)
+      }
+      // Named values never leak into the legacy top-level fallback/output fields.
+      nodeInputPath = undefined
+      nodeInputText = undefined
+    }
+    const result = await window.electron.extensions.runProcess(extId, processInput, processParams)
     if (!result.success) throw new Error(result.error ?? 'Process extension failed')
     nodeInputPath = result.result?.filePath ?? nodeInputPath
     nodeInputText = result.result?.text     ?? nodeInputText

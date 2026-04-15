@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { register } from 'node:module'
 
 register('../../scripts/node-ts-extensionless-loader.mjs', import.meta.url)
-const { buildAutomationCapabilities } = await import('./automation-capabilities.ts')
+const { buildAutomationCapabilities, parseExtensionManifest } = await import('./automation-capabilities.ts')
 const {
   getAutomationCapabilitiesWithDeps,
   resolveAutomationCapabilitiesContextWithDeps,
@@ -306,4 +306,184 @@ test('buildAutomationCapabilities keeps backend_ready=true on partial model para
       axios.get = originalGet
     }
   })
+})
+
+test('parseExtensionManifest preserves legacy process nodes without inputs[]', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'mesh-tools',
+      displayName: 'Mesh Tools',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'optimize',
+          name: 'Optimize Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          params_schema: [{ key: 'ratio', type: 'number' }],
+        },
+      ],
+    },
+    'mesh-tools',
+    new Set(),
+    true,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.deepEqual(extension.nodes, [
+    {
+      id: 'optimize',
+      name: 'Optimize Mesh',
+      input: 'mesh',
+      output: 'mesh',
+      paramsSchema: [{ key: 'ratio', type: 'number' }],
+      hfRepo: undefined,
+      downloadCheck: undefined,
+      hfSkipPrefixes: undefined,
+      // The upstream parser retains these fields even on a legacy process.
+      inputs: undefined, inputLabels: undefined, paramDefaults: {},
+      hfIncludePrefixes: undefined, hasModelSources: false, weightGroups: undefined, weightVariants: undefined,
+    },
+  ])
+})
+
+test('parseExtensionManifest normalizes optional process inputs[] with required=true by default', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'mesh-refiners',
+      displayName: 'Mesh Refiners',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'refine',
+          name: 'Refine Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          inputs: [
+            { name: 'reference_image', type: 'image' },
+            { name: 'coarse_mesh', type: 'mesh', required: false },
+          ],
+          params_schema: [{ key: 'strength', type: 'number' }],
+        },
+      ],
+    },
+    'mesh-refiners',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.deepEqual(extension.nodes[0], {
+    id: 'refine',
+    name: 'Refine Mesh',
+    input: 'mesh',
+    output: 'mesh',
+    inputs: [
+      { name: 'reference_image', type: 'image', required: true },
+      { name: 'coarse_mesh', type: 'mesh', required: false },
+    ],
+    paramsSchema: [{ key: 'strength', type: 'number' }],
+    hfRepo: undefined,
+    downloadCheck: undefined,
+    hfSkipPrefixes: undefined,
+    // Named ports are additive to upstream discovery metadata, not a replacement.
+    inputLabels: undefined, paramDefaults: {}, hfIncludePrefixes: undefined,
+    hasModelSources: false, weightGroups: undefined, weightVariants: undefined,
+  })
+})
+
+test('buildAutomationCapabilities emits normalized inputs[] for process nodes without breaking legacy io', async () => {
+  await withTempExtensions(async ({ builtinDir, userExtensionsDir }) => {
+    await createProcessManifest(userExtensionsDir, 'mesh-refiners', {
+      id: 'mesh-refiners',
+      displayName: 'Mesh Refiners',
+      version: '1.2.0',
+      description: 'Refine mesh with multiple named inputs',
+      source: 'acme/mesh-refiners',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [
+        {
+          id: 'refine',
+          name: 'Refine Mesh',
+          input: 'mesh',
+          output: 'mesh',
+          inputs: [
+            { name: 'reference_image', type: 'image' },
+            { name: 'coarse_mesh', type: 'mesh', required: false },
+          ],
+          params_schema: [{ key: 'strength', type: 'number' }],
+        },
+      ],
+    })
+
+    const originalGet = axios.get
+    axios.get = async (url) => {
+      if (url.endsWith('/health')) return { data: { ok: true } }
+      if (url.endsWith('/model/all')) return { data: [] }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+
+    try {
+      const response = await buildAutomationCapabilities({
+        builtinDir,
+        userExtensionsDir,
+        trustedRepos: new Set(['acme/mesh-refiners']),
+      })
+
+      assert.equal(response.processes.length, 1)
+      assert.deepEqual(response.processes[0], {
+        kind: 'process',
+        source: 'electron-manifest',
+        id: 'mesh-refiners/refine',
+        extension_id: 'mesh-refiners',
+        node_id: 'refine',
+        name: 'Refine Mesh',
+        extension_name: 'Mesh Refiners',
+        description: 'Refine mesh with multiple named inputs',
+        version: '1.2.0',
+        builtin: false,
+        trusted: true,
+        entry: 'processor.js',
+        input: 'mesh',
+        output: 'mesh',
+        inputs: [
+          { name: 'reference_image', type: 'image', required: true },
+          { name: 'coarse_mesh', type: 'mesh', required: false },
+        ],
+        params_schema: [{ key: 'strength', type: 'number' }],
+        ready: null,
+      })
+    } finally {
+      axios.get = originalGet
+    }
+  })
+})
+
+test('named and positional declarations preserve upstream labels, defaults, audio and custom modalities', () => {
+  const inputs = ['image', 'image', 'text', 'audio', 'capture']
+  const schema = [{ id: 'mode', type: 'string', default: 'schema' }]
+  const result = parseExtensionManifest({ type: 'process', params_schema: schema, param_defaults: { mode: 'root' }, nodes: [{
+    id: 'legacy', input: 'capture', inputs, input_labels: ['front', 'side', 'prompt', 'sound', 'capture'], output: 'video', param_defaults: { mode: '' },
+  }, { id: 'named', input: 'audio', inputs: [{ name: 'sound', type: 'audio' }], output: 'audio' }] }, 'bundle', new Set())
+  assert.deepEqual(result.nodes[0].inputs, inputs)
+  assert.deepEqual(result.nodes[0].inputLabels, ['front', 'side', 'prompt', 'sound', 'capture'])
+  assert.deepEqual(result.nodes[0].paramsSchema, schema)
+  assert.deepEqual(result.nodes[0].paramDefaults, { mode: '' })
+  assert.equal(result.nodes[0].output, 'video')
+  assert.deepEqual(result.nodes[1].inputs, [{ name: 'sound', type: 'audio', required: true }])
+  assert.throws(() => parseExtensionManifest({ type: 'process', nodes: [{ id: 'scene', inputs: [{ name: 'world', type: 'scene' }] }] }, 'scene', new Set()), /scene/i)
+})
+
+test('installer applies the existing scene ABI boundary to named declarations without restricting custom types', async () => {
+  const { validateInstallManifest } = await import('./extension-install-utils.ts')
+  const validate = (type, node) => validateInstallManifest({ id: 'pack', type, entry: 'processor.js', generator_class: 'Generator', nodes: [{ id: 'run', ...node }] }, { hasEntryFile: () => true, hasGeneratorFile: () => true }, 'fixture')
+  assert.equal(validate('process', { inputs: [{ name: 'frame', type: 'image' }, { name: 'capture', type: 'capture' }], output: 'video' }).isProcess, true)
+  assert.equal(validate('model', { inputs: ['capture'], output: 'video' }).isProcess, false)
+  assert.equal(validate('model', { input: 'scene', output: 'scene' }).isProcess, false)
+  assert.equal(validate('model', { inputs: [{ name: 'frame', type: 'image' }] }).isProcess, false)
+  assert.throws(() => validate('process', { inputs: [{ name: 'world', type: 'scene' }] }), /scene.*model/)
+  assert.throws(() => validate('model', { inputs: [{ name: 'world', type: 'scene' }] }), /scene.*single/)
 })

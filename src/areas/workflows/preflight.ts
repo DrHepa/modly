@@ -1,9 +1,11 @@
+import { hasNamedProcessInputs } from './processPorts'
+import { validateWorkflowProcessRun } from './processConnectionRules'
 import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
 
-type DataType = 'image' | 'text' | 'mesh' | 'audio' | 'scene'
+type DataType = string
 
 export interface WorkflowPreflightIssue {
   key: string
@@ -34,7 +36,7 @@ function formatType(type: DataType): string {
   if (type === 'mesh') return 'mesh'
   if (type === 'image') return 'image'
   if (type === 'audio') return 'audio'
-  return 'text'
+  return type
 }
 
 function formatRequiredTypes(types: DataType[]): string {
@@ -138,6 +140,12 @@ export function validateWorkflowPreflight(
         nodeId: node.id,
         message: `${ext.name} uses an unsupported scene input or output declaration.`,
       })
+      continue
+    }
+
+    if (ext.type === 'process' && hasNamedProcessInputs(ext.inputs)) {
+      const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
+      if (issue) pushIssue(issues, { key: `${node.id}:${issue.code}:${issue.portName}`, nodeId: node.id, message: issue.message })
       continue
     }
 

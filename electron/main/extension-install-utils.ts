@@ -49,7 +49,8 @@ export function assertSupportedSceneNodeShape(
   declaredInputs: unknown[],
   output: unknown,
 ): void {
-  const usesSceneInput = declaredInputs.includes('scene')
+  const usesSceneInput = declaredInputs.some((input) => input === 'scene'
+    || (typeof input === 'object' && input !== null && 'type' in input && input.type === 'scene'))
   if (kind === 'process' && (usesSceneInput || output === 'scene')) {
     throw new Error('manifest.json: scene input and output are supported only for model nodes')
   }

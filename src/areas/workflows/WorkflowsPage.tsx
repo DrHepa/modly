@@ -1,3 +1,4 @@
+import { getProcessTargetPort, getProcessTargetPorts } from './processPorts'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -21,6 +22,12 @@ import { useAppStore } from '@shared/stores/appStore'
 import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import {
+  resolveProcessConnectionSource,
+  validateProcessConnection,
+  validateWorkflowProcessRun,
+  type ProcessConnectionRuleIssue,
+} from './processConnectionRules'
 import { useWorkflowRunStore } from './workflowRunStore'
 import { validateWorkflowPreflight } from './preflight'
 import ExtensionNode    from './nodes/ExtensionNode'
@@ -69,7 +76,7 @@ function findWhileContainerAt(nodes: FlowNode<WFNodeData>[], pos: { x: number; y
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
-const IO_STYLES: Record<'image' | 'text' | 'mesh' | 'audio' | 'scene', string> = {
+const IO_STYLES: Record<string, string> = {
   audio: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
   image: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',
@@ -77,9 +84,9 @@ const IO_STYLES: Record<'image' | 'text' | 'mesh' | 'audio' | 'scene', string> =
   scene: 'bg-pink-500/15 text-pink-400 border-pink-500/25',
 }
 
-function IoBadge({ type }: { type: 'image' | 'text' | 'mesh' | 'audio' | 'scene' }) {
+function IoBadge({ type }: { type: string }) {
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type]}`}>
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
       {type}
     </span>
   )
@@ -810,11 +817,7 @@ function getNodeInputType(
   if (node.type === 'previewNode') return 'image'
   if (node.type === 'imagePreviewNode') return 'image'
   const ext = allExts.find((e) => e.id === (node.data as WFNodeData)?.extensionId)
-  if (ext?.inputs && ext.inputs.length > 1 && targetHandle) {
-    const idx = parseInt(targetHandle.replace('input-', ''), 10)
-    return ext.inputs[isNaN(idx) ? 0 : idx] ?? ext.input
-  }
-  return ext?.input
+  return ext ? getProcessTargetPort(ext, targetHandle)?.type : undefined
 }
 
 // ─── Workflow canvas (inner, requires ReactFlowProvider) ──────────────────────
@@ -840,6 +843,7 @@ function WorkflowCanvasInner({
   const [edges, setEdges, onEdgesChange] = useEdgesState(toFlowEdges(workflow.edges))
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [connectionIssue, setConnectionIssue] = useState<ProcessConnectionRuleIssue | null>(null)
 
   // Pending connection: set when user drags a handle and releases on empty canvas
   const pendingConnectionRef  = useRef<OnConnectStartParams | null>(null)
@@ -864,12 +868,15 @@ function WorkflowCanvasInner({
   useEffect(() => {
     setNodes(toFlowNodes(workflow.nodes))
     setEdges(toFlowEdges(workflow.edges))
+    setConnectionIssue(null)
     historyRef.current = [{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges) }]
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-sync only when the workflow switches; adding nodes/edges would reset the editor on every change
   }, [workflow.id])
+
+  useEffect(() => { setConnectionIssue(null) }, [nodes, edges])
 
   // Re-sync when Generate tab (or another external source) saves param changes
   useEffect(() => {
@@ -987,6 +994,30 @@ function WorkflowCanvasInner({
 
   const canUndo = histIdx > 0
   const canRedo = histIdx < historyRef.current.length - 1
+  const runValidationIssue = useMemo(() => validateWorkflowProcessRun({
+    nodes: toWorkflowNodes(nodes),
+    edges: toWorkflowEdges(edges),
+    allExtensions,
+  }), [nodes, edges, allExtensions])
+  const activeValidationIssue = connectionIssue ?? runValidationIssue
+
+  const appendValidatedEdge = useCallback((connection: Connection, nextNodes = toWorkflowNodes(nodes)) => {
+    const issue = validateProcessConnection({
+      connection,
+      nodes: nextNodes,
+      edges: toWorkflowEdges(edges),
+      allExtensions,
+    })
+
+    if (issue) {
+      setConnectionIssue(issue)
+      return false
+    }
+
+    setConnectionIssue(null)
+    setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
+    return true
+  }, [nodes, edges, allExtensions, setEdges])
 
   const isValidConnection = useCallback((connection: FlowEdge | Connection) => {
     const srcType = getNodeOutputType(getNode(connection.source) as FlowNode<WFNodeData>, allExtensions)
@@ -1015,8 +1046,8 @@ function WorkflowCanvasInner({
 
   const onConnect = useCallback((params: Connection) => {
     connectionCompletedRef.current = true
-    setEdges((eds) => addEdge({ ...params, ...DEFAULT_EDGE_OPTS }, eds))
-  }, [setEdges])
+    appendValidatedEdge(params)
+  }, [appendValidatedEdge])
 
   const onConnectEnd = useCallback((event: MouseEvent | TouchEvent) => {
     if (connectionCompletedRef.current || !pendingConnectionRef.current?.nodeId) {
@@ -1171,43 +1202,40 @@ function WorkflowCanvasInner({
     )
     const newNodeId = newId()
     const isContainer = isContainerType(type)
-    setNodes((nds) => {
-      const parent = isContainer ? undefined : findWhileContainerAt(nds, position)
-      const node: FlowNode<WFNodeData> = {
-        id: newNodeId, type,
-        position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-        data: { extensionId, enabled: true, params: {} } as WFNodeData,
-        ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
-        ...(parent ? { parentId: parent.id } : {}),
-      }
-      // Containers must sit before their future children in the array → prepend.
-      return isContainer ? [node, ...nds] : [...nds, node]
-    })
+    const parent = isContainer ? undefined : findWhileContainerAt(nodes, position)
+    const node: FlowNode<WFNodeData> = {
+      id: newNodeId, type,
+      position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
+      data: { extensionId, enabled: true, params: {} } as WFNodeData,
+      ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
+      ...(parent ? { parentId: parent.id } : {}),
+    }
+    setNodes((nds) => isContainer ? [node, ...nds] : [...nds, node])
+    const nextNodes = toWorkflowNodes([...nodes, node])
 
-    // If palette was opened from a connection drag, wire the edge automatically.
-    // ExtensionNodes use id'd handles (input-0 / output), not the default null
-    // handle, so the new node's side must reference them or React Flow can't place
-    // the edge ("Couldn't create edge for target handle id: null").
     const pending = pendingConnectionRef.current
     if (pending?.nodeId) {
       const isSource = pending.handleType === 'source'
       const isExt = type === 'extensionNode'
-      // Skip wiring when the new node can't take the connection: a source-only node
-      // (Image/Text/Mesh) as target, or a sink-only node (Add to Scene/Preview) as
-      // source — those have no matching handle and would orphan the edge.
       const canWire = isSource ? !NODE_TYPES_WITHOUT_TARGET.has(type) : !NODE_TYPES_WITHOUT_SOURCE.has(type)
       if (canWire) {
-        const edge = isSource
-          ? { id: newId(), source: pending.nodeId, sourceHandle: pending.handleId ?? undefined, target: newNodeId, targetHandle: isExt ? 'input-0' : undefined }
-          : { id: newId(), source: newNodeId, sourceHandle: isExt ? 'output' : undefined, target: pending.nodeId, targetHandle: pending.handleId ?? undefined }
-        setEdges((eds) => addEdge({ ...edge, ...DEFAULT_EDGE_OPTS }, eds))
+        const extension = allExtensions.find((candidate) => candidate.id === extensionId)
+        const sourceType = resolveProcessConnectionSource(pending.nodeId, {
+          nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), allExtensions,
+        }).type ?? getNodeOutputType(getNode(pending.nodeId) as FlowNode<WFNodeData>, allExtensions)
+        const ports = extension ? getProcessTargetPorts(extension) : []
+        const firstPort = ports.find((port) => port.type === sourceType) ?? ports[0]
+        const connection: Connection = isSource
+          ? { source: pending.nodeId, sourceHandle: pending.handleId ?? null, target: newNodeId, targetHandle: isExt ? (firstPort?.name ?? 'input-0') : null }
+          : { source: newNodeId, sourceHandle: isExt ? 'output' : null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
+        appendValidatedEdge(connection, nextNodes)
       }
     }
 
     pendingConnectionRef.current = null
     setPendingDropPos(null)
     setPaletteOpen(false)
-  }, [screenToFlowPosition, setNodes, setEdges, pendingDropPos])
+  }, [screenToFlowPosition, setNodes, pendingDropPos, nodes, edges, appendValidatedEdge, allExtensions, getNode])
 
   // When a While container is deleted (button or keyboard), detach its children
   // to absolute coordinates so they don't get orphaned to the canvas origin.
@@ -1273,6 +1301,7 @@ function WorkflowCanvasInner({
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
+    if (runValidationIssue) { setConnectionIssue(runValidationIssue); return }
     if (preflightIssues.length > 0) {
       showToast(preflightIssues[0].message)
       return
@@ -1282,7 +1311,7 @@ function WorkflowCanvasInner({
     const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     saveAndClaim(wf)
     runWorkflow(wf, allExtensions)
-  }, [workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel, preflightIssues, showToast])
+  }, [workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel, preflightIssues, showToast, runValidationIssue])
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -1359,10 +1388,12 @@ function WorkflowCanvasInner({
           {/* Run / Stop */}
           <button
             onClick={handleRun}
+            disabled={!isRunning && Boolean(runValidationIssue)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors
               ${isRunning
                 ? 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20 hover:border-red-500/50'
-                : 'bg-accent/10 border-accent/30 text-accent-light hover:bg-accent/20 hover:border-accent/50'}`}
+                : 'bg-accent/10 border-accent/30 text-accent-light hover:bg-accent/20 hover:border-accent/50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent/10 disabled:hover:border-accent/30'}`}
+            title={!isRunning && runValidationIssue ? runValidationIssue.message : 'Run workflow'}
           >
             {isRunning ? (
               <>
@@ -1403,9 +1434,20 @@ function WorkflowCanvasInner({
       {/* React Flow canvas */}
       <div className="flex-1 relative" onDragOver={onDragOver} onDrop={onDrop}>
 
+        {activeValidationIssue && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10 border border-red-500/20 text-red-300 whitespace-nowrap max-w-[90vw]">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" className="shrink-0">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 5h2v6h-2V7zm0 8h2v2h-2v-2z"/>
+              </svg>
+              <span className="text-[10px] font-medium truncate">{activeValidationIssue.message}</span>
+            </div>
+          </div>
+        )}
+
         {/* No model node warning */}
         {!nodes.some((n) => n.type === 'extensionNode' && allExtensions.find((e) => e.id === (n.data as WFNodeData).extensionId && e.type === 'model')) && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+          <div className={`absolute left-1/2 -translate-x-1/2 z-10 pointer-events-none ${activeValidationIssue ? 'top-12' : 'top-3'}`}>
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-accent/10 border border-accent/20 text-accent-light whitespace-nowrap">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" className="shrink-0">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>

@@ -53,6 +53,12 @@ export interface ProcessInput {
   /** Per-slot texts for multi-text-input nodes (index = target handle slot). */
   texts?:    (string | undefined)[]
   nodeId?:   string
+  inputs?:   Record<string, {
+    type: string
+    filePath?: string
+    text?: string
+    sourceNodeId: string
+  }>
 }
 
 export interface ProcessResult {

@@ -1,3 +1,4 @@
+import { getProcessTargetPort } from '../processPorts'
 import { getBezierPath, useReactFlow, useEdges } from '@xyflow/react'
 import type { EdgeProps } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
@@ -37,13 +38,7 @@ export default function WorkflowEdge({
 
   // For multi-input nodes pick the color of the specific connected handle
   const targetExt = allExtensions.find((e) => e.id === targetNode?.data?.extensionId)
-  const targetInputType = (() => {
-    if (targetExt?.inputs && targetExt.inputs.length > 1 && targetHandle) {
-      const idx = parseInt(targetHandle.replace('input-', ''), 10)
-      return targetExt.inputs[isNaN(idx) ? 0 : idx] ?? targetExt.input
-    }
-    return targetExt?.input
-  })()
+  const targetInputType = targetExt ? getProcessTargetPort(targetExt, targetHandle)?.type : undefined
 
   const targetColor = targetNode?.type === 'outputNode'
     ? HANDLE_COLOR.mesh

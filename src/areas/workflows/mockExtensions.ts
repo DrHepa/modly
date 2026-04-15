@@ -1,6 +1,6 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ParamSchema, WeightVariantsInfo } from '@shared/types/electron.d'
+import type { ParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -10,10 +10,10 @@ export interface WorkflowExtension {
   nodeId:          string   // "node_id"
   name:            string
   description:     string
-  input:           'image' | 'text' | 'mesh' | 'audio' | 'scene'
-  inputs?:         ('image' | 'text' | 'mesh' | 'audio' | 'scene')[]   // multi-input; overrides input when set
+  input:           string
+  inputs?:         string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:    string[]                                  // display labels per input slot
-  output:          'image' | 'text' | 'mesh' | 'audio' | 'scene'
+  output:          string
   params:          ParamSchema[]
   builtin:         boolean
   type:            'model' | 'process'
@@ -30,6 +30,12 @@ function applyParamDefaults(
       ? { ...p, default: defaults[p.id]! }
       : p,
   )
+}
+
+export function normalizeWorkflowProcessInputs(inputs?: string[] | ProcessPort[]): string[] | ProcessPort[] | undefined {
+  if (!Array.isArray(inputs) || inputs.length === 0) return inputs
+  if (inputs.every((input): input is string => typeof input === 'string')) return [...inputs]
+  return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
 }
 
 export function buildAllWorkflowExtensions(
@@ -50,7 +56,7 @@ export function buildAllWorkflowExtensions(
         name:            node.name,
         description:     ext.description ?? '',
         input:           node.input,
-        inputs:          node.inputs,
+        inputs:          normalizeWorkflowProcessInputs(node.inputs),
         inputLabels:     node.inputLabels,
         output:          node.output,
         params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),

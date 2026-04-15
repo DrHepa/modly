@@ -1,3 +1,4 @@
+import { getProcessTargetPorts } from '../processPorts'
 import { useCallback, useEffect, useRef, useLayoutEffect, useState } from 'react'
 import { Handle, Position, useReactFlow } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
@@ -128,8 +129,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const ext = allExtensions.find((e) => e.id === data.extensionId)
   const openExtension = useNavStore((s) => s.openExtension)
 
-  const inputs      = ext?.inputs  // defined → multi-input mode
-  const isMulti     = inputs && inputs.length > 1
+  const inputs = getProcessTargetPorts(ext ?? { input: 'image' })
+  const isMulti = inputs.length > 1 || inputs.some((port) => !port.isLegacy)
   const isTerminal  = ext?.id === 'mesh-exporter'
   const outputColor = HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams   = (ext?.params.length ?? 0) > 0
@@ -169,8 +170,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     <div className="flex flex-col divide-y divide-zinc-800/40">
       {inputs.map((inputType, i) => (
         <div key={i} ref={(el) => { if (el) handleRefs.current[i] = el }} className="flex items-center justify-between px-3 py-2">
-          <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputType] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-            {ext?.inputLabels?.[i] ?? inputType}
+          <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputType.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+            {ext?.inputLabels?.[i] ?? (inputType.isLegacy ? inputType.type : `${inputType.name} (${inputType.type})`)}
           </span>
           {i === 0 && !isTerminal && (
             <>
@@ -210,10 +211,10 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       {inputs.map((inputType, i) => (
         <Handle
           key={i}
-          id={`input-${i}`}
+          id={inputType.name ?? `input-${i}`}
           type="target"
           position={Position.Left}
-          style={{ background: HANDLE_COLOR[inputType], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[i] ?? '50%' }}
+          style={{ background: HANDLE_COLOR[inputType.type], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[i] ?? '50%' }}
         />
       ))}
       {!isTerminal && (

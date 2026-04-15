@@ -14,10 +14,10 @@ import type {
 export interface ExtensionNode {
   id:               string
   name:             string
-  input:            'image' | 'text' | 'mesh' | 'audio' | 'scene'
-  inputs?:          ('image' | 'text' | 'mesh' | 'audio' | 'scene')[]   // multi-input nodes; overrides input when set
+  input:            string
+  inputs?:          string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
-  output:           'image' | 'text' | 'mesh' | 'audio' | 'scene'
+  output:           string
   paramsSchema:     ParamSchema[]
   paramDefaults?:   Record<string, number | string>
   hfRepo?:          string
@@ -38,6 +38,19 @@ export interface WeightVariantsInfo {
 export interface SharedWeightGroup {
   id: string
   dependentNodeIds: string[]
+}
+
+export interface ProcessPort {
+  name:     string
+  type:     string
+  required?: boolean
+}
+
+export interface NamedProcessInput {
+  type:         string
+  filePath?:    string
+  text?:        string
+  sourceNodeId: string
 }
 
 export interface ModelExtension {
@@ -110,6 +123,7 @@ export interface ProcessInput {
   /** Per-slot texts for multi-text-input nodes (index = target handle slot). */
   texts?:    (string | undefined)[]
   nodeId?:   string
+  inputs?:   Record<string, NamedProcessInput>
 }
 
 export interface ProcessResult {
@@ -195,7 +209,7 @@ export interface AutomationProcessCapability {
   trusted: boolean
   entry: string
   input?: string
-  inputs?: string[]
+  inputs?: string[] | ProcessPort[]
   input_labels?: string[]
   output?: string
   param_defaults?: Record<string, unknown>

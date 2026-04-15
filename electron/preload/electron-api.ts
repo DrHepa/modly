@@ -1,3 +1,5 @@
+import type { ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
+import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
   AssetLibraryListResult,
@@ -278,10 +280,10 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
 
       runProcess: (
         extensionId: string,
-        input:       { filePath?: string; text?: string; texts?: (string | undefined)[]; nodeId?: string },
+        input:       ProcessInput,
         params:      Record<string, unknown>,
       ): Promise<{ success: boolean; result?: { filePath?: string; text?: string }; error?: string }> =>
-        ipcRenderer.invoke('extensions:runProcess', extensionId, input, params) as Promise<{ success: boolean; result?: { filePath?: string; text?: string }; error?: string }>,
+        invokeExtensionsRunProcess((...args) => ipcRenderer.invoke(...args) as Promise<{ success: boolean; result?: ProcessResult; error?: string }>, extensionId, input, params),
 
       onInstallProgress: (cb: (data: {
         step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'

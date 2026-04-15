@@ -51,12 +51,18 @@ type AutomationProcessCapability = {
   trusted: boolean
   entry: string
   input?: string
-  inputs?: string[]
+  inputs?: string[] | ProcessPort[]
   input_labels?: string[]
   output?: string
   param_defaults?: Record<string, unknown>
   params_schema?: unknown
   ready?: null
+}
+
+export type ProcessPort = {
+  name: string
+  type: string
+  required?: boolean
 }
 
 type AutomationUiOnlyCapability = {
@@ -150,7 +156,7 @@ export type ParsedManifest = {
     id:                string
     name?:             string
     input?:            string
-    inputs?:           string[]
+    inputs?:           string[] | ProcessPort[]
     input_labels?:     string[]
     output?:           string
     params_schema?:    unknown[]
@@ -166,6 +172,12 @@ export type ParsedManifest = {
 }
 
 export type ListedExtensionNode = ReturnType<typeof parseExtensionManifest>['nodes'][number]
+
+function normalizeProcessPorts(inputs: string[] | ProcessPort[] | undefined): string[] | ProcessPort[] | undefined {
+  if (!Array.isArray(inputs) || inputs.length === 0) return inputs
+  if (inputs.every((input): input is string => typeof input === 'string')) return [...inputs]
+  return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
+}
 
 type InstallationState = {
   corrupted?: boolean
@@ -274,7 +286,7 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
       id:             nodeId,
       name:           n.name ?? n.id,
       input:          n.input  ?? 'image' as const,
-      inputs:         n.inputs,
+      inputs:         normalizeProcessPorts(n.inputs),
       inputLabels:    n.input_labels,
       output:         n.output ?? 'mesh'  as const,
       paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],

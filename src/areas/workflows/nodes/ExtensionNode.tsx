@@ -6,6 +6,7 @@ import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
 import { getProcessTargetPorts, PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
 import { useWorkflowRunStore } from '../workflowRunStore'
+import WorkflowParamControl from '../components/WorkflowParamControl'
 import BaseNode from './BaseNode'
 
 // ─── Handle colors ────────────────────────────────────────────────────────────
@@ -15,135 +16,6 @@ const TAG_CLS: Record<string, string> = {
   image: 'border-sky-500/30 bg-sky-500/10 text-sky-400',
   mesh:  'border-violet-500/30 bg-violet-500/10 text-violet-400',
   text:  'border-amber-500/30 bg-amber-500/10 text-amber-400',
-}
-
-// ─── Param control ────────────────────────────────────────────────────────────
-
-// nodrag — without it, React Flow starts dragging the node on mousedown inside
-// these fields, so click-drag text selection (or opening a <select>) moves the
-// node instead.
-const inputCls = 'nodrag w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-accent/60'
-
-function IntInput({ value, onChange, className }: { value: number; onChange: (v: number) => void; className: string }) {
-  const [text, setText] = useState(String(value))
-  const prevValue = useRef(value)
-  if (prevValue.current !== value && parseInt(text, 10) !== value) {
-    prevValue.current = value
-    setText(String(value))
-  }
-  return (
-    <input
-      type="text"
-      inputMode="numeric"
-      value={text}
-      onChange={(e) => {
-        const raw = e.target.value
-        if (raw !== '' && raw !== '-' && !/^-?\d+$/.test(raw)) return
-        setText(raw)
-        const n = parseInt(raw, 10)
-        if (!isNaN(n)) { prevValue.current = n; onChange(n) }
-      }}
-      className={className}
-    />
-  )
-}
-
-function FloatInput({ value, onChange, className }: { value: number; onChange: (v: number) => void; className: string }) {
-  const [text, setText] = useState(String(value))
-  const prevValue = useRef(value)
-  if (prevValue.current !== value && parseFloat(text.replace(',', '.')) !== value) {
-    prevValue.current = value
-    setText(String(value))
-  }
-  return (
-    <input
-      type="text"
-      inputMode="decimal"
-      value={text}
-      onChange={(e) => {
-        const raw = e.target.value.replace(',', '.')
-        if (raw !== '' && raw !== '-' && raw !== '.' && !/^-?\d*\.?\d*$/.test(raw)) return
-        setText(e.target.value)
-        const num = parseFloat(raw)
-        if (!isNaN(num)) { prevValue.current = num; onChange(num) }
-      }}
-      className={className}
-    />
-  )
-}
-
-/** Dropdown of the files inside the folder held by another param (dir_from). */
-function FileSelectControl({ param, value, dirValue, onChange }: {
-  param:    ParamSchema
-  value:    string
-  dirValue: string
-  onChange: (v: string) => void
-}) {
-  const [files, setFiles] = useState<string[]>([])
-  const extsKey = (param.extensions ?? []).join(',')
-  useEffect(() => {
-    let alive = true
-    if (!dirValue) { setFiles([]); return }
-    window.electron.fs.listFiles(dirValue, param.extensions ?? undefined).then((list) => {
-      if (alive) setFiles(list)
-    }).catch(() => { if (alive) setFiles([]) })
-    return () => { alive = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirValue, extsKey])
-
-  return (
-    <select value={value} disabled={!dirValue} onChange={(e) => onChange(e.target.value)}
-      className={`${inputCls} ${!dirValue ? 'opacity-50 cursor-not-allowed' : ''}`}>
-      <option value="">{!dirValue ? 'Pick a folder first…' : files.length === 0 ? 'No files found' : 'Select…'}</option>
-      {/* Keep a saved value visible even if it's no longer in the folder listing. */}
-      {value && !files.includes(value) && <option value={value}>{value} (missing)</option>}
-      {files.map((f) => <option key={f} value={f}>{f}</option>)}
-    </select>
-  )
-}
-
-function ParamControl({ param, value, onChange, resolvedParams }: {
-  param:          ParamSchema
-  value:          number | string
-  onChange:       (v: number | string) => void
-  resolvedParams: Record<string, unknown>
-}) {
-  if (param.type === 'file-select') {
-    const dirValue = String(resolvedParams[param.dir_from ?? ''] ?? '')
-    return <FileSelectControl param={param} value={String(value ?? '')} dirValue={dirValue} onChange={onChange} />
-  }
-  if (param.type === 'select') {
-    return (
-      <select value={value} onChange={(e) => onChange(e.target.value)} className={inputCls}>
-        {param.options?.map((o) => (
-          <option key={String(o.value)} value={o.value}>{o.label ?? String(o.value)}</option>
-        ))}
-      </select>
-    )
-  }
-  if (param.type === 'string') {
-    return (
-      <div className="flex items-center gap-1">
-        <input type="text" value={value as string} placeholder={param.tooltip ?? ''}
-          onChange={(e) => onChange(e.target.value)} className={`${inputCls} flex-1`} />
-        <button
-          onClick={async () => {
-            const p = await window.electron.fs.selectDirectory()
-            if (p) onChange(p)
-          }}
-          className="nodrag shrink-0 flex items-center justify-center w-6 h-6 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-400 hover:text-zinc-200 transition-colors"
-        >
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-          </svg>
-        </button>
-      </div>
-    )
-  }
-  if (param.type === 'float') {
-    return <FloatInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
-  }
-  return <IntInput value={value as number} onChange={(v) => onChange(v)} className={inputCls} />
 }
 
 // ─── ExtensionNode ────────────────────────────────────────────────────────────
@@ -171,11 +43,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const outputColor = PROCESS_PORT_HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams = (ext?.params.length ?? 0) > 0
 
-  const patchParam = useCallback((key: string, val: number | string) => {
-    const params = { ...data.params, [key]: val }
-    updateNodeData(id, { params })
-    // Push live so a paused/looping run picks up the change on the next node start.
-    useWorkflowRunStore.getState().setLiveNodeParams(id, params)
+  const patchParam = useCallback((key: string, val: boolean | number | string) => {
+    updateNodeData(id, { params: { ...data.params, [key]: val } })
   }, [id, data.params, updateNodeData])
 
   const paramById = new Map(ext?.params.map((p) => [p.id, p]))
@@ -267,11 +136,15 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     >
       {hasParams && (
         <div className="px-3 pb-3 pt-2.5 flex flex-col gap-2">
-          {(() => {
-            // Effective values of every param (user value or schema default) —
-            // lets file-select params resolve their source folder (dir_from).
-            const resolvedParams = Object.fromEntries(
-              (ext?.params ?? []).map((p) => [p.id, data.params[p.id] ?? p.default]),
+          {ext!.params.filter(isVisible).map((param) => {
+            const val = (data.params[param.id] ?? param.default) as boolean | number | string
+            return (
+              <div key={param.id} className="flex items-center gap-2">
+                <label className="text-[10px] text-zinc-500 w-24 shrink-0 leading-tight">{param.label}</label>
+                <div className="flex-1">
+                  <WorkflowParamControl param={param} value={val} onChange={(v) => patchParam(param.id, v)} />
+                </div>
+              </div>
             )
             return ext!.params.filter(isVisible).map((param) => {
               const val = (data.params[param.id] ?? param.default) as number | string

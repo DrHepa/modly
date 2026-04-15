@@ -1,6 +1,7 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import type { ParamSchema, ProcessPort } from '@shared/types/electron.d'
+import { normalizeWorkflowParams } from './workflowParamSchema.ts'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -52,7 +53,7 @@ export function buildAllWorkflowExtensions(
         inputLabels:     node.inputLabels,
         output:          node.output,
         ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
-        params:          node.paramsSchema as ParamSchema[],
+        params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,
         type:            'process',
       })
@@ -73,7 +74,7 @@ export function buildAllWorkflowExtensions(
         inputs:          node.inputs,
         inputLabels:     node.inputLabels,
         output:          node.output,
-        params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
+        params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,
         type:            'model',
       })

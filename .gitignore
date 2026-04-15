@@ -47,3 +47,4 @@ src/**/*.d.ts
 electron.vite.config.js
 electron.vite.config.d.ts
 *.tsbuildinfo
+.atl/

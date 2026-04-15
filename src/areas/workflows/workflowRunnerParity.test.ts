@@ -29,5 +29,7 @@ test('legacy useWorkflowRunner hook is explicitly marked as inactive parity path
   const source = await readWorkflowFile('useWorkflowRunner.ts')
 
   assert.match(source, /workflowRunStore is the sole active workflow execution path/)
-  assert.match(source, /buildProcessExecutionInput/)
+  assert.match(source, /from '\.\/workflowDispatch'/)
+  assert.match(source, /resolveWorkflowDispatch\(/)
+  assert.doesNotMatch(source, /ext\?\.input === 'image' && ext\?\.output === 'mesh'/)
 })

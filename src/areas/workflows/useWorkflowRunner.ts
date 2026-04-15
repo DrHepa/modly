@@ -2,8 +2,8 @@ import { useState, useCallback, useRef } from 'react'
 import axios from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
-import { getWorkflowExtension } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import { resolveWorkflowDispatch } from './workflowDispatch'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -117,7 +117,7 @@ export function useWorkflowRunner(allExtensions: WorkflowExtension[]) {
         if (cancelRef.current) { setRunState(IDLE); return }
 
         const node = execNodes[i]
-        const ext  = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
+        const { ext, mode } = resolveWorkflowDispatch(node, allExtensions)
 
         // Resolve this node's inputs from its actual predecessors in the graph.
         // For multi-input nodes, route by outputType (image vs mesh).
@@ -153,11 +153,7 @@ export function useWorkflowRunner(allExtensions: WorkflowExtension[]) {
 
         setRunState((s) => ({ ...s, blockIndex: i, blockProgress: 0, blockStep: 'Starting…' }))
 
-        // Model extensions always go through the HTTP API (job queue, progress, GPU).
-        // Process extensions always go through IPC runProcess (CPU, synchronous).
-        const isGeneratorNode = ext?.type === 'model'
-
-        if (isGeneratorNode) {
+        if (mode === 'model') {
           // ── Generator: call Python FastAPI ──────────────────────────────────
           // For multi-input nodes, use the resolved image path (not the global imagePath)
           const activeImagePath = nodeInputPath ?? imagePath
@@ -227,12 +223,9 @@ export function useWorkflowRunner(allExtensions: WorkflowExtension[]) {
 
         } else {
           // ── Process extension ────────────────────────────────────────────────
-          const parts  = (node.data.extensionId ?? '').split('/')
-          const extId  = parts[0]
-          const nodeId = parts[1] ?? ''
           const result = await window.electron.extensions.runProcess(
-            extId,
-            { filePath: nodeInputPath, text: nodeInputText, nodeId },
+            ext.extensionId,
+            { filePath: nodeInputPath, text: nodeInputText, nodeId: ext.nodeId },
             node.data.params as Record<string, unknown>,
           )
           if (!result.success) throw new Error(result.error ?? 'Process extension failed')

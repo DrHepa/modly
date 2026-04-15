@@ -1,10 +1,10 @@
 import { create } from 'zustand'
-import axios, { AxiosInstance } from 'axios'
-import { useAppStore } from '@shared/stores/appStore'
-import { getWorkflowExtension } from './mockExtensions'
-import type { WorkflowExtension } from './mockExtensions'
-import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import axios from 'axios'
+import { useAppStore } from '../../shared/stores/appStore.ts'
+import type { WorkflowExtension } from './mockExtensions.ts'
+import type { Workflow, WFNode, WFEdge } from '../../shared/types/electron.d'
 import { buildProcessExecutionInput } from './processExecution.ts'
+import { resolveWorkflowDispatch } from './workflowDispatch.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -641,24 +641,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       const loops: LoopInfo[] = []
       const indexOf = new Map(preExecExtNodes.map((n, i) => [n.id, i]))
 
-      for (const w of workflow.nodes) {
-        if (w.type !== 'whileNode') continue
-        const bounds = whileBounds(w)
-        const idxs = preExecExtNodes.reduce<number[]>((acc, n, idx) => {
-          if (isInsideWhile(n, w.id, bounds)) acc.push(idx)
-          return acc
-        }, [])
-        if (idxs.length === 0) continue
-        const iters = Number(w.data?.iterations)
-        loops.push({
-          whileId:  w.id,
-          kind:     'while',
-          firstIdx: Math.min(...idxs),
-          lastIdx:  Math.max(...idxs),
-          bodyIds:  new Set(idxs.map((i) => preExecExtNodes[i].id)),
-          iterations: Number.isFinite(iters) && iters > 0 ? Math.floor(iters) : null,
-        })
-      }
+        const node = execNodes[i]
+        const dispatch = resolveWorkflowDispatch(node, allExtensions)
+        const { ext, mode } = dispatch
 
       for (const [iterId, files] of iteratorFiles) {
         const bodyIds = new Set([...reachableExecutable(iterId, workflow.edges, nodeMap)].filter((id) => indexOf.has(id)))
@@ -721,9 +706,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
         // ── Model extensions → HTTP API ───────────────────────────────────
         // Process extensions → IPC runProcess
-        const isModelNode = ext?.type === 'model'
-
-        if (isModelNode) {
+        if (mode === 'model') {
           const activeImagePath = nodeInputPath ?? selectedImagePath
           const base64 = selectedImageData && nodeInputPath === undefined
             ? selectedImageData
@@ -732,7 +715,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           const blob  = new Blob([bytes], { type: 'image/png' })
           const fname = activeImagePath.split(/[\\/]/).pop() ?? 'image.png'
 
-          // For multi-input nodes: inject mesh path as params.mesh_path
           const extraParams: Record<string, unknown> = {}
           if (nodeInputMeshPath) {
             const norm = nodeInputMeshPath.replace(/\\/g, '/')
@@ -791,9 +773,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           }
 
         } else {
-          // ── Process extension → IPC ─────────────────────────────────────
-          const parts  = (node.data.extensionId ?? '').split('/')
-          const extId  = parts[0]
           const processInput = buildProcessExecutionInput({
             node,
             nodes: workflow.nodes,
@@ -803,7 +782,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             previousNodeOutput: i > 0 ? nodeOutputs.get(execNodes[i - 1].id) : undefined,
           })
           const result = await window.electron.extensions.runProcess(
-            extId,
+            ext.extensionId,
             processInput,
             node.data.params as Record<string, unknown>,
           )

@@ -26,5 +26,7 @@ test('runtime workflow entrypoints use workflowRunStore instead of useWorkflowRu
   assert.doesNotMatch(extensionNodeSource, /useWorkflowRunner/)
 
   assert.match(workflowRunStoreSource, /buildProcessExecutionInput/)
+  assert.match(workflowRunStoreSource, /from '\.\/workflowDispatch(?:\.ts)?'/)
+  assert.match(workflowRunStoreSource, /resolveWorkflowDispatch\(/)
   assert.doesNotMatch(workflowRunStoreSource, /useWorkflowRunner/)
 })

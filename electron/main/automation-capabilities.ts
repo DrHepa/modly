@@ -42,8 +42,15 @@ type AutomationProcessCapability = {
   entry: string
   input?: 'image' | 'text' | 'mesh'
   output?: 'image' | 'text' | 'mesh'
+  inputs?: ProcessPort[]
   params_schema?: unknown
   ready?: null
+}
+
+export type ProcessPort = {
+  name: string
+  type: 'image' | 'text' | 'mesh'
+  required?: boolean
 }
 
 type AutomationUiOnlyCapability = {
@@ -137,6 +144,7 @@ export type ParsedManifest = {
     name?: string
     input?: 'mesh' | 'image' | 'text'
     output?: 'mesh' | 'image' | 'text'
+    inputs?: ProcessPort[]
     params_schema?: unknown[]
     hf_repo?: string
     download_check?: string
@@ -149,10 +157,21 @@ export type ListedExtensionNode = {
   name: string
   input: 'image' | 'text' | 'mesh'
   output: 'image' | 'text' | 'mesh'
+  inputs?: ProcessPort[]
   paramsSchema: unknown[]
   hfRepo?: string
   downloadCheck?: string
   hfSkipPrefixes?: string[]
+}
+
+function normalizeProcessPorts(inputs: ProcessPort[] | undefined): ProcessPort[] | undefined {
+  if (!Array.isArray(inputs) || inputs.length === 0) return undefined
+
+  return inputs.map((input) => ({
+    name: input.name,
+    type: input.type,
+    required: input.required ?? true,
+  }))
 }
 
 type ListedExtensionCommon = {
@@ -236,16 +255,21 @@ export function parseExtensionManifest(
     builtin,
   }
 
-  const nodes = (parsed.nodes ?? []).map((node) => ({
-    id: node.id,
-    name: node.name ?? node.id,
-    input: node.input ?? 'image' as const,
-    output: node.output ?? 'mesh' as const,
-    paramsSchema: node.params_schema ?? [],
-    hfRepo: node.hf_repo,
-    downloadCheck: node.download_check,
-    hfSkipPrefixes: node.hf_skip_prefixes,
-  }))
+  const nodes = (parsed.nodes ?? []).map((node) => {
+    const normalizedInputs = normalizeProcessPorts(node.inputs)
+
+    return {
+      id: node.id,
+      name: node.name ?? node.id,
+      input: node.input ?? 'image' as const,
+      output: node.output ?? 'mesh' as const,
+      ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
+      paramsSchema: node.params_schema ?? [],
+      hfRepo: node.hf_repo,
+      downloadCheck: node.download_check,
+      hfSkipPrefixes: node.hf_skip_prefixes,
+    }
+  })
 
   if (parsed.type === 'process') {
     return { ...common, type: 'process', entry: parsed.entry ?? 'processor.js', nodes }
@@ -676,6 +700,7 @@ export async function getManifestProcesses(options: {
       entry: extension.entry,
       input: node.input,
       output: node.output,
+      ...(node.inputs ? { inputs: node.inputs } : {}),
       params_schema: node.paramsSchema,
       ready: null,
     }))

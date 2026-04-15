@@ -14,16 +14,29 @@ import type {
 export interface ExtensionNode {
   id:               string
   name:             string
-  input:            'image' | 'text' | 'mesh' | 'audio'
-  inputs?:          ('image' | 'text' | 'mesh' | 'audio')[]   // multi-input nodes; overrides input when set
-  inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
-  output:           'image' | 'text' | 'mesh' | 'audio'
+  input:            'image' | 'text' | 'mesh'
+  inputs?:          ('image' | 'text' | 'mesh')[]   // multi-input nodes; overrides input when set
+  output:           'image' | 'text' | 'mesh'
+  inputs?:          ProcessPort[]
   paramsSchema:     ParamSchema[]
   paramDefaults?:   Record<string, number | string>
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
   hfIncludePrefixes?: string[]
+}
+
+export interface ProcessPort {
+  name:     string
+  type:     'image' | 'text' | 'mesh'
+  required?: boolean
+}
+
+export interface NamedProcessInput {
+  type:         'image' | 'text' | 'mesh'
+  filePath?:    string
+  text?:        string
+  sourceNodeId: string
 }
 
 export interface ModelExtension {
@@ -89,6 +102,7 @@ export interface ProcessInput {
   /** Per-slot texts for multi-text-input nodes (index = target handle slot). */
   texts?:    (string | undefined)[]
   nodeId?:   string
+  inputs?:   Record<string, NamedProcessInput>
 }
 
 export interface ProcessResult {
@@ -176,6 +190,7 @@ export interface AutomationProcessCapability {
   entry: string
   input?: 'image' | 'text' | 'mesh'
   output?: 'image' | 'text' | 'mesh'
+  inputs?: ProcessPort[]
   params_schema?: unknown
   ready?: boolean | null
 }

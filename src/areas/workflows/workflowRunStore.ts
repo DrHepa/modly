@@ -4,7 +4,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { getWorkflowExtension } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
-import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
+import { buildProcessExecutionInput } from './processExecution.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -685,9 +685,152 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         if (l.kind === 'while') {
           loopExtraSteps += l.iterations != null ? (l.iterations - 1) * l.bodyIds.size : 0
         } else {
-          const g = forEachGroups.get(l.lastIdx) ?? []
-          g.push(l)
-          forEachGroups.set(l.lastIdx, g)
+          // Single-input
+          for (const edge of incomingEdges) {
+            const src = nodeOutputs.get(edge.source)
+            if (src?.filePath !== undefined) nodeInputPath = src.filePath
+            if (src?.text     !== undefined) nodeInputText = src.text
+          }
+          // Fallback to previous node's output
+          if (nodeInputPath === undefined && nodeInputText === undefined && i > 0) {
+            const prev = nodeOutputs.get(execNodes[i - 1].id)
+            if (prev?.filePath !== undefined) nodeInputPath = prev.filePath
+            if (prev?.text     !== undefined) nodeInputText = prev.text
+          }
+        }
+
+        set((s) => ({
+          activeNodeId: node.id,
+          runState: { ...s.runState, blockIndex: i, blockProgress: 0, blockStep: 'Starting…' },
+        }))
+
+        // ── Wait node → pause until continueRun(), then passthrough ───────
+        if (node.type === 'waitNode') {
+          set((s) => ({ runState: { ...s.runState, status: 'paused', blockStep: 'Paused — click Continue' } }))
+          await new Promise<void>((resolve) => { _resume.current = resolve })
+          if (_cancel.current) { set({ runState: IDLE, activeNodeId: null }); return }
+
+          nodeOutputs.set(node.id, {
+            filePath:   nodeInputPath,
+            text:       nodeInputText,
+            outputType: incomingEdges[0] ? nodeOutputs.get(incomingEdges[0].source)?.outputType : undefined,
+          })
+          set((s) => ({ runState: { ...s.runState, status: 'running' } }))
+          continue
+        }
+
+        // ── Model extensions → HTTP API ───────────────────────────────────
+        // Process extensions → IPC runProcess
+        const isModelNode = ext?.type === 'model'
+
+        if (isModelNode) {
+          const activeImagePath = nodeInputPath ?? selectedImagePath
+          const base64 = selectedImageData && nodeInputPath === undefined
+            ? selectedImageData
+            : await window.electron.fs.readFileBase64(activeImagePath)
+          const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+          const blob  = new Blob([bytes], { type: 'image/png' })
+          const fname = activeImagePath.split(/[\\/]/).pop() ?? 'image.png'
+
+          // For multi-input nodes: inject mesh path as params.mesh_path
+          const extraParams: Record<string, unknown> = {}
+          if (nodeInputMeshPath) {
+            const norm = nodeInputMeshPath.replace(/\\/g, '/')
+            extraParams.mesh_path = norm.startsWith(workspaceDir)
+              ? norm.slice(workspaceDir.length).replace(/^\//, '')
+              : norm
+          }
+
+          const fd = new FormData()
+          fd.append('image', blob, fname)
+          fd.append('model_id', node.data.extensionId ?? '')
+          fd.append('collection', 'Workflows')
+          fd.append('remesh', 'none')
+          fd.append('enable_texture', 'false')
+          fd.append('texture_resolution', '1024')
+          fd.append('params', JSON.stringify({ ...node.data.params, ...extraParams }))
+
+          set((s) => ({ runState: { ...s.runState, blockProgress: 5, blockStep: 'Submitting to model…' } }))
+
+          const { data } = await client.post<{ job_id: string }>(
+            '/generate/from-image', fd,
+            { headers: { 'Content-Type': 'multipart/form-data' } },
+          )
+          _activeJobId.current = data.job_id
+
+          while (true) {
+            if (_cancel.current) {
+              await client.post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
+              _activeJobId.current = null
+              set({ runState: IDLE, activeNodeId: null })
+              return
+            }
+            await new Promise((r) => setTimeout(r, 1200))
+
+            const { data: st } = await client.get<{
+              status: string; progress?: number; step?: string; output_url?: string; error?: string
+            }>(`/generate/status/${_activeJobId.current}`)
+
+            if (st.status === 'done' && st.output_url) {
+              const rel = st.output_url.replace(/^\/workspace\//, '')
+              nodeInputPath = `${workspaceDir}/${rel}`
+              _activeJobId.current = null
+              set((s) => ({ runState: { ...s.runState, blockProgress: 100, blockStep: 'Generation complete' } }))
+              break
+            }
+            if (st.status === 'error') throw new Error(st.error ?? 'Generation failed')
+
+            const total   = execNodes.length
+            const overall = total > 0
+              ? Math.round((i / total) * 100 + (st.progress ?? 0) / total)
+              : st.progress ?? 0
+            set((s) => ({
+              runState: { ...s.runState, blockProgress: st.progress ?? s.runState.blockProgress, blockStep: st.step ?? 'Generating…' },
+            }))
+            useAppStore.getState().updateCurrentJob({ status: 'generating', progress: overall, step: st.step })
+          }
+
+        } else {
+          // ── Process extension → IPC ─────────────────────────────────────
+          const parts  = (node.data.extensionId ?? '').split('/')
+          const extId  = parts[0]
+          const processInput = buildProcessExecutionInput({
+            node,
+            nodes: workflow.nodes,
+            edges: workflow.edges,
+            allExtensions,
+            nodeOutputs,
+            previousNodeOutput: i > 0 ? nodeOutputs.get(execNodes[i - 1].id) : undefined,
+          })
+          const result = await window.electron.extensions.runProcess(
+            extId,
+            processInput,
+            node.data.params as Record<string, unknown>,
+          )
+          if (!result.success) throw new Error(result.error ?? 'Process extension failed')
+          nodeInputPath = processInput.filePath
+          nodeInputText = processInput.text
+          nodeInputPath = result.result?.filePath ?? nodeInputPath
+          nodeInputText = result.result?.text     ?? nodeInputText
+          set((s) => ({ runState: { ...s.runState, blockProgress: 100, blockStep: 'Done' } }))
+        }
+
+        // Store output with type for downstream routing
+        const outputType = ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
+        nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
+
+        // If this node feeds an Add-to-Scene, push the mesh to currentJob
+        // immediately so the 3D viewer loads it without waiting for the rest of the run.
+        const norm = nodeInputPath?.replace(/\\/g, '/')
+        if (
+          norm?.startsWith(workspaceDir) &&
+          workflow.edges.some((e) => e.source === node.id && outputNodeIds.has(e.target))
+        ) {
+          useAppStore.getState().updateCurrentJob({
+            status:    'done',
+            progress:  100,
+            outputUrl: `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`,
+          })
         }
       }
       for (const group of forEachGroups.values()) {

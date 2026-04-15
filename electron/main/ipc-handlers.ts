@@ -23,6 +23,8 @@ import { listVisibleExtensions, parseExtensionManifest, type ParsedManifest } fr
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { spawn } from 'child_process'
 import { fetchTrustedRepos } from './trusted-repos'
+import type { ProcessInput } from '../../src/shared/types/electron.d'
+import { runProcessExtensionWithDeps } from './run-process-handler'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -1279,39 +1281,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   // Run a process extension in an isolated worker thread
-  ipcMain.handle('extensions:runProcess', async (_, extensionId: string, input: { filePath?: string; text?: string; texts?: (string | undefined)[]; nodeId?: string }, params: Record<string, unknown>) => {
-    const userData        = app.getPath('userData')
-    const { extensionsDir, workspaceDir } = getSettings(userData)
-
-    // Resolve extension directory: check built-ins first, then user extensions
-    const builtinExtDir = join(getBuiltinExtensionsDir(), extensionId)
-    const userExtDir    = join(extensionsDir, extensionId)
-    const extDir        = existsSync(builtinExtDir) ? builtinExtDir : userExtDir
-
-    if (!existsSync(extDir)) return { success: false, error: `Extension "${extensionId}" not found` }
-
-    try {
-      const manifestRaw = await readFile(join(extDir, 'manifest.json'), 'utf-8')
-      const manifest    = JSON.parse(manifestRaw) as ParsedManifest
-      if (manifest.type !== 'process') return { success: false, error: `Extension "${extensionId}" is not a process extension` }
-
-      const entry           = manifest.entry ?? 'processor.js'
-      const isPythonEntry   = entry.endsWith('.py')
-      const userData        = app.getPath('userData')
-
-      let runner
-      if (isPythonEntry) {
-        const pythonExe = getExtPythonExe(extDir) ?? getVenvPythonExe(userData)
-        runner = getPythonProcessRunner(extensionId, pythonExe, extDir, entry, workspaceDir, app.getPath('temp'))
-      } else {
-        runner = getProcessRunner(extensionId, extDir, entry, workspaceDir, app.getPath('temp'))
-      }
-
-      const result = await runner.run(input, params)
-      return { success: true, result }
-    } catch (err) {
-      return { success: false, error: String(err) }
-    }
+  ipcMain.handle('extensions:runProcess', async (_, extensionId: string, input: ProcessInput, params: Record<string, unknown>) => {
+    return runProcessExtensionWithDeps({
+      extensionId,
+      input,
+      params,
+      getUserDataPath: () => app.getPath('userData'),
+      getTempPath: () => app.getPath('temp'),
+      getSettings,
+      getBuiltinExtensionsDir,
+      getExtPythonExe,
+      getVenvPythonExe,
+      getProcessRunner,
+      getPythonProcessRunner,
+    })
   })
 
   // Terminate all process runners on app quit

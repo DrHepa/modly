@@ -1,6 +1,6 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ParamSchema } from '@shared/types/electron.d'
+import type { ParamSchema, ProcessPort } from '@shared/types/electron.d'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -10,25 +10,23 @@ export interface WorkflowExtension {
   nodeId:          string   // "node_id"
   name:            string
   description:     string
-  input:           'image' | 'text' | 'mesh' | 'audio'
-  inputs?:         ('image' | 'text' | 'mesh' | 'audio')[]   // multi-input; overrides input when set
-  inputLabels?:    string[]                                  // display labels per input slot
-  output:          'image' | 'text' | 'mesh' | 'audio'
+  input:           'image' | 'text' | 'mesh'
+  inputs?:         ('image' | 'text' | 'mesh')[]   // multi-input; overrides input when set
+  output:          'image' | 'text' | 'mesh'
+  inputs?:         ProcessPort[]
   params:          ParamSchema[]
   builtin:         boolean
   type:            'model' | 'process'
 }
 
-function applyParamDefaults(
-  schema:   ParamSchema[],
-  defaults: Record<string, number | string> | undefined,
-): ParamSchema[] {
-  if (!defaults || Object.keys(defaults).length === 0) return schema
-  return schema.map((p) =>
-    Object.prototype.hasOwnProperty.call(defaults, p.id)
-      ? { ...p, default: defaults[p.id]! }
-      : p,
-  )
+export function normalizeWorkflowProcessInputs(inputs?: ProcessPort[]): ProcessPort[] | undefined {
+  if (!Array.isArray(inputs) || inputs.length === 0) return undefined
+
+  return inputs.map((input) => ({
+    name: input.name,
+    type: input.type,
+    required: input.required ?? true,
+  }))
 }
 
 export function buildAllWorkflowExtensions(
@@ -39,6 +37,8 @@ export function buildAllWorkflowExtensions(
 
   for (const ext of processExtensions) {
     for (const node of ext.nodes) {
+      const normalizedInputs = normalizeWorkflowProcessInputs(node.inputs)
+
       result.push({
         id:              `${ext.id}/${node.id}`,
         extensionId:     ext.id,
@@ -51,7 +51,8 @@ export function buildAllWorkflowExtensions(
         inputs:          node.inputs,
         inputLabels:     node.inputLabels,
         output:          node.output,
-        params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
+        ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
+        params:          node.paramsSchema as ParamSchema[],
         builtin:         ext.builtin,
         type:            'process',
       })

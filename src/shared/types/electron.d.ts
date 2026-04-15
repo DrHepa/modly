@@ -10,7 +10,7 @@ export interface ExtensionNode {
   inputs?:          ('image' | 'text' | 'mesh')[]   // multi-input nodes; overrides input when set
   output:           'image' | 'text' | 'mesh'
   inputs?:          ProcessPort[]
-  paramsSchema:     ParamSchema[]
+  paramsSchema:     RawParamSchema[]
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
@@ -42,18 +42,81 @@ export interface ModelExtension {
   nodes:        ExtensionNode[]
 }
 
-export interface ParamSchema {
+export type WorkflowPickerIntent = 'image' | 'mesh' | 'directory' | 'save-path' | 'generic-file'
+
+export interface WorkflowParamFilter {
+  name: string
+  extensions: string[]
+}
+
+export interface WorkflowParamOption {
+  value: number | string
+  label: string
+}
+
+interface WorkflowParamSchemaBase {
   id:       string
   label:    string
-  type:     'select' | 'int' | 'float' | 'string'
-  default:  number | string
-  options?: { value: number | string; label: string }[]
+  tooltip?: string
+  show_if?: Record<string, boolean | number | string | (boolean | number | string)[]>
+}
+
+export interface SelectParamSchema extends WorkflowParamSchemaBase {
+  type: 'select'
+  default: number | string
+  options?: WorkflowParamOption[]
+}
+
+export interface IntParamSchema extends WorkflowParamSchemaBase {
+  type: 'int'
+  default: number
   min?:     number
   max?:     number
   step?:    number
-  tooltip?: string
-  show_if?: Record<string, string | number | (string | number)[]>
 }
+
+export interface FloatParamSchema extends WorkflowParamSchemaBase {
+  type: 'float'
+  default: number
+  min?: number
+  max?: number
+  step?: number
+}
+
+export interface StringParamSchema extends WorkflowParamSchemaBase {
+  type: 'string'
+  default: string
+  pickerIntent?: WorkflowPickerIntent
+  filters?: WorkflowParamFilter[]
+}
+
+export interface BooleanParamSchema extends WorkflowParamSchemaBase {
+  type: 'boolean'
+  default: boolean
+}
+
+export interface UnsupportedParamSchema extends WorkflowParamSchemaBase {
+  type: 'unsupported'
+  default: ''
+  reason: string
+  rawType?: string
+}
+
+export type RawParamSchema =
+  | SelectParamSchema
+  | IntParamSchema
+  | FloatParamSchema
+  | StringParamSchema
+  | BooleanParamSchema
+  | Record<string, unknown>
+
+export type ParamSchema =
+  | SelectParamSchema
+  | IntParamSchema
+  | FloatParamSchema
+  | StringParamSchema
+  | BooleanParamSchema
+  | UnsupportedParamSchema
 
 export interface ProcessExtension {
   type:         'process'

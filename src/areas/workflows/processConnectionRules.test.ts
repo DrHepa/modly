@@ -159,6 +159,54 @@ test('detects persisted duplicate-port edges before run', () => {
   })
 })
 
+test('accepts valid multi-input workflows before run', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const image = createNode('image-source', 'imageNode')
+  const mesh = createNode('mesh-source', 'meshNode')
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [image, mesh, target],
+    edges: [
+      { id: 'edge-image', source: 'image-source', target: 'target-node', targetHandle: 'reference_image' },
+      { id: 'edge-mesh', source: 'mesh-source', target: 'target-node', targetHandle: 'coarse_mesh' },
+    ],
+    allExtensions: [createProcessExtension([
+      { name: 'reference_image', type: 'image' },
+      { name: 'coarse_mesh', type: 'mesh' },
+    ])],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('reuses the shared validator issue message for real invalid workflows', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const wrongMesh = createNode('wrong-source', 'meshNode')
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [wrongMesh, target],
+    edges: [
+      { id: 'edge-wrong', source: 'wrong-source', target: 'target-node', targetHandle: 'reference_image' },
+    ],
+    allExtensions: [createProcessExtension([
+      { name: 'reference_image', type: 'image' },
+      { name: 'coarse_mesh', type: 'mesh', required: false },
+    ])],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'run',
+    code: 'type-mismatch',
+    message: 'Port "reference_image" expects image but received mesh.',
+    targetNodeId: 'target-node',
+    targetHandle: 'reference_image',
+    portName: 'reference_image',
+    expectedType: 'image',
+    actualType: 'mesh',
+    sourceNodeId: 'wrong-source',
+  })
+})
+
 test('preserves legacy single-input behavior for nodes without inputs[]', () => {
   const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
   const image = createNode('image-source', 'imageNode')
@@ -179,4 +227,19 @@ test('preserves legacy single-input behavior for nodes without inputs[]', () => 
     ],
     allExtensions: [createProcessExtension()],
   }), null)
+})
+
+test('keeps legacy single-input linear workflows runnable under the shared validator', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const image = createNode('image-source', 'imageNode')
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [image, target],
+    edges: [
+      { id: 'legacy-edge', source: 'image-source', target: 'target-node' },
+    ],
+    allExtensions: [createProcessExtension()],
+  })
+
+  assert.equal(issue, null)
 })

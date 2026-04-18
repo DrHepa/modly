@@ -12,7 +12,6 @@ export interface WorkflowExtension {
   name:            string
   description:     string
   input:           'image' | 'text' | 'mesh'
-  inputs?:         ('image' | 'text' | 'mesh')[]   // multi-input; overrides input when set
   output:          'image' | 'text' | 'mesh'
   inputs?:         ProcessPort[]
   params:          ParamSchema[]
@@ -49,7 +48,6 @@ export function buildAllWorkflowExtensions(
         name:            node.name,
         description:     ext.description ?? '',
         input:           node.input,
-        inputs:          node.inputs,
         output:          node.output,
         ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
         params:          normalizeWorkflowParams(node.paramsSchema),
@@ -70,8 +68,8 @@ export function buildAllWorkflowExtensions(
         name:            node.name,
         description:     ext.description ?? '',
         input:           node.input,
-        inputs:          node.inputs,
         output:          node.output,
+        ...(node.inputs ? { inputs: node.inputs } : {}),
         params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,
         type:            'model',

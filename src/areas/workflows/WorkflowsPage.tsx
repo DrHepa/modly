@@ -749,32 +749,6 @@ function HelpModal({ onClose }: { onClose: () => void }) {
   )
 }
 
-// ─── Connection type helpers ──────────────────────────────────────────────────
-
-function getNodeOutputType(node: Node | undefined, allExts: WorkflowExtension[]): string | undefined {
-  if (!node) return undefined
-  if (node.type === 'imageNode') return 'image'
-  if (node.type === 'meshNode')  return 'mesh'
-  if (node.type === 'textNode')  return 'text'
-  return allExts.find((e) => e.id === (node.data as WFNodeData)?.extensionId)?.output
-}
-
-function getNodeInputType(
-  node: Node | undefined,
-  targetHandle: string | null | undefined,
-  allExts: WorkflowExtension[],
-): string | undefined {
-  if (!node) return undefined
-  if (node.type === 'outputNode')  return 'mesh'
-  if (node.type === 'previewNode') return 'image'
-  const ext = allExts.find((e) => e.id === (node.data as WFNodeData)?.extensionId)
-  if (ext?.inputs && ext.inputs.length > 1 && targetHandle) {
-    const idx = parseInt(targetHandle.replace('input-', ''), 10)
-    return ext.inputs[isNaN(idx) ? 0 : idx] ?? ext.input
-  }
-  return ext?.input
-}
-
 // ─── Workflow canvas (inner, requires ReactFlowProvider) ──────────────────────
 
 function WorkflowCanvasInner({
@@ -790,7 +764,7 @@ function WorkflowCanvasInner({
   onNew:            () => void
   onImport:         () => void
 }) {
-  const { screenToFlowPosition, updateNodeData, getNode } = useReactFlow()
+  const { screenToFlowPosition, updateNodeData } = useReactFlow()
   const { runState, run: runWorkflow, cancel } = useWorkflowRunStore()
   const isRunning = runState.status === 'running' || runState.status === 'paused'
 
@@ -910,13 +884,6 @@ function WorkflowCanvasInner({
     setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
     return true
   }, [nodes, edges, allExtensions, setEdges])
-
-  const isValidConnection = useCallback((connection: Connection) => {
-    const srcType = getNodeOutputType(getNode(connection.source) as Node, allExtensions)
-    const tgtType = getNodeInputType(getNode(connection.target) as Node, connection.targetHandle, allExtensions)
-    if (!srcType || !tgtType) return true
-    return srcType === tgtType
-  }, [getNode, allExtensions])
 
   const onConnectStart: OnConnectStart = useCallback((_, params: OnConnectStartParams) => {
     pendingConnectionRef.current  = params
@@ -1232,7 +1199,6 @@ function WorkflowCanvasInner({
           onEdgesChange={onEdgesChange}
           onConnectStart={onConnectStart}
           onConnect={onConnect}
-          isValidConnection={isValidConnection}
           onConnectEnd={onConnectEnd}
           onEdgeContextMenu={(e, edge) => { e.preventDefault(); setEdges((eds) => eds.filter((ed) => ed.id !== edge.id)) }}
           defaultEdgeOptions={DEFAULT_EDGE_OPTS}

@@ -1,0 +1,12 @@
+{
+  "id": "shared-id",
+  "type": "process",
+  "entry": "processor.js",
+  "nodes": [
+    {
+      "id": "clean",
+      "input": "mesh",
+      "output": "mesh"
+    }
+  ]
+}

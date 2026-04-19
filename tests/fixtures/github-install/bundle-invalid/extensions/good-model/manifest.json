@@ -1,0 +1,12 @@
+{
+  "id": "good-model",
+  "type": "model",
+  "generator_class": "GoodModel",
+  "nodes": [
+    {
+      "id": "generate",
+      "input": "image",
+      "output": "mesh"
+    }
+  ]
+}

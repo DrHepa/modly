@@ -1,4 +1,4 @@
-import type { ExtensionNode, ModelExtension, ModelOwnershipMetadata } from '@shared/types/electron.d'
+import type { ExtensionNode, ModelExtension, ModelOwnershipMetadata } from '../../shared/types/electron.d'
 
 export interface ModelOwnershipCapabilityState extends ModelOwnershipMetadata {
   downloaded: boolean

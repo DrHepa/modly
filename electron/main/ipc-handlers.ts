@@ -1,11 +1,9 @@
 import { ipcMain, BrowserWindow, dialog, app, shell } from 'electron'
-import { buildSync } from 'esbuild'
 import { autoUpdater } from 'electron-updater'
 import { join } from 'path'
 import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp } from 'fs/promises'
 import { existsSync, readdirSync, statSync } from 'fs'
 import axios from 'axios'
-import * as tar from 'tar'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
 import {
   isModelDownloaded,
@@ -28,12 +26,13 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { listVisibleExtensions } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { spawn } from 'child_process'
 import { fetchTrustedRepos } from './trusted-repos'
 import type { ProcessInput } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
+import { installGitHubExtensionRepo } from './github-extension-install'
 
 type WindowGetter = () => BrowserWindow | null
 
@@ -131,6 +130,20 @@ async function listModelExtensions(userData: string) {
     userExtensionsDir: getSettings(userData).extensionsDir,
     trustedRepos: new Set(),
   })
+}
+
+function listBuiltinExtensionIds(): Set<string> {
+  const builtinDir = getBuiltinExtensionsDir()
+  if (!existsSync(builtinDir)) return new Set()
+
+  try {
+    return new Set(
+      readdirSync(builtinDir)
+        .filter((entry) => statSync(join(builtinDir, entry)).isDirectory()),
+    )
+  } catch {
+    return new Set()
+  }
 }
 
 async function resolveOwnershipContext(userData: string, capabilityId: string) {
@@ -591,180 +604,29 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {
-    const win    = getWindow()
-    const emit   = (data: object) => win?.webContents.send('extensions:installProgress', data)
-    const tmpDir = app.getPath('temp')
-
-    let tarPath    = ''
-    let extractDir = ''
-
-    try {
-      // 1. Parse and validate GitHub URL
-      const parsed  = new URL(githubUrl.trim())
-      if (parsed.hostname !== 'github.com') throw new Error('Invalid URL: must be a GitHub repository (github.com)')
-      const parts = parsed.pathname.split('/').filter(Boolean)
-      if (parts.length < 2) throw new Error('Invalid URL: expected format https://github.com/owner/repo')
-      const [owner, repo] = parts
-
-      emit({ step: 'downloading', percent: 0 })
-
-      // 2. Download tarball via GitHub API
-      const tarballUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/HEAD`
-      tarPath    = join(tmpDir, `modly-ext-${Date.now()}.tar.gz`)
-      extractDir = join(tmpDir, `modly-ext-extract-${Date.now()}`)
-
-      const response = await axios.get(tarballUrl, {
-        responseType: 'arraybuffer',
-        headers: {
-          'Accept':     'application/vnd.github.v3+json',
-          'User-Agent': 'Modly-App',
-        },
-        onDownloadProgress: (evt) => {
-          const pct = evt.total ? Math.round((evt.loaded / evt.total) * 80) : 40
-          emit({ step: 'downloading', percent: pct })
-        },
-      })
-
-      await writeFile(tarPath, Buffer.from(response.data as ArrayBuffer))
-
-      // 3. Extract tarball (GitHub wraps contents in a top-level {owner}-{repo}-{sha}/ folder)
-      emit({ step: 'extracting' })
-      await mkdir(extractDir, { recursive: true })
-      await tar.x({ file: tarPath, cwd: extractDir, strip: 1 })
-
-      // 4. Validate manifest.json
-      emit({ step: 'validating' })
-      const manifestPath = join(extractDir, 'manifest.json')
-
-      if (!existsSync(manifestPath)) throw new Error('manifest.json missing from repository')
-
-      const manifestRaw = await readFile(manifestPath, 'utf-8')
-      const manifest    = JSON.parse(manifestRaw) as ParsedManifest
-
-      if (!manifest.id) throw new Error('manifest.json: required field "id" missing')
-      if (!manifest.nodes?.length) throw new Error('manifest.json: required field "nodes" missing or empty')
-
-      const isProcess = manifest.type === 'process'
-      const entryFile = manifest.entry ?? 'processor.js'
-      const isPythonProcess = isProcess && entryFile.endsWith('.py')
-
-      if (isProcess) {
-        // Process extension validation
-        if (!existsSync(join(extractDir, entryFile)))
-          throw new Error(`manifest.json: entry file "${entryFile}" missing from repository`)
-      } else {
-        // Model extension validation
-        const generatorPath = join(extractDir, 'generator.py')
-        if (!existsSync(generatorPath)) throw new Error('generator.py missing from repository')
-        if (!manifest.generator_class)  throw new Error('manifest.json: required field "generator_class" missing')
-      }
-
-      // Override source field with the actual GitHub URL so trust is based on origin
-      manifest.source = `https://github.com/${owner}/${repo}`
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8')
-
-      // 5. Copy to extensions directory (overwrite if already present)
-      const extensionsDir = getSettings(app.getPath('userData')).extensionsDir
-      await mkdir(extensionsDir, { recursive: true })
-      const destDir = join(extensionsDir, manifest.id)
-
-      if (existsSync(destDir)) {
-        terminateProcessRunner(manifest.id)
-        await rmAsync(destDir, { recursive: true, force: true })
-      }
-      await cp(extractDir, destDir, { recursive: true })
-
-      // Compile TypeScript entry to JS at install time (once, no runtime overhead)
-      if (isProcess && entryFile.endsWith('.ts')) {
-        emit({ step: 'setting_up', message: 'Compiling TypeScript entry…' })
-        const compiledEntry = entryFile.replace(/\.ts$/, '.js')
-        buildSync({
-          entryPoints: [join(destDir, entryFile)],
-          outfile:     join(destDir, compiledEntry),
-          bundle:      true,
-          platform:    'node',
-          format:      'cjs',
-          external:    ['electron'],
-        })
-        manifest.entry = compiledEntry
-        await writeFile(join(destDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
-      }
-
-      if (isPythonProcess) {
-        // 6a. Python process extension: run setup.py if present (same as model extensions)
-        if (existsSync(join(destDir, 'setup.py'))) {
-          emit({ step: 'setting_up', message: 'Setting up Python environment…' })
+    const win = getWindow()
+    const trustedRepos = await fetchTrustedRepos()
+    return installGitHubExtensionRepo({
+      githubUrl,
+      extensionsDir: getSettings(app.getPath('userData')).extensionsDir,
+      builtinExtensionIds: listBuiltinExtensionIds(),
+      trustedRepos,
+      emitProgress: (data) => {
+        win?.webContents.send('extensions:installProgress', data)
+      },
+      operations: {
+        async runExtensionSetup({ destinationDir, onLog }) {
           const { sm: gpuSm, cudaVersion } = await detectGpuInfo()
-          try {
-            await runExtensionSetup(destDir, gpuSm, cudaVersion, (line) => {
-              logger.info(`[ext-setup] ${line}`)
-              emit({ step: 'setting_up', message: line })
-            })
-          } catch (err) {
-            logger.warn(`[ext-setup] setup.py failed: ${err}`)
-            emit({ step: 'setting_up', message: `Warning: setup failed — ${err}` })
-          }
-        }
-      } else if (isProcess) {
-        // 6b. JS process extension: npm install if package.json present
-        if (existsSync(join(destDir, 'package.json'))) {
-          emit({ step: 'setting_up', message: 'Installing dependencies…' })
-          await new Promise<void>((resolve, reject) => {
-            const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-            const child = spawn(npm, ['install', '--omit=dev', '--no-audit', '--no-fund'], {
-              cwd:   destDir,
-              stdio: 'pipe',
-            })
-            let buf = ''
-            const onData = (chunk: Buffer) => {
-              buf += chunk.toString()
-              const lines = buf.split('\n')
-              buf = lines.pop() ?? ''
-              for (const raw of lines) {
-                const line = raw.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g'), '').trim()
-                if (line) emit({ step: 'setting_up', message: line })
-              }
-            }
-            child.stdout?.on('data', onData)
-            child.stderr?.on('data', onData)
-            child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`npm install failed (exit ${code})`)))
-            child.on('error', reject)
+          await runExtensionSetup(destinationDir, gpuSm, cudaVersion, (line) => {
+            logger.info(`[ext-setup] ${line}`)
+            onLog?.(line)
           })
-        }
-      } else {
-        // 6b. Model extension: run setup.py directly (no FastAPI required)
-        if (existsSync(join(destDir, 'setup.py'))) {
-          emit({ step: 'setting_up', message: 'Setting up Python environment…' })
-          const { sm: gpuSm, cudaVersion } = await detectGpuInfo()
-          try {
-            await runExtensionSetup(destDir, gpuSm, cudaVersion, (line) => {
-              logger.info(`[ext-setup] ${line}`)
-              emit({ step: 'setting_up', message: line })
-            })
-          } catch (setupErr: any) {
-            throw new Error(`Extension setup failed: ${setupErr?.message ?? setupErr}`)
-          }
-        }
-
-        try {
+        },
+        async reloadExtensions() {
           await axios.post(`${API_BASE_URL}/extensions/reload`, {}, { timeout: 10_000 })
-        } catch { /* Python might not be running yet */ }
-      }
-
-      emit({ step: 'done', extensionId: manifest.id })
-
-      const trustedRepos = await fetchTrustedRepos()
-      const ext = parseExtensionManifest(manifest, manifest.id, trustedRepos)
-      return { success: true, extensionId: manifest.id, extension: ext }
-
-    } catch (err) {
-      emit({ step: 'error', message: String(err) })
-      return { success: false, error: String(err) }
-    } finally {
-      // Cleanup temp files
-      if (tarPath    && existsSync(tarPath))    rmAsync(tarPath,    { force: true }).catch(() => {})
-      if (extractDir && existsSync(extractDir)) rmAsync(extractDir, { recursive: true, force: true }).catch(() => {})
-    }
+        },
+      },
+    })
   })
 
   // Uninstall an extension — built-ins cannot be uninstalled

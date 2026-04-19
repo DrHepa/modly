@@ -31,6 +31,7 @@ EXT_DIR       = Path(os.environ["EXTENSION_DIR"])
 MODELS_DIR    = Path(os.environ.get("MODELS_DIR",    Path.home() / ".modly" / "models"))
 WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", Path.home() / ".modly" / "workspace"))
 MODLY_API_DIR = os.environ.get("MODLY_API_DIR", "")
+MODEL_ID      = os.environ.get("MODEL_ID", "")
 # MODEL_DIR is set by ExtensionProcess to match its own model_dir (composite node id path).
 # Falls back to MODELS_DIR/manifest_id for standalone/legacy use.
 _MODEL_DIR_OVERRIDE = os.environ.get("MODEL_DIR", "")
@@ -81,13 +82,32 @@ def load_generator(manifest: dict):
     return getattr(mod, manifest["generator_class"])
 
 
+def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
+    nodes = manifest.get("nodes") or []
+    node = {}
+
+    if nodes and MODEL_ID and "/" in MODEL_ID:
+        requested_node_id = MODEL_ID.split("/", 1)[1]
+        node = next((candidate for candidate in nodes if candidate.get("id") == requested_node_id), {})
+
+    if not node and nodes and _MODEL_DIR_OVERRIDE:
+        node_id = Path(_MODEL_DIR_OVERRIDE).name
+        node = next((candidate for candidate in nodes if candidate.get("id") == node_id), {})
+
+    if not node and nodes:
+        node = nodes[0]
+
+    model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / (MODEL_ID or manifest["id"])
+    return node, model_dir
+
+
 # ------------------------------------------------------------------ #
 # Main loop
 # ------------------------------------------------------------------ #
 
 def main() -> None:
     manifest = json.loads((EXT_DIR / "manifest.json").read_text(encoding="utf-8"))
-    model_id = manifest["id"]
+    model_id = MODEL_ID or manifest["id"]
 
     try:
         GenClass = load_generator(manifest)
@@ -112,18 +132,7 @@ def main() -> None:
     # Use MODEL_DIR to find the correct node for multi-node extensions:
     # MODEL_DIR is set by ExtensionProcess to MODELS_DIR/ext_id/node_id,
     # so its last component matches the node id.
-    nodes = manifest.get("nodes") or []
-    node = {}
-    if nodes and _MODEL_DIR_OVERRIDE:
-        node_id = Path(_MODEL_DIR_OVERRIDE).name
-        node = next((n for n in nodes if n.get("id") == node_id), nodes[0])
-    elif nodes:
-        node = nodes[0]
-
-    # Use MODEL_DIR env var (set by ExtensionProcess) when available so the
-    # generator uses the exact same path that is_downloaded() checks against.
-    # Falls back to MODELS_DIR/manifest_id for legacy / standalone use.
-    model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / model_id
+    node, model_dir = resolve_runner_context(manifest)
     gen = GenClass(model_dir, WORKSPACE_DIR)
     gen.hf_repo          = manifest.get("hf_repo", "")          or node.get("hf_repo", "")
     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", []) or node.get("hf_skip_prefixes", [])

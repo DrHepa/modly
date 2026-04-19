@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { AnyExtension } from '@shared/types/electron.d'
+import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
 
@@ -7,6 +8,7 @@ interface Props {
   ext:              AnyExtension
   installedIds:     string[]
   downloading:      Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>
+  ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: import('@shared/types/electron.d').ExtensionNode, fullId: string) => void
@@ -20,7 +22,7 @@ const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
   process: { label: 'Process', cls: 'bg-emerald-500/15 border-emerald-500/25 text-emerald-400' },
 }
 
-export function ExtensionCard({ ext, installedIds, downloading, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
 
@@ -139,16 +141,23 @@ export function ExtensionCard({ ext, installedIds, downloading, loadError, disab
           {ext.nodes.map((node) => {
             const fullId        = `${ext.id}/${node.id}`
             const hasWeights    = !!node.hfRepo
-            const installed     = !hasWeights || installedIds.includes(fullId)
+            const ownershipState = ownershipStateById?.[fullId]
+            const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
             const dlInfo        = downloading[fullId]
             const isDownloading = dlInfo !== undefined
+            const ownerDownloading = ownershipState?.isOwnerDownloading ?? false
             const dlPercent     = dlInfo?.percent ?? 0
             const dlFile        = dlInfo?.file?.split('/').pop()
             const dlFileIndex   = dlInfo?.fileIndex
             const dlTotalFiles  = dlInfo?.totalFiles
+            const installDisabled = Boolean(disabled || ownershipState?.installDisabled)
+            const deleteDisabled = Boolean(disabled || ownershipState?.deleteDisabled)
+            const deleteTitle = ownershipState?.warning ?? (disabled ? 'Cannot delete while another action is in progress' : 'Remove owner-scoped model weights')
+            const downloadTitle = ownershipState?.warning ?? (disabled ? 'Another action is already in progress' : `Download ${node.name} weights`)
 
             return (
-              <div key={node.id} className="flex items-center gap-2">
+              <div key={node.id} className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-2">
                 {/* Node name */}
                 <span className="text-[11px] text-zinc-400 font-medium shrink-0 truncate" style={{ maxWidth: '5rem' }}>
                   {node.name}
@@ -195,11 +204,19 @@ export function ExtensionCard({ ext, installedIds, downloading, loadError, disab
                         <polyline points="20 6 9 17 4 12"/>
                       </svg>
                       <span className="text-[10px] font-semibold text-emerald-400 flex-1 truncate">{node.name}</span>
+                      {ownershipState?.badges.map((badge) => (
+                        <span
+                          key={badge}
+                          className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-md bg-sky-950/40 border border-sky-800/30 text-[9px] font-semibold text-sky-300"
+                        >
+                          {badge}
+                        </span>
+                      ))}
                       {onUninstallNode && (
                         <button
                           onClick={(e) => { e.stopPropagation(); onUninstallNode(fullId) }}
-                          disabled={disabled}
-                          title="Remove model weights"
+                          disabled={deleteDisabled}
+                          title={deleteTitle}
                           className="shrink-0 text-emerald-700 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                         >
                           <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
@@ -209,13 +226,35 @@ export function ExtensionCard({ ext, installedIds, downloading, loadError, disab
                         </button>
                       )}
                     </div>
+                  ) : isDownloading ? (
+                    <div className="flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-zinc-500 truncate max-w-[100px]" title={dlFile}>
+                          {dlFile ?? 'Downloading…'}
+                        </span>
+                        <span className="text-[10px] font-mono text-zinc-400 shrink-0 ml-1">
+                          {dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ${dlPercent}%` : `${dlPercent}%`}
+                        </span>
+                      </div>
+                      <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-accent transition-all duration-300"
+                          style={{ width: `${dlPercent}%` }}
+                        />
+                      </div>
+                    </div>
+                  ) : ownerDownloading ? (
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-sky-950/30 border border-sky-800/30">
+                      <div className="w-2 h-2 rounded-full border border-sky-400/40 border-t-sky-200 animate-spin shrink-0" />
+                      <span className="text-[10px] font-semibold text-sky-300 truncate">Shared download in progress</span>
+                    </div>
                   ) : (
                     <button
-                      onClick={() => !disabled && onInstall(node, fullId)}
-                      disabled={disabled}
-                      title={disabled ? 'A download is already in progress' : `Download ${node.name} weights`}
+                      onClick={() => !installDisabled && onInstall(node, fullId)}
+                      disabled={installDisabled}
+                      title={downloadTitle}
                       className={`w-full flex items-center justify-center gap-1 px-2 py-1 rounded-lg border text-[10px] font-semibold transition-all ${
-                        !disabled
+                        !installDisabled
                           ? 'bg-accent/15 border-accent/25 text-accent-light hover:bg-accent/25 hover:border-accent/40 cursor-pointer'
                           : 'bg-zinc-800/40 border-zinc-700/30 text-zinc-600 cursor-not-allowed'
                       }`}
@@ -229,6 +268,16 @@ export function ExtensionCard({ ext, installedIds, downloading, loadError, disab
                     </button>
                   )}
                 </div>
+                </div>
+
+                {ownershipState?.warning && hasWeights && (
+                  <div className="ml-auto w-[calc(100%-7rem)] flex items-start gap-1.5 px-2 py-1 rounded-lg bg-amber-950/20 border border-amber-900/30">
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-300 shrink-0 mt-px">
+                      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                    </svg>
+                    <p className="text-[10px] text-amber-200/90 leading-relaxed">{ownershipState.warning}</p>
+                  </div>
+                )}
               </div>
             )
           })}

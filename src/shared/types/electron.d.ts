@@ -13,6 +13,19 @@ export interface ExtensionNode {
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
+  capabilityId?:    string
+  bundleId?:        string
+  weightOwnerId?:   string
+  sharedOwner?:     boolean
+  legacyPaths?:     string[]
+}
+
+export interface ModelOwnershipMetadata {
+  capabilityId: string
+  bundleId: string
+  weightOwnerId: string
+  sharedOwner: boolean
+  legacyPaths: string[]
 }
 
 export interface ProcessPort {
@@ -303,10 +316,10 @@ declare global {
         listDownloaded: () => Promise<{ id: string; name: string; size_gb: number }[]>
         isDownloaded:   (modelId: string) => Promise<boolean>
         download:       (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<{ success: boolean; error?: string }>
-        delete:         (modelId: string) => Promise<{ success: boolean; error?: string }>
+        delete:         (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
-        onProgress:     (cb: (data: { modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
+        onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
         offProgress:    () => void
       }
       app: {

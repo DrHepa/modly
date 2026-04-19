@@ -9,12 +9,15 @@ interface Props {
 }
 
 export function ModelCard({ model, onDelete, onGenerate, disabled }: Props): JSX.Element {
+  const ownerScopeLabel = model.ownerScopeLabel ?? (model.sharedOwner ? 'Shared weights' : 'Owner-scoped')
+  const deleteTitle = model.ownerWarning ?? (disabled ? 'Cannot delete while another action is in progress' : 'Remove owner-scoped weights')
+
   return (
     <div className="relative flex flex-col gap-2 px-3.5 py-4 rounded-2xl border transition-all min-h-[110px] bg-zinc-900/60 border-zinc-800 hover:border-zinc-700">
       {/* Open in explorer */}
       <button
         onClick={() => window.electron.model.showInFolder(model.id)}
-        title="Show in explorer"
+        title="Show owner folder"
         className="absolute top-2.5 right-2.5 flex items-center justify-center w-6 h-6 rounded-lg text-zinc-600 hover:text-zinc-300 hover:bg-zinc-700/60 transition-all"
       >
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -27,10 +30,30 @@ export function ModelCard({ model, onDelete, onGenerate, disabled }: Props): JSX
         {formatModelName(model.id)}
       </p>
 
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-zinc-800/80 border border-zinc-700/60 text-[10px] font-semibold text-zinc-300">
+          {ownerScopeLabel}
+        </span>
+        {model.sharedOwner && (
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-sky-950/40 border border-sky-800/30 text-[10px] font-semibold text-sky-300">
+            Shared impact
+          </span>
+        )}
+      </div>
+
       {/* Size */}
       <span className="text-[11px] font-medium text-zinc-400">
         {model.size_gb > 0 ? `${model.size_gb} GB` : '—'}
       </span>
+
+      {model.ownerWarning && (
+        <div className="flex items-start gap-1.5 px-2 py-1 rounded-lg bg-amber-950/20 border border-amber-900/30">
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-300 shrink-0 mt-px">
+            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <p className="text-[10px] text-amber-200/90 leading-relaxed">{model.ownerWarning}</p>
+        </div>
+      )}
 
       {/* Actions */}
       <div className="flex items-center gap-1.5 mt-auto">
@@ -47,7 +70,7 @@ export function ModelCard({ model, onDelete, onGenerate, disabled }: Props): JSX
         <button
           onClick={onDelete}
           disabled={disabled}
-          title={disabled ? 'Cannot delete while an install is in progress' : 'Uninstall'}
+          title={deleteTitle}
           className="flex items-center justify-center w-7 h-7 rounded-lg bg-red-950/40 border border-red-900/30 text-red-500 hover:bg-red-900/50 hover:text-red-300 hover:border-red-700/50 transition-all shrink-0 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-red-950/40 disabled:hover:text-red-500 disabled:hover:border-red-900/30"
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">

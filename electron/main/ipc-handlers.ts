@@ -12,6 +12,17 @@ import {
   listDownloadedModels,
   downloadModelFromHF,
 } from './model-downloader'
+import {
+  createOwnerScopedDeletePlan,
+  createExtensionUninstallCleanupPlan,
+  deleteOwnedModelPaths,
+  isOwnedModelDownloaded,
+  listDownloadedModelCapabilities,
+  mapDownloadProgressToCapability,
+  resolveModelOwnership,
+  resolveShowInFolderPath,
+  type ModelOwnershipDescriptor,
+} from './model-ownership'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
 import { logger } from './logger'
@@ -101,6 +112,40 @@ function runExtensionSetup(
     })
     proc.on('error', reject)
   })
+}
+
+function createFallbackOwnership(modelId: string): ModelOwnershipDescriptor {
+  const [bundleId = modelId] = modelId.split('/')
+  return {
+    capabilityId: modelId,
+    bundleId,
+    weightOwnerId: modelId,
+    sharedOwner: false,
+    legacyPaths: [modelId],
+  }
+}
+
+async function listModelExtensions(userData: string) {
+  return listVisibleExtensions({
+    builtinDir: getBuiltinExtensionsDir(),
+    userExtensionsDir: getSettings(userData).extensionsDir,
+    trustedRepos: new Set(),
+  })
+}
+
+async function resolveOwnershipContext(userData: string, capabilityId: string) {
+  const extensions = await listModelExtensions(userData)
+  const ownership = resolveModelOwnership(extensions, capabilityId) ?? createFallbackOwnership(capabilityId)
+  const siblingCapabilityIds = extensions
+    .filter((extension) => extension.type === 'model')
+    .flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+    .filter((candidateCapabilityId) => candidateCapabilityId !== capabilityId)
+    .filter((candidateCapabilityId) => {
+      const candidateOwnership = resolveModelOwnership(extensions, candidateCapabilityId)
+      return candidateOwnership?.weightOwnerId === ownership.weightOwnerId
+    })
+
+  return { extensions, ownership, siblingCapabilityIds }
 }
 
 export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
@@ -260,9 +305,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
-    const modelDir = join(getSettings(app.getPath('userData')).modelsDir, modelId)
+    const userData = app.getPath('userData')
+    const modelsDir = getSettings(userData).modelsDir
+    const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(userData, modelId)
+    const deletePlan = createOwnerScopedDeletePlan(modelsDir, ownership, siblingCapabilityIds)
 
-    // Unload the model and wait for confirmation so file handles are released
+    if (deletePlan.mode === 'blocked') {
+      return { success: true, warning: deletePlan.warning, skipped: true } as { success: boolean; error?: string }
+    }
     try {
       await axios.post(`${API_BASE_URL}/model/unload/${encodeURIComponent(modelId)}`, {}, { timeout: 10_000 })
       // Give the OS a moment to release file locks (Windows holds handles briefly after close)
@@ -270,36 +320,23 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     } catch {
       // Unload failed (model may not be loaded) — still attempt deletion
     }
-
-    // Retry removal — Windows may return EBUSY/EPERM if handles linger
-    const maxRetries = 3
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        await rmAsync(modelDir, { recursive: true, force: true })
-        return { success: true }
-      } catch (err: unknown) {
-        const code = (err as NodeJS.ErrnoException).code
-        const isLocked = code === 'EBUSY' || code === 'EPERM'
-        if (isLocked && attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1_000 * attempt))
-          continue
-        }
-        return {
-          success: false,
-          error: isLocked
-            ? `Model files are still locked after ${maxRetries} attempts. Close any programs using the model and try again.`
-            : String(err),
-        }
-      }
+    try {
+      await deleteOwnedModelPaths(deletePlan.targets)
+      return { success: true, warning: deletePlan.warning } as { success: boolean; error?: string }
+    } catch (err) {
+      return { success: false, error: String(err) }
     }
 
     return { success: false, error: 'Unexpected error during deletion' }
   })
 
-  ipcMain.handle('model:showInFolder', (_, modelId: string) => {
-    const modelDir = join(getSettings(app.getPath('userData')).modelsDir, modelId)
-    if (existsSync(modelDir)) {
-      shell.openPath(modelDir)
+  ipcMain.handle('model:showInFolder', async (_, modelId: string) => {
+    const userData = app.getPath('userData')
+    const modelsDir = getSettings(userData).modelsDir
+    const { ownership } = await resolveOwnershipContext(userData, modelId)
+    const activePath = resolveShowInFolderPath(modelsDir, ownership)
+    if (activePath && existsSync(activePath)) {
+      shell.openPath(activePath)
     }
   })
 
@@ -318,14 +355,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   // Model management
-  ipcMain.handle('model:listDownloaded', () => {
-    const modelsDir = getSettings(app.getPath('userData')).modelsDir
-    return listDownloadedModels(modelsDir)
+  ipcMain.handle('model:listDownloaded', async () => {
+    const userData = app.getPath('userData')
+    const modelsDir = getSettings(userData).modelsDir
+    const extensions = await listModelExtensions(userData)
+    const downloaded = listDownloadedModelCapabilities(modelsDir, extensions)
+    return downloaded.length > 0 ? downloaded : listDownloadedModels(modelsDir)
   })
 
-  ipcMain.handle('model:isDownloaded', (_, modelId: string): boolean => {
-    const modelsDir = getSettings(app.getPath('userData')).modelsDir
-    return isModelDownloaded(modelsDir, modelId)
+  ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
+    const userData = app.getPath('userData')
+    const modelsDir = getSettings(userData).modelsDir
+    const { ownership } = await resolveOwnershipContext(userData, modelId)
+    return isOwnedModelDownloaded(modelsDir, ownership) || isModelDownloaded(modelsDir, modelId)
   })
 
   ipcMain.handle('model:activeDownloads', () =>
@@ -333,11 +375,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   )
 
   ipcMain.handle('model:download', async (event, { repoId, modelId, skipPrefixes }: { repoId: string; modelId: string; skipPrefixes?: string[] }) => {
-    activeDownloads.set(modelId, { percent: 0 })
+    const userData = app.getPath('userData')
+    const { ownership } = await resolveOwnershipContext(userData, modelId)
     try {
-      await downloadModelFromHF(repoId, modelId, (progress) => {
+      activeDownloads.set(modelId, { percent: 0 })
+      await downloadModelFromHF(repoId, ownership.weightOwnerId, (progress) => {
         activeDownloads.set(modelId, progress)
-        event.sender.send('model:downloadProgress', { modelId, ...progress })
+        event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, progress))
       }, skipPrefixes)
       return { success: true }
     } catch (err) {
@@ -734,10 +778,28 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const extensionsDir = getSettings(userData).extensionsDir
     const extPath       = join(extensionsDir, extensionId)
     try {
+      const { extensions } = await resolveOwnershipContext(userData, extensionId)
+      const cleanupPlans = createExtensionUninstallCleanupPlan(getSettings(userData).modelsDir, extensions, extensionId)
+
       // Terminate process runner if it's a process extension
       terminateProcessRunner(extensionId)
 
+      for (const extension of extensions) {
+        if (extension.type !== 'model' || extension.id !== extensionId) continue
+        for (const node of extension.nodes) {
+          const capabilityId = node.capabilityId ?? `${extension.id}/${node.id}`
+          try {
+            await axios.post(`${API_BASE_URL}/model/unload/${encodeURIComponent(capabilityId)}`, {}, { timeout: 5000 })
+          } catch {
+            // best effort
+          }
+        }
+      }
+
       await rmAsync(extPath, { recursive: true, force: true })
+      for (const cleanupPlan of cleanupPlans) {
+        await deleteOwnedModelPaths(cleanupPlan.targets)
+      }
       // Hot-reload Python so it stops using the deleted model extension
       try {
         await axios.post(`${API_BASE_URL}/extensions/reload`, {}, { timeout: 10_000 })

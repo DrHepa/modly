@@ -82,7 +82,10 @@ async def hf_download(repo_id: str, model_id: str, skip_prefixes: Optional[str] 
     """
     import json as _json
     import os
-    dest_dir  = str(MODELS_DIR / model_id)
+    try:
+        dest_dir = str(generator_registry.canonical_model_dir(model_id))
+    except KeyError:
+        dest_dir = str(MODELS_DIR / model_id)
     # Prefer skip_prefixes passed directly from the client (authoritative, no registry dep)
     if skip_prefixes:
         try:
@@ -147,5 +150,4 @@ async def hf_download(repo_id: str, model_id: str, skip_prefixes: Optional[str] 
             yield _fmt({"error": str(exc)})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
 

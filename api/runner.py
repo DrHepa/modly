@@ -110,6 +110,16 @@ def _select_node(
     return {}
 
 
+def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
+    # Identity selects the capability; storage never overrides an explicit node.
+    node_id = _MODEL_NODE_ID_OVERRIDE
+    if not node_id and "/" in _MODEL_ID_OVERRIDE:
+        node_id = _MODEL_ID_OVERRIDE.split("/", 1)[1]
+    node = _select_node(manifest, _MODEL_DIR_OVERRIDE, node_id)
+    model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / (_MODEL_ID_OVERRIDE or manifest["id"])
+    return node, model_dir
+
+
 def _resolve_ready_schema(GenClass, node: dict, manifest: dict) -> list:
     try:
         return GenClass.params_schema()
@@ -208,7 +218,7 @@ def main() -> None:
 
     # Support both flat manifest (legacy) and nodes[] format. The host passes an
     # explicit node id; MODEL_DIR name inference remains only as a legacy fallback.
-    node = _select_node(manifest, _MODEL_DIR_OVERRIDE, _MODEL_NODE_ID_OVERRIDE)
+    node, model_dir = resolve_runner_context(manifest)
 
     # Announce readiness and send params_schema so ExtensionProcess
     # can serve it without needing to query the subprocess later.
@@ -219,7 +229,6 @@ def main() -> None:
     # Use MODEL_DIR env var (set by ExtensionProcess) when available so the
     # generator uses the exact same path that is_downloaded() checks against.
     # Falls back to MODELS_DIR/manifest_id for legacy / standalone use.
-    model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / model_id
     gen = GenClass(model_dir, WORKSPACE_DIR)
     gen.MODEL_ID = model_id
     gen.MODEL_NODE_ID = node.get("id", "")

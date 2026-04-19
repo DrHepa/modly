@@ -55,6 +55,7 @@ function fixture(t) {
       get: (...args) => hooks.listModels(...args),
       isAxiosError: (err) => Boolean(err?.isAxiosError),
     }
+    if (name === './automation-capabilities') return { activeExtensionInstalls: new Set() }
     if (name === './model-sources') return realSources
     if (name === './model-download-plan') return realPlan
     if (name === './extension-path-guard') return realGuard
@@ -80,7 +81,7 @@ for (const action of ['deleteSharedGroup', 'deleteExtensionWeights']) {
     const f = fixture(t), entered = deferred(), finish = deferred()
     f.hooks.unload = async () => { entered.resolve(); await finish.promise; return { data: { unloaded: true } } }
     const deleting = f.invoke(action, 'demo', 'base')
-    await entered.promise
+    await Promise.race([entered.promise, deleting.then((result) => { throw new Error(`Removal finished before unload: ${JSON.stringify(result)}`) })])
     const blocked = await f.invoke('download', 'demo/a')
     assert.equal(blocked.success, false)
     assert.match(blocked.error, /busy/)
@@ -216,3 +217,113 @@ test('model path changes are rejected while weights are reserved', async (t) => 
   finish.resolve()
   await downloading
 })
+
+function ownerFixture(t) {
+  const f = fixture(t)
+  writeFileSync(join(f.settings.extensionsDir, 'demo', 'manifest.json'), JSON.stringify({
+    id: 'demo', type: 'model', weight_groups: [{ id: 'base', model_sources: [source] }],
+    nodes: [
+      { id: 'a', weight_owner_id: 'private', model_sources: [source], weight_groups: ['base'] },
+      { id: 'b', weight_owner_id: 'private', model_sources: [source] },
+    ],
+  }))
+  return f
+}
+
+test('private owner aliases preserve per-capability group readiness without moving legacy weights', async (t) => {
+  const f = ownerFixture(t)
+  const legacy = join(f.settings.modelsDir, 'demo/b')
+  mkdirSync(legacy, { recursive: true })
+  writeFileSync(join(legacy, 'weights.bin'), 'legacy')
+  assert.equal(await f.invoke('isDownloaded', 'demo/b'), true)
+  assert.equal(await f.invoke('isDownloaded', 'demo/a'), false)
+  assert.equal(await f.invoke('hasLocalData', 'demo/a'), true)
+  const group = join(f.settings.modelsDir, 'demo/_shared/base')
+  mkdirSync(group, { recursive: true })
+  writeFileSync(join(group, 'weights.bin'), 'group')
+  assert.equal(await f.invoke('isDownloaded', 'demo/a'), true)
+  assert.equal(existsSync(join(f.settings.modelsDir, 'demo/private')), false)
+  assert.equal(readFileSync(join(legacy, 'weights.bin'), 'utf8'), 'legacy')
+})
+
+test('alias download reserves canonical private root, leaves groups separate, and blocks sibling deletion/download', async (t) => {
+  const f = ownerFixture(t), entered = deferred(), finish = deferred()
+  f.hooks.download = async (id) => {
+    if (id === 'demo/private') { entered.resolve(); await finish.promise }
+  }
+  const first = f.invoke('download', 'demo/b')
+  // Avoid an unbounded wait when a regression targets the capability instead of the owner.
+  await Promise.race([entered.promise, first])
+  assert.deepEqual(f.calls, ['demo/private'])
+  const sibling = await f.invoke('download', 'demo/a')
+  assert.equal(sibling.success, false)
+  assert.equal((await f.invoke('delete', 'demo/a')).success, false)
+  finish.resolve()
+  assert.equal((await first).success, true)
+  const deleted = await f.invoke('delete', 'demo/a')
+  assert.equal(deleted.success, false)
+  assert.match(deleted.warning, /demo\/b/)
+  assert.equal(f.removed.length, 0)
+})
+
+test('bundled private and shared roots download independently with capability progress identity', async (t) => {
+  const f = ownerFixture(t)
+  assert.equal((await f.invoke('download', 'demo/a')).success, true)
+  assert.deepEqual(f.calls, ['demo/_shared/base', 'demo/private'])
+  assert.equal(await f.invoke('isDownloaded', 'demo/a'), true)
+  assert.equal(await f.invoke('isDownloaded', 'demo/b'), true)
+  assert.ok(f.events.some(([name, event]) => name === 'model:downloadProgress' && event.modelId === 'demo/a' && event.capabilityId === 'demo/a'))
+})
+
+test('variant removal reserves canonical plus legacy aliases and keeps its selected path across unload', async (t) => {
+  const f = fixture(t), entered = deferred(), finish = deferred()
+  writeFileSync(join(f.settings.extensionsDir, 'demo', 'manifest.json'), JSON.stringify({
+    id: 'demo', type: 'model', nodes: [{
+      id: 'a', weight_owner_id: 'owner', hf_repo: 'org/base', download_check: 'pipeline.json',
+      params_schema: [{ id: 'quant', type: 'select', default: 'Q4', options: ['Q4'] }],
+      weight_variants: { param: 'quant', default: 'Q4', options: [{ id: 'Q4', include_prefixes: ['q4/'], checks: ['q4/weights.bin'] }] },
+    }],
+  }))
+  const legacy = join(f.settings.modelsDir, 'demo/a'), canonical = join(f.settings.modelsDir, 'demo/owner')
+  mkdirSync(join(legacy, 'q4'), { recursive: true })
+  writeFileSync(join(legacy, 'pipeline.json'), '{}')
+  writeFileSync(join(legacy, 'q4/weights.bin'), 'legacy')
+  f.hooks.unload = async () => { entered.resolve(); await finish.promise; return { data: { unloaded: true } } }
+  const removing = f.invoke('deleteWeightVariant', 'demo/a', 'Q4')
+  await Promise.race([entered.promise, removing.then((result) => { throw new Error(`Removal finished before unload: ${JSON.stringify(result)}`) })])
+  try {
+    const blocked = await f.invoke('download', 'demo/a', 'Q4')
+    assert.equal(blocked.success, false)
+    assert.match(blocked.error, /busy/)
+    // Simulate an external filesystem change, not another Modly operation.
+    mkdirSync(join(canonical, 'q4'), { recursive: true })
+    writeFileSync(join(canonical, 'q4/weights.bin'), 'canonical')
+  } finally { finish.resolve() }
+  assert.equal((await removing).success, true)
+  assert.equal(existsSync(join(legacy, 'q4/weights.bin')), false)
+  assert.equal(readFileSync(join(canonical, 'q4/weights.bin'), 'utf8'), 'canonical')
+  assert.equal(readFileSync(join(legacy, 'pipeline.json'), 'utf8'), '{}')
+})
+
+for (const [label, owners] of [
+  ['canonical case aliases', ['Shared', 'shared']],
+  ['canonical versus legacy case alias', ['B', 'other']],
+]) {
+  test(`installed plan rejects ${label} before any unload or removal`, async (t) => {
+    const f = fixture(t), unloaded = []
+    writeFileSync(join(f.settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({
+      id: 'demo', type: 'model', nodes: owners.map((owner, index) => ({
+        id: index ? 'b' : 'a', weight_owner_id: owner, model_sources: [source],
+      })),
+    }))
+    f.hooks.unload = async (url) => { unloaded.push(url); return { data: { unloaded: true } } }
+    for (const action of ['delete', 'download']) {
+      const result = await f.invoke(action, 'demo/a')
+      assert.equal(result.success, false)
+      assert.match(result.error, /portable|overlap/i)
+    }
+    assert.deepEqual(unloaded, [])
+    assert.deepEqual(f.removed, [])
+    assert.deepEqual(f.calls, [])
+  })
+}

@@ -218,6 +218,30 @@ class _LegacyGeneratorProxy:
 
         return call_in_context
 
+    def prepare_path_replacement(
+        self, model_dir: Path, outputs_dir: Path, shared_model_dirs: Dict[str, Path]
+    ) -> BaseGenerator:
+        """Run fallible extension code without replacing the current target."""
+        manager = object.__getattribute__(self, "_manager")
+        context = object.__getattribute__(self, "_context")
+        target = object.__getattribute__(self, "_target")
+        with manager.activate(context):
+            replacement = type(target)(model_dir, outputs_dir)
+            for name in (
+                "hf_repo", "hf_skip_prefixes", "download_check", "_params_schema",
+                "MODEL_ID", "MODEL_NODE_ID",
+            ):
+                setattr(replacement, name, getattr(target, name))
+            replacement.shared_model_dirs = shared_model_dirs
+            return replacement
+
+    def rebind_unloaded_model_dir(self, model_dir: Path) -> None:
+        """Recreate constructor-cached paths after the registry confirmed unload."""
+        replacement = self.prepare_path_replacement(
+            model_dir, self.outputs_dir, self.shared_model_dirs
+        )
+        object.__setattr__(self, "_target", replacement)
+
     def __setattr__(self, name: str, value: object) -> None:
         manager = object.__getattribute__(self, "_manager")
         context = object.__getattribute__(self, "_context")
@@ -596,8 +620,34 @@ def _discover_extensions(
                     spec.loader.exec_module(module)
                     cls_or_None = getattr(module, class_name)
 
+            legacy_paths_by_owner: Dict[str, list[str]] = {}
+            for node in nodes:
+                owner_id = node.get("weight_owner_id", node["id"])
+                if "weight_owner_id" in node:
+                    owner_id = safe_source_id(owner_id, "weight_owner_id")
+                weight_owner_id = f"{ext_id}/{owner_id}"
+                legacy_paths_by_owner.setdefault(weight_owner_id, []).append(f"{ext_id}/{node['id']}")
+
+            # Existing node/source IDs are ASCII. Use the same portable identity
+            # for canonical roots and every alias as the Electron planner does;
+            # never lowercase paths on disk or merge differently-spelled roots.
+            roots: Dict[str, Tuple[str, str]] = {}
+            for owner, legacy_paths in legacy_paths_by_owner.items():
+                for spelling in [owner, *legacy_paths]:
+                    key = spelling.lower()
+                    previous = roots.get(key)
+                    if previous and previous[0] != spelling:
+                        raise ValueError(
+                            f"weight roots {previous[0]!r} and {spelling!r} are not portable-unique"
+                        )
+                    if previous and previous[1] != owner:
+                        raise ValueError(f"weight owner {owner!r} overlaps another owner's legacy path")
+                    roots[key] = (spelling, owner)
+
             if nodes:
                 for node in nodes:
+                    weight_owner_id = f"{ext_id}/{node.get('weight_owner_id', node['id'])}"
+                    legacy_paths = list(legacy_paths_by_owner[weight_owner_id])
                     model_sources = normalize_model_sources(node)
                     group_ids = normalize_weight_group_references(
                         node,
@@ -610,6 +660,11 @@ def _discover_extensions(
                     node_manifest = {
                         **manifest,
                         "id":               f"{ext_id}/{node['id']}",
+                        "capability_id":    f"{ext_id}/{node['id']}",
+                        "bundle_id":        ext_id,
+                        "weight_owner_id":  weight_owner_id,
+                        "shared_owner":     len(legacy_paths) > 1,
+                        "legacy_paths":     legacy_paths,
                         "ext_id":           ext_id,
                         "node_id":          node["id"],
                         "name":             node.get("name", node["id"]),
@@ -660,6 +715,29 @@ def _discover_extensions(
     return result, errors
 
 
+def canonical_model_dir(models_dir: Path, manifest: dict) -> Path:
+    owner_id = manifest.get("weight_owner_id") or manifest.get("id")
+    return models_dir / owner_id
+
+
+def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
+    canonical_dir = canonical_model_dir(models_dir, manifest)
+    if canonical_dir.exists():
+        return canonical_dir
+
+    # Read-through compatibility only: prefer the canonical owner path, then the
+    # first existing legacy alias in manifest order. We do NOT merge aliases or
+    # move files automatically because that could delete valid shared weights.
+    for legacy_path in manifest.get("legacy_paths", [manifest.get("id")]):
+        legacy_dir = models_dir / legacy_path
+        if legacy_dir == canonical_dir:
+            continue
+        if legacy_dir.exists():
+            return legacy_dir
+
+    return canonical_dir
+
+
 # ------------------------------------------------------------------ #
 # GeneratorRegistry
 # ------------------------------------------------------------------ #
@@ -674,6 +752,10 @@ class GeneratorRegistry:
         # calls deliberately skip it: a load can hold it for minutes (first-run
         # downloads happen inside load()), and status must stay responsive.
         self._lifecycle_lock = threading.RLock()
+        # Lock order: lifecycle -> publication. Readers take only publication,
+        # release it before import isolation/extension hooks/IO, and never wait
+        # for lifecycle while holding it. Publication contains host writes only.
+        self._path_publication_lock = threading.Lock()
         self._legacy_imports = _LegacyImportManager()
         self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
 
@@ -703,14 +785,14 @@ class GeneratorRegistry:
                     # Pin the subprocess envelope to the exact registry key;
                     # multi-node workers must never fall back to an extension ID.
                     gen.MODEL_ID    = model_id
-                    gen.model_dir   = MODELS_DIR / model_id
+                    gen.model_dir   = resolve_active_model_dir(MODELS_DIR, manifest)
                     gen.outputs_dir = WORKSPACE_DIR
                 else:
                     # Legacy direct mode
                     if legacy_context is None:
                         raise RuntimeError("legacy import context is missing")
                     with self._legacy_imports.activate(legacy_context):
-                        direct_gen = cls(MODELS_DIR / model_id, WORKSPACE_DIR)
+                        direct_gen = cls(resolve_active_model_dir(MODELS_DIR, manifest), WORKSPACE_DIR)
                     gen = _LegacyGeneratorProxy(
                         direct_gen,
                         self._legacy_imports,
@@ -752,6 +834,30 @@ class GeneratorRegistry:
 
         print(f"[Registry] Active model  : {self._active_id}")
         print(f"[Registry] All models    : {list(self._generators.keys())}")
+
+    def canonical_model_dir(self, model_id: str) -> Path:
+        return canonical_model_dir(MODELS_DIR, {"id": model_id, **self.get_manifest(model_id)})
+
+    def resolve_active_model_dir(self, model_id: str) -> Path:
+        return resolve_active_model_dir(MODELS_DIR, {"id": model_id, **self.get_manifest(model_id)})
+
+    def _rebind_unloaded_model_dir(self, model_id: str, gen: BaseGenerator) -> None:
+        """Called only under the lifecycle lock after confirmed runtime teardown.
+
+        A root is pinned for the runtime lifetime, even after cooperative unload:
+        the runner (and direct adapters) may cache paths in their constructor.
+        Status/getters never retarget a live runtime. Free Memory, scoped unload,
+        registry reload and path updates provide explicit adoption boundaries.
+        """
+        if model_id not in self._manifests:
+            return
+        model_dir = self.resolve_active_model_dir(model_id)
+        if gen.model_dir == model_dir:
+            return
+        if isinstance(gen, _LegacyGeneratorProxy):
+            gen.rebind_unloaded_model_dir(model_dir)
+        else:
+            gen.model_dir = model_dir
 
     def reload(self, validation_capability: object = None) -> None:
         """
@@ -859,8 +965,14 @@ class GeneratorRegistry:
         """
         target_id = model_id or self._active_id
         manifest = self._manifests.get(target_id, {})
+        variants = manifest.get("weight_variants")
+        if variants is None:
+            return
+        # Check the bound execution root, not a newly appeared preferred folder.
+        gen = self.get_generator(target_id)
+        models_dir, model_dir = self._snapshot_model_paths(gen)
         option = missing_weight_variant(
-            MODELS_DIR, target_id, manifest.get("weight_variants"), params
+            models_dir, model_dir.relative_to(models_dir).as_posix(), variants, params
         )
         if option is not None:
             raise RuntimeError(
@@ -912,16 +1024,36 @@ class GeneratorRegistry:
     # Status
     # ------------------------------------------------------------------ #
 
+    def _snapshot_model_paths(self, gen: BaseGenerator) -> Tuple[Path, Path]:
+        """Capture a matching root/target without waiting on model lifecycle."""
+        with self._path_publication_lock:
+            models_dir = MODELS_DIR
+            if isinstance(gen, _LegacyGeneratorProxy):
+                target = object.__getattribute__(gen, "_target")
+            else:
+                # ExtensionProcess is host-owned; this is a plain path field.
+                return models_dir, gen.model_dir
+        # The target stays stable even if its proxy is replaced after capture.
+        # Never acquire import isolation (or call extension code) under the
+        # publication lock: a constructor may itself query registry status.
+        manager = object.__getattribute__(gen, "_manager")
+        context = object.__getattribute__(gen, "_context")
+        with manager.activate(context):
+            return models_dir, target.model_dir
+
     def _is_downloaded(self, model_id: str, gen: BaseGenerator) -> bool:
         manifest = self._manifests[model_id]
+        if "model_sources" not in manifest and not manifest.get("weight_groups"):
+            return gen.is_downloaded()
         private_ready = True
+        models_dir, model_dir = self._snapshot_model_paths(gen)
         if "model_sources" in manifest:
             private_ready = model_sources_are_downloaded(
-                MODELS_DIR, model_id, manifest["model_sources"]
+                models_dir, model_dir.relative_to(models_dir).as_posix(), manifest["model_sources"]
             )
         shared_ready = all(
             weight_group_sources_are_downloaded(
-                MODELS_DIR,
+                models_dir,
                 manifest.get("ext_id", model_id.split("/", 1)[0]),
                 group,
             )
@@ -969,41 +1101,93 @@ class GeneratorRegistry:
 
     def update_paths(self, models_dir: Optional[Path], workspace_dir: Optional[Path]) -> None:
         global MODELS_DIR, WORKSPACE_DIR
-        import services.generator_registry as _self_module
 
         with self._lifecycle_lock:
-            if models_dir is not None:
-                self.unload_all()
-                models_dir.mkdir(parents=True, exist_ok=True)
-                _self_module.MODELS_DIR = models_dir
-                for model_id, gen in self._generators.items():
-                    gen.model_dir = models_dir / model_id
-                    manifest = self._manifests[model_id]
-                    gen.shared_model_dirs = {
-                        group["id"]: resolve_weight_group_root(
-                            models_dir,
-                            manifest.get("ext_id", model_id.split("/", 1)[0]),
-                            group["id"],
-                        )
-                        for group in manifest.get("weight_groups", [])
-                    }
+            if models_dir is None:
+                # Preserve the existing workspace-only update contract.
+                if workspace_dir is not None:
+                    workspace_dir.mkdir(parents=True, exist_ok=True)
+                    WORKSPACE_DIR = workspace_dir
+                    for gen in self._generators.values():
+                        gen.outputs_dir = workspace_dir
+                return
 
+            models_dir.mkdir(parents=True, exist_ok=True)
+            next_workspace = workspace_dir if workspace_dir is not None else WORKSPACE_DIR
             if workspace_dir is not None:
                 workspace_dir.mkdir(parents=True, exist_ok=True)
-                _self_module.WORKSPACE_DIR = workspace_dir
-                for gen in self._generators.values():
-                    gen.outputs_dir = workspace_dir
 
-    def unload_all(self) -> None:
+            # Release runtimes, but do not adopt even an old-root alias yet.
+            # Preparation may fail after earlier adapters succeeded; all old
+            # targets and path metadata must then remain usable (unloaded).
+            self.unload_all(rebind_paths=False)
+            prepared = []
+            # Retain old targets through the critical section so even an
+            # extension finalizer cannot run as a side effect of pointer swaps.
+            retired_targets = []
+            for model_id, gen in self._generators.items():
+                manifest = self._manifests[model_id]
+                model_dir = resolve_active_model_dir(models_dir, {"id": model_id, **manifest})
+                shared_dirs = {
+                    group["id"]: resolve_weight_group_root(
+                        models_dir,
+                        manifest.get("ext_id", model_id.split("/", 1)[0]),
+                        group["id"],
+                    )
+                    for group in manifest.get("weight_groups", [])
+                }
+                if isinstance(gen, _LegacyGeneratorProxy):
+                    retired_targets.append(object.__getattribute__(gen, "_target"))
+                    replacement = gen.prepare_path_replacement(
+                        model_dir, next_workspace, shared_dirs
+                    )
+                    prepared.append((gen, replacement))
+                elif isinstance(gen, ExtensionProcess):
+                    prepared.append((gen, {
+                        "model_dir": model_dir,
+                        "outputs_dir": next_workspace,
+                        "shared_model_dirs": shared_dirs,
+                    }))
+                else:
+                    raise TypeError("Unsupported unwrapped generator during path update")
+
+            # No constructors, extension setters, imports, filesystem work or
+            # fallible path resolution after publication starts. Stable proxies
+            # are preserved; stopped subprocess wrappers receive plain fields.
+            with self._path_publication_lock:
+                for gen, replacement in prepared:
+                    if isinstance(gen, _LegacyGeneratorProxy):
+                        object.__setattr__(gen, "_target", replacement)
+                    else:
+                        gen.__dict__.update(replacement)
+                MODELS_DIR = models_dir
+                WORKSPACE_DIR = next_workspace
+
+    def _unload_generator(
+        self, model_id: str, gen: BaseGenerator, *, rebind_paths: bool = True
+    ) -> bool:
+        if isinstance(gen, ExtensionProcess):
+            # Cooperative unload leaves the constructor and MODEL_DIR alive.
+            gen.stop()
+        else:
+            gen.unload()
+            if gen.is_loaded():
+                return False
+        if rebind_paths:
+            self._rebind_unloaded_model_dir(model_id, gen)
+        return True
+
+    def unload_model(self, model_id: str) -> bool:
+        """Confirm scoped release and adopt preferred storage at this boundary."""
+        with self._lifecycle_lock:
+            return self._unload_generator(model_id, self.get_generator(model_id))
+
+    def unload_all(self, *, rebind_paths: bool = True) -> None:
         with self._lifecycle_lock:
             still_loaded = []
             for model_id, gen in self._generators.items():
-                if isinstance(gen, ExtensionProcess):
-                    gen.stop()
-                else:
-                    gen.unload()
-                    if gen.is_loaded():
-                        still_loaded.append(model_id)
+                if not self._unload_generator(model_id, gen, rebind_paths=rebind_paths):
+                    still_loaded.append(model_id)
             if still_loaded:
                 raise RuntimeError(
                     "Models are still loaded; weights were preserved: "

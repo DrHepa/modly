@@ -6,6 +6,8 @@ import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getHfToken } from './hf-token'
 import type { ModelSource } from './model-sources'
+export { getCanonicalModelPath, getLegacyModelPaths, selectPreferredModelPath } from './model-ownership'
+export type { ModelOwnershipDescriptor, PreferredModelPath } from './model-ownership'
 
 export interface DownloadProgress {
   percent: number

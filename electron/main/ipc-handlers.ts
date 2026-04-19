@@ -20,6 +20,7 @@ import {
 } from './model-downloader'
 import {
   legacyDownloadSteps,
+  privateModelStorageId,
   resolveInstalledExtensionSharedWeightGroups,
   resolveInstalledModelDownloadPlan,
 } from './model-download-plan'
@@ -37,6 +38,7 @@ import {
   resolveWeightStorageRoot,
   weightStorageHasLocalData,
 } from './model-sources'
+import { listDownloadedModelCapabilities } from './model-ownership'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
 import { logger } from './logger'
@@ -216,6 +218,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     builtinExtensionsDir: getBuiltinExtensionsDir(),
     blockedExtensionIds: activeExtensionInstalls,
   })
+  const ownerPeers = (plan: Awaited<ReturnType<typeof resolveModelPlan>>) =>
+    plan.ownership?.legacyPaths.filter((id) => id !== plan.modelId) ?? []
+  const ownerDeleteWarning = (plan: Awaited<ReturnType<typeof resolveModelPlan>>) =>
+    `Delete is owner-scoped for '${plan.ownership?.weightOwnerId}' and still referenced by: ${ownerPeers(plan).join(', ')}`
+  function planDownloaded(modelsDir: string, plan: Awaited<ReturnType<typeof resolveModelPlan>>) {
+    const storageId = privateModelStorageId(modelsDir, plan)
+    if (plan.kind === 'multi-source') {
+      const privateReady = plan.sources.length === 0 || areModelSourcesDownloaded(modelsDir, storageId, plan.sources)
+      return privateReady && plan.sharedGroups.every((group) => areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group))
+    }
+    return isModelDownloaded(modelsDir, storageId, plan.downloadCheck)
+      && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
+  }
   const LOCKED_MODEL_FILES_ERROR = 'Model files are still locked after several attempts. Close any programs using the model and try again.'
   // Logging from renderer
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
@@ -402,21 +417,34 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+  ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }> => {
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Cannot remove model weights while their download is active' }
     }
-    let modelDir: string
+    let targets: string[]
     try {
-      await resolveModelPlan(modelId)
-      modelDir = resolveModelRoot(getSettings(app.getPath('userData')).modelsDir, modelId)
+      const plan = await resolveModelPlan(modelId)
+      if (ownerPeers(plan).length > 0) {
+        const warning = ownerDeleteWarning(plan)
+        return { success: false, error: warning, warning, skipped: true }
+      }
+      const modelsDir = getSettings(app.getPath('userData')).modelsDir
+      targets = [...new Set(plan.ownership
+        ? [plan.ownership.weightOwnerId, ...plan.ownership.legacyPaths]
+        : [modelId])].map((id) => resolveModelRoot(modelsDir, id))
     } catch (err) {
       return { success: false, error: String(err) }
     }
 
     try {
       const removed = await weightOperations.remove(
-        [modelDir], () => unloadForRemoval([modelId]), () => rmWithRetry(modelDir, 'model-delete'),
+        targets, () => unloadForRemoval([modelId]), async (): Promise<Awaited<ReturnType<typeof rmWithRetry>>> => {
+          for (const target of targets) {
+            const result = await rmWithRetry(target, 'model-delete')
+            if (!result.ok) return result
+          }
+          return { ok: true }
+        },
       )
       notifyWeightChange()
       return removed.ok ? { success: true } : {
@@ -433,18 +461,23 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
     try {
       const plan = await resolveModelPlan(modelId)
+      if (ownerPeers(plan).length > 0) return { success: false, error: ownerDeleteWarning(plan) }
       const variant = plan.kind === 'legacy'
         ? plan.weightVariants?.options.find((option) => option.id === variantId)
         : undefined
       if (!variant) throw new Error(`Model node "${modelId}" has no weight variant "${String(variantId)}"`)
       const modelsDir = getSettings(app.getPath('userData')).modelsDir
-      // Reserve the node root (blocks a concurrent download of any of its variants),
-      // unload with confirmation, then list and remove only this variant's files.
+      const storageId = privateModelStorageId(modelsDir, plan)
+      const reservedIds = plan.ownership
+        ? [...new Set([plan.ownership.weightOwnerId, ...plan.ownership.legacyPaths])]
+        : [modelId]
+      // Reserve every alias before unload and pin the selected storage path:
+      // a canonical download must not race deletion from a legacy directory.
       const removed = await weightOperations.remove(
-        [resolveModelRoot(modelsDir, modelId)],
+        reservedIds.map((id) => resolveModelRoot(modelsDir, id)),
         () => unloadForRemoval([modelId]),
         async (): Promise<Awaited<ReturnType<typeof rmWithRetry>>> => {
-          for (const file of await listWeightVariantFiles(modelsDir, modelId, variant)) {
+          for (const file of await listWeightVariantFiles(modelsDir, storageId, variant)) {
             const result = await rmWithRetry(file, 'model-variant-delete')
             if (!result.ok) return result
           }
@@ -459,11 +492,17 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  ipcMain.handle('model:showInFolder', (_, modelId: string) => {
-    const modelDir = join(getSettings(app.getPath('userData')).modelsDir, modelId)
-    if (existsSync(modelDir)) {
-      shell.openPath(modelDir)
+  ipcMain.handle('model:showInFolder', async (_, modelId: string) => {
+    const modelsDir = getSettings(app.getPath('userData')).modelsDir
+    let modelDir: string
+    try {
+      const plan = await resolveModelPlan(modelId)
+      modelDir = resolveModelRoot(modelsDir, privateModelStorageId(modelsDir, plan))
+    } catch {
+      // Preserve exploration of old flat folders even without an installed extension.
+      modelDir = modelId.includes('/') ? resolveModelRoot(modelsDir, modelId) : resolveExtensionModelRoot(modelsDir, modelId)
     }
+    if (existsSync(modelDir)) await shell.openPath(modelDir)
   })
 
   // Read local file → base64 (bypasses file:// restrictions in the renderer)
@@ -478,29 +517,29 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   // Model management
-  ipcMain.handle('model:listDownloaded', () => {
-    const modelsDir = getSettings(app.getPath('userData')).modelsDir
-    return listDownloadedModels(modelsDir)
+  ipcMain.handle('model:listDownloaded', async () => {
+    const settings = getSettings(app.getPath('userData'))
+    const extensions = await listVisibleExtensions({
+      builtinDir: getBuiltinExtensionsDir(), userExtensionsDir: settings.extensionsDir, trustedRepos: new Set(),
+    })
+    const models = extensions.filter((extension) => extension.type === 'model' && !extension.corrupted)
+    if (models.length === 0) return listDownloadedModels(settings.modelsDir)
+    // Directory presence supplies size only, never source/group/variant readiness.
+    const sizes = new Map(listDownloadedModelCapabilities(settings.modelsDir, models).map((candidate) => [candidate.id, candidate.size_gb]))
+    const ready = await Promise.all(models.flatMap((extension) => extension.nodes.map(async (node) => {
+      const id = `${extension.id}/${node.id}`
+      try {
+        return planDownloaded(settings.modelsDir, await resolveModelPlan(id))
+          ? { id, name: node.name, size_gb: sizes.get(id) ?? 0 }
+          : null
+      } catch { return null }
+    })))
+    return ready.filter((candidate) => candidate !== null)
   })
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
-    const modelsDir = getSettings(app.getPath('userData')).modelsDir
     try {
-      const plan = await resolveInstalledModelDownloadPlan({
-        modelId,
-        userExtensionsDir: getSettings(app.getPath('userData')).extensionsDir,
-        builtinExtensionsDir: getBuiltinExtensionsDir(),
-        blockedExtensionIds: activeExtensionInstalls,
-      })
-      if (plan.kind === 'multi-source') {
-        const privateReady = plan.sources.length === 0
-          || areModelSourcesDownloaded(modelsDir, modelId, plan.sources)
-        return privateReady && plan.sharedGroups.every((group) => (
-          areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group)
-        ))
-      }
-      return isModelDownloaded(modelsDir, modelId, plan.downloadCheck)
-        && (!plan.weightVariants || installedWeightVariants(modelsDir, modelId, plan.weightVariants).length > 0)
+      return planDownloaded(getSettings(app.getPath('userData')).modelsDir, await resolveModelPlan(modelId))
     } catch {
       return false
     }
@@ -512,7 +551,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     try {
       const plan = await resolveModelPlan(modelId)
       return plan.kind === 'legacy' && plan.weightVariants
-        ? installedWeightVariants(getSettings(app.getPath('userData')).modelsDir, modelId, plan.weightVariants)
+        ? installedWeightVariants(getSettings(app.getPath('userData')).modelsDir, privateModelStorageId(getSettings(app.getPath('userData')).modelsDir, plan), plan.weightVariants)
         : null
     } catch {
       return null
@@ -521,8 +560,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('model:hasLocalData', async (_, modelId: string): Promise<boolean> => {
     try {
-      await resolveModelPlan(modelId)
-      return modelHasLocalData(getSettings(app.getPath('userData')).modelsDir, modelId)
+      const plan = await resolveModelPlan(modelId)
+      const modelsDir = getSettings(app.getPath('userData')).modelsDir
+      const ids = plan.ownership ? [plan.ownership.weightOwnerId, ...plan.ownership.legacyPaths] : [modelId]
+      return ids.some((id) => modelHasLocalData(modelsDir, id))
     } catch {
       return false
     }
@@ -618,7 +659,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:activeDownloads', () =>
-    [...activeDownloads.entries()].map(([modelId, active]) => ({ modelId, ...active.progress }))
+    [...activeDownloads.entries()].map(([modelId, active]) => ({ capabilityId: modelId, modelId, ...active.progress }))
   )
 
   ipcMain.handle('model:download', async (
@@ -648,6 +689,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
 
     const modelsDir = getSettings(app.getPath('userData')).modelsDir
+    const privateTargetId = plan.ownership?.weightOwnerId ?? modelId
     const allTargets = plan.kind === 'multi-source'
       ? [
           ...plan.sharedGroups.map((group) => ({
@@ -656,7 +698,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             sources: group.sources,
           })),
           ...(plan.sources.length > 0 ? [{
-            targetId: modelId,
+            targetId: privateTargetId,
             label: 'Node-specific',
             sources: plan.sources,
           }] : []),
@@ -664,7 +706,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       : []
     const targetRoots = plan.kind === 'multi-source'
       ? allTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
-      : [resolveModelRoot(modelsDir, modelId)]
+      : [resolveModelRoot(modelsDir, privateTargetId)]
     let release: () => void
     try {
       release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
@@ -683,7 +725,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     try {
       const onProgress = (progress: DownloadProgress) => {
         active.progress = { ...progress, variantId }
-        event.sender.send('model:downloadProgress', { modelId, variantId, ...progress })
+        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, ...progress })
       }
       if (plan.kind === 'multi-source') {
         if (managedTargets.length === 0) {
@@ -708,13 +750,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
         if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
       } else {
-        active.currentTargetId = modelId
+        active.currentTargetId = privateTargetId
         // Shared files and the variant are separate passes sharing one 0-100 bar.
         for (const [index, step] of legacySteps.entries()) {
           if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
           await downloadModelFromHF(
             plan.repoId,
-            modelId,
+            privateTargetId,
             (progress) => onProgress({ ...progress, percent: Math.round((index * 100 + progress.percent) / legacySteps.length) }),
             step.skipPrefixes,
             step.includePrefixes,
@@ -726,11 +768,11 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     } catch (err: any) {
       const message = err?.message ?? String(err)
       if (message.includes('paused')) {
-        event.sender.send('model:downloadProgress', { modelId, variantId, percent: 0, status: 'paused', paused: true })
+        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'paused', paused: true })
         return { success: false, paused: true }
       }
       if (message.includes('cancelled')) {
-        event.sender.send('model:downloadProgress', { modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
+        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
         return { success: false, cancelled: true }
       }
       return { success: false, error: String(err) }
@@ -782,7 +824,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         }
       }
       const roots = active?.targetRoots ?? interruptedTargets.get(modelId) ?? [resolveModelRoot(
-        getSettings(app.getPath('userData')).modelsDir, modelId,
+        getSettings(app.getPath('userData')).modelsDir, (await resolveModelPlan(modelId)).ownership?.weightOwnerId ?? modelId,
       )]
       // Another sibling may have resumed these targets after our session stopped.
       const release = weightOperations.acquire(`cancelling ${modelId}`, roots)

@@ -23,10 +23,23 @@ export interface ExtensionNode {
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
+  capabilityId?:    string
+  bundleId?:        string
+  weightOwnerId?:   string
+  sharedOwner?:     boolean
+  legacyPaths?:     string[]
   hfIncludePrefixes?: string[]
   hasModelSources?: boolean
   weightGroups?:    string[]
   weightVariants?:  WeightVariantsInfo
+}
+
+export interface ModelOwnershipMetadata {
+  capabilityId: string
+  bundleId: string
+  weightOwnerId: string
+  sharedOwner: boolean
+  legacyPaths: string[]
 }
 
 export interface WeightVariantsInfo {
@@ -383,14 +396,14 @@ declare global {
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>
         listDownloaded: () => Promise<{ id: string; name: string; size_gb: number }[]>
-        activeDownloads: () => Promise<{ modelId: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>
+        activeDownloads: () => Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>
         isDownloaded:   (modelId: string) => Promise<boolean>
         hasLocalData:    (modelId: string) => Promise<boolean>
         sharedGroups:    (extensionId: string) => Promise<SharedWeightGroupState[]>
         download:       (modelId: string, variantId?: string) => Promise<{ success: boolean; error?: string; paused?: boolean; cancelled?: boolean }>
         pauseDownload:  (modelId: string) => Promise<{ success: boolean; error?: string }>
         cancelDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
-        delete:         (modelId: string) => Promise<{ success: boolean; error?: string }>
+        delete:         (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
         deleteSharedGroup: (extensionId: string, groupId: string) => Promise<{ success: boolean; error?: string }>
         deleteExtensionWeights: (extensionId: string) => Promise<{ success: boolean; error?: string }>
         /** Installed variant ids, or null when the node's install state could not be read */
@@ -400,6 +413,7 @@ declare global {
         showInFolder:   (modelId: string) => Promise<void>
         onProgress:     (cb: (data: {
           modelId: string
+          capabilityId?: string
           variantId?: string
           percent: number
           file?: string

@@ -1,4 +1,5 @@
 import type { AnyExtension } from '@shared/types/electron.d'
+import type { ModelOwnershipCapabilityState } from '../modelOwnershipState'
 import type { ExtensionNode } from '@shared/types/electron.d'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
@@ -18,6 +19,7 @@ interface Props {
   ext:              AnyExtension
   installedIds:     string[]
   downloading:      DownloadMap
+  ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: ExtensionNode, fullId: string) => void
@@ -28,7 +30,7 @@ interface Props {
 }
 
 export function ExtensionCard({
-  ext, installedIds, downloading, loadError, disabled,
+  ext, installedIds, downloading, ownershipStateById, loadError, disabled,
   onInstall, onInstallAll, onPauseDownload, onCancelDownload, onOpen,
 }: Props): JSX.Element {
   const isModel = ext.type === 'model'
@@ -119,6 +121,7 @@ export function ExtensionCard({
           {ext.nodes.map((node) => {
             const fullId = `${ext.id}/${node.id}`
             const state = getNodeState(ext.id, node, installedIds, downloading)
+            const ownership = ownershipStateById?.[fullId]
             return (
               <div
                 key={node.id}
@@ -132,12 +135,14 @@ export function ExtensionCard({
                     )}
                   </span>
                   <IOBadge node={node} />
+                  {ownership?.sharedOwner && <span className="text-[10px] text-sky-300" title={ownership.warning ?? undefined}>Shared weights</span>}
+                  {ownership?.warning && <p className="text-[10px] text-amber-300 leading-relaxed">{ownership.warning}</p>}
                 </div>
                 {isModel && (
                   <div className="shrink-0">
                     <NodeInstallControl
                       state={state}
-                      disabled={disabled}
+                      disabled={disabled || Boolean(ownership?.isOwnerDownloading && state.kind !== 'downloading')}
                       onInstall={() => onInstall(node, fullId)}
                       onPause={() => onPauseDownload(fullId)}
                       onResume={() => onInstall(node, fullId)}

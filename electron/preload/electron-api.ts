@@ -1,4 +1,4 @@
-import type { ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
@@ -165,10 +165,12 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       deleteWeightVariant: (modelId: string, variantId: string) => ipcRenderer.invoke('model:deleteWeightVariant', modelId, variantId),
       unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
-      activeDownloads: (): Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> =>
-        ipcRenderer.invoke('model:activeDownloads') as Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>,
+      activeDownloads: (): Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> =>
+        ipcRenderer.invoke('model:activeDownloads') as Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>,
       onProgress:     (cb: (data: {
         modelId: string
+        capabilityId?: string
+        variantId?: string
         percent: number
         file?: string
         fileIndex?: number
@@ -182,6 +184,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       }) => void) => {
         ipcRenderer.on('model:downloadProgress', (_event, data) => cb(data as {
           modelId: string
+          capabilityId?: string
+          variantId?: string
           percent: number
           file?: string
           fileIndex?: number
@@ -242,30 +246,30 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
 
     // Extensions
     extensions: {
-      list: (): Promise<unknown[]> =>
-        ipcRenderer.invoke('extensions:list') as Promise<unknown[]>,
+      list: (): Promise<AnyExtension[]> =>
+        ipcRenderer.invoke('extensions:list') as Promise<AnyExtension[]>,
 
       installFromGitHub: (url: string): Promise<{
         success: boolean; error?: string; cancelled?: boolean
         extensionId?: string
-        extension?: unknown
+        extension?: AnyExtension
       }> => ipcRenderer.invoke('extensions:installFromGitHub', url) as Promise<{
         success: boolean; error?: string; cancelled?: boolean
         extensionId?: string
-        extension?: unknown
+        extension?: AnyExtension
       }>,
 
       installFromLocal: (): Promise<{
         success: boolean; error?: string; cancelled?: boolean
         needsRepair?: boolean
         extensionId?: string
-        extension?: unknown
+        extension?: AnyExtension
         localPath?: string
       }> => ipcRenderer.invoke('extensions:installFromLocal') as Promise<{
         success: boolean; error?: string; cancelled?: boolean
         needsRepair?: boolean
         extensionId?: string
-        extension?: unknown
+        extension?: AnyExtension
         localPath?: string
       }>,
 

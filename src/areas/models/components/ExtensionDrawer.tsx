@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { ModelOwnershipCapabilityState } from '../modelOwnershipState'
 import type { AnyExtension, ExtensionNode, SharedWeightGroupState } from '@shared/types/electron.d'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useNavStore } from '@shared/stores/navStore'
@@ -21,6 +22,7 @@ interface Props {
   localDataIds:     string[]
   downloading:      DownloadMap
   sharedGroups:     SharedWeightGroupState[]
+  ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: ExtensionNode, fullId: string, variantId?: string) => void
@@ -37,7 +39,7 @@ interface Props {
 }
 
 export function ExtensionDrawer({
-  ext, installedIds, localDataIds, downloading, sharedGroups, loadError, disabled,
+  ext, installedIds, localDataIds, downloading, sharedGroups, ownershipStateById, loadError, disabled,
   onInstall, onInstallAll, onPauseDownload, onCancelDownload,
   onUninstallNode, onDeleteSharedGroup, onDeleteWeightVariant, onUninstall, onRepaired, onSynced, onClose,
 }: Props): JSX.Element {
@@ -240,6 +242,7 @@ export function ExtensionDrawer({
             <div className="flex flex-col gap-2">
               {ext.nodes.map((node) => {
                 const fullId = `${ext.id}/${node.id}`
+                const ownership = ownershipStateById?.[fullId]
                 const state = getNodeState(ext.id, node, installedIds, downloading)
                 const dl = state.kind === 'downloading' ? state.dl : null
                 const variants = isModel ? node.weightVariants : undefined
@@ -280,8 +283,8 @@ export function ExtensionDrawer({
                             {localDataIds.includes(fullId) && state.kind !== 'downloading' && (
                               <button
                                 onClick={() => onUninstallNode(fullId)}
-                                disabled={disabled || isCorrupted}
-                                title={state.kind === 'installed' ? 'Remove model weights' : 'Remove partial model data'}
+                                disabled={disabled || isCorrupted || ownership?.sharedOwner}
+                                title={ownership?.warning ?? (state.kind === 'installed' ? 'Remove model weights' : 'Remove partial model data')}
                                 className="p-1 rounded-md text-zinc-600 hover:text-red-400 hover:bg-red-950/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -294,6 +297,13 @@ export function ExtensionDrawer({
                         )}
                       </div>
                     </div>
+
+                    {ownership?.sharedOwner && (
+                      <div className="mt-2 text-[11px] text-amber-300 leading-relaxed">
+                        <span className="font-semibold text-sky-300">Shared weights</span>
+                        {ownership.warning && <p>{ownership.warning}</p>}
+                      </div>
+                    )}
 
                     {/* Weight variants — each one installs and deletes on its own */}
                     {variants && (
@@ -331,8 +341,8 @@ export function ExtensionDrawer({
                                 {installed && !dl && (
                                   <button
                                     onClick={() => handleDeleteWeightVariant(fullId, option.id)}
-                                    disabled={disabled || isCorrupted}
-                                    title={`Remove ${option.label} weights`}
+                                    disabled={disabled || isCorrupted || ownership?.sharedOwner}
+                                    title={ownership?.warning ?? `Remove ${option.label} weights`}
                                     className="p-1 rounded-md text-zinc-600 hover:text-red-400 hover:bg-red-950/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                                   >
                                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { describeModelOwnership } from './model-ownership'
 import { join, resolve as resolvePath } from 'path'
 import { readFile, readdir } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
@@ -168,6 +169,7 @@ export type ParsedManifest = {
     model_sources?: unknown
     weight_groups?: unknown
     weight_variants?: unknown
+    weight_owner_id?: string
   }[]
 }
 
@@ -253,7 +255,8 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
   if (weightGroups || parsed.nodes?.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
     validateModelNodeIds(parsed.nodes ?? [])
   }
-  const nodes = (parsed.nodes ?? []).map(n => {
+  const ownership = parsed.type === 'process' ? [] : describeModelOwnership(common.id, parsed.nodes ?? [])
+  const nodes = (parsed.nodes ?? []).map((n, index) => {
     const declaredInputs = Array.isArray(n.inputs) ? n.inputs : [n.input ?? 'image']
     const output = n.output ?? 'mesh'
     assertSupportedSceneNodeShape(parsed.type === 'process' ? 'process' : 'model', n, declaredInputs, output)
@@ -283,6 +286,7 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
       )
     }
     return {
+      ...ownership[index],
       id:             nodeId,
       name:           n.name ?? n.id,
       input:          n.input  ?? 'image' as const,

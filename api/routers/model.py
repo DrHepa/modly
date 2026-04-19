@@ -12,7 +12,6 @@ from fastapi import APIRouter, Header, HTTPException, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse
 from services.generator_registry import generator_registry
 import services.generator_registry as registry_module
-from services.extension_process import ExtensionProcess
 from services.model_sources import (
     normalize_model_sources,
     resolve_download_path,
@@ -114,19 +113,15 @@ async def unload_all_models():
 async def unload_model(model_id: str):
     """Unloads a model from memory so its files can be safely deleted."""
     try:
-        gen = generator_registry.get_generator(model_id)
+        unloaded = await asyncio.to_thread(generator_registry.unload_model, model_id)
     except ValueError as exc:
         if model_id in generator_registry._generators:
             raise HTTPException(409, str(exc)) from exc
         return {"unloaded": True}  # No runtime registered for these files.
-    # unload() on ExtensionProcess deliberately swallows IPC errors; deletion
-    # needs a confirmed process exit so no worker can retain file handles.
-    if isinstance(gen, ExtensionProcess):
-        gen.stop()
-    else:
-        gen.unload()
-        if gen.is_loaded():
-            raise HTTPException(409, "Model is still loaded; weights were preserved")
+    # The registry confirms process exit/direct unload under its lifecycle lock
+    # before adopting a preferred owner root. No status-side retargeting occurs.
+    if not unloaded:
+        raise HTTPException(409, "Model is still loaded; weights were preserved")
     return {"unloaded": True}
 
 
@@ -325,7 +320,10 @@ async def hf_download(
     token = x_hf_token
     import json as _json
     import os
-    dest_dir  = str(registry_module.MODELS_DIR / model_id)
+    try:
+        dest_dir = str(generator_registry.canonical_model_dir(model_id))
+    except KeyError:
+        dest_dir = str(registry_module.MODELS_DIR / model_id)
     # Prefer skip_prefixes passed directly from the client (authoritative, no registry dep)
     if skip_prefixes:
         try:

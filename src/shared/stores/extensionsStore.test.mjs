@@ -47,3 +47,29 @@ test('extension list keeps an interrupted model in the model store with recovery
   assert.deepEqual(result.modelExtensions, [pendingModel])
   assert.deepEqual(result.processExtensions, [processExtension])
 })
+
+test('ownership refresh composes with installed variants and does not replace extension metadata', async (t) => {
+  const { useExtensionsStore } = loadModule()
+  const extension = {
+    type: 'model', id: 'bundle', name: 'Bundle', trusted: false, builtin: false,
+    nodes: ['a', 'b'].map((id) => ({
+      id, name: id, hfRepo: 'org/base', capabilityId: `bundle/${id}`, bundleId: 'bundle',
+      weightOwnerId: 'bundle/private', sharedOwner: true, legacyPaths: ['bundle/a', 'bundle/b'],
+      weightVariants: { param: 'quant', default: 'Q4', options: [{ id: 'Q4', label: 'Q4' }] },
+      inputs: ['image', 'text'], inputLabels: ['Photo', 'Prompt'], paramDefaults: { enabled: false },
+    })),
+  }
+  const original = globalThis.window
+  t.after(() => { globalThis.window = original })
+  globalThis.window = { electron: {
+    extensions: { list: async () => [extension] },
+    model: { isDownloaded: async (id) => id === 'bundle/b', installedWeightVariants: async () => ['Q4'] },
+  } }
+  await useExtensionsStore.getState().loadExtensions()
+  const state = useExtensionsStore.getState()
+  assert.deepEqual(state.readyOwnerIds, ['bundle/private'])
+  assert.deepEqual(state.installedWeightVariants, { 'bundle/a': ['Q4'], 'bundle/b': ['Q4'] })
+  assert.deepEqual(state.modelExtensions, [extension])
+  assert.deepEqual(state.modelExtensions[0].nodes[0].inputs, ['image', 'text'])
+  assert.deepEqual(state.modelExtensions[0].nodes[0].paramDefaults, { enabled: false })
+})

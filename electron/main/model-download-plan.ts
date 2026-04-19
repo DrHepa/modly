@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { describeModelOwnership, type ModelOwnershipDescriptor } from './model-ownership'
 
 import {
   EXT_INCOMPLETE_MARKER,
@@ -15,6 +16,7 @@ import {
   normalizeWeightVariants,
   validateModelNodeIds,
   safeModelSourceId,
+  resolveModelRoot,
   weightGroupTargetId,
   type ModelSource,
   type ModelWeightGroup,
@@ -23,6 +25,7 @@ import {
 
 interface InstalledNode {
   id?: unknown
+  weight_owner_id?: unknown
   hf_repo?: unknown
   download_check?: unknown
   hf_skip_prefixes?: unknown
@@ -47,7 +50,7 @@ export interface InstalledSharedWeightGroup extends ModelWeightGroup {
   dependentModelIds: string[]
 }
 
-export type InstalledModelDownloadPlan = {
+export type InstalledModelDownloadPlan = { ownership?: ModelOwnershipDescriptor } & ({
   kind: 'legacy'
   modelId: string
   extensionId: string
@@ -64,6 +67,16 @@ export type InstalledModelDownloadPlan = {
   nodeId: string
   sources: ModelSource[]
   sharedGroups: InstalledSharedWeightGroup[]
+})
+
+/** Read-through only. Downloads always target the canonical owner instead. */
+export function privateModelStorageId(modelsDir: string, plan: InstalledModelDownloadPlan): string {
+  if (!plan.ownership) return plan.modelId
+  const { weightOwnerId, legacyPaths } = plan.ownership
+  for (const id of [weightOwnerId, ...legacyPaths]) {
+    if (existsSync(resolveModelRoot(modelsDir, id))) return id
+  }
+  return weightOwnerId
 }
 
 async function hasPendingRegistration(root: string, extensionId: string): Promise<boolean> {
@@ -143,6 +156,9 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
 
   const node = matches[0]
   const modelId = `${extensionId}/${nodeId}`
+  const ownership = nodes.some((candidate) => candidate.weight_owner_id !== undefined)
+    ? describeModelOwnership(extensionId, nodes).find((candidate) => candidate.capabilityId === modelId)
+    : undefined
   const weightVariants = normalizeWeightVariants(node, node.params_schema ?? manifest.params_schema)
   const sources = normalizeModelSources(node)
   const refs = normalizeWeightGroupReferences(
@@ -158,6 +174,7 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
       throw new Error(`Model node "${modelId}" must use model_sources for private weights when weight_groups are declared`)
     }
     return {
+      ...(ownership ? { ownership } : {}),
       kind: 'multi-source',
       modelId,
       extensionId,
@@ -171,6 +188,7 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
     throw new Error(`Model node "${modelId}" has no Hugging Face download source`)
   }
   return {
+    ...(ownership ? { ownership } : {}),
     kind: 'legacy',
     modelId,
     extensionId,

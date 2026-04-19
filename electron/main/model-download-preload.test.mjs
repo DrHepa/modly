@@ -62,3 +62,25 @@ test('UI exposes partial-data removal and dependent-node warnings', () => {
   assert.match(drawer, /Remove partial model data/)
   assert.match(drawer, /following nodes will become unavailable/)
 })
+
+test('owner progress preserves capability, variant and cancellation metadata through the factory', async () => {
+  const { createElectronApi } = loadModule()
+  const calls = [], listeners = new Map()
+  const ipc = {
+    invoke: async (...args) => { calls.push(args); return { success: true } },
+    send: () => {}, on: (channel, fn) => listeners.set(channel, fn), removeAllListeners: () => {},
+  }
+  const api = createElectronApi(ipc, { setZoomFactor: () => {} }, { getPathForFile: () => '' })
+  let received
+  api.model.onProgress((data) => { received = data })
+  const payload = { capabilityId: 'bundle/a', modelId: 'bundle/a', variantId: 'Q4', percent: 20,
+    bytesDownloaded: 200, totalBytes: 1000, stalledSeconds: 1, paused: true, cancelled: false }
+  listeners.get('model:downloadProgress')(null, payload)
+  assert.deepEqual(received, payload)
+  await api.model.download('bundle/a', 'Q4')
+  await api.model.pauseDownload('bundle/a')
+  await api.model.cancelDownload('bundle/a')
+  assert.deepEqual(calls, [
+    ['model:download', 'bundle/a', 'Q4'], ['model:pauseDownload', 'bundle/a'], ['model:cancelDownload', 'bundle/a'],
+  ])
+})

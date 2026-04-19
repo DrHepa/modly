@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '../../areas/models/modelOwnershipState'
 import type { ModelExtension, ProcessExtension, AnyExtension } from '@shared/types/electron.d'
 
 // ─── Re-exports for consumers ─────────────────────────────────────────────────
@@ -20,6 +21,8 @@ export interface InstallProgress {
 interface ExtensionsStore {
   modelExtensions:   ModelExtension[]
   processExtensions: ProcessExtension[]
+  readyOwnerIds: string[]
+  refreshModelOwnership: (extensions?: ModelExtension[]) => Promise<void>
   loading:           boolean
   installProgress:   InstallProgress | null
   installError:      string | null
@@ -53,6 +56,7 @@ export function partitionExtensionsByType(list: AnyExtension[]): {
 export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   modelExtensions:   [],
   processExtensions: [],
+  readyOwnerIds: [],
   loading:           false,
   installProgress:   null,
   installError:      null,
@@ -70,10 +74,23 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
         ...extensions,
         loading:           false,
       })
-      await get().refreshInstalledWeightVariants()
+      await Promise.all([get().refreshInstalledWeightVariants(), get().refreshModelOwnership()])
     } catch {
       set({ loading: false })
     }
+  },
+
+  async refreshModelOwnership(extensions) {
+    const currentExtensions = get().modelExtensions
+    const modelExtensions = extensions ?? currentExtensions
+    const metadata = collectModelOwnershipMetadata(modelExtensions)
+    const ready = await Promise.all(metadata.map(async (capability) => {
+      try { return await window.electron.model.isDownloaded(capability.capabilityId) ? capability.capabilityId : null }
+      catch { return null }
+    }))
+    // Ignore stale results if an install/uninstall replaced the model list.
+    if (currentExtensions !== get().modelExtensions) return
+    set({ readyOwnerIds: collectReadyOwnerIds(metadata, ready.filter((id): id is string => id !== null)) })
   },
 
   async refreshInstalledWeightVariants() {
@@ -97,7 +114,9 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Install from GitHub ────────────────────────────────────────────────────
 
   async installFromGitHub(url: string) {
-    return installExtension(() => window.electron.extensions.installFromGitHub(url), set)
+    const result = await installExtension(() => window.electron.extensions.installFromGitHub(url), set)
+    await get().refreshModelOwnership()
+    return result
   },
 
   // ── Install from local folder ──────────────────────────────────────────────
@@ -109,6 +128,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
       set({ installProgress: null, installError: null })
       return { success: false, cancelled: true }
     }
+    await get().refreshModelOwnership()
     return result
   },
 
@@ -122,6 +142,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
         processExtensions: state.processExtensions.filter((e) => e.id !== extensionId),
       }))
     }
+    await get().refreshModelOwnership()
     return result
   },
 

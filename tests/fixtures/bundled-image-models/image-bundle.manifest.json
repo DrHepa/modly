@@ -1,0 +1,28 @@
+{
+  "id": "image-bundle",
+  "displayName": "Image Bundle",
+  "generator_class": "DummyGenerator",
+  "type": "model",
+  "nodes": [
+    {
+      "id": "sd15",
+      "name": "SD 1.5",
+      "hf_repo": "acme/sd15",
+      "download_check": "weights/model.safetensors",
+      "weight_owner_id": "shared-base"
+    },
+    {
+      "id": "sdxl-base",
+      "name": "SDXL Base",
+      "hf_repo": "acme/sdxl-base",
+      "download_check": "weights/model.safetensors",
+      "weight_owner_id": "shared-base"
+    },
+    {
+      "id": "flux-schnell",
+      "name": "Flux Schnell",
+      "hf_repo": "acme/flux-schnell",
+      "download_check": "weights/model.safetensors"
+    }
+  ]
+}

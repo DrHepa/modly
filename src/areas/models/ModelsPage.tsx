@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
+import { collectModelOwnershipMetadata, collectReadyOwnerIds, deriveModelOwnershipState } from './modelOwnershipState'
 import { useNavStore } from '@shared/stores/navStore'
 import type { AnyExtension, ModelExtension, SharedWeightGroupState } from '@shared/types/electron.d'
 import { deleteModelsThenUninstallExtension, formatModelName, installModelAndRefresh, installModelQueue } from './utils'
@@ -53,6 +54,14 @@ export default function ModelsPage(): JSX.Element {
   const [localDataIds, setLocalDataIds] = useState<string[]>([])
   const [sharedGroupStates, setSharedGroupStates] = useState<Record<string, SharedWeightGroupState[]>>({})
   const [downloading, setDownloading] = useState<DownloadMap>({})
+
+  const ownershipStateById = useMemo(() => {
+    const metadata = collectModelOwnershipMetadata(modelExtensions)
+    const downloadingOwners = new Set(metadata
+      .filter((capability) => downloading[capability.capabilityId] && !downloading[capability.capabilityId].paused)
+      .map((capability) => capability.weightOwnerId))
+    return deriveModelOwnershipState(metadata, new Set(collectReadyOwnerIds(metadata, installedNodeIds)), downloadingOwners, new Set(installedNodeIds))
+  }, [modelExtensions, installedNodeIds, downloading])
 
   // Uninstall modal state
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
@@ -109,7 +118,7 @@ export default function ModelsPage(): JSX.Element {
     setInstalledNodeIds(ids)
     setLocalDataIds(localIds)
     setSharedGroupStates(sharedStates)
-    await useExtensionsStore.getState().refreshInstalledWeightVariants()
+    await Promise.all([useExtensionsStore.getState().refreshInstalledWeightVariants(), useExtensionsStore.getState().refreshModelOwnership()])
   }
 
   useEffect(() => {
@@ -233,7 +242,8 @@ export default function ModelsPage(): JSX.Element {
   }
 
   async function handleUninstallNode(fullId: string) {
-    await window.electron.model.delete(fullId)
+    const result = await window.electron.model.delete(fullId)
+    if (!result.success || result.warning) setGhErr(result.warning ?? result.error ?? 'Could not remove model weights')
     refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
   }
 
@@ -283,7 +293,7 @@ export default function ModelsPage(): JSX.Element {
     if (ext?.type === 'model') {
       const localModels = ext.nodes.filter((n) => localDataIds.includes(`${extId}/${n.id}`))
       const hasSharedLocalData = (sharedGroupStates[extId] ?? []).some((group) => group.hasLocalData)
-      setModelsToDelete(ext.weightGroups?.length && (localModels.length > 0 || hasSharedLocalData)
+      setModelsToDelete((ext.weightGroups?.length || ext.nodes.some((node) => node.sharedOwner)) && (localModels.length > 0 || hasSharedLocalData)
         ? new Set([`${extId}/*`])
         : new Set(localModels.map((n) => `${extId}/${n.id}`)))
     } else {
@@ -371,6 +381,7 @@ export default function ModelsPage(): JSX.Element {
   }
 
   const cardHandlers = {
+    ownershipStateById,
     installedIds: installedNodeIds,
     downloading,
     disabled: isBusy,
@@ -680,6 +691,7 @@ export default function ModelsPage(): JSX.Element {
           localDataIds={localDataIds}
           downloading={downloading}
           sharedGroups={sharedGroupStates[selectedExt.id] ?? []}
+          ownershipStateById={ownershipStateById}
           loadError={extLoadError(selectedExt)}
           disabled={isBusy}
           onInstall={handleInstallNode}
@@ -702,7 +714,7 @@ export default function ModelsPage(): JSX.Element {
         const installedModels = ext?.type === 'model'
           ? ext.nodes.filter((n) => localDataIds.includes(`${uninstallTarget}/${n.id}`))
           : []
-        const sharedExtensionHasData = ext?.type === 'model' && Boolean(ext.weightGroups?.length) && (
+        const sharedExtensionHasData = ext?.type === 'model' && Boolean(ext.weightGroups?.length || ext.nodes.some((node) => node.sharedOwner)) && (
           installedModels.length > 0
           || (sharedGroupStates[uninstallTarget] ?? []).some((group) => group.hasLocalData)
         )

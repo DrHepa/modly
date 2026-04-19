@@ -1,0 +1,13 @@
+{
+  "id": "mesh-process",
+  "type": "process",
+  "entry": "processor.js",
+  "source": "https://example.com/process",
+  "nodes": [
+    {
+      "id": "clean",
+      "input": "mesh",
+      "output": "mesh"
+    }
+  ]
+}

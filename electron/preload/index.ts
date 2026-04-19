@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AnyExtension, ProcessInput } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallProgress, ExtensionInstallResult, ProcessInput } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 
 // Expose a typed API to the renderer process via window.electron
@@ -136,11 +136,7 @@ contextBridge.exposeInMainWorld('electron', {
     list: (): Promise<AnyExtension[]> =>
       ipcRenderer.invoke('extensions:list'),
 
-    installFromGitHub: (url: string): Promise<{
-      success: boolean; error?: string
-      extensionId?: string
-      extension?: AnyExtension
-    }> => ipcRenderer.invoke('extensions:installFromGitHub', url),
+    installFromGitHub: (url: string): Promise<ExtensionInstallResult> => ipcRenderer.invoke('extensions:installFromGitHub', url),
 
     uninstall: (extensionId: string): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('extensions:uninstall', extensionId),
@@ -158,12 +154,7 @@ contextBridge.exposeInMainWorld('electron', {
     ): Promise<{ success: boolean; result?: { filePath?: string; text?: string }; error?: string }> =>
       invokeExtensionsRunProcess(ipcRenderer.invoke.bind(ipcRenderer), extensionId, input, params),
 
-    onInstallProgress: (cb: (data: {
-      step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'
-      percent?: number
-      extensionId?: string
-      message?: string
-    }) => void) => {
+    onInstallProgress: (cb: (data: ExtensionInstallProgress) => void) => {
       ipcRenderer.on('extensions:installProgress', (_event, data) => cb(data))
     },
     offInstallProgress: () => ipcRenderer.removeAllListeners('extensions:installProgress'),

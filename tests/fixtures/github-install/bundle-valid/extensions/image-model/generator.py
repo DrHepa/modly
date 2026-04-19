@@ -1,0 +1,2 @@
+class ImageModel:
+    pass

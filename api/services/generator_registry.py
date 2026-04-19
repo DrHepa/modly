@@ -418,7 +418,7 @@ def _consume_registration_validation_capability(
 
 def _discover_extensions(
     legacy_imports: _LegacyImportManager,
-    registration_authorization: Optional[RegistrationValidationAuthorization] = None,
+    registration_authorization: Tuple[RegistrationValidationAuthorization, ...] = (),
 ) -> Tuple[
     Dict[str, Tuple[type, dict, Path, Optional[_LegacyImportContext]]],
     Dict[str, str],
@@ -555,14 +555,14 @@ def _discover_extensions(
                 or (
                     _registration_pending(ext_id)
                     and not (
-                        registration_authorization is not None
-                        and registration_authorization[0] == ext_id
-                        and registration_authorization[1].exists()
+                        any(authorization[0] == ext_id
+                        and authorization[1].exists()
                         # Normalize like the capability's destination (resolved
                         # root + name): EXTENSIONS_DIR may be a Windows 8.3 short
                         # path. The extension folder itself is not resolved.
-                        and registration_authorization[2]
+                        and authorization[2]
                         == Path(os.path.abspath(ext_dir.parent.resolve() / ext_dir.name))
+                        for authorization in registration_authorization)
                     )
                 )
             )
@@ -761,7 +761,7 @@ class GeneratorRegistry:
 
     def initialize(
         self,
-        registration_authorization: Optional[RegistrationValidationAuthorization] = None,
+        registration_authorization: Tuple[RegistrationValidationAuthorization, ...] = (),
     ) -> None:
         """Discovers and instantiates all extensions. Call at startup."""
         extensions, discovery_errors = _discover_extensions(
@@ -864,8 +864,12 @@ class GeneratorRegistry:
         Re-scans extensions and updates the registry without restarting FastAPI.
         Unloads all current generators before reloading.
         """
-        registration_authorization = _consume_registration_validation_capability(
-            validation_capability,
+        # Each child still needs its own exact, single-use host capability.
+        # Invalid/replayed siblings never inherit another child's authorization.
+        capabilities = validation_capability if isinstance(validation_capability, list) else [validation_capability]
+        registration_authorization = tuple(
+            authorization for capability in capabilities
+            if (authorization := _consume_registration_validation_capability(capability)) is not None
         )
         with self._lifecycle_lock:
             print("[Registry] Reloading extensions...")

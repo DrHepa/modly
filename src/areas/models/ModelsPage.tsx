@@ -27,6 +27,111 @@ const SORTS: { id: SortId; label: string }[] = [
   { id: 'type', label: 'Type' },
 ]
 
+type InstallBannerTone = 'success' | 'warning' | 'error'
+
+type GitHubInstallBannerModel = {
+  tone: InstallBannerTone
+  title: string
+  message?: string
+  failures?: string[]
+}
+
+export function GitHubRepoHelpCopy(): JSX.Element {
+  return (
+    <>
+      Supports a legacy root repo with <span className="font-mono text-zinc-500">manifest.json</span> and its model generator or process entry, or a bundled repo with child extensions under <span className="font-mono text-zinc-500">extensions/*</span>.
+    </>
+  )
+}
+
+export function GitHubInstallStatusBanner({
+  installResult,
+  ghErr,
+}: {
+  installResult: {
+    success: boolean
+    status?: 'success' | 'partial' | 'error'
+    installed?: Array<{ extensionId: string }>
+    failed?: Array<{ extensionId: string; error: string }>
+    warnings?: string[]
+    error?: string
+  } | null
+  ghErr: string | null
+}): JSX.Element | null {
+  const banner = buildGitHubInstallBannerModel(installResult, ghErr)
+
+  if (!banner) return null
+
+  const toneClasses: Record<InstallBannerTone, string> = {
+    success: 'bg-emerald-950/30 border-emerald-800/30 text-emerald-400',
+    warning: 'bg-amber-950/20 border-amber-900/30 text-amber-300',
+    error: 'bg-red-950/30 border-red-800/30 text-red-400',
+  }
+
+  return (
+    <div className={`flex flex-col gap-2 px-3 py-2 rounded-lg border ${toneClasses[banner.tone]}`}>
+      <p className="text-[11px] font-semibold">{banner.title}</p>
+      {banner.message && <p className="text-[11px]">{banner.message}</p>}
+      {banner.failures && banner.failures.length > 0 && (
+        <ul className="list-disc pl-4 text-[10px] space-y-1">
+          {banner.failures.map((failure) => (
+            <li key={failure}>{failure}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function buildGitHubInstallBannerModel(
+  installResult: {
+    success: boolean
+    status?: 'success' | 'partial' | 'error'
+    installed?: Array<{ extensionId: string }>
+    failed?: Array<{ extensionId: string; error: string }>
+    warnings?: string[]
+    error?: string
+  } | null,
+  ghErr: string | null,
+): GitHubInstallBannerModel | null {
+  if (!installResult && !ghErr) return null
+
+  const installedCount = installResult?.installed?.length ?? 0
+  const failed = installResult?.failed ?? []
+  const failedCount = failed.length
+  const totalChildren = installedCount + failedCount
+
+  if (installResult?.status === 'partial') {
+    return {
+      tone: 'warning',
+      title: `Installed ${installedCount} of ${totalChildren} extensions from this repo.`,
+      message: failedCount ? `${failedCount} ${failedCount === 1 ? 'child failed.' : 'children failed.'}` : 'Installation completed with warnings.',
+      failures: [...failed.map((entry) => `${entry.extensionId}: ${entry.error}`), ...(installResult.warnings ?? [])],
+    }
+  }
+
+  if (installResult?.success) {
+    if (installedCount === 1 && failedCount === 0) {
+      return {
+        tone: 'success',
+        title: 'Extension installed successfully!',
+      }
+    }
+
+    return {
+      tone: 'success',
+      title: `Installed ${installedCount} extensions from this repo.`,
+      message: `${installedCount} of ${totalChildren} children are ready.`,
+    }
+  }
+
+  return {
+    tone: 'error',
+    title: 'No extensions completed installation.',
+    message: ghErr ?? installResult?.error ?? 'Installation failed',
+  }
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function ModelsPage(): JSX.Element {
@@ -36,6 +141,7 @@ export default function ModelsPage(): JSX.Element {
   const extLoading        = useExtensionsStore((s) => s.loading)
   const installProgress   = useExtensionsStore((s) => s.installProgress)
   const installError      = useExtensionsStore((s) => s.installError)
+  const installResult     = useExtensionsStore((s) => s.installResult)
   const loadErrors        = useExtensionsStore((s) => s.loadErrors)
   const loadExtensions    = useExtensionsStore((s) => s.loadExtensions)
   const installFromGH     = useExtensionsStore((s) => s.installFromGitHub)
@@ -268,10 +374,11 @@ export default function ModelsPage(): JSX.Element {
     setGhErr(null)
     clearInstall()
     const result = await installFromGH(url)
-    if (result.success) {
+    // Partial outcomes must keep their only failure/warning banner visible.
+    if (result.success && (result.status === undefined || result.status === 'success')) {
       setShowGHForm(false)
       setGhUrl('')
-    } else {
+    } else if (!result.success) {
       setGhErr(result.error ?? 'Installation failed')
     }
   }
@@ -589,26 +696,10 @@ export default function ModelsPage(): JSX.Element {
               </div>
             )}
 
-            {installProgress?.step === 'done' && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-950/30 border border-emerald-800/30">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="text-emerald-400 shrink-0">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-                <p className="text-[11px] text-emerald-400">Extension installed successfully!</p>
-              </div>
-            )}
-
-            {ghErr && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-950/30 border border-red-800/30">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
-                  <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                </svg>
-                <p className="text-[11px] text-red-400">{ghErr}</p>
-              </div>
-            )}
+            <GitHubInstallStatusBanner installResult={installResult} ghErr={ghErr} />
 
             <p className="text-[10px] text-zinc-600">
-              The repo must contain a <span className="font-mono text-zinc-500">manifest.json</span> and a <span className="font-mono text-zinc-500">generator.py</span> at its root.
+              <GitHubRepoHelpCopy />
             </p>
           </div>
         </div>

@@ -1,0 +1,13 @@
+{
+  "id": "image-model",
+  "type": "model",
+  "source": "https://example.com/model",
+  "generator_class": "ImageModel",
+  "nodes": [
+    {
+      "id": "generate",
+      "input": "image",
+      "output": "mesh"
+    }
+  ]
+}

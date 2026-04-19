@@ -55,6 +55,11 @@ class ExtensionReloadRouteTests(unittest.TestCase):
 
         self.assertEqual(self.registry.reload_calls, [capability])
 
+    def test_batch_capabilities_are_forwarded_in_one_reload(self) -> None:
+        capabilities = [{"extensionId": "first"}, {"extensionId": "second"}]
+        asyncio.run(reload_extensions({"validationCapabilities": capabilities}))
+        self.assertEqual(self.registry.reload_calls, [capabilities])
+
 
 if __name__ == "__main__":
     unittest.main()

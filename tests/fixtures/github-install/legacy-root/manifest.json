@@ -1,0 +1,13 @@
+{
+  "id": "legacy-root-model",
+  "type": "model",
+  "source": "https://example.com/not-canonical",
+  "generator_class": "LegacyRootModel",
+  "nodes": [
+    {
+      "id": "generate-mesh",
+      "input": "image",
+      "output": "mesh"
+    }
+  ]
+}

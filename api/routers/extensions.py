@@ -20,8 +20,8 @@ async def reload_extensions(payload: dict | None = Body(default=None)):
     from services.generator_registry import generator_registry
     validation_capability = None
     if isinstance(payload, dict):
-        candidate = payload.get("validationCapability")
-        if isinstance(candidate, dict):
+        candidate = payload.get("validationCapabilities", payload.get("validationCapability"))
+        if isinstance(candidate, (dict, list)):
             validation_capability = candidate
     # Off the event loop: reload waits for any in-progress model load.
     await asyncio.to_thread(generator_registry.reload, validation_capability)

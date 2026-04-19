@@ -1,0 +1,12 @@
+{
+  "id": "shared-id",
+  "type": "model",
+  "generator_class": "FirstModel",
+  "nodes": [
+    {
+      "id": "generate",
+      "input": "image",
+      "output": "mesh"
+    }
+  ]
+}

@@ -663,6 +663,18 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pending runtime registration"):
             self.registry.get_active()
 
+    def test_batch_capabilities_validate_all_children_without_bypassing_invalid_siblings(self) -> None:
+        first = self._make_loadable_pending_extension("batch-first")
+        second = self._make_loadable_pending_extension("batch-second")
+        invalid = self._make_loadable_pending_extension("batch-invalid")
+        invalid["token"] = "x" * 43
+        self.registry.reload([first, second, invalid])
+        self.assertEqual(set(self.registry._generators), {"batch-first/generate", "batch-second/generate"})
+        self.assertIn("batch-invalid/generate", self.registry.load_errors())
+        self.registry.reload([first, second])
+        self.assertNotIn("batch-first/generate", self.registry._generators)
+        self.assertNotIn("batch-second/generate", self.registry._generators)
+
     def test_valid_capability_authorizes_exact_pending_extension_once(self) -> None:
         capability = self._make_loadable_pending_extension("pending-update")
 

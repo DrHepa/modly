@@ -1,0 +1,12 @@
+{
+  "id": "broken-model",
+  "type": "model",
+  "generator_class": "BrokenModel",
+  "nodes": [
+    {
+      "id": "generate",
+      "input": "image",
+      "output": "mesh"
+    }
+  ]
+}

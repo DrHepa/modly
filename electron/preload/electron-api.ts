@@ -1,4 +1,4 @@
-import type { AnyExtension, ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
@@ -249,15 +249,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       list: (): Promise<AnyExtension[]> =>
         ipcRenderer.invoke('extensions:list') as Promise<AnyExtension[]>,
 
-      installFromGitHub: (url: string): Promise<{
-        success: boolean; error?: string; cancelled?: boolean
-        extensionId?: string
-        extension?: AnyExtension
-      }> => ipcRenderer.invoke('extensions:installFromGitHub', url) as Promise<{
-        success: boolean; error?: string; cancelled?: boolean
-        extensionId?: string
-        extension?: AnyExtension
-      }>,
+      installFromGitHub: (url: string): Promise<ExtensionInstallResult> =>
+        ipcRenderer.invoke('extensions:installFromGitHub', url) as Promise<ExtensionInstallResult>,
 
       installFromLocal: (): Promise<{
         success: boolean; error?: string; cancelled?: boolean
@@ -289,18 +282,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       ): Promise<{ success: boolean; result?: { filePath?: string; text?: string }; error?: string }> =>
         invokeExtensionsRunProcess((...args) => ipcRenderer.invoke(...args) as Promise<{ success: boolean; result?: ProcessResult; error?: string }>, extensionId, input, params),
 
-      onInstallProgress: (cb: (data: {
-        step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'
-        percent?: number
-        extensionId?: string
-        message?: string
-      }) => void) => {
-        ipcRenderer.on('extensions:installProgress', (_event, data) => cb(data as {
-          step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'
-          percent?: number
-          extensionId?: string
-          message?: string
-        }))
+      onInstallProgress: (cb: (data: ExtensionInstallProgress) => void) => {
+        ipcRenderer.on('extensions:installProgress', (_event, data) => cb(data as ExtensionInstallProgress))
       },
       offInstallProgress: () => ipcRenderer.removeAllListeners('extensions:installProgress'),
     },

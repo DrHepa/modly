@@ -189,6 +189,41 @@ export interface ProcessExtension {
 
 export type AnyExtension = ModelExtension | ProcessExtension
 
+export type ExtensionInstallStatus = 'success' | 'partial' | 'error'
+export type ExtensionInstallFailureStage = 'download' | 'extract' | 'validate' | 'commit' | 'setup' | 'npm' | 'reload' | string
+
+export interface InstalledExtensionResult {
+  extensionId: string
+  extension: AnyExtension
+  status: Extract<ExtensionInstallStatus, 'success' | 'partial'>
+}
+
+export interface FailedExtensionResult {
+  extensionId: string
+  stage: ExtensionInstallFailureStage
+  error: string
+}
+
+export interface ExtensionInstallResult {
+  success: boolean
+  status?: ExtensionInstallStatus
+  installed?: InstalledExtensionResult[]
+  failed?: FailedExtensionResult[]
+  warnings?: string[]
+  reloaded?: boolean
+  error?: string
+  extensionId?: string
+  extension?: AnyExtension
+}
+
+export interface ExtensionInstallProgress extends Partial<ExtensionInstallResult> {
+  step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'child_result' | 'done' | 'error'
+  percent?: number
+  message?: string
+  completedChildren?: number
+  totalChildren?: number
+}
+
 // ─── Process runner types ─────────────────────────────────────────────────────
 
 export interface ProcessInput {
@@ -490,13 +525,7 @@ declare global {
       }
       extensions: {
         list:              () => Promise<AnyExtension[]>
-        installFromGitHub: (url: string) => Promise<{
-          success:      boolean
-          error?:       string
-          cancelled?:   boolean
-          extensionId?: string
-          extension?:   AnyExtension
-        }>
+        installFromGitHub: (url: string) => Promise<ExtensionInstallResult>
         installFromLocal:  () => Promise<{
           success:      boolean
           error?:       string
@@ -510,12 +539,7 @@ declare global {
         repair:      (extensionId: string) => Promise<{ success: boolean; error?: string }>
         reload:      () => Promise<{ success: boolean; error?: string; errors?: Record<string, string> }>
         runProcess:  (extensionId: string, input: ProcessInput, params: Record<string, unknown>) => Promise<{ success: boolean; result?: ProcessResult; error?: string }>
-        onInstallProgress: (cb: (data: {
-          step:          'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'
-          percent?:      number
-          extensionId?:  string
-          message?:      string
-        }) => void) => void
+        onInstallProgress: (cb: (data: ExtensionInstallProgress) => void) => void
         offInstallProgress: () => void
       }
     }

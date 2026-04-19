@@ -21,7 +21,19 @@ export interface ExtensionNode {
   hfRepo?:          string
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
-  hfIncludePrefixes?: string[]
+  capabilityId?:    string
+  bundleId?:        string
+  weightOwnerId?:   string
+  sharedOwner?:     boolean
+  legacyPaths?:     string[]
+}
+
+export interface ModelOwnershipMetadata {
+  capabilityId: string
+  bundleId: string
+  weightOwnerId: string
+  sharedOwner: boolean
+  legacyPaths: string[]
 }
 
 export interface ProcessPort {
@@ -346,27 +358,12 @@ declare global {
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>
         listDownloaded: () => Promise<{ id: string; name: string; size_gb: number }[]>
-        activeDownloads: () => Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>
-        isDownloaded:   (modelId: string, downloadCheck?: string) => Promise<boolean>
-        download:       (repoId: string, modelId: string, skipPrefixes?: string[], includePrefixes?: string[]) => Promise<{ success: boolean; error?: string }>
-        pauseDownload:  (modelId: string) => Promise<{ success: boolean; error?: string }>
-        cancelDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
-        delete:         (modelId: string) => Promise<{ success: boolean; error?: string }>
+        isDownloaded:   (modelId: string) => Promise<boolean>
+        download:       (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<{ success: boolean; error?: string }>
+        delete:         (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
-        onProgress:     (cb: (data: {
-          modelId: string
-          percent: number
-          file?: string
-          fileIndex?: number
-          totalFiles?: number
-          status?: string
-          bytesDownloaded?: number
-          totalBytes?: number
-          stalledSeconds?: number
-          paused?: boolean
-          cancelled?: boolean
-        }) => void) => void
+        onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
         offProgress:    () => void
       }
       app: {

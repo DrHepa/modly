@@ -145,11 +145,12 @@ export type ParsedManifest = {
     input?: 'mesh' | 'image' | 'text'
     output?: 'mesh' | 'image' | 'text'
     inputs?: ProcessPort[]
-    params_schema?: unknown[]
-    hf_repo?: string
-    download_check?: string
-    hf_skip_prefixes?: string[]
-  }[]
+      params_schema?: unknown[]
+      hf_repo?: string
+      download_check?: string
+      hf_skip_prefixes?: string[]
+      weight_owner_id?: string
+    }[]
 }
 
 export type ListedExtensionNode = {
@@ -162,6 +163,11 @@ export type ListedExtensionNode = {
   hfRepo?: string
   downloadCheck?: string
   hfSkipPrefixes?: string[]
+  capabilityId?: string
+  bundleId?: string
+  weightOwnerId?: string
+  sharedOwner?: boolean
+  legacyPaths?: string[]
 }
 
 function normalizeProcessPorts(inputs: ProcessPort[] | undefined): ProcessPort[] | undefined {
@@ -244,8 +250,9 @@ export function parseExtensionManifest(
   trustedRepos: Set<string>,
   builtin = false,
 ): ListedExtension {
+  const extensionId = parsed.id ?? fallbackId
   const common = {
-    id: parsed.id ?? fallbackId,
+    id: extensionId,
     name: parsed.displayName ?? parsed.name ?? fallbackId,
     version: parsed.version,
     description: parsed.description,
@@ -255,8 +262,32 @@ export function parseExtensionManifest(
     builtin,
   }
 
+  const legacyPathsByOwner = new Map<string, string[]>()
+  for (const node of parsed.nodes ?? []) {
+    const capabilityId = `${extensionId}/${node.id}`
+    const ownerId = node.weight_owner_id ?? node.id
+    const weightOwnerId = `${extensionId}/${ownerId}`
+    const existingLegacyPaths = legacyPathsByOwner.get(weightOwnerId)
+
+    if (existingLegacyPaths) existingLegacyPaths.push(capabilityId)
+    else legacyPathsByOwner.set(weightOwnerId, [capabilityId])
+  }
+
   const nodes = (parsed.nodes ?? []).map((node) => {
     const normalizedInputs = normalizeProcessPorts(node.inputs)
+    const capabilityId = `${extensionId}/${node.id}`
+    const ownerId = node.weight_owner_id ?? node.id
+    const weightOwnerId = `${extensionId}/${ownerId}`
+    const legacyPaths = [...(legacyPathsByOwner.get(weightOwnerId) ?? [capabilityId])]
+    const modelOwnership = parsed.type === 'process'
+      ? {}
+      : {
+          capabilityId,
+          bundleId: extensionId,
+          weightOwnerId,
+          sharedOwner: legacyPaths.length > 1,
+          legacyPaths,
+        }
 
     return {
       id: node.id,
@@ -268,6 +299,7 @@ export function parseExtensionManifest(
       hfRepo: node.hf_repo,
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
+      ...modelOwnership,
     }
   })
 

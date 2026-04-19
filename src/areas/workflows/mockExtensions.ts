@@ -60,6 +60,9 @@ export function buildAllWorkflowExtensions(
   for (const ext of modelExtensions) {
     for (const node of ext.nodes) {
       result.push({
+        // Workflow/runtime identity stays on ext.id/node.id for ALL model nodes,
+        // including bundled image models. Owner metadata is install-state only
+        // and must never leak into saved workflow identifiers.
         id:              `${ext.id}/${node.id}`,
         extensionId:     ext.id,
         extensionName:   ext.name,

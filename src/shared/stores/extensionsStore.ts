@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ModelExtension, ProcessExtension, AnyExtension } from '@shared/types/electron.d'
+import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '@areas/models/modelOwnershipState'
 
 // ─── Re-exports for consumers ─────────────────────────────────────────────────
 
@@ -20,6 +21,7 @@ export interface InstallProgress {
 interface ExtensionsStore {
   modelExtensions:   ModelExtension[]
   processExtensions: ProcessExtension[]
+  readyOwnerIds:     string[]
   loading:           boolean
   installProgress:   InstallProgress | null
   installError:      string | null
@@ -30,12 +32,14 @@ interface ExtensionsStore {
   installFromLocal:  () => Promise<{ success: boolean; error?: string; cancelled?: boolean }>
   uninstall:         (extensionId: string) => Promise<{ success: boolean; error?: string }>
   reload:            () => Promise<void>
+  refreshModelOwnership: (extensions?: ModelExtension[]) => Promise<void>
   clearInstallState: () => void
 }
 
 export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   modelExtensions:   [],
   processExtensions: [],
+  readyOwnerIds:     [],
   loading:           false,
   installProgress:   null,
   installError:      null,
@@ -47,13 +51,19 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
     set({ loading: true })
     try {
       const list = (await window.electron.extensions.list()) as AnyExtension[]
+      const modelExtensions = list.filter((e): e is ModelExtension => e.type === 'model')
+      const processExtensions = list.filter((e): e is ProcessExtension => e.type === 'process')
+      const downloaded = await window.electron.model.listDownloaded()
+      const readyOwnerIds = collectReadyOwnerIds(collectModelOwnershipMetadata(modelExtensions), downloaded.map((model) => model.id))
+
       set({
-        modelExtensions:   list.filter((e): e is ModelExtension   => e.type === 'model'),
-        processExtensions: list.filter((e): e is ProcessExtension => e.type === 'process'),
+        modelExtensions,
+        processExtensions,
+        readyOwnerIds,
         loading:           false,
       })
     } catch {
-      set({ loading: false })
+      set({ loading: false, readyOwnerIds: [] })
     }
   },
 
@@ -141,6 +151,8 @@ async function installExtension(
             }
           }
         })
+
+        if (ext.type === 'model') await get().refreshModelOwnership()
       } else {
         set({ installProgress: null, installError: result.error ?? 'Installation failed' })
       }
@@ -153,4 +165,42 @@ async function installExtension(
     } finally {
       window.electron.extensions.offInstallProgress()
     }
-}
+  },
+
+  // ── Uninstall ──────────────────────────────────────────────────────────────
+
+  async uninstall(extensionId: string) {
+    const result = await window.electron.extensions.uninstall(extensionId)
+    if (result.success) {
+      set((state) => ({
+        modelExtensions:   state.modelExtensions.filter((e)   => e.id !== extensionId),
+        processExtensions: state.processExtensions.filter((e) => e.id !== extensionId),
+      }))
+      await get().refreshModelOwnership()
+    }
+    return result
+  },
+
+  // ── Reload (rescan extensions dir + Python registry) ──────────────────────
+
+  async reload() {
+    const result = await window.electron.extensions.reload()
+    if (result.success) {
+      set({ loadErrors: result.errors ?? {} })
+    }
+    await get().loadExtensions()
+  },
+
+  async refreshModelOwnership(extensions) {
+    const modelExtensions = extensions ?? get().modelExtensions
+    const downloaded = await window.electron.model.listDownloaded()
+    const readyOwnerIds = collectReadyOwnerIds(collectModelOwnershipMetadata(modelExtensions), downloaded.map((model) => model.id))
+    set({ readyOwnerIds })
+  },
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  clearInstallState() {
+    set({ installProgress: null, installError: null })
+  },
+}))

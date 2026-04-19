@@ -1,29 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import type { AnyExtension, ModelExtension } from '@shared/types/electron.d'
 import { formatModelName } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import type { ExtensionNode } from './components/ExtensionCard'
-import { ExtensionDrawer } from './components/ExtensionDrawer'
-import { ICONS } from './components/extensionShared'
-
-// ─── Filters & sorts ──────────────────────────────────────────────────────────
-
-type FilterId = 'all' | 'process' | 'model' | 'official'
-type SortId   = 'name' | 'type'
-
-const FILTERS: { id: FilterId; label: string }[] = [
-  { id: 'all',      label: 'All' },
-  { id: 'process',  label: 'Processors' },
-  { id: 'model',    label: 'Models' },
-  { id: 'official', label: 'Official' },
-]
-
-const SORTS: { id: SortId; label: string }[] = [
-  { id: 'name', label: 'Name (A–Z)' },
-  { id: 'type', label: 'Type' },
-]
+import { collectModelOwnershipMetadata, deriveModelOwnershipState } from './modelOwnershipState'
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
@@ -32,6 +14,7 @@ export default function ModelsPage(): JSX.Element {
   const modelExtensions   = useExtensionsStore((s) => s.modelExtensions)
   const processExtensions = useExtensionsStore((s) => s.processExtensions)
   const extLoading        = useExtensionsStore((s) => s.loading)
+  const readyOwnerIds     = useExtensionsStore((s) => s.readyOwnerIds)
   const installProgress   = useExtensionsStore((s) => s.installProgress)
   const installError      = useExtensionsStore((s) => s.installError)
   const loadErrors        = useExtensionsStore((s) => s.loadErrors)
@@ -40,6 +23,7 @@ export default function ModelsPage(): JSX.Element {
   const installFromLocal  = useExtensionsStore((s) => s.installFromLocal)
   const uninstallExt      = useExtensionsStore((s) => s.uninstall)
   const reloadExtensions  = useExtensionsStore((s) => s.reload)
+  const refreshModelOwnership = useExtensionsStore((s) => s.refreshModelOwnership)
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   const allExtensions: AnyExtension[] = useMemo(
@@ -48,18 +32,7 @@ export default function ModelsPage(): JSX.Element {
   )
 
   // Model weight state (needed for node install status + uninstall cleanup)
-  const [installedVariantIds, setInstalledVariantIds] = useState<string[]>([])
-  const [downloading, setDownloading] = useState<Record<string, {
-    percent: number
-    file?: string
-    fileIndex?: number
-    totalFiles?: number
-    status?: string
-    bytesDownloaded?: number
-    totalBytes?: number
-    stalledSeconds?: number
-    paused?: boolean
-  }>>({})
+  const [downloading, setDownloading] = useState<Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>>({})
 
   // Uninstall modal state
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
@@ -81,65 +54,41 @@ export default function ModelsPage(): JSX.Element {
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
-  // Check each model node individually via filesystem IPC — reliable regardless of API state
-  async function refreshInstalledIds(exts: ModelExtension[]) {
-    const ids: string[] = []
-    for (const ext of exts) {
-      for (const node of ext.nodes) {
-        if (!node.hfRepo) continue
-        const fullId = `${ext.id}/${node.id}`
-        const ok = await window.electron.model.isDownloaded(fullId, node.downloadCheck)
-        if (ok) ids.push(fullId)
-      }
-    }
-    setInstalledVariantIds(ids)
-  }
+  const ownershipMetadata = useMemo(() => collectModelOwnershipMetadata(modelExtensions), [modelExtensions])
+
+  const downloadingOwnerIds = useMemo(() => {
+    const metadataByCapabilityId = new Map(ownershipMetadata.map((ownership) => [ownership.capabilityId, ownership]))
+    return new Set(
+      Object.keys(downloading)
+        .map((capabilityId) => metadataByCapabilityId.get(capabilityId)?.weightOwnerId)
+        .filter((weightOwnerId): weightOwnerId is string => Boolean(weightOwnerId)),
+    )
+  }, [downloading, ownershipMetadata])
+
+  const ownershipStateById = useMemo(
+    () => deriveModelOwnershipState(ownershipMetadata, new Set(readyOwnerIds), downloadingOwnerIds),
+    [ownershipMetadata, readyOwnerIds, downloadingOwnerIds],
+  )
+
+  const installedVariantIds = useMemo(
+    () => Object.values(ownershipStateById).filter((ownership) => ownership.downloaded).map((ownership) => ownership.capabilityId),
+    [ownershipStateById],
+  )
 
   useEffect(() => {
-    loadExtensions().then(async () => {
-      const exts = useExtensionsStore.getState().modelExtensions
-      const active = await window.electron.model.activeDownloads()
-      if (active.length > 0) {
-        setDownloading((prev) => {
-          const next = { ...prev }
-          for (const { modelId, ...progress } of active) if (!next[modelId]) next[modelId] = progress
-          return next
-        })
-      }
-      refreshInstalledIds(exts)
-    })
-    window.electron.model.onProgress(({ modelId: id, percent, file, fileIndex, totalFiles, status, bytesDownloaded, totalBytes, stalledSeconds, paused, cancelled }) => {
-      if (cancelled) {
-        setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
-        return
-      }
-      setDownloading((prev) => {
-        const current = prev[id]
-        return {
-          ...prev,
-          [id]: {
-            percent: paused ? (current?.percent ?? percent) : percent,
-            file: file ?? current?.file,
-            fileIndex: fileIndex ?? current?.fileIndex,
-            totalFiles: totalFiles ?? current?.totalFiles,
-            status,
-            bytesDownloaded: bytesDownloaded ?? current?.bytesDownloaded,
-            totalBytes: totalBytes ?? current?.totalBytes,
-            stalledSeconds: stalledSeconds ?? current?.stalledSeconds,
-            paused,
-          },
-        }
-      })
+    loadExtensions()
+    window.electron.model.onProgress(({ capabilityId, modelId, percent, file, fileIndex, totalFiles }) => {
+      const id = capabilityId ?? modelId
+      if (!id) return
+      setDownloading((prev) => ({ ...prev, [id]: { percent, file, fileIndex, totalFiles } }))
       if (percent === 100) {
-        const exts = useExtensionsStore.getState().modelExtensions
-        refreshInstalledIds(exts).then(() => {
+        refreshModelOwnership().then(() => {
           setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
         })
       }
     })
     return () => window.electron.model.offProgress()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- register the progress listener once on mount
-  }, [])
+  }, [loadExtensions, refreshModelOwnership])
 
   useEffect(() => {
     if (installError) setGhErr(installError)
@@ -249,8 +198,7 @@ export default function ModelsPage(): JSX.Element {
     setUninstallError(null)
     setUninstallTarget(null)
     setModelsToDelete(new Set())
-    setSelectedId((id) => (id === extId ? null : id))
-    refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
+    await refreshModelOwnership()
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -259,7 +207,7 @@ export default function ModelsPage(): JSX.Element {
     installProgress.step !== 'done' &&
     installProgress.step !== 'error'
 
-  const isBusy = isInstalling || Object.keys(downloading).length > 0
+  const extensionActionsDisabled = isInstalling || Object.keys(downloading).length > 0
 
   const counts = useMemo(() => ({
     all:      allExtensions.length,
@@ -606,7 +554,33 @@ export default function ModelsPage(): JSX.Element {
         ) : (
           <div className="grid gap-3.5 mt-1" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(296px, 1fr))' }}>
             {filteredExtensions.map((ext) => (
-              <ExtensionCard key={ext.id} ext={ext} loadError={extLoadError(ext)} {...cardHandlers} />
+              <ExtensionCard
+                key={ext.id}
+                ext={ext}
+                installedIds={installedVariantIds}
+                downloading={downloading}
+                ownershipStateById={ownershipStateById}
+                disabled={extensionActionsDisabled}
+                loadError={
+                  loadErrors[ext.id] ??
+                  ext.nodes.map((n) => loadErrors[`${ext.id}/${n.id}`]).find(Boolean)
+                }
+                onInstall={(node: ExtensionNode, fullId: string) => {
+                  if (!node.hfRepo) return
+                  setDownloading((prev) => ({ ...prev, [fullId]: { percent: 0 } }))
+                  window.electron.model.download(node.hfRepo!, fullId, node.hfSkipPrefixes).then((result: { success: boolean }) => {
+                    if (!result.success) {
+                      setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
+                    }
+                  })
+                }}
+                onUninstallNode={async (fullId: string) => {
+                  await window.electron.model.delete(fullId)
+                  await refreshModelOwnership()
+                }}
+                onUninstall={(extId) => openUninstallModal(extId)}
+                onRepaired={() => reloadExtensions()}
+              />
             ))}
           </div>
         )}

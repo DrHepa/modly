@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { ProcessInput } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ProcessInput } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 
 // Expose a typed API to the renderer process via window.electron
@@ -89,8 +89,7 @@ contextBridge.exposeInMainWorld('electron', {
     delete:         (modelId: string) => ipcRenderer.invoke('model:delete', modelId),
     unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
     showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
-    activeDownloads: (): Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> => ipcRenderer.invoke('model:activeDownloads'),
-    onProgress:     (cb: (data: { modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => {
+    onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => {
       ipcRenderer.on('model:downloadProgress', (_event, data) => cb(data))
     },
     offProgress:    () => ipcRenderer.removeAllListeners('model:downloadProgress')
@@ -134,13 +133,13 @@ contextBridge.exposeInMainWorld('electron', {
 
   // Extensions
   extensions: {
-    list: (): Promise<unknown[]> =>
+    list: (): Promise<AnyExtension[]> =>
       ipcRenderer.invoke('extensions:list'),
 
     installFromGitHub: (url: string): Promise<{
       success: boolean; error?: string
       extensionId?: string
-      extension?: unknown
+      extension?: AnyExtension
     }> => ipcRenderer.invoke('extensions:installFromGitHub', url),
 
     uninstall: (extensionId: string): Promise<{ success: boolean; error?: string }> =>

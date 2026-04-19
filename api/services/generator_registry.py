@@ -111,11 +111,22 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                 spec.loader.exec_module(module)
                 cls_or_None = getattr(module, class_name)
 
+            legacy_paths_by_owner: Dict[str, list[str]] = {}
+            for node in nodes:
+                owner_id = node.get("weight_owner_id") or node["id"]
+                weight_owner_id = f"{ext_id}/{owner_id}"
+                legacy_paths_by_owner.setdefault(weight_owner_id, []).append(f"{ext_id}/{node['id']}")
+
             if nodes:
                 for node in nodes:
+                    owner_id = node.get("weight_owner_id") or node["id"]
+                    weight_owner_id = f"{ext_id}/{owner_id}"
+                    legacy_paths = list(legacy_paths_by_owner.get(weight_owner_id, [f"{ext_id}/{node['id']}"]))
                     node_manifest = {
                         **manifest,
                         "id":               f"{ext_id}/{node['id']}",
+                        "capability_id":    f"{ext_id}/{node['id']}",
+                        "bundle_id":        ext_id,
                         "ext_id":           ext_id,
                         "node_id":          node["id"],
                         "name":             node.get("name", node["id"]),
@@ -126,6 +137,9 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
                         "input":            node.get("input", "image"),
                         "output":           node.get("output", "mesh"),
+                        "weight_owner_id":  weight_owner_id,
+                        "shared_owner":     len(legacy_paths) > 1,
+                        "legacy_paths":     legacy_paths,
                     }
                     full_id = f"{ext_id}/{node['id']}"
                     result[full_id] = (cls_or_None, node_manifest, ext_dir)
@@ -151,6 +165,29 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
             print(f"[Registry] ERROR loading extension '{ext_dir.name}': {exc}")
 
     return result
+
+
+def canonical_model_dir(models_dir: Path, manifest: dict) -> Path:
+    owner_id = manifest.get("weight_owner_id") or manifest.get("id")
+    return models_dir / owner_id
+
+
+def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
+    canonical_dir = canonical_model_dir(models_dir, manifest)
+    if canonical_dir.exists():
+        return canonical_dir
+
+    # Read-through compatibility only: prefer the canonical owner path, then the
+    # first existing legacy alias in manifest order. We do NOT merge aliases or
+    # move files automatically because that could delete valid shared weights.
+    for legacy_path in manifest.get("legacy_paths", [manifest.get("id")]):
+        legacy_dir = models_dir / legacy_path
+        if legacy_dir == canonical_dir:
+            continue
+        if legacy_dir.exists():
+            return legacy_dir
+
+    return canonical_dir
 
 
 # ------------------------------------------------------------------ #
@@ -180,11 +217,11 @@ class GeneratorRegistry:
                         )
                     # Subprocess mode: wrap in ExtensionProcess
                     gen = ExtensionProcess(ext_dir, manifest)
-                    gen.model_dir   = MODELS_DIR / model_id
+                    gen.model_dir   = canonical_model_dir(MODELS_DIR, manifest)
                     gen.outputs_dir = WORKSPACE_DIR
                 else:
                     # Legacy direct mode
-                    gen = cls(MODELS_DIR / model_id, WORKSPACE_DIR)
+                    gen = cls(canonical_model_dir(MODELS_DIR, manifest), WORKSPACE_DIR)
                     gen.hf_repo          = manifest.get("hf_repo", "")
                     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
                     gen.download_check   = manifest.get("download_check", "")
@@ -213,6 +250,17 @@ class GeneratorRegistry:
         print(f"[Registry] Active model  : {self._active_id}")
         print(f"[Registry] All models    : {list(self._generators.keys())}")
 
+    def canonical_model_dir(self, model_id: str) -> Path:
+        return canonical_model_dir(MODELS_DIR, self.get_manifest(model_id))
+
+    def resolve_active_model_dir(self, model_id: str) -> Path:
+        return resolve_active_model_dir(MODELS_DIR, self.get_manifest(model_id))
+
+    def _sync_generator_model_dir(self, model_id: str) -> BaseGenerator:
+        gen = self._generators[model_id]
+        gen.model_dir = self.resolve_active_model_dir(model_id)
+        return gen
+
     def reload(self) -> None:
         """
         Re-scans extensions and updates the registry without restarting FastAPI.
@@ -240,9 +288,10 @@ class GeneratorRegistry:
 
     def get_active(self) -> BaseGenerator:
         """Returns the active generator. Downloads and loads if necessary."""
-        gen = self._generators[self._active_id]
+        gen = self._sync_generator_model_dir(self._active_id)
         if not gen.is_loaded():
             if not gen.is_downloaded():
+                gen.model_dir = self.canonical_model_dir(self._active_id)
                 if isinstance(gen, ExtensionProcess):
                     # Let the subprocess handle its own download logic during
                     # load() — some extensions (e.g. mv-adapter) need custom
@@ -259,7 +308,7 @@ class GeneratorRegistry:
                 f"Unknown model ID: '{model_id}'. "
                 f"Available: {list(self._generators.keys())}"
             )
-        return self._generators[model_id]
+        return self._sync_generator_model_dir(model_id)
 
     def get_manifest(self, model_id: str) -> dict:
         """Returns the manifest of an extension."""
@@ -284,7 +333,7 @@ class GeneratorRegistry:
     # ------------------------------------------------------------------ #
 
     def active_status(self) -> dict:
-        gen      = self._generators[self._active_id]
+        gen      = self._sync_generator_model_dir(self._active_id)
         manifest = self._manifests[self._active_id]
         return {
             "id":         self._active_id,
@@ -296,6 +345,7 @@ class GeneratorRegistry:
     def all_status(self) -> list:
         result = []
         for model_id, gen in self._generators.items():
+            gen = self._sync_generator_model_dir(model_id)
             manifest = self._manifests[model_id]
             result.append({
                 "id":          model_id,
@@ -315,7 +365,7 @@ class GeneratorRegistry:
         target_id = model_id or self._active_id
         if target_id not in self._generators:
             raise KeyError(target_id)
-        return self._generators[target_id].params_schema()
+        return self._sync_generator_model_dir(target_id).params_schema()
 
     # ------------------------------------------------------------------ #
     # Paths update & shutdown
@@ -330,7 +380,7 @@ class GeneratorRegistry:
             models_dir.mkdir(parents=True, exist_ok=True)
             _self_module.MODELS_DIR = models_dir
             for model_id, gen in self._generators.items():
-                gen.model_dir = models_dir / model_id
+                gen.model_dir = resolve_active_model_dir(models_dir, self._manifests[model_id])
 
         if workspace_dir is not None:
             workspace_dir.mkdir(parents=True, exist_ok=True)

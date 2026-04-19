@@ -4,8 +4,17 @@
  */
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
 import { join } from 'path'
-import { getSettings } from './settings-store'
+import { getSettings } from './settings-store.ts'
 import { app } from 'electron'
+export {
+  getCanonicalModelPath,
+  getLegacyModelPaths,
+  selectPreferredModelPath,
+} from './model-ownership.ts'
+export type {
+  ModelOwnershipDescriptor,
+  PreferredModelPath,
+} from './model-ownership.ts'
 
 export interface DownloadProgress {
   percent: number

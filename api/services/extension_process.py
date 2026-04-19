@@ -73,8 +73,7 @@ class ExtensionProcess:
         env["MODELS_DIR"]    = str(MODELS_DIR)
         env["WORKSPACE_DIR"] = str(WORKSPACE_DIR)
         env["MODLY_API_DIR"] = str(Path(__file__).parent.parent)
-        if sys.platform == "darwin":
-            env.setdefault("NUMBA_DISABLE_JIT", "1")
+        env["MODEL_ID"] = self.MODEL_ID
         # Pass the exact model_dir so runner.py doesn't have to re-derive it
         # from manifest["id"] (which is the ext_id, not the composite node id).
         # runner.py extracts the node id from MODEL_DIR's trailing path component.

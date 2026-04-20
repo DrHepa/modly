@@ -74,6 +74,7 @@ beforeEach(() => {
         get: async () => ({ workspaceDir: '/workspace' }),
       },
       fs: {
+        deleteDirectory: async () => {},
         readFileBase64: async (filePath: string) => {
           fsReadCalls.push(filePath)
           return Buffer.from('fs-bytes').toString('base64')
@@ -86,7 +87,7 @@ beforeEach(() => {
         },
       },
     },
-  } as typeof globalThis.window
+  } as unknown as typeof globalThis.window
 })
 
 afterEach(() => {
@@ -198,6 +199,10 @@ test('workflowRunStore keeps legacy image-to-mesh model nodes on the model API p
     extensionId: 'legacy',
     nodeId: 'image-to-mesh',
     type: 'model',
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: 'fallback prompt' },
+      { id: 'strength', label: 'Strength', type: 'float', default: 0.75 },
+    ],
   })
   const workflow = createWorkflow(createNode('model-node', 'extensionNode', {
     extensionId: ext.id,
@@ -231,12 +236,139 @@ test('workflowRunStore keeps legacy image-to-mesh model nodes on the model API p
   assert.equal(postCalls.length, 1)
   assert.equal(postCalls[0].path, '/generate/from-image')
   assert.equal(postCalls[0].data.get('model_id'), ext.id)
-  assert.equal(postCalls[0].data.get('params'), JSON.stringify({ prompt: 'refine' }))
+  assert.equal(postCalls[0].data.get('params'), JSON.stringify({ prompt: 'refine', strength: 0.75 }))
   assert.deepEqual(getCalls, ['/generate/status/job-1'])
+  assert.equal(runProcessCalls.length, 0)
+  assert.deepEqual(fsReadCalls, ['/tmp/source.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/model.glb')
+})
+
+test('workflowRunStore dispatches text-capability model nodes through the text generation endpoint without reading image bytes', async () => {
+  const ext = createWorkflowExtension({
+    id: 'text/model',
+    extensionId: 'text-vendor',
+    nodeId: 'text-to-mesh',
+    type: 'model',
+    input: 'text',
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: 'fallback prompt' },
+      { id: 'seed', label: 'Seed', type: 'int', default: 99 },
+      { id: 'enable_detail', label: 'Enable detail', type: 'boolean', default: true },
+      { id: 'negative_prompt', label: 'Negative prompt', type: 'string', default: 'blurry' },
+      { id: 'sampler', label: 'Sampler', type: 'select', default: 'ddim', options: [{ value: 'ddim', label: 'DDIM' }] },
+    ],
+  })
+  const workflow = createWorkflow(createNode('text-model-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: {
+      prompt: 'A stone castle',
+      seed: 0,
+      enable_detail: false,
+      negative_prompt: '',
+    },
+  }))
+  const postCalls: Array<{ path: string; data: Record<string, unknown>; config: unknown }> = []
+  const getCalls: string[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown, config?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown>, config })
+        return { data: { job_id: 'job-text-1' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      getCalls.push(path)
+      return { data: { status: 'done', output_url: '/workspace/output/text-model.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal(postCalls[0].path, '/generate/from-text')
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'A stone castle',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      seed: 0,
+      enable_detail: false,
+      negative_prompt: '',
+      sampler: 'ddim',
+    },
+  })
+  assert.deepEqual(getCalls, ['/generate/status/job-text-1'])
   assert.equal(runProcessCalls.length, 0)
   assert.deepEqual(fsReadCalls, [])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
-  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/model.glb')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/text-model.glb')
+})
+
+test('workflowRunStore blocks model dispatch before backend requests when capability input metadata is missing or unsupported', async () => {
+  const scenarios: Array<{ name: string; input: WorkflowExtension['input'] | undefined; expectedError: string }> = [
+    {
+      name: 'missing capability input',
+      input: undefined,
+      expectedError: 'Error: Missing workflow capability input metadata for extension: invalid/missing-input',
+    },
+    {
+      name: 'unsupported capability input',
+      input: 'mesh',
+      expectedError: 'Error: Unsupported workflow capability input for extension invalid/unsupported-input: mesh',
+    },
+  ]
+
+  for (const scenario of scenarios) {
+    useWorkflowRunStore.getState().reset()
+
+    const ext = createWorkflowExtension({
+      id: scenario.name === 'missing capability input' ? 'invalid/missing-input' : 'invalid/unsupported-input',
+      extensionId: 'invalid',
+      nodeId: 'invalid-node',
+      type: 'model',
+      input: scenario.input as WorkflowExtension['input'],
+    })
+    const workflow = createWorkflow(createNode('invalid-model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { prompt: 'should not dispatch' },
+    }))
+    let axiosPostCalls = 0
+    let axiosGetCalls = 0
+
+    axiosClientMock = {
+      async post(path: string) {
+        axiosPostCalls += 1
+        throw new Error(`Unexpected axios.post call: ${path}`)
+      },
+      async get(path: string) {
+        axiosGetCalls += 1
+        throw new Error(`Unexpected axios.get call: ${path}`)
+      },
+    }
+
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+
+    assert.equal(axiosPostCalls, 0, `${scenario.name} should not call axios.post`)
+    assert.equal(axiosGetCalls, 0, `${scenario.name} should not call axios.get`)
+    assert.equal(runProcessCalls.length, 0, `${scenario.name} should not run process extensions`)
+    assert.deepEqual(fsReadCalls, [], `${scenario.name} should not read image bytes`)
+    assert.equal(useWorkflowRunStore.getState().activeNodeId, null)
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+    assert.equal(useWorkflowRunStore.getState().runState.error, scenario.expectedError)
+  }
 })
 
 test('workflowRunStore sends resolved process image-to-mesh nodes through runProcess', async () => {
@@ -279,6 +411,65 @@ test('workflowRunStore sends resolved process image-to-mesh nodes through runPro
   assert.deepEqual(runProcessCalls[0].params, { quality: 'high' })
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/process.glb')
+})
+
+test('workflowRunStore hydrates missing defaults for legacy process nodes before runProcess', async () => {
+  const ext = createWorkflowExtension({
+    id: 'vendor/legacy-process',
+    extensionId: 'vendor-process',
+    nodeId: 'mesh-refiner',
+    type: 'process',
+    params: [
+      { id: 'quality', label: 'Quality', type: 'string', default: 'medium' },
+      { id: 'strength', label: 'Strength', type: 'float', default: 0.75 },
+    ],
+  })
+  const workflow = createWorkflow(createNode('process-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: { quality: 'high' },
+  }))
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0].params, { quality: 'high', strength: 0.75 })
+})
+
+test('workflowRunStore preserves falsy process params during hydration without mutating the workflow document', async () => {
+  const ext = createWorkflowExtension({
+    id: 'vendor/process-falsy',
+    extensionId: 'vendor-process',
+    nodeId: 'mesh-refiner',
+    type: 'process',
+    params: [
+      { id: 'enabled', label: 'Enabled', type: 'boolean', default: true },
+      { id: 'retries', label: 'Retries', type: 'int', default: 3 },
+      { id: 'note', label: 'Note', type: 'string', default: 'fallback note' },
+      { id: 'sampler', label: 'Sampler', type: 'select', default: 'ddim', options: [{ value: 'ddim', label: 'DDIM' }] },
+    ],
+  })
+  const rawParams = {
+    enabled: false,
+    retries: 0,
+    note: '',
+  }
+  const workflow = createWorkflow(createNode('process-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: rawParams,
+  }))
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0].params, {
+    enabled: false,
+    retries: 0,
+    note: '',
+    sampler: 'ddim',
+  })
+  assert.deepEqual(workflow.nodes[1].data.params, rawParams)
 })
 
 test('workflowRunStore surfaces unresolved extension ids before dispatch', async () => {

@@ -5,6 +5,7 @@ import type { WorkflowExtension } from './mockExtensions.ts'
 import type { Workflow, WFNode, WFEdge } from '../../shared/types/electron.d'
 import { buildProcessExecutionInput } from './processExecution.ts'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
+import { hydrateWorkflowNodeParams } from './workflowNodeParams.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,103 +45,94 @@ function flushResume(): void {
   if (fn) fn()
 }
 
-interface NodeOutput { filePath?: string; text?: string; outputType?: string }
+type ModelGenerationRequest =
+  | {
+      kind: 'image'
+      imagePath: string
+      imageData?: string
+      params: Record<string, unknown>
+    }
+  | {
+      kind: 'text'
+      payload: {
+        prompt: string
+        model_id: string
+        collection: string
+        remesh: string
+        enable_texture: boolean
+        texture_resolution: number
+        params: Record<string, unknown>
+      }
+    }
 
-function isSceneMeshOutput(output: NodeOutput | undefined): output is NodeOutput & { filePath: string } {
-  return output?.outputType === 'mesh' && typeof output.filePath === 'string'
-}
+function buildModelGenerationRequest(args: {
+  ext: WorkflowExtension
+  node: WFNode
+  nodeParams: Record<string, unknown>
+  nodeInputPath?: string
+  nodeInputText?: string
+  nodeInputMeshPath?: string
+  selectedImagePath: string
+  selectedImageData?: string
+  workspaceDir: string
+}): ModelGenerationRequest {
+  const {
+    ext,
+    node,
+    nodeParams,
+    nodeInputPath,
+    nodeInputText,
+    nodeInputMeshPath,
+    selectedImagePath,
+    selectedImageData,
+    workspaceDir,
+  } = args
 
-// ─── For Each iterator (image / text / mesh) ───────────────────────────────────
-// A "For Each" node walks a folder alphabetically and emits one file per loop
-// iteration. Its loop body = the executable nodes reachable downstream, which
-// re-run for every file. The `mode` param picks what it emits and which files it
-// matches.
+  if (ext.input === undefined) {
+    throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
+  }
 
-const FOR_EACH_MODES: Record<string, { exts: string[]; outputType: 'image' | 'text' | 'mesh' }> = {
-  image: { exts: ['png', 'jpg', 'jpeg', 'webp'],              outputType: 'image' },
-  text:  { exts: ['txt', 'md', 'prompt'],                     outputType: 'text'  },
-  mesh:  { exts: ['glb', 'gltf', 'obj', 'stl', 'ply', 'fbx'], outputType: 'mesh'  },
-}
+  if (ext.input === 'text') {
+    const promptParam = typeof nodeParams.prompt === 'string' ? nodeParams.prompt : undefined
+    const prompt = nodeInputText ?? promptParam ?? ''
+    const { prompt: _prompt, ...params } = nodeParams
 
-function iteratorConfig(node: WFNode): { exts: string[]; outputType: 'image' | 'text' | 'mesh' } {
-  return FOR_EACH_MODES[(node.data.params?.mode as string) ?? 'image'] ?? FOR_EACH_MODES.image
-}
-
-function isIterator(type: string | undefined): boolean {
-  return type === 'forEachNode'
-}
-
-/** True for nodes the runner executes (and can re-run inside a loop body). */
-function isExecutable(node: WFNode): boolean {
-  if (isIterator(node.type)) return true
-  return node.type === 'extensionNode' && !!node.data.enabled
-}
-
-/** Absolute, alphabetically-sorted paths of an iterator's files (listFiles sorts). */
-async function listIteratorFiles(dir: string, exts: string[]): Promise<string[]> {
-  const names = await window.electron.fs.listFiles(dir, exts)
-  const norm  = dir.replace(/\\/g, '/').replace(/\/+$/, '')
-  return names.map((n) => `${norm}/${n}`)
-}
-
-/** Read a UTF-8 text file through the base64 IPC bridge. */
-async function readTextFile(filePath: string): Promise<string> {
-  const b64 = await window.electron.fs.readFileBase64(filePath)
-  return new TextDecoder('utf-8').decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)))
-}
-
-/**
- * Executable nodes reachable downstream from `startId` (its loop body). Traversal
- * stops at Wait boundaries — those nodes belong to branches, not the pre-phase loop.
- */
-function reachableExecutable(startId: string, edges: WFEdge[], nodeMap: Map<string, WFNode>): Set<string> {
-  const body = new Set<string>([startId])
-  const stack = [startId]
-  const seen = new Set<string>([startId])
-  while (stack.length > 0) {
-    const id = stack.pop()!
-    for (const e of edges) {
-      if (e.source !== id || seen.has(e.target)) continue
-      seen.add(e.target)
-      const t = nodeMap.get(e.target)
-      if (!t || isBranchStarter(t.type)) continue
-      if (isExecutable(t)) body.add(e.target)
-      stack.push(e.target)
+    return {
+      kind: 'text',
+      payload: {
+        prompt,
+        model_id: node.data.extensionId ?? '',
+        collection: 'Workflows',
+        remesh: 'none',
+        enable_texture: false,
+        texture_resolution: 1024,
+        params,
+      },
     }
   }
-  return body
+
+  if (ext.input !== 'image') {
+    throw new Error(`Unsupported workflow capability input for extension ${ext.id}: ${String(ext.input)}`)
+  }
+
+  const activeImagePath = nodeInputPath ?? selectedImagePath
+  const extraParams: Record<string, unknown> = {}
+  if (nodeInputMeshPath) {
+    const norm = nodeInputMeshPath.replace(/\\/g, '/')
+    extraParams.mesh_path = norm.startsWith(workspaceDir)
+      ? norm.slice(workspaceDir.length).replace(/^\//, '')
+      : norm
+  }
+
+  return {
+    kind: 'image',
+    imagePath: activeImagePath,
+    imageData: selectedImageData && nodeInputPath === undefined ? selectedImageData : undefined,
+    params: { ...nodeParams, ...extraParams },
+  }
 }
 
-function toWorkspaceUrl(filePath: string, workspaceDir: string): string | undefined {
-  const norm = filePath.replace(/\\/g, '/')
-  if (!norm.startsWith(workspaceDir)) return undefined
-  return `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
-}
-
-interface RunContext {
-  workflow:           Workflow
-  allExtensions:      WorkflowExtension[]
-  client:             AxiosInstance
-  workspaceDir:       string
-  selectedImagePath:  string | undefined
-  selectedImageData?: string
-  overrideImageData?: string
-  nodeOutputs:        Map<string, NodeOutput>
-  nodeMap:            Map<string, WFNode>
-  /** nodes in execution (topological) order */
-  ordered:            WFNode[]
-  branches:           Map<string, WFNode[]>
-  waitIds:            string[]
-  /** waitId → nearest upstream waitId (null = top-level, runnable from the start) */
-  parentWait:         Map<string, string | null>
-  /** iterator node id → its resolved file paths, one per loop iteration */
-  iteratorFiles:      Map<string, string[]>
-  /** workspace URL of the most recently pushed scene mesh (last branch the user ran wins) */
-  lastSceneMesh?:     string
-}
-const _ctx = { current: null as RunContext | null }
-
-// ─── Topological sort (DFS preorder, branch-first) ───────────────────────────
+// ─── Topological sort ─────────────────────────────────────────────────────────
 
 function topoSort(nodes: WFNode[], edges: WFEdge[]): WFNode[] {
   const nodeMap = new Map(nodes.map((n) => [n.id, n]))
@@ -644,6 +636,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         const node = execNodes[i]
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
+        const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
 
       for (const [iterId, files] of iteratorFiles) {
         const bodyIds = new Set([...reachableExecutable(iterId, workflow.edges, nodeMap)].filter((id) => indexOf.has(id)))
@@ -707,37 +700,40 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         // ── Model extensions → HTTP API ───────────────────────────────────
         // Process extensions → IPC runProcess
         if (mode === 'model') {
-          const activeImagePath = nodeInputPath ?? selectedImagePath
-          const base64 = selectedImageData && nodeInputPath === undefined
-            ? selectedImageData
-            : await window.electron.fs.readFileBase64(activeImagePath)
-          const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-          const blob  = new Blob([bytes], { type: 'image/png' })
-          const fname = activeImagePath.split(/[\\/]/).pop() ?? 'image.png'
-
-          const extraParams: Record<string, unknown> = {}
-          if (nodeInputMeshPath) {
-            const norm = nodeInputMeshPath.replace(/\\/g, '/')
-            extraParams.mesh_path = norm.startsWith(workspaceDir)
-              ? norm.slice(workspaceDir.length).replace(/^\//, '')
-              : norm
-          }
-
-          const fd = new FormData()
-          fd.append('image', blob, fname)
-          fd.append('model_id', node.data.extensionId ?? '')
-          fd.append('collection', 'Workflows')
-          fd.append('remesh', 'none')
-          fd.append('enable_texture', 'false')
-          fd.append('texture_resolution', '1024')
-          fd.append('params', JSON.stringify({ ...node.data.params, ...extraParams }))
+          const request = buildModelGenerationRequest({
+            ext,
+            node,
+            nodeParams: hydratedParams,
+            nodeInputPath,
+            nodeInputText,
+            nodeInputMeshPath,
+            selectedImagePath,
+            selectedImageData,
+            workspaceDir,
+          })
 
           set((s) => ({ runState: { ...s.runState, blockProgress: 5, blockStep: 'Submitting to model…' } }))
 
-          const { data } = await client.post<{ job_id: string }>(
-            '/generate/from-image', fd,
-            { headers: { 'Content-Type': 'multipart/form-data' } },
-          )
+          const { data } = await (request.kind === 'image'
+            ? (async () => {
+              const base64 = request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)
+              const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+              const blob  = new Blob([bytes], { type: 'image/png' })
+              const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
+              const fd = new FormData()
+              fd.append('image', blob, fname)
+              fd.append('model_id', node.data.extensionId ?? '')
+              fd.append('collection', 'Workflows')
+              fd.append('remesh', 'none')
+              fd.append('enable_texture', 'false')
+              fd.append('texture_resolution', '1024')
+              fd.append('params', JSON.stringify(request.params))
+              return client.post<{ job_id: string }>(
+                '/generate/from-image', fd,
+                { headers: { 'Content-Type': 'multipart/form-data' } },
+              )
+            })()
+            : client.post<{ job_id: string }>('/generate/from-text', request.payload))
           _activeJobId.current = data.job_id
 
           while (true) {
@@ -784,7 +780,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           const result = await window.electron.extensions.runProcess(
             ext.extensionId,
             processInput,
-            node.data.params as Record<string, unknown>,
+            hydratedParams,
           )
           if (!result.success) throw new Error(result.error ?? 'Process extension failed')
           nodeInputPath = processInput.filePath

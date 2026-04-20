@@ -74,7 +74,12 @@ def api_modules(monkeypatch, tmp_path):
     monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace_dir)
     monkeypatch.setattr(generation_jobs, "WORKSPACE_DIR", workspace_dir)
     monkeypatch.setattr(generator_registry, "_generators", {VALID_MODEL_ID: fake_generator}, raising=False)
-    monkeypatch.setattr(generator_registry, "_manifests", {VALID_MODEL_ID: {"name": "Fake Generator"}}, raising=False)
+    monkeypatch.setattr(
+        generator_registry,
+        "_manifests",
+        {VALID_MODEL_ID: {"id": VALID_MODEL_ID, "name": "Fake Generator", "input": "image"}},
+        raising=False,
+    )
     monkeypatch.setattr(generator_registry, "_errors", {}, raising=False)
     monkeypatch.setattr(generator_registry, "_active_id", VALID_MODEL_ID, raising=False)
 

@@ -21,6 +21,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
   validateProcessConnection,
   validateWorkflowProcessRun,
@@ -987,11 +988,13 @@ function WorkflowCanvasInner({
 
     const extensionId = e.dataTransfer.getData(DRAG_KEY)
     if (!extensionId) return
-    setNodes((nds) => [...nds, {
-      id: newId(), type: 'extensionNode', position,
-      data: { extensionId, enabled: true, params: {} },
-    }])
-  }, [screenToFlowPosition, setNodes])
+    setNodes((nds) => [...nds, createHydratedExtensionWorkflowNode({
+      id: newId(),
+      extensionId,
+      position,
+      allExtensions,
+    })])
+  }, [screenToFlowPosition, setNodes, allExtensions])
 
   // Keyboard shortcuts (Space, Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z)
   useEffect(() => {
@@ -1084,10 +1087,14 @@ function WorkflowCanvasInner({
       pendingDropPos ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     )
     const newNodeId = newId()
-    const newNode = {
-      id: newNodeId, type, position,
-      data: { extensionId, enabled: true, params: {} },
-    }
+    const newNode = type === 'extensionNode' && extensionId
+      ? createHydratedExtensionWorkflowNode({ id: newNodeId, extensionId, position, allExtensions })
+      : {
+          id: newNodeId,
+          type,
+          position,
+          data: { extensionId, enabled: true, params: {} },
+        }
     const nextNodes = toWorkflowNodes([...nodes, newNode])
     setNodes((nds) => [...nds, newNode])
 
@@ -1107,7 +1114,7 @@ function WorkflowCanvasInner({
     pendingConnectionRef.current = null
     setPendingDropPos(null)
     setPaletteOpen(false)
-  }, [screenToFlowPosition, setNodes, pendingDropPos, nodes, appendValidatedEdge])
+  }, [screenToFlowPosition, setNodes, pendingDropPos, nodes, appendValidatedEdge, allExtensions])
 
   // When a While container is deleted (button or keyboard), detach its children
   // to absolute coordinates so they don't get orphaned to the canvas origin.

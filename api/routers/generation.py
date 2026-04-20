@@ -1,10 +1,12 @@
 import re as _re
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
+from schemas.generation import GenerateFromTextRequest
 from services.generator_registry import generator_registry
 from services.generation_jobs import (
     cancel_job as cancel_generation_job,
     create_from_image_job,
+    create_from_text_job,
     get_job_status,
     parse_params_object,
     validate_image_upload,
@@ -12,6 +14,14 @@ from services.generation_jobs import (
 )
 
 router = APIRouter(tags=["generation"])
+
+
+def sanitize_collection_name(collection: str) -> str:
+    collection = collection.strip()
+    if not collection or _re.search(r'[/:*?"<>|\\]', collection):
+        return "Default"
+    return collection
+
 
 @router.post("/from-image")
 async def generate_from_image(
@@ -30,9 +40,7 @@ async def generate_from_image(
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
 
     # Sanitize collection name: strip, forbid path separators and special chars
-    collection = collection.strip()
-    if not collection or _re.search(r'[/:*?"<>|\\]', collection):
-        collection = "Default"
+    collection = sanitize_collection_name(collection)
 
     validate_model_id(model_id)
 
@@ -49,6 +57,35 @@ async def generate_from_image(
     }
 
     job = create_from_image_job(background_tasks, image_bytes, full_params, collection)
+    return {"job_id": job.job_id}
+
+
+@router.post("/from-text")
+async def generate_from_text(
+    payload: GenerateFromTextRequest,
+    background_tasks: BackgroundTasks,
+):
+    prompt = payload.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+
+    if payload.remesh not in ("quad", "triangle", "none"):
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+
+    collection = sanitize_collection_name(payload.collection)
+
+    validate_model_id(payload.model_id)
+
+    generator_registry.switch_model(payload.model_id)
+
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+    }
+
+    job = create_from_text_job(background_tasks, prompt, full_params, collection)
     return {"job_id": job.job_id}
 
 

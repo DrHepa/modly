@@ -1,5 +1,5 @@
-import type { AutomationCapabilitiesResponse } from './automation-capabilities'
-import type { AppSettings } from './settings-store'
+import type { AutomationCapabilitiesResponse } from './automation-capabilities.ts'
+import type { AppSettings } from './settings-store.ts'
 
 type Awaitable<T> = T | Promise<T>
 
@@ -23,19 +23,19 @@ const defaultAutomationCapabilitiesServiceDeps: AutomationCapabilitiesServiceDep
     return app.getPath('userData')
   },
   getBuiltinExtensionsDir: async () => {
-    const { getBuiltinExtensionsDir } = await import('./builtin-sync')
+    const { getBuiltinExtensionsDir } = await import('./builtin-sync.ts')
     return getBuiltinExtensionsDir()
   },
   getSettings: async (userData) => {
-    const { getSettings } = await import('./settings-store')
+    const { getSettings } = await import('./settings-store.ts')
     return getSettings(userData)
   },
   fetchTrustedRepos: async () => {
-    const { fetchTrustedRepos } = await import('./trusted-repos')
+    const { fetchTrustedRepos } = await import('./trusted-repos.ts')
     return fetchTrustedRepos()
   },
   buildAutomationCapabilities: async (context) => {
-    const { buildAutomationCapabilities } = await import('./automation-capabilities')
+    const { buildAutomationCapabilities } = await import('./automation-capabilities.ts')
     return buildAutomationCapabilities(context)
   },
 }

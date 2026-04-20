@@ -166,3 +166,32 @@ test('renderer fails closed for unsupported process and mixed scene node shapes'
     assert.ok(issues.some((issue) => issue.key === 'target:unsupported-scene-shape'))
   }
 })
+
+test('text-only MODEL preflight accepts hydrated prompt without an image or text edge', { timeout: 2000 }, () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const capability = ext({ type: 'model', input: 'text', params: [{ id: 'prompt', type: 'string', default: 'default prompt' }] })
+  const workflow = { nodes: [{ id: 'model', type: 'extensionNode', data: { extensionId: capability.id, enabled: true, params: {} } }], edges: [] }
+  assert.deepEqual(validateWorkflowPreflight(workflow, [capability]), [])
+  workflow.nodes[0].data.params = { prompt: '' }
+  assert.equal(validateWorkflowPreflight(workflow, [capability]).length, 1, 'explicit empty prompt does not inherit default')
+  workflow.nodes[0].data.params = { prompt: '   ' }
+  assert.equal(validateWorkflowPreflight(workflow, [capability]).length, 1)
+})
+
+test('prompt fallback never replaces PROCESS or mixed MODEL input contracts', { timeout: 2000 }, () => {
+  const { validateWorkflowPreflight } = loadModule()
+  for (const overrides of [{ type: 'process', input: 'text' }, { type: 'model', input: 'image', inputs: ['image', 'text'] }, { type: 'model', input: 'text', inputs: ['text', 'text'] }]) {
+    const capability = ext({ ...overrides, params: [{ id: 'prompt', type: 'string', default: 'default prompt' }] })
+    const workflow = { nodes: [{ id: 'model', type: 'extensionNode', data: { extensionId: capability.id, enabled: true, params: {} } }], edges: [] }
+    assert.ok(validateWorkflowPreflight(workflow, [capability]).length > 0)
+  }
+})
+
+test('single text slot uses the text alias but explicit empty prompt takes precedence', { timeout: 2000 }, () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const capability = ext({ type: 'model', input: 'text', inputs: ['text'], params: [{ id: 'text', type: 'string', default: 'alias default' }] })
+  const workflow = { nodes: [{ id: 'model', type: 'extensionNode', data: { extensionId: capability.id, enabled: true, params: {} } }], edges: [] }
+  assert.deepEqual(validateWorkflowPreflight(workflow, [capability]), [])
+  workflow.nodes[0].data.params = { prompt: '' }
+  assert.equal(validateWorkflowPreflight(workflow, [capability]).length, 1)
+})

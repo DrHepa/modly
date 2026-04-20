@@ -27,6 +27,16 @@ class JobStatus(JobProgress):
         return self.job_id
 
 
+class GenerateFromTextRequest(BaseModel):
+    prompt: str
+    model_id: str = "sf3d"
+    collection: str = "Default"
+    remesh: str = "quad"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class GenerateFromArtifactRequest(BaseModel):
     """Generic typed-artifact request. Only scene is public in this release."""
     input_kind: Literal["scene"]

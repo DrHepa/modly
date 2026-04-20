@@ -5,7 +5,7 @@ import {
   ResolveCanonicalProcessTargetError,
   resolveCanonicalProcessTarget,
   type CanonicalProcessTarget,
-} from './automation-capabilities'
+} from './automation-capabilities.ts'
 import {
   resolveAutomationCapabilitiesContext,
   type AutomationCapabilitiesContext,
@@ -128,7 +128,7 @@ const defaultProcessRunsServiceDeps: ProcessRunsServiceDeps = {
   resolveContext: () => resolveAutomationCapabilitiesContext(),
   resolveWorkspaceDir: async () => {
     const { app } = await import('electron')
-    const { getSettings } = await import('./settings-store')
+    const { getSettings } = await import('./settings-store.ts')
     return getSettings(app.getPath('userData')).workspaceDir
   },
   resolveTempDir: async () => {
@@ -151,7 +151,7 @@ const defaultProcessRunsServiceDeps: ProcessRunsServiceDeps = {
     const { createRunScopedProcessRunner, getExtPythonExe } = await import('./process-runner')
     if (target.entry.endsWith('.py')) {
       const { app } = await import('electron')
-      const { getVenvPythonExe } = await import('./python-setup')
+      const { getVenvPythonExe } = await import('./python-setup.ts')
       const pythonExe = getExtPythonExe(target.extDir) ?? getVenvPythonExe(app.getPath('userData'))
 
       return createRunScopedProcessRunner({

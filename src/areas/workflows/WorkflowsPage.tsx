@@ -22,6 +22,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
   resolveProcessConnectionSource,
   validateProcessConnection,
@@ -1103,12 +1104,12 @@ function WorkflowCanvasInner({
       const node: FlowNode<WFNodeData> = {
         id: newId(), type: 'extensionNode',
         position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-        data: { extensionId, enabled: true, params: {} } as WFNodeData,
+        data: createHydratedExtensionWorkflowNode({ id: '', extensionId, position, allExtensions }).data,
         ...(parent ? { parentId: parent.id } : {}),
       }
       return [...nds, node]
     })
-  }, [screenToFlowPosition, setNodes])
+  }, [screenToFlowPosition, setNodes, allExtensions])
 
   // Keyboard shortcuts (Space, Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z)
   useEffect(() => {
@@ -1206,7 +1207,9 @@ function WorkflowCanvasInner({
     const node: FlowNode<WFNodeData> = {
       id: newNodeId, type,
       position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-      data: { extensionId, enabled: true, params: {} } as WFNodeData,
+      data: type === 'extensionNode' && extensionId
+        ? createHydratedExtensionWorkflowNode({ id: newNodeId, extensionId, position, allExtensions }).data
+        : { extensionId, enabled: true, params: {} } as WFNodeData,
       ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
       ...(parent ? { parentId: parent.id } : {}),
     }

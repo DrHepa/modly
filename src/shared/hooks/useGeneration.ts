@@ -1,22 +1,79 @@
 import { useCallback, useRef } from 'react'
-import { useAppStore } from '@shared/stores/appStore'
-import { useApi } from './useApi'
-import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
+import { showCompletionNotification, showErrorNotification } from '../utils/notification.ts'
+import { useAppStore, type GenerationOptions } from '../stores/appStore.ts'
+import { useExtensionsStore, type ModelExtension } from '../stores/extensionsStore.ts'
+import { useApi, type GenerationSubmitRequest } from './useApi.ts'
+import { resolveWorkflowPrompt } from '../../areas/workflows/workflowNodeParams.ts'
+
+type ResolveLegacyGenerationRequestArgs = {
+  imagePath: string | null | undefined
+  selectedImageData: string | null
+  generationOptions: GenerationOptions
+  modelExtensions: ModelExtension[]
+}
+
+function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): string {
+  // Match the selected canonical node before the historical single-node alias.
+  const node = modelExtensions.flatMap((extension) => extension.nodes.map((node) => ({ extension, node })))
+    .find(({ extension, node }) => `${extension.id}/${node.id}` === modelId)?.node
+    ?? modelExtensions.find((extension) => extension.id === modelId && extension.nodes.length === 1)?.nodes[0]
+  let input = node?.input
+  if (node?.inputs?.length) {
+    // Positional artifact slots must not fall back to a scalar text declaration.
+    if (node.inputs.every((kind) => kind === 'text')) input = 'text'
+    else if (input === 'text') input = 'image'
+  }
+
+  if (!input) {
+    throw new Error(`Missing generation input metadata for model ${modelId}`)
+  }
+
+  return input
+}
+
+export function resolveLegacyGenerationRequest({
+  imagePath,
+  selectedImageData,
+  generationOptions,
+  modelExtensions,
+}: ResolveLegacyGenerationRequestArgs): GenerationSubmitRequest {
+  const input = resolveModelInput(generationOptions.modelId, modelExtensions)
+
+  if (input === 'text') {
+    return {
+      kind: 'text',
+      prompt: resolveWorkflowPrompt(generationOptions.modelParams),
+    }
+  }
+
+  if (!imagePath) {
+    throw new Error(`Image path is required for image generation model ${generationOptions.modelId}`)
+  }
+
+  if (input === 'scene') return { kind: 'scene', inputPath: imagePath }
+
+  return {
+    kind: 'image',
+    imagePath,
+    imageData: selectedImageData ?? undefined,
+  }
+}
 
 export function useGeneration() {
   const { currentJob, setCurrentJob, updateCurrentJob, generationOptions, selectedImageData, pushMeshUrl, clearMeshHistory } = useAppStore()
-  const { generateFromImage, pollJobStatus, cancelJob } = useApi()
+  const modelExtensions = useExtensionsStore((s) => s.modelExtensions)
+  const { submitGeneration, pollJobStatus, cancelJob } = useApi()
   const cancelledRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
 
   const startGeneration = useCallback(
-    async (imagePath: string) => {
+    async (imagePath?: string | null) => {
       cancelledRef.current = false
       abortControllerRef.current = new AbortController()
       clearMeshHistory()
       const job = {
         id: crypto.randomUUID(),
-        imageFile: imagePath,
+        imageFile: imagePath ?? '',
         status: 'uploading' as const,
         progress: 0,
         createdAt: Date.now(),
@@ -26,7 +83,8 @@ export function useGeneration() {
       setCurrentJob(job)
 
       try {
-        const { jobId } = await generateFromImage(imagePath, generationOptions, selectedImageData ?? undefined, abortControllerRef.current.signal)
+        const request = resolveLegacyGenerationRequest({ imagePath, selectedImageData, generationOptions, modelExtensions })
+        const { jobId } = await submitGeneration(request, generationOptions, abortControllerRef.current.signal)
 
         if (cancelledRef.current) {
           await cancelJob(jobId)
@@ -56,8 +114,7 @@ export function useGeneration() {
         void showErrorNotification(errorMessage, 'Generation failed')
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- useApi re-creates its fns each render, so this re-memoizes anyway (values stay fresh)
-    [generateFromImage, pollJobStatus, cancelJob, setCurrentJob, updateCurrentJob]
+    [submitGeneration, pollJobStatus, cancelJob, setCurrentJob, updateCurrentJob, generationOptions, selectedImageData, modelExtensions, clearMeshHistory]
   )
 
   const pollUntilDone = async (jobId: string) => {

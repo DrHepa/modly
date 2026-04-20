@@ -1,4 +1,5 @@
-import { hasNamedProcessInputs } from './processPorts'
+import { getPositionalInputTypes, hasNamedProcessInputs } from './processPorts'
+import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import { validateWorkflowProcessRun } from './processConnectionRules'
 import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
@@ -151,8 +152,15 @@ export function validateWorkflowPreflight(
 
     const incomingEdges = workflow.edges.filter((edge) => edge.target === node.id)
     const requiredTypes = [...new Set((ext.inputs ?? [ext.input]) as DataType[])]
+    // A main text prompt can replace one text input, not multiple required ports
+    // or a text auxiliary on an image/mesh model. Keep all other wiring checks.
+    const positional = getPositionalInputTypes(ext)
+    const singleTextModel = ext.type === 'model' && !hasNamedProcessInputs(ext.inputs)
+      && (positional?.length ? positional.length === 1 && positional[0] === 'text' : ext.input === 'text')
+    const hasPrompt = singleTextModel && resolveWorkflowPrompt(hydrateWorkflowNodeParams(ext, node.data.params)).trim().length > 0
 
     for (const requiredType of requiredTypes) {
+      if (requiredType === 'text' && hasPrompt) continue
       const hasMatchingInput = incomingEdges.some((edge) => outputTypes.get(edge.source) === requiredType)
       if (!hasMatchingInput) {
         pushIssue(issues, {

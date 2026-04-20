@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import inspect
 import json
 import re as _re
@@ -128,6 +129,28 @@ def create_from_image_job(
 ) -> JobStatus:
     return create_generation_job(
         background_tasks, image_bytes, params, collection, output_kind, model_id,
+    )
+
+
+def create_from_text_job(
+    background_tasks: BackgroundTasks,
+    prompt: str,
+    params: dict,
+    collection: str = "Default",
+    output_kind: str = "mesh",
+    model_id: Optional[str] = None,
+) -> JobStatus:
+    # Legacy generators still consume image bytes. Match the existing text-only
+    # workflow ABI with a valid placeholder PNG and both prompt aliases, while
+    # leaving scheduling, variants, cancellation and artifacts to the shared owner.
+    placeholder = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    generation_params = dict(params)
+    generation_params.setdefault("prompt", prompt)
+    generation_params.setdefault("text", prompt)
+    return create_generation_job(
+        background_tasks, placeholder, generation_params, collection, output_kind, model_id,
     )
 
 

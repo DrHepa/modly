@@ -165,6 +165,7 @@ test('a required named port cannot use an inherited dictionary member as missing
 import ts from 'typescript'
 import * as connectionRules from './processConnectionRules.ts'
 import { getProcessTargetPorts } from './processPorts.ts'
+import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory.ts'
 
 const pageSource = await readWorkflowFile('WorkflowsPage.tsx')
 const pageAst = ts.createSourceFile('WorkflowsPage.tsx', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
@@ -206,7 +207,7 @@ function invokePalette(sourceKind: string, reversed: boolean, targetInputs: Work
     NODE_TYPES_WITHOUT_TARGET: new Set(['imageNode', 'meshNode', 'textNode', 'sceneNode', 'forEachNode']),
     NODE_TYPES_WITHOUT_SOURCE: new Set(['outputNode', 'previewNode']),
     allExtensions, getNode: (id: string) => nodes.find((candidate) => candidate.id === id),
-    getProcessTargetPorts, ...connectionRules,
+    getProcessTargetPorts, createHydratedExtensionWorkflowNode, ...connectionRules,
     setConnectionIssue: (value: connectionRules.ProcessConnectionRuleIssue | null) => { issue = value },
     addEdge: (connection: Omit<WFEdge, 'id'>, current: WFEdge[]) => [...current, { id: 'added', ...connection }],
     DEFAULT_EDGE_OPTS: {}, setPendingDropPos: () => {}, setPaletteOpen: () => {}, window: { innerWidth: 100, innerHeight: 100 },

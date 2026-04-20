@@ -1,12 +1,13 @@
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
 
 import services.generator_registry as registry
-from schemas.generation import GenerateFromArtifactRequest
+from schemas.generation import GenerateFromArtifactRequest, GenerateFromTextRequest
 from services.artifact_input import RESERVED_ARTIFACT_PARAMS, validate_artifact_input
 from services.generation_jobs import (
     VALID_REMESH_MODES,
     cancel_job as cancel_generation_job,
     create_from_image_job,
+    create_from_text_job,
     create_generation_job,
     get_job_status,
     parse_params_object,
@@ -47,6 +48,27 @@ async def generate_from_image(
     job = create_from_image_job(
         background_tasks, image_bytes, full_params, collection,
         manifest.get("output", "mesh"), model_id,
+    )
+    return {"job_id": job.job_id}
+
+
+@router.post("/from-text")
+async def generate_from_text(payload: GenerateFromTextRequest, background_tasks: BackgroundTasks):
+    prompt = payload.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+    if payload.remesh not in VALID_REMESH_MODES:
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+    manifest = validate_model_id(payload.model_id)
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+    }
+    job = create_from_text_job(
+        background_tasks, prompt, full_params, payload.collection,
+        manifest.get("output", "mesh"), payload.model_id,
     )
     return {"job_id": job.job_id}
 

@@ -11,6 +11,7 @@ import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
 import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
 import { assignSlotFilePaths } from './slotInputs'
+import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import type { SlotInputType } from './slotInputs'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -316,7 +317,7 @@ async function executeExtensionNode(
   }
   // Freshest params at the moment the node starts (so loop iterations / Retry pick
   // up edits made while paused, not the values captured at run start).
-  const liveParams = _liveParams.current.get(node.id) ?? node.data.params ?? {}
+  const liveParams = hydrateWorkflowNodeParams(ext, _liveParams.current.get(node.id) ?? node.data.params ?? {})
 
   const resolveSource = (sourceId: string): NodeOutput | undefined => {
     const realId = resolveDataSource(sourceId, workflow.edges, nodeMap)
@@ -373,6 +374,7 @@ async function executeExtensionNode(
   }
 
   if (mode === 'model') {
+    if (!ext.input && !positionalInputs?.length) throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
@@ -381,15 +383,12 @@ async function executeExtensionNode(
       throw new Error('No input image selected for model node')
     }
 
-    let blob: Blob
-    let fname: string
-    if (isTextInput || isSceneInput || (selectedImageData && nodeInputPath === undefined)) {
-      const base64 = selectedImageData && nodeInputPath === undefined
-        ? selectedImageData
-        : 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' // 1x1 transparent PNG
+    let blob: Blob | undefined
+    let fname = 'image.png'
+    if (!isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
       fname = 'placeholder.png'
-      blob = new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else {
+      blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
+    } else if (!isTextInput && !isSceneInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
       blob = new Blob([bytes], { type: 'image/png' })
@@ -411,10 +410,7 @@ async function executeExtensionNode(
       extraParams.extra_image_paths = extraImagePaths
     }
 
-    const schemaDefaults = Object.fromEntries(
-      (ext.params ?? []).map((p) => [p.id, p.default]),
-    )
-    const effectiveParams = { ...schemaDefaults, ...liveParams }
+    const effectiveParams = liveParams
 
     setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
     let submission: { data: { job_id: string } }
@@ -428,9 +424,17 @@ async function executeExtensionNode(
         model_id: node.data.extensionId ?? '', collection: 'Workflows',
         params: { ...effectiveParams, ...extraParams },
       })
+    } else if (isTextInput) {
+      const { prompt: _prompt, ...params } = effectiveParams
+      const prompt = resolveWorkflowPrompt(effectiveParams, nodeInputText)
+      submission = await client.post('/generate/from-text', {
+        prompt, model_id: ext.id, collection: 'Workflows',
+        remesh: 'none', enable_texture: false, texture_resolution: 1024,
+        params: { ...params, ...extraParams },
+      })
     } else {
       const fd = new FormData()
-      fd.append('image', blob, fname)
+      fd.append('image', blob!, fname)
       fd.append('model_id', node.data.extensionId ?? '')
       fd.append('collection', 'Workflows')
       fd.append('remesh', 'none')
@@ -461,6 +465,7 @@ async function executeExtensionNode(
         setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Generation complete' }))
         break
       }
+      if (st.status === 'cancelled') throw new Error('Cancelled')
       if (st.status === 'error') throw new Error(st.error ?? 'Generation failed')
 
       setRunState((s) => ({ ...s, blockProgress: st.progress ?? s.blockProgress, blockStep: st.step ?? 'Generating…' }))

@@ -1,6 +1,6 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SceneCandidate(BaseModel):
@@ -25,3 +25,13 @@ class JobStatus(JobProgress):
     @property
     def run_id(self) -> str:
         return self.job_id
+
+
+class GenerateFromTextRequest(BaseModel):
+    prompt: str
+    model_id: str = "sf3d"
+    collection: str = "Default"
+    remesh: str = "quad"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
+    params: dict[str, Any] = Field(default_factory=dict)

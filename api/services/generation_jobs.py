@@ -27,10 +27,42 @@ def create_job() -> JobStatus:
     return job
 
 
-def create_from_image_job(background_tasks: BackgroundTasks, image_bytes: bytes, params: dict, collection: str = "Default") -> JobStatus:
+def create_generation_job(
+    background_tasks: BackgroundTasks,
+    *,
+    params: dict,
+    collection: str = "Default",
+    image_bytes: Optional[bytes] = None,
+    prompt: Optional[str] = None,
+) -> JobStatus:
     job = create_job()
-    background_tasks.add_task(_run_generation, job.job_id, image_bytes, params, collection)
+    background_tasks.add_task(
+        _run_generation,
+        job.job_id,
+        image_bytes=image_bytes,
+        prompt=prompt,
+        params=params,
+        collection=collection,
+    )
     return job
+
+
+def create_from_image_job(background_tasks: BackgroundTasks, image_bytes: bytes, params: dict, collection: str = "Default") -> JobStatus:
+    return create_generation_job(
+        background_tasks,
+        image_bytes=image_bytes,
+        params=params,
+        collection=collection,
+    )
+
+
+def create_from_text_job(background_tasks: BackgroundTasks, prompt: str, params: dict, collection: str = "Default") -> JobStatus:
+    return create_generation_job(
+        background_tasks,
+        prompt=prompt,
+        params=params,
+        collection=collection,
+    )
 
 
 def get_job(job_id: str) -> Optional[JobStatus]:
@@ -144,7 +176,14 @@ def build_scene_candidate(output_path: Optional[Path], collection: str = "Defaul
     )
 
 
-async def _run_generation(job_id: str, image_bytes: bytes, params: dict, collection: str = "Default") -> None:
+async def _run_generation(
+    job_id: str,
+    *,
+    image_bytes: Optional[bytes] = None,
+    prompt: Optional[str] = None,
+    params: dict,
+    collection: str = "Default",
+) -> None:
     job = _jobs[job_id]
     job.status = "running"
 
@@ -184,11 +223,16 @@ async def _run_generation(job_id: str, image_bytes: bytes, params: dict, collect
 
         cancel_event = _cancel_events.get(job_id)
         supports_cancel = "cancel_event" in inspect.signature(gen.generate).parameters
+        generation_input = image_bytes if image_bytes is not None else b""
+        generation_params = dict(params)
+        if prompt is not None:
+            generation_params.setdefault("prompt", prompt)
+
         output_path = await loop.run_in_executor(
             None,
-            lambda: gen.generate(image_bytes, params, progress_cb, cancel_event)
+            lambda: gen.generate(generation_input, generation_params, progress_cb, cancel_event)
             if supports_cancel
-            else gen.generate(image_bytes, params, progress_cb),
+            else gen.generate(generation_input, generation_params, progress_cb),
         )
 
         if job_id in _cancelled:

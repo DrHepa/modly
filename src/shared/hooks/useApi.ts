@@ -1,36 +1,85 @@
 import axios from 'axios'
-import { useAppStore, GenerationOptions } from '@shared/stores/appStore'
+import { useAppStore, type GenerationOptions } from '../stores/appStore.ts'
 
-export function useApi() {
-  const apiUrl = useAppStore((s) => s.apiUrl)
+export type GenerationSubmitRequest =
+  | {
+    kind: 'image'
+    imagePath: string
+    imageData?: string
+  }
+  | {
+    kind: 'text'
+    prompt: string
+  }
 
-  const client = axios.create({ baseURL: apiUrl })
+type ApiClient = Pick<ReturnType<typeof axios.create>, 'post' | 'get'>
 
+type CreateGenerationApiDeps = {
+  client: ApiClient
+  readFileBase64: (filePath: string) => Promise<string>
+}
+
+function createImageFormData(imagePath: string, options: GenerationOptions, base64: string): FormData {
+  const byteArray = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+  const blob = new Blob([byteArray], { type: 'image/png' })
+  const filename = imagePath.split(/[\\/]/).pop() ?? 'image.png'
+
+  const formData = new FormData()
+  formData.append('image', blob, filename)
+  formData.append('model_id', options.modelId)
+  formData.append('remesh', options.remesh)
+  formData.append('enable_texture', String(options.enableTexture))
+  formData.append('texture_resolution', String(options.textureResolution))
+  formData.append('params', JSON.stringify(options.modelParams))
+  return formData
+}
+
+export function createGenerationApi({ client, readFileBase64 }: CreateGenerationApiDeps) {
   async function generateFromImage(
     imagePath: string,
     options: GenerationOptions,
     imageData?: string,
     signal?: AbortSignal,
   ): Promise<{ jobId: string }> {
-    // Use provided base64 (drag & drop) or read from disk via IPC
-    const base64 = imageData ?? await window.electron.fs.readFileBase64(imagePath)
-    const byteArray = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-    const blob = new Blob([byteArray], { type: 'image/png' })
-    const filename = imagePath.split(/[\\/]/).pop() ?? 'image.png'
-
-    const formData = new FormData()
-    formData.append('image', blob, filename)
-    formData.append('model_id', options.modelId)
-    formData.append('remesh', options.remesh)
-    formData.append('enable_texture', String(options.enableTexture))
-    formData.append('texture_resolution', String(options.textureResolution))
-    formData.append('params', JSON.stringify(options.modelParams))
+    const base64 = imageData ?? await readFileBase64(imagePath)
+    const formData = createImageFormData(imagePath, options, base64)
     const { data } = await client.post<{ job_id: string }>('/generate/from-image', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       signal,
     })
 
     return { jobId: data.job_id }
+  }
+
+  async function generateFromText(
+    prompt: string,
+    options: GenerationOptions,
+    signal?: AbortSignal,
+  ): Promise<{ jobId: string }> {
+    const { data } = await client.post<{ job_id: string }>('/generate/from-text', {
+      prompt,
+      model_id: options.modelId,
+      remesh: options.remesh,
+      enable_texture: options.enableTexture,
+      texture_resolution: options.textureResolution,
+      params: options.modelParams,
+    }, {
+      signal,
+    })
+
+    return { jobId: data.job_id }
+  }
+
+  async function submitGeneration(
+    request: GenerationSubmitRequest,
+    options: GenerationOptions,
+    signal?: AbortSignal,
+  ): Promise<{ jobId: string }> {
+    if (request.kind === 'text') {
+      return generateFromText(request.prompt, options, signal)
+    }
+
+    return generateFromImage(request.imagePath, options, request.imageData, signal)
   }
 
   async function pollJobStatus(jobId: string): Promise<{
@@ -116,5 +165,16 @@ export function useApi() {
     return { url: data.url }
   }
 
-  return { generateFromImage, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh }
+  return { generateFromImage, generateFromText, submitGeneration, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh }
+}
+
+export function useApi() {
+  const apiUrl = useAppStore((s) => s.apiUrl)
+
+  const client = axios.create({ baseURL: apiUrl })
+
+  return createGenerationApi({
+    client,
+    readFileBase64: (filePath) => window.electron.fs.readFileBase64(filePath),
+  })
 }

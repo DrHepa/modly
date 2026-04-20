@@ -5,10 +5,10 @@ import {
   AUTOMATION_HTTP_BRIDGE_PATH,
   AutomationHttpBridge,
   PROCESS_RUNS_HTTP_BRIDGE_PATH,
-} from './automation-http-bridge'
-import { ResolveCanonicalProcessTargetError, type CanonicalProcessTarget } from './automation-capabilities'
-import { ProcessRunsService, type ProcessRunSnapshot } from './process-runs-service'
-import type { IProcessRunner, ProcessInput, ProcessResult } from './process-runner'
+} from './automation-http-bridge.ts'
+import { ResolveCanonicalProcessTargetError, type CanonicalProcessTarget } from './automation-capabilities.ts'
+import { ProcessRunsService, type ProcessRunSnapshot } from './process-runs-service.ts'
+import type { IProcessRunner, ProcessInput, ProcessResult } from './process-runner.ts'
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void

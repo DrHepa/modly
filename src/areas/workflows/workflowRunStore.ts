@@ -5,6 +5,7 @@ import type { WorkflowExtension } from './mockExtensions.ts'
 import type { Workflow, WFNode, WFEdge } from '../../shared/types/electron.d'
 import { buildProcessExecutionInput } from './processExecution.ts'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
+import { hydrateWorkflowNodeParams } from './workflowNodeParams.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +34,93 @@ function flushResume(): void {
   if (!fn) return
   _resume.current = null
   fn()
+}
+
+type ModelGenerationRequest =
+  | {
+      kind: 'image'
+      imagePath: string
+      imageData?: string
+      params: Record<string, unknown>
+    }
+  | {
+      kind: 'text'
+      payload: {
+        prompt: string
+        model_id: string
+        collection: string
+        remesh: string
+        enable_texture: boolean
+        texture_resolution: number
+        params: Record<string, unknown>
+      }
+    }
+
+function buildModelGenerationRequest(args: {
+  ext: WorkflowExtension
+  node: WFNode
+  nodeParams: Record<string, unknown>
+  nodeInputPath?: string
+  nodeInputText?: string
+  nodeInputMeshPath?: string
+  selectedImagePath: string
+  selectedImageData?: string
+  workspaceDir: string
+}): ModelGenerationRequest {
+  const {
+    ext,
+    node,
+    nodeParams,
+    nodeInputPath,
+    nodeInputText,
+    nodeInputMeshPath,
+    selectedImagePath,
+    selectedImageData,
+    workspaceDir,
+  } = args
+
+  if (ext.input === undefined) {
+    throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
+  }
+
+  if (ext.input === 'text') {
+    const promptParam = typeof nodeParams.prompt === 'string' ? nodeParams.prompt : undefined
+    const prompt = nodeInputText ?? promptParam ?? ''
+    const { prompt: _prompt, ...params } = nodeParams
+
+    return {
+      kind: 'text',
+      payload: {
+        prompt,
+        model_id: node.data.extensionId ?? '',
+        collection: 'Workflows',
+        remesh: 'none',
+        enable_texture: false,
+        texture_resolution: 1024,
+        params,
+      },
+    }
+  }
+
+  if (ext.input !== 'image') {
+    throw new Error(`Unsupported workflow capability input for extension ${ext.id}: ${String(ext.input)}`)
+  }
+
+  const activeImagePath = nodeInputPath ?? selectedImagePath
+  const extraParams: Record<string, unknown> = {}
+  if (nodeInputMeshPath) {
+    const norm = nodeInputMeshPath.replace(/\\/g, '/')
+    extraParams.mesh_path = norm.startsWith(workspaceDir)
+      ? norm.slice(workspaceDir.length).replace(/^\//, '')
+      : norm
+  }
+
+  return {
+    kind: 'image',
+    imagePath: activeImagePath,
+    imageData: selectedImageData && nodeInputPath === undefined ? selectedImageData : undefined,
+    params: { ...nodeParams, ...extraParams },
+  }
 }
 
 // ─── Topological sort ─────────────────────────────────────────────────────────
@@ -161,6 +249,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const node = execNodes[i]
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
+        const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
 
         // ── Resolve inputs ────────────────────────────────────────────────
         let nodeInputPath:     string | undefined
@@ -217,37 +306,40 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         // ── Model extensions → HTTP API ───────────────────────────────────
         // Process extensions → IPC runProcess
         if (mode === 'model') {
-          const activeImagePath = nodeInputPath ?? selectedImagePath
-          const base64 = selectedImageData && nodeInputPath === undefined
-            ? selectedImageData
-            : await window.electron.fs.readFileBase64(activeImagePath)
-          const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-          const blob  = new Blob([bytes], { type: 'image/png' })
-          const fname = activeImagePath.split(/[\\/]/).pop() ?? 'image.png'
-
-          const extraParams: Record<string, unknown> = {}
-          if (nodeInputMeshPath) {
-            const norm = nodeInputMeshPath.replace(/\\/g, '/')
-            extraParams.mesh_path = norm.startsWith(workspaceDir)
-              ? norm.slice(workspaceDir.length).replace(/^\//, '')
-              : norm
-          }
-
-          const fd = new FormData()
-          fd.append('image', blob, fname)
-          fd.append('model_id', node.data.extensionId ?? '')
-          fd.append('collection', 'Workflows')
-          fd.append('remesh', 'none')
-          fd.append('enable_texture', 'false')
-          fd.append('texture_resolution', '1024')
-          fd.append('params', JSON.stringify({ ...node.data.params, ...extraParams }))
+          const request = buildModelGenerationRequest({
+            ext,
+            node,
+            nodeParams: hydratedParams,
+            nodeInputPath,
+            nodeInputText,
+            nodeInputMeshPath,
+            selectedImagePath,
+            selectedImageData,
+            workspaceDir,
+          })
 
           set((s) => ({ runState: { ...s.runState, blockProgress: 5, blockStep: 'Submitting to model…' } }))
 
-          const { data } = await client.post<{ job_id: string }>(
-            '/generate/from-image', fd,
-            { headers: { 'Content-Type': 'multipart/form-data' } },
-          )
+          const { data } = await (request.kind === 'image'
+            ? (async () => {
+              const base64 = request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)
+              const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+              const blob  = new Blob([bytes], { type: 'image/png' })
+              const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
+              const fd = new FormData()
+              fd.append('image', blob, fname)
+              fd.append('model_id', node.data.extensionId ?? '')
+              fd.append('collection', 'Workflows')
+              fd.append('remesh', 'none')
+              fd.append('enable_texture', 'false')
+              fd.append('texture_resolution', '1024')
+              fd.append('params', JSON.stringify(request.params))
+              return client.post<{ job_id: string }>(
+                '/generate/from-image', fd,
+                { headers: { 'Content-Type': 'multipart/form-data' } },
+              )
+            })()
+            : client.post<{ job_id: string }>('/generate/from-text', request.payload))
           _activeJobId.current = data.job_id
 
           while (true) {
@@ -294,7 +386,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           const result = await window.electron.extensions.runProcess(
             ext.extensionId,
             processInput,
-            node.data.params as Record<string, unknown>,
+            hydratedParams,
           )
           if (!result.success) throw new Error(result.error ?? 'Process extension failed')
           nodeInputPath = processInput.filePath

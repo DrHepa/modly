@@ -5,18 +5,18 @@ import {
   ResolveCanonicalProcessTargetError,
   resolveCanonicalProcessTarget,
   type CanonicalProcessTarget,
-} from './automation-capabilities'
+} from './automation-capabilities.ts'
 import {
   resolveAutomationCapabilitiesContext,
   type AutomationCapabilitiesContext,
-} from './automation-capabilities-service'
+} from './automation-capabilities-service.ts'
 import {
   createRunScopedProcessRunner,
   getExtPythonExe,
   type IProcessRunner,
   type ProcessInput,
   type ProcessResult,
-} from './process-runner'
+} from './process-runner.ts'
 
 const PROCESS_RUNS_HEALTH_URL = 'http://127.0.0.1:8765/health'
 const PROCESS_RUNS_HEALTH_TIMEOUT_MS = 2_000
@@ -130,7 +130,7 @@ const defaultProcessRunsServiceDeps: ProcessRunsServiceDeps = {
   resolveContext: () => resolveAutomationCapabilitiesContext(),
   resolveWorkspaceDir: async () => {
     const { app } = await import('electron')
-    const { getSettings } = await import('./settings-store')
+    const { getSettings } = await import('./settings-store.ts')
     return getSettings(app.getPath('userData')).workspaceDir
   },
   resolveTempDir: async () => {
@@ -152,7 +152,7 @@ const defaultProcessRunsServiceDeps: ProcessRunsServiceDeps = {
   createRunner: async ({ target, workspaceDir, tempDir }) => {
     if (target.entry.endsWith('.py')) {
       const { app } = await import('electron')
-      const { getVenvPythonExe } = await import('./python-setup')
+      const { getVenvPythonExe } = await import('./python-setup.ts')
       const pythonExe = getExtPythonExe(target.extDir) ?? getVenvPythonExe(app.getPath('userData'))
 
       return createRunScopedProcessRunner({

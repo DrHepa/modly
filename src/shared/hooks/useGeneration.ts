@@ -1,21 +1,77 @@
 import { useCallback, useRef } from 'react'
-import { useAppStore } from '@shared/stores/appStore'
-import { useApi } from './useApi'
+import { useAppStore, type GenerationOptions } from '../stores/appStore.ts'
+import { useExtensionsStore, type ModelExtension } from '../stores/extensionsStore.ts'
+import { useApi, type GenerationSubmitRequest } from './useApi.ts'
+
+type ResolveLegacyGenerationRequestArgs = {
+  imagePath: string | null | undefined
+  selectedImageData: string | null
+  generationOptions: GenerationOptions
+  modelExtensions: ModelExtension[]
+}
+
+function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): 'image' | 'text' {
+  const extension = modelExtensions.find((candidate) => candidate.id === modelId)
+  const input = extension?.nodes[0]?.input
+
+  if (!input) {
+    throw new Error(`Missing generation input metadata for model ${modelId}`)
+  }
+
+  if (input === 'image' || input === 'text') {
+    return input
+  }
+
+  throw new Error(`Unsupported generation input for model ${modelId}: ${input}`)
+}
+
+export function resolveLegacyGenerationRequest({
+  imagePath,
+  selectedImageData,
+  generationOptions,
+  modelExtensions,
+}: ResolveLegacyGenerationRequestArgs): GenerationSubmitRequest {
+  const input = resolveModelInput(generationOptions.modelId, modelExtensions)
+
+  if (input === 'text') {
+    return {
+      kind: 'text',
+      prompt: typeof generationOptions.modelParams.prompt === 'string' ? generationOptions.modelParams.prompt : '',
+    }
+  }
+
+  if (!imagePath) {
+    throw new Error(`Image path is required for image generation model ${generationOptions.modelId}`)
+  }
+
+  return {
+    kind: 'image',
+    imagePath,
+    imageData: selectedImageData ?? undefined,
+  }
+}
 
 export function useGeneration() {
   const { currentJob, setCurrentJob, updateCurrentJob, generationOptions, selectedImageData, pushMeshUrl, clearMeshHistory } = useAppStore()
-  const { generateFromImage, pollJobStatus, cancelJob } = useApi()
+  const modelExtensions = useExtensionsStore((s) => s.modelExtensions)
+  const { submitGeneration, pollJobStatus, cancelJob } = useApi()
   const cancelledRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
 
   const startGeneration = useCallback(
-    async (imagePath: string) => {
+    async (imagePath?: string | null) => {
       cancelledRef.current = false
       abortControllerRef.current = new AbortController()
       clearMeshHistory()
+      const request = resolveLegacyGenerationRequest({
+        imagePath,
+        selectedImageData,
+        generationOptions,
+        modelExtensions,
+      })
       const job = {
         id: crypto.randomUUID(),
-        imageFile: imagePath,
+        imageFile: request.kind === 'image' ? request.imagePath : '',
         status: 'uploading' as const,
         progress: 0,
         createdAt: Date.now(),
@@ -25,7 +81,7 @@ export function useGeneration() {
       setCurrentJob(job)
 
       try {
-        const { jobId } = await generateFromImage(imagePath, generationOptions, selectedImageData ?? undefined, abortControllerRef.current.signal)
+        const { jobId } = await submitGeneration(request, generationOptions, abortControllerRef.current.signal)
 
         if (cancelledRef.current) {
           await cancelJob(jobId)
@@ -54,7 +110,7 @@ export function useGeneration() {
         })
       }
     },
-    [generateFromImage, pollJobStatus, cancelJob, setCurrentJob, updateCurrentJob]
+    [submitGeneration, pollJobStatus, cancelJob, setCurrentJob, updateCurrentJob, generationOptions, selectedImageData, modelExtensions, clearMeshHistory]
   )
 
   const pollUntilDone = async (jobId: string) => {

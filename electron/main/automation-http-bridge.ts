@@ -1,18 +1,18 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { AutomationCapabilitiesResponse } from './automation-capabilities'
+import type { AutomationCapabilitiesResponse } from './automation-capabilities.ts'
 import {
   ProcessRunServiceError,
   type CreateProcessRunRequest,
   type ProcessRunError,
   type ProcessRunSnapshot,
-} from './process-runs-service'
+} from './process-runs-service.ts'
 
 export const AUTOMATION_HTTP_BRIDGE_HOST = '127.0.0.1'
 export const AUTOMATION_HTTP_BRIDGE_PORT = 8766
 export const AUTOMATION_HTTP_BRIDGE_PATH = '/automation/capabilities'
 export const PROCESS_RUNS_HTTP_BRIDGE_PATH = '/process-runs'
 
-let defaultProcessRunsServicePromise: Promise<import('./process-runs-service').ProcessRunsService> | null = null
+let defaultProcessRunsServicePromise: Promise<import('./process-runs-service.ts').ProcessRunsService> | null = null
 
 type AutomationHttpBridgeDeps = {
   createServer: typeof createServer
@@ -35,7 +35,7 @@ type AutomationHttpBridgeOptions = Partial<AutomationHttpBridgeDeps> & {
 const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
   createServer,
   getAutomationCapabilities: async () => {
-    const { getAutomationCapabilities } = await import('./automation-capabilities-service')
+    const { getAutomationCapabilities } = await import('./automation-capabilities-service.ts')
     return getAutomationCapabilities()
   },
   createProcessRun: async (request) => {
@@ -52,7 +52,7 @@ const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
   },
   logger: {
     info: (message) => {
-      void import('./logger')
+      void import('./logger.ts')
         .then(({ logger }) => {
           logger.info(message)
         })
@@ -61,7 +61,7 @@ const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
         })
     },
     warn: (message) => {
-      void import('./logger')
+      void import('./logger.ts')
         .then(({ logger }) => {
           logger.warn(message)
         })
@@ -70,7 +70,7 @@ const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
         })
     },
     error: (message) => {
-      void import('./logger')
+      void import('./logger.ts')
         .then(({ logger }) => {
           logger.error(message)
         })
@@ -81,9 +81,9 @@ const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
   },
 }
 
-async function getDefaultProcessRunsService(): Promise<import('./process-runs-service').ProcessRunsService> {
+async function getDefaultProcessRunsService(): Promise<import('./process-runs-service.ts').ProcessRunsService> {
   if (!defaultProcessRunsServicePromise) {
-    defaultProcessRunsServicePromise = import('./process-runs-service').then(({ createProcessRunsService }) => createProcessRunsService())
+    defaultProcessRunsServicePromise = import('./process-runs-service.ts').then(({ createProcessRunsService }) => createProcessRunsService())
   }
 
   return defaultProcessRunsServicePromise

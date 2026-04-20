@@ -4,13 +4,13 @@ import {
   type ProcessRunSnapshot,
   ProcessRunServiceError,
   ProcessRunsService,
-} from './process-runs-service'
+} from './process-runs-service.ts'
 import {
   ResolveCanonicalProcessTargetError,
   type CanonicalProcessTarget,
-} from './automation-capabilities'
-import type { IProcessRunner, ProcessInput, ProcessResult } from './process-runner'
-import { resolveWorkspaceOutputDir } from '../../src/areas/workflows/nodes/mesh-exporter/output-path'
+} from './automation-capabilities.ts'
+import type { IProcessRunner, ProcessInput, ProcessResult } from './process-runner.ts'
+import { resolveWorkspaceOutputDir } from '../../src/areas/workflows/nodes/mesh-exporter/output-path.ts'
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void

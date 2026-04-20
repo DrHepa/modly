@@ -17,9 +17,7 @@ type PanelMode = 'basic' | 'chat'
 import { validateWorkflowProcessRun } from '@areas/workflows/processConnectionRules'
 import WorkflowParamControl from '@areas/workflows/components/WorkflowParamControl'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
-import ChatPanel from './ChatPanel'
-
-type PanelMode = 'basic' | 'chat'
+import type { WorkflowRunState } from '@areas/workflows/workflowRunStore'
 
 const toFlowNodes = (nodes: WFNode[]): FlowNode[] => nodes as unknown as FlowNode[]
 const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
@@ -64,6 +62,90 @@ function mimeFromPath(p: string): string {
   if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg'
   if (ext === 'webp') return 'image/webp'
   return 'image/png'
+}
+
+type WorkflowRunErrorCopy = {
+  title: string
+  detail: string
+}
+
+function normalizeWorkflowRunError(error?: string): string {
+  return error?.replace(/^Error:\s*/, '').trim() ?? ''
+}
+
+export function resolveWorkflowRunErrorCopy(error?: string): WorkflowRunErrorCopy | null {
+  const normalizedError = normalizeWorkflowRunError(error)
+
+  if (!normalizedError) return null
+
+  if (/prompt is required/i.test(normalizedError)) {
+    return {
+      title: 'Prompt required',
+      detail: 'Add text in the workflow prompt field before generating.',
+    }
+  }
+
+  if (/Missing workflow capability input metadata/i.test(normalizedError)) {
+    return {
+      title: 'Capability metadata is incomplete',
+      detail: 'Modly cannot tell whether this model expects text or an image.',
+    }
+  }
+
+  if (/Unsupported workflow capability input/i.test(normalizedError)) {
+    return {
+      title: 'Unsupported model mode',
+      detail: 'This Generate panel only supports models that start from text or image inputs.',
+    }
+  }
+
+  return {
+    title: 'Workflow run failed',
+    detail: normalizedError,
+  }
+}
+
+export function WorkflowRunFeedback({
+  runState,
+  runValidationIssue,
+  isRunning,
+}: {
+  runState: WorkflowRunState
+  runValidationIssue: { message: string } | null
+  isRunning: boolean
+}) {
+  if (!isRunning) {
+    const runErrorCopy = resolveWorkflowRunErrorCopy(runState.error)
+
+    if (runErrorCopy) {
+      return (
+        <div className="flex items-start gap-2 px-2.5 py-2 rounded-lg bg-red-950/40 border border-red-800/50">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0 mt-0.5">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <div className="flex flex-col gap-0.5 min-w-0">
+            <span className="text-[10px] text-red-300 font-semibold">{runErrorCopy.title}</span>
+            <span className="text-[10px] text-red-400 font-medium">{runErrorCopy.detail}</span>
+          </div>
+        </div>
+      )
+    }
+  }
+
+  if (runValidationIssue && !isRunning) {
+    return (
+      <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-red-950/40 border border-red-800/50">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        <span className="text-[10px] text-red-400 font-medium">{runValidationIssue.message}</span>
+      </div>
+    )
+  }
+
+  return null
 }
 
 // ─── Workflow dropdown ────────────────────────────────────────────────────────
@@ -442,15 +524,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
 
       {/* Footer */}
       <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
-        {runValidationIssue && !isRunning && (
-          <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-red-950/40 border border-red-800/50">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
-              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-            </svg>
-            <span className="text-[10px] text-red-400 font-medium">{runValidationIssue.message}</span>
-          </div>
-        )}
+        <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
         {isRunning ? (
           <button onClick={() => cancel()}
             className="w-full py-2.5 rounded-lg text-sm font-semibold bg-red-600 hover:bg-red-700 text-white transition-colors">

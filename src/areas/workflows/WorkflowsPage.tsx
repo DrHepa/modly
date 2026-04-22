@@ -28,28 +28,19 @@ import {
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
 import { useWorkflowRunStore } from './workflowRunStore'
-import { validateWorkflowPreflight } from './preflight'
-import ExtensionNode    from './nodes/ExtensionNode'
-import ImageNode        from './nodes/ImageNode'
-import TextNode         from './nodes/TextNode'
-import AddToSceneNode   from './nodes/AddToSceneNode'
-import Load3DMeshNode   from './nodes/Load3DMeshNode'
-import PreviewImageNode from './nodes/PreviewImageNode'
-import WaitNode         from './nodes/WaitNode'
-import WhileNode        from './nodes/WhileNode'
-import ForEachNode      from './nodes/ForEachNode'
 import WorkflowEdge     from './nodes/WorkflowEdge'
+import {
+  WORKFLOW_BUILTIN_PANEL_NODES,
+  WORKFLOW_BUILTIN_PALETTE_NODES,
+  createBuiltinWorkflowNode,
+} from './workflowBuiltinNodeCatalog'
+import { WORKFLOW_NODE_TYPES } from './workflowNodeTypes'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DRAG_KEY      = 'modly/extension-id'
 const DRAG_NODE_KEY = 'modly/node-type'
-const NODE_TYPES = { extensionNode: ExtensionNode, imageNode: ImageNode, textNode: TextNode, outputNode: AddToSceneNode, meshNode: Load3DMeshNode, previewNode: PreviewImageNode, waitNode: WaitNode, whileNode: WhileNode, forEachNode: ForEachNode }
-
-// Loop-container node types: resizable frames whose children form a loop body.
-// (For Each iterators are plain source nodes, not containers.)
-const CONTAINER_TYPES = new Set(['whileNode'])
-const isContainerType = (type: string | undefined): boolean => !!type && CONTAINER_TYPES.has(type)
+const NODE_TYPES = WORKFLOW_NODE_TYPES
 const EDGE_TYPES = { workflowEdge: WorkflowEdge }
 
 const DEFAULT_EDGE_OPTS = { type: 'workflowEdge' }
@@ -175,16 +166,7 @@ function NewWorkflowModal({ onBlank, onTemplate, onClose }: {
 const PANEL_MIN = 240
 const PANEL_MAX = 860
 
-const PANEL_BUILTIN_NODES = [
-  { type: 'imageNode',   label: 'Image',         color: '#38bdf8', icon: <><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></> },
-  { type: 'textNode',    label: 'Text',           color: '#fbbf24', icon: <><path d="M17 6.1H3M21 12.1H3M15.1 18H3"/></> },
-  { type: 'meshNode',    label: 'Load 3D Mesh',   color: '#a78bfa', icon: <><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></> },
-  { type: 'outputNode',  label: 'Add to Scene',   color: '#a78bfa', icon: <><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></> },
-  { type: 'previewNode', label: 'Preview Views',  color: '#38bdf8', icon: <><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/></> },
-  { type: 'waitNode',    label: 'Wait',           color: '#71717a', icon: <><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></> },
-  { type: 'whileNode',   label: 'While',          color: '#f59e0b', icon: <><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></> },
-  { type: 'forEachNode', label: 'For Each', color: '#38bdf8', icon: <><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></> },
-]
+const PANEL_BUILTIN_NODES = WORKFLOW_BUILTIN_PANEL_NODES
 
 function ExtGroupHeader({ title, author, expanded, onToggle, count }: { title: string; author?: string; expanded: boolean; onToggle: () => void; count: number }) {
   return (
@@ -421,19 +403,10 @@ function PanelToggleIcon({ open }: { open: boolean }) {
 
 // ─── Node palette (Space to open) ────────────────────────────────────────────
 
-const BUILTIN_NODES = [
-  { type: 'imageNode',   label: 'Image',         color: '#38bdf8', description: 'Image input' },
-  { type: 'textNode',    label: 'Text',           color: '#fbbf24', description: 'Text input' },
-  { type: 'meshNode',    label: 'Load 3D Mesh',   color: '#a78bfa', description: 'Load a 3D mesh file or use current model' },
-  { type: 'outputNode',  label: 'Add to Scene',   color: '#a78bfa', description: 'Output node — adds the mesh to the 3D scene' },
-  { type: 'previewNode', label: 'Preview Views',  color: '#38bdf8', description: 'Displays multi-view image outputs in a 2×3 grid' },
-  { type: 'waitNode',    label: 'Wait',           color: '#71717a', description: 'Pauses the workflow until you click Continue' },
-  { type: 'whileNode',   label: 'While',          color: '#f59e0b', description: 'Container: wrap nodes to loop them N times or with Continue/Retry' },
-  { type: 'forEachNode', label: 'For Each', color: '#38bdf8', description: 'Iterates a folder (image / text / mesh) alphabetically, one item per run of the downstream nodes' },
-]
+const BUILTIN_NODES = WORKFLOW_BUILTIN_PALETTE_NODES
 
 type PaletteItem =
-  | { kind: 'node'; data: typeof BUILTIN_NODES[0] }
+  | { kind: 'node'; data: (typeof BUILTIN_NODES)[number] }
   | { kind: 'ext';  data: WorkflowExtension }
 
 type PaletteGroup = {
@@ -979,10 +952,7 @@ function WorkflowCanvasInner({
 
     const nodeType = e.dataTransfer.getData(DRAG_NODE_KEY)
     if (nodeType) {
-      setNodes((nds) => [...nds, {
-        id: newId(), type: nodeType, position,
-        data: { enabled: true, params: {} },
-      }])
+      setNodes((nds) => [...nds, createBuiltinWorkflowNode(nodeType, position)])
       return
     }
 
@@ -1089,12 +1059,7 @@ function WorkflowCanvasInner({
     const newNodeId = newId()
     const newNode = type === 'extensionNode' && extensionId
       ? createHydratedExtensionWorkflowNode({ id: newNodeId, extensionId, position, allExtensions })
-      : {
-          id: newNodeId,
-          type,
-          position,
-          data: { extensionId, enabled: true, params: {} },
-        }
+      : { ...createBuiltinWorkflowNode(type, position, extensionId), id: newNodeId }
     const nextNodes = toWorkflowNodes([...nodes, newNode])
     setNodes((nds) => [...nds, newNode])
 

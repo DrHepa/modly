@@ -2,7 +2,8 @@ import { getBezierPath, useReactFlow } from '@xyflow/react'
 import type { EdgeProps } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
-import { PROCESS_PORT_HANDLE_COLOR, resolveProcessTargetColor } from '../processPorts'
+import { PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
+import { resolveWorkflowEdgeTargetColor } from './workflowEdgeColors'
 
 export default function WorkflowEdge({
   id, source, target,
@@ -26,14 +27,11 @@ export default function WorkflowEdge({
     ? PROCESS_PORT_HANDLE_COLOR.mesh
     : (extensionOutput ? PROCESS_PORT_HANDLE_COLOR[extensionOutput] : '#52525b')
 
-  const targetColor = targetNode?.type === 'outputNode'
-    ? PROCESS_PORT_HANDLE_COLOR.mesh
-    : targetNode?.type === 'previewNode'
-    ? PROCESS_PORT_HANDLE_COLOR.image
-    : resolveProcessTargetColor(
-      allExtensions.find((e) => e.id === targetNode?.data?.extensionId) ?? {},
-      targetHandle,
-    )
+  const targetColor = resolveWorkflowEdgeTargetColor({
+    targetNodeType: targetNode?.type,
+    targetExtension: allExtensions.find((e) => e.id === targetNode?.data?.extensionId) ?? {},
+    targetHandle,
+  })
 
   const [edgePath] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
   const gradientId = `wf-edge-${id}`

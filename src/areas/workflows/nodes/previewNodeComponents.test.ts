@@ -4,11 +4,35 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { ReactFlowProvider } from '@xyflow/react'
 
-import PreviewImageNode, { PreviewImageContent } from './PreviewImageNode.tsx'
-import PreviewViewsNode, { PreviewViewsContent } from './PreviewViewsNode.tsx'
+import PreviewImageNode, { PreviewImageContent, resolvePreviewImageNodeUrl } from './PreviewImageNode.tsx'
+import PreviewViewsNode, { PreviewViewsContent, resolvePreviewViewsNodeUrl } from './PreviewViewsNode.tsx'
 import ImagePreviewNode from './ImagePreviewNode.tsx'
 import { WORKFLOW_NODE_TYPES } from '../workflowNodeTypes.tsx'
 import { WORKFLOW_BUILTIN_NODE_TYPES } from '../workflowBuiltinNodeCatalog.tsx'
+import { useAppStore } from '../../../shared/stores/appStore.ts'
+import { useWorkflowRunStore } from '../workflowRunStore.ts'
+
+test('resolvePreviewImageNodeUrl forwards apiUrl through the shared resolver', () => {
+  const imageUrl = resolvePreviewImageNodeUrl({
+    nodeId: 'preview-image',
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'source-a', target: 'preview-image' }],
+    nodeImageOutputs: { 'source-a': '/workspace/preview.png' },
+  })
+
+  assert.equal(imageUrl, 'http://127.0.0.1:8000/workspace/preview.png')
+})
+
+test('resolvePreviewViewsNodeUrl shares the same workspace fallback behavior', () => {
+  const imageUrl = resolvePreviewViewsNodeUrl({
+    nodeId: 'preview-views',
+    apiUrl: '',
+    edges: [{ source: 'source-a', target: 'preview-views' }],
+    nodeImageOutputs: { 'source-a': '/workspace/views.png' },
+  })
+
+  assert.equal(imageUrl, undefined)
+})
 
 test('PreviewImageContent renders a single upstream image preview', () => {
   const markup = renderToStaticMarkup(React.createElement(PreviewImageContent, { imageUrl: '/workspace/preview.png' }))
@@ -50,3 +74,38 @@ test('terminal component markup exposes only the target while upstream passthrou
     assert.equal((markup.match(/react-flow__handle[^\"]*source/g) ?? []).length, sourceHandles)
   }
 })
+
+for (const [Component, sinkType] of [[PreviewImageNode, 'previewImageNode'], [PreviewViewsNode, 'previewNode']] as const) {
+  test(`${sinkType} actual SSR component uses current API and resolved Wait source without changing its handles`, () => {
+    // Seed the real Zustand server snapshots, not a second resolver model.
+    // Repeated SSR snapshots verify prop/URL composition, not live subscriptions,
+    // image decoding, CSP enforcement or native Electron rendering.
+    const appSnapshot = useAppStore.getInitialState()
+    const runSnapshot = useWorkflowRunStore.getInitialState()
+    const previousApiUrl = appSnapshot.apiUrl
+    const previousImageOutputs = runSnapshot.nodeImageOutputs
+    const nodes = ['imageNode', 'waitNode', 'imagePreviewNode', sinkType, 'imageNode'].map((type, i) => ({ id: String(i), type, position: { x: 0, y: 0 }, data: { enabled: true, params: {} } }))
+    const edges = [{ id: 'a', source: '0', target: '1' }, { id: 'b', source: '1', target: '2' }, { id: 'c', source: '2', target: '3' }]
+    const render = (apiUrl: string, currentEdges = edges, imageUrl = '/workspace/preview.png') => {
+      appSnapshot.apiUrl = apiUrl
+      runSnapshot.nodeImageOutputs = { '0': imageUrl, '4': '/workspace/rewired.png' }
+      return renderToStaticMarkup(React.createElement(ReactFlowProvider, {
+        initialNodes: nodes, initialEdges: currentEdges, children: React.createElement(Component, { id: '3' }),
+      }))
+    }
+    try {
+      for (const apiUrl of ['http://127.0.0.1:8000', 'http://127.0.0.1:9000']) {
+        const markup = render(apiUrl)
+        assert.ok(markup.includes(`${apiUrl}/workspace/preview.png`))
+        assert.equal((markup.match(/react-flow__handle[^\"]*source/g) ?? []).length, 0)
+        assert.ok(render(apiUrl, [{ id: 'rewire', source: '4', target: '3' }]).includes(`${apiUrl}/workspace/rewired.png`))
+        assert.equal(render(apiUrl, []).includes('/workspace/'), false)
+      }
+      assert.equal(render('').includes('/workspace/'), false)
+      for (const imageUrl of ['https://example.invalid/preview.png', 'data:image/png;base64,AA==']) assert.ok(render('', edges, imageUrl).includes(imageUrl))
+    } finally {
+      appSnapshot.apiUrl = previousApiUrl
+      runSnapshot.nodeImageOutputs = previousImageOutputs
+    }
+  })
+}

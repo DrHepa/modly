@@ -11,6 +11,8 @@ import {
   PREVIEW_VIEWS_NODE_TYPE,
   PREVIEW_VIEWS_TITLE,
 } from './previewNodeShared.ts'
+import { resolvePreviewImageNodeUrl } from './PreviewImageNode.tsx'
+import { resolvePreviewViewsNodeUrl } from './PreviewViewsNode.tsx'
 
 test('legacy previewNode workflows remain registered under the existing node type', () => {
   assert.equal(WORKFLOW_BUILTIN_NODE_TYPES.includes(PREVIEW_VIEWS_NODE_TYPE), true)
@@ -77,4 +79,32 @@ test('preflight follows Wait and upstream preview sources without making termina
     if (sourceType === 'imageNode') assert.deepEqual(issues, [])
     else assert.ok(issues.some((issue) => /expects an image.*text/.test(issue.message)))
   }
+})
+
+test('both preview node types normalize workspace outputs through the same shared seam', () => {
+  const sharedArgs = {
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'source-a', target: 'preview-node' }],
+    nodeImageOutputs: { 'source-a': '/workspace/preview.png' },
+  }
+
+  assert.equal(
+    resolvePreviewImageNodeUrl({ ...sharedArgs, nodeId: 'preview-node' }),
+    'http://127.0.0.1:8000/workspace/preview.png',
+  )
+  assert.equal(
+    resolvePreviewViewsNodeUrl({ ...sharedArgs, nodeId: 'preview-node' }),
+    'http://127.0.0.1:8000/workspace/preview.png',
+  )
+})
+
+test('both preview node types preserve non-workspace upstream values as fallback behavior', () => {
+  const sharedArgs = {
+    apiUrl: '',
+    edges: [{ source: 'source-a', target: 'preview-node' }],
+    nodeImageOutputs: { 'source-a': 'http://cdn.example.com/preview.png' },
+  }
+
+  assert.equal(resolvePreviewImageNodeUrl({ ...sharedArgs, nodeId: 'preview-node' }), 'http://cdn.example.com/preview.png')
+  assert.equal(resolvePreviewViewsNodeUrl({ ...sharedArgs, nodeId: 'preview-node' }), 'http://cdn.example.com/preview.png')
 })

@@ -3,6 +3,7 @@ import { Handle, Position, useEdges, useNodes } from '@xyflow/react'
 import type { WFNode } from '../../../shared/types/electron.d'
 
 import { useWorkflowRunStore } from '../workflowRunStore'
+import { useAppStore } from '../../../shared/stores/appStore.ts'
 import BaseNode from './BaseNode'
 import { PREVIEW_VIEWS_EMPTY_COPY, PREVIEW_VIEWS_TITLE, resolvePreviewImageUrl } from './previewNodeShared'
 
@@ -39,15 +40,21 @@ export function PreviewViewsContent({ imageUrl }: { imageUrl?: string }) {
   )
 }
 
+export function resolvePreviewViewsNodeUrl(args: Parameters<typeof resolvePreviewImageUrl>[0]) {
+  return resolvePreviewImageUrl(args)
+}
+
 export default function PreviewViewsNode({ id, selected }: { id: string; selected?: boolean }) {
+  const apiUrl = useAppStore((state) => state.apiUrl)
   const nodeImageOutputs = useWorkflowRunStore((state) => state.nodeImageOutputs)
   const edges = useEdges()
   const nodes = useNodes()
 
-  const imageUrl = resolvePreviewImageUrl({
+  const imageUrl = resolvePreviewViewsNodeUrl({
     nodeId: id,
     edges,
     nodes: nodes as WFNode[],
+    apiUrl,
     nodeImageOutputs,
   })
 

@@ -99,7 +99,7 @@ interface LegacyWorkflow {
 // An edge into/out of the wrong side can't resolve a handle and makes React Flow
 // warn ("Couldn't create edge for target handle id: null") on every render.
 export const NODE_TYPES_WITHOUT_TARGET = new Set(['imageNode', 'textNode', 'meshNode', 'sceneNode', 'inputNode', 'forEachNode'])
-export const NODE_TYPES_WITHOUT_SOURCE = new Set(['outputNode', 'previewNode'])
+export const NODE_TYPES_WITHOUT_SOURCE = new Set(['outputNode', 'previewNode', 'previewImageNode'])
 
 function sanitizeEdges(nodes: WFNode[], edges: WFEdge[]): WFEdge[] {
   const typeOf = new Map(nodes.map((n) => [n.id, n.type]))

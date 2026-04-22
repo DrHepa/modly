@@ -166,6 +166,8 @@ import ts from 'typescript'
 import * as connectionRules from './processConnectionRules.ts'
 import { getProcessTargetPorts } from './processPorts.ts'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory.ts'
+import { createBuiltinWorkflowNode } from './workflowBuiltinNodeCatalog.tsx'
+import { NODE_TYPES_WITHOUT_SOURCE, NODE_TYPES_WITHOUT_TARGET } from '../../shared/stores/workflowsStore.ts'
 
 const pageSource = await readWorkflowFile('WorkflowsPage.tsx')
 const pageAst = ts.createSourceFile('WorkflowsPage.tsx', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
@@ -189,7 +191,7 @@ const callback = ${paletteOwners.get('addNodeFromPalette')};
 return callback;
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText
 
-function invokePalette(sourceKind: string, reversed: boolean, targetInputs: WorkflowExtension['inputs']) {
+function invokePalette(sourceKind: string, reversed: boolean, targetInputs: WorkflowExtension['inputs'], options: { type?: string; handleType?: string; container?: boolean } = {}) {
   let nodes = sourceKind === 'waitNode'
     ? [node('mesh', 'meshNode'), node('source', 'waitNode'), node('unrelated', 'imageNode'), node('preview', 'imagePreviewNode')]
     : [node('source', sourceKind as WFNode['type'], sourceKind === 'forEachNode' ? { mode: 'mesh' } : {}), node('unrelated', 'imageNode'), node('preview', 'imagePreviewNode')]
@@ -197,24 +199,27 @@ function invokePalette(sourceKind: string, reversed: boolean, targetInputs: Work
   if (reversed) edges.reverse()
   let issue: connectionRules.ProcessConnectionRuleIssue | null = null
   const allExtensions = [extension('run', targetInputs)]
+  allExtensions[0].params = [{ id: 'strength', label: 'Strength', type: 'float', default: 0 }]
+  const container = options.container ? node('container', 'whileNode', {}, { position: { x: 100, y: 100 }, width: 420, height: 240 }) : undefined
+  if (container) nodes = [container, ...nodes]
   const env = {
-    screenToFlowPosition: (value: unknown) => value, pendingDropPos: { x: 0, y: 0 }, newId: () => 'new-target',
-    isContainerType: () => false, findWhileContainerAt: () => undefined,
+    screenToFlowPosition: (value: unknown) => value, pendingDropPos: options.container ? { x: 125, y: 150 } : { x: 0, y: 0 }, newId: () => 'new-target',
+    isContainerType: (type: string) => type === 'whileNode', findWhileContainerAt: () => container,
     nodes, edges, setNodes: (update: (current: WFNode[]) => WFNode[]) => { nodes = update(nodes) },
     setEdges: (update: (current: WFEdge[]) => WFEdge[]) => { edges = update(edges) },
     toWorkflowNodes: (value: WFNode[]) => value, toWorkflowEdges: (value: WFEdge[]) => value,
-    pendingConnectionRef: { current: { nodeId: 'source', handleType: 'source', handleId: 'output' } },
-    NODE_TYPES_WITHOUT_TARGET: new Set(['imageNode', 'meshNode', 'textNode', 'sceneNode', 'forEachNode']),
-    NODE_TYPES_WITHOUT_SOURCE: new Set(['outputNode', 'previewNode']),
+    pendingConnectionRef: { current: { nodeId: 'source', handleType: options.handleType ?? 'source', handleId: 'output' } },
+    NODE_TYPES_WITHOUT_TARGET,
+    NODE_TYPES_WITHOUT_SOURCE,
     allExtensions, getNode: (id: string) => nodes.find((candidate) => candidate.id === id),
-    getProcessTargetPorts, createHydratedExtensionWorkflowNode, ...connectionRules,
+    getProcessTargetPorts, createHydratedExtensionWorkflowNode, createBuiltinWorkflowNode, ...connectionRules,
     setConnectionIssue: (value: connectionRules.ProcessConnectionRuleIssue | null) => { issue = value },
     addEdge: (connection: Omit<WFEdge, 'id'>, current: WFEdge[]) => [...current, { id: 'added', ...connection }],
     DEFAULT_EDGE_OPTS: {}, setPendingDropPos: () => {}, setPaletteOpen: () => {}, window: { innerWidth: 100, innerHeight: 100 },
   }
   const callback = new Function(...Object.keys(env), paletteCode)(...Object.values(env))
-  callback('extensionNode', 'pack/run')
-  return { nodes, addedEdge: edges.find((candidate) => candidate.target === 'new-target'), issue }
+  callback(options.type ?? 'extensionNode', options.type ? undefined : 'pack/run')
+  return { nodes, edges, addedEdge: edges.find((candidate) => candidate.target === 'new-target'), issue }
 }
 
 for (const sourceKind of ['meshNode', 'waitNode', 'forEachNode']) {
@@ -237,6 +242,45 @@ test('actual palette preserves positional handles and unresolved-source first-po
   const unresolved = invokePalette('unresolvedSource', false, [{ name: 'reference', type: 'image', required: false }, { name: 'coarse', type: 'mesh' }])
   assert.equal(unresolved.issue, null)
   assert.equal(unresolved.addedEdge?.targetHandle, 'reference')
+})
+
+test('actual palette creates all preview IDs while blocking reverse wires from terminal sinks', () => {
+  for (const type of ['previewNode', 'previewImageNode', 'imagePreviewNode']) {
+    const incoming = invokePalette('imageNode', false, undefined, { type, container: true })
+    const created = incoming.nodes.find((candidate) => candidate.id === 'new-target')!
+    assert.equal(created.type, type)
+    assert.deepEqual(created.data, { extensionId: undefined, enabled: true, params: {} })
+    assert.equal(created.parentId, 'container')
+    assert.deepEqual(created.position, { x: 25, y: 50 })
+    assert.equal(incoming.addedEdge?.source, 'source')
+    const outgoing = invokePalette('extensionNode', false, undefined, { type, handleType: 'target' })
+    assert.equal(outgoing.edges.some((candidate) => candidate.source === 'new-target'), type === 'imagePreviewNode')
+  }
+})
+
+test('actual palette retains current hydration, canonical identity and While geometry', () => {
+  const hydrated = invokePalette('imageNode', false, undefined, { container: true }).nodes.find((candidate) => candidate.id === 'new-target')!
+  assert.equal(hydrated.data.extensionId, 'pack/run')
+  assert.equal(hydrated.data.params.strength, 0)
+  assert.equal(hydrated.parentId, 'container')
+  assert.deepEqual(hydrated.position, { x: 25, y: 50 })
+  const container = invokePalette('imageNode', false, undefined, { type: 'whileNode' }).nodes[0]
+  assert.equal(container.type, 'whileNode')
+  assert.deepEqual(container.style, { width: 420, height: 240 })
+  assert.equal(container.parentId, undefined)
+})
+
+test('actual runner keeps image passthrough data and terminal sinks without leaking scene manifests', async () => {
+  const { store, calls } = storeFixture(() => ({ filePath: '/workspace/generated.png' }))
+  const nodes = [node('image', 'imageNode', { filePath: '/workspace/input.png' }), node('pass', 'imagePreviewNode'), node('run', 'extensionNode'), node('single', 'previewImageNode'), node('views', 'previewNode'), node('scene', 'sceneNode', { manifestPath: 'scene/manifest.json' })]
+  await store.getState().run(workflow(nodes, [edge('image', 'pass'), edge('pass', 'run'), edge('run', 'single'), edge('run', 'views')]), [extension('run', undefined, 'image', 'image')])
+  assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].input.filePath, '/workspace/input.png')
+  assert.equal(store.getState().nodeImageOutputs.run, '/workspace/generated.png')
+  assert.equal(store.getState().nodeImageOutputs.scene, undefined)
+  assert.equal(store.getState().nodeImageOutputs.single, undefined)
+  assert.equal(store.getState().nodeImageOutputs.views, undefined)
 })
 
 test('display-unsupported and unknown supplied params survive the actual PROCESS executor unchanged', async () => {

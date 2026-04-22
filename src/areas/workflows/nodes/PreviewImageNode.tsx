@@ -1,28 +1,46 @@
-import { Handle, Position, useReactFlow } from '@xyflow/react'
+import React from 'react'
+import { Handle, Position, useEdges, useNodes } from '@xyflow/react'
+import type { WFNode } from '../../../shared/types/electron.d'
+
 import { useWorkflowRunStore } from '../workflowRunStore'
 import BaseNode from './BaseNode'
+import { PREVIEW_IMAGE_EMPTY_COPY, PREVIEW_IMAGE_TITLE, resolvePreviewImageUrl } from './previewNodeShared'
 
 const INPUT_COLOR = '#38bdf8'
 
-/**
- * Preview node for multi-view image outputs (e.g. MV-Adapter Generate Views).
- *
- * Expects a vertical strip PNG where N views are stacked top→bottom.
- * Displays them in a 2×3 grid using CSS background-position cropping.
- */
-export default function PreviewImageNode({ id, selected }: { id: string; selected?: boolean }) {
-  const nodeImageOutputs = useWorkflowRunStore((s) => s.nodeImageOutputs)
-  const { getEdges }     = useReactFlow()
+export function PreviewImageContent({ imageUrl }: { imageUrl?: string }) {
+  if (!imageUrl) {
+    return (
+        <p className="py-2 text-center text-[10px] text-zinc-600 italic">
+        {PREVIEW_IMAGE_EMPTY_COPY}
+      </p>
+    )
+  }
 
-  // Find the image URL fed into this node (first matching incoming edge)
-  const incomingEdge = getEdges().find((e) => e.target === id)
-  const imageUrl     = incomingEdge ? nodeImageOutputs[incomingEdge.source] : undefined
+  return (
+    <div className="nodrag overflow-hidden rounded border border-zinc-800 bg-zinc-950/60">
+      <img src={imageUrl} alt="Workflow preview output" className="h-40 w-full object-contain" />
+    </div>
+  )
+}
+
+export default function PreviewImageNode({ id, selected }: { id: string; selected?: boolean }) {
+  const nodeImageOutputs = useWorkflowRunStore((state) => state.nodeImageOutputs)
+  const edges = useEdges()
+  const nodes = useNodes()
+
+  const imageUrl = resolvePreviewImageUrl({
+    nodeId: id,
+    edges,
+    nodes: nodes as WFNode[],
+    nodeImageOutputs,
+  })
 
   return (
     <BaseNode
       id={id}
       selected={selected}
-      title="Preview Views"
+      title={PREVIEW_IMAGE_TITLE}
       minWidth={200}
       icon={
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={INPUT_COLOR} strokeWidth="2">
@@ -33,8 +51,8 @@ export default function PreviewImageNode({ id, selected }: { id: string; selecte
       }
       subheader={
         <div className="flex items-center gap-1.5 px-3 py-2">
-          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border border-sky-500/30 bg-sky-500/10 text-sky-400">image</span>
-          <span className="text-[9px] text-zinc-600">→ preview</span>
+          <span className="inline-flex items-center rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[9px] font-medium text-sky-400">image</span>
+          <span className="text-[9px] text-zinc-600">→ single preview</span>
         </div>
       }
       handles={
@@ -46,30 +64,7 @@ export default function PreviewImageNode({ id, selected }: { id: string; selecte
       }
     >
       <div className="px-2 pb-2 pt-1">
-        {imageUrl ? (
-          <div
-            className="nodrag grid gap-0.5 rounded overflow-hidden"
-            style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}
-          >
-            {[0, 1, 2, 3, 4, 5].map((i) => (
-              <div
-                key={i}
-                style={{
-                  aspectRatio: '1',
-                  backgroundImage: `url(${imageUrl})`,
-                  backgroundSize: '100% 600%',
-                  backgroundPosition: `0 ${i * 20}%`,
-                  backgroundRepeat: 'no-repeat',
-                  borderRadius: '2px',
-                }}
-              />
-            ))}
-          </div>
-        ) : (
-          <p className="py-2 text-center text-[10px] text-zinc-600 italic">
-            Connect a multi-view image to preview.
-          </p>
-        )}
+        <PreviewImageContent imageUrl={imageUrl} />
       </div>
     </BaseNode>
   )

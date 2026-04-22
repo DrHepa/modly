@@ -1,15 +1,9 @@
-import { getProcessTargetPort } from '../processPorts'
 import { getBezierPath, useReactFlow, useEdges } from '@xyflow/react'
 import type { EdgeProps } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
-
-const HANDLE_COLOR: Record<string, string> = {
-  audio: '#34d399',
-  image: '#38bdf8',
-  mesh:  '#a78bfa',
-  text:  '#fbbf24',
-}
+import { PROCESS_PORT_HANDLE_COLOR as HANDLE_COLOR } from '../processPorts'
+import { resolveWorkflowEdgeTargetColor } from './workflowEdgeColors'
 
 export default function WorkflowEdge({
   id, source, target,
@@ -37,14 +31,11 @@ export default function WorkflowEdge({
     : (HANDLE_COLOR[allExtensions.find((e) => e.id === sourceNode?.data?.extensionId)?.output ?? ''] ?? '#52525b')
 
   // For multi-input nodes pick the color of the specific connected handle
-  const targetExt = allExtensions.find((e) => e.id === targetNode?.data?.extensionId)
-  const targetInputType = targetExt ? getProcessTargetPort(targetExt, targetHandle)?.type : undefined
-
-  const targetColor = targetNode?.type === 'outputNode'
-    ? HANDLE_COLOR.mesh
-    : targetNode?.type === 'previewNode'
-    ? HANDLE_COLOR.image
-    : (HANDLE_COLOR[targetInputType ?? ''] ?? '#52525b')
+  const targetColor = resolveWorkflowEdgeTargetColor({
+    targetNodeType: targetNode?.type,
+    targetExtension: allExtensions.find((e) => e.id === targetNode?.data?.extensionId) ?? {},
+    targetHandle,
+  })
 
   const [edgePath] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
   const gradientId = `wf-edge-${id}`

@@ -5,6 +5,7 @@ import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
+import { isPreviewNodeType } from './nodes/previewNodeShared'
 
 type DataType = string
 
@@ -21,6 +22,7 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
   if (node.type === 'sceneNode') return 'Load Scene'
   if (node.type === 'outputNode') return 'Add to Scene'
   if (node.type === 'previewNode') return 'Preview Views'
+  if (node.type === 'previewImageNode') return 'Preview Image'
   if (node.type === 'imagePreviewNode') return 'Preview Image'
   if (node.type === 'forEachNode') {
     const mode = (node.data.params?.mode as string) ?? 'image'
@@ -51,7 +53,6 @@ function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): Da
   if (node.type === 'textNode') return 'text'
   if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
   if (node.type === 'sceneNode') return 'scene'
-  if (node.type === 'previewNode') return 'image'
   if (node.type === 'imagePreviewNode') return 'image'
   if (node.type === 'forEachNode') {
     const mode = (node.data.params?.mode as DataType | undefined) ?? 'image'
@@ -87,6 +88,23 @@ export function validateWorkflowPreflight(
   }
 
   for (const node of workflow.nodes) {
+    if (isPreviewNodeType(node.type)) {
+      for (const edge of workflow.edges) {
+        if (edge.source === node.id) {
+          pushIssue(issues, {
+            key: `${node.id}:no-output:${edge.id}`, nodeId: node.id,
+            message: `${nodeLabel(node, allExtensions)} has no output handle. Use the passthrough Preview Image node to forward an image.`,
+          })
+        }
+        const sourceType = outputTypes.get(edge.source)
+        if (edge.target === node.id && sourceType && sourceType !== 'image') {
+          pushIssue(issues, {
+            key: `${node.id}:type:${edge.id}`, nodeId: node.id,
+            message: `${nodeLabel(node, allExtensions)} expects an image, but received ${formatType(sourceType)}.`,
+          })
+        }
+      }
+    }
     if (node.type === 'meshNode' && node.data.params?.source === 'current' && !options?.currentMeshUrl) {
       pushIssue(issues, {
         key: `${node.id}:current-mesh`,

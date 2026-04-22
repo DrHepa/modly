@@ -12,13 +12,34 @@ type PreviewEdge = {
 
 type ResolvePreviewImageUrlArgs = {
   nodeId: string
+  apiUrl?: string
   edges: PreviewEdge[]
   nodeImageOutputs: Record<string, string>
 }
 
-export function resolvePreviewImageUrl({ nodeId, edges, nodeImageOutputs }: ResolvePreviewImageUrlArgs): string | undefined {
+type NormalizePreviewImageUrlArgs = {
+  imageUrl?: string
+  apiUrl?: string
+}
+
+export function normalizePreviewImageUrl({ imageUrl, apiUrl }: NormalizePreviewImageUrlArgs): string | undefined {
+  if (!imageUrl) {
+    return undefined
+  }
+
+  if (!imageUrl.startsWith('/workspace/')) {
+    return imageUrl
+  }
+
+  return apiUrl ? `${apiUrl}${imageUrl}` : undefined
+}
+
+export function resolvePreviewImageUrl({ nodeId, apiUrl, edges, nodeImageOutputs }: ResolvePreviewImageUrlArgs): string | undefined {
   const incomingEdge = edges.find((edge) => edge.target === nodeId)
-  return incomingEdge ? nodeImageOutputs[incomingEdge.source] : undefined
+  return normalizePreviewImageUrl({
+    imageUrl: incomingEdge ? nodeImageOutputs[incomingEdge.source] : undefined,
+    apiUrl,
+  })
 }
 
 export function isPreviewNodeType(nodeType?: string): boolean {

@@ -3,8 +3,30 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { PreviewImageContent } from './PreviewImageNode.tsx'
-import { PreviewViewsContent } from './PreviewViewsNode.tsx'
+import { PreviewImageContent, resolvePreviewImageNodeUrl } from './PreviewImageNode.tsx'
+import { PreviewViewsContent, resolvePreviewViewsNodeUrl } from './PreviewViewsNode.tsx'
+
+test('resolvePreviewImageNodeUrl forwards apiUrl through the shared resolver', () => {
+  const imageUrl = resolvePreviewImageNodeUrl({
+    nodeId: 'preview-image',
+    apiUrl: 'http://127.0.0.1:8000',
+    getEdges: () => [{ source: 'source-a', target: 'preview-image' }],
+    nodeImageOutputs: { 'source-a': '/workspace/preview.png' },
+  })
+
+  assert.equal(imageUrl, 'http://127.0.0.1:8000/workspace/preview.png')
+})
+
+test('resolvePreviewViewsNodeUrl shares the same workspace fallback behavior', () => {
+  const imageUrl = resolvePreviewViewsNodeUrl({
+    nodeId: 'preview-views',
+    apiUrl: '',
+    getEdges: () => [{ source: 'source-a', target: 'preview-views' }],
+    nodeImageOutputs: { 'source-a': '/workspace/views.png' },
+  })
+
+  assert.equal(imageUrl, undefined)
+})
 
 test('PreviewImageContent renders a single upstream image preview', () => {
   const markup = renderToStaticMarkup(React.createElement(PreviewImageContent, { imageUrl: '/workspace/preview.png' }))

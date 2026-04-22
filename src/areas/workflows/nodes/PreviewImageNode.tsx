@@ -2,6 +2,7 @@ import React from 'react'
 import { Handle, Position, useReactFlow } from '@xyflow/react'
 
 import { useWorkflowRunStore } from '../workflowRunStore'
+import { useAppStore } from '../../../shared/stores/appStore.ts'
 import BaseNode from './BaseNode'
 import { PREVIEW_IMAGE_EMPTY_COPY, PREVIEW_IMAGE_TITLE, resolvePreviewImageUrl } from './previewNodeShared'
 
@@ -23,13 +24,34 @@ export function PreviewImageContent({ imageUrl }: { imageUrl?: string }) {
   )
 }
 
+export function resolvePreviewImageNodeUrl({
+  nodeId,
+  apiUrl,
+  getEdges,
+  nodeImageOutputs,
+}: {
+  nodeId: string
+  apiUrl?: string
+  getEdges: () => Array<{ source: string; target: string }>
+  nodeImageOutputs: Record<string, string>
+}) {
+  return resolvePreviewImageUrl({
+    nodeId,
+    apiUrl,
+    edges: getEdges(),
+    nodeImageOutputs,
+  })
+}
+
 export default function PreviewImageNode({ id, selected }: { id: string; selected?: boolean }) {
+  const apiUrl = useAppStore((state) => state.apiUrl)
   const nodeImageOutputs = useWorkflowRunStore((state) => state.nodeImageOutputs)
   const { getEdges } = useReactFlow()
 
-  const imageUrl = resolvePreviewImageUrl({
+  const imageUrl = resolvePreviewImageNodeUrl({
     nodeId: id,
-    edges: getEdges(),
+    apiUrl,
+    getEdges,
     nodeImageOutputs,
   })
 

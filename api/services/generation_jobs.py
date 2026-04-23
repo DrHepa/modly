@@ -2,6 +2,7 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import re as _re
 import threading
 import time
@@ -9,7 +10,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 
@@ -27,6 +28,11 @@ VALID_REMESH_MODES = ("quad", "triangle", "none")
 _jobs: Dict[str, JobStatus] = {}
 _cancelled: set = set()
 _cancel_events: Dict[str, threading.Event] = {}
+_last_logged_snapshots: Dict[str, Tuple[str, int, Optional[str]]] = {}
+# Job state and its log snapshot share one short publication/retirement boundary.
+# Reentrant because transition owners call _log_job_progress while holding it.
+_log_lock = threading.RLock()
+_generation_logger = logging.getLogger("modly.generation.jobs")
 _completed_at: Dict[str, float] = {}
 _job_generators: Dict[str, object] = {}
 # A pinned generation owns the complete switch/load/generate lifecycle.  Keeping
@@ -40,15 +46,39 @@ _pinned_generation_executor = ThreadPoolExecutor(
 _JOB_TTL = 1800  # purge terminal jobs after 30 minutes
 
 
+def _log_job_progress(job: JobStatus) -> bool:
+    with _log_lock:
+        if _jobs.get(job.job_id) is not job:
+            return False
+        snapshot = (job.status, job.progress, job.step)
+        previous = _last_logged_snapshots.get(job.job_id)
+        if previous == snapshot:
+            return False
+        _last_logged_snapshots[job.job_id] = snapshot
+        # Extension step text can echo prompts, paths or exception details. Keep
+        # it intact in the API/snapshot, but log only whether it changed.
+        step_changed = snapshot[2] != (previous[2] if previous else None)
+        _generation_logger.info(
+            "generation job progress job_id=%s status=%s progress=%s step_changed=%s",
+            job.job_id,
+            snapshot[0],
+            snapshot[1],
+            step_changed,
+        )
+    return True
+
+
 def _purge_old_jobs() -> None:
     cutoff = time.monotonic() - _JOB_TTL
-    stale = [jid for jid, t in _completed_at.items() if t < cutoff]
-    for jid in stale:
-        _jobs.pop(jid, None)
-        _cancelled.discard(jid)
-        _cancel_events.pop(jid, None)
-        _job_generators.pop(jid, None)
-        _completed_at.pop(jid, None)
+    with _log_lock:
+        stale = [jid for jid, t in _completed_at.items() if t < cutoff]
+        for jid in stale:
+            _jobs.pop(jid, None)
+            _cancelled.discard(jid)
+            _cancel_events.pop(jid, None)
+            _job_generators.pop(jid, None)
+            _completed_at.pop(jid, None)
+            _last_logged_snapshots.pop(jid, None)
 
 
 def sanitize_collection(collection: str) -> str:
@@ -98,8 +128,10 @@ def create_job() -> JobStatus:
     _purge_old_jobs()
     job_id = str(uuid.uuid4())
     job = JobStatus(job_id=job_id, status="pending", progress=0)
-    _jobs[job_id] = job
-    _cancel_events[job_id] = threading.Event()
+    with _log_lock:
+        _jobs[job_id] = job
+        _cancel_events[job_id] = threading.Event()
+        _last_logged_snapshots.pop(job_id, None)
     return job
 
 
@@ -170,23 +202,25 @@ def get_job_status(job_id: str) -> JobStatus:
 
 
 def cancel_job(job_id: str) -> JobStatus:
-    job = require_job(job_id)
+    with _log_lock:
+        job = require_job(job_id)
 
-    if job.status not in ("pending", "running"):
-        return job
+        if job.status not in ("pending", "running"):
+            return job
 
-    _cancelled.add(job_id)
+        _cancelled.add(job_id)
 
-    cancel_event = _cancel_events.get(job_id)
-    if cancel_event is not None:
-        cancel_event.set()
+        cancel_event = _cancel_events.get(job_id)
+        if cancel_event is not None:
+            cancel_event.set()
 
-    job.status = "cancelled"
-    _completed_at[job_id] = time.monotonic()
+        job.status = "cancelled"
+        _completed_at[job_id] = time.monotonic()
+        _log_job_progress(job)
+        gen = _job_generators.get(job_id)
 
     try:
         # Queued cancellation must never kill the generator owned by another job.
-        gen = _job_generators.get(job_id)
         if gen is not None and hasattr(gen, "_proc") and gen._proc and gen._proc.poll() is None:
             gen._proc.kill()
             gen._loaded = False
@@ -282,9 +316,11 @@ async def _run_generation(
     executor = _pinned_generation_executor if model_id is not None else None
     # Shown while this job waits behind another one on the single worker;
     # _run_generation_impl clears it as soon as the job actually starts.
-    queued_job = _jobs.get(job_id)
-    if queued_job is not None and executor is not None:
-        queued_job.step = "Waiting for the previous generation…"
+    with _log_lock:
+        queued_job = _jobs.get(job_id)
+        if queued_job is not None and executor is not None and queued_job.status == "pending":
+            queued_job.step = "Waiting for the previous generation…"
+            _log_job_progress(queued_job)
     future = loop.run_in_executor(
         executor,
         _run_generation_impl,
@@ -300,14 +336,16 @@ async def _run_generation(
     except asyncio.CancelledError:
         # asyncio cancellation attempts to cancel a queued concurrent future.
         # If it has already begun, the event lets the generator stop safely.
-        _cancelled.add(job_id)
-        cancel_event = _cancel_events.get(job_id)
-        if cancel_event is not None:
-            cancel_event.set()
-        job = _jobs.get(job_id)
-        if job is not None and job.status in ("pending", "running"):
-            job.status = "cancelled"
-            _completed_at[job_id] = time.monotonic()
+        with _log_lock:
+            job = _jobs.get(job_id)
+            if job is queued_job and job is not None and job.status in ("pending", "running"):
+                _cancelled.add(job_id)
+                cancel_event = _cancel_events.get(job_id)
+                if cancel_event is not None:
+                    cancel_event.set()
+                job.status = "cancelled"
+                _completed_at[job_id] = time.monotonic()
+                _log_job_progress(job)
         raise
 
 
@@ -319,20 +357,32 @@ def _run_generation_impl(
     output_kind: str,
     model_id: Optional[str],
 ) -> None:
-    if job_id in _cancelled:
-        return
-    job = _jobs[job_id]
-    job.status = "running"
-    job.step = None
+    with _log_lock:
+        job = _jobs.get(job_id)
+        if job is None or job.status != "pending" or job_id in _cancelled:
+            return
+        job.status = "running"
+        job.step = None
+        _log_job_progress(job)
 
     def progress_cb(pct: int, step: str = "") -> None:
+        if job.status != "running":
+            return
         # Monotonic: the loading phase walks the bar up on a background thread and
         # extensions then report their own 0->100 scale, so an unguarded assignment
         # yanks the bar backwards on the first generation progress message.
         if pct > job.progress:
-            job.progress = pct
-        if step:
-            job.step = step
+            next_progress = pct
+        else:
+            next_progress = job.progress
+        with _log_lock:
+            # Cancellation/retirement may have won after the optimistic read.
+            if _jobs.get(job_id) is not job or job.status != "running":
+                return
+            job.progress = max(job.progress, next_progress)
+            if step:
+                job.step = step
+            _log_job_progress(job)
 
     try:
         # Refuse a selected weight variant that is not installed before loading
@@ -344,7 +394,11 @@ def _run_generation_impl(
         get_generator = (lambda: generator_registry.activate_ready_generator(model_id)) \
             if model_id is not None else generator_registry.get_active
         if model_id is not None:
-            _job_generators[job_id] = generator_registry.get_generator(model_id)
+            pinned_generator = generator_registry.get_generator(model_id)
+            with _log_lock:
+                if _jobs.get(job_id) is not job or job.status != "running":
+                    return
+                _job_generators[job_id] = pinned_generator
         status_reader = (lambda: generator_registry.model_status(model_id)) \
             if model_id is not None else generator_registry.active_status
         status = status_reader()
@@ -367,9 +421,10 @@ def _run_generation_impl(
         else:
             gen = get_generator()
 
-        _job_generators[job_id] = gen
-        if job_id in _cancelled:
-            return
+        with _log_lock:
+            if _jobs.get(job_id) is not job or job.status != "running":
+                return
+            _job_generators[job_id] = gen
 
         # Direct output to the collection subfolder
         coll_dir = registry.WORKSPACE_DIR / collection
@@ -408,29 +463,35 @@ def _run_generation_impl(
             except (OSError, ValueError) as exc:
                 raise ValueError("Generated scene output is not a valid workspace scene") from exc
 
-        job.status   = "done"
-        job.progress = 100
-        _completed_at[job_id] = time.monotonic()
-        job.output_url = build_output_url(output_path, collection)
+        output_url = build_output_url(output_path, collection)
         # The private candidate is a mesh insertion descriptor, not a generic
         # artifact wrapper: scene/image/audio outputs retain only their URL.
-        if output_kind == "mesh":
-            job.scene_candidate = build_scene_candidate(output_path, collection)
+        scene_candidate = build_scene_candidate(output_path, collection) if output_kind == "mesh" else None
+        with _log_lock:
+            if _jobs.get(job_id) is not job or job.status != "running":
+                return
+            job.status = "done"
+            job.progress = 100
+            _completed_at[job_id] = time.monotonic()
+            job.output_url = output_url
+            job.scene_candidate = scene_candidate
+            _log_job_progress(job)
 
     except GenerationCancelled:
-        job.status = "cancelled"
-        _completed_at[job_id] = time.monotonic()
-    except Exception as exc:
-        if job_id in _cancelled:
-            return
+        with _log_lock:
+            if _jobs.get(job_id) is job and job.status == "running":
+                job.status = "cancelled"
+                _completed_at[job_id] = time.monotonic()
+                _log_job_progress(job)
+    except Exception:
         tb = traceback.format_exc()
-        msg = f"[Generation ERROR] {exc}\n{tb}"
-        try:
-            print(msg)
-        except UnicodeEncodeError:
-            print(msg.encode("ascii", errors="replace").decode("ascii"))
-        job.status = "error"
-        job.error  = tb.strip()
-        _completed_at[job_id] = time.monotonic()
+        with _log_lock:
+            if _jobs.get(job_id) is job and job.status == "running":
+                job.status = "error"
+                job.error = tb.strip()
+                _completed_at[job_id] = time.monotonic()
+                _log_job_progress(job)
     finally:
-        _job_generators.pop(job_id, None)
+        with _log_lock:
+            if _jobs.get(job_id) is job:
+                _job_generators.pop(job_id, None)

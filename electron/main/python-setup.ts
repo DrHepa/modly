@@ -6,8 +6,9 @@ import { spawn, execSync } from 'child_process'
 import { createHash } from 'crypto'
 import { getSettings } from './settings-store'
 import { copyRuntimeTree } from './copy-runtime'
+import { buildManagedVenvInstallArgs, PYTHON_SETUP_VERSION } from './python-setup-bootstrap'
 
-const SETUP_VERSION = 3
+const SETUP_VERSION = PYTHON_SETUP_VERSION
 
 interface SetupJson {
   version: number
@@ -230,7 +231,7 @@ function installRequirements(
     console.log('[PythonSetup] Installing requirements with', pythonExe)
     const proc = spawn(
       pythonExe,
-      ['-m', 'pip', 'install', '-r', requirementsPath, '--no-warn-script-location', '--progress-bar', 'off'],
+      buildManagedVenvInstallArgs(requirementsPath),
       { stdio: ['ignore', 'pipe', 'pipe'], env: cleanPythonEnv() }
     )
     let packagesInstalled = 0

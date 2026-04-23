@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 
 
@@ -103,7 +104,7 @@ def test_generate_from_text_rejects_missing_or_blank_prompt_without_creating_job
     assert api_modules["generation_jobs"]._jobs == {}
 
 
-def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch):
+def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry
     from services.generators.base import GenerationCancelled
 
@@ -146,6 +147,7 @@ def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and
 
     generation_jobs = api_modules["generation_jobs"]
     blocking_generator = BlockingGenerator(api_modules["workspace_dir"])
+    caplog.set_level(logging.INFO, logger="modly.generation.jobs")
     monkeypatch.setattr(generator_registry, "_generators", {api_modules["valid_model_id"]: blocking_generator}, raising=False)
     monkeypatch.setattr(generator_registry, "_active_id", api_modules["valid_model_id"], raising=False)
 
@@ -205,4 +207,105 @@ def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and
         assert final_image.progress == final_text.progress == 30
         assert final_image.step == final_text.step == "Preparing mesh"
 
+        messages = [record.getMessage() for record in caplog.records if record.name == "modly.generation.jobs"]
+        assert any(
+            f"job_id={image_job.job_id} status=cancelled progress=30 step=Preparing mesh" in message
+            for message in messages
+        )
+        assert any(
+            f"job_id={text_job.job_id} status=cancelled progress=30 step=Preparing mesh" in message
+            for message in messages
+        )
+
     asyncio.run(exercise_both_flows())
+
+
+def test_generation_job_progress_logging_uses_safe_fields_and_deduplicates_snapshots(api_modules, caplog):
+    generation_jobs = api_modules["generation_jobs"]
+    job = generation_jobs.create_job()
+
+    caplog.set_level(logging.INFO, logger="modly.generation.jobs")
+
+    job.status = "running"
+    job.progress = 10
+    job.step = "Preparing mesh"
+
+    assert generation_jobs._log_job_progress(job) is True
+    assert generation_jobs._log_job_progress(job) is False
+
+    job.progress = 40
+    assert generation_jobs._log_job_progress(job) is True
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "modly.generation.jobs"]
+
+    assert messages == [
+        f"generation job progress job_id={job.job_id} status=running progress=10 step=Preparing mesh",
+        f"generation job progress job_id={job.job_id} status=running progress=40 step=Preparing mesh",
+    ]
+    assert all("prompt" not in message for message in messages)
+    assert all("filename" not in message for message in messages)
+    assert all("output_url" not in message for message in messages)
+
+
+def test_run_generation_logs_progress_done_and_error_without_changing_contracts_or_leaking_payloads(api_modules, caplog, capsys):
+    generation_jobs = api_modules["generation_jobs"]
+    fake_generator = api_modules["fake_generator"]
+
+    caplog.set_level(logging.INFO, logger="modly.generation.jobs")
+
+    async def exercise_success_and_error():
+        success_job = generation_jobs.create_job()
+        await generation_jobs._run_generation(
+            success_job.job_id,
+            prompt="secret prompt must not leak",
+            params={"filename": "secret-output.glb"},
+            collection="Legacy",
+        )
+
+        assert generation_jobs.get_job_status(success_job.job_id).model_dump() == {
+            "job_id": success_job.job_id,
+            "status": "done",
+            "progress": 100,
+            "step": "Writing mesh",
+            "output_url": "/workspace/Legacy/secret-output.glb",
+            "error": None,
+            "scene_candidate": {
+                "kind": "mesh",
+                "workspace_path": "Legacy/secret-output.glb",
+                "output_url": "/workspace/Legacy/secret-output.glb",
+                "display_name": "secret-output.glb",
+            },
+        }
+
+        fake_generator.fail_with = RuntimeError("sensitive failure detail")
+        error_job = generation_jobs.create_job()
+        await generation_jobs._run_generation(
+            error_job.job_id,
+            image_bytes=b"secret-image-bytes",
+            params={"filename": "error-output.glb"},
+            collection="Legacy",
+        )
+
+        error_status = generation_jobs.get_job_status(error_job.job_id)
+        assert error_status.status == "error"
+        assert error_status.progress == 0
+        assert "sensitive failure detail" in error_status.error
+
+    asyncio.run(exercise_success_and_error())
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "modly.generation.jobs"]
+
+    assert any("status=running progress=40 step=Preparing mesh" in message for message in messages)
+    assert any("status=running progress=85 step=Writing mesh" in message for message in messages)
+    assert any("status=done progress=100 step=Writing mesh" in message for message in messages)
+    assert any("status=error progress=0 step=None" in message for message in messages)
+    assert not any("secret prompt" in message for message in messages)
+    assert not any("secret-output.glb" in message for message in messages)
+    assert not any("secret-image-bytes" in message for message in messages)
+    assert not any("sensitive failure detail" in message for message in messages)
+    assert not any("Traceback" in message for message in messages)
+
+    captured = capsys.readouterr()
+    terminal_output = captured.out + captured.err
+    assert "sensitive failure detail" not in terminal_output
+    assert "Traceback" not in terminal_output

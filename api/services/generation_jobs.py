@@ -1,11 +1,12 @@
 import asyncio
 import inspect
 import json
+import logging
 import threading
 import traceback
 import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 
@@ -17,6 +18,27 @@ from services.generators.base import GenerationCancelled, smooth_progress
 _jobs: Dict[str, JobStatus] = {}
 _cancelled: set[str] = set()
 _cancel_events: Dict[str, threading.Event] = {}
+_last_logged_snapshots: Dict[str, Tuple[str, int, Optional[str]]] = {}
+_log_lock = threading.Lock()
+_generation_logger = logging.getLogger("modly.generation.jobs")
+
+
+def _log_job_progress(job: JobStatus) -> bool:
+    snapshot = (job.status, job.progress, job.step)
+
+    with _log_lock:
+        if _last_logged_snapshots.get(job.job_id) == snapshot:
+            return False
+        _last_logged_snapshots[job.job_id] = snapshot
+
+    _generation_logger.info(
+        "generation job progress job_id=%s status=%s progress=%s step=%s",
+        job.job_id,
+        job.status,
+        job.progress,
+        job.step,
+    )
+    return True
 
 
 def create_job() -> JobStatus:
@@ -24,6 +46,8 @@ def create_job() -> JobStatus:
     job = JobStatus(job_id=job_id, status="pending", progress=0)
     _jobs[job_id] = job
     _cancel_events[job_id] = threading.Event()
+    with _log_lock:
+        _last_logged_snapshots.pop(job_id, None)
     return job
 
 
@@ -93,6 +117,7 @@ def cancel_job(job_id: str) -> JobStatus:
         cancel_event.set()
 
     job.status = "cancelled"
+    _log_job_progress(job)
 
     try:
         gen = generator_registry._generators.get(generator_registry._active_id)
@@ -186,11 +211,13 @@ async def _run_generation(
 ) -> None:
     job = _jobs[job_id]
     job.status = "running"
+    _log_job_progress(job)
 
     def progress_cb(pct: int, step: str = "") -> None:
         job.progress = pct
         if step:
             job.step = step
+        _log_job_progress(job)
 
     try:
         loop = asyncio.get_running_loop()
@@ -242,13 +269,15 @@ async def _run_generation(
         job.progress = 100
         job.output_url = build_output_url(output_path, collection)
         job.scene_candidate = build_scene_candidate(output_path, collection)
+        _log_job_progress(job)
 
     except GenerationCancelled:
         job.status = "cancelled"
-    except Exception as exc:
+        _log_job_progress(job)
+    except Exception:
         if job_id in _cancelled:
             return
         tb = traceback.format_exc()
-        print(f"[Generation ERROR] {exc}\n{tb}")
         job.status = "error"
         job.error = tb.strip()
+        _log_job_progress(job)

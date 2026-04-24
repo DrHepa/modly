@@ -35,6 +35,22 @@ test('PreviewImageContent renders a single upstream image preview', () => {
   assert.match(markup, /Workflow preview output/)
 })
 
+test('PreviewImageContent lets the generated image fill the resizable node body without fixed height', () => {
+  const markup = renderToStaticMarkup(React.createElement(PreviewImageContent, { imageUrl: '/workspace/preview.png' }))
+
+  assert.match(markup, /<div class="[^"]*h-full[^"]*flex[^"]*"/)
+  assert.match(markup, /<img[^>]+class="[^"]*h-full[^"]*w-full[^"]*object-contain[^"]*"/)
+  assert.doesNotMatch(markup, /h-40/)
+})
+
+test('PreviewImageContent keeps empty guidance free from image layout wrappers', () => {
+  const markup = renderToStaticMarkup(React.createElement(PreviewImageContent, { imageUrl: undefined }))
+
+  assert.match(markup, /Connect an image to preview\./)
+  assert.doesNotMatch(markup, /<img/)
+  assert.doesNotMatch(markup, /h-full/)
+})
+
 test('PreviewImageContent renders empty guidance when no image is connected', () => {
   const markup = renderToStaticMarkup(React.createElement(PreviewImageContent, { imageUrl: undefined }))
 

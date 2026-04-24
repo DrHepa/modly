@@ -18,8 +18,8 @@ export function PreviewImageContent({ imageUrl }: { imageUrl?: string }) {
   }
 
   return (
-    <div className="nodrag overflow-hidden rounded border border-zinc-800 bg-zinc-950/60">
-      <img src={imageUrl} alt="Workflow preview output" className="h-40 w-full object-contain" />
+    <div className="nodrag h-full flex overflow-hidden rounded border border-zinc-800 bg-zinc-950/60">
+      <img src={imageUrl} alt="Workflow preview output" className="h-full w-full object-contain" />
     </div>
   )
 }
@@ -82,7 +82,7 @@ export default function PreviewImageNode({ id, selected }: { id: string; selecte
         />
       }
     >
-      <div className="px-2 pb-2 pt-1">
+      <div className="flex-1 min-h-0 px-2 pb-2 pt-1">
         <PreviewImageContent imageUrl={imageUrl} />
       </div>
     </BaseNode>

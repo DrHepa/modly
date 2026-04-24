@@ -25,3 +25,33 @@ test('preload model runtimeReadiness invokes the model:runtimeReadiness IPC chan
     },
   ])
 })
+
+test('preload model runtimeReadinessAction invokes the model:runtimeReadinessAction IPC channel', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      return { success: true }
+    },
+  })
+
+  const action = {
+    id: 'codex.login.docs',
+    kind: 'open_external_url',
+    label: 'Open login docs',
+    docs_url: 'https://developers.openai.com/codex/auth',
+    safety: 'manual',
+  }
+  const result = await api.model.runtimeReadinessAction(action)
+
+  assert.deepEqual(result, { success: true })
+  assert.deepEqual(invocations, [
+    {
+      channel: 'model:runtimeReadinessAction',
+      args: [action],
+    },
+  ])
+})

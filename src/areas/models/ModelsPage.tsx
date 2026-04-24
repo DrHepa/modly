@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import type { AnyExtension } from '@shared/types/electron.d'
+import type { AnyExtension, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { formatModelName } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import type { ExtensionNode } from './components/ExtensionCard'
@@ -14,6 +14,22 @@ type GitHubInstallBannerModel = {
   title: string
   message?: string
   failures?: string[]
+}
+
+export function createRuntimeReadinessActionDispatcher({
+  runRuntimeReadinessAction,
+  electronRuntimeReadinessAction,
+}: {
+  runRuntimeReadinessAction: (
+    modelId: string,
+    action: RuntimeReadinessAction,
+    options: { dispatch: (action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> },
+  ) => Promise<{ success: boolean; error?: string }>
+  electronRuntimeReadinessAction: (action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }>
+}): (modelId: string, action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> {
+  return (modelId, action) => runRuntimeReadinessAction(modelId, action, {
+    dispatch: electronRuntimeReadinessAction,
+  })
 }
 
 export function GitHubRepoHelpCopy(): JSX.Element {
@@ -130,6 +146,7 @@ export default function ModelsPage(): JSX.Element {
   const reloadExtensions  = useExtensionsStore((s) => s.reload)
   const refreshModelOwnership = useExtensionsStore((s) => s.refreshModelOwnership)
   const ensureRuntimeReadiness = useExtensionsStore((s) => s.ensureRuntimeReadiness)
+  const runRuntimeReadinessAction = useExtensionsStore((s) => s.runRuntimeReadinessAction)
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   const allExtensions: AnyExtension[] = useMemo(
@@ -356,6 +373,14 @@ export default function ModelsPage(): JSX.Element {
     return loadErrors[ext.id] ??
       ext.nodes.map((n) => loadErrors[`${ext.id}/${n.id}`]).find(Boolean)
   }
+
+  const dispatchRuntimeReadinessAction = useMemo(
+    () => createRuntimeReadinessActionDispatcher({
+      runRuntimeReadinessAction,
+      electronRuntimeReadinessAction: window.electron.model.runtimeReadinessAction,
+    }),
+    [runRuntimeReadinessAction],
+  )
 
   function installProgressLabel(): string {
     if (!installProgress) return ''
@@ -676,6 +701,7 @@ export default function ModelsPage(): JSX.Element {
                 }}
                 onUninstall={(extId) => openUninstallModal(extId)}
                 onRepaired={() => reloadExtensions()}
+                onRuntimeReadinessAction={dispatchRuntimeReadinessAction}
               />
             ))}
           </div>

@@ -10,6 +10,7 @@ No other file needs to be modified.
 import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as Futur
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from services.generators.base import BaseGenerator
 from services.extension_process import ExtensionProcess, _venv_python
@@ -468,9 +470,184 @@ _EVIDENCE_ALLOWLIST = {
     "entitlement_state",
 }
 
+_DETAIL_DIAGNOSTIC_ALLOWLIST = {
+    "runtime_source",
+    "runtime_name",
+    "runtime_version",
+    "runtime_version_supported",
+    "supported_versions",
+    "platform_supported",
+    "platform_key",
+    "auth_state",
+    "entitlement_state",
+    "extension_setup_state",
+    "extension_import_state",
+    "codex_app_server_state",
+    "readiness_source",
+    "diagnostic_status",
+    "last_checked_at",
+}
+
+_ACTION_KINDS = {
+    "show_guidance",
+    "show_details",
+    "open_external_url",
+    "refresh_readiness",
+}
+_ACTION_SAFETY = {"manual", "non_destructive", "confirm"}
+_ACTION_REFRESH_AFTER = {"always", "success", "never"}
+_ACTION_ID_RE = re.compile(r"^[a-z0-9._:-]{1,80}$")
+_MAX_RUNTIME_ACTIONS = 5
+_MAX_SHORT_TEXT = 200
+_MAX_GUIDANCE_TEXT = 2000
+_MAX_DIAGNOSTIC_VALUE = 160
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_text(value, *, max_length: int = _MAX_SHORT_TEXT) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped) > max_length or _looks_sensitive(stripped):
+        return None
+    return stripped
+
+
+def _looks_sensitive(value: str) -> bool:
+    lowered = value.lower()
+    sensitive_markers = (
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer ",
+        "traceback",
+        "raw output",
+        "home=",
+        "env=",
+        "sk-",
+    )
+    if any(marker in lowered for marker in sensitive_markers):
+        return True
+    if ".." in value or "~/" in value or "\\" in value:
+        return True
+    if re.search(r"(^|\s)/(?:home|users|private|tmp|var|etc|opt|usr|root)(?:/|\s|$)", value):
+        return True
+    return False
+
+
+def _safe_url(value) -> str | None:
+    if not isinstance(value, str) or len(value) > 500 or _looks_sensitive(value):
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    return value
+
+
+def _sanitize_runtime_actions(actions) -> list[dict]:
+    if not isinstance(actions, list):
+        return []
+
+    safe_actions: list[dict] = []
+    for action in actions:
+        if len(safe_actions) >= _MAX_RUNTIME_ACTIONS:
+            break
+        if not isinstance(action, dict):
+            continue
+
+        action_id = _safe_text(action.get("id"), max_length=80)
+        kind = action.get("kind")
+        label = _safe_text(action.get("label"), max_length=80)
+        safety = action.get("safety")
+        if not action_id or not _ACTION_ID_RE.fullmatch(action_id):
+            continue
+        if kind not in _ACTION_KINDS or safety not in _ACTION_SAFETY or not label:
+            continue
+
+        safe_action = {
+            "id": action_id,
+            "kind": kind,
+            "label": label,
+            "safety": safety,
+        }
+
+        for key in ("reason",):
+            value = _safe_text(action.get(key), max_length=_MAX_SHORT_TEXT)
+            if value:
+                safe_action[key] = value
+
+        guidance = _safe_text(action.get("guidance"), max_length=_MAX_GUIDANCE_TEXT)
+        if guidance:
+            safe_action["guidance"] = guidance
+
+        docs_url = _safe_url(action.get("docs_url"))
+        if docs_url:
+            safe_action["docs_url"] = docs_url
+        elif kind == "open_external_url":
+            continue
+
+        if isinstance(action.get("disabled"), bool):
+            safe_action["disabled"] = action["disabled"]
+        if isinstance(action.get("requires_confirmation"), bool):
+            safe_action["requires_confirmation"] = action["requires_confirmation"]
+        if action.get("refresh_after") in _ACTION_REFRESH_AFTER:
+            safe_action["refresh_after"] = action["refresh_after"]
+
+        confirmation = _sanitize_confirmation(action.get("confirmation"))
+        if confirmation:
+            safe_action["confirmation"] = confirmation
+
+        safe_actions.append(safe_action)
+
+    return safe_actions
+
+
+def _sanitize_confirmation(confirmation) -> dict | None:
+    if not isinstance(confirmation, dict):
+        return None
+    safe_confirmation = {}
+    for key in ("title", "body", "confirm_label"):
+        value = _safe_text(confirmation.get(key), max_length=_MAX_SHORT_TEXT)
+        if value:
+            safe_confirmation[key] = value
+    return safe_confirmation or None
+
+
+def _sanitize_string_map(values, allowlist: set[str]) -> dict:
+    if not isinstance(values, dict):
+        return {}
+    safe_values = {}
+    for key, value in values.items():
+        if key not in allowlist or not isinstance(value, (str, int, float, bool)):
+            continue
+        safe_value = _safe_text(str(value), max_length=_MAX_DIAGNOSTIC_VALUE)
+        if safe_value is not None:
+            safe_values[key] = safe_value
+    return safe_values
+
+
+def _sanitize_runtime_details(details) -> dict:
+    if not isinstance(details, dict):
+        return {}
+    safe_details = {}
+    for key in ("title", "summary"):
+        value = _safe_text(details.get(key), max_length=_MAX_SHORT_TEXT)
+        if value:
+            safe_details[key] = value
+    guidance = _safe_text(details.get("guidance"), max_length=_MAX_GUIDANCE_TEXT)
+    if guidance:
+        safe_details["guidance"] = guidance
+    for key in ("evidence", "diagnostics"):
+        safe_values = _sanitize_string_map(details.get(key), _DETAIL_DIAGNOSTIC_ALLOWLIST)
+        if safe_values:
+            safe_details[key] = safe_values
+    return safe_details
 
 
 def _unsupported_runtime_readiness() -> dict:
@@ -508,13 +685,15 @@ def _sanitize_runtime_readiness(status: dict) -> dict:
             result[key] = value
     evidence = status.get("evidence")
     if isinstance(evidence, dict):
-        safe_evidence = {
-            key: str(value)
-            for key, value in evidence.items()
-            if key in _EVIDENCE_ALLOWLIST and isinstance(value, (str, int, float, bool))
-        }
+        safe_evidence = _sanitize_string_map(evidence, _EVIDENCE_ALLOWLIST)
         if safe_evidence:
             result["evidence"] = safe_evidence
+    actions = _sanitize_runtime_actions(status.get("actions"))
+    if actions:
+        result["actions"] = actions
+    details = _sanitize_runtime_details(status.get("details"))
+    if details:
+        result["details"] = details
     if status.get("stale") is True:
         result["stale"] = True
     return result

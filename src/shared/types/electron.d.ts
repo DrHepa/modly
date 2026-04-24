@@ -170,8 +170,40 @@ export interface RuntimeReadiness {
   label_hint?: 'Ready' | 'Setup Codex' | 'Login' | 'Update Codex' | 'Unsupported' | 'Checking failed'
   reason?: string
   evidence?: Record<string, unknown>
+  actions?: RuntimeReadinessAction[]
+  details?: RuntimeReadinessDetails
   checked_at: string
   stale?: boolean
+}
+
+export type RuntimeReadinessActionKind = 'show_guidance' | 'show_details' | 'open_external_url' | 'refresh_readiness'
+export type RuntimeReadinessActionSafety = 'manual' | 'non_destructive' | 'confirm'
+
+export interface RuntimeReadinessAction {
+  id: string
+  kind: RuntimeReadinessActionKind
+  label: string
+  disabled?: boolean
+  reason?: string
+  guidance?: string
+  docs_url?: string
+  requires_confirmation?: boolean
+  confirmation?: { title: string; body: string; confirm_label: string }
+  refresh_after?: 'always' | 'success' | 'never'
+  safety: RuntimeReadinessActionSafety
+}
+
+export interface RuntimeReadinessDetails {
+  title?: string
+  summary?: string
+  evidence?: Record<string, string>
+  diagnostics?: Record<string, string>
+  guidance?: string
+}
+
+export interface RuntimeReadinessActionResult {
+  success: boolean
+  error?: string
 }
 
 export interface RuntimeReadinessResponse {
@@ -415,6 +447,7 @@ declare global {
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
         runtimeReadiness: (modelIds: string[]) => Promise<RuntimeReadinessResponse>
+        runtimeReadinessAction: (action: RuntimeReadinessAction) => Promise<RuntimeReadinessActionResult>
         onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
         offProgress:    () => void
       }

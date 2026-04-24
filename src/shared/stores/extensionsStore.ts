@@ -7,10 +7,31 @@ import type {
   ModelExtension,
   ProcessExtension,
   RuntimeReadiness,
+  RuntimeReadinessAction,
+  RuntimeReadinessDetails,
 } from '../types/electron.d'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '../../areas/models/modelOwnershipState.ts'
 
 const RUNTIME_READINESS_TTL_MS = 30_000
+const MAX_ACTIONS = 5
+const ACTION_ID_RE = /^[a-z0-9._:-]{1,80}$/
+const ALLOWED_DIAGNOSTIC_KEYS = new Set([
+  'runtime_source',
+  'runtime_name',
+  'runtime_version',
+  'runtime_version_supported',
+  'supported_versions',
+  'platform_supported',
+  'platform_key',
+  'auth_state',
+  'entitlement_state',
+  'extension_setup_state',
+  'extension_import_state',
+  'codex_app_server_state',
+  'readiness_source',
+  'diagnostic_status',
+  'last_checked_at',
+])
 
 type RuntimeReadinessCacheEntry = RuntimeReadiness & { received_at?: number }
 
@@ -36,6 +57,8 @@ interface ExtensionsStore {
   loadErrors:        Record<string, string>
   runtimeReadinessById: Record<string, RuntimeReadinessCacheEntry>
   runtimeReadinessLoadingById: Record<string, boolean>
+  runtimeReadinessActionLoadingById: Record<string, boolean>
+  runtimeReadinessActionErrorById: Record<string, string | null>
 
   loadExtensions:    () => Promise<void>
   installFromGitHub: (url: string) => Promise<InstallResult>
@@ -43,6 +66,11 @@ interface ExtensionsStore {
   reload:            () => Promise<void>
   refreshModelOwnership: (extensions?: ModelExtension[]) => Promise<void>
   ensureRuntimeReadiness: (modelIds: string[], options?: { force?: boolean }) => Promise<void>
+  runRuntimeReadinessAction: (
+    modelId: string,
+    action: RuntimeReadinessAction,
+    options?: { dispatch?: (action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> },
+  ) => Promise<{ success: boolean; error?: string }>
   clearInstallState: () => void
 }
 
@@ -59,6 +87,8 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   loadErrors:        {},
   runtimeReadinessById: {},
   runtimeReadinessLoadingById: {},
+  runtimeReadinessActionLoadingById: {},
+  runtimeReadinessActionErrorById: {},
 
   // ── Load list ──────────────────────────────────────────────────────────────
 
@@ -231,6 +261,50 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
     return run
   },
 
+  async runRuntimeReadinessAction(modelId, action, options) {
+    const actionKey = buildRuntimeReadinessActionKey(modelId, action.id)
+    set((state) => ({
+      runtimeReadinessActionLoadingById: { ...state.runtimeReadinessActionLoadingById, [actionKey]: true },
+      runtimeReadinessActionErrorById: { ...state.runtimeReadinessActionErrorById, [actionKey]: null },
+    }))
+
+    try {
+      let result: { success: boolean; error?: string }
+      if (action.kind === 'refresh_readiness') {
+        await get().ensureRuntimeReadiness([modelId], { force: true })
+        result = { success: true }
+      } else if (options?.dispatch) {
+        result = normalizeRuntimeReadinessActionResult(await options.dispatch(action))
+        if (action.refresh_after === 'always' || (action.refresh_after === 'success' && result.success)) {
+          await get().ensureRuntimeReadiness([modelId], { force: true })
+        }
+      } else {
+        result = { success: false, error: 'Runtime readiness action requires explicit UI dispatch.' }
+      }
+
+      set((state) => ({
+        runtimeReadinessActionErrorById: {
+          ...state.runtimeReadinessActionErrorById,
+          [actionKey]: result.success ? null : sanitizeRuntimeActionError(result.error),
+        },
+      }))
+      return result.success ? { success: true } : { success: false, error: sanitizeRuntimeActionError(result.error) }
+    } catch {
+      const result = { success: false, error: 'Runtime readiness action failed.' }
+      set((state) => ({
+        runtimeReadinessActionErrorById: {
+          ...state.runtimeReadinessActionErrorById,
+          [actionKey]: result.error,
+        },
+      }))
+      return result
+    } finally {
+      set((state) => ({
+        runtimeReadinessActionLoadingById: { ...state.runtimeReadinessActionLoadingById, [actionKey]: false },
+      }))
+    }
+  },
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   clearInstallState() {
@@ -341,7 +415,7 @@ function mergeRuntimeReadinessResponse(
   for (const id of requestedIds) {
     const readiness = models[id]
     if (readiness) {
-      next[id] = { ...readiness, received_at: receivedAt }
+      next[id] = { ...sanitizeRuntimeReadiness(readiness), received_at: receivedAt }
       continue
     }
 
@@ -354,6 +428,88 @@ function mergeRuntimeReadinessResponse(
   }
 
   return next
+}
+
+function buildRuntimeReadinessActionKey(modelId: string, actionId: string): string {
+  return `${modelId}:${actionId}`
+}
+
+function normalizeRuntimeReadinessActionResult(value: { success?: boolean; error?: string }): { success: boolean; error?: string } {
+  return value.success ? { success: true } : { success: false, error: sanitizeRuntimeActionError(value.error) }
+}
+
+function sanitizeRuntimeActionError(error: unknown): string {
+  return typeof error === 'string' && error.trim() && !containsUnsafeText(error)
+    ? error.trim().slice(0, 240)
+    : 'Runtime readiness action failed.'
+}
+
+function sanitizeRuntimeReadiness(readiness: RuntimeReadiness): RuntimeReadiness {
+  const actions = sanitizeRuntimeReadinessActions(readiness.actions)
+  const details = sanitizeRuntimeReadinessDetails(readiness.details)
+  return {
+    ...readiness,
+    ...(actions.length > 0 ? { actions } : { actions: undefined }),
+    ...(details ? { details } : { details: undefined }),
+  }
+}
+
+function sanitizeRuntimeReadinessActions(actions: RuntimeReadiness['actions']): RuntimeReadinessAction[] {
+  if (!Array.isArray(actions)) return []
+  return actions
+    .filter((action) => {
+      if (!ACTION_ID_RE.test(action.id)) return false
+      if (!['show_guidance', 'show_details', 'open_external_url', 'refresh_readiness'].includes(action.kind)) return false
+      if (!['manual', 'non_destructive', 'confirm'].includes(action.safety)) return false
+      if (!isSafeText(action.label, 240)) return false
+      if (action.reason && !isSafeText(action.reason, 2_000)) return false
+      if (action.guidance && !isSafeText(action.guidance, 2_000)) return false
+      if (action.docs_url && !isSafeHttpsUrl(action.docs_url)) return false
+      if (action.kind === 'open_external_url' && !action.docs_url) return false
+      return true
+    })
+    .slice(0, MAX_ACTIONS)
+}
+
+function sanitizeRuntimeReadinessDetails(details: RuntimeReadiness['details']): RuntimeReadinessDetails | undefined {
+  if (!details) return undefined
+  const sanitized: RuntimeReadinessDetails = {}
+  if (details.title && isSafeText(details.title, 240)) sanitized.title = details.title
+  if (details.summary && isSafeText(details.summary, 2_000)) sanitized.summary = details.summary
+  if (details.guidance && isSafeText(details.guidance, 2_000)) sanitized.guidance = details.guidance
+  const evidence = sanitizeDiagnosticMap(details.evidence)
+  const diagnostics = sanitizeDiagnosticMap(details.diagnostics)
+  if (Object.keys(evidence).length > 0) sanitized.evidence = evidence
+  if (Object.keys(diagnostics).length > 0) sanitized.diagnostics = diagnostics
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined
+}
+
+function sanitizeDiagnosticMap(map: RuntimeReadinessDetails['diagnostics']): Record<string, string> {
+  if (!map) return {}
+  const sanitized: Record<string, string> = {}
+  for (const [key, value] of Object.entries(map)) {
+    if (ALLOWED_DIAGNOSTIC_KEYS.has(key) && isSafeText(value, 240)) {
+      sanitized[key] = value
+    }
+  }
+  return sanitized
+}
+
+function isSafeHttpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function isSafeText(value: string, maxLength: number): boolean {
+  const text = value.trim()
+  return Boolean(text) && text.length <= maxLength && !containsUnsafeText(text)
+}
+
+function containsUnsafeText(value: string): boolean {
+  return /\.\.|token\s*=|secret|api[_-]?key|raw output|command output|\b[A-Z_]{3,}=|(?:^|\s)(?:\/[\w.-]+){2,}|[A-Za-z]:\\/i.test(value)
 }
 
 function createCheckingFailedReadiness(receivedAt: number): RuntimeReadinessCacheEntry {

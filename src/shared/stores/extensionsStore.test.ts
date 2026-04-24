@@ -72,7 +72,7 @@ function createProcessExtension(id: string) {
 function installMockWindow(result: MockInstallResult, downloadedIds: string[] = [], readiness?: {
   calls: string[][]
   responses: Array<Promise<{ success: boolean; models: Record<string, RuntimeReadiness>; error?: string }> | { success: boolean; models: Record<string, RuntimeReadiness>; error?: string }>
-}) {
+}, shellCalls: string[] = []) {
   let progressHandler: ((data: { step: string; percent?: number; message?: string }) => void) | undefined
 
   Object.defineProperty(globalThis, 'window', {
@@ -110,6 +110,12 @@ function installMockWindow(result: MockInstallResult, downloadedIds: string[] = 
             return response ?? { success: true, models: {} }
           },
         },
+        shell: {
+          async openExternal(url: string) {
+            shellCalls.push(url)
+            return { success: true }
+          },
+        },
       },
     },
   })
@@ -127,6 +133,8 @@ function resetStoreState() {
     loadErrors: {},
     runtimeReadinessById: {},
     runtimeReadinessLoadingById: {},
+    runtimeReadinessActionLoadingById: {},
+    runtimeReadinessActionErrorById: {},
   })
 }
 
@@ -142,6 +150,35 @@ const loginReadiness: RuntimeReadiness = {
   machine_code: 'preflight/not_authenticated',
   label_hint: 'Login',
   checked_at: '2026-04-24T00:00:00.000Z',
+}
+
+const loginReadinessWithActions: RuntimeReadiness = {
+  ...loginReadiness,
+  actions: [
+    {
+      id: 'codex.login.docs',
+      kind: 'open_external_url',
+      label: 'Open login docs',
+      docs_url: 'https://developers.openai.com/codex/auth',
+      safety: 'manual',
+    },
+    {
+      id: 'bad.secret',
+      kind: 'show_guidance',
+      label: 'Leak',
+      guidance: 'token=secret /home/user/private',
+      safety: 'manual',
+    },
+  ],
+  details: {
+    title: 'Login required',
+    summary: 'Complete Codex auth outside Modly.',
+    diagnostics: {
+      runtime_source: 'path',
+      auth_state: 'missing',
+      raw_output: 'token=secret',
+    },
+  },
 }
 
 test('installFromGitHub preserves legacy single-extension installs and refreshes model ownership', async () => {
@@ -299,4 +336,70 @@ test('ensureRuntimeReadiness marks stale cache on failure and returns checking f
   const stale = useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']
   assert.equal(stale?.label_hint, 'Ready')
   assert.equal(stale?.stale, true)
+})
+
+test('ensureRuntimeReadiness stores bounded actions and details without leaking unsafe fields or opening URLs', async () => {
+  const shellCalls: string[] = []
+  const readiness = {
+    calls: [] as string[][],
+    responses: [
+      { success: true, models: { 'codex/text-to-image': loginReadinessWithActions } },
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness, shellCalls)
+  resetStoreState()
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+
+  const stored = useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']
+  assert.deepEqual(stored?.actions?.map((action) => action.id), ['codex.login.docs'])
+  assert.deepEqual(stored?.details?.diagnostics, {
+    runtime_source: 'path',
+    auth_state: 'missing',
+  })
+  assert.equal(stored?.details?.summary, 'Complete Codex auth outside Modly.')
+  assert.deepEqual(shellCalls, [])
+})
+
+test('runRuntimeReadinessAction forces refresh for refresh_readiness actions and records bounded loading state', async () => {
+  const readiness = {
+    calls: [] as string[][],
+    responses: [
+      { success: true, models: { 'codex/text-to-image': loginReadiness } },
+      { success: true, models: { 'codex/text-to-image': readyReadiness } },
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  await useExtensionsStore.getState().runRuntimeReadinessAction('codex/text-to-image', {
+    id: 'refresh',
+    kind: 'refresh_readiness',
+    label: 'Refresh',
+    safety: 'non_destructive',
+  })
+
+  assert.deepEqual(readiness.calls, [['codex/text-to-image'], ['codex/text-to-image']])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Ready')
+  assert.equal(useExtensionsStore.getState().runtimeReadinessActionLoadingById['codex/text-to-image:refresh'], false)
+  assert.equal(useExtensionsStore.getState().runtimeReadinessActionErrorById['codex/text-to-image:refresh'], null)
+})
+
+test('runRuntimeReadinessAction does not execute open_external_url without explicit dispatcher', async () => {
+  const shellCalls: string[] = []
+  installMockWindow({ success: true }, [], undefined, shellCalls)
+  resetStoreState()
+
+  const result = await useExtensionsStore.getState().runRuntimeReadinessAction('codex/text-to-image', {
+    id: 'docs',
+    kind: 'open_external_url',
+    label: 'Docs',
+    docs_url: 'https://developers.openai.com/codex/cli',
+    safety: 'manual',
+  })
+
+  assert.deepEqual(result, { success: false, error: 'Runtime readiness action requires explicit UI dispatch.' })
+  assert.deepEqual(shellCalls, [])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessActionErrorById['codex/text-to-image:docs'], 'Runtime readiness action requires explicit UI dispatch.')
 })

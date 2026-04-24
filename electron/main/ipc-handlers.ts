@@ -33,7 +33,7 @@ import { fetchTrustedRepos } from './trusted-repos'
 import type { ProcessInput } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
 import { installGitHubExtensionRepo } from './github-extension-install'
-import { fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
+import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -488,6 +488,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('model:runtimeReadiness', async (_event, modelIds: string[]) => {
     return fetchRuntimeReadinessWithHealthGate(modelIds, { apiBaseUrl: API_BASE_URL })
+  })
+
+  ipcMain.handle('model:runtimeReadinessAction', async (_event, action: unknown) => {
+    const handler = createRuntimeReadinessActionHandler({
+      openExternal: (url) => shell.openExternal(url),
+    })
+    return handler(action)
   })
 
   ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {

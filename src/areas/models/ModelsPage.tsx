@@ -143,11 +143,13 @@ export default function ModelsPage(): JSX.Element {
   const installError      = useExtensionsStore((s) => s.installError)
   const installResult     = useExtensionsStore((s) => s.installResult)
   const loadErrors        = useExtensionsStore((s) => s.loadErrors)
+  const runtimeReadinessById = useExtensionsStore((s) => s.runtimeReadinessById)
   const loadExtensions    = useExtensionsStore((s) => s.loadExtensions)
   const installFromGH     = useExtensionsStore((s) => s.installFromGitHub)
   const installFromLocal  = useExtensionsStore((s) => s.installFromLocal)
   const uninstallExt      = useExtensionsStore((s) => s.uninstall)
   const reloadExtensions  = useExtensionsStore((s) => s.reload)
+  const ensureRuntimeReadiness = useExtensionsStore((s) => s.ensureRuntimeReadiness)
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   const allExtensions: AnyExtension[] = useMemo(
@@ -279,6 +281,11 @@ export default function ModelsPage(): JSX.Element {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- register the progress listener once on mount
   }, [])
+
+  useEffect(() => {
+    const modelIds = modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+    if (modelIds.length > 0) void ensureRuntimeReadiness(modelIds)
+  }, [modelExtensions, ensureRuntimeReadiness])
 
   useEffect(() => {
     if (installError) setGhErr(installError)
@@ -489,6 +496,7 @@ export default function ModelsPage(): JSX.Element {
 
   const cardHandlers = {
     ownershipStateById,
+    runtimeReadinessById,
     installedIds: installedNodeIds,
     downloading,
     disabled: isBusy,

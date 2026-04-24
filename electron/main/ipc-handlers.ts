@@ -46,6 +46,7 @@ import { getBuiltinExtensionsDir } from './builtin-sync'
 import { activeExtensionInstalls, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { fetchTrustedRepos } from './trusted-repos'
+import { fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { spawn, execFile } from 'child_process'
 import {
   assertSafeExtensionId,
@@ -406,6 +407,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     } catch (err) {
       return { success: false, error: String(err) }
     }
+  })
+
+  ipcMain.handle('model:runtimeReadiness', async (_event, modelIds: string[]) => {
+    return fetchRuntimeReadinessWithHealthGate(modelIds, { apiBaseUrl: API_BASE_URL })
   })
 
   ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }> => {

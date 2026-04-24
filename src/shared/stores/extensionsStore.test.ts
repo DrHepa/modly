@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { AnyExtension, FailedExtensionResult, InstalledExtensionResult } from '../types/electron.d'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import type { AnyExtension, FailedExtensionResult, InstalledExtensionResult, RuntimeReadiness } from '../types/electron.d'
 
 const { useExtensionsStore } = await import(new URL('./extensionsStore.ts', import.meta.url).href)
 
@@ -69,7 +71,10 @@ function createProcessExtension(id: string) {
   }
 }
 
-function installMockWindow(result: MockInstallResult, downloadedIds: string[] = []) {
+function installMockWindow(result: MockInstallResult, downloadedIds: string[] = [], readiness?: {
+  calls: string[][]
+  responses: Array<Promise<{ success: boolean; models: Record<string, RuntimeReadiness>; error?: string }> | { success: boolean; models: Record<string, RuntimeReadiness>; error?: string }>
+}) {
   let progressHandler: ((data: { step: string; percent?: number; message?: string }) => void) | undefined
 
   Object.defineProperty(globalThis, 'window', {
@@ -100,6 +105,14 @@ function installMockWindow(result: MockInstallResult, downloadedIds: string[] = 
         model: {
           async isDownloaded(id: string) { return downloadedIds.includes(id) },
           async installedWeightVariants() { return [] },
+          async listDownloaded() {
+            return downloadedIds.map((id) => ({ id, name: id, size_gb: 1 }))
+          },
+          async runtimeReadiness(modelIds: string[]) {
+            readiness?.calls.push(modelIds)
+            const response = readiness?.responses.shift()
+            return response ?? { success: true, models: {} }
+          },
         },
       },
     },
@@ -107,6 +120,7 @@ function installMockWindow(result: MockInstallResult, downloadedIds: string[] = 
 }
 
 function resetStoreState() {
+  useExtensionsStore.getState().invalidateRuntimeReadiness()
   useExtensionsStore.setState({
     modelExtensions: [],
     processExtensions: [],
@@ -116,7 +130,23 @@ function resetStoreState() {
     installError: null,
     installResult: null,
     loadErrors: {},
+    runtimeReadinessById: {},
+    runtimeReadinessLoadingById: {},
   })
+}
+
+const readyReadiness: RuntimeReadiness = {
+  ok: true,
+  machine_code: 'ready',
+  label_hint: 'Ready',
+  checked_at: '2026-04-24T00:00:00.000Z',
+}
+
+const loginReadiness: RuntimeReadiness = {
+  ok: false,
+  machine_code: 'preflight/not_authenticated',
+  label_hint: 'Login',
+  checked_at: '2026-04-24T00:00:00.000Z',
 }
 
 test('installFromGitHub preserves legacy single-extension installs and refreshes model ownership', async () => {
@@ -224,4 +254,129 @@ test('installFromGitHub keeps partial installs merged and surfaces failed childr
     completedChildren: 1,
     totalChildren: 2,
   })
+})
+
+test('ensureRuntimeReadiness debounces duplicate ids and caches fresh readiness', async () => {
+  const readiness = {
+    calls: [] as string[][],
+    responses: [
+      Promise.resolve({
+        success: true,
+        models: {
+          'codex/text-to-image': loginReadiness,
+        },
+      }),
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+
+  const first = useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image', 'codex/text-to-image'])
+  const second = useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  await Promise.all([first, second])
+
+  assert.deepEqual(readiness.calls, [['codex/text-to-image']])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Login')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  assert.deepEqual(readiness.calls, [['codex/text-to-image']])
+})
+
+test('ensureRuntimeReadiness marks stale cache on failure and returns checking failed without cache', async () => {
+  const readiness: NonNullable<Parameters<typeof installMockWindow>[2]> = {
+    calls: [] as string[][],
+    responses: [
+      { success: false, error: 'Backend unavailable', models: {} },
+      { success: true, models: { 'codex/text-to-image': readyReadiness } },
+      { success: false, error: 'Backend unavailable again', models: {} },
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Checking failed')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'], { force: true })
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Ready')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'], { force: true })
+  const stale = useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']
+  assert.equal(stale?.label_hint, 'Ready')
+  assert.equal(stale?.stale, true)
+})
+
+test('ensureRuntimeReadiness deduplicates overlapping batches by exact capability', async () => {
+  let release!: (value: { success: boolean; models: Record<string, RuntimeReadiness> }) => void
+  const deferred = new Promise<{ success: boolean; models: Record<string, RuntimeReadiness> }>((resolve) => { release = resolve })
+  const readiness = { calls: [] as string[][], responses: [deferred, Promise.resolve({ success: true, models: { 'ext/c': loginReadiness } })] }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+  const first = useExtensionsStore.getState().ensureRuntimeReadiness(['ext/a', 'ext/b'])
+  const second = useExtensionsStore.getState().ensureRuntimeReadiness(['ext/b', 'ext/c'])
+  await Promise.resolve()
+  assert.deepEqual(readiness.calls, [['ext/a', 'ext/b'], ['ext/c']])
+  release({ success: true, models: { 'ext/a': readyReadiness, 'ext/b': loginReadiness } })
+  await Promise.all([first, second])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['ext/b'].label_hint, 'Login')
+})
+
+test('ensureRuntimeReadiness discards old lifecycle responses without clearing a new request', async () => {
+  let release!: (value: { success: boolean; models: Record<string, RuntimeReadiness> }) => void
+  const deferred = new Promise<{ success: boolean; models: Record<string, RuntimeReadiness> }>((resolve) => { release = resolve })
+  const readiness = { calls: [] as string[][], responses: [deferred, Promise.resolve({ success: true, models: { 'ext/a': loginReadiness } })] }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+  const old = useExtensionsStore.getState().ensureRuntimeReadiness(['ext/a'])
+  await Promise.resolve()
+  useExtensionsStore.getState().invalidateRuntimeReadiness()
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['ext/a'])
+  release({ success: true, models: { 'ext/a': readyReadiness } })
+  await old
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['ext/a'].label_hint, 'Login')
+  assert.equal(useExtensionsStore.getState().runtimeReadinessLoadingById['ext/a'], false)
+})
+
+test('loadExtensions restores installed and paused download controls before optional readiness settles', async () => {
+  const { getNodeState, NodeInstallControl } = await import(new URL('../../areas/models/components/extensionShared.tsx', import.meta.url).href)
+  let release!: (value: { success: boolean; models: Record<string, RuntimeReadiness> }) => void
+  const deferred = new Promise<{ success: boolean; models: Record<string, RuntimeReadiness> }>((resolve) => { release = resolve })
+  const readiness = { calls: [] as string[][], responses: [deferred] }
+  installMockWindow({ success: true }, ['ext/node'], readiness)
+  resetStoreState()
+  const extension = createModelExtension('ext')
+  window.electron.extensions.list = async () => [extension] as AnyExtension[]
+  let activeDownloadsCalled = false
+  window.electron.model.activeDownloads = async () => {
+    activeDownloadsCalled = true
+    return [{ modelId: 'ext/node', percent: 25, paused: true }]
+  }
+  let installedIds: string[] = []
+  let downloads: Record<string, { percent: number; paused?: boolean }> = {}
+  // Exercise the real store and the ModelsPage loadExtensions().then recovery order.
+  const initialization = useExtensionsStore.getState().loadExtensions().then(async () => {
+    const active = await window.electron.model.activeDownloads()
+    downloads = Object.fromEntries(active.map(({ modelId, ...progress }) => [modelId, progress]))
+    if (await window.electron.model.isDownloaded('ext/node')) installedIds.push('ext/node')
+  })
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(readiness.calls, [['ext/node']])
+    assert.equal(useExtensionsStore.getState().runtimeReadinessLoadingById['ext/node'], true)
+    assert.equal(activeDownloadsCalled, true, 'readiness must not delay download recovery')
+    assert.deepEqual(installedIds, ['ext/node'])
+    assert.equal(getNodeState('ext', extension.nodes[0], installedIds, {}).kind, 'installed')
+    const html = renderToStaticMarkup(createElement(NodeInstallControl, {
+      state: getNodeState('ext', extension.nodes[0], installedIds, downloads),
+      onInstall() {}, onPause() {}, onResume() {}, onCancel() {},
+    }))
+    assert.match(html, /Resume download/)
+    assert.match(html, /Cancel download/)
+    assert.doesNotMatch(html, />Install</)
+  } finally {
+    release({ success: true, models: { 'ext/node': readyReadiness } })
+    await initialization
+    await useExtensionsStore.getState().ensureRuntimeReadiness(['ext/node'])
+    resetStoreState()
+  }
 })

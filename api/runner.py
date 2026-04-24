@@ -198,6 +198,24 @@ def validate_requested_model(msg: dict, manifest: dict, node: dict) -> None:
         raise ValueError(
             f"Generation request model '{requested}' does not match worker model '{expected}'"
         )
+def resolve_runtime_readiness(gen) -> dict:
+    readiness = getattr(gen, "readiness_status", None)
+    if not callable(readiness):
+        return {
+            "ok": False,
+            "machine_code": "unsupported_contract",
+            "label_hint": "Checking failed",
+            "reason": "Model does not expose runtime readiness.",
+        }
+    status = readiness()
+    if not isinstance(status, dict):
+        return {
+            "ok": False,
+            "machine_code": "check_failed",
+            "label_hint": "Checking failed",
+            "reason": "Runtime readiness check failed.",
+        }
+    return status
 
 
 # ------------------------------------------------------------------ #
@@ -314,6 +332,10 @@ def main() -> None:
             elif action == "unload":
                 gen.unload()
                 send({"type": "unloaded"})
+
+            # ---- runtime readiness ------------------------------------
+            elif action == "runtime_readiness":
+                send({"type": "runtime_readiness", "id": rid, "status": resolve_runtime_readiness(gen)})
 
             # ---- shutdown --------------------------------------------
             elif action == "shutdown":

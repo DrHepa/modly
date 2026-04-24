@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -25,6 +26,14 @@ _MISSING_MODULE_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
 _AUTO_REPAIR_PACKAGE_MAP = {
     "PIL": "Pillow",
 }
+
+
+class RuntimeReadinessUnavailable(RuntimeError):
+    """Host-authored diagnostic state, safe to expose without exception text."""
+    def __init__(self, machine_code: str, reason: str):
+        super().__init__(reason)
+        self.machine_code = machine_code
+        self.reason = reason
 
 
 def _venv_python(ext_dir: Path) -> Path:
@@ -51,6 +60,13 @@ class ExtensionProcess:
         self._queue:  queue.Queue                = queue.Queue()
         self._lock:   threading.Lock             = threading.Lock()
         self._loaded: bool                       = False
+        # Order: invocation -> readiness state; neither is held by stop().
+        # The write lock protects only stdin, not the reply queue's owner.
+        self._invocation_lock = threading.Lock()
+        self._readiness_lock = threading.Lock()
+        self._readiness_pending = None
+        self._runtime_revision = 0
+        self._readiness_timeout = 5.0
 
         # Mirrors BaseGenerator attributes used by the registry
         self.hf_repo          = manifest.get("hf_repo", "")
@@ -140,6 +156,7 @@ class ExtensionProcess:
                 bufsize=1,
                 env=self._build_env(),
             )
+            self._runtime_revision += 1
 
             # Background thread: read stdout → queue
             reader = threading.Thread(target=self._read_loop, args=(self._proc, run_queue), daemon=True)
@@ -217,11 +234,63 @@ class ExtensionProcess:
                 line = line.strip()
                 if line:
                     try:
-                        msg_queue.put(json.loads(line))
+                        message = json.loads(line)
+                        if not self._route_readiness_reply(proc, message):
+                            msg_queue.put(message)
                     except json.JSONDecodeError:
                         print(f"[{self.MODEL_ID}] {line}", file=sys.stderr)
         finally:
+            if self._proc is proc:
+                self._runtime_revision += 1
+            self._finish_readiness(proc)
             msg_queue.put(None)  # sentinel: process is done
+
+    def _route_readiness_reply(self, proc, message: dict) -> bool:
+        """Keep diagnostic replies (including late errors) out of model RPCs."""
+        request_id = message.get("id")
+        if not (message.get("type") == "runtime_readiness" or
+                isinstance(request_id, str) and request_id.startswith("readiness:")):
+            return False
+        with self._readiness_lock:
+            pending = self._readiness_pending
+            if pending and pending[0] is proc and pending[1] == request_id:
+                self._readiness_pending = None
+                pending[2].put(message)
+        return True
+
+    def _finish_readiness(self, proc) -> None:
+        with self._readiness_lock:
+            pending = self._readiness_pending
+            if pending and pending[0] is proc:
+                self._readiness_pending = None
+                pending[2].put(None)
+
+    def _assert_no_readiness_pending(self) -> None:
+        with self._readiness_lock:
+            pending = self._readiness_pending
+            if pending and pending[0].poll() is None:
+                raise RuntimeReadinessUnavailable("runtime_busy", "Worker is busy checking runtime readiness.")
+            self._readiness_pending = None
+
+    @contextmanager
+    def _model_invocation(self, *, release_readiness: bool = False):
+        # Hold ownership through send AND receive. A timed-out diagnostic still
+        # owns the worker until its correlated reply arrives or stop reaps it.
+        with self._invocation_lock:
+            if release_readiness:
+                with self._readiness_lock:
+                    pending = self._readiness_pending
+                # Explicit release may reap the reserved diagnostic worker.
+                # Invocation ownership prevents a new model RPC or restart
+                # between this exact-incarnation check and stop().
+                if pending and pending[0] is self._proc:
+                    self.stop()
+            self._assert_no_readiness_pending()
+            self._runtime_revision += 1
+            try:
+                yield
+            finally:
+                self._runtime_revision += 1
 
     def _stderr_loop(self, proc: subprocess.Popen) -> None:
         """Forward subprocess stderr to the main process stderr, emitting
@@ -282,25 +351,27 @@ class ExtensionProcess:
         return self._loaded and self._proc is not None and self._proc.poll() is None
 
     def load(self) -> None:
-        self._ensure_started()
-        self._send({"action": "load"})
+        with self._model_invocation():
+            self._ensure_started()
+            self._send({"action": "load"})
 
-        msg = self._recv(timeout=None)  # model load can be arbitrarily slow
-        if msg.get('type') in ['loaded', 'ready']:
-            self._loaded = True
-        elif msg.get("type") == "error":
-            raise RuntimeError(msg.get("traceback") or msg.get("message"))
-        else:
-            raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to load: {msg}")
+            msg = self._recv(timeout=None)  # model load can be arbitrarily slow
+            if msg.get('type') in ['loaded', 'ready']:
+                self._loaded = True
+            elif msg.get("type") == "error":
+                raise RuntimeError(msg.get("traceback") or msg.get("message"))
+            else:
+                raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to load: {msg}")
 
     def unload(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._send({"action": "unload"})
-                self._recv(timeout=30.0)
-            except Exception:
-                pass
-        self._loaded = False
+        with self._model_invocation(release_readiness=True):
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._send({"action": "unload"})
+                    self._recv(timeout=30.0)
+                except Exception:
+                    pass
+            self._loaded = False
 
     def generate(
         self,
@@ -424,16 +495,47 @@ class ExtensionProcess:
         progress_cb: Optional[Callable[[int, str], None]],
         cancel_event: Optional[threading.Event],
     ) -> Path:
-        req_id = str(uuid.uuid4())
-        self._send({
-            "action": "generate", "id": req_id, "model_id": self.MODEL_ID,
-            **input_payload, "params": params,
-            "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
-        })
-        return self._receive_generation(req_id, progress_cb, cancel_event)
+        with self._model_invocation():
+            req_id = str(uuid.uuid4())
+            self._send({
+                "action": "generate", "id": req_id, "model_id": self.MODEL_ID,
+                **input_payload, "params": params,
+                "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+            })
+            return self._receive_generation(req_id, progress_cb, cancel_event)
 
     def params_schema(self) -> list:
         return self._params_schema
+
+    def readiness_status(self) -> dict:
+        """Probe an idle, already-running worker; never import/load/repair one."""
+        if not self._invocation_lock.acquire(blocking=False):
+            raise RuntimeReadinessUnavailable("runtime_busy", "Worker is busy.")
+        try:
+            self._assert_no_readiness_pending()
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                raise RuntimeReadinessUnavailable("runtime_not_running", "Worker is not running; diagnostics do not start it.")
+            request_id = f"readiness:{uuid.uuid4()}"
+            replies: queue.Queue = queue.Queue()
+            with self._readiness_lock:
+                self._readiness_pending = (proc, request_id, replies)
+            # Even on timeout or a partial write, retain pending ownership:
+            # there is no safe assumption that the worker did not run the hook.
+            self._send({"action": "runtime_readiness", "id": request_id})
+        finally:
+            self._invocation_lock.release()
+        # The pending reservation, not this waiting thread, owns the worker.
+        # New load/generate/probes reject it; explicit unload can stop it.
+        try:
+            msg = replies.get(timeout=self._readiness_timeout)
+        except queue.Empty as exc:
+            raise TimeoutError("Runtime readiness check timed out") from exc
+        if msg is None or self._proc is not proc or proc.poll() is not None:
+            raise RuntimeError("Runtime readiness worker changed")
+        if msg.get("type") == "runtime_readiness":
+            return msg.get("status") or {}
+        raise RuntimeError("Runtime readiness check failed")
 
     def stop(self) -> None:
         """Hard-stop the subprocess.
@@ -445,6 +547,7 @@ class ExtensionProcess:
         next load() starts a fresh subprocess.
         """
         proc = self._proc
+        self._runtime_revision += 1
         self._loaded = False
         if proc and proc.poll() is None:
             try:
@@ -463,7 +566,11 @@ class ExtensionProcess:
                     f"[{self.MODEL_ID}] Extension subprocess is still running"
                 )
         self._proc = None
+        self._finish_readiness(proc)
         self._drain_queue()
+        # Wake a load/generation consumer even if draining removed the reader's
+        # death sentinel. The next subprocess receives its own fresh queue.
+        self._queue.put(None)
 
     def _drain_queue(self) -> None:
         while not self._queue.empty():

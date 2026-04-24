@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult, RuntimeReadinessResponse } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
@@ -165,6 +165,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       deleteWeightVariant: (modelId: string, variantId: string) => ipcRenderer.invoke('model:deleteWeightVariant', modelId, variantId),
       unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
+      runtimeReadiness: (modelIds: string[]): Promise<RuntimeReadinessResponse> =>
+        ipcRenderer.invoke('model:runtimeReadiness', modelIds) as Promise<RuntimeReadinessResponse>,
       activeDownloads: (): Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> =>
         ipcRenderer.invoke('model:activeDownloads') as Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>,
       onProgress:     (cb: (data: {

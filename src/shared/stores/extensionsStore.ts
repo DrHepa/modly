@@ -1,6 +1,10 @@
 import { create } from 'zustand'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '../../areas/models/modelOwnershipState'
-import type { ModelExtension, ProcessExtension, AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, InstalledExtensionResult } from '@shared/types/electron.d'
+import type { ModelExtension, ProcessExtension, AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, InstalledExtensionResult, RuntimeReadiness } from '@shared/types/electron.d'
+
+const RUNTIME_READINESS_TTL_MS = 30_000
+
+type RuntimeReadinessCacheEntry = RuntimeReadiness & { received_at?: number }
 
 // ─── Re-exports for consumers ─────────────────────────────────────────────────
 
@@ -25,6 +29,8 @@ interface ExtensionsStore {
   loadErrors:        Record<string, string>
   /** Installed weight variant ids, keyed by "ext_id/node_id", for nodes that declare variants */
   installedWeightVariants: Record<string, string[]>
+  runtimeReadinessById: Record<string, RuntimeReadinessCacheEntry>
+  runtimeReadinessLoadingById: Record<string, boolean>
 
   loadExtensions:    () => Promise<void>
   refreshInstalledWeightVariants: () => Promise<void>
@@ -32,6 +38,8 @@ interface ExtensionsStore {
   installFromLocal:  () => Promise<{ success: boolean; error?: string; cancelled?: boolean; needsRepair?: boolean }>
   uninstall:         (extensionId: string) => Promise<{ success: boolean; error?: string }>
   reload:            () => Promise<void>
+  ensureRuntimeReadiness: (modelIds: string[], options?: { force?: boolean }) => Promise<void>
+  invalidateRuntimeReadiness: () => void
   clearInstallState: () => void
 }
 
@@ -49,6 +57,9 @@ export function partitionExtensionsByType(list: AnyExtension[]): {
   }
 }
 
+let runtimeReadinessEpoch = 0
+const runtimeReadinessInFlight = new Map<string, Promise<void>>()
+
 export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   modelExtensions:   [],
   processExtensions: [],
@@ -59,10 +70,13 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   installResult:     null,
   loadErrors:        {},
   installedWeightVariants: {},
+  runtimeReadinessById: {},
+  runtimeReadinessLoadingById: {},
 
   // ── Load list ──────────────────────────────────────────────────────────────
 
   async loadExtensions() {
+    get().invalidateRuntimeReadiness()
     set({ loading: true })
     try {
       const list = (await window.electron.extensions.list()) as AnyExtension[]
@@ -72,6 +86,8 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
         loading:           false,
       })
       await Promise.all([get().refreshInstalledWeightVariants(), get().refreshModelOwnership()])
+      // Optional diagnostics must not delay installed/download-state recovery.
+      void get().ensureRuntimeReadiness(collectRuntimeReadinessModelIds(extensions.modelExtensions))
     } catch {
       set({ loading: false })
     }
@@ -111,6 +127,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Install from GitHub ────────────────────────────────────────────────────
 
   async installFromGitHub(url: string) {
+    get().invalidateRuntimeReadiness()
     set({ installProgress: { step: 'downloading', percent: 0, success: false }, installError: null, installResult: null })
 
     window.electron.extensions.onInstallProgress((data) => {
@@ -179,6 +196,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Install from local folder ──────────────────────────────────────────────
 
   async installFromLocal() {
+    get().invalidateRuntimeReadiness()
     const result = await installExtension(() => window.electron.extensions.installFromLocal(), set)
     // If user cancelled the folder picker, treat as a no-op (not an error)
     if ((result as any).cancelled) {
@@ -192,6 +210,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Uninstall ──────────────────────────────────────────────────────────────
 
   async uninstall(extensionId: string) {
+    get().invalidateRuntimeReadiness()
     const result = await window.electron.extensions.uninstall(extensionId)
     if (result.success) {
       set((state) => ({
@@ -206,11 +225,76 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Reload (rescan extensions dir + Python registry) ──────────────────────
 
   async reload() {
+    get().invalidateRuntimeReadiness()
     const result = await window.electron.extensions.reload()
     if (result.success) {
       set({ loadErrors: result.errors ?? {} })
     }
     await get().loadExtensions()
+  },
+
+  invalidateRuntimeReadiness() {
+    runtimeReadinessEpoch += 1
+    runtimeReadinessInFlight.clear()
+    set({ runtimeReadinessById: {}, runtimeReadinessLoadingById: {} })
+  },
+
+  async ensureRuntimeReadiness(modelIds, options) {
+    const epoch = runtimeReadinessEpoch
+    const modelExtensions = get().modelExtensions
+    const now = Date.now()
+    const uniqueIds = [...new Set(modelIds.map((id) => id.trim()).filter(Boolean))]
+    const waits = uniqueIds.flatMap((id) => {
+      const pending = runtimeReadinessInFlight.get(id)
+      return pending ? [pending] : []
+    })
+    const idsToFetch = uniqueIds.filter((id) => {
+      if (runtimeReadinessInFlight.has(id)) return false
+      const cached = get().runtimeReadinessById[id]
+      return options?.force || !cached?.received_at || now - cached.received_at >= RUNTIME_READINESS_TTL_MS
+    })
+
+    if (idsToFetch.length === 0) {
+      await Promise.all(waits)
+      return
+    }
+    const isCurrent = () => epoch === runtimeReadinessEpoch && modelExtensions === get().modelExtensions
+    set((state) => ({
+      runtimeReadinessLoadingById: {
+        ...state.runtimeReadinessLoadingById,
+        ...Object.fromEntries(idsToFetch.map((id) => [id, true])),
+      },
+    }))
+    // Publish per-id ownership before even a synchronous IPC failure can settle.
+    const run = Promise.resolve().then(async () => {
+      try {
+        const result = await window.electron.model.runtimeReadiness(idsToFetch)
+        if (!isCurrent()) return
+        const receivedAt = Date.now()
+        set((state) => ({
+          runtimeReadinessById: mergeRuntimeReadinessResponse(state.runtimeReadinessById, idsToFetch, result.models, result.success, receivedAt),
+        }))
+      } catch {
+        if (!isCurrent()) return
+        const receivedAt = Date.now()
+        set((state) => ({
+          runtimeReadinessById: mergeRuntimeReadinessResponse(state.runtimeReadinessById, idsToFetch, {}, false, receivedAt),
+        }))
+      } finally {
+        if (isCurrent()) set((state) => ({
+          runtimeReadinessLoadingById: {
+            ...state.runtimeReadinessLoadingById,
+            ...Object.fromEntries(idsToFetch.map((id) => [id, false])),
+          },
+        }))
+        for (const id of idsToFetch) {
+          if (runtimeReadinessInFlight.get(id) === run) runtimeReadinessInFlight.delete(id)
+        }
+      }
+    })
+
+    for (const id of idsToFetch) runtimeReadinessInFlight.set(id, run)
+    await Promise.all([...waits, run])
   },
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -381,5 +465,43 @@ function buildDoneInstallProgress(result: Required<Pick<ExtensionInstallResult, 
     totalChildren: result.installed.length + result.failed.length,
     ...(isLegacyCompatibleSuccess && result.extensionId ? { extensionId: result.extensionId } : {}),
     ...(result.status === 'error' && result.error ? { message: result.error } : {}),
+  }
+}
+
+function collectRuntimeReadinessModelIds(modelExtensions: ModelExtension[]): string[] {
+  return modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+}
+
+function mergeRuntimeReadinessResponse(
+  previous: Record<string, RuntimeReadinessCacheEntry>,
+  requestedIds: string[],
+  models: Record<string, RuntimeReadiness>,
+  success: boolean,
+  receivedAt: number,
+): Record<string, RuntimeReadinessCacheEntry> {
+  const next = { ...previous }
+  for (const id of requestedIds) {
+    const readiness = models[id]
+    if (success && readiness) {
+      next[id] = { ...readiness, received_at: receivedAt }
+      continue
+    }
+
+    const cached = previous[id]
+    next[id] = !success && cached
+      ? { ...cached, stale: true, received_at: receivedAt }
+      : createCheckingFailedReadiness(receivedAt)
+  }
+
+  return next
+}
+
+function createCheckingFailedReadiness(receivedAt: number): RuntimeReadinessCacheEntry {
+  return {
+    ok: false,
+    machine_code: 'checking_failed',
+    label_hint: 'Checking failed',
+    checked_at: new Date(receivedAt).toISOString(),
+    received_at: receivedAt,
   }
 }

@@ -4,6 +4,7 @@ import time
 import os
 import socket
 import threading
+import re
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -67,6 +68,20 @@ async def model_status():
 async def all_models_status():
     """Status of all known models (downloaded, loaded, required VRAM)."""
     return await asyncio.to_thread(generator_registry.all_status)
+
+
+@router.get("/runtime-readiness")
+async def model_runtime_readiness(model_ids: str):
+    """Read-only optional runtime readiness by canonical model ID."""
+    requested_ids = [model_id.strip() for model_id in model_ids.split(",") if model_id.strip()]
+    for model_id in requested_ids:
+        if not _is_safe_canonical_model_id(model_id):
+            raise HTTPException(400, f"Invalid model ID: {model_id}")
+    return {"readiness": await asyncio.to_thread(generator_registry.runtime_readiness, requested_ids)}
+
+
+def _is_safe_canonical_model_id(model_id: str) -> bool:
+    return re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*", model_id) is not None
 
 
 @router.get("/params")

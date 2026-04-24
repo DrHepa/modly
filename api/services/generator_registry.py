@@ -19,12 +19,15 @@ import sys
 import threading
 from contextlib import contextmanager
 from functools import wraps
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from services.generators.base import BaseGenerator
-from services.extension_process import ExtensionProcess, _venv_python
+from services.extension_process import ExtensionProcess, RuntimeReadinessUnavailable, _venv_python
 from services.model_sources import (
     missing_weight_variant,
     model_sources_are_downloaded,
@@ -758,6 +761,13 @@ class GeneratorRegistry:
         self._path_publication_lock = threading.Lock()
         self._legacy_imports = _LegacyImportManager()
         self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
+        self._runtime_readiness_ttl_seconds = 30.0
+        self._runtime_readiness_timeout_seconds = 5.0
+        self._runtime_readiness_epoch = 0
+        self._runtime_readiness_cache: Dict[tuple, tuple[float, dict]] = {}
+        self._runtime_readiness_inflight: Dict[tuple, Future] = {}
+        self._runtime_readiness_lock = threading.Lock()
+        self._runtime_readiness_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runtime-readiness")
 
     def initialize(
         self,
@@ -873,6 +883,7 @@ class GeneratorRegistry:
         )
         with self._lifecycle_lock:
             print("[Registry] Reloading extensions...")
+            self._invalidate_runtime_readiness()
             for gen in self._generators.values():
                 if isinstance(gen, ExtensionProcess):
                     gen.stop()
@@ -932,6 +943,7 @@ class GeneratorRegistry:
                     "from the Modly Models page before generation."
                 )
             if not gen.is_loaded():
+                self._invalidate_runtime_readiness(model_id)
                 if not downloaded:
                     if isinstance(gen, ExtensionProcess):
                         # Let the subprocess handle its own download logic during
@@ -1021,6 +1033,7 @@ class GeneratorRegistry:
 
             if model_id != self._active_id:
                 if self._active_id in self._generators:
+                    self._invalidate_runtime_readiness(self._active_id)
                     self._generators[self._active_id].unload()
                 self._active_id = model_id
 
@@ -1092,6 +1105,124 @@ class GeneratorRegistry:
             })
         return result
 
+    def _invalidate_runtime_readiness(self, model_id: Optional[str] = None) -> None:
+        with self._runtime_readiness_lock:
+            self._runtime_readiness_epoch += 1
+            self._runtime_readiness_cache.clear()
+            # Running hooks cannot be cancelled in Python. They keep their old
+            # identity and cannot publish into the new lifecycle epoch.
+            for future in self._runtime_readiness_inflight.values():
+                future.cancel()
+            self._runtime_readiness_inflight.clear()
+
+    def _runtime_identity(self, model_id: str) -> tuple:
+        # Snapshot host fields only. No extension getters/import lock under the
+        # publication lock (same order as the existing root publication owner).
+        with self._path_publication_lock:
+            gen = self._generators.get(model_id)
+            if gen is None:
+                return ()
+            target = (object.__getattribute__(gen, "_target")
+                      if isinstance(gen, _LegacyGeneratorProxy) else gen)
+            fields = vars(target)
+            worker = fields.get("_proc")
+            return (model_id, gen, target, worker,
+                    fields.get("_runtime_revision", 0),
+                    str(MODELS_DIR), str(WORKSPACE_DIR),
+                    str(fields.get("model_dir")),
+                    tuple(sorted((key, str(value)) for key, value in
+                                 fields.get("shared_model_dirs", {}).items())),
+                    self._runtime_readiness_epoch)
+
+    def runtime_readiness(self, model_ids: list[str]) -> dict:
+        """Bounded optional diagnostics; never select, load or download a model."""
+        deadline = time.monotonic() + self._runtime_readiness_timeout_seconds
+        readiness: dict[str, dict] = {}
+        for model_id in dict.fromkeys(model_ids):
+            if model_id in self._generators:
+                readiness[model_id] = self._runtime_readiness_for_model(model_id, deadline)
+        return readiness
+
+    def _runtime_readiness_for_model(self, model_id: str, deadline: float) -> dict:
+        identity = self._runtime_identity(model_id)
+        now = time.monotonic()
+        with self._runtime_readiness_lock:
+            for key in list(self._runtime_readiness_cache):
+                if key[0] == model_id and key != identity:
+                    self._runtime_readiness_cache.pop(key, None)
+            for key, completed in list(self._runtime_readiness_inflight.items()):
+                if key != identity and completed.done():
+                    self._runtime_readiness_inflight.pop(key, None)
+            cached = self._runtime_readiness_cache.get(identity)
+            if cached and now - cached[0] < self._runtime_readiness_ttl_seconds:
+                return dict(cached[1])
+            future = self._runtime_readiness_inflight.get(identity)
+            if future is None and now < deadline:
+                future = self._runtime_readiness_executor.submit(
+                    self._compute_runtime_readiness, model_id, identity, deadline
+                )
+                self._runtime_readiness_inflight[identity] = future
+        try:
+            if future is None:
+                raise TimeoutError()
+            status = future.result(timeout=max(0, deadline - time.monotonic()))
+            if self._runtime_identity(model_id) != identity:
+                return _checking_failed_runtime_readiness()
+            with self._runtime_readiness_lock:
+                if self._runtime_readiness_epoch != identity[-1]:
+                    return _checking_failed_runtime_readiness()
+                self._runtime_readiness_cache[identity] = (time.monotonic(), status)
+            return dict(status)
+        except RuntimeReadinessUnavailable as exc:
+            return {"ok": False, "machine_code": exc.machine_code,
+                    "label_hint": "Checking failed", "reason": exc.reason,
+                    "checked_at": _now_iso()}
+        except Exception:
+            # A late completion is not fresh evidence. Cancel queued probes and
+            # retain running ones for deduplication until they settle.
+            if future is not None:
+                future.cancel()
+            return self._runtime_readiness_failure(model_id, identity)
+        finally:
+            if future is not None and future.done():
+                with self._runtime_readiness_lock:
+                    if self._runtime_readiness_inflight.get(identity) is future:
+                        self._runtime_readiness_inflight.pop(identity, None)
+
+    def _compute_runtime_readiness(self, model_id: str, identity: tuple, deadline: float) -> dict:
+        # Never queue behind a long model load or retain the global lifecycle
+        # lock while executing an extension hook.
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise RuntimeReadinessUnavailable("runtime_busy", "Model lifecycle is busy.")
+        try:
+            if time.monotonic() >= deadline or self._runtime_identity(model_id) != identity:
+                raise RuntimeError("Runtime readiness identity expired")
+            gen = self.get_generator(model_id)
+            if not isinstance(gen, ExtensionProcess):
+                # A thread deadline cannot cancel extension code or release its
+                # shared import-isolation lock. Decline this diagnostic only;
+                # normal direct model loading/generation stays unchanged.
+                return _unsupported_runtime_readiness(
+                    "Runtime readiness requires an isolated worker; direct model use is unchanged."
+                )
+        finally:
+            self._lifecycle_lock.release()
+        if time.monotonic() >= deadline or self._runtime_identity(model_id) != identity:
+            raise TimeoutError("Runtime readiness check expired")
+        status = gen.readiness_status()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Runtime readiness check expired")
+        return _sanitize_runtime_readiness(status)
+
+    def _runtime_readiness_failure(self, model_id: str, identity: tuple) -> dict:
+        if self._runtime_identity(model_id) != identity:
+            return _checking_failed_runtime_readiness()
+        with self._runtime_readiness_lock:
+            cached = self._runtime_readiness_cache.get(identity)
+        if cached:
+            return {**cached[1], "stale": True}
+        return _checking_failed_runtime_readiness()
+
     def params_schema(self, model_id: Optional[str] = None) -> list:
         target_id = model_id or self._active_id
         gen = self._generators.get(target_id)
@@ -1110,6 +1241,7 @@ class GeneratorRegistry:
             if models_dir is None:
                 # Preserve the existing workspace-only update contract.
                 if workspace_dir is not None:
+                    self._invalidate_runtime_readiness()
                     workspace_dir.mkdir(parents=True, exist_ok=True)
                     WORKSPACE_DIR = workspace_dir
                     for gen in self._generators.values():
@@ -1170,6 +1302,7 @@ class GeneratorRegistry:
     def _unload_generator(
         self, model_id: str, gen: BaseGenerator, *, rebind_paths: bool = True
     ) -> bool:
+        self._invalidate_runtime_readiness(model_id)
         if isinstance(gen, ExtensionProcess):
             # Cooperative unload leaves the constructor and MODEL_DIR alive.
             gen.stop()
@@ -1197,6 +1330,67 @@ class GeneratorRegistry:
                     "Models are still loaded; weights were preserved: "
                     + ", ".join(still_loaded)
                 )
+
+
+_EVIDENCE_ALLOWLIST = {
+    "source",
+    "runtime_name",
+    "runtime_version",
+    "platform",
+    "auth_state",
+    "entitlement_state",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _unsupported_runtime_readiness(reason: str = "Model does not expose runtime readiness.") -> dict:
+    return {
+        "ok": False,
+        "machine_code": "unsupported_contract",
+        "label_hint": "Checking failed",
+        "reason": reason,
+        "checked_at": _now_iso(),
+    }
+
+
+def _checking_failed_runtime_readiness() -> dict:
+    return {
+        "ok": False,
+        "machine_code": "check_failed",
+        "label_hint": "Checking failed",
+        "reason": "Runtime readiness check failed.",
+        "checked_at": _now_iso(),
+    }
+
+
+def _sanitize_runtime_readiness(status: dict) -> dict:
+    if not isinstance(status, dict):
+        return _checking_failed_runtime_readiness()
+
+    result: dict = {
+        "ok": status.get("ok") is True,
+        "machine_code": str(status.get("machine_code") or "check_failed"),
+        "checked_at": str(status.get("checked_at") or _now_iso()),
+    }
+    for key in ("label_hint", "reason"):
+        value = status.get(key)
+        if isinstance(value, str):
+            result[key] = value
+    evidence = status.get("evidence")
+    if isinstance(evidence, dict):
+        safe_evidence = {
+            key: str(value)
+            for key, value in evidence.items()
+            if key in _EVIDENCE_ALLOWLIST and isinstance(value, (str, int, float, bool))
+        }
+        if safe_evidence:
+            result["evidence"] = safe_evidence
+    if status.get("stale") is True:
+        result["stale"] = True
+    return result
 
 
 # Singleton

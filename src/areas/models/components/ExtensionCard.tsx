@@ -1,4 +1,4 @@
-import type { AnyExtension } from '@shared/types/electron.d'
+import type { AnyExtension, RuntimeReadiness } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '../modelOwnershipState'
 import type { ExtensionNode } from '@shared/types/electron.d'
 export type { AnyExtension as Extension }
@@ -20,6 +20,7 @@ interface Props {
   installedIds:     string[]
   downloading:      DownloadMap
   ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
+  runtimeReadinessById?: Record<string, RuntimeReadiness | undefined>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: ExtensionNode, fullId: string) => void
@@ -30,7 +31,7 @@ interface Props {
 }
 
 export function ExtensionCard({
-  ext, installedIds, downloading, ownershipStateById, loadError, disabled,
+  ext, installedIds, downloading, ownershipStateById, runtimeReadinessById, loadError, disabled,
   onInstall, onInstallAll, onPauseDownload, onCancelDownload, onOpen,
 }: Props): JSX.Element {
   const isModel = ext.type === 'model'
@@ -122,6 +123,7 @@ export function ExtensionCard({
             const fullId = `${ext.id}/${node.id}`
             const state = getNodeState(ext.id, node, installedIds, downloading)
             const ownership = ownershipStateById?.[fullId]
+            const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadinessById?.[node.capabilityId ?? fullId])
             return (
               <div
                 key={node.id}
@@ -135,6 +137,11 @@ export function ExtensionCard({
                     )}
                   </span>
                   <IOBadge node={node} />
+                  {isModel && runtimeLabel && (
+                    <span role="status" aria-label={`Runtime: ${runtimeLabel}`} className="text-[10px] text-zinc-300">
+                      Runtime: <span>{runtimeLabel}</span>
+                    </span>
+                  )}
                   {ownership?.sharedOwner && <span className="text-[10px] text-sky-300" title={ownership.warning ?? undefined}>Shared weights</span>}
                   {ownership?.warning && <p className="text-[10px] text-amber-300 leading-relaxed">{ownership.warning}</p>}
                 </div>
@@ -172,4 +179,23 @@ export function ExtensionCard({
       </div>
     </div>
   )
+}
+
+function resolveRuntimeReadinessLabel(readiness?: RuntimeReadiness): string | null {
+  if (!readiness) return null
+  if (readiness.machine_code === 'unsupported_contract') return null
+  if (readiness.stale) return 'Checking failed (stale)'
+  if (readiness.label_hint) return readiness.label_hint
+  if (readiness.ok || readiness.machine_code === 'ready') return 'Ready'
+
+  switch (readiness.machine_code) {
+    case 'preflight/codex_missing': return 'Setup Codex'
+    case 'preflight/not_authenticated':
+    case 'preflight/no_entitlement': return 'Login'
+    case 'preflight/unsupported_version': return 'Update Codex'
+    case 'preflight/unsupported_platform': return 'Unsupported'
+    case 'checking_failed': return 'Checking failed'
+    case 'check_failed': return 'Checking failed'
+    default: return null
+  }
 }

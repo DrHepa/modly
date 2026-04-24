@@ -1,8 +1,27 @@
 import { create } from 'zustand'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '../../areas/models/modelOwnershipState'
-import type { ModelExtension, ProcessExtension, AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, InstalledExtensionResult, RuntimeReadiness } from '@shared/types/electron.d'
+import type { ModelExtension, ProcessExtension, AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, InstalledExtensionResult, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
 
 const RUNTIME_READINESS_TTL_MS = 30_000
+const MAX_ACTIONS = 5
+const ACTION_ID_RE = /^[a-z0-9._:-]{1,80}$/
+const ALLOWED_DIAGNOSTIC_KEYS = new Set([
+  'runtime_source',
+  'runtime_name',
+  'runtime_version',
+  'runtime_version_supported',
+  'supported_versions',
+  'platform_supported',
+  'platform_key',
+  'auth_state',
+  'entitlement_state',
+  'extension_setup_state',
+  'extension_import_state',
+  'codex_app_server_state',
+  'readiness_source',
+  'diagnostic_status',
+  'last_checked_at',
+])
 
 type RuntimeReadinessCacheEntry = RuntimeReadiness & { received_at?: number }
 
@@ -31,6 +50,8 @@ interface ExtensionsStore {
   installedWeightVariants: Record<string, string[]>
   runtimeReadinessById: Record<string, RuntimeReadinessCacheEntry>
   runtimeReadinessLoadingById: Record<string, boolean>
+  runtimeReadinessActionLoadingById: Record<string, boolean>
+  runtimeReadinessActionErrorById: Record<string, string | null>
 
   loadExtensions:    () => Promise<void>
   refreshInstalledWeightVariants: () => Promise<void>
@@ -40,6 +61,11 @@ interface ExtensionsStore {
   reload:            () => Promise<void>
   ensureRuntimeReadiness: (modelIds: string[], options?: { force?: boolean }) => Promise<void>
   invalidateRuntimeReadiness: () => void
+  runRuntimeReadinessAction: (
+    modelId: string,
+    action: RuntimeReadinessAction,
+    options?: { dispatch?: (action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> },
+  ) => Promise<{ success: boolean; error?: string }>
   clearInstallState: () => void
 }
 
@@ -72,6 +98,8 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   installedWeightVariants: {},
   runtimeReadinessById: {},
   runtimeReadinessLoadingById: {},
+  runtimeReadinessActionLoadingById: {},
+  runtimeReadinessActionErrorById: {},
 
   // ── Load list ──────────────────────────────────────────────────────────────
 
@@ -236,7 +264,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   invalidateRuntimeReadiness() {
     runtimeReadinessEpoch += 1
     runtimeReadinessInFlight.clear()
-    set({ runtimeReadinessById: {}, runtimeReadinessLoadingById: {} })
+    set({ runtimeReadinessById: {}, runtimeReadinessLoadingById: {}, runtimeReadinessActionLoadingById: {}, runtimeReadinessActionErrorById: {} })
   },
 
   async ensureRuntimeReadiness(modelIds, options) {
@@ -295,6 +323,69 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
 
     for (const id of idsToFetch) runtimeReadinessInFlight.set(id, run)
     await Promise.all([...waits, run])
+  },
+
+  async runRuntimeReadinessAction(modelId, action, options) {
+    const sanitized = sanitizeRuntimeReadinessActions([action])[0]
+    if (!sanitized || sanitized.disabled || typeof modelId !== 'string'
+        || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(modelId)
+        || !['refresh_readiness', 'open_external_url'].includes(sanitized.kind)) {
+      return { success: false, error: 'Runtime readiness action is unavailable.' }
+    }
+    action = sanitized
+    const actionKey = buildRuntimeReadinessActionKey(modelId, action.id)
+    if (get().runtimeReadinessActionLoadingById[actionKey]) {
+      return { success: false, error: 'Runtime readiness action is already running.' }
+    }
+    const epoch = runtimeReadinessEpoch
+    const extensions = get().modelExtensions
+    const isCurrent = () => epoch === runtimeReadinessEpoch && extensions === get().modelExtensions
+    set((state) => ({
+      runtimeReadinessActionLoadingById: { ...state.runtimeReadinessActionLoadingById, [actionKey]: true },
+      runtimeReadinessActionErrorById: { ...state.runtimeReadinessActionErrorById, [actionKey]: null },
+    }))
+
+    try {
+      let result: { success: boolean; error?: string }
+      if (action.kind === 'refresh_readiness') {
+        // Force bypasses only the renderer cache, not the backend diagnostic TTL.
+        await get().ensureRuntimeReadiness([modelId], { force: true })
+        const readiness = get().runtimeReadinessById[modelId]
+        result = isCurrent() && readiness && !readiness.stale
+          && !['check_failed', 'checking_failed'].includes(readiness.machine_code)
+          ? { success: true }
+          : { success: false, error: 'Runtime readiness check failed.' }
+      } else if (options?.dispatch) {
+        result = normalizeRuntimeReadinessActionResult(await options.dispatch(action))
+        if (isCurrent() && (action.refresh_after === 'always' || (action.refresh_after === 'success' && result.success))) {
+          await get().ensureRuntimeReadiness([modelId], { force: true })
+        }
+      } else {
+        result = { success: false, error: 'Runtime readiness action requires explicit UI dispatch.' }
+      }
+
+      if (!isCurrent()) return { success: false, error: 'Runtime readiness action is no longer current.' }
+      set((state) => ({
+        runtimeReadinessActionErrorById: {
+          ...state.runtimeReadinessActionErrorById,
+          [actionKey]: result.success ? null : sanitizeRuntimeActionError(result.error),
+        },
+      }))
+      return result.success ? { success: true } : { success: false, error: sanitizeRuntimeActionError(result.error) }
+    } catch {
+      const result = { success: false, error: 'Runtime readiness action failed.' }
+      if (isCurrent()) set((state) => ({
+        runtimeReadinessActionErrorById: {
+          ...state.runtimeReadinessActionErrorById,
+          [actionKey]: result.error,
+        },
+      }))
+      return result
+    } finally {
+      if (isCurrent()) set((state) => ({
+        runtimeReadinessActionLoadingById: { ...state.runtimeReadinessActionLoadingById, [actionKey]: false },
+      }))
+    }
   },
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -483,7 +574,7 @@ function mergeRuntimeReadinessResponse(
   for (const id of requestedIds) {
     const readiness = models[id]
     if (success && readiness) {
-      next[id] = { ...readiness, received_at: receivedAt }
+      next[id] = { ...sanitizeRuntimeReadiness(readiness), received_at: receivedAt }
       continue
     }
 
@@ -494,6 +585,111 @@ function mergeRuntimeReadinessResponse(
   }
 
   return next
+}
+
+function buildRuntimeReadinessActionKey(modelId: string, actionId: string): string {
+  return `${modelId}:${actionId}`
+}
+
+function normalizeRuntimeReadinessActionResult(value: unknown): { success: boolean; error?: string } {
+  return isReadinessObject(value) && value.success === true
+    ? { success: true }
+    : { success: false, error: sanitizeRuntimeActionError(isReadinessObject(value) ? value.error : undefined) }
+}
+
+function sanitizeRuntimeActionError(error: unknown): string {
+  return typeof error === 'string' && error.trim() && !containsUnsafeText(error)
+    ? error.trim().slice(0, 240)
+    : 'Runtime readiness action failed.'
+}
+
+function sanitizeRuntimeReadiness(readiness: RuntimeReadiness): RuntimeReadiness {
+  const actions = sanitizeRuntimeReadinessActions(readiness.actions)
+  const details = sanitizeRuntimeReadinessDetails(readiness.details)
+  return {
+    ...readiness,
+    ...(actions.length > 0 ? { actions } : { actions: undefined }),
+    ...(details ? { details } : { details: undefined }),
+  }
+}
+
+function sanitizeRuntimeReadinessActions(actions: unknown): RuntimeReadinessAction[] {
+  if (!Array.isArray(actions)) return []
+  return actions
+    .map((action): RuntimeReadinessAction | undefined => {
+      if (!isReadinessObject(action) || typeof action.id !== 'string' || !ACTION_ID_RE.test(action.id)) return undefined
+      if (typeof action.kind !== 'string' || !['show_guidance', 'show_details', 'open_external_url', 'refresh_readiness'].includes(action.kind)) return undefined
+      if (typeof action.safety !== 'string' || !['manual', 'non_destructive', 'confirm'].includes(action.safety)) return undefined
+      if (!isSafeText(action.label, 240)) return undefined
+      if (action.reason !== undefined && !isSafeText(action.reason, 2_000)) return undefined
+      if (action.guidance !== undefined && !isSafeText(action.guidance, 2_000)) return undefined
+      if (action.docs_url !== undefined && !isSafeHttpsUrl(action.docs_url)) return undefined
+      if (action.kind === 'open_external_url' && !action.docs_url) return undefined
+      const confirmation = isReadinessObject(action.confirmation) ? action.confirmation : undefined
+      return {
+        id: action.id, label: action.label.trim(),
+        kind: action.kind as RuntimeReadinessAction['kind'], safety: action.safety as RuntimeReadinessAction['safety'],
+        ...(action.disabled === true ? { disabled: true } : {}),
+        ...(action.requires_confirmation === true ? { requires_confirmation: true } : {}),
+        ...(typeof action.reason === 'string' ? { reason: action.reason } : {}),
+        ...(typeof action.guidance === 'string' ? { guidance: action.guidance } : {}),
+        ...(typeof action.docs_url === 'string' ? { docs_url: action.docs_url } : {}),
+        ...(['always', 'success', 'never'].includes(action.refresh_after as string)
+          ? { refresh_after: action.refresh_after as RuntimeReadinessAction['refresh_after'] } : {}),
+        ...(confirmation && isSafeText(confirmation.title, 240) && isSafeText(confirmation.body, 2_000) && isSafeText(confirmation.confirm_label, 240)
+          ? { confirmation: { title: confirmation.title, body: confirmation.body, confirm_label: confirmation.confirm_label } } : {}),
+      }
+    })
+    .filter((action): action is RuntimeReadinessAction => Boolean(action))
+    .slice(0, MAX_ACTIONS)
+}
+
+function sanitizeRuntimeReadinessDetails(details: RuntimeReadiness['details']): RuntimeReadinessDetails | undefined {
+  if (!isReadinessObject(details)) return undefined
+  const sanitized: RuntimeReadinessDetails = {}
+  if (details.title && isSafeText(details.title, 240)) sanitized.title = details.title
+  if (details.summary && isSafeText(details.summary, 2_000)) sanitized.summary = details.summary
+  if (details.guidance && isSafeText(details.guidance, 2_000)) sanitized.guidance = details.guidance
+  const evidence = sanitizeDiagnosticMap(details.evidence)
+  const diagnostics = sanitizeDiagnosticMap(details.diagnostics)
+  if (Object.keys(evidence).length > 0) sanitized.evidence = evidence
+  if (Object.keys(diagnostics).length > 0) sanitized.diagnostics = diagnostics
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined
+}
+
+function sanitizeDiagnosticMap(map: unknown): Record<string, string> {
+  if (!isReadinessObject(map)) return {}
+  const sanitized: Record<string, string> = {}
+  for (const [key, value] of Object.entries(map)) {
+    if (ALLOWED_DIAGNOSTIC_KEYS.has(key) && isSafeText(value, 240)) {
+      sanitized[key] = value
+    }
+  }
+  return sanitized
+}
+
+function isSafeHttpsUrl(value: unknown): boolean {
+  if (typeof value !== 'string' || !value || value.length > 500 || /[\s\\\u0000-\u001f\u007f]/.test(value)) return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' && !url.username && !url.password
+  } catch {
+    return false
+  }
+}
+
+function isSafeText(value: unknown, maxLength: number): value is string {
+  if (typeof value !== 'string') return false
+  const text = value.trim()
+  return Boolean(text) && text.length <= maxLength && !containsUnsafeText(text)
+}
+
+function containsUnsafeText(value: string): boolean {
+  return /\.\.|token\s*=|secret|api[_-]?key|raw output|command output|\b[A-Z_]{3,}=|(?:^|\s)(?:\/[\w.-]+){2,}|\b[A-Za-z]:[\\/]/i.test(value)
+}
+
+function isReadinessObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function createCheckingFailedReadiness(receivedAt: number): RuntimeReadinessCacheEntry {

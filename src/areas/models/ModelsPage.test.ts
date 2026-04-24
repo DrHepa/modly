@@ -221,3 +221,42 @@ test('ModelsPage actual install handler keeps complete failure visible with the 
   assert.equal(state.ghUrl, ' https://github.com/acme/bundle ')
   assert.equal(state.ghErr, 'setup failed')
 })
+
+test('ModelsPage runtime readiness dispatcher uses the validated Electron action path only after explicit dispatch', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const calls: string[] = []
+    const action = {
+      id: 'docs',
+      kind: 'open_external_url',
+      label: 'Open docs',
+      docs_url: 'https://developers.openai.com/codex/cli',
+      requires_confirmation: true,
+      safety: 'confirm',
+    }
+    const handler = module.createRuntimeReadinessActionDispatcher({
+      runRuntimeReadinessAction: async (modelId: string, receivedAction: unknown, options: { dispatch: (a: unknown) => Promise<{ success: boolean }> }) => {
+        calls.push(`store:${modelId}:${(receivedAction as { id: string }).id}`)
+        const result = await options.dispatch(receivedAction)
+        calls.push(`result:${result.success}`)
+        return result
+      },
+      electronRuntimeReadinessAction: async (receivedAction: unknown) => {
+        calls.push(`electron:${(receivedAction as { id: string }).id}`)
+        return { success: true }
+      },
+    })
+
+    assert.deepEqual(calls, [])
+    const result = await handler('modly-codex-image-extension/text-to-image', action)
+
+    assert.deepEqual(calls, [
+      'store:modly-codex-image-extension/text-to-image:docs',
+      'electron:docs',
+      'result:true',
+    ])
+    assert.deepEqual(result, { success: true })
+  } finally {
+    await cleanup()
+  }
+})

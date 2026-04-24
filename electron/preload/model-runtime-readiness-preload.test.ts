@@ -50,3 +50,33 @@ test('readiness addition preserves the current preload factory and model control
     ['model:installedWeightVariants', 'ext/node'],
   ])
 })
+
+test('preload model runtimeReadinessAction invokes the model:runtimeReadinessAction IPC channel', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      return { success: true }
+    },
+  }, { setZoomFactor() {} }, { getPathForFile() { return '/inert/file' } })
+
+  const action = {
+    id: 'codex.login.docs',
+    kind: 'open_external_url',
+    label: 'Open login docs',
+    docs_url: 'https://developers.openai.com/codex/auth',
+    safety: 'manual',
+  } as const
+  const result = await api.model.runtimeReadinessAction(action)
+
+  assert.deepEqual(result, { success: true })
+  assert.deepEqual(invocations, [
+    {
+      channel: 'model:runtimeReadinessAction',
+      args: [action],
+    },
+  ])
+})

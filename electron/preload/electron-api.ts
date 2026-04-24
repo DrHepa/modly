@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult, RuntimeReadinessResponse } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult, RuntimeReadinessResponse, RuntimeReadinessAction, RuntimeReadinessActionResult } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
@@ -167,6 +167,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
       runtimeReadiness: (modelIds: string[]): Promise<RuntimeReadinessResponse> =>
         ipcRenderer.invoke('model:runtimeReadiness', modelIds) as Promise<RuntimeReadinessResponse>,
+      runtimeReadinessAction: (action: RuntimeReadinessAction): Promise<RuntimeReadinessActionResult> =>
+        ipcRenderer.invoke('model:runtimeReadinessAction', action) as Promise<RuntimeReadinessActionResult>,
       activeDownloads: (): Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> =>
         ipcRenderer.invoke('model:activeDownloads') as Promise<{ modelId: string; capabilityId?: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>,
       onProgress:     (cb: (data: {

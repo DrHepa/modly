@@ -69,6 +69,60 @@ def _registry(model_id: str, generator) -> GeneratorRegistry:
     return registry
 
 
+def _ready_status_with_actions() -> dict:
+    return {
+        "ok": False,
+        "machine_code": "preflight/runtime_missing",
+        "label_hint": "Setup Codex",
+        "checked_at": "2026-04-24T00:00:00Z",
+        "actions": [
+            {
+                "id": "setup.codex",
+                "kind": "show_guidance",
+                "label": "Setup Codex",
+                "guidance": "Install the user-managed runtime using the official guide, then refresh readiness.",
+                "safety": "manual",
+                "refresh_after": "never",
+            },
+            {
+                "id": "codex.docs",
+                "kind": "open_external_url",
+                "label": "Open Codex setup docs",
+                "docs_url": "https://developers.openai.com/codex/cli",
+                "safety": "non_destructive",
+            },
+            {
+                "id": "refresh",
+                "kind": "refresh_readiness",
+                "label": "Refresh",
+                "safety": "non_destructive",
+            },
+        ],
+        "details": {
+            "title": "Codex runtime setup",
+            "summary": "Runtime is not ready yet.",
+            "guidance": "Complete setup outside Modly and refresh.",
+            "diagnostics": {
+                "runtime_source": "missing",
+                "runtime_name": "codex",
+                "runtime_version": "unknown",
+                "runtime_version_supported": "false",
+                "supported_versions": "0.122.0",
+                "platform_supported": "true",
+                "platform_key": "linux-x64",
+                "auth_state": "unknown",
+                "entitlement_state": "unknown",
+                "extension_setup_state": "ok",
+                "extension_import_state": "ok",
+                "codex_app_server_state": "unknown",
+                "readiness_source": "extension",
+                "diagnostic_status": "complete",
+                "last_checked_at": "2026-04-24T00:00:00Z",
+            },
+        },
+    }
+
+
 def test_registry_detects_optional_readiness_method_caches_and_sanitizes_evidence():
     generator = CountingReadinessGenerator()
     registry = _registry("runtime-ext/text-to-image", generator)
@@ -94,6 +148,116 @@ def test_registry_detects_optional_readiness_method_caches_and_sanitizes_evidenc
     cached = registry.runtime_readiness(["runtime-ext/text-to-image"])
     assert generator.calls == 1
     assert cached == first_result
+
+
+def test_registry_passes_through_bounded_generic_actions_and_details_when_safe():
+    generator = CountingReadinessGenerator(statuses=[_ready_status_with_actions()])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == _ready_status_with_actions()["actions"]
+    assert readiness["details"] == _ready_status_with_actions()["details"]
+    assert readiness["machine_code"] == "preflight/runtime_missing"
+
+
+def test_registry_strips_unsafe_actions_details_and_unsupported_fields():
+    unsafe_status = _ready_status_with_actions()
+    unsafe_status["actions"] = [
+        {
+            "id": "valid-guidance",
+            "kind": "show_guidance",
+            "label": "Safe guidance",
+            "guidance": "Use official docs and refresh after finishing.",
+            "safety": "manual",
+            "secret": "unsupported field must not survive",
+        },
+        {"id": "bad-kind", "kind": "preflight/install", "label": "Install", "safety": "confirm"},
+        {
+            "id": "bad-url",
+            "kind": "open_external_url",
+            "label": "Open unsafe docs",
+            "docs_url": "file:///private/token.txt",
+            "safety": "non_destructive",
+        },
+        {"id": "bad path", "kind": "show_details", "label": "Bad id", "safety": "manual"},
+        {"id": "a1", "kind": "show_details", "label": "One", "safety": "manual"},
+        {"id": "a2", "kind": "show_details", "label": "Two", "safety": "manual"},
+        {"id": "a3", "kind": "show_details", "label": "Three", "safety": "manual"},
+        {"id": "a4", "kind": "show_details", "label": "Four", "safety": "manual"},
+        {"id": "a5", "kind": "show_details", "label": "Five", "safety": "manual"},
+        {"id": "a6", "kind": "show_details", "label": "Six", "safety": "manual"},
+    ]
+    unsafe_status["details"] = {
+        "title": "Diagnostics",
+        "summary": "No raw command output is preserved.",
+        "diagnostics": {
+            "runtime_name": "codex",
+            "auth_state": "missing",
+            "token": "sk-secret-token",
+            "raw_output": "Traceback with command output and HOME=/private/user",
+            "runtime_source": "/private/user/bin/codex",
+            "platform_key": "../../etc/passwd",
+        },
+        "unsupported": "field must not survive",
+    }
+    unsafe_status["extra"] = {"must": "drop"}
+    generator = CountingReadinessGenerator(statuses=[unsafe_status])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == [
+        {
+            "id": "valid-guidance",
+            "kind": "show_guidance",
+            "label": "Safe guidance",
+            "guidance": "Use official docs and refresh after finishing.",
+            "safety": "manual",
+        },
+        {"id": "a1", "kind": "show_details", "label": "One", "safety": "manual"},
+        {"id": "a2", "kind": "show_details", "label": "Two", "safety": "manual"},
+        {"id": "a3", "kind": "show_details", "label": "Three", "safety": "manual"},
+        {"id": "a4", "kind": "show_details", "label": "Four", "safety": "manual"},
+    ]
+    assert readiness["details"] == {
+        "title": "Diagnostics",
+        "summary": "No raw command output is preserved.",
+        "diagnostics": {"runtime_name": "codex", "auth_state": "missing"},
+    }
+    assert "extra" not in readiness
+    assert "secret" not in str(readiness)
+    assert "private" not in str(readiness)
+    assert "Traceback" not in str(readiness)
+    assert ".." not in str(readiness)
+
+
+def test_registry_strips_repair_extension_from_runtime_readiness_actions():
+    status = _ready_status_with_actions()
+    status["actions"] = [
+        {
+            "id": "repair-extension",
+            "kind": "repair_extension",
+            "label": "Repair extension",
+            "safety": "confirm",
+            "requires_confirmation": True,
+            "confirmation": {
+                "title": "Repair extension",
+                "body": "Run existing extension repair setup.",
+                "confirm_label": "Repair",
+            },
+        },
+        {"id": "refresh", "kind": "refresh_readiness", "label": "Refresh", "safety": "non_destructive"},
+    ]
+    generator = CountingReadinessGenerator(statuses=[status])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == [
+        {"id": "refresh", "kind": "refresh_readiness", "label": "Refresh", "safety": "non_destructive"}
+    ]
+    assert "repair_extension" not in str(readiness)
 
 
 def test_registry_returns_stale_cache_on_error_and_sanitized_failure_without_cache():
@@ -474,3 +638,96 @@ def test_direct_diagnostics_never_enter_hooks_or_block_other_model_controls(tmp_
         assert accesses == []
     finally:
         plain._runtime_readiness_executor.shutdown(wait=True)
+
+
+def test_actions_reject_malformed_fields_without_losing_status_or_valid_siblings():
+    valid = {'id': 'details', 'kind': 'show_details', 'label': 'Details', 'safety': 'manual'}
+    for malformed in [
+        {**valid, 'kind': []}, {**valid, 'safety': {}},
+        {**valid, 'kind': 'open_external_url', 'docs_url': 'https://['},
+        {**valid, 'kind': 'open_external_url', 'docs_url': 'https://user:pass@example.com/docs'},
+    ]:
+        generator = CountingReadinessGenerator([{
+            'ok': True, 'machine_code': 'ready', 'actions': [malformed, valid],
+        }])
+        generator.release.set()
+        registry = _registry('ext/node', generator)
+        try:
+            status = registry.runtime_readiness(['ext/node'])['ext/node']
+            assert status['machine_code'] == 'ready'
+            assert status['actions'] == [valid]
+            assert registry.runtime_readiness(['ext/node'])['ext/node'] == status
+            assert generator.calls == 1, 'actions must not bypass backend TTL'
+        finally:
+            registry._runtime_readiness_executor.shutdown(wait=True)
+
+
+def test_readiness_sanitizer_preserves_https_queries_and_fragments():
+    from services.generator_registry import _sanitize_runtime_readiness
+
+    action = {'id': 'docs.query', 'kind': 'open_external_url', 'label': 'Platform docs', 'safety': 'manual'}
+    for url in [
+        'https://example.invalid/docs?tab=linux&version=0.122.0#install',
+        'https://example.invalid/docs?topic=api_key#authorization',
+    ]:
+        result = _sanitize_runtime_readiness({
+            'ok': True, 'machine_code': 'ready', 'actions': [{**action, 'docs_url': url}],
+        })
+        assert result['actions'] == [{**action, 'docs_url': url}]
+    for url in [
+        'http://example.invalid/docs', 'file:///tmp/docs', 'javascript:alert(1)',
+        'https://user:pass@example.invalid/docs', 'https://example.invalid:invalid/docs',
+        'https://example.invalid/docs tab=linux', 'https://example.invalid/\\docs',
+        'https://example.invalid/\x00docs', 'https://example.invalid/\x7fdocs',
+    ]:
+        result = _sanitize_runtime_readiness({
+            'ok': True, 'machine_code': 'ready', 'actions': [{**action, 'docs_url': url}],
+        })
+        assert 'actions' not in result, url
+
+
+def test_readiness_sanitizer_omits_drive_paths_from_text_and_details():
+    from services.generator_registry import _sanitize_runtime_readiness
+
+    for path in [
+        'C:/Users/Example/AppData/Local/codex.exe',
+        r'C:\Users\Example\AppData\Local\codex.exe',
+        r'C:/Users\Example/AppData/Local/codex.exe',
+        '/home/example/bin/codex',
+        'Located at C:/Users/Example/codex.exe',
+        '(z:/Users/Example/codex.exe)',
+        r'"C:\Users\Example\codex.exe"',
+    ]:
+        result = _sanitize_runtime_readiness({
+            'ok': True, 'machine_code': 'ready',
+            'actions': [{'id': 'details', 'kind': 'show_details', 'label': 'Details', 'safety': 'manual',
+                         'reason': f'Runtime at {path}', 'guidance': path}],
+            'details': {
+                'title': path, 'summary': f'Runtime at {path}', 'guidance': path,
+                'diagnostics': {'runtime_source': path, 'auth_state': 'authenticated', 'runtime_version': '0.122.0'},
+                'evidence': {'runtime_source': 'path', 'runtime_name': path},
+            },
+        })
+        assert result['details'] == {
+            'diagnostics': {'auth_state': 'authenticated', 'runtime_version': '0.122.0'},
+            'evidence': {'runtime_source': 'path'},
+        }
+        assert result['actions'] == [{'id': 'details', 'kind': 'show_details', 'label': 'Details', 'safety': 'manual'}]
+
+
+def test_readiness_sanitizer_preserves_https_prose_in_guidance_and_details():
+    from services.generator_registry import _sanitize_runtime_readiness
+
+    for text in [
+        'See https://example.invalid/docs for help.',
+        'https://example.invalid/docs',
+        'Docs (https://example.invalid/docs#install).',
+    ]:
+        action = {'id': 'guide', 'kind': 'show_guidance', 'label': 'Setup guide', 'safety': 'manual', 'guidance': text}
+        details = {'title': text, 'summary': text, 'guidance': text}
+        result = _sanitize_runtime_readiness({
+            'ok': False, 'machine_code': 'preflight/runtime_missing',
+            'actions': [action], 'details': details,
+        })
+        assert result['actions'] == [action]
+        assert result['details'] == details

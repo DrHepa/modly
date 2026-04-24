@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionInstallProgress, ExtensionInstallResult, ProcessInput, RuntimeReadinessResponse } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallProgress, ExtensionInstallResult, ProcessInput, RuntimeReadinessAction, RuntimeReadinessActionResult, RuntimeReadinessResponse } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc.ts'
 
 export type IpcRendererLike = {
@@ -54,6 +54,7 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
       unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
       runtimeReadiness: (modelIds: string[]): Promise<RuntimeReadinessResponse> => ipcRenderer.invoke('model:runtimeReadiness', modelIds) as Promise<RuntimeReadinessResponse>,
+      runtimeReadinessAction: (action: RuntimeReadinessAction): Promise<RuntimeReadinessActionResult> => ipcRenderer.invoke('model:runtimeReadinessAction', action) as Promise<RuntimeReadinessActionResult>,
       onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => { ipcRenderer.on('model:downloadProgress', (_event, data) => cb(data as { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string })) },
       offProgress:    () => ipcRenderer.removeAllListeners('model:downloadProgress')
     },

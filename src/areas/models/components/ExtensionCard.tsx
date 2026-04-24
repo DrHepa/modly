@@ -1,8 +1,18 @@
 import { useState } from 'react'
-import type { AnyExtension, RuntimeReadiness } from '@shared/types/electron.d'
+import type { AnyExtension, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
+
+type RuntimeReadinessActionIntent = 'show_modal' | 'confirm_then_dispatch' | 'dispatch' | 'disabled'
+type RuntimeReadinessModalState = {
+  mode: 'details' | 'guidance' | 'confirmation'
+  title: string
+  action?: RuntimeReadinessAction
+  modelId: string
+  details?: RuntimeReadinessDetails
+  guidance?: string
+}
 
 interface Props {
   ext:              AnyExtension
@@ -16,6 +26,7 @@ interface Props {
   onUninstall:      (extId: string) => void
   onUninstallNode?: (fullId: string) => void
   onRepaired?:      () => void
+  onRuntimeReadinessAction?: (modelId: string, action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string }
 }
 
 const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
@@ -23,9 +34,10 @@ const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
   process: { label: 'Process', cls: 'bg-emerald-500/15 border-emerald-500/25 text-emerald-400' },
 }
 
-export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
+  const [runtimeModal, setRuntimeModal] = useState<RuntimeReadinessModalState | null>(null)
 
   const badge = TYPE_BADGE[ext.type] ?? TYPE_BADGE.model
 
@@ -39,6 +51,44 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
     } else {
       setRepairError(result.error ?? 'Repair failed')
     }
+  }
+
+  async function handleRuntimeReadinessAction(modelId: string, action: RuntimeReadinessAction, readiness: RuntimeReadiness) {
+    const intent = resolveRuntimeReadinessActionIntent(action)
+    if (intent === 'disabled') return
+
+    if (intent === 'show_modal') {
+      const details = filterRuntimeReadinessDetailsForDisplay(readiness.details)
+      setRuntimeModal({
+        mode: action.kind === 'show_guidance' ? 'guidance' : 'details',
+        title: action.label,
+        modelId,
+        action,
+        details,
+        guidance: action.guidance ?? details.guidance,
+      })
+      return
+    }
+
+    if (intent === 'confirm_then_dispatch') {
+      setRuntimeModal({
+        mode: 'confirmation',
+        title: action.confirmation?.title ?? action.label,
+        modelId,
+        action,
+        guidance: action.confirmation?.body ?? action.guidance,
+      })
+      return
+    }
+
+    await onRuntimeReadinessAction?.(modelId, action)
+  }
+
+  async function confirmRuntimeReadinessAction() {
+    if (!runtimeModal?.action) return
+    const { modelId, action } = runtimeModal
+    setRuntimeModal(null)
+    await onRuntimeReadinessAction?.(modelId, action)
   }
 
   return (
@@ -143,6 +193,7 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
             const fullId        = `${ext.id}/${node.id}`
             const runtimeReadiness = runtimeReadinessById?.[fullId]
             const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadiness)
+            const runtimeDetails = filterRuntimeReadinessDetailsForDisplay(runtimeReadiness?.details)
             const hasWeights    = !!node.hfRepo
             const ownershipState = ownershipStateById?.[fullId]
             const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
@@ -277,6 +328,24 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                 </div>
                 </div>
 
+                {runtimeLabel && runtimeReadiness?.actions && runtimeReadiness.actions.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pl-0.5">
+                    {runtimeReadiness.actions.map((action) => (
+                      <button
+                        key={action.id}
+                        onClick={() => handleRuntimeReadinessAction(fullId, action, runtimeReadiness)}
+                        disabled={Boolean(action.disabled || disabled)}
+                        title={action.disabled ? action.reason : action.guidance}
+                        className="px-2 py-1 rounded-md bg-zinc-800/70 border border-zinc-700/50 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700/70 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >{action.label}</button>
+                    ))}
+                  </div>
+                )}
+
+                {runtimeLabel && Object.keys(runtimeDetails).length > 0 && (
+                  <RuntimeReadinessDetailsPanel details={runtimeDetails} />
+                )}
+
                 {ownershipState?.warning && hasWeights && (
                   <div className="ml-auto w-[calc(100%-7rem)] flex items-start gap-1.5 px-2 py-1 rounded-lg bg-amber-950/20 border border-amber-900/30">
                     <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-300 shrink-0 mt-px">
@@ -290,8 +359,107 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
           })}
         </div>
       )}
+
+      {runtimeModal && (
+        <div role="dialog" aria-modal="true" className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-zinc-950/70" onClick={() => setRuntimeModal(null)} />
+          <div className="relative w-96 rounded-2xl bg-zinc-900 border border-zinc-700 shadow-2xl p-5 flex flex-col gap-3">
+            <h2 className="text-sm font-semibold text-zinc-100">{runtimeModal.title}</h2>
+            {runtimeModal.guidance && <p className="text-xs text-zinc-400 leading-relaxed">{runtimeModal.guidance}</p>}
+            {runtimeModal.details && Object.keys(runtimeModal.details).length > 0 && <RuntimeReadinessDetailsPanel details={runtimeModal.details} />}
+            <div className="flex gap-2 pt-2">
+              <button onClick={() => setRuntimeModal(null)} className="flex-1 py-2 rounded-lg bg-zinc-800 text-xs text-zinc-300">Cancel</button>
+              {runtimeModal.mode === 'confirmation' && (
+                <button onClick={confirmRuntimeReadinessAction} className="flex-1 py-2 rounded-lg bg-accent text-xs font-semibold text-white">
+                  {runtimeModal.action?.confirmation?.confirm_label ?? runtimeModal.action?.label ?? 'Continue'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
+}
+
+function RuntimeReadinessDetailsPanel({ details }: { details: RuntimeReadinessDetails }): JSX.Element {
+  const entries = [
+    ...Object.entries(details.diagnostics ?? {}),
+    ...Object.entries(details.evidence ?? {}),
+  ]
+
+  return (
+    <div className="flex flex-col gap-1.5 px-2.5 py-2 rounded-lg bg-zinc-900/70 border border-zinc-800/70">
+      {details.title && <p className="text-[10px] font-semibold text-zinc-300">{details.title}</p>}
+      {details.summary && <p className="text-[10px] text-zinc-500 leading-relaxed">{details.summary}</p>}
+      {details.guidance && <p className="text-[10px] text-zinc-500 leading-relaxed">{details.guidance}</p>}
+      {entries.length > 0 && (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-1">
+          {entries.map(([key, value]) => (
+            <div key={`${key}:${value}`} className="contents">
+              <dt className="text-[9px] text-zinc-600 font-mono">{key}</dt>
+              <dd className="text-[9px] text-zinc-400 font-mono break-all">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  )
+}
+
+export function resolveRuntimeReadinessActionIntent(action: RuntimeReadinessAction): RuntimeReadinessActionIntent {
+  if (action.disabled) return 'disabled'
+  if (action.kind === 'show_guidance' || action.kind === 'show_details') return 'show_modal'
+  if (action.kind === 'open_external_url' && (action.requires_confirmation || action.safety === 'confirm')) return 'confirm_then_dispatch'
+  return 'dispatch'
+}
+
+export function filterRuntimeReadinessDetailsForDisplay(details: RuntimeReadinessDetails | undefined): RuntimeReadinessDetails {
+  if (!details) return {}
+  const filtered: RuntimeReadinessDetails = {}
+  if (details.title && isSafeReadinessText(details.title, 240)) filtered.title = details.title
+  if (details.summary && isSafeReadinessText(details.summary, 2_000)) filtered.summary = details.summary
+  if (details.guidance && isSafeReadinessText(details.guidance, 2_000)) filtered.guidance = details.guidance
+
+  const diagnostics = filterRuntimeReadinessDiagnosticMap(details.diagnostics)
+  const evidence = filterRuntimeReadinessDiagnosticMap(details.evidence)
+  if (Object.keys(diagnostics).length > 0) filtered.diagnostics = diagnostics
+  if (Object.keys(evidence).length > 0) filtered.evidence = evidence
+  return filtered
+}
+
+const SAFE_RUNTIME_DETAIL_KEYS = new Set([
+  'runtime_source',
+  'runtime_name',
+  'runtime_version',
+  'runtime_version_supported',
+  'supported_versions',
+  'platform_supported',
+  'platform_key',
+  'auth_state',
+  'entitlement_state',
+  'extension_setup_state',
+  'extension_import_state',
+  'codex_app_server_state',
+  'readiness_source',
+  'diagnostic_status',
+  'last_checked_at',
+])
+
+function filterRuntimeReadinessDiagnosticMap(map: Record<string, string> | undefined): Record<string, string> {
+  if (!map) return {}
+  const filtered: Record<string, string> = {}
+  for (const [key, value] of Object.entries(map)) {
+    if (SAFE_RUNTIME_DETAIL_KEYS.has(key) && isSafeReadinessText(value, 240)) {
+      filtered[key] = value
+    }
+  }
+  return filtered
+}
+
+function isSafeReadinessText(value: string, maxLength: number): boolean {
+  const text = value.trim()
+  return Boolean(text) && text.length <= maxLength && !/\.\.|token\s*=|secret|api[_-]?key|raw output|command output|\b[A-Z_]{3,}=|(?:^|\s)(?:\/[\w.-]+){2,}|[A-Za-z]:\\/i.test(text)
 }
 
 function resolveRuntimeReadinessLabel(readiness?: RuntimeReadiness): string | null {

@@ -53,6 +53,60 @@ def _registry(model_id: str, generator) -> GeneratorRegistry:
     return registry
 
 
+def _ready_status_with_actions() -> dict:
+    return {
+        "ok": False,
+        "machine_code": "preflight/runtime_missing",
+        "label_hint": "Setup Codex",
+        "checked_at": "2026-04-24T00:00:00Z",
+        "actions": [
+            {
+                "id": "setup.codex",
+                "kind": "show_guidance",
+                "label": "Setup Codex",
+                "guidance": "Install the user-managed runtime using the official guide, then refresh readiness.",
+                "safety": "manual",
+                "refresh_after": "never",
+            },
+            {
+                "id": "codex.docs",
+                "kind": "open_external_url",
+                "label": "Open Codex setup docs",
+                "docs_url": "https://developers.openai.com/codex/cli",
+                "safety": "non_destructive",
+            },
+            {
+                "id": "refresh",
+                "kind": "refresh_readiness",
+                "label": "Refresh",
+                "safety": "non_destructive",
+            },
+        ],
+        "details": {
+            "title": "Codex runtime setup",
+            "summary": "Runtime is not ready yet.",
+            "guidance": "Complete setup outside Modly and refresh.",
+            "diagnostics": {
+                "runtime_source": "missing",
+                "runtime_name": "codex",
+                "runtime_version": "unknown",
+                "runtime_version_supported": "false",
+                "supported_versions": "0.122.0",
+                "platform_supported": "true",
+                "platform_key": "linux-x64",
+                "auth_state": "unknown",
+                "entitlement_state": "unknown",
+                "extension_setup_state": "ok",
+                "extension_import_state": "ok",
+                "codex_app_server_state": "unknown",
+                "readiness_source": "extension",
+                "diagnostic_status": "complete",
+                "last_checked_at": "2026-04-24T00:00:00Z",
+            },
+        },
+    }
+
+
 def test_registry_detects_optional_readiness_method_caches_and_sanitizes_evidence():
     generator = CountingReadinessGenerator()
     registry = _registry("runtime-ext/text-to-image", generator)
@@ -78,6 +132,116 @@ def test_registry_detects_optional_readiness_method_caches_and_sanitizes_evidenc
     cached = registry.runtime_readiness(["runtime-ext/text-to-image"])
     assert generator.calls == 1
     assert cached == first_result
+
+
+def test_registry_passes_through_bounded_generic_actions_and_details_when_safe():
+    generator = CountingReadinessGenerator(statuses=[_ready_status_with_actions()])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == _ready_status_with_actions()["actions"]
+    assert readiness["details"] == _ready_status_with_actions()["details"]
+    assert readiness["machine_code"] == "preflight/runtime_missing"
+
+
+def test_registry_strips_unsafe_actions_details_and_unsupported_fields():
+    unsafe_status = _ready_status_with_actions()
+    unsafe_status["actions"] = [
+        {
+            "id": "valid-guidance",
+            "kind": "show_guidance",
+            "label": "Safe guidance",
+            "guidance": "Use official docs and refresh after finishing.",
+            "safety": "manual",
+            "secret": "unsupported field must not survive",
+        },
+        {"id": "bad-kind", "kind": "preflight/install", "label": "Install", "safety": "confirm"},
+        {
+            "id": "bad-url",
+            "kind": "open_external_url",
+            "label": "Open unsafe docs",
+            "docs_url": "file:///private/token.txt",
+            "safety": "non_destructive",
+        },
+        {"id": "bad path", "kind": "show_details", "label": "Bad id", "safety": "manual"},
+        {"id": "a1", "kind": "show_details", "label": "One", "safety": "manual"},
+        {"id": "a2", "kind": "show_details", "label": "Two", "safety": "manual"},
+        {"id": "a3", "kind": "show_details", "label": "Three", "safety": "manual"},
+        {"id": "a4", "kind": "show_details", "label": "Four", "safety": "manual"},
+        {"id": "a5", "kind": "show_details", "label": "Five", "safety": "manual"},
+        {"id": "a6", "kind": "show_details", "label": "Six", "safety": "manual"},
+    ]
+    unsafe_status["details"] = {
+        "title": "Diagnostics",
+        "summary": "No raw command output is preserved.",
+        "diagnostics": {
+            "runtime_name": "codex",
+            "auth_state": "missing",
+            "token": "sk-secret-token",
+            "raw_output": "Traceback with command output and HOME=/private/user",
+            "runtime_source": "/private/user/bin/codex",
+            "platform_key": "../../etc/passwd",
+        },
+        "unsupported": "field must not survive",
+    }
+    unsafe_status["extra"] = {"must": "drop"}
+    generator = CountingReadinessGenerator(statuses=[unsafe_status])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == [
+        {
+            "id": "valid-guidance",
+            "kind": "show_guidance",
+            "label": "Safe guidance",
+            "guidance": "Use official docs and refresh after finishing.",
+            "safety": "manual",
+        },
+        {"id": "a1", "kind": "show_details", "label": "One", "safety": "manual"},
+        {"id": "a2", "kind": "show_details", "label": "Two", "safety": "manual"},
+        {"id": "a3", "kind": "show_details", "label": "Three", "safety": "manual"},
+        {"id": "a4", "kind": "show_details", "label": "Four", "safety": "manual"},
+    ]
+    assert readiness["details"] == {
+        "title": "Diagnostics",
+        "summary": "No raw command output is preserved.",
+        "diagnostics": {"runtime_name": "codex", "auth_state": "missing"},
+    }
+    assert "extra" not in readiness
+    assert "secret" not in str(readiness)
+    assert "private" not in str(readiness)
+    assert "Traceback" not in str(readiness)
+    assert ".." not in str(readiness)
+
+
+def test_registry_strips_repair_extension_from_runtime_readiness_actions():
+    status = _ready_status_with_actions()
+    status["actions"] = [
+        {
+            "id": "repair-extension",
+            "kind": "repair_extension",
+            "label": "Repair extension",
+            "safety": "confirm",
+            "requires_confirmation": True,
+            "confirmation": {
+                "title": "Repair extension",
+                "body": "Run existing extension repair setup.",
+                "confirm_label": "Repair",
+            },
+        },
+        {"id": "refresh", "kind": "refresh_readiness", "label": "Refresh", "safety": "non_destructive"},
+    ]
+    generator = CountingReadinessGenerator(statuses=[status])
+    registry = _registry("runtime-ext/text-to-image", generator)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])["runtime-ext/text-to-image"]
+
+    assert readiness["actions"] == [
+        {"id": "refresh", "kind": "refresh_readiness", "label": "Refresh", "safety": "non_destructive"}
+    ]
+    assert "repair_extension" not in str(readiness)
 
 
 def test_registry_returns_stale_cache_on_error_and_sanitized_failure_without_cache():

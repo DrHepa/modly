@@ -101,6 +101,26 @@ def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
     return node, model_dir
 
 
+def resolve_runtime_readiness(gen) -> dict:
+    readiness = getattr(gen, "readiness_status", None)
+    if not callable(readiness):
+        return {
+            "ok": False,
+            "machine_code": "unsupported_contract",
+            "label_hint": "Checking failed",
+            "reason": "Model does not expose runtime readiness.",
+        }
+    status = readiness()
+    if not isinstance(status, dict):
+        return {
+            "ok": False,
+            "machine_code": "check_failed",
+            "label_hint": "Checking failed",
+            "reason": "Runtime readiness check failed.",
+        }
+    return status
+
+
 # ------------------------------------------------------------------ #
 # Main loop
 # ------------------------------------------------------------------ #
@@ -175,6 +195,10 @@ def main() -> None:
             elif action == "unload":
                 gen.unload()
                 send({"type": "unloaded"})
+
+            # ---- runtime readiness ------------------------------------
+            elif action == "runtime_readiness":
+                send({"type": "runtime_readiness", "status": resolve_runtime_readiness(gen)})
 
             # ---- shutdown --------------------------------------------
             elif action == "shutdown":

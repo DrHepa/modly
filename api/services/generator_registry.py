@@ -11,6 +11,10 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -200,6 +204,12 @@ class GeneratorRegistry:
         self._manifests:  Dict[str, dict]          = {}
         self._errors:     Dict[str, str]           = {}
         self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
+        self._runtime_readiness_ttl_seconds = 30.0
+        self._runtime_readiness_timeout_seconds = 5.0
+        self._runtime_readiness_cache: Dict[str, tuple[float, dict]] = {}
+        self._runtime_readiness_inflight: Dict[str, Future] = {}
+        self._runtime_readiness_lock = threading.Lock()
+        self._runtime_readiness_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runtime-readiness")
 
     def initialize(self) -> None:
         """Discovers and instantiates all extensions. Call at startup."""
@@ -361,6 +371,59 @@ class GeneratorRegistry:
             })
         return result
 
+    def runtime_readiness(self, model_ids: list[str]) -> dict:
+        """Returns optional read-only runtime readiness for canonical model IDs."""
+        readiness: dict[str, dict] = {}
+        for model_id in model_ids:
+            if model_id not in self._generators:
+                continue
+            readiness[model_id] = self._runtime_readiness_for_model(model_id)
+        return readiness
+
+    def _runtime_readiness_for_model(self, model_id: str) -> dict:
+        now = time.monotonic()
+        with self._runtime_readiness_lock:
+            cached = self._runtime_readiness_cache.get(model_id)
+            if cached and now - cached[0] < self._runtime_readiness_ttl_seconds:
+                return dict(cached[1])
+
+            future = self._runtime_readiness_inflight.get(model_id)
+            if future is None:
+                future = self._runtime_readiness_executor.submit(self._compute_runtime_readiness, model_id)
+                self._runtime_readiness_inflight[model_id] = future
+
+        try:
+            status = future.result(timeout=self._runtime_readiness_timeout_seconds)
+        except (FutureTimeoutError, Exception):
+            return self._runtime_readiness_failure(model_id)
+        finally:
+            if future.done():
+                with self._runtime_readiness_lock:
+                    if self._runtime_readiness_inflight.get(model_id) is future:
+                        self._runtime_readiness_inflight.pop(model_id, None)
+
+        with self._runtime_readiness_lock:
+            self._runtime_readiness_cache[model_id] = (time.monotonic(), status)
+        return dict(status)
+
+    def _compute_runtime_readiness(self, model_id: str) -> dict:
+        gen = self._sync_generator_model_dir(model_id)
+        readiness = getattr(gen, "readiness_status", None)
+        if not callable(readiness):
+            return _unsupported_runtime_readiness()
+
+        status = readiness()
+        return _sanitize_runtime_readiness(status)
+
+    def _runtime_readiness_failure(self, model_id: str) -> dict:
+        with self._runtime_readiness_lock:
+            cached = self._runtime_readiness_cache.get(model_id)
+        if cached:
+            stale = dict(cached[1])
+            stale["stale"] = True
+            return stale
+        return _checking_failed_runtime_readiness()
+
     def params_schema(self, model_id: Optional[str] = None) -> list:
         target_id = model_id or self._active_id
         if target_id not in self._generators:
@@ -394,6 +457,67 @@ class GeneratorRegistry:
                 gen.stop()
             else:
                 gen.unload()
+
+
+_EVIDENCE_ALLOWLIST = {
+    "source",
+    "runtime_name",
+    "runtime_version",
+    "platform",
+    "auth_state",
+    "entitlement_state",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _unsupported_runtime_readiness() -> dict:
+    return {
+        "ok": False,
+        "machine_code": "unsupported_contract",
+        "label_hint": "Checking failed",
+        "reason": "Model does not expose runtime readiness.",
+        "checked_at": _now_iso(),
+    }
+
+
+def _checking_failed_runtime_readiness() -> dict:
+    return {
+        "ok": False,
+        "machine_code": "check_failed",
+        "label_hint": "Checking failed",
+        "reason": "Runtime readiness check failed.",
+        "checked_at": _now_iso(),
+    }
+
+
+def _sanitize_runtime_readiness(status: dict) -> dict:
+    if not isinstance(status, dict):
+        return _checking_failed_runtime_readiness()
+
+    result: dict = {
+        "ok": bool(status.get("ok", False)),
+        "machine_code": str(status.get("machine_code") or "check_failed"),
+        "checked_at": str(status.get("checked_at") or _now_iso()),
+    }
+    for key in ("label_hint", "reason"):
+        value = status.get(key)
+        if isinstance(value, str):
+            result[key] = value
+    evidence = status.get("evidence")
+    if isinstance(evidence, dict):
+        safe_evidence = {
+            key: str(value)
+            for key, value in evidence.items()
+            if key in _EVIDENCE_ALLOWLIST and isinstance(value, (str, int, float, bool))
+        }
+        if safe_evidence:
+            result["evidence"] = safe_evidence
+    if status.get("stale") is True:
+        result["stale"] = True
+    return result
 
 
 # Singleton

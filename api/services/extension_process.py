@@ -361,6 +361,17 @@ class ExtensionProcess:
     def params_schema(self) -> list:
         return self._params_schema
 
+    def readiness_status(self) -> dict:
+        """Read-only optional runtime readiness from the extension runner."""
+        self._ensure_started()
+        self._send({"action": "runtime_readiness"})
+        msg = self._recv(timeout=5.0)
+        if msg.get("type") == "runtime_readiness":
+            return msg.get("status") or {}
+        if msg.get("type") == "error":
+            raise RuntimeError(msg.get("message") or "Runtime readiness check failed")
+        raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to runtime_readiness: {msg}")
+
     def stop(self) -> None:
         """Hard-stop the subprocess.
 

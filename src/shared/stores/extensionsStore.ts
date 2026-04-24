@@ -6,8 +6,13 @@ import type {
   InstalledExtensionResult,
   ModelExtension,
   ProcessExtension,
+  RuntimeReadiness,
 } from '../types/electron.d'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds } from '../../areas/models/modelOwnershipState.ts'
+
+const RUNTIME_READINESS_TTL_MS = 30_000
+
+type RuntimeReadinessCacheEntry = RuntimeReadiness & { received_at?: number }
 
 // ─── Re-exports for consumers ─────────────────────────────────────────────────
 
@@ -29,14 +34,19 @@ interface ExtensionsStore {
   installError:      string | null
   installResult:     InstallResult | null
   loadErrors:        Record<string, string>
+  runtimeReadinessById: Record<string, RuntimeReadinessCacheEntry>
+  runtimeReadinessLoadingById: Record<string, boolean>
 
   loadExtensions:    () => Promise<void>
   installFromGitHub: (url: string) => Promise<InstallResult>
   uninstall:         (extensionId: string) => Promise<{ success: boolean; error?: string }>
   reload:            () => Promise<void>
   refreshModelOwnership: (extensions?: ModelExtension[]) => Promise<void>
+  ensureRuntimeReadiness: (modelIds: string[], options?: { force?: boolean }) => Promise<void>
   clearInstallState: () => void
 }
+
+const runtimeReadinessInFlight = new Map<string, Promise<void>>()
 
 export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   modelExtensions:   [],
@@ -47,6 +57,8 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   installError:      null,
   installResult:     null,
   loadErrors:        {},
+  runtimeReadinessById: {},
+  runtimeReadinessLoadingById: {},
 
   // ── Load list ──────────────────────────────────────────────────────────────
 
@@ -65,6 +77,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
         readyOwnerIds,
         loading:           false,
       })
+      await get().ensureRuntimeReadiness(collectRuntimeReadinessModelIds(modelExtensions))
     } catch {
       set({ loading: false, readyOwnerIds: [] })
     }
@@ -159,6 +172,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
       set({ loadErrors: result.errors ?? {} })
     }
     await get().loadExtensions()
+    await get().ensureRuntimeReadiness(collectRuntimeReadinessModelIds(get().modelExtensions), { force: true })
   },
 
   async refreshModelOwnership(extensions) {
@@ -166,6 +180,55 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
     const downloaded = await window.electron.model.listDownloaded()
     const readyOwnerIds = collectReadyOwnerIds(collectModelOwnershipMetadata(modelExtensions), downloaded.map((model) => model.id))
     set({ readyOwnerIds })
+  },
+
+  async ensureRuntimeReadiness(modelIds, options) {
+    const now = Date.now()
+    const uniqueIds = [...new Set(modelIds.map((id) => id.trim()).filter(Boolean))]
+    const idsToFetch = uniqueIds.filter((id) => {
+      if (options?.force) return true
+      const cached = get().runtimeReadinessById[id]
+      return !cached?.received_at || now - cached.received_at >= RUNTIME_READINESS_TTL_MS
+    })
+
+    if (idsToFetch.length === 0) return
+
+    const cacheKey = idsToFetch.slice().sort().join('\0')
+    const existing = runtimeReadinessInFlight.get(cacheKey)
+    if (existing) return existing
+
+    const run = (async () => {
+      set((state) => ({
+        runtimeReadinessLoadingById: {
+          ...state.runtimeReadinessLoadingById,
+          ...Object.fromEntries(idsToFetch.map((id) => [id, true])),
+        },
+      }))
+
+      try {
+        const result = await window.electron.model.runtimeReadiness(idsToFetch)
+        const receivedAt = Date.now()
+        set((state) => ({
+          runtimeReadinessById: mergeRuntimeReadinessResponse(state.runtimeReadinessById, idsToFetch, result.models, result.success, receivedAt),
+        }))
+      } catch {
+        const receivedAt = Date.now()
+        set((state) => ({
+          runtimeReadinessById: mergeRuntimeReadinessResponse(state.runtimeReadinessById, idsToFetch, {}, false, receivedAt),
+        }))
+      } finally {
+        set((state) => ({
+          runtimeReadinessLoadingById: {
+            ...state.runtimeReadinessLoadingById,
+            ...Object.fromEntries(idsToFetch.map((id) => [id, false])),
+          },
+        }))
+        runtimeReadinessInFlight.delete(cacheKey)
+      }
+    })()
+
+    runtimeReadinessInFlight.set(cacheKey, run)
+    return run
   },
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -260,5 +323,45 @@ function buildDoneInstallProgress(result: Required<Pick<ExtensionInstallResult, 
     totalChildren: result.installed.length + result.failed.length,
     ...(isLegacyCompatibleSuccess && result.extensionId ? { extensionId: result.extensionId } : {}),
     ...(result.status === 'error' && result.error ? { message: result.error } : {}),
+  }
+}
+
+function collectRuntimeReadinessModelIds(modelExtensions: ModelExtension[]): string[] {
+  return modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+}
+
+function mergeRuntimeReadinessResponse(
+  previous: Record<string, RuntimeReadinessCacheEntry>,
+  requestedIds: string[],
+  models: Record<string, RuntimeReadiness>,
+  success: boolean,
+  receivedAt: number,
+): Record<string, RuntimeReadinessCacheEntry> {
+  const next = { ...previous }
+  for (const id of requestedIds) {
+    const readiness = models[id]
+    if (readiness) {
+      next[id] = { ...readiness, received_at: receivedAt }
+      continue
+    }
+
+    if (!success) {
+      const cached = previous[id]
+      next[id] = cached
+        ? { ...cached, stale: true, received_at: receivedAt }
+        : createCheckingFailedReadiness(receivedAt)
+    }
+  }
+
+  return next
+}
+
+function createCheckingFailedReadiness(receivedAt: number): RuntimeReadinessCacheEntry {
+  return {
+    ok: false,
+    machine_code: 'checking_failed',
+    label_hint: 'Checking failed',
+    checked_at: new Date(receivedAt).toISOString(),
+    received_at: receivedAt,
   }
 }

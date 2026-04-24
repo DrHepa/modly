@@ -146,6 +146,22 @@ export interface ProcessExtension {
 
 export type AnyExtension = ModelExtension | ProcessExtension
 
+export interface RuntimeReadiness {
+  ok: boolean
+  machine_code: string
+  label_hint?: 'Ready' | 'Setup Codex' | 'Login' | 'Update Codex' | 'Unsupported' | 'Checking failed'
+  reason?: string
+  evidence?: Record<string, unknown>
+  checked_at: string
+  stale?: boolean
+}
+
+export interface RuntimeReadinessResponse {
+  success: boolean
+  models: Record<string, RuntimeReadiness>
+  error?: string
+}
+
 export type ExtensionInstallStatus = 'success' | 'partial' | 'error'
 export type ExtensionInstallFailureStage = 'download' | 'extract' | 'validate' | 'commit' | 'setup' | 'npm' | 'reload' | string
 
@@ -354,6 +370,7 @@ declare global {
         delete:         (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
+        runtimeReadiness: (modelIds: string[]) => Promise<RuntimeReadinessResponse>
         onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
         offProgress:    () => void
       }

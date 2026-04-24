@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { AnyExtension, FailedExtensionResult, InstalledExtensionResult } from '../types/electron.d'
+import type { AnyExtension, FailedExtensionResult, InstalledExtensionResult, RuntimeReadiness } from '../types/electron.d'
 
 const { useExtensionsStore } = await import(new URL('./extensionsStore.ts', import.meta.url).href)
 
@@ -69,7 +69,10 @@ function createProcessExtension(id: string) {
   }
 }
 
-function installMockWindow(result: MockInstallResult, downloadedIds: string[] = []) {
+function installMockWindow(result: MockInstallResult, downloadedIds: string[] = [], readiness?: {
+  calls: string[][]
+  responses: Array<Promise<{ success: boolean; models: Record<string, RuntimeReadiness>; error?: string }> | { success: boolean; models: Record<string, RuntimeReadiness>; error?: string }>
+}) {
   let progressHandler: ((data: { step: string; percent?: number; message?: string }) => void) | undefined
 
   Object.defineProperty(globalThis, 'window', {
@@ -101,6 +104,11 @@ function installMockWindow(result: MockInstallResult, downloadedIds: string[] = 
           async listDownloaded() {
             return downloadedIds.map((id) => ({ id, name: id, size_gb: 1 }))
           },
+          async runtimeReadiness(modelIds: string[]) {
+            readiness?.calls.push(modelIds)
+            const response = readiness?.responses.shift()
+            return response ?? { success: true, models: {} }
+          },
         },
       },
     },
@@ -117,7 +125,23 @@ function resetStoreState() {
     installError: null,
     installResult: null,
     loadErrors: {},
+    runtimeReadinessById: {},
+    runtimeReadinessLoadingById: {},
   })
+}
+
+const readyReadiness: RuntimeReadiness = {
+  ok: true,
+  machine_code: 'ready',
+  label_hint: 'Ready',
+  checked_at: '2026-04-24T00:00:00.000Z',
+}
+
+const loginReadiness: RuntimeReadiness = {
+  ok: false,
+  machine_code: 'preflight/not_authenticated',
+  label_hint: 'Login',
+  checked_at: '2026-04-24T00:00:00.000Z',
 }
 
 test('installFromGitHub preserves legacy single-extension installs and refreshes model ownership', async () => {
@@ -225,4 +249,54 @@ test('installFromGitHub keeps partial installs merged and surfaces failed childr
     completedChildren: 1,
     totalChildren: 2,
   })
+})
+
+test('ensureRuntimeReadiness debounces duplicate ids and caches fresh readiness', async () => {
+  const readiness = {
+    calls: [] as string[][],
+    responses: [
+      Promise.resolve({
+        success: true,
+        models: {
+          'codex/text-to-image': loginReadiness,
+        },
+      }),
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+
+  const first = useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image', 'codex/text-to-image'])
+  const second = useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  await Promise.all([first, second])
+
+  assert.deepEqual(readiness.calls, [['codex/text-to-image']])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Login')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  assert.deepEqual(readiness.calls, [['codex/text-to-image']])
+})
+
+test('ensureRuntimeReadiness marks stale cache on failure and returns checking failed without cache', async () => {
+  const readiness = {
+    calls: [] as string[][],
+    responses: [
+      { success: false, error: 'Backend unavailable', models: {} },
+      { success: true, models: { 'codex/text-to-image': readyReadiness } },
+      { success: false, error: 'Backend unavailable again', models: {} },
+    ],
+  }
+  installMockWindow({ success: true }, [], readiness)
+  resetStoreState()
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Checking failed')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'], { force: true })
+  assert.equal(useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']?.label_hint, 'Ready')
+
+  await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'], { force: true })
+  const stale = useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']
+  assert.equal(stale?.label_hint, 'Ready')
+  assert.equal(stale?.stale, true)
 })

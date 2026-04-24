@@ -20,6 +20,23 @@ async def all_models_status():
     return generator_registry.all_status()
 
 
+@router.get("/runtime-readiness")
+async def model_runtime_readiness(model_ids: str):
+    """Read-only optional runtime readiness by canonical model ID."""
+    requested_ids = [model_id.strip() for model_id in model_ids.split(",") if model_id.strip()]
+    for model_id in requested_ids:
+        if not _is_safe_canonical_model_id(model_id):
+            raise HTTPException(400, f"Invalid model ID: {model_id}")
+    return {"readiness": generator_registry.runtime_readiness(requested_ids)}
+
+
+def _is_safe_canonical_model_id(model_id: str) -> bool:
+    if model_id.startswith("/") or ".." in model_id.split("/"):
+        return False
+    parts = model_id.split("/")
+    return len(parts) >= 2 and all(parts)
+
+
 @router.get("/params")
 async def model_params(model_id: Optional[str] = None):
     """Parameter schema of the active model (or a specified model)."""
@@ -150,4 +167,3 @@ async def hf_download(repo_id: str, model_id: str, skip_prefixes: Optional[str] 
             yield _fmt({"error": str(exc)})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-

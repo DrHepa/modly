@@ -122,11 +122,13 @@ export default function ModelsPage(): JSX.Element {
   const installError      = useExtensionsStore((s) => s.installError)
   const installResult     = useExtensionsStore((s) => s.installResult)
   const loadErrors        = useExtensionsStore((s) => s.loadErrors)
+  const runtimeReadinessById = useExtensionsStore((s) => s.runtimeReadinessById)
   const loadExtensions    = useExtensionsStore((s) => s.loadExtensions)
   const installFromGH     = useExtensionsStore((s) => s.installFromGitHub)
   const uninstallExt      = useExtensionsStore((s) => s.uninstall)
   const reloadExtensions  = useExtensionsStore((s) => s.reload)
   const refreshModelOwnership = useExtensionsStore((s) => s.refreshModelOwnership)
+  const ensureRuntimeReadiness = useExtensionsStore((s) => s.ensureRuntimeReadiness)
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   // All extensions (model + process), sorted builtin-first then by name
@@ -190,6 +192,11 @@ export default function ModelsPage(): JSX.Element {
     })
     return () => window.electron.model.offProgress()
   }, [loadExtensions, refreshModelOwnership])
+
+  useEffect(() => {
+    const modelIds = modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+    if (modelIds.length > 0) void ensureRuntimeReadiness(modelIds)
+  }, [modelExtensions, ensureRuntimeReadiness])
 
   useEffect(() => {
     if (installError) setGhErr(installError)
@@ -432,6 +439,7 @@ export default function ModelsPage(): JSX.Element {
                 installedIds={installedVariantIds}
                 downloading={downloading}
                 ownershipStateById={ownershipStateById}
+                runtimeReadinessById={runtimeReadinessById}
                 disabled={extensionActionsDisabled}
                 loadError={
                   loadErrors[ext.id] ??

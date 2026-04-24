@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { AnyExtension } from '@shared/types/electron.d'
+import type { AnyExtension, RuntimeReadiness } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
@@ -9,6 +9,7 @@ interface Props {
   installedIds:     string[]
   downloading:      Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>
   ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
+  runtimeReadinessById?: Record<string, RuntimeReadiness | undefined>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: import('@shared/types/electron.d').ExtensionNode, fullId: string) => void
@@ -22,7 +23,7 @@ const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
   process: { label: 'Process', cls: 'bg-emerald-500/15 border-emerald-500/25 text-emerald-400' },
 }
 
-export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
 
@@ -140,6 +141,8 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
         <div className="flex flex-col gap-2 pt-2 border-t border-zinc-800/60">
           {ext.nodes.map((node) => {
             const fullId        = `${ext.id}/${node.id}`
+            const runtimeReadiness = runtimeReadinessById?.[fullId]
+            const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadiness)
             const hasWeights    = !!node.hfRepo
             const ownershipState = ownershipStateById?.[fullId]
             const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
@@ -174,7 +177,11 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
 
                 {/* Status (only for nodes that need model weights) */}
                 <div className="flex-1 min-w-0">
-                  {!hasWeights ? (
+                  {runtimeLabel ? (
+                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800/50 border border-zinc-700/40">
+                      <span className="text-[10px] font-semibold text-zinc-300">{runtimeLabel}</span>
+                    </div>
+                  ) : !hasWeights ? (
                     <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-950/40 border border-emerald-800/30">
                       <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="text-emerald-400 shrink-0">
                         <polyline points="20 6 9 17 4 12"/>
@@ -285,4 +292,21 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
       )}
     </div>
   )
+}
+
+function resolveRuntimeReadinessLabel(readiness?: RuntimeReadiness): string | null {
+  if (!readiness) return null
+  if (readiness.machine_code === 'unsupported_contract') return null
+  if (readiness.label_hint) return readiness.label_hint
+  if (readiness.ok || readiness.machine_code === 'ready') return 'Ready'
+
+  switch (readiness.machine_code) {
+    case 'preflight/codex_missing': return 'Setup Codex'
+    case 'preflight/not_authenticated':
+    case 'preflight/no_entitlement': return 'Login'
+    case 'preflight/unsupported_version': return 'Update Codex'
+    case 'preflight/unsupported_platform': return 'Unsupported'
+    case 'checking_failed': return 'Checking failed'
+    default: return null
+  }
 }

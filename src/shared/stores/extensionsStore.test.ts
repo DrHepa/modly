@@ -318,9 +318,9 @@ test('ensureRuntimeReadiness marks stale cache on failure and returns checking f
   const readiness = {
     calls: [] as string[][],
     responses: [
-      { success: false, error: 'Backend unavailable', models: {} },
+      { success: false, error: 'Backend unavailable', models: {} as Record<string, RuntimeReadiness> },
       { success: true, models: { 'codex/text-to-image': readyReadiness } },
-      { success: false, error: 'Backend unavailable again', models: {} },
+      { success: false, error: 'Backend unavailable again', models: {} as Record<string, RuntimeReadiness> },
     ],
   }
   installMockWindow({ success: true }, [], readiness)
@@ -352,7 +352,7 @@ test('ensureRuntimeReadiness stores bounded actions and details without leaking 
   await useExtensionsStore.getState().ensureRuntimeReadiness(['codex/text-to-image'])
 
   const stored = useExtensionsStore.getState().runtimeReadinessById['codex/text-to-image']
-  assert.deepEqual(stored?.actions?.map((action) => action.id), ['codex.login.docs'])
+  assert.deepEqual(stored?.actions?.map((action: { id: string }) => action.id), ['codex.login.docs'])
   assert.deepEqual(stored?.details?.diagnostics, {
     runtime_source: 'path',
     auth_state: 'missing',

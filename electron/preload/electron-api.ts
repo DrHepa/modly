@@ -45,6 +45,10 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
     cache: { clear: (): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('cache:clear') as Promise<{ success: boolean; error?: string }> },
     api: { updatePaths: (patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string }): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('api:updatePaths', patch) as Promise<{ success: boolean; error?: string }> },
     automation: { capabilities: () => ipcRenderer.invoke('automation:capabilities') },
+    scene: {
+      onImportMesh: (cb: (payload: { meshPath: string; url: string; displayName: string }) => void) => { ipcRenderer.on('scene:importMesh', (_event, payload) => cb(payload as { meshPath: string; url: string; displayName: string })) },
+      offImportMesh: () => ipcRenderer.removeAllListeners('scene:importMesh'),
+    },
     model: {
       export:         (args: { outputUrl: string; format: string }) => ipcRenderer.invoke('model:export', args),
       listDownloaded: () => ipcRenderer.invoke('model:listDownloaded'),
@@ -84,7 +88,12 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
       uninstall: (extensionId: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:uninstall', extensionId) as Promise<{ success: boolean; error?: string }>,
       repair: (extensionId: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:repair', extensionId) as Promise<{ success: boolean; error?: string }>,
       reload: (): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:reload') as Promise<{ success: boolean; error?: string }>,
-      runProcess: (extensionId: string, input: ProcessInput, params: Record<string, unknown>) => invokeExtensionsRunProcess(ipcRenderer.invoke.bind(ipcRenderer), extensionId, input, params),
+      runProcess: (extensionId: string, input: ProcessInput, params: Record<string, unknown>) => invokeExtensionsRunProcess(
+        (channel, targetExtensionId, targetInput, targetParams) => ipcRenderer.invoke(channel, targetExtensionId, targetInput, targetParams) as Promise<{ success: boolean; result?: import('../../src/shared/types/electron.d').ProcessResult; error?: string }>,
+        extensionId,
+        input,
+        params,
+      ),
       onInstallProgress: (cb: (data: ExtensionInstallProgress) => void) => { ipcRenderer.on('extensions:installProgress', (_event, data) => cb(data as ExtensionInstallProgress)) },
       offInstallProgress: () => ipcRenderer.removeAllListeners('extensions:installProgress'),
     },

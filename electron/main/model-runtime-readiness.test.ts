@@ -101,7 +101,7 @@ test('fetchRuntimeReadinessWithHealthGate preserves sanitized readiness actions 
   })
 
   const readiness = result.models['modly-codex-image-extension/text-to-image']
-  assert.deepEqual(readiness?.actions?.map((action) => action.id), ['codex.login.docs', 'codex.refresh'])
+  assert.deepEqual(readiness?.actions?.map((action: { id: string }) => action.id), ['codex.login.docs', 'codex.refresh'])
   assert.equal(readiness?.actions?.[0]?.docs_url, 'https://developers.openai.com/codex/auth')
   assert.deepEqual(readiness?.details?.diagnostics, {
     runtime_source: 'path',
@@ -147,7 +147,7 @@ test('fetchRuntimeReadinessWithHealthGate drops unsafe readiness action and deta
 
   const readiness = result.models['codex/text-to-image']
   assert.equal(readiness?.label_hint, 'Update Codex')
-  assert.deepEqual(readiness?.actions?.map((action) => action.id), ['valid.details'])
+  assert.deepEqual(readiness?.actions?.map((action: { id: string }) => action.id), ['valid.details'])
   assert.equal(readiness?.details?.title, undefined)
   assert.deepEqual(readiness?.details?.diagnostics, { runtime_version: '0.123.0' })
 })

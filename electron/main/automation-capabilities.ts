@@ -2,6 +2,7 @@ import axios from 'axios'
 import { join, resolve as resolvePath } from 'path'
 import { readFile, readdir } from 'fs/promises'
 import { existsSync } from 'fs'
+import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
 
 type AutomationCapabilityError = {
   source: 'backend-runtime' | 'electron-manifest'
@@ -66,6 +67,14 @@ export type AutomationCapabilitiesResponse = {
   backend_ready: boolean
   models: AutomationModelCapability[]
   processes: AutomationProcessCapability[]
+  scene: {
+    import_mesh: {
+      supported: true
+      route: '/scene/import-mesh'
+      allowed_extensions: string[]
+      extensions: string[]
+    }
+  }
   excluded: {
     ui_only_nodes: AutomationUiOnlyCapability[]
   }
@@ -761,6 +770,14 @@ export async function buildAutomationCapabilities(options: {
     backend_ready: backendResult.backend_ready,
     models: backendResult.models,
     processes: processResult.processes,
+    scene: {
+      import_mesh: {
+        supported: true,
+        route: '/scene/import-mesh',
+        allowed_extensions: [...SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS],
+        extensions: [...SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS],
+      },
+    },
     excluded: {
       ui_only_nodes: getUiOnlyNodes(),
     },

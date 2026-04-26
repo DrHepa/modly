@@ -344,6 +344,14 @@ export interface AutomationCapabilitiesResponse {
   backend_ready: boolean
   models: AutomationModelCapability[]
   processes: AutomationProcessCapability[]
+  scene: {
+    import_mesh: {
+      supported: true
+      route: '/scene/import-mesh'
+      allowed_extensions: string[]
+      extensions: string[]
+    }
+  }
   excluded: {
     ui_only_nodes: AutomationUiOnlyCapability[]
   }
@@ -393,6 +401,10 @@ declare global {
       }
       automation: {
         capabilities: () => Promise<AutomationCapabilitiesResponse>
+      }
+      scene: {
+        onImportMesh: (cb: (payload: { meshPath: string; url: string; displayName: string }) => void) => void
+        offImportMesh: () => void
       }
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>

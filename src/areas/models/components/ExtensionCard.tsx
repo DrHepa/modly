@@ -335,7 +335,10 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                     {visibleRuntimeActions.map((action) => (
                       <button
                         key={action.id}
-                        onClick={() => handleRuntimeReadinessAction(fullId, action, runtimeReadiness)}
+                        onClick={() => {
+                          if (!runtimeReadiness) return
+                          handleRuntimeReadinessAction(fullId, action, runtimeReadiness)
+                        }}
                         disabled={Boolean(action.disabled || disabled)}
                         title={action.disabled ? action.reason : action.guidance}
                         className="px-2 py-1 rounded-md bg-zinc-800/70 border border-zinc-700/50 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700/70 disabled:opacity-50 disabled:cursor-not-allowed"

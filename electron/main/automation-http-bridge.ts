@@ -6,11 +6,17 @@ import {
   type ProcessRunError,
   type ProcessRunSnapshot,
 } from './process-runs-service.ts'
+import {
+  createSceneImportService,
+  type SceneImportMeshRequest,
+  type SceneImportMeshResult,
+} from './scene-import-service.ts'
 
 export const AUTOMATION_HTTP_BRIDGE_HOST = '127.0.0.1'
 export const AUTOMATION_HTTP_BRIDGE_PORT = 8766
 export const AUTOMATION_HTTP_BRIDGE_PATH = '/automation/capabilities'
 export const PROCESS_RUNS_HTTP_BRIDGE_PATH = '/process-runs'
+export const SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH = '/scene/import-mesh'
 
 let defaultProcessRunsServicePromise: Promise<import('./process-runs-service.ts').ProcessRunsService> | null = null
 
@@ -20,6 +26,7 @@ type AutomationHttpBridgeDeps = {
   createProcessRun: (request: CreateProcessRunRequest) => Promise<ProcessRunSnapshot>
   getProcessRun: (runId: string) => Promise<ProcessRunSnapshot> | ProcessRunSnapshot
   cancelProcessRun: (runId: string) => Promise<ProcessRunSnapshot> | ProcessRunSnapshot
+  importSceneMesh: (request: SceneImportMeshRequest) => Promise<SceneImportMeshResult>
   logger: {
     info: (message: string) => void
     warn: (message: string) => void
@@ -50,6 +57,7 @@ const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
     const service = await getDefaultProcessRunsService()
     return service.cancelRun(runId)
   },
+  importSceneMesh: async (request) => createSceneImportService().importMesh(request),
   logger: {
     info: (message) => {
       void import('./logger.ts')
@@ -139,6 +147,20 @@ function assertCreateProcessRunRequest(value: unknown): CreateProcessRunRequest 
   }
 }
 
+function assertSceneImportMeshRequest(value: unknown): SceneImportMeshRequest {
+  if (!isPlainObject(value)) {
+    throw new ProcessRunServiceError(400, {
+      code: 'INVALID_JSON',
+      message: 'Request body must be a JSON object.',
+      retryable: false,
+    })
+  }
+
+  return {
+    meshPath: (value.meshPath ?? value.mesh_path) as string,
+  }
+}
+
 function writeProcessRunSnapshot(response: ServerResponse, statusCode: number, snapshot: ProcessRunSnapshot): void {
   writeJson(response, statusCode, {
     run_id: snapshot.run_id,
@@ -172,6 +194,7 @@ export class AutomationHttpBridge {
       createProcessRun: options.createProcessRun ?? defaultAutomationHttpBridgeDeps.createProcessRun,
       getProcessRun: options.getProcessRun ?? defaultAutomationHttpBridgeDeps.getProcessRun,
       cancelProcessRun: options.cancelProcessRun ?? defaultAutomationHttpBridgeDeps.cancelProcessRun,
+      importSceneMesh: options.importSceneMesh ?? defaultAutomationHttpBridgeDeps.importSceneMesh,
       logger: options.logger ?? defaultAutomationHttpBridgeDeps.logger,
     }
   }
@@ -261,6 +284,24 @@ export class AutomationHttpBridge {
         }
 
         writeJson(response, 200, payload)
+        return
+      }
+
+      if (url.pathname === SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH) {
+        if (method !== 'POST') {
+          response.setHeader('Allow', 'POST')
+          writeJson(response, 405, { error: 'Method Not Allowed' })
+          return
+        }
+
+        const body = await readJsonBody(request)
+        const result = await this.deps.importSceneMesh(assertSceneImportMeshRequest(body))
+        if (result.ok) {
+          writeJson(response, result.statusCode, result.result)
+          return
+        }
+
+        writeJson(response, result.statusCode, { error: result.error })
         return
       }
 

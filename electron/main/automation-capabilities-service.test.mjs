@@ -172,6 +172,14 @@ test('buildAutomationCapabilities returns full canonical payload when backend is
       })
 
       assert.equal(response.backend_ready, true)
+      assert.deepEqual(response.scene, {
+        import_mesh: {
+          supported: true,
+          route: '/scene/import-mesh',
+          allowed_extensions: ['.glb', '.obj', '.stl', '.ply'],
+          extensions: ['.glb', '.obj', '.stl', '.ply'],
+        },
+      })
       assert.equal(response.models.length, 1)
       assert.deepEqual(response.models[0], {
         kind: 'model',

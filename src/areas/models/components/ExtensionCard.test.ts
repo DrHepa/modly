@@ -69,6 +69,12 @@ function createActionReadiness(): RuntimeReadiness {
         },
       },
       {
+        id: 'runtime-details',
+        kind: 'show_details',
+        label: 'Details',
+        safety: 'manual',
+      },
+      {
         id: 'refresh',
         kind: 'refresh_readiness',
         label: 'Refresh',
@@ -195,17 +201,22 @@ test('ExtensionCard never presents stale runtime success as current readiness', 
   assert.match(html, />Install</)
 })
 
-test('ExtensionCard renders generic readiness actions and details affordances while preserving iteration-one label', async () => {
+test('ExtensionCard static markup renders readiness label and actions without inline details diagnostics', async () => {
   const html = await renderCard({
     'modly-codex-image-extension/text-to-image': createActionReadiness(),
   })
 
   assert.match(html, />Setup Codex</)
-  assert.match(html, /<button[^>]*>Setup Codex<\/button>/)
   assert.match(html, /<button[^>]*>Open docs<\/button>/)
   assert.match(html, /<button[^>]*>Refresh<\/button>/)
-  assert.match(html, /Codex runtime details/)
-  assert.match(html, /Codex is not available on PATH\./)
+  assert.doesNotMatch(html, /<button[^>]*>Setup Codex<\/button>/)
+  assert.doesNotMatch(html, /<button[^>]*>Details<\/button>/)
+  assert.doesNotMatch(html, /Codex runtime details/)
+  assert.doesNotMatch(html, /Codex is not available on PATH\./)
+  assert.doesNotMatch(html, /Modly does not install Codex silently\./)
+  assert.doesNotMatch(html, /runtime_source/)
+  assert.doesNotMatch(html, /platform_key/)
+  assert.doesNotMatch(html, /linux-x64/)
 })
 
 test('ExtensionCard action planner requires explicit user intent before dispatching readiness actions', async () => {
@@ -285,7 +296,7 @@ test('ExtensionCard filters readiness diagnostics to safe display fields only', 
   }
 })
 
-test('ExtensionCard renders disabled readiness actions without dispatch affordance and omits unsafe detail values', async () => {
+test('ExtensionCard renders disabled readiness actions but not full readiness details inline', async () => {
   const html = await renderCard({
     'modly-codex-image-extension/text-to-image': {
       ...createReadiness('preflight/unsupported_platform', 'Unsupported'),
@@ -310,10 +321,12 @@ test('ExtensionCard renders disabled readiness actions without dispatch affordan
     },
   })
 
-  assert.match(html, /<button[^>]*disabled=""[^>]*>Unsupported<\/button>/)
-  assert.match(html, /This platform is unsupported\./)
-  assert.match(html, /platform_supported/)
-  assert.match(html, /linux-arm64/)
+  assert.match(html, />Unsupported</)
+  assert.doesNotMatch(html, /<button[^>]*disabled=""[^>]*>Unsupported<\/button>/)
+  assert.doesNotMatch(html, /This platform is unsupported\./)
+  assert.doesNotMatch(html, /Unsupported platform/)
+  assert.doesNotMatch(html, /platform_supported/)
+  assert.doesNotMatch(html, /linux-arm64/)
   assert.doesNotMatch(html, /\/home\/user\/bin\/codex/)
 })
 
@@ -359,7 +372,7 @@ test('readiness confirmation dialog exposes a named native modal without dispatc
   } finally { await cleanup() }
 })
 
-test('readiness card omits drive paths while preserving benign details and query-link affordances', async () => {
+test('readiness card omits inline details while retaining safe detail filtering and query-link affordances', async () => {
   const { module, cleanup } = await loadExtensionCardModule()
   const calls: string[] = []
   try {
@@ -390,15 +403,15 @@ test('readiness card omits drive paths while preserving benign details and query
         }],
       } }, undefined, {}, { onRuntimeReadinessAction: () => { calls.push('dispatch'); return { success: true } } })
       assert.equal(html.includes(path), false)
-      assert.match(html, /authenticated/)
-      assert.match(html, /0\.122\.0/)
+      assert.doesNotMatch(html, /authenticated/)
+      assert.doesNotMatch(html, /0\.122\.0/)
       assert.match(html, />Platform docs<\/button>/)
       assert.deepEqual(calls, [])
     }
   } finally { await cleanup() }
 })
 
-test('ExtensionCard exposes useful runtime content without an optional label hint', async () => {
+test('ExtensionCard exposes only link and refresh actions without an optional label hint', async () => {
   const id = 'modly-codex-image-extension/text-to-image'
   const calls: string[] = []
   const actions: NonNullable<RuntimeReadiness['actions']> = [
@@ -415,9 +428,12 @@ test('ExtensionCard exposes useful runtime content without an optional label hin
       onRuntimeReadinessAction: () => { calls.push('action'); return { success: true } },
       onInstall: () => calls.push('install'), onInstallAll: () => calls.push('install-all'),
     })
-    for (const action of actions) assert.equal(html.includes('>' + action.label + '</button>'), 'actions' in content)
-    assert.equal(html.includes(details.summary), 'details' in content)
-    assert.equal(html.includes(details.title), 'details' in content)
+    for (const action of actions) {
+      const visible = 'actions' in content && (action.kind === 'open_external_url' || action.kind === 'refresh_readiness')
+      assert.equal(html.includes('>' + action.label + '</button>'), visible)
+    }
+    assert.doesNotMatch(html, /<p[^>]*>See https:\/\/example.invalid\/docs for help\.<\/p>/)
+    assert.equal(html.includes(details.title), false)
     assert.doesNotMatch(html, /aria-label="Runtime:/)
     assert.match(html, />Install</)
     assert.match(html, /Install all/)
@@ -440,7 +456,7 @@ test('ExtensionCard suppresses absent unsupported or empty runtime content witho
   }
 })
 
-test('readiness card preserves HTTPS prose in guidance and details', async () => {
+test('readiness helpers preserve HTTPS prose while the card hides guidance and inline details', async () => {
   const { module, cleanup } = await loadExtensionCardModule()
   try {
     for (const text of [
@@ -455,8 +471,56 @@ test('readiness card preserves HTTPS prose in guidance and details', async () =>
         details,
         actions: [{ id: 'guide', kind: 'show_guidance', label: 'Setup guide', safety: 'manual', guidance: text }],
       } })
-      assert.equal(html.includes(text), true)
-      assert.match(html, />Setup guide<\/button>/)
+      assert.equal(html.includes(text), false)
+      assert.doesNotMatch(html, />Setup guide<\/button>/)
+      const dialog = renderToStaticMarkup(createElement(module.RuntimeReadinessDialog, {
+        modal: { mode: 'details', title: 'Runtime details', modelId: 'ext/node', details },
+        onClose: () => undefined, onConfirm: () => assert.fail('Rendering details must not dispatch'),
+      }))
+      assert.equal(dialog.includes(text), true)
+      assert.match(dialog, /<dialog[^>]*aria-modal="true"/)
     }
   } finally { await cleanup() }
+})
+
+test('ExtensionCard retains disabled visible actions and capability-scoped pending errors', async () => {
+  const readiness = createActionReadiness()
+  readiness.actions = readiness.actions?.map((action) => action.kind === 'open_external_url'
+    ? { ...action, disabled: true, reason: 'Documentation is unavailable.' } : action)
+  const html = await renderCard({ 'canonical/node': readiness }, undefined, { capabilityId: 'canonical/node' }, {
+    runtimeReadinessActionLoadingById: { 'canonical/node:refresh': true },
+    runtimeReadinessActionErrorById: {
+      'canonical/node:refresh': 'Refresh failed.',
+      'canonical/node:setup-guidance': 'Hidden guidance error.',
+    },
+  })
+  assert.match(html, /<button[^>]*disabled=""[^>]*title="Documentation is unavailable\."[^>]*>Open docs<\/button>/)
+  assert.match(html, /<button[^>]*disabled=""[^>]*aria-busy="true"[^>]*>Refresh<\/button>/)
+  assert.match(html, /<p[^>]*role="alert"[^>]*>Refresh failed\.<\/p>/)
+  assert.doesNotMatch(html, /Hidden guidance error/)
+})
+
+test('ExtensionCard keeps installed sources groups variants and active download controls after simplification', async () => {
+  const id = 'modly-codex-image-extension/text-to-image'
+  for (const node of [
+    { hasModelSources: true },
+    { weightGroups: ['base'] },
+    { hasModelSources: true, weightVariants: { options: [{ id: 'one' }, { id: 'two' }] } },
+  ]) {
+    const html = await renderCard({ [id]: createActionReadiness() }, undefined, node, { installedIds: [id] })
+    assert.match(html, /Installed/)
+    assert.match(html, /All nodes ready/)
+    assert.doesNotMatch(html, /Install all/)
+    assert.match(html, />Open docs<\/button>/)
+    if ('weightVariants' in node) assert.match(html, /2 variants/)
+  }
+  for (const paused of [false, true]) {
+    const html = await renderCard({ [id]: createActionReadiness() }, undefined, { hasModelSources: true }, {
+      downloading: { [id]: { percent: 25, paused } },
+    })
+    assert.equal(html.includes(paused ? 'Resume download' : 'Pause download'), true)
+    assert.match(html, /Cancel download/)
+    assert.doesNotMatch(html, /Install all/)
+    assert.match(html, />Refresh<\/button>/)
+  }
 })

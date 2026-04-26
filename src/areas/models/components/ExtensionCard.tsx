@@ -184,7 +184,9 @@ export function ExtensionCard({
             const capabilityId = node.capabilityId ?? fullId
             const runtimeReadiness = runtimeReadinessById?.[capabilityId]
             const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadiness)
-            const runtimeDetails = filterRuntimeReadinessDetailsForDisplay(runtimeReadiness?.details)
+            const visibleRuntimeActions = (runtimeReadiness?.actions ?? []).filter((action) => (
+              action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
+            ))
             return (
               <div
                 key={node.id}
@@ -219,9 +221,9 @@ export function ExtensionCard({
                   </div>
                 )}
 
-                {isModel && runtimeReadiness?.machine_code !== 'unsupported_contract' && runtimeReadiness?.actions && runtimeReadiness.actions.length > 0 && (
+                {isModel && runtimeReadiness && runtimeReadiness.machine_code !== 'unsupported_contract' && visibleRuntimeActions.length > 0 && (
                   <div className="w-full flex flex-wrap gap-1.5 pl-0.5">
-                    {runtimeReadiness.actions.map((action) => (
+                    {visibleRuntimeActions.map((action) => (
                       <button
                         key={action.id}
                         onClick={(event) => { event.stopPropagation(); void handleRuntimeReadinessAction(capabilityId, action, runtimeReadiness) }}
@@ -232,16 +234,13 @@ export function ExtensionCard({
                         className="px-2 py-1 rounded-md bg-zinc-800/70 border border-zinc-700/50 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700/70 disabled:opacity-50 disabled:cursor-not-allowed"
                       >{action.label}</button>
                     ))}
-                    {runtimeReadiness.actions.map((action) => {
+                    {visibleRuntimeActions.map((action) => {
                       const error = runtimeReadinessActionErrorById?.[`${capabilityId}:${action.id}`]
                       return error ? <p key={`error:${action.id}`} role="alert" className="w-full text-xs text-amber-300">{error}</p> : null
                     })}
                   </div>
                 )}
 
-                {isModel && runtimeReadiness?.machine_code !== 'unsupported_contract' && Object.keys(runtimeDetails).length > 0 && (
-                  <RuntimeReadinessDetailsPanel details={runtimeDetails} />
-                )}
               </div>
             )
           })}

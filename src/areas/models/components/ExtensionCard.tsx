@@ -193,7 +193,9 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
             const fullId        = `${ext.id}/${node.id}`
             const runtimeReadiness = runtimeReadinessById?.[fullId]
             const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadiness)
-            const runtimeDetails = filterRuntimeReadinessDetailsForDisplay(runtimeReadiness?.details)
+            const visibleRuntimeActions = (runtimeReadiness?.actions ?? []).filter((action) => (
+              action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
+            ))
             const hasWeights    = !!node.hfRepo
             const ownershipState = ownershipStateById?.[fullId]
             const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
@@ -328,9 +330,9 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                 </div>
                 </div>
 
-                {runtimeLabel && runtimeReadiness?.actions && runtimeReadiness.actions.length > 0 && (
+                {runtimeLabel && visibleRuntimeActions.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 pl-0.5">
-                    {runtimeReadiness.actions.map((action) => (
+                    {visibleRuntimeActions.map((action) => (
                       <button
                         key={action.id}
                         onClick={() => handleRuntimeReadinessAction(fullId, action, runtimeReadiness)}
@@ -340,10 +342,6 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                       >{action.label}</button>
                     ))}
                   </div>
-                )}
-
-                {runtimeLabel && Object.keys(runtimeDetails).length > 0 && (
-                  <RuntimeReadinessDetailsPanel details={runtimeDetails} />
                 )}
 
                 {ownershipState?.warning && hasWeights && (

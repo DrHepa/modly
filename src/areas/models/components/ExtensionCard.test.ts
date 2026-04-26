@@ -69,6 +69,12 @@ function createActionReadiness(): RuntimeReadiness {
         },
       },
       {
+        id: 'runtime-details',
+        kind: 'show_details',
+        label: 'Details',
+        safety: 'manual',
+      },
+      {
         id: 'refresh',
         kind: 'refresh_readiness',
         label: 'Refresh',
@@ -164,17 +170,22 @@ test('ExtensionCard shows non-blocking checking-failed readiness without startin
   assert.doesNotMatch(html, />Download</)
 })
 
-test('ExtensionCard renders generic readiness actions and details affordances while preserving iteration-one label', async () => {
+test('ExtensionCard static markup renders readiness label and actions without inline details diagnostics', async () => {
   const html = await renderCard({
     'modly-codex-image-extension/text-to-image': createActionReadiness(),
   })
 
   assert.match(html, />Setup Codex</)
-  assert.match(html, /<button[^>]*>Setup Codex<\/button>/)
   assert.match(html, /<button[^>]*>Open docs<\/button>/)
   assert.match(html, /<button[^>]*>Refresh<\/button>/)
-  assert.match(html, /Codex runtime details/)
-  assert.match(html, /Codex is not available on PATH\./)
+  assert.doesNotMatch(html, /<button[^>]*>Setup Codex<\/button>/)
+  assert.doesNotMatch(html, /<button[^>]*>Details<\/button>/)
+  assert.doesNotMatch(html, /Codex runtime details/)
+  assert.doesNotMatch(html, /Codex is not available on PATH\./)
+  assert.doesNotMatch(html, /Modly does not install Codex silently\./)
+  assert.doesNotMatch(html, /runtime_source/)
+  assert.doesNotMatch(html, /platform_key/)
+  assert.doesNotMatch(html, /linux-x64/)
 })
 
 test('ExtensionCard action planner requires explicit user intent before dispatching readiness actions', async () => {
@@ -254,7 +265,7 @@ test('ExtensionCard filters readiness diagnostics to safe display fields only', 
   }
 })
 
-test('ExtensionCard renders disabled readiness actions without dispatch affordance and omits unsafe detail values', async () => {
+test('ExtensionCard renders disabled readiness actions but not full readiness details inline', async () => {
   const html = await renderCard({
     'modly-codex-image-extension/text-to-image': {
       ...createReadiness('preflight/unsupported_platform', 'Unsupported'),
@@ -279,9 +290,11 @@ test('ExtensionCard renders disabled readiness actions without dispatch affordan
     },
   })
 
-  assert.match(html, /<button[^>]*disabled=""[^>]*>Unsupported<\/button>/)
-  assert.match(html, /This platform is unsupported\./)
-  assert.match(html, /platform_supported/)
-  assert.match(html, /linux-arm64/)
+  assert.match(html, />Unsupported</)
+  assert.doesNotMatch(html, /<button[^>]*disabled=""[^>]*>Unsupported<\/button>/)
+  assert.doesNotMatch(html, /This platform is unsupported\./)
+  assert.doesNotMatch(html, /Unsupported platform/)
+  assert.doesNotMatch(html, /platform_supported/)
+  assert.doesNotMatch(html, /linux-arm64/)
   assert.doesNotMatch(html, /\/home\/user\/bin\/codex/)
 })

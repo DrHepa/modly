@@ -3,6 +3,7 @@ import { describeModelOwnership } from './model-ownership'
 import { join, resolve as resolvePath } from 'path'
 import { readFile, readdir } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
+import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
 import {
   normalizeModelSources, normalizeWeightGroupReferences, normalizeWeightGroups,
   normalizeWeightVariants, safeModelSourceId, validateModelNodeIds,
@@ -79,6 +80,14 @@ export type AutomationCapabilitiesResponse = {
   backend_ready: boolean
   models: AutomationModelCapability[]
   processes: AutomationProcessCapability[]
+  scene: {
+    import_mesh: {
+      supported: true
+      route: '/scene/import-mesh'
+      allowed_extensions: string[]
+      extensions: string[]
+    }
+  }
   excluded: {
     ui_only_nodes: AutomationUiOnlyCapability[]
   }
@@ -674,6 +683,14 @@ export async function buildAutomationCapabilities(options: {
     backend_ready: backendResult.backend_ready,
     models: backendResult.models,
     processes: processResult.processes,
+    scene: {
+      import_mesh: {
+        supported: true,
+        route: '/scene/import-mesh',
+        allowed_extensions: [...SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS],
+        extensions: [...SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS],
+      },
+    },
     excluded: {
       ui_only_nodes: getUiOnlyNodes(),
     },

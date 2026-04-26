@@ -5,6 +5,7 @@ import {
   AUTOMATION_HTTP_BRIDGE_PATH,
   AutomationHttpBridge,
   PROCESS_RUNS_HTTP_BRIDGE_PATH,
+  SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH,
 } from './automation-http-bridge'
 import { parseExtensionManifest, ResolveCanonicalProcessTargetError, type CanonicalProcessTarget } from './automation-capabilities'
 import { ProcessRunsService, type ProcessRunSnapshot } from './process-runs-service'
@@ -65,6 +66,23 @@ function createTarget(processId: string): CanonicalProcessTarget {
   }
 }
 
+function createCapabilitiesPayload() {
+  return {
+    backend_ready: true,
+    models: [],
+    processes: [],
+    scene: {
+      import_mesh: {
+        supported: true as const,
+        route: SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH as '/scene/import-mesh',
+        allowed_extensions: ['.glb', '.obj', '.stl', '.ply'],
+        extensions: ['.glb', '.obj', '.stl', '.ply'],
+      },
+    },
+    excluded: { ui_only_nodes: [] },
+  }
+}
+
 function createService(controlledRunner: ReturnType<typeof createTerminatingRunner>): ProcessRunsService {
   return new ProcessRunsService({
     now: () => new Date('2026-04-14T12:00:00.000Z'),
@@ -113,12 +131,7 @@ test('serves localhost process-runs create/get/cancel and factual errors', async
   const bridge = new AutomationHttpBridge({
     host: '127.0.0.1',
     port: 0,
-    getAutomationCapabilities: async () => ({
-      backend_ready: true,
-      models: [],
-      processes: [],
-      excluded: { ui_only_nodes: [] },
-    }),
+    getAutomationCapabilities: async () => createCapabilitiesPayload(),
     createProcessRun: (request) => service.createAndStartRun(request),
     getProcessRun: (runId) => service.getRun(runId),
     cancelProcessRun: (runId) => service.cancelRun(runId),
@@ -239,18 +252,89 @@ test('serves localhost process-runs create/get/cancel and factual errors', async
   })
 })
 
+test('serves scene import mesh route with JSON result and validation errors', async (t) => {
+  const bridge = new AutomationHttpBridge({
+    host: '127.0.0.1',
+    port: 0,
+    getAutomationCapabilities: async () => createCapabilitiesPayload(),
+    importSceneMesh: async ({ meshPath }) => {
+      if (meshPath === '../escape.glb') {
+        return {
+          ok: false,
+          statusCode: 400,
+          error: {
+            code: 'INVALID_WORKSPACE_PATH',
+            field: 'meshPath',
+            message: 'meshPath must stay inside the workspace; traversal is rejected.',
+            retryable: false,
+          },
+        }
+      }
+
+      return {
+        ok: true,
+        statusCode: 200,
+        result: {
+          meshPath,
+          url: `/workspace/${meshPath}`,
+          displayName: 'imported.glb',
+        },
+      }
+    },
+    logger: {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+    },
+  })
+
+  await bridge.start()
+  t.after(async () => {
+    await bridge.stop()
+  })
+
+  const origin = bridge.getOrigin()
+  assert.ok(origin)
+
+  const success = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mesh_path: 'Default/imported.glb' }),
+  })
+  assert.equal(success.status, 200)
+  assert.deepEqual(await success.json(), {
+    meshPath: 'Default/imported.glb',
+    url: '/workspace/Default/imported.glb',
+    displayName: 'imported.glb',
+  })
+
+  const invalid = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ meshPath: '../escape.glb' }),
+  })
+  assert.equal(invalid.status, 400)
+  assert.deepEqual(await invalid.json(), {
+    error: {
+      code: 'INVALID_WORKSPACE_PATH',
+      field: 'meshPath',
+      message: 'meshPath must stay inside the workspace; traversal is rejected.',
+      retryable: false,
+    },
+  })
+
+  const wrongMethod = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`)
+  assert.equal(wrongMethod.status, 405)
+  assert.equal(wrongMethod.headers.get('allow'), 'POST')
+})
+
 test('serves mesh-exporter success, stable terminal polls, and invalid output_path rejection', async (t) => {
   const controlledRunner = createTerminatingRunner()
   const service = createService(controlledRunner)
   const bridge = new AutomationHttpBridge({
     host: '127.0.0.1',
     port: 0,
-    getAutomationCapabilities: async () => ({
-      backend_ready: true,
-      models: [],
-      processes: [],
-      excluded: { ui_only_nodes: [] },
-    }),
+    getAutomationCapabilities: async () => createCapabilitiesPayload(),
     createProcessRun: (request) => service.createAndStartRun(request),
     getProcessRun: (runId) => service.getRun(runId),
     cancelProcessRun: (runId) => service.cancelRun(runId),
@@ -320,4 +404,25 @@ test('serves mesh-exporter success, stable terminal polls, and invalid output_pa
   assert.equal(stablePollResponse.status, 200)
   const stablePoll = await stablePollResponse.json() as { run: ProcessRunSnapshot }
   assert.deepEqual(stablePoll.run, finished)
+})
+
+test('scene route rejects malformed JSON and non-object requests before dispatch', async (t) => {
+  let dispatches = 0
+  const bridge = new AutomationHttpBridge({
+    host: '127.0.0.1', port: 0,
+    importSceneMesh: async () => { dispatches += 1; throw new Error('Unexpected scene dispatch') },
+    logger: { info() {}, warn() {}, error() {} },
+  })
+  await bridge.start()
+  t.after(() => bridge.stop())
+  const origin = bridge.getOrigin()
+  assert.ok(origin)
+  for (const body of ['{', '[]', 'null', '"mesh.glb"']) {
+    const response = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })
+    assert.equal(response.status, 400)
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'INVALID_JSON')
+  }
+  assert.equal(dispatches, 0)
 })

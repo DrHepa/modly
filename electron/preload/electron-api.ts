@@ -146,6 +146,12 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         ipcRenderer.invoke('api:updatePaths', patch) as Promise<{ success: boolean; error?: string }>,
     },
 
+    // Automation mesh dispatch into the mounted Generate viewer.
+    scene: {
+      onImportMesh: (cb: (payload: { meshPath: string; url: string; displayName: string }) => void) => { ipcRenderer.on('scene:importMesh', (_event, payload) => cb(payload as { meshPath: string; url: string; displayName: string })) },
+      offImportMesh: () => ipcRenderer.removeAllListeners('scene:importMesh'),
+    },
+
     // Model management
     model: {
       export:         (args: { outputUrl: string; format: string }) => ipcRenderer.invoke('model:export', args),

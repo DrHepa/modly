@@ -23,6 +23,7 @@ import {
   type AssetLibrarySortMode,
   type GenerateOpenPanel,
 } from './assetLibraryUi'
+import { buildSceneImportGenerationJob } from './sceneImportAutomation'
 
 const MIN_WIDTH = 220
 const MAX_WIDTH = 520
@@ -713,6 +714,16 @@ export default function GeneratePage(): JSX.Element {
     return () => window.removeEventListener('keydown', handler)
   }, [undoMesh, redoMesh])
 
+  useEffect(() => {
+    window.electron.scene.onImportMesh((payload) => {
+      const job = buildSceneImportGenerationJob(payload)
+      setCurrentJob(job)
+      pushMeshUrl(payload.url)
+    })
+
+    return () => window.electron.scene.offImportMesh()
+  }, [setCurrentJob, pushMeshUrl])
+
   const hasModel = currentJob?.status === 'done' && !!currentJob.outputUrl
   const showOpenInSlicer = hasModel && canOpenInOrcaSlicer(currentJob?.outputUrl)
 
@@ -808,15 +819,7 @@ export default function GeneratePage(): JSX.Element {
     setImporting(true)
     try {
       const { url } = await importMesh(filePath)
-      const job: GenerationJob = {
-        id: `import-${Date.now()}`,
-        imageFile: '',
-        status: 'done',
-        progress: 100,
-        outputUrl: url,
-        originalOutputUrl: url,
-        createdAt: Date.now(),
-      }
+      const job: GenerationJob = buildSceneImportGenerationJob({ meshPath: filePath, url, displayName: filePath.split(/[\\/]/).pop() ?? filePath })
       setCurrentJob(job)
       pushMeshUrl(url)
     } finally {

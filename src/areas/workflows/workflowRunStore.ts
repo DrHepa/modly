@@ -56,6 +56,46 @@ type ModelGenerationRequest =
       }
     }
 
+const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
+
+function resolveModelImageRouting(args: {
+  ext: WorkflowExtension
+  incomingEdges: WFEdge[]
+  nodeOutputs: Map<string, { filePath?: string; text?: string; outputType?: string }>
+}): {
+  applies: boolean
+  frontPath?: string
+  sideParams: Record<string, string>
+} {
+  const namedImagePorts = new Set(
+    args.ext.inputs?.filter((port) => port.type === 'image').map((port) => port.name) ?? [],
+  )
+
+  if (namedImagePorts.size === 0) {
+    return { applies: false, sideParams: {} }
+  }
+
+  const routed = new Map<string, string>()
+  for (const edge of args.incomingEdges) {
+    const handle = edge.targetHandle ?? undefined
+    if (!handle || !namedImagePorts.has(handle)) continue
+
+    const src = args.nodeOutputs.get(edge.source)
+    if (!src?.filePath || src.outputType !== 'image') continue
+    routed.set(handle, src.filePath)
+  }
+
+  return {
+    applies: true,
+    frontPath: routed.get('front'),
+    sideParams: {
+      ...(routed.get('left') ? { left_image_path: routed.get('left')! } : {}),
+      ...(routed.get('back') ? { back_image_path: routed.get('back')! } : {}),
+      ...(routed.get('right') ? { right_image_path: routed.get('right')! } : {}),
+    },
+  }
+}
+
 function buildModelGenerationRequest(args: {
   ext: WorkflowExtension
   node: WFNode
@@ -63,7 +103,8 @@ function buildModelGenerationRequest(args: {
   nodeInputPath?: string
   nodeInputText?: string
   nodeInputMeshPath?: string
-  selectedImagePath: string
+  routedSideParams?: Record<string, string>
+  selectedImagePath?: string
   selectedImageData?: string
   workspaceDir: string
 }): ModelGenerationRequest {
@@ -74,6 +115,7 @@ function buildModelGenerationRequest(args: {
     nodeInputPath,
     nodeInputText,
     nodeInputMeshPath,
+    routedSideParams = {},
     selectedImagePath,
     selectedImageData,
     workspaceDir,
@@ -107,6 +149,12 @@ function buildModelGenerationRequest(args: {
   }
 
   const activeImagePath = nodeInputPath ?? selectedImagePath
+  if (!activeImagePath) {
+    throw new Error("ENOENT: no such file or directory, open ''")
+  }
+  const sanitizedNodeParams = Object.fromEntries(
+    Object.entries(nodeParams).filter(([key]) => !RESERVED_MODEL_SIDE_IMAGE_PARAMS.includes(key as typeof RESERVED_MODEL_SIDE_IMAGE_PARAMS[number])),
+  )
   const extraParams: Record<string, unknown> = {}
   if (nodeInputMeshPath) {
     const norm = nodeInputMeshPath.replace(/\\/g, '/')
@@ -119,7 +167,7 @@ function buildModelGenerationRequest(args: {
     kind: 'image',
     imagePath: activeImagePath,
     imageData: selectedImageData && nodeInputPath === undefined ? selectedImageData : undefined,
-    params: { ...nodeParams, ...extraParams },
+    params: { ...sanitizedNodeParams, ...routedSideParams, ...extraParams },
   }
 }
 
@@ -257,6 +305,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         let nodeInputMeshPath: string | undefined
 
         const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
+        const modelImageRouting = resolveModelImageRouting({
+          ext,
+          incomingEdges,
+          nodeOutputs,
+        })
 
         if (ext?.inputs && ext.inputs.length > 1) {
           // Multi-input: route each incoming edge by the source node's outputType
@@ -281,6 +334,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             if (prev?.filePath !== undefined) nodeInputPath = prev.filePath
             if (prev?.text     !== undefined) nodeInputText = prev.text
           }
+        }
+
+        if (modelImageRouting.applies) {
+          nodeInputPath = modelImageRouting.frontPath
         }
 
         set((s) => ({
@@ -313,6 +370,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             nodeInputPath,
             nodeInputText,
             nodeInputMeshPath,
+            routedSideParams: modelImageRouting.sideParams,
             selectedImagePath,
             selectedImageData,
             workspaceDir,

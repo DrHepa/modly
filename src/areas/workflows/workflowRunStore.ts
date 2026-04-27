@@ -65,6 +65,46 @@ type ModelGenerationRequest =
       }
     }
 
+const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
+
+function resolveModelImageRouting(args: {
+  ext: WorkflowExtension
+  incomingEdges: WFEdge[]
+  nodeOutputs: Map<string, { filePath?: string; text?: string; outputType?: string }>
+}): {
+  applies: boolean
+  frontPath?: string
+  sideParams: Record<string, string>
+} {
+  const namedImagePorts = new Set(
+    args.ext.inputs?.filter((port) => port.type === 'image').map((port) => port.name) ?? [],
+  )
+
+  if (namedImagePorts.size === 0) {
+    return { applies: false, sideParams: {} }
+  }
+
+  const routed = new Map<string, string>()
+  for (const edge of args.incomingEdges) {
+    const handle = edge.targetHandle ?? undefined
+    if (!handle || !namedImagePorts.has(handle)) continue
+
+    const src = args.nodeOutputs.get(edge.source)
+    if (!src?.filePath || src.outputType !== 'image') continue
+    routed.set(handle, src.filePath)
+  }
+
+  return {
+    applies: true,
+    frontPath: routed.get('front'),
+    sideParams: {
+      ...(routed.get('left') ? { left_image_path: routed.get('left')! } : {}),
+      ...(routed.get('back') ? { back_image_path: routed.get('back')! } : {}),
+      ...(routed.get('right') ? { right_image_path: routed.get('right')! } : {}),
+    },
+  }
+}
+
 function buildModelGenerationRequest(args: {
   ext: WorkflowExtension
   node: WFNode
@@ -72,7 +112,8 @@ function buildModelGenerationRequest(args: {
   nodeInputPath?: string
   nodeInputText?: string
   nodeInputMeshPath?: string
-  selectedImagePath: string
+  routedSideParams?: Record<string, string>
+  selectedImagePath?: string
   selectedImageData?: string
   workspaceDir: string
 }): ModelGenerationRequest {
@@ -83,6 +124,7 @@ function buildModelGenerationRequest(args: {
     nodeInputPath,
     nodeInputText,
     nodeInputMeshPath,
+    routedSideParams = {},
     selectedImagePath,
     selectedImageData,
     workspaceDir,
@@ -116,6 +158,12 @@ function buildModelGenerationRequest(args: {
   }
 
   const activeImagePath = nodeInputPath ?? selectedImagePath
+  if (!activeImagePath) {
+    throw new Error("ENOENT: no such file or directory, open ''")
+  }
+  const sanitizedNodeParams = Object.fromEntries(
+    Object.entries(nodeParams).filter(([key]) => !RESERVED_MODEL_SIDE_IMAGE_PARAMS.includes(key as typeof RESERVED_MODEL_SIDE_IMAGE_PARAMS[number])),
+  )
   const extraParams: Record<string, unknown> = {}
   if (nodeInputMeshPath) {
     const norm = nodeInputMeshPath.replace(/\\/g, '/')
@@ -128,7 +176,7 @@ function buildModelGenerationRequest(args: {
     kind: 'image',
     imagePath: activeImagePath,
     imageData: selectedImageData && nodeInputPath === undefined ? selectedImageData : undefined,
-    params: { ...nodeParams, ...extraParams },
+    params: { ...sanitizedNodeParams, ...routedSideParams, ...extraParams },
   }
 }
 
@@ -638,30 +686,28 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         const { ext, mode } = dispatch
         const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
 
-      for (const [iterId, files] of iteratorFiles) {
-        const bodyIds = new Set([...reachableExecutable(iterId, workflow.edges, nodeMap)].filter((id) => indexOf.has(id)))
-        const idxs = [...bodyIds].map((id) => indexOf.get(id)!)
-        if (idxs.length === 0) continue
-        loops.push({
-          whileId:    iterId,
-          kind:       'forEach',
-          firstIdx:   Math.min(...idxs),
-          lastIdx:    Math.max(...idxs),
-          bodyIds,
-          iterations: files.length,   // one pass per file
+        // ── Resolve inputs ────────────────────────────────────────────────
+        let nodeInputPath:     string | undefined
+        let nodeInputText:     string | undefined
+        let nodeInputMeshPath: string | undefined
+
+        const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
+        const modelImageRouting = resolveModelImageRouting({
+          ext,
+          incomingEdges,
+          nodeOutputs,
         })
-      }
-      const loopCounters = new Map(loops.map((l) => [l.whileId, l.iterations]))
-      // Auto-mode loops replay their body N times; count the extra passes so the
-      // progress total reflects the real work (manual loops stay unbounded). While
-      // loops are independent. For Each loops sharing a boundary (same lastIdx) run
-      // in lockstep over the union of their bodies, so that union is replayed once
-      // per pass — count it once, for max(files) − 1 extra passes.
-      const forEachGroups = new Map<number, LoopInfo[]>()
-      let loopExtraSteps = 0
-      for (const l of loops) {
-        if (l.kind === 'while') {
-          loopExtraSteps += l.iterations != null ? (l.iterations - 1) * l.bodyIds.size : 0
+
+        if (ext?.inputs && ext.inputs.length > 1) {
+          // Multi-input: route each incoming edge by the source node's outputType
+          for (const edge of incomingEdges) {
+            const src = nodeOutputs.get(edge.source)
+            if (!src) continue
+            if (src.outputType === 'mesh')        nodeInputMeshPath = src.filePath
+            else if (src.outputType === 'image')  nodeInputPath     = src.filePath
+            else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
+            if (src.text !== undefined)           nodeInputText     = src.text
+          }
         } else {
           // Single-input
           for (const edge of incomingEdges) {
@@ -675,6 +721,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             if (prev?.filePath !== undefined) nodeInputPath = prev.filePath
             if (prev?.text     !== undefined) nodeInputText = prev.text
           }
+        }
+
+        if (modelImageRouting.applies) {
+          nodeInputPath = modelImageRouting.frontPath
         }
 
         set((s) => ({
@@ -707,6 +757,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             nodeInputPath,
             nodeInputText,
             nodeInputMeshPath,
+            routedSideParams: modelImageRouting.sideParams,
             selectedImagePath,
             selectedImageData,
             workspaceDir,

@@ -338,8 +338,23 @@ async function executeExtensionNode(
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
   const positionalInputs = ext && getPositionalInputTypes(ext)
   const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
+  // This adapter is only the named front/side image MODEL contract, not a
+  // generic named-input ABI and not the named PROCESS transport below.
+  const namedModelImagePorts = mode === 'model' && ext.input === 'image' && hasNamedProcessInputs(ext.inputs)
+    ? new Set(ext.inputs.filter((port) => port.type === 'image' && ['front', 'left', 'back', 'right'].includes(port.name)).map((port) => port.name))
+    : new Set<string>()
+  const routedSideParams: Record<string, string> = {}
 
-  if (positionalInputs && positionalInputs.length > 1) {
+  if (namedModelImagePorts.size > 0) {
+    for (const edge of incomingEdges) {
+      const src = resolveSource(edge.source)
+      if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
+      const handle = edge.targetHandle
+      if (!handle || !namedModelImagePorts.has(handle) || src?.outputType !== 'image' || !src.filePath) continue
+      if (handle === 'front') nodeInputPath = src.filePath
+      else routedSideParams[`${handle}_image_path`] = src.filePath
+    }
+  } else if (positionalInputs && positionalInputs.length > 1) {
     // Scene is intentionally a single-input-only model contract. The guard
     // above rejects it before this multi-slot path, and filtering it here also
     // narrows the remaining declarations to assignSlotFilePaths' exact ABI.
@@ -410,7 +425,15 @@ async function executeExtensionNode(
       extraParams.extra_image_paths = extraImagePaths
     }
 
-    const effectiveParams = liveParams
+    const effectiveParams = { ...liveParams }
+    if (namedModelImagePorts.size > 0) {
+      // Only declared image side ports reserve these keys. Other models and
+      // undeclared sides retain their ordinary user parameters.
+      for (const side of ['left', 'back', 'right']) {
+        if (namedModelImagePorts.has(side)) delete effectiveParams[`${side}_image_path`]
+      }
+      Object.assign(effectiveParams, routedSideParams)
+    }
 
     setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
     let submission: { data: { job_id: string } }

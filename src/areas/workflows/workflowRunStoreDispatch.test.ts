@@ -38,6 +38,7 @@ let useWorkflowRunStore: WorkflowRunStore
 let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
 let fsReadCalls: string[]
+let iteratorFileNames: string[]
 let onProcessRun: ((call: RunProcessCall) => void) | undefined
 let appState: {
   apiUrl: string
@@ -55,6 +56,7 @@ beforeEach(() => {
   }
   runProcessCalls = []
   fsReadCalls = []
+  iteratorFileNames = []
   onProcessRun = undefined
   appState = {
     apiUrl: 'http://inert.invalid', currentJob: null,
@@ -67,7 +69,7 @@ beforeEach(() => {
     settings: { get: async () => ({ workspaceDir: '/workspace' }) },
     fs: {
       deleteDirectory: async () => ({ success: true }),
-      listFiles: async () => [],
+      listFiles: async () => iteratorFileNames,
       readFileBase64: async (filePath: string) => {
         fsReadCalls.push(filePath)
         return Buffer.from('fs-bytes').toString('base64')
@@ -120,6 +122,24 @@ function createWorkflowExtension(overrides: Partial<WorkflowExtension>): Workflo
   }
 }
 
+function createNamedImageModelExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  return createWorkflowExtension({
+    id: 'multi/image-to-mesh',
+    extensionId: 'multi',
+    nodeId: 'image-to-mesh',
+    type: 'model',
+    input: 'image',
+    output: 'mesh',
+    inputs: [
+      { name: 'front', type: 'image', required: true },
+      { name: 'left', type: 'image', required: false },
+      { name: 'back', type: 'image', required: false },
+      { name: 'right', type: 'image', required: false },
+    ],
+    ...overrides,
+  })
+}
+
 function createNode(id: string, type: WFNode['type'], data: WFNode['data'] = { enabled: true, params: {} }): WFNode {
   return {
     id,
@@ -148,6 +168,36 @@ function createWorkflow(node: WFNode): Workflow {
     edges,
     createdAt: '2026-04-15T00:00:00.000Z',
     updatedAt: '2026-04-15T00:00:00.000Z',
+  }
+}
+
+function createMultiInputWorkflow(args: {
+  node: WFNode
+  imageSources: Array<{ id: string; filePath: string; targetHandle: 'front' | 'left' | 'back' | 'right' }>
+}): Workflow {
+  const nodes = [
+    ...args.imageSources.map((source) => createNode(source.id, 'imageNode', { enabled: true, params: { filePath: source.filePath } })),
+    args.node,
+    createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+  ]
+  const edges: WFEdge[] = [
+    ...args.imageSources.map((source) => ({
+      id: `edge-${source.id}`,
+      source: source.id,
+      target: args.node.id,
+      targetHandle: source.targetHandle,
+    })),
+    { id: 'edge-output', source: args.node.id, target: 'output-node' },
+  ]
+
+  return {
+    id: 'workflow-multi-input',
+    name: 'Dispatch Workflow Multi Input',
+    description: '',
+    nodes,
+    edges,
+    createdAt: '2026-04-27T00:00:00.000Z',
+    updatedAt: '2026-04-27T00:00:00.000Z',
   }
 }
 
@@ -224,6 +274,358 @@ test('workflowRunStore keeps legacy image-to-mesh model nodes on the model API p
   assert.deepEqual(fsReadCalls, ['/tmp/source.png'])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/model.glb')
+  assert.deepEqual(Object.keys(useWorkflowRunStore.getState().nodeImageOutputs), [])
+})
+
+test('workflowRunStore routes the named front edge as multipart image instead of using the last image edge', async () => {
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'left-source', filePath: '/tmp/left-view.png', targetHandle: 'left' },
+      { id: 'front-source', filePath: '/tmp/front-view.png', targetHandle: 'front' },
+      { id: 'right-source', filePath: '/tmp/right-view.png', targetHandle: 'right' },
+    ],
+  })
+  const postCalls: Array<{ path: string; data: FormData }> = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push({ path, data: data as FormData })
+        return { data: { job_id: 'job-front-route' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/front-route.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal((postCalls[0].data.get('image') as File).name, 'front-view.png')
+  assert.deepEqual(fsReadCalls, ['/tmp/front-view.png'])
+})
+
+test('workflowRunStore flattens only connected named side views into model params', async () => {
+  const ext = createNamedImageModelExtension({
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: 'fallback prompt' },
+      { id: 'strength', label: 'Strength', type: 'float', default: 0.75 },
+    ],
+  })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { prompt: 'refine' },
+    }),
+    imageSources: [
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+      { id: 'left-source', filePath: '/tmp/left.png', targetHandle: 'left' },
+      { id: 'back-source', filePath: '/tmp/back.png', targetHandle: 'back' },
+      { id: 'right-source', filePath: '/tmp/right.png', targetHandle: 'right' },
+    ],
+  })
+  const postCalls: FormData[] = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-side-params' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/side-params.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
+    prompt: 'refine',
+    strength: 0.75,
+    left_image_path: '/tmp/left.png',
+    back_image_path: '/tmp/back.png',
+    right_image_path: '/tmp/right.png',
+  })
+})
+
+test('workflowRunStore omits unconnected side views and removes stale reserved side params', async () => {
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {
+        keep: 'value',
+        left_image_path: '/tmp/stale-left.png',
+        back_image_path: '/tmp/stale-back.png',
+        right_image_path: '/tmp/stale-right.png',
+      },
+    }),
+    imageSources: [{ id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' }],
+  })
+  const postCalls: FormData[] = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-omit-stale' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/omit-stale.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), { keep: 'value' })
+})
+
+test('workflowRunStore falls back to selectedImagePath when front is missing but keeps connected side-view params', async () => {
+  appState.selectedImageData = undefined
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [{ id: 'left-source', filePath: '/tmp/left-only.png', targetHandle: 'left' }],
+  })
+  const postCalls: FormData[] = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-fallback' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/fallback.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal((postCalls[0].get('image') as File).name, 'source.png')
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), { left_image_path: '/tmp/left-only.png' })
+  assert.deepEqual(fsReadCalls, ['/tmp/source.png'])
+})
+
+test('workflowRunStore preserves the legacy missing-primary-image failure when front and selected image are both absent', async () => {
+  appState.selectedImagePath = undefined
+  appState.selectedImageData = undefined
+
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {
+        left_image_path: '/tmp/stale-left.png',
+      },
+    }),
+    imageSources: [{ id: 'left-source', filePath: '/tmp/left-only.png', targetHandle: 'left' }],
+  })
+  let postCalls = 0
+  let getCalls = 0
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls += 1
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      getCalls += 1
+      throw new Error(`Unexpected axios.get call: ${path}`)
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls, 0)
+  assert.equal(getCalls, 0)
+  assert.equal(runProcessCalls.length, 0)
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /No input image selected for model node/)
+})
+
+function captureImageRequests(): FormData[] {
+  const posts: FormData[] = []
+  axiosClientMock = {
+    async post(path, data) {
+      assert.equal(path, '/generate/from-image')
+      assert.ok(data instanceof FormData)
+      posts.push(data)
+      return { data: { job_id: 'named-images' } }
+    },
+    async get() { return { data: { status: 'done', output_url: '/workspace/output/model.glb' } } },
+  }
+  return posts
+}
+
+for (const reversed of [false, true]) {
+  test(`named MODEL front and side routing traverses Wait regardless of edge order (${reversed})`, async () => {
+    const ext = createNamedImageModelExtension()
+    const workflow = createMultiInputWorkflow({
+      node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+      imageSources: [
+        { id: 'front', filePath: '/front.png', targetHandle: 'front' },
+        { id: 'side', filePath: '/side.png', targetHandle: 'left' },
+      ],
+    })
+    workflow.nodes.push(createNode('wait-front', 'waitNode'), createNode('wait-side', 'waitNode'))
+    workflow.edges[0].source = 'wait-front'
+    workflow.edges[1].source = 'wait-side'
+    workflow.edges.push(
+      { id: 'front-wait', source: 'front', target: 'wait-front' },
+      { id: 'side-wait', source: 'side', target: 'wait-side' },
+    )
+    if (reversed) workflow.edges.reverse()
+    const posts = captureImageRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    // Independent Waits merge into the pre-phase under the accepted executor.
+    assert.equal(posts.length, 1)
+    assert.equal((posts[0].get('image') as File).name, 'front.png')
+    assert.deepEqual(JSON.parse(String(posts[0].get('params'))), { left_image_path: '/side.png' })
+    assert.deepEqual(fsReadCalls, ['/front.png'])
+    await useWorkflowRunStore.getState().continueRun('wait-front')
+    await useWorkflowRunStore.getState().continueRun('wait-side')
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  })
+}
+
+test('named MODEL front resumes through a single Wait branch', async () => {
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    imageSources: [{ id: 'front', filePath: '/front.png', targetHandle: 'front' }],
+  })
+  workflow.nodes.push(createNode('wait', 'waitNode'))
+  workflow.edges[0].source = 'wait'
+  workflow.edges.push({ id: 'front-wait', source: 'front', target: 'wait' })
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(posts.length, 0)
+  assert.equal(useWorkflowRunStore.getState().waitStates.wait, 'pending')
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal((posts[0].get('image') as File).name, 'front.png')
+  assert.deepEqual(fsReadCalls, ['/front.png'])
+})
+
+test('named MODEL fallback accepts selected bytes without a path and retains primitive and unknown params', async () => {
+  appState.selectedImagePath = undefined
+  const ext = createNamedImageModelExtension()
+  const params = { count: 0, enabled: false, prompt: '', unknown: { keep: true }, right_image_path: '/stale.png' }
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params }),
+    imageSources: [{ id: 'side', filePath: '/side.png', targetHandle: 'left' }],
+  })
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal((posts[0].get('image') as File).name, 'placeholder.png')
+  assert.deepEqual(JSON.parse(String(posts[0].get('params'))), {
+    count: 0, enabled: false, prompt: '', unknown: { keep: true }, left_image_path: '/side.png',
+  })
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(params.right_image_path, '/stale.png', 'Routing must not mutate the saved workflow')
+})
+
+test('named MODEL image ports do not consume mesh outputs or undeclared side handles', async () => {
+  const ext = createNamedImageModelExtension({ inputs: [{ name: 'front', type: 'image' }] })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: { left_image_path: 'user-left' } }),
+    imageSources: [
+      { id: 'wrong-kind', filePath: '/mesh.glb', targetHandle: 'front' },
+      { id: 'undeclared', filePath: '/side.png', targetHandle: 'left' },
+    ],
+  })
+  workflow.nodes[0].type = 'meshNode'
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal((posts[0].get('image') as File).name, 'placeholder.png')
+  assert.deepEqual(JSON.parse(String(posts[0].get('params'))), { left_image_path: 'user-left' })
+  assert.deepEqual(fsReadCalls, [])
+})
+
+for (const inputs of [undefined, ['image', 'image'], [{ name: 'reference', type: 'image' }]] satisfies WorkflowExtension['inputs'][]) {
+  test(`MODEL side-key cleanup does not apply to other contracts ${JSON.stringify(inputs)}`, async () => {
+    const ext = createWorkflowExtension({ inputs })
+    const target = createExtensionNode(ext.id)
+    target.data.params = { left_image_path: 'user-left', back_image_path: 'user-back', right_image_path: 'user-right' }
+    const workflow = createWorkflow(target)
+    if (inputs && typeof inputs[0] !== 'string') workflow.edges[0].targetHandle = 'reference'
+    const posts = captureImageRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    assert.deepEqual(JSON.parse(String(posts[0].get('params'))), target.data.params)
+    assert.deepEqual(fsReadCalls, ['/tmp/source.png'])
+  })
+}
+
+test('named PROCESS front and side handles keep typed descriptors and same-named user params', async () => {
+  const ext = createNamedImageModelExtension({ type: 'process' })
+  const params = { left_image_path: 'process-user-param', flag: false, zero: 0, empty: '' }
+  const workflow = createMultiInputWorkflow({
+    node: createNode('process', 'extensionNode', { extensionId: ext.id, enabled: true, params }),
+    imageSources: [
+      { id: 'front', filePath: '/front.png', targetHandle: 'front' },
+      { id: 'left', filePath: '/left.png', targetHandle: 'left' },
+    ],
+  })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(runProcessCalls, [{ extensionId: ext.extensionId, input: { nodeId: ext.nodeId, inputs: {
+    front: { type: 'image', filePath: '/front.png', sourceNodeId: 'front' },
+    left: { type: 'image', filePath: '/left.png', sourceNodeId: 'left' },
+  } }, params }])
+  assert.deepEqual(fsReadCalls, [])
+})
+
+test('named MODEL resolves each For Each image through the upstream image-preview passthrough', async () => {
+  iteratorFileNames = ['a.png', 'b.png']
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    imageSources: [
+      { id: 'front', filePath: '/unused.png', targetHandle: 'front' },
+      { id: 'side', filePath: '/side.png', targetHandle: 'left' },
+    ],
+  })
+  workflow.nodes[0] = createNode('front', 'forEachNode', { enabled: true, params: { dir: '/images', mode: 'image' } })
+  workflow.nodes.push(createNode('preview', 'imagePreviewNode'))
+  workflow.edges[0].source = 'preview'
+  workflow.edges.push({ id: 'iterator-preview', source: 'front', target: 'preview' })
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(posts.map((post) => (post.get('image') as File).name), ['a.png', 'b.png'])
+  assert.deepEqual(posts.map((post) => JSON.parse(String(post.get('params')))), [
+    { left_image_path: '/side.png' }, { left_image_path: '/side.png' },
+  ])
+  assert.deepEqual(fsReadCalls, ['/images/a.png', '/images/b.png'])
 })
 
 test('workflowRunStore dispatches text-capability model nodes through the text generation endpoint without reading image bytes', async () => {
@@ -554,13 +956,15 @@ test('unresolved MODEL-looking ids fail before even reading image input', async 
   assert.equal(runProcessCalls.length, 0)
 })
 
-for (const type of ['model', 'process'] as const) {
-  test(`actual ${type} dispatch reads live params again on each While iteration`, async () => {
-    const ext = createWorkflowExtension({ type })
+for (const kind of ['model', 'named-model', 'process'] as const) {
+  test(`actual ${kind} dispatch reads live params again on each While iteration`, async () => {
+    const type = kind === 'process' ? 'process' : 'model'
+    const ext = kind === 'named-model' ? createNamedImageModelExtension() : createWorkflowExtension({ type })
     const target = createExtensionNode(ext.id)
     target.parentId = 'while'
     target.data.params = { count: 1, custom: 'original' }
     const workflow = createWorkflow(target)
+    if (kind === 'named-model') workflow.edges[0].targetHandle = 'front'
     for (const node of workflow.nodes) node.position = { x: 1000, y: 1000 }
     const container = createNode('while', 'whileNode', { enabled: true, params: {}, iterations: 2 })
     container.width = 420

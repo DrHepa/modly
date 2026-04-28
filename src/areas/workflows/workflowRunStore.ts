@@ -58,6 +58,12 @@ function isSceneMeshOutput(output: NodeOutput | undefined): output is NodeOutput
   return output?.outputType === 'mesh' && typeof output.filePath === 'string'
 }
 
+function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
+  const normalized = filePath.replace(/\\/g, '/')
+  const workspace = workspaceDir.replace(/\\/g, '/').replace(/\/+$/, '')
+  return normalized.startsWith(`${workspace}/`) ? normalized.slice(workspace.length + 1) : normalized
+}
+
 // ─── For Each iterator (image / text / mesh) ───────────────────────────────────
 // A "For Each" node walks a folder alphabetically and emits one file per loop
 // iteration. Its loop body = the executable nodes reachable downstream, which
@@ -393,6 +399,30 @@ async function executeExtensionNode(
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
+    const namedModelInputs = hasNamedProcessInputs(ext.inputs) ? ext.inputs : []
+    const meshPorts = namedModelInputs.filter((port) => port.type === 'mesh')
+    const meshPaths = new Map<string, string>()
+    for (const edge of incomingEdges) {
+      if (!meshPorts.some((port) => port.name === edge.targetHandle)) continue
+      const src = resolveSource(edge.source)
+      if (src?.outputType === 'mesh' && src.filePath?.trim()) meshPaths.set(edge.targetHandle!, src.filePath)
+    }
+    for (const port of meshPorts) {
+      if (port.required !== false && !meshPaths.has(port.name)) {
+        throw new Error(`Missing required ${port.name} mesh input for extension ${ext.id}`)
+      }
+    }
+    // A declared prompt port owns its connected text (including blank values).
+    // Legacy text models and unrelated named/mixed declarations keep their ABI.
+    const promptPort = isTextInput && namedModelInputs.find((port) => port.name === 'prompt' && port.type === 'text')
+    if (promptPort) {
+      nodeInputText = undefined
+      for (const edge of incomingEdges) {
+        if (edge.targetHandle !== promptPort.name) continue
+        const src = resolveSource(edge.source)
+        if (src?.text !== undefined && (!src.outputType || src.outputType === 'text')) nodeInputText = src.text
+      }
+    }
     const activeImagePath = (isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
     if (!isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
@@ -412,10 +442,7 @@ async function executeExtensionNode(
 
     const extraParams: Record<string, unknown> = {}
     if (nodeInputMeshPath) {
-      const norm = nodeInputMeshPath.replace(/\\/g, '/')
-      extraParams.mesh_path = norm.startsWith(workspaceDir)
-        ? norm.slice(workspaceDir.length).replace(/^\//, '')
-        : norm
+      extraParams.mesh_path = normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
     }
     if (nodeInputText !== undefined && nodeInputText.trim().length > 0) {
       extraParams.prompt = nodeInputText
@@ -450,6 +477,18 @@ async function executeExtensionNode(
     } else if (isTextInput) {
       const { prompt: _prompt, ...params } = effectiveParams
       const prompt = resolveWorkflowPrompt(effectiveParams, nodeInputText)
+      if (promptPort && promptPort.required !== false && !prompt.trim()) {
+        throw new Error(`Missing required prompt input for extension ${ext.id}`)
+      }
+      // This is the specialized text + rigged_mesh adapter, not a multi-mesh ABI.
+      const riggedMeshPath = meshPaths.get('rigged_mesh')
+      if (riggedMeshPath) {
+        const normalized = normalizeWorkflowPath(riggedMeshPath, workspaceDir)
+        extraParams.rigged_mesh_path = normalized
+        extraParams.mesh_path = normalized
+        extraParams.node_id = ext.nodeId
+        extraParams.model_id = ext.id
+      }
       submission = await client.post('/generate/from-text', {
         prompt, model_id: ext.id, collection: 'Workflows',
         remesh: 'none', enable_texture: false, texture_resolution: 1024,

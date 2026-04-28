@@ -39,6 +39,7 @@ let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
 let fsReadCalls: string[]
 let iteratorFileNames: string[]
+let workspaceDir: string
 let onProcessRun: ((call: RunProcessCall) => void) | undefined
 let appState: {
   apiUrl: string
@@ -57,6 +58,7 @@ beforeEach(() => {
   runProcessCalls = []
   fsReadCalls = []
   iteratorFileNames = []
+  workspaceDir = '/workspace'
   onProcessRun = undefined
   appState = {
     apiUrl: 'http://inert.invalid', currentJob: null,
@@ -66,7 +68,7 @@ beforeEach(() => {
   }
   const fixture = { app: appState, get client() { return axiosClientMock } }
   const window = { electron: {
-    settings: { get: async () => ({ workspaceDir: '/workspace' }) },
+    settings: { get: async () => ({ workspaceDir }) },
     fs: {
       deleteDirectory: async () => ({ success: true }),
       listFiles: async () => iteratorFileNames,
@@ -199,6 +201,51 @@ function createMultiInputWorkflow(args: {
     createdAt: '2026-04-27T00:00:00.000Z',
     updatedAt: '2026-04-27T00:00:00.000Z',
   }
+}
+
+function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePath?: string; includeMeshEdge?: boolean }): Workflow {
+  const nodes = [
+    createNode('text-source', 'textNode', { enabled: true, params: { text: args.text ?? 'Walk forward' } }),
+    createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/rigs/avatar.glb' } }),
+    args.node,
+    createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+  ]
+  const edges: WFEdge[] = [
+    { id: 'edge-text', source: 'text-source', target: args.node.id, targetHandle: 'prompt' },
+    ...(args.includeMeshEdge === false ? [] : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: 'rigged_mesh' }]),
+    { id: 'edge-output', source: args.node.id, target: 'output-node' },
+  ]
+
+  return {
+    id: 'workflow-text-mesh',
+    name: 'Dispatch Workflow Text Mesh',
+    description: '',
+    nodes,
+    edges,
+    createdAt: '2026-04-28T00:00:00.000Z',
+    updatedAt: '2026-04-28T00:00:00.000Z',
+  }
+}
+
+function createNamedTextMeshModelExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  return createWorkflowExtension({
+    id: 'motion/animate', extensionId: 'motion-owner', nodeId: 'animate', input: 'text',
+    inputs: [{ name: 'prompt', type: 'text' }, { name: 'rigged_mesh', type: 'mesh' }],
+    ...overrides,
+  })
+}
+
+function captureTextRequests(): Record<string, unknown>[] {
+  const posts: Record<string, unknown>[] = []
+  axiosClientMock = {
+    async post(path, data) {
+      assert.equal(path, '/generate/from-text')
+      posts.push(JSON.parse(JSON.stringify(data)))
+      return { data: { job_id: 'named-mesh' } }
+    },
+    async get() { return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } } },
+  }
+  return posts
 }
 
 test('resolves model dispatch from extension type even for image-to-mesh nodes', () => {
@@ -693,6 +740,271 @@ test('workflowRunStore dispatches text-capability model nodes through the text g
   assert.deepEqual(fsReadCalls, [])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/text-model.glb')
+})
+
+test('workflowRunStore routes named rigged mesh input into text generation params', async () => {
+  const ext = createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    name: 'Animate Rigged Mesh',
+    type: 'model',
+    input: 'text',
+    output: 'mesh',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: '' },
+      { id: 'duration', label: 'Duration', type: 'float', default: 5 },
+    ],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { duration: 3 },
+    }),
+    text: 'Jump and wave',
+    meshFilePath: '/workspace/rigs/avatar.glb',
+  })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+        return { data: { job_id: 'job-text-mesh' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Jump and wave',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      duration: 3,
+      prompt: 'Jump and wave',
+      text: 'Jump and wave',
+      rigged_mesh_path: 'rigs/avatar.glb',
+      mesh_path: 'rigs/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: ext.id,
+    },
+  })
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore blocks animate-rigged-mesh before generation when rigged mesh is missing', async () => {
+  const ext = createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    type: 'model',
+    input: 'text',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: '' }],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    includeMeshEdge: false,
+  })
+  let postCalls = 0
+  let getCalls = 0
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls += 1
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      getCalls += 1
+      throw new Error(`Unexpected axios.get call: ${path}`)
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls, 0)
+  assert.equal(getCalls, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.equal(
+    useWorkflowRunStore.getState().runState.error,
+    'Error: Missing required rigged_mesh mesh input for extension kimodo/animate-rigged-mesh',
+  )
+})
+
+for (const [workspace, filePath, expected] of [
+  ['/workspace', '/workspace/rigs/avatar.glb', 'rigs/avatar.glb'],
+  ['/workspace', '/workspace-other/avatar.glb', '/workspace-other/avatar.glb'],
+  ['/workspace/', 'rigs\\avatar.glb', 'rigs/avatar.glb'],
+  ['C:\\workspace\\', 'C:\\workspace\\rigs\\avatar.glb', 'rigs/avatar.glb'],
+  ['C:\\workspace', 'C:\\workspace-other\\avatar.glb', 'C:/workspace-other/avatar.glb'],
+]) {
+  test(`named rigged mesh path respects workspace boundaries: ${filePath}`, async () => {
+    workspaceDir = workspace
+    const ext = createNamedTextMeshModelExtension()
+    const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id), meshFilePath: filePath })
+    workflow.nodes[2].data.params = { node_id: 'stale-node', model_id: 'stale-model' }
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    assert.equal(posts[0].model_id, ext.id)
+    assert.deepEqual(posts[0].params, {
+      prompt: 'Walk forward', text: 'Walk forward', rigged_mesh_path: expected, mesh_path: expected,
+      node_id: ext.nodeId, model_id: ext.id,
+    })
+    assert.deepEqual(fsReadCalls, [])
+  })
+}
+
+for (const wrongKind of [false, true]) {
+  test(`required named mesh uses typed Wait sources before image reads or HTTP (${wrongKind})`, async () => {
+    const ext = createNamedTextMeshModelExtension()
+    const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id) })
+    if (wrongKind) workflow.nodes[1].type = 'imageNode'
+    workflow.nodes.push(createNode('wait', 'waitNode'))
+    workflow.edges[1].source = 'wait'
+    workflow.edges.push({ id: 'mesh-wait', source: 'mesh-source', target: 'wait' })
+    workflow.edges.reverse()
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(posts.length, 0)
+    await useWorkflowRunStore.getState().continueRun('wait')
+    assert.equal(posts.length, wrongKind ? 0 : 1)
+    assert.equal(useWorkflowRunStore.getState().runState.status, wrongKind ? 'error' : 'done')
+    if (wrongKind) assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
+    else assert.equal((posts[0].params as Record<string, unknown>).rigged_mesh_path, 'rigs/avatar.glb')
+    assert.deepEqual(fsReadCalls, [])
+    assert.equal(runProcessCalls.length, 0)
+  })
+}
+
+test('omitted required defaults to true and validates mesh before the image MODEL reads its front', async () => {
+  const ext = createNamedImageModelExtension({ inputs: [{ name: 'front', type: 'image' }, { name: 'rigged_mesh', type: 'mesh' }] })
+  const workflow = createMultiInputWorkflow({ node: createExtensionNode(ext.id), imageSources: [
+    { id: 'front', filePath: '/front.png', targetHandle: 'front' },
+  ] })
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
+  assert.equal(posts.length, 0)
+  assert.deepEqual(fsReadCalls, [])
+})
+
+test('optional mesh and prompt permit omission and retain falsy/unknown parameters', async () => {
+  const ext = createNamedTextMeshModelExtension({ inputs: [
+    { name: 'prompt', type: 'text', required: false }, { name: 'rigged_mesh', type: 'mesh', required: false },
+  ] })
+  const node = createExtensionNode(ext.id)
+  node.data.params = { prompt: '', seed: 0, enabled: false, empty: '', unknown: { keep: true } }
+  const workflow = createTextMeshWorkflow({ node, text: '', includeMeshEdge: false })
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(posts[0].prompt, '')
+  assert.deepEqual(posts[0].params, { seed: 0, enabled: false, empty: '', unknown: { keep: true } })
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(node.data.params.prompt, '')
+})
+
+for (const connected of [false, true]) {
+  test(`declared required prompt rejects blanks without falling back over connected empty text (${connected})`, async () => {
+    const ext = createNamedTextMeshModelExtension()
+    const node = createExtensionNode(ext.id)
+    node.data.params = { prompt: connected ? 'must not replace connected blank' : '  ' }
+    const workflow = createTextMeshWorkflow({ node, text: '  ' })
+    if (!connected) workflow.edges = workflow.edges.filter((edge) => edge.id !== 'edge-text')
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+    assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required prompt input/)
+    assert.equal(posts.length, 0)
+    assert.deepEqual(fsReadCalls, [])
+  })
+}
+
+test('required prompt still accepts the current text alias when no prompt edge is connected', async () => {
+  const ext = createNamedTextMeshModelExtension({ params: [{ id: 'text', label: 'Text', type: 'string', default: 'Alias motion' }] })
+  const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id) })
+  workflow.edges = workflow.edges.filter((edge) => edge.id !== 'edge-text')
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(posts[0].prompt, 'Alias motion')
+})
+
+test('unrelated named text declarations do not gain a required-prompt rule or generic mesh transport', async () => {
+  const ext = createNamedTextMeshModelExtension({ inputs: [
+    { name: 'description', type: 'text' }, { name: 'reference_mesh', type: 'mesh' },
+  ] })
+  const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id), text: '' })
+  workflow.edges[0].targetHandle = 'description'
+  workflow.edges[1].targetHandle = 'reference_mesh'
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(posts[0].prompt, '')
+  assert.deepEqual(posts[0].params, {})
+})
+
+test('mixed positional text and mesh keeps the existing image adapter without blank-prompt validation', async () => {
+  const ext = createWorkflowExtension({ input: 'text', inputs: ['text', 'mesh', 'image'] })
+  const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id), text: '', meshFilePath: '/workspace-other/avatar.glb' })
+  workflow.edges[0].targetHandle = 'input-0'
+  workflow.edges[1].targetHandle = 'input-1'
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(JSON.parse(String(posts[0].get('params'))), { mesh_path: '/workspace-other/avatar.glb' })
+  assert.deepEqual(fsReadCalls, [])
+})
+
+test('named text MODEL resolves every For Each mesh with its current capability identity', async () => {
+  iteratorFileNames = ['a.glb', 'b.glb']
+  const ext = createNamedTextMeshModelExtension()
+  const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id) })
+  workflow.nodes[1] = createNode('mesh-source', 'forEachNode', { enabled: true, params: { dir: '/workspace/rigs', mode: 'mesh' } })
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(posts.map((post) => (post.params as Record<string, unknown>).rigged_mesh_path), ['rigs/a.glb', 'rigs/b.glb'])
+  assert.deepEqual(fsReadCalls, [])
+})
+
+test('named rigged mesh PROCESS input stays typed and does not acquire MODEL metadata params', async () => {
+  const ext = createNamedTextMeshModelExtension({ type: 'process' })
+  const node = createExtensionNode(ext.id)
+  node.data.params = { mesh_path: 'user-mesh', node_id: 'user-node', enabled: false }
+  const workflow = createTextMeshWorkflow({ node })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(runProcessCalls, [{ extensionId: ext.extensionId, input: { nodeId: ext.nodeId, inputs: {
+    prompt: { type: 'text', text: 'Walk forward', sourceNodeId: 'text-source' },
+    rigged_mesh: { type: 'mesh', filePath: '/workspace/rigs/avatar.glb', sourceNodeId: 'mesh-source' },
+  } }, params: node.data.params }])
+  assert.deepEqual(fsReadCalls, [])
 })
 
 test('workflowRunStore blocks model dispatch before backend requests when capability input metadata is missing', async () => {

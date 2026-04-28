@@ -67,6 +67,13 @@ type ModelGenerationRequest =
 
 const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
 
+function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
+  const norm = filePath.replace(/\\/g, '/')
+  return norm.startsWith(workspaceDir)
+    ? norm.slice(workspaceDir.length).replace(/^\//, '')
+    : norm
+}
+
 function resolveModelImageRouting(args: {
   ext: WorkflowExtension
   incomingEdges: WFEdge[]
@@ -105,6 +112,38 @@ function resolveModelImageRouting(args: {
   }
 }
 
+function resolveModelMeshRouting(args: {
+  ext: WorkflowExtension
+  incomingEdges: WFEdge[]
+  nodeOutputs: Map<string, { filePath?: string; text?: string; outputType?: string }>
+}): {
+  applies: boolean
+  requiredPorts: string[]
+  routed: Map<string, string>
+} {
+  const meshPorts = args.ext.inputs?.filter((port) => port.type === 'mesh') ?? []
+  if (meshPorts.length === 0) {
+    return { applies: false, requiredPorts: [], routed: new Map() }
+  }
+
+  const meshPortNames = new Set(meshPorts.map((port) => port.name))
+  const routed = new Map<string, string>()
+  for (const edge of args.incomingEdges) {
+    const handle = edge.targetHandle ?? undefined
+    if (!handle || !meshPortNames.has(handle)) continue
+
+    const src = args.nodeOutputs.get(edge.source)
+    if (!src?.filePath || src.outputType !== 'mesh') continue
+    routed.set(handle, src.filePath)
+  }
+
+  return {
+    applies: true,
+    requiredPorts: meshPorts.filter((port) => port.required).map((port) => port.name),
+    routed,
+  }
+}
+
 function buildModelGenerationRequest(args: {
   ext: WorkflowExtension
   node: WFNode
@@ -112,6 +151,7 @@ function buildModelGenerationRequest(args: {
   nodeInputPath?: string
   nodeInputText?: string
   nodeInputMeshPath?: string
+  routedMeshParams?: Record<string, string>
   routedSideParams?: Record<string, string>
   selectedImagePath?: string
   selectedImageData?: string
@@ -124,6 +164,7 @@ function buildModelGenerationRequest(args: {
     nodeInputPath,
     nodeInputText,
     nodeInputMeshPath,
+    routedMeshParams = {},
     routedSideParams = {},
     selectedImagePath,
     selectedImageData,
@@ -138,6 +179,9 @@ function buildModelGenerationRequest(args: {
     const promptParam = typeof nodeParams.prompt === 'string' ? nodeParams.prompt : undefined
     const prompt = nodeInputText ?? promptParam ?? ''
     const { prompt: _prompt, ...params } = nodeParams
+    if (!prompt.trim()) {
+      throw new Error(`Missing required prompt input for extension ${ext.id}`)
+    }
 
     return {
       kind: 'text',
@@ -148,7 +192,7 @@ function buildModelGenerationRequest(args: {
         remesh: 'none',
         enable_texture: false,
         texture_resolution: 1024,
-        params,
+        params: { ...params, ...routedMeshParams },
       },
     }
   }
@@ -166,10 +210,7 @@ function buildModelGenerationRequest(args: {
   )
   const extraParams: Record<string, unknown> = {}
   if (nodeInputMeshPath) {
-    const norm = nodeInputMeshPath.replace(/\\/g, '/')
-    extraParams.mesh_path = norm.startsWith(workspaceDir)
-      ? norm.slice(workspaceDir.length).replace(/^\//, '')
-      : norm
+    extraParams.mesh_path = normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
   }
 
   return {
@@ -697,6 +738,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           incomingEdges,
           nodeOutputs,
         })
+        const modelMeshRouting = resolveModelMeshRouting({
+          ext,
+          incomingEdges,
+          nodeOutputs,
+        })
 
         if (ext?.inputs && ext.inputs.length > 1) {
           // Multi-input: route each incoming edge by the source node's outputType
@@ -725,6 +771,23 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
         if (modelImageRouting.applies) {
           nodeInputPath = modelImageRouting.frontPath
+        }
+
+        const routedMeshParams: Record<string, string> = {}
+        if (modelMeshRouting.applies) {
+          for (const requiredPort of modelMeshRouting.requiredPorts) {
+            if (!modelMeshRouting.routed.get(requiredPort)) {
+              throw new Error(`Missing required ${requiredPort} mesh input for extension ${ext.id}`)
+            }
+          }
+          const riggedMeshPath = modelMeshRouting.routed.get('rigged_mesh')
+          if (riggedMeshPath) {
+            const normalized = normalizeWorkflowPath(riggedMeshPath, workspaceDir)
+            routedMeshParams.rigged_mesh_path = normalized
+            routedMeshParams.mesh_path = normalized
+            routedMeshParams.node_id = ext.nodeId
+            routedMeshParams.model_id = node.data.extensionId ?? ''
+          }
         }
 
         set((s) => ({
@@ -757,6 +820,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             nodeInputPath,
             nodeInputText,
             nodeInputMeshPath,
+            routedMeshParams,
             routedSideParams: modelImageRouting.sideParams,
             selectedImagePath,
             selectedImageData,

@@ -130,12 +130,11 @@ async function renderCard(runtimeReadinessById: Record<string, RuntimeReadiness 
   }
 }
 
-test('ExtensionCard maps runtime readiness to Codex iteration-one labels', async () => {
+test('ExtensionCard maps runtime failures to Codex iteration-one labels', async () => {
   const cases: Array<[RuntimeReadiness, string]> = [
     [createReadiness('preflight/codex_missing', 'Setup Codex'), 'Setup Codex'],
     [createReadiness('preflight/not_authenticated', 'Login'), 'Login'],
     [createReadiness('preflight/unsupported_version', 'Update Codex'), 'Update Codex'],
-    [createReadiness('ready', 'Ready', true), 'Ready'],
   ]
 
   for (const [readiness, expectedLabel] of cases) {
@@ -175,11 +174,11 @@ test('ExtensionCard shows non-blocking checking-failed readiness without startin
   assert.doesNotMatch(html, />Install</)
 })
 
-test('ExtensionCard keeps source/group installs and download controls alongside runtime labels', async () => {
+test('ExtensionCard keeps source/group installs without a misleading runtime success label', async () => {
   const id = 'modly-codex-image-extension/text-to-image'
   for (const patch of [{ hasModelSources: true }, { weightGroups: ['base'] }]) {
     const html = await renderCard({ [id]: createReadiness('ready', 'Ready', true) }, undefined, patch)
-    assert.match(html, /aria-label="Runtime: Ready"/)
+    assert.doesNotMatch(html, /aria-label="Runtime: Ready"/)
     assert.match(html, />Install</)
     assert.match(html, /Install all/)
     assert.match(html, /0\/1 nodes installed/)
@@ -505,7 +504,7 @@ test('ExtensionCard keeps installed sources groups variants and active download 
   for (const node of [
     { hasModelSources: true },
     { weightGroups: ['base'] },
-    { hasModelSources: true, weightVariants: { options: [{ id: 'one' }, { id: 'two' }] } },
+    { hfRepo: 'org/repo', weightVariants: { param: 'variant', default: 'one', options: [{ id: 'one', label: 'One' }, { id: 'two', label: 'Two' }] } },
   ]) {
     const html = await renderCard({ [id]: createActionReadiness() }, undefined, node, { installedIds: [id] })
     assert.match(html, /Installed/)
@@ -522,5 +521,101 @@ test('ExtensionCard keeps installed sources groups variants and active download 
     assert.match(html, /Cancel download/)
     assert.doesNotMatch(html, /Install all/)
     assert.match(html, />Refresh<\/button>/)
+  }
+})
+
+test('ExtensionCard suppresses runtime success for installed and genuinely weightless nodes', async () => {
+  const id = 'modly-codex-image-extension/text-to-image'
+  const readiness = { [id]: createReadiness('ready', 'Ready', true) }
+  const weightless = await renderCard(readiness)
+  assert.match(weightless, />All nodes ready</)
+  assert.doesNotMatch(weightless, /Runtime:|>Install</)
+
+  const installed = await renderCard(readiness, undefined, { hasModelSources: true, weightGroups: ['base'] }, { installedIds: [id] })
+  assert.match(installed, /Installed/)
+  assert.match(installed, />All nodes ready</)
+  assert.doesNotMatch(installed, /Runtime:|Install all/)
+})
+
+test('ExtensionCard runtime success cannot complete missing private groups or variant weights', async () => {
+  const id = 'modly-codex-image-extension/text-to-image'
+  for (const patch of [
+    { hasModelSources: true },
+    { weightGroups: ['distinct-group'] },
+    { hasModelSources: true, weightGroups: ['distinct-group'] },
+    { hfRepo: 'org/repo', weightVariants: { param: 'variant', default: 'small', options: [{ id: 'small', label: 'Small' }] } },
+  ]) {
+    const html = await renderCard({ [id]: createReadiness('ready', 'Ready', true) }, undefined, patch)
+    assert.match(html, />Install</)
+    assert.match(html, /Install all/)
+    assert.match(html, /0\/1 nodes installed/)
+    assert.doesNotMatch(html, /Runtime:|All nodes ready|>Installed</)
+  }
+})
+
+test('ExtensionCard keeps shared-owner siblings independently installed and warnings quiet after runtime success', async () => {
+  const { deriveModelOwnershipState } = await import(pathToFileURL(path.join(projectRoot, 'src/areas/models/modelOwnershipState.ts')).href)
+  const capabilities = ['complete', 'incomplete'].map((id) => ({
+    capabilityId: `bundle/${id}`, bundleId: 'bundle', weightOwnerId: 'bundle/private', sharedOwner: true,
+    legacyPaths: ['bundle/complete', 'bundle/incomplete'],
+  }))
+  const installedIds = ['bundle/complete']
+  const ownershipStateById = deriveModelOwnershipState(capabilities, new Set(['bundle/private']), new Set(), new Set(installedIds))
+  const nodes = capabilities.map((capability, index) => ({
+    id: index ? 'incomplete' : 'complete', name: index ? 'Incomplete node' : 'Complete node',
+    input: 'text', output: 'image', paramsSchema: [], hasModelSources: true,
+    weightGroups: [index ? 'missing-group' : 'complete-group'], ...capability,
+  }))
+  const html = await renderCard(Object.fromEntries(capabilities.map(({ capabilityId }) => [capabilityId, createReadiness('ready', 'Ready', true)])), undefined, {}, {
+    ext: { type: 'model', id: 'bundle', name: 'Bundle', trusted: true, builtin: false, nodes },
+    installedIds, ownershipStateById,
+  })
+  assert.match(html, /Complete node[\s\S]*?Installed[\s\S]*?Incomplete node[\s\S]*?>Install</)
+  assert.match(html, /1\/2 nodes installed/)
+  assert.doesNotMatch(html, /Runtime:|All nodes ready/)
+  assert.equal(ownershipStateById['bundle/incomplete'].downloaded, false)
+  assert.equal(ownershipStateById['bundle/incomplete'].installDisabled, false)
+  assert.equal(ownershipStateById['bundle/complete'].deleteDisabled, true)
+  assert.match(html, /title="Downloading this node also prepares shared weights for another node in this extension\."/)
+  assert.doesNotMatch(html, /<p[^>]*>Shared weights|<p[^>]*>Downloading this node/)
+})
+
+test('ExtensionCard preserves installed weight status beside runtime failures and stale success', async () => {
+  const id = 'modly-codex-image-extension/text-to-image'
+  for (const [readiness, label] of [
+    [createReadiness('checking_failed', 'Checking failed'), 'Checking failed'],
+    [createReadiness('preflight/not_authenticated', 'Login'), 'Login'],
+    [{ ...createReadiness('ready', 'Ready', true), stale: true }, 'Checking failed (stale)'],
+  ] as const) {
+    const html = await renderCard({ [id]: readiness }, undefined, { hasModelSources: true, weightGroups: ['base'] }, { installedIds: [id] })
+    assert.ok(html.includes(`aria-label="Runtime: ${label}"`))
+    assert.match(html, /Installed/)
+    assert.match(html, />All nodes ready</)
+    assert.doesNotMatch(html, /aria-label="Runtime: Ready"/)
+  }
+})
+
+test('ExtensionCard keeps only explicit URL and refresh actions when the runtime success label is hidden', async () => {
+  const readiness = { ...createActionReadiness(), ...createReadiness('ready', 'Ready', true) }
+  const html = await renderCard({ 'canonical/node': readiness }, undefined, { capabilityId: 'canonical/node', hasModelSources: true }, {
+    runtimeReadinessActionLoadingById: { 'canonical/node:refresh': true },
+    runtimeReadinessActionErrorById: { 'canonical/node:refresh': 'Refresh failed.', 'canonical/node:runtime-details': 'Hidden details error.' },
+  })
+  assert.doesNotMatch(html, /Runtime:|>Setup Codex<\/button>|>Details<\/button>|Hidden details error/)
+  assert.match(html, />Open docs<\/button>/)
+  assert.match(html, /<button[^>]*disabled=""[^>]*aria-busy="true"[^>]*>Refresh<\/button>/)
+  assert.match(html, /role="alert"[^>]*>Refresh failed\./)
+  assert.match(html, />Install</)
+})
+
+test('ExtensionCard keeps pause resume and cancel controls while runtime success is hidden', async () => {
+  const id = 'modly-codex-image-extension/text-to-image'
+  for (const paused of [false, true]) {
+    const html = await renderCard({ [id]: createReadiness('ready', 'Ready', true) }, 'org/repo', {}, {
+      downloading: { [id]: { percent: 25, paused, variantId: 'small' } },
+    })
+    assert.ok(html.includes(paused ? 'Resume download' : 'Pause download'))
+    assert.match(html, /Cancel download/)
+    assert.doesNotMatch(html, /Runtime:|Install all/)
   }
 })

@@ -192,7 +192,7 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
           {ext.nodes.map((node) => {
             const fullId        = `${ext.id}/${node.id}`
             const runtimeReadiness = runtimeReadinessById?.[fullId]
-            const runtimeLabel = resolveRuntimeReadinessLabel(runtimeReadiness)
+            const runtimeLabel = runtimeReadiness?.ok ? null : resolveRuntimeReadinessLabel(runtimeReadiness)
             const visibleRuntimeActions = (runtimeReadiness?.actions ?? []).filter((action) => (
               action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
             ))

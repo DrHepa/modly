@@ -308,15 +308,6 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                     ))}
                   </div>
                 )}
-
-                {ownershipState?.warning && hasWeights && (
-                  <div className="ml-auto w-[calc(100%-7rem)] flex items-start gap-1.5 px-2 py-1 rounded-lg bg-amber-950/20 border border-amber-900/30">
-                    <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-300 shrink-0 mt-px">
-                      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                    </svg>
-                    <p className="text-[10px] text-amber-200/90 leading-relaxed">{ownershipState.warning}</p>
-                  </div>
-                )}
               </div>
             )
           })}

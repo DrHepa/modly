@@ -48,14 +48,16 @@ function createSharedWarning(
   if (peerCapabilityIds.length === 0) return null
 
   if (isOwnerDownloading) {
-    return `Shared weights are downloading for: ${ownerCapabilityIds.join(', ')}. Wait for the owner download to finish.`
+    return ownerCapabilityIds.length > 1
+      ? 'Shared weights are downloading for this extension. Wait for the download to finish.'
+      : 'Model weights are downloading. Wait for the download to finish.'
   }
 
   if (downloaded) {
-    return `Shared weights are still used by: ${peerCapabilityIds.join(', ')}. Uninstall the whole extension to remove them safely.`
+    return 'Shared weights are used by another node in this extension. Uninstall the whole extension to remove them safely.'
   }
 
-  return `Downloading this node also downloads shared weights for: ${peerCapabilityIds.join(', ')}.`
+  return 'Downloading this node also prepares shared weights for another node in this extension.'
 }
 
 export function deriveModelOwnershipState(

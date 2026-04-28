@@ -36,7 +36,7 @@ test('deriveModelOwnershipState marks every capability ready when their shared o
     installDisabled: true,
     isOwnerDownloading: false,
     ownerPeerCapabilityIds: ['image-bundle/sdxl-base'],
-    warning: 'Shared weights are still used by: image-bundle/sdxl-base. Uninstall the whole extension to remove them safely.',
+    warning: 'Shared weights are used by another node in this extension. Uninstall the whole extension to remove them safely.',
   })
   assert.equal(state['image-bundle/sdxl-base']?.downloaded, true)
 })
@@ -104,7 +104,7 @@ test('deriveModelOwnershipState exposes shared-owner badge and blocks per-node d
     installDisabled: true,
     isOwnerDownloading: false,
     ownerPeerCapabilityIds: ['image-bundle/sdxl-base'],
-    warning: 'Shared weights are still used by: image-bundle/sdxl-base. Uninstall the whole extension to remove them safely.',
+    warning: 'Shared weights are used by another node in this extension. Uninstall the whole extension to remove them safely.',
   })
 })
 
@@ -142,6 +142,6 @@ test('deriveModelOwnershipState disables sibling downloads while a shared owner 
     installDisabled: true,
     isOwnerDownloading: true,
     ownerPeerCapabilityIds: ['image-bundle/sd15'],
-    warning: 'Shared weights are downloading for: image-bundle/sd15, image-bundle/sdxl-base. Wait for the owner download to finish.',
+    warning: 'Shared weights are downloading for this extension. Wait for the download to finish.',
   })
 })

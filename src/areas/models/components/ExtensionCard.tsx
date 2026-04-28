@@ -206,7 +206,6 @@ export function ExtensionCard({
                     </span>
                   )}
                   {ownership?.sharedOwner && <span className="text-[10px] text-sky-300" title={ownership.warning ?? undefined}>Shared weights</span>}
-                  {ownership?.warning && <p className="text-[10px] text-amber-300 leading-relaxed">{ownership.warning}</p>}
                 </div>
                 {isModel && (
                   <div className="shrink-0">
@@ -240,7 +239,6 @@ export function ExtensionCard({
                     })}
                   </div>
                 )}
-
               </div>
             )
           })}

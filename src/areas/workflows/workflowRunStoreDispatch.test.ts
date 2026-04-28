@@ -212,6 +212,30 @@ function createMultiInputWorkflow(args: {
   }
 }
 
+function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePath?: string; includeMeshEdge?: boolean }): Workflow {
+  const nodes = [
+    createNode('text-source', 'textNode', { enabled: true, params: { text: args.text ?? 'Walk forward' } }),
+    createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/rigs/avatar.glb' } }),
+    args.node,
+    createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+  ]
+  const edges: WFEdge[] = [
+    { id: 'edge-text', source: 'text-source', target: args.node.id, targetHandle: 'prompt' },
+    ...(args.includeMeshEdge === false ? [] : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: 'rigged_mesh' }]),
+    { id: 'edge-output', source: args.node.id, target: 'output-node' },
+  ]
+
+  return {
+    id: 'workflow-text-mesh',
+    name: 'Dispatch Workflow Text Mesh',
+    description: '',
+    nodes,
+    edges,
+    createdAt: '2026-04-28T00:00:00.000Z',
+    updatedAt: '2026-04-28T00:00:00.000Z',
+  }
+}
+
 test('resolves model dispatch from extension type even for image-to-mesh nodes', () => {
   const ext = createWorkflowExtension({ type: 'model' })
 
@@ -576,6 +600,121 @@ test('workflowRunStore dispatches text-capability model nodes through the text g
   assert.deepEqual(fsReadCalls, [])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/text-model.glb')
+})
+
+test('workflowRunStore routes named rigged mesh input into text generation params', async () => {
+  const ext = createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    name: 'Animate Rigged Mesh',
+    type: 'model',
+    input: 'text',
+    output: 'mesh',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: '' },
+      { id: 'duration', label: 'Duration', type: 'float', default: 5 },
+    ],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { duration: 3 },
+    }),
+    text: 'Jump and wave',
+    meshFilePath: '/workspace/rigs/avatar.glb',
+  })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-text-mesh' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Jump and wave',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      duration: 3,
+      rigged_mesh_path: 'rigs/avatar.glb',
+      mesh_path: 'rigs/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: ext.id,
+    },
+  })
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore blocks animate-rigged-mesh before generation when rigged mesh is missing', async () => {
+  const ext = createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    type: 'model',
+    input: 'text',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: '' }],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    includeMeshEdge: false,
+  })
+  let postCalls = 0
+  let getCalls = 0
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls += 1
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      getCalls += 1
+      throw new Error(`Unexpected axios.get call: ${path}`)
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls, 0)
+  assert.equal(getCalls, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.equal(
+    useWorkflowRunStore.getState().runState.error,
+    'Error: Missing required rigged_mesh mesh input for extension kimodo/animate-rigged-mesh',
+  )
 })
 
 test('workflowRunStore blocks model dispatch before backend requests when capability input metadata is missing or unsupported', async () => {

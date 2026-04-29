@@ -151,6 +151,30 @@ def test_extension_process_and_runner_keep_capability_id_with_owner_model_dir(
     assert model_dir == owner_model_dir
 
 
+def test_extension_process_load_ignores_stale_unloaded_ack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    process = ExtensionProcess(tmp_path, {"id": "kimodo-soma-rp/animate-rigged-mesh"})
+    responses = iter([
+        {"type": "unloaded"},
+        {"type": "loaded"},
+    ])
+    sent: list[dict] = []
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+    monkeypatch.setattr(process, "_recv", lambda timeout=None: next(responses))
+
+    process.load()
+
+    assert sent == [{"action": "load"}]
+    assert process.is_loaded() is True
+
+
 def test_reload_keeps_bundled_fixture_capabilities_ready_across_legacy_and_canonical_layouts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

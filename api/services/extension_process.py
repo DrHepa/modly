@@ -352,15 +352,24 @@ class ExtensionProcess:
 
     def load(self) -> None:
         with self._model_invocation():
+            self._loaded = False
             self._ensure_started()
+            proc = self._proc
             self._send({"action": "load"})
 
-            msg = self._recv(timeout=None)  # model load can be arbitrarily slow
-            if msg.get('type') in ['loaded', 'ready']:
-                self._loaded = True
-            elif msg.get("type") == "error":
-                raise RuntimeError(msg.get("traceback") or msg.get("message"))
-            else:
+            while True:
+                msg = self._recv(timeout=None)  # model load can be arbitrarily slow
+                # A cooperative unload may time out before its acknowledgement
+                # arrives. It does not confirm this load, nor does startup ready.
+                if msg.get("type") == "unloaded":
+                    continue
+                if msg.get("type") == "loaded":
+                    if proc is None or self._proc is not proc or proc.poll() is not None:
+                        raise RuntimeError(f"[{self.MODEL_ID}] Load worker changed or stopped")
+                    self._loaded = True
+                    return
+                if msg.get("type") == "error":
+                    raise RuntimeError(msg.get("traceback") or msg.get("message"))
                 raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to load: {msg}")
 
     def unload(self) -> None:

@@ -175,6 +175,8 @@ class ExtensionProcess:
         self._send({"action": "load"})
 
         msg = self._recv(timeout=None)  # model load can be arbitrarily slow
+        if msg.get("type") == "unloaded":
+            msg = self._recv(timeout=None)
         if msg.get("type") == "loaded":
             self._loaded = True
         elif msg.get("type") == "error":

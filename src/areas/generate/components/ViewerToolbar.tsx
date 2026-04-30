@@ -1,11 +1,15 @@
 import type { ViewMode } from '../models'
+import { resolveAnimationToggleState } from './viewerAnimation'
 export type { ViewMode }
 
 interface ViewerToolbarProps {
   viewMode: ViewMode
   autoRotate: boolean
+  animationPlaying: boolean
+  hasAnimations: boolean
   onViewMode: (mode: ViewMode) => void
   onAutoRotate: () => void
+  onAnimationToggle: () => void
   onScreenshot: () => void
   showViewModes?: boolean   // view modes are mesh-only; hidden for splats
 }
@@ -70,11 +74,16 @@ const MODES: { mode: ViewMode; icon: React.ReactNode; label: string }[] = [
 export function ViewerToolbar({
   viewMode,
   autoRotate,
+  animationPlaying,
+  hasAnimations,
   onViewMode,
   onAutoRotate,
+  onAnimationToggle,
   onScreenshot,
   showViewModes = true,
 }: ViewerToolbarProps): JSX.Element {
+  const animationState = resolveAnimationToggleState({ hasAnimations, animationPlaying })
+
   return (
     <div className="absolute left-4 top-1/2 -translate-y-1/2 z-20 flex flex-col gap-1 bg-zinc-900/70 border border-zinc-700/50 backdrop-blur-sm rounded-xl p-1.5">
       {showViewModes && MODES.map(({ mode, icon, label }) => (
@@ -102,6 +111,25 @@ export function ViewerToolbar({
       </ToolbarButton>
 
       <ToolbarButton
+        active={animationPlaying && hasAnimations}
+        disabled={animationState.disabled}
+        label={animationState.label}
+        ariaPressed={animationState.pressed}
+        onClick={onAnimationToggle}
+      >
+        {animationPlaying && hasAnimations ? (
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+            <rect x="6" y="4" width="4" height="16" rx="1" />
+            <rect x="14" y="4" width="4" height="16" rx="1" />
+          </svg>
+        ) : (
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        )}
+      </ToolbarButton>
+
+      <ToolbarButton
         active={false}
         label="Screenshot"
         onClick={onScreenshot}
@@ -120,16 +148,23 @@ interface ToolbarButtonProps {
   label: string
   onClick: () => void
   children: React.ReactNode
+  ariaPressed?: boolean
+  disabled?: boolean
 }
 
-function ToolbarButton({ active, label, onClick, children }: ToolbarButtonProps): JSX.Element {
+function ToolbarButton({ active, label, onClick, children, ariaPressed, disabled = false }: ToolbarButtonProps): JSX.Element {
   return (
     <button
       title={label}
+      aria-label={label}
+      aria-pressed={ariaPressed}
+      disabled={disabled}
       onClick={onClick}
       className={`
         relative w-8 h-8 flex items-center justify-center rounded-lg transition-colors
-        ${active
+        ${disabled
+          ? 'text-zinc-600 cursor-not-allowed opacity-60'
+          : active
           ? 'bg-violet-600 text-white'
           : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/60'
         }

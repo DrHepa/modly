@@ -1,7 +1,6 @@
-import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode, ErrorInfo, MutableRefObject } from 'react'
-import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber'
-import type { ThreeEvent } from '@react-three/fiber'
+import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode, ErrorInfo } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Environment, GizmoHelper, Lightformer, OrbitControls, useGizmoContext, useGLTF } from '@react-three/drei'
 import { EffectComposer, Outline, Select, Selection } from '@react-three/postprocessing'
 import * as THREE from 'three'
@@ -16,17 +15,9 @@ import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
-import type { LightSettings } from '@shared/stores/appStore'
-import { DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
-
-export type GizmoMode = 'translate' | 'rotate' | 'scale'
-
-const SELECTION_OUTLINE_VISIBLE_COLOR = 0x8b5cf6
-const SELECTION_OUTLINE_HIDDEN_COLOR = 0x5b21b6
-const SELECTION_OUTLINE_EDGE_STRENGTH = 2.5
-const SELECTION_OUTLINE_BLUR = false
-const SELECTION_OUTLINE_MULTISAMPLING = 0
-const SELECTION_OUTLINE_RESOLUTION_SCALE = 0.5
+import { resolveAnimationAvailability, syncAnimationActions } from './viewerAnimation'
+import type { LightSettings } from '../GeneratePage'
+import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 
 // ---------------------------------------------------------------------------
 // Procedural textures
@@ -136,45 +127,48 @@ function ModelLoadError(): JSX.Element {
 
 interface MeshModelProps {
   url: string
-  jobId: string
   viewMode: ViewMode
-  selected: boolean
+  animationPlaying: boolean
   onStats: (stats: { vertices: number; triangles: number }) => void
   onSelect: () => void
-  onObject: (obj: THREE.Object3D | null) => void
+  onAnimationAvailability: (hasAnimations: boolean) => void
 }
 
-function MeshModel({ url, jobId, viewMode, selected, onStats, onSelect, onObject }: MeshModelProps): JSX.Element {
-  const extension = url.split('?')[0]?.split('.').pop()?.toLowerCase()
-  const common = { url, jobId, viewMode, selected, onStats, onSelect, onObject }
-  return extension === 'obj' ? <ObjMeshModel {...common} /> : <GltfMeshModel {...common} />
-}
-
-function GltfMeshModel(props: MeshModelProps): JSX.Element {
-  const { scene } = useGLTF(props.url)
-  return <SceneMeshModel {...props} scene={scene} loaderType="gltf" />
-}
-
-function ObjMeshModel(props: MeshModelProps): JSX.Element {
-  const scene = useLoader(OBJLoader, props.url)
-  return <SceneMeshModel {...props} scene={scene} loaderType="obj" />
-}
-
-function SceneMeshModel({
-  url,
-  viewMode,
-  selected,
-  onStats,
-  onSelect,
-  onObject,
-  scene,
-  loaderType,
-}: MeshModelProps & {
-  scene: THREE.Group | THREE.Scene
-  loaderType: 'gltf' | 'obj'
-}): JSX.Element {
+function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnimationAvailability }: MeshModelProps): JSX.Element {
+  const { scene, animations } = useGLTF(url)
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
+  const mixerRef = useRef<THREE.AnimationMixer | null>(null)
+  const actionsRef = useRef<THREE.AnimationAction[]>([])
+
+  useEffect(() => {
+    onAnimationAvailability(resolveAnimationAvailability(animations))
+  }, [animations, onAnimationAvailability])
+
+  useEffect(() => {
+    const mixer = new THREE.AnimationMixer(scene)
+    const actions = animations.map((clip) => mixer.clipAction(clip))
+    mixerRef.current = mixer
+    actionsRef.current = actions
+
+    return () => {
+      actions.forEach((action) => action.stop())
+      mixer.stopAllAction()
+      mixer.uncacheRoot(scene)
+      actionsRef.current = []
+      mixerRef.current = null
+    }
+  }, [scene, animations])
+
+  useEffect(() => {
+    syncAnimationActions(actionsRef.current, animationPlaying && resolveAnimationAvailability(animations))
+  }, [animationPlaying, animations])
+
+  useFrame((_, delta) => {
+    if (animationPlaying && mixerRef.current) {
+      mixerRef.current.update(delta)
+    }
+  })
 
   // Expose the scene object so Viewer3D can attach the transform gizmo to it.
   useEffect(() => {
@@ -815,8 +809,9 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
 
   const [viewMode, setViewMode] = useState<ViewMode>('solid')
   const [autoRotate, setAutoRotate] = useState(false)
-  const selected = useAppStore((s) => s.meshSelected)
-  const setSelected = useAppStore((s) => s.setMeshSelected)
+  const [animationPlaying, setAnimationPlaying] = useState(false)
+  const [hasAnimations, setHasAnimations] = useState(false)
+  const [selected, setSelected] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const splatRef = useRef<SplatViewerHandle | null>(null)
 
@@ -847,6 +842,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
   useEffect(() => {
     setSelected(false)
     setViewMode('solid')
+    setAnimationPlaying(false)
+    setHasAnimations(false)
     setStoreMeshStats(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the model changes; setters are stable
   }, [modelUrl])
@@ -880,74 +877,12 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
     link.click()
   }
 
-  // Snapshot the pre-drag pose when a gizmo manipulation starts.
-  const handleGizmoDragStart = useCallback(() => {
-    if (meshObject) {
-      pendingTransform.current = {
-        p: meshObject.position.clone(),
-        q: meshObject.quaternion.clone(),
-        s: meshObject.scale.clone(),
-      }
+  const handleAnimationAvailability = (available: boolean) => {
+    setHasAnimations(available)
+    if (!available) {
+      setAnimationPlaying(false)
     }
-  }, [meshObject])
-
-  // Commit the snapshot on release, but only if the pose actually changed.
-  const handleGizmoDragEnd = useCallback(() => {
-    const before = pendingTransform.current
-    pendingTransform.current = null
-    if (!before || !meshObject) return
-    const changed = !meshObject.position.equals(before.p)
-      || !meshObject.quaternion.equals(before.q)
-      || !meshObject.scale.equals(before.s)
-    if (changed) transformHistory.current.push(before)
-  }, [meshObject])
-
-  // Revert the most recent gizmo manipulation. Returns false when there is
-  // nothing to undo, so the caller can fall back to the mesh-history undo.
-  const undoTransform = useCallback((): boolean => {
-    const prev = transformHistory.current.pop()
-    if (!prev || !meshObject) return false
-    meshObject.position.copy(prev.p)
-    meshObject.quaternion.copy(prev.q)
-    meshObject.scale.copy(prev.s)
-    return true
-  }, [meshObject])
-
-  // Expose transform-undo so the page's Ctrl+Z undoes gizmo edits first.
-  useEffect(() => {
-    if (!gizmoUndoRef) return
-    gizmoUndoRef.current = undoTransform
-    return () => { if (gizmoUndoRef.current === undoTransform) gizmoUndoRef.current = null }
-  }, [gizmoUndoRef, undoTransform])
-
-  // Drop the transform history when the model changes.
-  useEffect(() => {
-    transformHistory.current = []
-    pendingTransform.current = null
-  }, [modelUrl])
-
-  // Memoise the post-processing stack so its children stay referentially stable.
-  // @react-three/postprocessing rebuilds (recompiles) all EffectPasses whenever the
-  // <EffectComposer> children identity changes; without this, every Viewer3D re-render
-  // (e.g. dragging a Lighting slider) recompiles the outline shader. The Outline still
-  // tracks selection through the <Selection> context, so nothing here needs to depend
-  // on render state.
-  const postProcessing = useMemo(() => (
-    <EffectComposer
-      autoClear={false}
-      multisampling={SELECTION_OUTLINE_MULTISAMPLING}
-      resolutionScale={SELECTION_OUTLINE_RESOLUTION_SCALE}
-      frameBufferType={THREE.HalfFloatType}
-    >
-      <Outline
-        blur={SELECTION_OUTLINE_BLUR}
-        edgeStrength={SELECTION_OUTLINE_EDGE_STRENGTH}
-        visibleEdgeColor={SELECTION_OUTLINE_VISIBLE_COLOR}
-        hiddenEdgeColor={SELECTION_OUTLINE_HIDDEN_COLOR}
-        xRay={false}
-      />
-    </EffectComposer>
-  ), [])
+  }
 
 
   return (
@@ -984,22 +919,18 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
           <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
 
           {modelUrl && currentJob ? (
-            <Selection enabled={selected}>
-              {postProcessing}
-              <Suspense fallback={null}>
-                <directionalLight position={[5, 8, 5]} color={lightSettings.mainColor} intensity={lightSettings.mainIntensity} castShadow />
-                <directionalLight position={[-4, 2, -4]} color={lightSettings.fillColor} intensity={lightSettings.fillIntensity} />
-                <MeshModel
-                  url={modelUrl}
-                  jobId={currentJob.id}
-                  viewMode={viewMode}
-                  selected={selected}
-                  onStats={setStoreMeshStats}
-                  onSelect={() => setSelected(true)}
-                  onObject={setMeshObject}
-                />
-              </Suspense>
-            </Selection>
+            <Suspense fallback={null}>
+<directionalLight position={[5, 8, 5]} color={lightSettings.mainColor} intensity={lightSettings.mainIntensity} castShadow />
+              <directionalLight position={[-4, 2, -4]} color={lightSettings.fillColor} intensity={lightSettings.fillIntensity} />
+              <MeshModel
+                url={modelUrl}
+                viewMode={viewMode}
+                animationPlaying={animationPlaying}
+                onStats={setStoreMeshStats}
+                onSelect={() => setSelected(true)}
+                onAnimationAvailability={handleAnimationAvailability}
+              />
+            </Suspense>
           ) : null}
 
           {selected && meshObject && gizmoMode === 'translate' && (
@@ -1036,8 +967,11 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
           <ViewerToolbar
             viewMode={viewMode}
             autoRotate={autoRotate}
+            animationPlaying={animationPlaying}
+            hasAnimations={hasAnimations}
             onViewMode={setViewMode}
             onAutoRotate={() => setAutoRotate((v) => !v)}
+            onAnimationToggle={() => setAnimationPlaying((v) => hasAnimations ? !v : false)}
             onScreenshot={handleScreenshot}
             showViewModes={!isSplat}
           />

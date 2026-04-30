@@ -1,6 +1,6 @@
 import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, ErrorInfo } from 'react'
-import { Canvas, useThree } from '@react-three/fiber'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Environment, GizmoHelper, Lightformer, OrbitControls, useGizmoContext, useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
@@ -12,6 +12,7 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
+import { resolveAnimationAvailability, syncAnimationActions } from './viewerAnimation'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 
@@ -122,16 +123,48 @@ function ModelLoadError(): JSX.Element {
 
 interface MeshModelProps {
   url: string
-  jobId: string
   viewMode: ViewMode
+  animationPlaying: boolean
   onStats: (stats: { vertices: number; triangles: number }) => void
   onSelect: () => void
+  onAnimationAvailability: (hasAnimations: boolean) => void
 }
 
-function MeshModel({ url, jobId, viewMode, onStats, onSelect }: MeshModelProps): JSX.Element {
-  const { scene } = useGLTF(url)
+function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnimationAvailability }: MeshModelProps): JSX.Element {
+  const { scene, animations } = useGLTF(url)
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
+  const mixerRef = useRef<THREE.AnimationMixer | null>(null)
+  const actionsRef = useRef<THREE.AnimationAction[]>([])
+
+  useEffect(() => {
+    onAnimationAvailability(resolveAnimationAvailability(animations))
+  }, [animations, onAnimationAvailability])
+
+  useEffect(() => {
+    const mixer = new THREE.AnimationMixer(scene)
+    const actions = animations.map((clip) => mixer.clipAction(clip))
+    mixerRef.current = mixer
+    actionsRef.current = actions
+
+    return () => {
+      actions.forEach((action) => action.stop())
+      mixer.stopAllAction()
+      mixer.uncacheRoot(scene)
+      actionsRef.current = []
+      mixerRef.current = null
+    }
+  }, [scene, animations])
+
+  useEffect(() => {
+    syncAnimationActions(actionsRef.current, animationPlaying && resolveAnimationAvailability(animations))
+  }, [animationPlaying, animations])
+
+  useFrame((_, delta) => {
+    if (animationPlaying && mixerRef.current) {
+      mixerRef.current.update(delta)
+    }
+  })
 
   // Free GPU resources and GLTF cache when this model is replaced or unmounted
   useEffect(() => {
@@ -347,6 +380,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
 
   const [viewMode, setViewMode] = useState<ViewMode>('solid')
   const [autoRotate, setAutoRotate] = useState(false)
+  const [animationPlaying, setAnimationPlaying] = useState(false)
+  const [hasAnimations, setHasAnimations] = useState(false)
   const [selected, setSelected] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
@@ -359,6 +394,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   useEffect(() => {
     setSelected(false)
     setViewMode('solid')
+    setAnimationPlaying(false)
+    setHasAnimations(false)
     setStoreMeshStats(null)
   }, [modelUrl])
 
@@ -382,6 +419,13 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     link.download = `modly-${Date.now()}.png`
     link.href = canvas.toDataURL('image/png')
     link.click()
+  }
+
+  const handleAnimationAvailability = (available: boolean) => {
+    setHasAnimations(available)
+    if (!available) {
+      setAnimationPlaying(false)
+    }
   }
 
 
@@ -419,10 +463,11 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
               <directionalLight position={[-4, 2, -4]} color={lightSettings.fillColor} intensity={lightSettings.fillIntensity} />
               <MeshModel
                 url={modelUrl}
-                jobId={currentJob.id}
                 viewMode={viewMode}
+                animationPlaying={animationPlaying}
                 onStats={setStoreMeshStats}
                 onSelect={() => setSelected(true)}
+                onAnimationAvailability={handleAnimationAvailability}
               />
             </Suspense>
           ) : null}
@@ -450,8 +495,11 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
           <ViewerToolbar
             viewMode={viewMode}
             autoRotate={autoRotate}
+            animationPlaying={animationPlaying}
+            hasAnimations={hasAnimations}
             onViewMode={setViewMode}
             onAutoRotate={() => setAutoRotate((v) => !v)}
+            onAnimationToggle={() => setAnimationPlaying((v) => hasAnimations ? !v : false)}
             onScreenshot={handleScreenshot}
           />
         )}

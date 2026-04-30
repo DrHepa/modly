@@ -16,6 +16,7 @@ import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
+import { resolveAnimationAvailability, syncAnimationActions } from './viewerAnimation'
 import type { LightSettings, PointLight } from '@shared/stores/appStore'
 import { DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 
@@ -193,24 +194,62 @@ interface MeshModelProps {
   jobId: string
   viewMode: ViewMode
   selected: boolean
+  animationPlaying: boolean
   onStats: (stats: { vertices: number; triangles: number }) => void
   onSelect: () => void
   onObject: (obj: THREE.Object3D | null) => void
+  onAnimationAvailability: (hasAnimations: boolean) => void
 }
 
-function MeshModel({ url, jobId, viewMode, selected, onStats, onSelect, onObject }: MeshModelProps): JSX.Element {
-  const extension = url.split('?')[0]?.split('.').pop()?.toLowerCase()
-  const common = { url, jobId, viewMode, selected, onStats, onSelect, onObject }
-  return extension === 'obj' ? <ObjMeshModel {...common} /> : <GltfMeshModel {...common} />
+function MeshModel(props: MeshModelProps): JSX.Element {
+  const extension = props.url.split('?')[0]?.split('.').pop()?.toLowerCase()
+  return extension === 'obj' ? <ObjMeshModel {...props} /> : <GltfMeshModel {...props} />
 }
 
 function GltfMeshModel(props: MeshModelProps): JSX.Element {
-  const { scene } = useGLTF(props.url)
+  const { scene, animations } = useGLTF(props.url)
+  const { animationPlaying, onAnimationAvailability } = props
+  const mixerRef = useRef<THREE.AnimationMixer | null>(null)
+  const actionsRef = useRef<THREE.AnimationAction[]>([])
+
+  useEffect(() => {
+    onAnimationAvailability(resolveAnimationAvailability(animations))
+    return () => onAnimationAvailability(false)
+  }, [scene, animations, onAnimationAvailability])
+
+  useEffect(() => {
+    if (!resolveAnimationAvailability(animations)) return
+    const mixer = new THREE.AnimationMixer(scene)
+    const actions = animations.map((clip) => mixer.clipAction(clip))
+    mixerRef.current = mixer
+    actionsRef.current = actions
+
+    return () => {
+      actions.forEach((action) => action.stop())
+      mixer.stopAllAction()
+      mixer.uncacheRoot(scene)
+      actionsRef.current = []
+      mixerRef.current = null
+    }
+  }, [scene, animations])
+
+  useEffect(() => {
+    syncAnimationActions(actionsRef.current, animationPlaying && resolveAnimationAvailability(animations))
+  }, [animationPlaying, scene, animations])
+
+  useFrame((_, delta) => {
+    if (animationPlaying && mixerRef.current) {
+      mixerRef.current.update(delta)
+    }
+  })
+
   return <SceneMeshModel {...props} scene={scene} loaderType="gltf" />
 }
 
 function ObjMeshModel(props: MeshModelProps): JSX.Element {
   const scene = useLoader(OBJLoader, props.url)
+  const { onAnimationAvailability } = props
+  useEffect(() => { onAnimationAvailability(false) }, [onAnimationAvailability])
   return <SceneMeshModel {...props} scene={scene} loaderType="obj" />
 }
 
@@ -938,6 +977,8 @@ export default function Viewer3D({
 
   const [viewMode, setViewMode] = useState<ViewMode>('solid')
   const [autoRotate, setAutoRotate] = useState(false)
+  const [playingUrl, setPlayingUrl] = useState<string | null>(null)
+  const [animationSource, setAnimationSource] = useState<{ url: string | null; available: boolean } | null>(null)
   const selected = useAppStore((s) => s.meshSelected)
   const setSelected = useAppStore((s) => s.setMeshSelected)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -960,6 +1001,11 @@ export default function Viewer3D({
   // plys are converted to GLB on import and workflow mesh outputs are .glb.
   const isSplat = /\.(ply|splat)$/i.test(outputUrl)
 
+  // Associate availability and playback with the loaded source. A parent reset
+  // effect must not erase a child's availability report on the initial mount.
+  const hasAnimations = !!modelUrl && !isSplat && animationSource?.url === modelUrl && animationSource.available
+  const animationPlaying = hasAnimations && playingUrl === modelUrl
+
   // The splat viewer needs binary .splat — route raw workspace .ply through the
   // conversion endpoint; import URLs already point at a .splat via serve-file.
   const splatUrl = outputUrl.startsWith('/workspace/')
@@ -970,6 +1016,7 @@ export default function Viewer3D({
   useEffect(() => {
     setSelected(false)
     setViewMode('solid')
+    setPlayingUrl(null)
     setStoreMeshStats(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the model changes; setters are stable
   }, [modelUrl])
@@ -1014,6 +1061,13 @@ export default function Viewer3D({
     link.href = dataUrl
     link.click()
   }
+
+  const handleAnimationAvailability = useCallback((available: boolean) => {
+    setAnimationSource({ url: modelUrl, available })
+    if (!available) {
+      setPlayingUrl(null)
+    }
+  }, [modelUrl])
 
   // Snapshot the pre-drag pose when a gizmo manipulation starts.
   const handleGizmoDragStart = useCallback(() => {
@@ -1125,13 +1179,16 @@ export default function Viewer3D({
                 <directionalLight position={[5, 8, 5]} color={lightSettings.mainColor} intensity={lightSettings.mainIntensity} castShadow />
                 <directionalLight position={[-4, 2, -4]} color={lightSettings.fillColor} intensity={lightSettings.fillIntensity} />
                 <MeshModel
+                  key={modelUrl}
                   url={modelUrl}
                   jobId={currentJob.id}
                   viewMode={viewMode}
                   selected={selected}
+                  animationPlaying={animationPlaying}
                   onStats={setStoreMeshStats}
                   onSelect={handleMeshSelect}
                   onObject={setMeshObject}
+                  onAnimationAvailability={handleAnimationAvailability}
                 />
               </Suspense>
             </Selection>
@@ -1188,8 +1245,11 @@ export default function Viewer3D({
           <ViewerToolbar
             viewMode={viewMode}
             autoRotate={autoRotate}
+            animationPlaying={animationPlaying}
+            hasAnimations={hasAnimations}
             onViewMode={setViewMode}
             onAutoRotate={() => setAutoRotate((v) => !v)}
+            onAnimationToggle={() => setPlayingUrl((url) => hasAnimations && url !== modelUrl ? modelUrl : null)}
             onScreenshot={handleScreenshot}
             showViewModes={!isSplat}
           />

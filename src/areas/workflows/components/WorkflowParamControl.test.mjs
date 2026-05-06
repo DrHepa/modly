@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import Reconciler from 'react-reconciler'
 
 // Actual component functions and React SSR. This does not mount a browser DOM.
 const module = { exports: {} }
@@ -22,7 +23,8 @@ function elements(tree) {
   return [tree, ...elements(tree.props?.children)]
 }
 function control(param, value = param.default, onChange = () => {}, resolvedParams = {}) {
-  return Control({ param, value, onChange, resolvedParams })
+  const tree = Control({ param, value, onChange, resolvedParams })
+  return param.type === 'string' && typeof tree.type === 'function' ? hooks(tree.type).render(tree.props) : tree
 }
 
 // Small deterministic hook adapter for invoking the real file-list/numeric
@@ -78,7 +80,7 @@ test('real string control keeps manual editing, legacy browsing, explicit aliase
 test('generic-file remains manual-only without a misleading or misrouted browse button', () => {
   let value
   const tree = control(string({ pickerIntent: 'generic-file' }), '', (next) => { value = next })
-  assert.equal(elements(tree).filter((node) => node.type === 'button').length, 0)
+  assert.equal(elements(tree).filter((node) => node.type === 'button' && node.props['aria-expanded'] === undefined).length, 0)
   const input = elements(tree).find((node) => node.type === 'input')
   input.props.onChange({ target: { value: '/arbitrary.bin' } })
   assert.equal(value, '/arbitrary.bin')
@@ -226,6 +228,11 @@ test('actual Generate and ExtensionNode components preserve visibility, variants
     let tree = render()
     let controls = elements(tree).filter((node) => node.type === Control)
     assert.equal(controls.length, 6)
+    for (const control of controls) {
+      const row = elements(tree).find((node) => node.key === JSON.stringify(['node', 'pack/run', control.props.param.id]))
+      assert.ok(row, `${surface}: model and field identity must reset local editor state`)
+      assert.match(row.props.className, /items-start.*min-w-0/)
+    }
     for (const [id, stored] of [['numericInt', '7'], ['numericFloat', '0.75']]) {
       const props = controls.find((node) => node.props.param.id === id).props
       assert.equal(props.value, stored)
@@ -244,6 +251,22 @@ test('actual Generate and ExtensionNode components preserve visibility, variants
     tree = render(); controls = elements(tree).filter((node) => node.type === Control)
     assert.ok(controls.some((node) => node.props.param.id === 'hidden'))
     assert.equal(controls.find((node) => node.props.param.id === 'enabled').props.value, false)
+    // Mount each owner's actual returned tree: stores/Flow remain adapters,
+    // while the shared controls and their keyed React state are real.
+    const mounted = mountControl({}, () => render())
+    try {
+      const folderToggle = () => mounted.find((node) => node.type === 'button' && /^(Expand|Collapse) Folder$/.test(node.props['aria-label']))
+      mounted.act(() => folderToggle().props.onClick())
+      assert.equal(folderToggle().props['aria-expanded'], true)
+      mounted.update({})
+      assert.equal(folderToggle().props['aria-expanded'], true, 'ordinary owner rerenders retain expansion')
+      model.id = 'other-pack'; nodes[0].data.extensionId = 'other-pack/run'
+      mounted.update({})
+      assert.equal(folderToggle().props['aria-expanded'], false, `${surface}: a new model resets expansion`)
+    } finally {
+      mounted.unmount()
+      model.id = 'pack'; nodes[0].data.extensionId = 'pack/run'
+    }
   }
   let tree = Node({ id: 'node', data: nodes[0].data })
   assert.deepEqual(elements(tree.props.handles).filter((node) => node.type === 'handle' && node.props.type === 'target').map((node) => node.props.id), ['input-0', 'input-1', 'input-2'])
@@ -263,4 +286,145 @@ test('numeric strings remain visible through real shared numeric controls withou
   let selected
   Control({ param: { id: 'select', label: 'Select', type: 'select', default: 0, options: [{ value: 0, label: '0' }, { value: 1, label: '1' }] }, value: 0, onChange: (value) => { selected = value } }).props.onChange({ target: { value: '1' } })
   assert.equal(selected, '1')
+})
+
+// Mount real React hooks and keyed reconciliation using the installed renderer.
+// The host tree and bubbling event adapter are NOT a browser DOM or React Flow.
+function mountControl(initialProps, Component = Control) {
+  const container = { children: [] }
+  const context = {}
+  const append = (parent, child) => { child.parent = parent; parent.children.push(child) }
+  const remove = (parent, child) => { parent.children.splice(parent.children.indexOf(child), 1) }
+  const renderer = Reconciler({
+    now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
+    getRootHostContext: () => context, getChildHostContext: () => context,
+    getPublicInstance: (instance) => instance,
+    prepareForCommit: () => null, resetAfterCommit: () => {},
+    createInstance: (type, props) => ({ type, props, children: [] }),
+    createTextInstance: (text) => ({ type: '#text', text, children: [] }),
+    appendInitialChild: append, appendChild: append, appendChildToContainer: append,
+    removeChild: remove, removeChildFromContainer: remove,
+    insertBefore: (parent, child, before) => { child.parent = parent; parent.children.splice(parent.children.indexOf(before), 0, child) },
+    shouldSetTextContent: () => false, finalizeInitialChildren: () => false,
+    prepareUpdate: () => true,
+    commitUpdate: (instance, _payload, _type, _old, props) => { instance.props = props },
+    commitTextUpdate: (instance, _old, text) => { instance.text = text },
+    clearContainer: (target) => { target.children = [] },
+    scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
+    detachDeletedInstance: () => {}, getCurrentEventPriority: () => 1,
+  })
+  const root = renderer.createContainer(container, 0, null, false, null, '', (error) => { throw error }, null)
+  const all = (node = container) => [node, ...node.children.flatMap((child) => all(child))]
+  const update = (props) => renderer.flushSync(() => renderer.updateContainer(props ? React.createElement(Component, props) : null, root, null))
+  update(initialProps)
+  return {
+    update, all,
+    find: (predicate) => all().find(predicate),
+    act: (action) => renderer.flushSync(action),
+    flushEffects: () => renderer.flushPassiveEffects(),
+    unmount: () => update(null),
+  }
+}
+
+test('mounted prompt and generic string editors toggle explicitly and retain controlled multiline values', () => {
+  for (const param of [string({ id: 'prompt', label: 'Prompt' }), string({ id: 'name', label: 'Name' })]) {
+    const changes = []
+    const props = { param, value: 'line one\nline two', onChange: (value) => changes.push(value) }
+    const h = mountControl(props)
+    try {
+      const editor = () => h.find((node) => node.type === 'textarea' || node.type === 'input')
+      const toggle = () => h.find((node) => node.type === 'button' && node.props['aria-expanded'] !== undefined)
+      assert.equal(editor().type, param.id === 'prompt' ? 'textarea' : 'input')
+      assert.ok(toggle(), 'an explicit expansion toggle is available')
+      assert.equal(editor().props['aria-label'], param.label)
+      for (let i = 0; i < 2; i++) {
+        const expanded = toggle().props['aria-expanded']
+        h.act(() => toggle().props.onClick())
+        assert.equal(toggle().props['aria-expanded'], !expanded)
+        assert.equal(editor().type, expanded ? 'input' : 'textarea')
+        assert.equal(editor().props.value, props.value)
+        assert.deepEqual(changes, [], 'presentation toggles must not rewrite values')
+      }
+      h.act(() => editor().props.onChange({ target: { value: 'typed\ntext' } }))
+      assert.deepEqual(changes, ['typed\ntext'])
+      const instance = editor()
+      h.update({ ...props, value: changes.at(-1) })
+      assert.equal(editor(), instance, 'typing updates the same host instance instead of remounting the editor')
+      assert.equal(editor().props.value, 'typed\ntext')
+      h.update({ ...props, value: '' })
+      assert.equal(editor().props.value, '')
+    } finally { h.unmount() }
+  }
+})
+
+test('mounted field and control-type switches reset expansion without changing hook order', () => {
+  const props = { param: string({ id: 'name', label: 'Name' }), value: '', onChange: () => {} }
+  const h = mountControl(props)
+  const toggle = () => h.find((node) => node.props?.['aria-expanded'] !== undefined)
+  try {
+    assert.ok(toggle(), 'generic fields have an expansion toggle')
+    h.act(() => toggle().props.onClick())
+    assert.ok(h.find((node) => node.type === 'textarea'))
+    h.update({ ...props, param: string({ id: 'other', label: 'Other' }) })
+    assert.ok(h.find((node) => node.type === 'input'))
+    h.update({ ...props, param: string({ id: 'prompt', label: 'Prompt' }) })
+    assert.ok(h.find((node) => node.type === 'textarea'))
+    h.act(() => toggle().props.onClick())
+    assert.ok(h.find((node) => node.type === 'input'))
+    h.update({ ...props, param: { id: 'b', label: 'Enabled', type: 'boolean', default: false }, value: false })
+    assert.equal(h.find((node) => node.props?.role === 'switch').props['aria-checked'], false)
+    h.update({ ...props, param: string({ id: 'prompt', label: 'Prompt' }) })
+    assert.ok(h.find((node) => node.type === 'textarea'))
+  } finally { h.unmount() }
+})
+
+test('mounted control down handlers block bubbling but leave default editing and selection intact', () => {
+  for (const param of [
+    string({ id: 'prompt', label: 'Prompt' }), string(),
+    { id: 'i', label: 'Count', type: 'int', default: 0 },
+    { id: 'f', label: 'Strength', type: 'float', default: 0.5, min: 0, max: 1, step: 0.05 },
+    { id: 'b', label: 'Enabled', type: 'boolean', default: false },
+    { id: 's', label: 'Select', type: 'select', default: 0, options: [{ value: 0 }] },
+    { id: 'file', label: 'File', type: 'file-select', default: '', dir_from: 'folder' },
+  ]) {
+    const h = mountControl({ param, value: param.default, onChange: () => {} })
+    try {
+      for (const target of h.all().filter((node) => ['input', 'textarea', 'select', 'button'].includes(node.type))) {
+        for (const eventName of ['onPointerDown', 'onMouseDown']) {
+          let stopped = false, prevented = false
+          const selection = { selectionStart: 1, selectionEnd: 3 }
+          const event = { target: selection, stopPropagation: () => { stopped = true }, preventDefault: () => { prevented = true } }
+          for (let node = target; node && !stopped; node = node.parent) node.props?.[eventName]?.(event)
+          assert.equal(stopped, true, `${param.type}/${target.type}/${eventName} escapes to the canvas`)
+          assert.equal(prevented, false)
+          assert.deepEqual(selection, { selectionStart: 1, selectionEnd: 3 })
+        }
+      }
+    } finally { h.unmount() }
+  }
+})
+
+test('mounted numeric editors retain incomplete typing and their host instance through controlled updates', () => {
+  for (const type of ['int', 'float']) {
+    const param = { id: 'number', label: 'Number', type, default: 0, min: 0, max: 1, step: 0.05 }
+    const changes = []
+    function Controlled() {
+      const [value, setValue] = React.useState(0)
+      return React.createElement(Control, { param, value, onChange: (next) => { changes.push(next); setValue(next) } })
+    }
+    const h = mountControl({}, Controlled)
+    try {
+      const input = () => h.find((node) => node.type === 'input' && node.props.type === 'text')
+      const instance = input()
+      h.act(() => input().props.onChange({ target: { value: '-' } }))
+      assert.equal(input().props.value, '-')
+      assert.deepEqual(changes, [])
+      const typed = type === 'float' ? '0,25' : '7'
+      h.act(() => input().props.onChange({ target: { value: typed } }))
+      assert.equal(changes.at(-1), type === 'float' ? 0.25 : 7)
+      h.update({})
+      assert.equal(input(), instance)
+      assert.equal(input().props.value, typed)
+    } finally { h.unmount() }
+  }
 })

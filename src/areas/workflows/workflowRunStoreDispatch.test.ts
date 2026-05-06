@@ -184,7 +184,7 @@ function createWorkflow(node: WFNode): Workflow {
 
 function createMultiInputWorkflow(args: {
   node: WFNode
-  imageSources: Array<{ id: string; filePath: string; targetHandle: 'front' | 'left' | 'back' | 'right' }>
+  imageSources: Array<{ id: string; filePath: string; targetHandle?: 'front' | 'left' | 'back' | 'right' }>
 }): Workflow {
   const nodes = [
     ...args.imageSources.map((source) => createNode(source.id, 'imageNode', { enabled: true, params: { filePath: source.filePath } })),
@@ -356,6 +356,49 @@ test('workflowRunStore routes the named front edge as multipart image instead of
   assert.equal(postCalls.length, 1)
   assert.equal((postCalls[0].data.get('image') as File).name, 'front-view.png')
   assert.deepEqual(fsReadCalls, ['/tmp/front-view.png'])
+})
+
+test('workflowRunStore keeps an untargeted legacy image edge as primary for named-input model nodes', async () => {
+  useAppStore.setState({
+    selectedImagePath: null,
+    selectedImageData: null,
+  })
+
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [{ id: 'legacy-source', filePath: '/tmp/legacy-primary.png' }],
+  })
+  const postCalls: FormData[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-legacy-untargeted' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/legacy-untargeted.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal((postCalls[0].get('image') as File).name, 'legacy-primary.png')
+  assert.deepEqual(fsReadCalls, ['/tmp/legacy-primary.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore flattens only connected named side views into model params', async () => {

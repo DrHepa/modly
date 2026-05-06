@@ -38,6 +38,7 @@ export interface ModelOwnershipMetadata {
 
 export interface ProcessPort {
   name:     string
+  label?:   string
   type:     'image' | 'text' | 'mesh'
   required?: boolean
 }

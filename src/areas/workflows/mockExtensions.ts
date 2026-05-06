@@ -24,6 +24,7 @@ export function normalizeWorkflowProcessInputs(inputs?: ProcessPort[]): ProcessP
 
   return inputs.map((input) => ({
     name: input.name,
+    ...(input.label ? { label: input.label } : {}),
     type: input.type,
     required: input.required ?? true,
   }))

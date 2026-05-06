@@ -75,7 +75,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
                   <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[port.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
                     {port.type}
                   </span>
-                  <span className="text-[9px] text-zinc-400 truncate">{port.name ?? 'input'}</span>
+                  <span className="text-[9px] text-zinc-400 truncate">{port.label ?? port.name ?? 'input'}</span>
                   {!port.required && <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>}
                 </div>
               ))}

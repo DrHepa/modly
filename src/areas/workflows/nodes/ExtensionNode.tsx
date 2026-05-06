@@ -138,9 +138,9 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
           {ext!.params.filter(isVisible).map((param) => {
             const val = (data.params[param.id] ?? param.default) as boolean | number | string
             return (
-              <div key={param.id} className="flex items-center gap-2">
+              <div key={param.id} className="flex items-start gap-2 min-w-0">
                 <label className="text-[10px] text-zinc-500 w-24 shrink-0 leading-tight">{param.label}</label>
-                <div className="flex-1">
+                <div className="min-w-0 flex-1">
                   <WorkflowParamControl param={param} value={val} onChange={(v) => patchParam(param.id, v)} />
                 </div>
               </div>

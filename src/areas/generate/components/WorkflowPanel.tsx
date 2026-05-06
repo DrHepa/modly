@@ -414,9 +414,9 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
           {ext.params.map((param) => {
             const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
             return (
-              <div key={param.id} className="flex items-center gap-2">
-                <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate">{param.label}</label>
-                <div className="flex-1">
+              <div key={param.id} className="flex items-start gap-2 min-w-0">
+                <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate leading-tight">{param.label}</label>
+                <div className="min-w-0 flex-1">
                   <WorkflowParamControl param={param} value={val}
                     onChange={(v) => onPatch(nodeId, { params: { ...(data?.params ?? {}), [param.id]: v } })} />
                 </div>

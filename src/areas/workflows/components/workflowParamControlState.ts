@@ -7,6 +7,18 @@ import type {
 
 export type WorkflowParamValue = boolean | number | string
 
+export type StringParamEditorMode = 'compact' | 'multiline'
+
+export type StringParamEditorState = {
+  mode: StringParamEditorMode
+  value: string
+}
+
+export type ControlDragEvent = {
+  stopPropagation: () => void
+  preventDefault?: () => void
+}
+
 export type WorkflowPickerFsApi = {
   selectImage: () => Promise<string | null>
   selectMeshFile: () => Promise<string | null>
@@ -24,6 +36,25 @@ export function toggleBooleanParamValue(param: BooleanParamSchema, value: Workfl
 
 export function isPickerEnabled(param: ParamSchema): param is StringParamSchema & { pickerIntent: WorkflowPickerIntent } {
   return param.type === 'string' && typeof param.pickerIntent === 'string'
+}
+
+export function isPromptLikeStringParam(param: ParamSchema): param is StringParamSchema {
+  return param.type === 'string' && (param.id === 'prompt' || /prompt/i.test(param.label))
+}
+
+export function resolveStringParamEditorState(
+  param: StringParamSchema,
+  value: WorkflowParamValue,
+  expanded: boolean,
+): StringParamEditorState {
+  return {
+    mode: isPromptLikeStringParam(param) || expanded ? 'multiline' : 'compact',
+    value: typeof value === 'string' ? value : String(value ?? ''),
+  }
+}
+
+export function stopControlDragPropagation(event: ControlDragEvent): void {
+  event.stopPropagation()
 }
 
 export async function selectWorkflowParamPath(

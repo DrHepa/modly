@@ -54,6 +54,77 @@ test('defaults declared process ports to required=true', () => {
   ])
 })
 
+test('preserves display labels without replacing named routing handles', () => {
+  const ports = getProcessTargetPorts({
+    input: 'image',
+    inputs: [
+      { name: 'front', label: 'Primary image', type: 'image' },
+      { name: 'left', label: 'Image 2', type: 'image', required: false },
+    ],
+  })
+
+  assert.deepEqual(ports, [
+    { name: 'front', label: 'Primary image', type: 'image', required: true, isLegacy: false },
+    { name: 'left', label: 'Image 2', type: 'image', required: false, isLegacy: false },
+  ])
+  assert.equal(getProcessTargetPort({ input: 'image', inputs: ports }, 'left')?.name, 'left')
+  assert.equal(getProcessTargetPort({ input: 'image', inputs: ports }, 'Image 2'), undefined)
+})
+
+test('normalizes only display labels and preserves optional custom named routing ports', () => {
+  const owner = { inputs: [
+    { name: 'audio-track', label: '  Soundtrack  ', type: 'audio', required: false },
+    { name: 'scene-source', label: '', type: 'scene' },
+    { name: 'capture-source', label: ' \t ', type: 'capture', required: false },
+  ] }
+  const original = structuredClone(owner)
+  assert.deepEqual(getProcessTargetPorts(owner), [
+    { name: 'audio-track', label: 'Soundtrack', type: 'audio', required: false, isLegacy: false },
+    { name: 'scene-source', type: 'scene', required: true, isLegacy: false },
+    { name: 'capture-source', type: 'capture', required: false, isLegacy: false },
+  ])
+  assert.equal(getProcessTargetPort(owner, 'Soundtrack'), undefined)
+  assert.equal(getProcessTargetPort(owner, 'audio-track')?.type, 'audio')
+  assert.equal(getProcessTargetPort(owner, undefined), undefined)
+  assert.deepEqual(owner, original)
+})
+
+for (const type of ['model', 'process']) {
+  test(`${type} manifest boundary tolerates non-string display labels without changing named routing`, async () => {
+    const { validateInstallManifest } = await import('../../../electron/main/extension-install-utils.ts')
+    const { parseExtensionManifest } = await import('../../../electron/main/automation-capabilities.ts')
+    const { buildAllWorkflowExtensions } = await import('./mockExtensions.ts')
+    for (const label of [0, 1, false, true, null, {}, ['unexpected']]) {
+      const manifest = JSON.parse(JSON.stringify({
+        id: 'label-boundary', type, entry: 'processor.js', generator_class: 'Fixture',
+        nodes: [{ id: 'run', input: 'image', output: 'mesh', inputs: [
+          { name: 'stable-front', type: 'image', required: false, label, extension_metadata: { preserve: 42 } },
+          { name: 'required-side', type: 'image', label },
+        ] }],
+      }))
+      const original = structuredClone(manifest)
+      validateInstallManifest(manifest, { hasEntryFile: () => true, hasGeneratorFile: () => true }, 'inert label fixture')
+      const parsed = parseExtensionManifest(manifest, 'label-boundary', new Set(), false)
+      assert.equal(parsed.type, type)
+      const [owner] = parsed.type === 'model' ? buildAllWorkflowExtensions([parsed], []) : buildAllWorkflowExtensions([], [parsed])
+      const ports = getProcessTargetPorts(owner)
+      assert.deepEqual(ports, [
+        { name: 'stable-front', type: 'image', required: false, isLegacy: false },
+        { name: 'required-side', type: 'image', required: true, isLegacy: false },
+      ])
+      assert.equal(getProcessTargetPort(owner, 'stable-front')?.required, false)
+      assert.equal(getProcessTargetPort(owner, 'required-side')?.required, true)
+      assert.equal(getProcessTargetPort(owner, 'unknown'), undefined)
+      assert.deepEqual(parsed.nodes[0].inputs, [
+        { ...manifest.nodes[0].inputs[0], required: false },
+        { ...manifest.nodes[0].inputs[1], required: true },
+      ])
+      assert.deepEqual(owner.inputs, parsed.nodes[0].inputs)
+      assert.deepEqual(manifest, original)
+    }
+  })
+}
+
 test('uses targetHandle to resolve process target colors and preserves legacy fallback', () => {
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'coarse_mesh'), '#a78bfa')
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'reference_image'), '#38bdf8')
@@ -77,14 +148,14 @@ test('workflow discovery keeps defaults and labels for both representations with
   const { buildAllWorkflowExtensions } = await import('./mockExtensions.ts')
   const nodes: ExtensionNode[] = [
     { id: 'legacy', name: 'Legacy', input: 'image', inputs: ['image', 'image', 'audio', 'capture'], inputLabels: ['front', 'side', 'sound', 'capture'], output: 'video', paramsSchema: [{ id: 'strength', label: 'Strength', type: 'float', default: 1 }], paramDefaults: { strength: 0 } },
-    { id: 'named', name: 'Named', input: 'image', inputs: [{ name: 'front', type: 'image' }], output: 'mesh', paramsSchema: [{ id: 'prompt', label: 'Prompt', type: 'string', default: 'schema' }], paramDefaults: { prompt: '' } },
+    { id: 'named', name: 'Named', input: 'image', inputs: [{ name: 'front', label: 'Primary image', type: 'image' }], output: 'mesh', paramsSchema: [{ id: 'prompt', label: 'Prompt', type: 'string', default: 'schema' }], paramDefaults: { prompt: '' } },
   ]
   const original = structuredClone(nodes)
   const result = buildAllWorkflowExtensions([], [{ type: 'process', id: 'pack', name: 'Pack', entry: 'processor.js', trusted: false, builtin: false, nodes }])
   assert.deepEqual(result[0].inputs, nodes[0].inputs)
   assert.deepEqual(result[0].inputLabels, nodes[0].inputLabels)
   assert.equal(result[0].params[0].default, 0)
-  assert.deepEqual(result[1].inputs, [{ name: 'front', type: 'image', required: true }])
+  assert.deepEqual(result[1].inputs, [{ name: 'front', label: 'Primary image', type: 'image', required: true }])
   assert.equal(result[1].params[0].default, '')
   assert.deepEqual(nodes, original)
 })

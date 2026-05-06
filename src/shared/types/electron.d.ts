@@ -55,6 +55,7 @@ export interface SharedWeightGroup {
 
 export interface ProcessPort {
   name:     string
+  label?:   string
   type:     string
   required?: boolean
 }

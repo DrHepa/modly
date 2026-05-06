@@ -78,7 +78,11 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       {inputs.map((inputType, i) => (
         <div key={i} ref={(el) => { if (el) handleRefs.current[i] = el }} className="flex items-center justify-between px-3 py-2">
           <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputType.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-            {ext?.inputLabels?.[i] ?? (inputType.isLegacy ? inputType.type : `${inputType.name} (${inputType.type})`)}
+            {ext?.inputLabels?.[i] ?? (inputType.isLegacy
+              ? inputType.type
+              : inputType.label || (typeof inputType.name === 'string' && inputType.name.trim())
+                ? `${inputType.label || (typeof inputType.name === 'string' && inputType.name.trim())} (${inputType.type})`
+                : inputType.type)}
           </span>
           {i === 0 && !isTerminal && (
             <>

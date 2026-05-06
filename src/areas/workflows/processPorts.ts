@@ -7,6 +7,7 @@ type ProcessPortOwner = {
 
 export type ResolvedProcessTargetPort = {
   name: string | null
+  label?: string
   type: string
   required: boolean
   isLegacy: boolean
@@ -32,6 +33,7 @@ export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessT
   if (hasNamedProcessInputs(owner.inputs)) {
     return owner.inputs.map((port) => ({
       name: port.name,
+      ...(typeof port.label === 'string' && port.label.trim() ? { label: port.label.trim() } : {}),
       type: port.type,
       required: port.required ?? true,
       isLegacy: false,

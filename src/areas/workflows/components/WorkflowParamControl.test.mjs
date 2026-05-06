@@ -275,6 +275,95 @@ test('actual Generate and ExtensionNode components preserve visibility, variants
   assert.deepEqual(elements(tree.props.handles).filter((node) => node.type === 'handle' && node.props.type === 'target').map((node) => node.props.id), ['front', 'coarse'])
 })
 
+test('mounted ExtensionNode shows named labels and fallbacks without changing handle identities', () => {
+  for (const type of ['model', 'process']) {
+    const manifestNode = { id: 'run', name: 'Run', input: 'image', output: 'mesh', paramsSchema: [] }
+    const extension = { id: 'pack', name: 'Pack', type, nodes: [manifestNode] }
+    const store = { modelExtensions: type === 'model' ? [extension] : [], processExtensions: type === 'process' ? [extension] : [], installedWeightVariants: {} }
+    const Node = actualOwner('src/areas/workflows/nodes/ExtensionNode.tsx', 'ExtensionNode', ['HANDLE_COLOR', 'TAG_CLS'], {
+      ...state, ...variants, ...discovery, ...ports, WorkflowParamControl: Control,
+      useState: React.useState, useRef: React.useRef, useLayoutEffect: React.useLayoutEffect, useCallback: React.useCallback,
+      useExtensionsStore: (selector) => selector ? selector(store) : store,
+      useNavStore: (selector) => selector({ openExtension: () => {} }),
+      useWorkflowRunStore: (selector) => selector({ activeNodeId: null }),
+      useReactFlow: () => ({ updateNodeData: () => assert.fail('display must not update workflow data') }),
+      BaseNode: ({ subheader, handles, children }) => React.createElement('div', null, subheader, handles, children),
+      Handle: 'handle', Position: { Left: 'left', Right: 'right' },
+    })
+    const props = { id: 'node', data: { extensionId: 'pack/run', enabled: true, params: { unknown: 'keep' } } }
+    const cases = [
+      { inputs: [{ name: 'front', label: 'Primary image', type: 'image' }, { name: 'left', label: 'Image 2', type: 'image', required: false }], labels: ['Primary image (image)', 'Image 2 (image)'], handles: ['front', 'left'] },
+      { inputs: [{ name: 'front', label: '  Only image  ', type: 'image' }], labels: ['Only image (image)'], handles: ['front'] },
+      { inputs: [{ name: 'track', label: '', type: 'audio' }, { name: 'scene', label: ' \t ', type: 'scene' }, { name: '', label: '', type: 'capture' }], labels: ['track (audio)', 'scene (scene)', 'capture'], handles: ['track', 'scene', ''] },
+      { inputs: [{ name: 'front', label: 0, type: 'image' }, { name: 'side', label: false, type: 'image', required: false }], labels: ['front (image)', 'side (image)'], handles: ['front', 'side'] },
+      { inputs: [{ name: 'front', label: null, type: 'image' }, { name: 'side', label: {}, type: 'image' }], labels: ['front (image)', 'side (image)'], handles: ['front', 'side'] },
+      { inputs: [{ name: 'front', label: 'Named label', type: 'image' }], inputLabels: ['Explicit slot label'], labels: ['Explicit slot label'], handles: ['front'] },
+      { inputs: ['image', 'audio', 'scene', 'capture'], inputLabels: ['Front', '', '   '], labels: ['Front', '', '   ', 'capture'], handles: ['input-0', 'input-1', 'input-2', 'input-3'] },
+    ]
+    for (const fixture of cases) {
+      manifestNode.inputs = fixture.inputs
+      manifestNode.inputLabels = fixture.inputLabels
+      const original = JSON.stringify(extension)
+      const h = mountControl(props, Node)
+      try {
+        assert.deepEqual(h.all().filter((node) => node.type === 'span').map((node) => node.props.children), [fixture.labels[0], 'mesh', ...fixture.labels.slice(1)], type)
+        const handleIds = () => h.all().filter((node) => node.type === 'handle' && node.props.type === 'target').map((node) => node.props.id)
+        assert.deepEqual(handleIds(), fixture.handles)
+        h.update(props)
+        assert.deepEqual(handleIds(), fixture.handles)
+        assert.equal(JSON.stringify(extension), original)
+        assert.equal(props.data.params.unknown, 'keep')
+      } finally { h.unmount() }
+    }
+  }
+})
+
+for (const type of ['model', 'process']) {
+  test(`mounted ${type} manifest boundary safely displays raw names without rewriting handle identity`, async () => {
+    const { validateInstallManifest } = await import('../../../../electron/main/extension-install-utils.ts')
+    const { parseExtensionManifest } = await import('../../../../electron/main/automation-capabilities.ts')
+    for (const name of [0, 1, false, true, null, ['unexpected'], { raw: 'name' }, ' stable ']) {
+      for (const display of [{}, { label: 'Named label' }, { inputLabels: ['Slot override'] }, { inputLabels: [''] }, { inputLabels: ['   '] }]) {
+        const manifest = JSON.parse(JSON.stringify({
+          id: 'raw-name', type, entry: 'processor.js', generator_class: 'Fixture',
+          nodes: [{ id: 'run', input: 'image', output: 'mesh', input_labels: display.inputLabels, inputs: [
+            { name, label: display.label, type: 'image', required: false, extension_metadata: { preserve: true } },
+          ] }],
+        }))
+        const original = structuredClone(manifest)
+        validateInstallManifest(manifest, { hasEntryFile: () => true, hasGeneratorFile: () => true }, 'inert name fixture')
+        const parsed = parseExtensionManifest(manifest, 'raw-name', new Set(), false)
+        const store = { modelExtensions: type === 'model' ? [parsed] : [], processExtensions: type === 'process' ? [parsed] : [], installedWeightVariants: {} }
+        const [owner] = discovery.buildAllWorkflowExtensions(store.modelExtensions, store.processExtensions)
+        assert.deepEqual(owner.inputs[0].name, name)
+        assert.equal(ports.getProcessTargetPorts(owner)[0].name, owner.inputs[0].name)
+        assert.equal(ports.getProcessTargetPorts(owner)[0].required, false)
+        const Node = actualOwner('src/areas/workflows/nodes/ExtensionNode.tsx', 'ExtensionNode', ['HANDLE_COLOR', 'TAG_CLS'], {
+          ...state, ...variants, ...discovery, ...ports, WorkflowParamControl: Control,
+          useState: React.useState, useRef: React.useRef, useLayoutEffect: React.useLayoutEffect, useCallback: React.useCallback,
+          useExtensionsStore: (selector) => selector ? selector(store) : store,
+          useNavStore: (selector) => selector({ openExtension: () => {} }),
+          useWorkflowRunStore: (selector) => selector({ activeNodeId: null }),
+          useReactFlow: () => ({ updateNodeData: () => assert.fail('display must not update workflow data') }),
+          BaseNode: ({ subheader, handles, children }) => React.createElement('div', null, subheader, handles, children),
+          Handle: 'handle', Position: { Left: 'left', Right: 'right' },
+        })
+        const props = { id: 'node', data: { extensionId: 'raw-name/run', enabled: true, params: { unknown: 'keep' } } }
+        const expected = display.inputLabels?.[0] ?? (display.label ? 'Named label (image)' : typeof name === 'string' ? 'stable (image)' : 'image')
+        const h = mountControl(props, Node)
+        try {
+          assert.deepEqual(h.all().filter((node) => node.type === 'span').map((node) => node.props.children), [expected, 'mesh'])
+          assert.equal(h.find((node) => node.type === 'handle' && node.props.type === 'target').props.id, owner.inputs[0].name ?? 'input-0')
+          // The PROCESS normalizer creates the outer port in the fixture's VM realm.
+          assert.deepEqual({ ...owner.inputs[0] }, { ...original.nodes[0].inputs[0], required: false })
+          assert.deepEqual(manifest, original)
+          assert.equal(props.data.params.unknown, 'keep')
+        } finally { h.unmount() }
+      }
+    }
+  })
+}
+
 test('numeric strings remain visible through real shared numeric controls without emitting runtime rewrites', () => {
   for (const [type, value, defaultValue] of [['int', '7', 3], ['float', '0.75', 0.5], ['int', '07', 3], ['float', '0.750', 0.5], ['float', '0,75', 0.5]]) {
     const param = { id: 'numeric', label: 'Numeric', type, default: defaultValue }

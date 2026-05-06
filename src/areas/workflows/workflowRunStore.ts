@@ -352,14 +352,22 @@ async function executeExtensionNode(
   const routedSideParams: Record<string, string> = {}
 
   if (namedModelImagePorts.size > 0) {
+    let legacyImagePath: string | undefined
     for (const edge of incomingEdges) {
       const src = resolveSource(edge.source)
       if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
       const handle = edge.targetHandle
-      if (!handle || !namedModelImagePorts.has(handle) || src?.outputType !== 'image' || !src.filePath) continue
+      if (src?.outputType !== 'image' || !src.filePath) continue
+      if (handle == null) {
+        legacyImagePath = src.filePath
+        continue
+      }
+      if (!namedModelImagePorts.has(handle)) continue
       if (handle === 'front') nodeInputPath = src.filePath
       else routedSideParams[`${handle}_image_path`] = src.filePath
     }
+    // Named front wins regardless of edge order; sides never replace primary.
+    nodeInputPath ??= legacyImagePath
   } else if (positionalInputs && positionalInputs.length > 1) {
     // Scene is intentionally a single-input-only model contract. The guard
     // above rejects it before this multi-slot path, and filtering it here also

@@ -53,6 +53,22 @@ test('defaults declared process ports to required=true', () => {
   ])
 })
 
+test('preserves display labels without replacing named routing handles', () => {
+  const ports = getProcessTargetPorts({
+    input: 'image',
+    inputs: [
+      { name: 'front', label: 'Primary image', type: 'image' },
+      { name: 'left', label: 'Image 2', type: 'image', required: false },
+    ],
+  })
+
+  assert.deepEqual(ports, [
+    { name: 'front', label: 'Primary image', type: 'image', required: true, isLegacy: false },
+    { name: 'left', label: 'Image 2', type: 'image', required: false, isLegacy: false },
+  ])
+  assert.equal(getProcessTargetPort({ input: 'image', inputs: ports }, 'left')?.name, 'left')
+})
+
 test('uses targetHandle to resolve process target colors and preserves legacy fallback', () => {
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'coarse_mesh'), '#a78bfa')
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'reference_image'), '#38bdf8')

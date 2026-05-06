@@ -50,6 +50,7 @@ type AutomationProcessCapability = {
 
 export type ProcessPort = {
   name: string
+  label?: string
   type: 'image' | 'text' | 'mesh'
   required?: boolean
 }
@@ -184,6 +185,7 @@ function normalizeProcessPorts(inputs: ProcessPort[] | undefined): ProcessPort[]
 
   return inputs.map((input) => ({
     name: input.name,
+    ...(input.label ? { label: input.label } : {}),
     type: input.type,
     required: input.required ?? true,
   }))

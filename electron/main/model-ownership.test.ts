@@ -102,6 +102,32 @@ test('parseExtensionManifest derives owner-aware metadata for bundled model node
   ])
 })
 
+test('parseExtensionManifest preserves process port labels while keeping handle names', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'codex-image',
+      type: 'model',
+      nodes: [{
+        id: 'image-to-image',
+        input: 'image',
+        output: 'image',
+        inputs: [
+          { name: 'front', label: 'Primary image', type: 'image' },
+          { name: 'left', label: 'Image 2', type: 'image', required: false },
+        ],
+      }],
+    },
+    'codex-image',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'front', label: 'Primary image', type: 'image', required: true },
+    { name: 'left', label: 'Image 2', type: 'image', required: false },
+  ])
+})
+
 test('selectPreferredModelPath prefers the canonical owner path over legacy aliases', () => {
   const result = selectPreferredModelPath(
     '/models',

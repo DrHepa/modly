@@ -750,7 +750,12 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             const src = nodeOutputs.get(edge.source)
             if (!src) continue
             if (src.outputType === 'mesh')        nodeInputMeshPath = src.filePath
-            else if (src.outputType === 'image')  nodeInputPath     = src.filePath
+            else if (src.outputType === 'image') {
+              const targetHandle = edge.targetHandle ?? undefined
+              if (!modelImageRouting.applies || !['left', 'back', 'right'].includes(targetHandle ?? '')) {
+                nodeInputPath = src.filePath
+              }
+            }
             else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
             if (src.text !== undefined)           nodeInputText     = src.text
           }
@@ -769,7 +774,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           }
         }
 
-        if (modelImageRouting.applies) {
+        if (modelImageRouting.applies && modelImageRouting.frontPath) {
           nodeInputPath = modelImageRouting.frontPath
         }
 

@@ -55,6 +55,16 @@ export type FailedExtensionResult = {
   error: string
 }
 
+class CandidatePostCopyStepError extends Error {
+  readonly stage: FailedExtensionResult['stage']
+
+  constructor(stage: FailedExtensionResult['stage'], message: string) {
+    super(message)
+    this.name = 'CandidatePostCopyStepError'
+    this.stage = stage
+  }
+}
+
 export type InstallGitHubExtensionRepoResult = {
   success: boolean
   status: InstallAggregateStatus
@@ -148,6 +158,10 @@ type ValidateInstallCandidatesInput = {
   repoDir: string
   sourceRepo: string
   discovery: InstallDiscovery
+}
+
+type SettledCommittedCandidate = {
+  installed: InstalledExtensionResult
 }
 
 export async function discoverInstallCandidates(repoDir: string): Promise<InstallDiscovery> {
@@ -324,38 +338,44 @@ export async function installGitHubExtensionRepo({
 
     for (const candidate of plan.candidates) {
       try {
+        const settledCandidate: { value?: SettledCommittedCandidate } = {}
+
         await commitInstallPlan({
           plan: { ...plan, candidates: [candidate] },
           extensionsDir,
           builtinExtensionIds,
+          operations: {
+            ensureDirectory: fsOps.ensureDirectory,
+            createTempDirectory: fsOps.createTempDirectory,
+            removeDirectory: fsOps.removeDirectory,
+            writeTextFile: fsOps.writeTextFile,
+          },
+          postCopyStep: async ({ destinationDir }) => {
+            settledCandidate.value = await settleCommittedCandidate({
+              candidate,
+              destinationDir,
+              trustedRepos,
+              emitProgress,
+              operations: fsOps,
+            })
+          },
         })
 
-        const settledCandidate = await settleCommittedCandidate({
-          candidate,
-          destinationDir: resolveExtensionPathWithinRoot(extensionsDir, candidate.id),
-          trustedRepos,
-          emitProgress,
-          operations: fsOps,
-        })
+        if (!settledCandidate.value) {
+          throw new Error(`Candidate "${candidate.id}" was copied but not settled`)
+        }
 
-        installed.push(settledCandidate.installed)
-        if (settledCandidate.failed) {
-          failed.push(settledCandidate.failed)
-        }
-        if (settledCandidate.warning) {
-          warnings.push(settledCandidate.warning)
-        }
+        installed.push(settledCandidate.value.installed)
 
         emit('child_result', {
           extensionId: candidate.id,
-          status: settledCandidate.installed.status,
-          message: settledCandidate.failed?.error,
+          status: settledCandidate.value.installed.status,
         })
       } catch (error) {
         const commitError = stringifyError(error)
         failed.push({
           extensionId: candidate.id,
-          stage: 'commit',
+          stage: error instanceof CandidatePostCopyStepError ? error.stage : 'commit',
           error: commitError,
         })
 
@@ -504,11 +524,7 @@ async function settleCommittedCandidate({
   trustedRepos: Set<string>
   emitProgress?: (event: InstallGitHubExtensionRepoProgress) => void
   operations: InstallGitHubExtensionRepoOperations
-}): Promise<{
-  installed: InstalledExtensionResult
-  failed?: FailedExtensionResult
-  warning?: string
-}> {
+}): Promise<SettledCommittedCandidate> {
   const emitSetupLog = (line: string) => {
     emitProgress?.({
       step: 'setting_up',
@@ -569,22 +585,7 @@ async function settleCommittedCandidate({
     }
   } catch (error) {
     const stage = candidate.type === 'process' && existsSync(join(destinationDir, 'package.json')) ? 'npm' : 'setup'
-    const extension = parseExtensionManifest(manifest, candidate.id, trustedRepos)
-    const errorMessage = stringifyError(error)
-
-    return {
-      installed: {
-        extensionId: candidate.id,
-        extension,
-        status: 'partial',
-      },
-      failed: {
-        extensionId: candidate.id,
-        stage,
-        error: errorMessage,
-      },
-      warning: `${candidate.id}: ${errorMessage}`,
-    }
+    throw new CandidatePostCopyStepError(stage, stringifyError(error))
   }
 }
 
@@ -611,21 +612,21 @@ async function commitStagedCandidate({
 
     await fsOps.copyDirectory(stagedDir, destinationDir)
 
+    if (postCopyStep) {
+      await postCopyStep({
+        candidate,
+        candidateId: candidate.id,
+        destinationDir,
+        replacedExisting: backupDir !== null,
+      })
+    }
+
     if (backupDir) {
       await fsOps.removeDirectory(backupDir)
     }
   } catch (error) {
     await restoreBackupIfNeeded(fsOps, backupDir, destinationDir)
     throw error
-  }
-
-  if (postCopyStep) {
-    await postCopyStep({
-      candidate,
-      candidateId: candidate.id,
-      destinationDir,
-      replacedExisting: backupDir !== null,
-    })
   }
 }
 

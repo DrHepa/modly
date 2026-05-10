@@ -41,6 +41,7 @@ async function renderToolbar(props: Record<string, unknown>) {
     return renderToStaticMarkup(createElement(module.ViewerToolbar, {
       viewMode: 'solid',
       autoRotate: false,
+      hasRig: false,
       onViewMode: () => undefined,
       onAutoRotate: () => undefined,
       onScreenshot: () => undefined,
@@ -64,6 +65,9 @@ test('ViewerToolbar disables one animation control when no clips are available a
   assert.doesNotMatch(html, /aria-pressed=/)
   assert.match(html, /title="Solid"/)
   assert.match(html, /title="Wireframe"/)
+  assert.match(html, /title="Rig bones \(rig only\)"/)
+  assert.match(html, /title="Rig joints \(rig only\)"/)
+  assert.match(html, /title="Bone influence \(rig only\)"/)
   assert.match(html, /title="Auto-rotate"/)
   assert.match(html, /title="Screenshot"/)
 })
@@ -94,4 +98,18 @@ test('ViewerToolbar renders one pressed Pause animation control while playing', 
   assert.match(html, /aria-label="Pause animation"/)
   assert.match(html, /aria-pressed="true"/)
   assert.doesNotMatch(html, /title="Play animation"/)
+})
+
+test('ViewerToolbar enables rig inspection controls when a skeleton is available', async () => {
+  const html = await renderToolbar({
+    hasRig: true,
+    hasAnimations: false,
+    animationPlaying: false,
+    onAnimationToggle: () => undefined,
+  })
+
+  assert.match(html, /title="Rig bones"/)
+  assert.match(html, /title="Rig joints"/)
+  assert.match(html, /title="Bone influence"/)
+  assert.doesNotMatch(html, /Rig bones \(rig only\)/)
 })

@@ -16,6 +16,105 @@ import { resolveAnimationAvailability, syncAnimationActions } from './viewerAnim
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 
+type RigStats = {
+  hasRig: boolean
+  skinnedMeshCount: number
+  boneCount: number
+  jointCount: number
+}
+
+type JointMarker = {
+  bone: THREE.Bone
+  marker: THREE.Mesh
+}
+
+const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
+
+function isRigViewMode(viewMode: ViewMode): boolean {
+  return RIG_VIEW_MODES.includes(viewMode)
+}
+
+function collectRigStats(scene: THREE.Object3D): RigStats {
+  const bones = new Set<THREE.Bone>()
+  let skinnedMeshCount = 0
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+    skinnedMeshCount += 1
+    child.skeleton.bones.forEach((bone) => bones.add(bone))
+  })
+
+  return {
+    hasRig: skinnedMeshCount > 0 && bones.size > 0,
+    skinnedMeshCount,
+    boneCount: bones.size,
+    jointCount: bones.size,
+  }
+}
+
+function buildInfluencePalette(size: number): THREE.Color[] {
+  return Array.from({ length: Math.max(size, 1) }, (_, index) => {
+    const color = new THREE.Color()
+    color.setHSL((index * 0.61803398875) % 1, 0.72, 0.58)
+    return color
+  })
+}
+
+function ensureInfluenceColors(mesh: THREE.SkinnedMesh, palette: THREE.Color[]): void {
+  const geometry = mesh.geometry
+  const position = geometry.getAttribute('position')
+  const skinIndex = geometry.getAttribute('skinIndex')
+  const skinWeight = geometry.getAttribute('skinWeight')
+
+  if (!position || !skinIndex || !skinWeight) return
+
+  const vertexCount = position.count
+  const colors = new Float32Array(vertexCount * 3)
+  const neutral = new THREE.Color('#27272a')
+
+  for (let index = 0; index < vertexCount; index += 1) {
+    let bestWeight = -1
+    let bestBoneIndex = 0
+
+    for (let slot = 0; slot < 4; slot += 1) {
+      const weight = skinWeight.getComponent(index, slot)
+      if (weight > bestWeight) {
+        bestWeight = weight
+        bestBoneIndex = skinIndex.getComponent(index, slot)
+      }
+    }
+
+    const color = neutral.clone().lerp(palette[bestBoneIndex % palette.length] ?? new THREE.Color('#a855f7'), Math.max(0.2, bestWeight))
+    colors[index * 3] = color.r
+    colors[index * 3 + 1] = color.g
+    colors[index * 3 + 2] = color.b
+  }
+
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+}
+
+function createInfluenceMaterial(): THREE.MeshStandardMaterial {
+  const material = new THREE.MeshStandardMaterial({
+    color: '#ffffff',
+    roughness: 0.72,
+    metalness: 0.08,
+    vertexColors: true,
+    side: THREE.DoubleSide,
+  })
+  ;(material as THREE.MeshStandardMaterial & { skinning: boolean }).skinning = true
+  material.toneMapped = true
+  return material
+}
+
+function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    color: '#18181b',
+    roughness: 0.9,
+    metalness: 0.0,
+    side: THREE.DoubleSide,
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Procedural textures
 // ---------------------------------------------------------------------------
@@ -128,18 +227,25 @@ interface MeshModelProps {
   onStats: (stats: { vertices: number; triangles: number }) => void
   onSelect: () => void
   onAnimationAvailability: (hasAnimations: boolean) => void
+  onRigStats: (stats: RigStats) => void
 }
 
-function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnimationAvailability }: MeshModelProps): JSX.Element {
+function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnimationAvailability, onRigStats }: MeshModelProps): JSX.Element {
   const { scene, animations } = useGLTF(url)
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
   const mixerRef = useRef<THREE.AnimationMixer | null>(null)
   const actionsRef = useRef<THREE.AnimationAction[]>([])
+  const skeletonHelpersRef = useRef<THREE.SkeletonHelper[]>([])
+  const jointMarkersRef = useRef<JointMarker[]>([])
 
   useEffect(() => {
     onAnimationAvailability(resolveAnimationAvailability(animations))
   }, [animations, onAnimationAvailability])
+
+  useEffect(() => {
+    onRigStats(collectRigStats(scene))
+  }, [scene, onRigStats])
 
   useEffect(() => {
     const mixer = new THREE.AnimationMixer(scene)
@@ -163,6 +269,17 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
   useFrame((_, delta) => {
     if (animationPlaying && mixerRef.current) {
       mixerRef.current.update(delta)
+    }
+
+    if (jointMarkersRef.current.length > 0) {
+      const worldPosition = new THREE.Vector3()
+      const localPosition = new THREE.Vector3()
+      jointMarkersRef.current.forEach(({ bone, marker }) => {
+        bone.getWorldPosition(worldPosition)
+        localPosition.copy(worldPosition)
+        scene.worldToLocal(localPosition)
+        marker.position.copy(localPosition)
+      })
     }
   })
 
@@ -235,6 +352,23 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
     // Remove any edge helpers from previous wireframe pass
     edgeHelpers.current.forEach((lines) => lines.parent?.remove(lines))
     edgeHelpers.current = []
+    skeletonHelpersRef.current.forEach((helper) => {
+      helper.parent?.remove(helper)
+      helper.geometry.dispose()
+      const helperMaterial = helper.material
+      if (Array.isArray(helperMaterial)) {
+        helperMaterial.forEach((material) => material.dispose())
+      } else {
+        helperMaterial.dispose()
+      }
+    })
+    skeletonHelpersRef.current = []
+    jointMarkersRef.current.forEach(({ marker }) => {
+      marker.parent?.remove(marker)
+      marker.geometry.dispose()
+      ;(marker.material as THREE.Material).dispose()
+    })
+    jointMarkersRef.current = []
 
     scene.traverse((child) => {
       if (!(child instanceof THREE.Mesh)) return
@@ -246,6 +380,18 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
 
       let next: THREE.Material
       switch (viewMode) {
+        case 'bones':
+        case 'joints':
+          next = child.userData.originalMaterial as THREE.Material
+          break
+        case 'influence':
+          if (child instanceof THREE.SkinnedMesh && child.skeleton) {
+            ensureInfluenceColors(child, buildInfluencePalette(child.skeleton.bones.length))
+            next = createInfluenceMaterial()
+          } else {
+            next = createMutedRigBackdropMaterial()
+          }
+          break
         case 'wireframe': {
           next = new THREE.MeshBasicMaterial({ color: 0x4ade80, wireframe: true })
           break
@@ -267,6 +413,47 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
 
       child.material = next
     })
+
+    if (isRigViewMode(viewMode)) {
+      const helperRoots = new Set<THREE.Object3D>()
+
+      scene.traverse((child) => {
+        if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+
+        child.skeleton.bones.forEach((bone) => {
+          let root: THREE.Object3D = bone
+          while (root.parent && root.parent instanceof THREE.Bone) {
+            root = root.parent
+          }
+          helperRoots.add(root)
+        })
+
+        if (viewMode === 'joints' || viewMode === 'influence') {
+          child.skeleton.bones.forEach((bone) => {
+            const marker = new THREE.Mesh(
+              new THREE.OctahedronGeometry(0.032, 0),
+              new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08 }),
+            )
+            marker.renderOrder = 3
+            scene.add(marker)
+            jointMarkersRef.current.push({ bone, marker })
+          })
+        }
+      })
+
+      helperRoots.forEach((root) => {
+        const helper = new THREE.SkeletonHelper(root)
+        const helperMaterial = Array.isArray(helper.material) ? helper.material[0] : helper.material
+        const lineMaterial = helperMaterial as THREE.LineBasicMaterial
+        lineMaterial.depthTest = false
+        lineMaterial.transparent = true
+        lineMaterial.opacity = viewMode === 'influence' ? 0.88 : 1
+        lineMaterial.color = new THREE.Color(viewMode === 'influence' ? '#f8fafc' : '#a78bfa')
+        helper.renderOrder = 2
+        scene.add(helper)
+        skeletonHelpersRef.current.push(helper)
+      })
+    }
   }, [scene, viewMode])
 
   return (
@@ -382,6 +569,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const [autoRotate, setAutoRotate] = useState(false)
   const [animationPlaying, setAnimationPlaying] = useState(false)
   const [hasAnimations, setHasAnimations] = useState(false)
+  const [rigStats, setRigStats] = useState<RigStats>({ hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 })
   const [selected, setSelected] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
@@ -396,6 +584,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     setViewMode('solid')
     setAnimationPlaying(false)
     setHasAnimations(false)
+    setRigStats({ hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 })
     setStoreMeshStats(null)
   }, [modelUrl])
 
@@ -468,6 +657,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 onStats={setStoreMeshStats}
                 onSelect={() => setSelected(true)}
                 onAnimationAvailability={handleAnimationAvailability}
+                onRigStats={setRigStats}
               />
             </Suspense>
           ) : null}
@@ -497,6 +687,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
             autoRotate={autoRotate}
             animationPlaying={animationPlaying}
             hasAnimations={hasAnimations}
+            hasRig={rigStats.hasRig}
             onViewMode={setViewMode}
             onAutoRotate={() => setAutoRotate((v) => !v)}
             onAnimationToggle={() => setAnimationPlaying((v) => hasAnimations ? !v : false)}

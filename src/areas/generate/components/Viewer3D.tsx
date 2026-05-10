@@ -31,6 +31,16 @@ type JointMarker = {
   marker: THREE.Mesh
 }
 
+type BoneSegment = {
+  parent: THREE.Bone
+  child: THREE.Bone
+}
+
+type RigLineOverlay = {
+  line: THREE.LineSegments
+  segments: BoneSegment[]
+}
+
 const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
 
 function isRigViewMode(viewMode: ViewMode): boolean {
@@ -102,10 +112,27 @@ function createInfluenceMaterial(): THREE.MeshStandardMaterial {
     roughness: 0.72,
     metalness: 0.08,
     vertexColors: true,
+    transparent: true,
+    opacity: 0.84,
+    depthWrite: false,
     side: THREE.DoubleSide,
   })
   ;(material as THREE.MeshStandardMaterial & { skinning: boolean }).skinning = true
   material.toneMapped = true
+  return material
+}
+
+function createRigShellMaterial(): THREE.MeshStandardMaterial {
+  const material = new THREE.MeshStandardMaterial({
+    color: '#f8fafc',
+    roughness: 0.82,
+    metalness: 0.02,
+    transparent: true,
+    opacity: 0.28,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  })
+  ;(material as THREE.MeshStandardMaterial & { skinning: boolean }).skinning = true
   return material
 }
 
@@ -114,6 +141,9 @@ function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
     color: '#18181b',
     roughness: 0.9,
     metalness: 0.0,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
     side: THREE.DoubleSide,
   })
 }
@@ -240,8 +270,9 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
   const mixerRef = useRef<THREE.AnimationMixer | null>(null)
   const actionsRef = useRef<THREE.AnimationAction[]>([])
-  const skeletonHelpersRef = useRef<THREE.SkeletonHelper[]>([])
+  const rigLineOverlaysRef = useRef<RigLineOverlay[]>([])
   const jointMarkersRef = useRef<JointMarker[]>([])
+  const transientMaterialsRef = useRef<THREE.Material[]>([])
 
   useEffect(() => {
     onAnimationAvailability(resolveAnimationAvailability(animations))
@@ -275,13 +306,29 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
       mixerRef.current.update(delta)
     }
 
-    if (jointMarkersRef.current.length > 0) {
+    if (rigLineOverlaysRef.current.length > 0 || jointMarkersRef.current.length > 0) {
       const worldPosition = new THREE.Vector3()
       const localPosition = new THREE.Vector3()
-      jointMarkersRef.current.forEach(({ bone, marker }) => {
+
+      const setBoneLocalPosition = (bone: THREE.Bone, target: THREE.Vector3) => {
         bone.getWorldPosition(worldPosition)
-        localPosition.copy(worldPosition)
-        scene.worldToLocal(localPosition)
+        target.copy(worldPosition)
+        scene.worldToLocal(target)
+      }
+
+      rigLineOverlaysRef.current.forEach(({ line, segments }) => {
+        const position = line.geometry.getAttribute('position') as THREE.BufferAttribute
+        segments.forEach(({ parent, child }, index) => {
+          setBoneLocalPosition(parent, localPosition)
+          position.setXYZ(index * 2, localPosition.x, localPosition.y, localPosition.z)
+          setBoneLocalPosition(child, localPosition)
+          position.setXYZ(index * 2 + 1, localPosition.x, localPosition.y, localPosition.z)
+        })
+        position.needsUpdate = true
+      })
+
+      jointMarkersRef.current.forEach(({ bone, marker }) => {
+        setBoneLocalPosition(bone, localPosition)
         marker.position.copy(localPosition)
       })
     }
@@ -370,23 +417,25 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
     // Remove any edge helpers from previous wireframe pass
     edgeHelpers.current.forEach((lines) => lines.parent?.remove(lines))
     edgeHelpers.current = []
-    skeletonHelpersRef.current.forEach((helper) => {
-      helper.parent?.remove(helper)
-      helper.geometry.dispose()
-      const helperMaterial = helper.material
-      if (Array.isArray(helperMaterial)) {
-        helperMaterial.forEach((material) => material.dispose())
-      } else {
-        helperMaterial.dispose()
-      }
+    rigLineOverlaysRef.current.forEach(({ line }) => {
+      line.parent?.remove(line)
+      line.geometry.dispose()
+      ;(line.material as THREE.Material).dispose()
     })
-    skeletonHelpersRef.current = []
+    rigLineOverlaysRef.current = []
     jointMarkersRef.current.forEach(({ marker }) => {
       marker.parent?.remove(marker)
       marker.geometry.dispose()
       ;(marker.material as THREE.Material).dispose()
     })
     jointMarkersRef.current = []
+    transientMaterialsRef.current.forEach((material) => material.dispose())
+    transientMaterialsRef.current = []
+
+    const trackMaterial = <T extends THREE.Material>(material: T): T => {
+      transientMaterialsRef.current.push(material)
+      return material
+    }
 
     scene.traverse((child) => {
       if (!(child instanceof THREE.Mesh)) return
@@ -400,30 +449,30 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
       switch (viewMode) {
         case 'bones':
         case 'joints':
-          next = child.userData.originalMaterial as THREE.Material
+          next = trackMaterial(createRigShellMaterial())
           break
         case 'influence':
           if (child instanceof THREE.SkinnedMesh && child.skeleton) {
             ensureInfluenceColors(child, buildInfluencePalette(child.skeleton.bones.length))
-            next = createInfluenceMaterial()
+            next = trackMaterial(createInfluenceMaterial())
           } else {
-            next = createMutedRigBackdropMaterial()
+            next = trackMaterial(createMutedRigBackdropMaterial())
           }
           break
         case 'wireframe': {
-          next = new THREE.MeshBasicMaterial({ color: 0x4ade80, wireframe: true })
+          next = trackMaterial(new THREE.MeshBasicMaterial({ color: 0x4ade80, wireframe: true }))
           break
         }
         case 'normals':
           // Ensure vertex normals exist — AI-generated meshes often skip this
           child.geometry.computeVertexNormals()
-          next = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide })
+          next = trackMaterial(new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }))
           break
         case 'matcap':
-          next = new THREE.MeshMatcapMaterial({ matcap: createMatcapTexture() })
+          next = trackMaterial(new THREE.MeshMatcapMaterial({ matcap: createMatcapTexture() }))
           break
         case 'uv':
-          next = new THREE.MeshBasicMaterial({ map: createCheckerTexture() })
+          next = trackMaterial(new THREE.MeshBasicMaterial({ map: createCheckerTexture() }))
           break
         default:
           next = child.userData.originalMaterial as THREE.Material
@@ -433,44 +482,46 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
     })
 
     if (isRigViewMode(viewMode)) {
-      const helperRoots = new Set<THREE.Object3D>()
+      const bones = new Set<THREE.Bone>()
 
       scene.traverse((child) => {
         if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+        child.skeleton.bones.forEach((bone) => bones.add(bone))
+      })
 
-        child.skeleton.bones.forEach((bone) => {
-          let root: THREE.Object3D = bone
-          while (root.parent && root.parent instanceof THREE.Bone) {
-            root = root.parent
-          }
-          helperRoots.add(root)
+      const segments = Array.from(bones)
+        .filter((bone) => bone.parent instanceof THREE.Bone && bones.has(bone.parent))
+        .map((bone) => ({ parent: bone.parent as THREE.Bone, child: bone }))
+
+      if (segments.length > 0) {
+        const geometry = new THREE.BufferGeometry()
+        geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segments.length * 2 * 3), 3))
+        const material = new THREE.LineBasicMaterial({
+          color: viewMode === 'influence' ? '#f8fafc' : '#38bdf8',
+          transparent: true,
+          opacity: viewMode === 'influence' ? 0.72 : 0.98,
+          depthTest: false,
+          depthWrite: false,
         })
+        const line = new THREE.LineSegments(geometry, material)
+        line.frustumCulled = false
+        line.renderOrder = 4
+        scene.add(line)
+        rigLineOverlaysRef.current.push({ line, segments })
+      }
 
-        if (viewMode === 'joints' || viewMode === 'influence') {
-          child.skeleton.bones.forEach((bone) => {
-            const marker = new THREE.Mesh(
-              new THREE.OctahedronGeometry(0.032, 0),
-              new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08 }),
-            )
-            marker.renderOrder = 3
-            scene.add(marker)
-            jointMarkersRef.current.push({ bone, marker })
-          })
-        }
-      })
-
-      helperRoots.forEach((root) => {
-        const helper = new THREE.SkeletonHelper(root)
-        const helperMaterial = Array.isArray(helper.material) ? helper.material[0] : helper.material
-        const lineMaterial = helperMaterial as THREE.LineBasicMaterial
-        lineMaterial.depthTest = false
-        lineMaterial.transparent = true
-        lineMaterial.opacity = viewMode === 'influence' ? 0.88 : 1
-        lineMaterial.color = new THREE.Color(viewMode === 'influence' ? '#f8fafc' : '#a78bfa')
-        helper.renderOrder = 2
-        scene.add(helper)
-        skeletonHelpersRef.current.push(helper)
-      })
+      if (viewMode === 'joints' || viewMode === 'influence') {
+        bones.forEach((bone) => {
+          const marker = new THREE.Mesh(
+            new THREE.OctahedronGeometry(0.026, 0),
+            new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08, depthTest: false, depthWrite: false }),
+          )
+          marker.frustumCulled = false
+          marker.renderOrder = 5
+          scene.add(marker)
+          jointMarkersRef.current.push({ bone, marker })
+        })
+      }
     }
   }, [scene, viewMode])
 

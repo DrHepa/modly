@@ -50,4 +50,8 @@ src/**/*.d.ts
 electron.vite.config.js
 electron.vite.config.d.ts
 *.tsbuildinfo
+
+# Local agent skills and generated registries
+.agents/
+skills-lock.json
 .atl/

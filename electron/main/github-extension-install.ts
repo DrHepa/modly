@@ -7,6 +7,7 @@ import axios from 'axios'
 import { buildSync } from 'esbuild'
 import * as tar from 'tar'
 import { parseExtensionManifest, type ListedExtension, type ParsedManifest } from './automation-capabilities.ts'
+import { assertSafeExtensionId, buildExtensionBackupPath, resolveExtensionPathWithinRoot } from './extension-path-guard.ts'
 
 export type InstallCandidateType = 'model' | 'process'
 
@@ -236,7 +237,7 @@ export async function commitInstallPlan({
 
   try {
     for (const candidate of plan.candidates) {
-      const stagedDir = join(stagingRoot, candidate.id)
+      const stagedDir = resolveExtensionPathWithinRoot(stagingRoot, candidate.id)
       await fsOps.copyDirectory(candidate.sourceDir, stagedDir)
       await persistCandidateManifest(fsOps, join(stagedDir, 'manifest.json'), candidate.manifest)
 
@@ -331,7 +332,7 @@ export async function installGitHubExtensionRepo({
 
         const settledCandidate = await settleCommittedCandidate({
           candidate,
-          destinationDir: join(extensionsDir, candidate.id),
+          destinationDir: resolveExtensionPathWithinRoot(extensionsDir, candidate.id),
           trustedRepos,
           emitProgress,
           operations: fsOps,
@@ -452,6 +453,10 @@ function validateCandidate(candidate: InstallCandidate): void {
   if (!candidate.manifest.id) {
     throw new Error(`${candidate.relativePath}: manifest.json missing required field "id"`)
   }
+
+  const safeId = assertSafeExtensionId(candidate.manifest.id)
+  candidate.id = safeId
+  candidate.manifest.id = safeId
 
   if (!candidate.manifest.nodes?.length) {
     throw new Error(`${candidate.id}: manifest.json missing required field "nodes" or nodes is empty`)
@@ -596,8 +601,8 @@ async function commitStagedCandidate({
   fsOps: InstallCommitOperations
   postCopyStep?: (context: CommitPostCopyContext) => Promise<void>
 }): Promise<void> {
-  const destinationDir = join(extensionsDir, candidate.id)
-  const backupDir = existsSync(destinationDir) ? join(extensionsDir, `.modly-backup-${candidate.id}-${Date.now()}`) : null
+  const destinationDir = resolveExtensionPathWithinRoot(extensionsDir, candidate.id)
+  const backupDir = existsSync(destinationDir) ? buildExtensionBackupPath(extensionsDir, candidate.id, String(Date.now())) : null
 
   try {
     if (backupDir) {

@@ -21,6 +21,9 @@ tools/modly-cli/__pycache__/
 # Models (heavy, downloaded at runtime)
 /models/
 
+# Local generated image outputs
+api/generated_images/
+
 # Logs
 *.log
 npm-debug.log*

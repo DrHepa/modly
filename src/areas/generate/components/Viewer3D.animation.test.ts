@@ -90,10 +90,10 @@ export function Canvas(props) {
   })
   return createElement('test-canvas', null, children)
 }
-export function useFrame(callback) {
+export function useFrame(callback, priority = 0) {
   const key = useRef({})
   const current = useRef(callback); current.current = callback
-  useEffect(() => { harness.frames.set(key.current, delta => current.current({}, delta)); return () => harness.frames.delete(key.current) }, [])
+  useEffect(() => { const frame = delta => current.current({}, delta); frame.priority = priority; harness.frames.set(key.current, frame); return () => harness.frames.delete(key.current) }, [priority])
 }
 export function useGLTF(url) { harness.loads.push(['gltf', url]); const asset = harness.gltf.get(url); if (!asset) throw new Error('Missing fixture ' + url); return asset }
 useGLTF.clear = url => harness.cleared.push(['gltf', url])
@@ -112,7 +112,7 @@ export const Select = props => createElement('test-select', props, props.childre
 export default forwardRef(function SplatViewer(props, ref) { return createElement('test-splat', { ...props, ref: undefined }) })
 `
 
-async function mount(t: any, initialPath: string | null = '/animated.glb') {
+async function mount(t: any, initialPath: string | null = '/animated.glb', initialise?: (harness: any) => void) {
   const directory = await mkdtemp(path.join(tmpdir(), 'modly-viewer-animation-'))
   const saved = new Map<string, PropertyDescriptor | undefined>()
   let unmount = () => undefined as void
@@ -188,6 +188,7 @@ async function mount(t: any, initialPath: string | null = '/animated.glb') {
     return { scene, mesh }
   }
   const first = asset('/animated.glb')
+  initialise?.(harness)
   const host: Host = { type: 'root', props: {}, children: [] }
   const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
   const undo = { current: null as (() => boolean) | null }
@@ -208,7 +209,7 @@ async function mount(t: any, initialPath: string | null = '/animated.glb') {
   }
   const click = (label: string) => flush(() => button(label).props.onClick())
   const switchTo = (url: string | null) => flush(() => job(url))
-  const frame = (delta: number) => { for (const callback of harness.frames.values()) (callback as (delta: number) => void)(delta) }
+  const frame = (delta: number) => { for (const callback of [...harness.frames.values()].sort((a: any, b: any) => a.priority - b.priority)) (callback as (delta: number) => void)(delta) }
   return { harness, host, node, button, click, switchTo, frame, render, unmount, asset, first, clip, mixers, uncached, useAppStore, undo, pointSelections, lightChanges }
 }
 
@@ -359,4 +360,230 @@ test('Viewer3D clears actions, loader cache, scene resources, frame subscription
   assert.equal(materialDisposed.mock.callCount(), 1)
   assert.equal(view.useAppStore.getState().meshSelected, false)
   assert.equal(view.undo.current, null)
+})
+
+
+function rigAsset(harness: any, url = '/rig.glb') {
+  const scene = new THREE.Group()
+  const parent = new THREE.Group()
+  parent.position.set(3, 2, -1)
+  parent.rotation.set(0.2, 0.4, 0.1)
+  parent.scale.set(1, 2, 0.5)
+  scene.add(parent)
+  const root = new THREE.Bone()
+  root.name = 'RigRoot'
+  const tip = new THREE.Bone()
+  tip.name = 'RigTip'
+  tip.position.set(0, 1, 0)
+  root.add(tip)
+  parent.add(root)
+  const skeleton = new THREE.Skeleton([root, tip])
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0, 0, 1, 0], 3))
+  geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute([0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0], 4))
+  geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute([1, 0, 0, 0, 0.3, 0.7, 0, 0, 0.5, 0.5, 0, 0], 4))
+  const colors = new THREE.Float32BufferAttribute([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], 3)
+  geometry.setAttribute('color', colors)
+  geometry.addGroup(0, 3, 0)
+  const materials = [new THREE.MeshStandardMaterial({ vertexColors: true }), new THREE.MeshBasicMaterial()]
+  const first = new THREE.SkinnedMesh(geometry, materials)
+  const second = new THREE.SkinnedMesh(geometry, materials)
+  const backdrop = new THREE.Mesh(geometry, materials)
+  parent.add(first, second, backdrop)
+  scene.updateMatrixWorld(true)
+  first.bind(skeleton)
+  second.bind(skeleton)
+  const clip = new THREE.AnimationClip('Bend', 1, [new THREE.NumberKeyframeTrack('RigTip.position[x]', [0, 1], [0, 2])])
+  harness.gltf.set(url, { scene, animations: [clip] })
+  return { scene, parent, root, tip, skeleton, geometry, colors, materials, first, second, backdrop, clip }
+}
+
+function rigOverlay(view: Awaited<ReturnType<typeof mount>>) {
+  const node = find(view.host, entry => entry.type === 'primitive' && entry.props.object.name === 'RigInspectionOverlay')
+  assert.ok(node, 'Missing mounted rig overlay')
+  return node.props.object as import('three').Group
+}
+
+function singleMaterial(mesh: import('three').Mesh): import('three').Material {
+  assert.ok(!Array.isArray(mesh.material))
+  return mesh.material
+}
+
+function disposeCounts(t: any, objects: { dispose: () => void }[]) {
+  return objects.map(object => t.mock.method(object, 'dispose'))
+}
+
+function overlayResources(overlay: import('three').Group) {
+  return overlay.children.flatMap(child => {
+    const mesh = child as import('three').Mesh
+    return [mesh.geometry, ...(Array.isArray(mesh.material) ? mesh.material : [mesh.material])]
+  })
+}
+
+test('Viewer3D reports mounted rig capability without a parent reset race and gates plain GLTF, OBJ and splats', async t => {
+  const view = await mount(t, '/rig.glb', harness => rigAsset(harness))
+  assert.equal(view.button('Rig bones').props.disabled, false)
+  assert.equal(view.button('Rig joints').props.disabled, false)
+  assert.equal(view.button('Bone influence').props.disabled, false)
+  assert.ok(view.button('Play animation'))
+  view.click('Rig joints')
+  assert.equal(rigOverlay(view).children.filter(child => child instanceof THREE.Mesh).length, 2)
+  view.asset('/rig.glb', [])
+  view.render()
+  assert.equal(view.button('Rig bones (rig only)').props.disabled, true)
+  assert.equal(find(view.host, entry => entry.type === 'primitive' && entry.props.object.name === 'RigInspectionOverlay'), undefined)
+  const obj = view.asset('/plain.obj', []).scene
+  view.harness.obj.set('/plain.obj', obj)
+  view.switchTo('/plain.obj')
+  assert.equal(view.button('Rig joints (rig only)').props.disabled, true)
+  view.switchTo('/scan.splat')
+  assert.equal(find(view.host, entry => /^(Rig bones|Rig joints|Bone influence)/.test(entry.props.title ?? '')), undefined)
+  view.switchTo(null)
+  assert.equal(view.harness.frames.size, 0)
+})
+
+test('Viewer3D owns influence clones, preserves source colors and material arrays, and disposes transient resources', async t => {
+  let rig!: ReturnType<typeof rigAsset>
+  const view = await mount(t, '/rig.glb', harness => { rig = rigAsset(harness) })
+  const sourceDisposals = disposeCounts(t, [rig.geometry, ...rig.materials])
+  const originalColors = Array.from(rig.colors.array)
+  view.click('Bone influence')
+  const influenceGeometry = rig.first.geometry
+  assert.notEqual(influenceGeometry, rig.geometry)
+  assert.notEqual(rig.second.geometry, rig.geometry)
+  assert.equal(rig.backdrop.geometry, rig.geometry, 'Unskinned shared geometry is not recolored')
+  assert.equal(rig.geometry.getAttribute('color'), rig.colors)
+  assert.deepEqual(Array.from(rig.colors.array), originalColors)
+  assert.notDeepEqual(Array.from(influenceGeometry.getAttribute('color').array), originalColors)
+  const overlay = rigOverlay(view)
+  assert.equal(rig.scene.getObjectByName('RigInspectionOverlay'), undefined, 'Helpers stay outside source stats/BVH/selection')
+  const selection = view.node('test-select')!
+  assert.equal(find(selection, entry => entry.props.object === overlay), undefined)
+  assert.ok(overlay.children.every(child => !('boundsTree' in (child as any).geometry)))
+  const hits: any[] = []
+  for (const child of overlay.children) child.raycast(new THREE.Raycaster(), hits)
+  assert.equal(hits.length, 0, 'Helpers cannot be picked as source meshes')
+  const transientDisposals = disposeCounts(t, [influenceGeometry, rig.second.geometry, singleMaterial(rig.first), singleMaterial(rig.second), singleMaterial(rig.backdrop), ...overlayResources(overlay)])
+  view.click('Solid')
+  assert.equal(rig.first.geometry, rig.geometry)
+  assert.equal(rig.second.geometry, rig.geometry)
+  assert.equal(rig.first.material, rig.materials)
+  assert.equal(rig.backdrop.material, rig.materials)
+  assert.equal(rig.geometry.getAttribute('color'), rig.colors)
+  assert.ok(transientDisposals.every(spy => spy.mock.callCount() === 1))
+  assert.ok(sourceDisposals.every(spy => spy.mock.callCount() === 0))
+  view.click('Bone influence')
+  const unmountDisposals = disposeCounts(t, [rig.first.geometry, rig.second.geometry, singleMaterial(rig.first), singleMaterial(rig.second), singleMaterial(rig.backdrop), ...overlayResources(rigOverlay(view))])
+  view.unmount()
+  assert.equal(rig.first.geometry, rig.geometry)
+  assert.equal(rig.first.material, rig.materials)
+  assert.equal(rig.geometry.getAttribute('color'), rig.colors)
+  assert.ok(unmountDisposals.every(spy => spy.mock.callCount() === 1))
+  assert.ok(sourceDisposals.every(spy => spy.mock.callCount() === 1))
+  assert.equal(view.mixers[0].existingAction(rig.clip), null)
+  assert.equal(view.harness.frames.size, 0)
+})
+
+test('Viewer3D SkeletonHelper and unique joints follow transformed animated bones after mixer updates and pause', async t => {
+  let rig!: ReturnType<typeof rigAsset>
+  const view = await mount(t, '/rig.glb', harness => { rig = rigAsset(harness) })
+  view.click('Rig joints')
+  const overlay = rigOverlay(view)
+  const helper = overlay.children.find(child => child instanceof THREE.SkeletonHelper) as import('three').SkeletonHelper
+  assert.ok(helper, 'Pick36 keeps SkeletonHelper rather than preapplying custom line rendering')
+  assert.equal(overlay.children.filter(child => child instanceof THREE.Mesh).length, 2, 'Shared bones receive one marker each')
+  rig.scene.position.set(8, -2, 3)
+  rig.scene.rotation.set(0.3, -0.7, 0.2)
+  rig.scene.scale.set(2, 0.5, 1.2)
+  const checkAlignment = () => {
+    const tipWorld = rig.tip.getWorldPosition(new THREE.Vector3())
+    const positions = helper.geometry.getAttribute('position')
+    const endpoint = new THREE.Vector3().fromBufferAttribute(positions, 0).applyMatrix4(helper.matrixWorld)
+    assert.ok(endpoint.distanceTo(tipWorld) < 1e-5, `Skeleton endpoint ${endpoint.toArray()} vs ${tipWorld.toArray()}`)
+    const markers = overlay.children.filter(child => child instanceof THREE.Mesh)
+    assert.ok(markers.some(marker => marker.getWorldPosition(new THREE.Vector3()).distanceTo(tipWorld) < 1e-6))
+  }
+  view.frame(0)
+  checkAlignment()
+  view.click('Play animation')
+  view.frame(0.25)
+  assert.equal(rig.tip.position.x, 0.5)
+  checkAlignment()
+  view.click('Pause animation')
+  view.frame(0.25)
+  assert.equal(rig.tip.position.x, 0.5)
+  checkAlignment()
+  const disposals = disposeCounts(t, overlayResources(overlay))
+  const next = rigAsset(view.harness, '/next-rig.glb')
+  view.switchTo('/next-rig.glb')
+  assert.ok(disposals.every(spy => spy.mock.callCount() === 1))
+  assert.equal(overlay.children.length, 0)
+  assert.equal(view.mixers[0].existingAction(rig.clip), null)
+  assert.ok(view.button('Play animation'))
+  view.frame(0.25)
+  assert.equal(next.tip.position.x, 0)
+})
+
+test('Viewer3D rig helpers do not contaminate source mesh statistics on same-URL scene replacement', async t => {
+  const view = await mount(t, '/rig.glb', harness => rigAsset(harness))
+  view.click('Rig joints')
+  const next = rigAsset(view.harness)
+  view.render()
+  assert.deepEqual(view.useAppStore.getState().meshStats, { vertices: 9, triangles: 3 })
+  view.click('Rig bones')
+  assert.equal(rigOverlay(view).children.filter(child => child instanceof THREE.Mesh).length, 0)
+  assert.deepEqual(view.useAppStore.getState().meshStats, { vertices: 9, triangles: 3 })
+  assert.equal(next.scene.getObjectByName('RigInspectionOverlay'), undefined)
+})
+
+
+test('Viewer3D restores absent colors and disposes influence geometry on same-source replacement and later source changes', async t => {
+  let rig!: ReturnType<typeof rigAsset>
+  const view = await mount(t, '/rig.glb', harness => {
+    rig = rigAsset(harness)
+    rig.geometry.deleteAttribute('color')
+  })
+  view.click('Bone influence')
+  assert.equal(rig.geometry.getAttribute('color'), undefined)
+  const clones = disposeCounts(t, [rig.first.geometry, rig.second.geometry])
+  view.click('Wireframe')
+  assert.ok(clones.every(spy => spy.mock.callCount() === 1))
+  assert.equal(rig.first.geometry, rig.geometry)
+  assert.equal(rig.geometry.getAttribute('color'), undefined)
+  const wireframe = disposeCounts(t, [singleMaterial(rig.first), singleMaterial(rig.second), singleMaterial(rig.backdrop)])
+  view.click('Bone influence')
+  assert.ok(wireframe.every(spy => spy.mock.callCount() === 1))
+  const oldMode = disposeCounts(t, [rig.first.geometry, rig.second.geometry, singleMaterial(rig.first), singleMaterial(rig.second), singleMaterial(rig.backdrop), ...overlayResources(rigOverlay(view))])
+  rigAsset(view.harness)
+  view.render()
+  assert.ok(oldMode.every(spy => spy.mock.callCount() === 1))
+  assert.equal(rig.first.material, rig.materials)
+  assert.equal(rig.first.geometry, rig.geometry)
+  assert.equal(rig.geometry.getAttribute('color'), undefined)
+  view.click('Bone influence')
+  const current = view.harness.gltf.get('/rig.glb').scene
+  const sourceMeshes: import('three').Mesh[] = []
+  current.traverse((child: import('three').Object3D) => { if (child instanceof THREE.Mesh) sourceMeshes.push(child) })
+  const nextMode = disposeCounts(t, [...sourceMeshes.map(singleMaterial), ...sourceMeshes.filter(mesh => mesh instanceof THREE.SkinnedMesh).map(mesh => mesh.geometry), ...overlayResources(rigOverlay(view))])
+  view.switchTo('/scan.splat')
+  assert.ok(nextMode.every(spy => spy.mock.callCount() === 1))
+  assert.equal(view.harness.frames.size, 0)
+})
+
+test('Viewer3D releases mode-owned matcap and checker textures without disposing source materials on mode changes', async t => {
+  const view = await mount(t)
+  // Canvas pixels are not rendered; these are only texture ownership checks.
+  ;(globalThis.document as any).createElement = () => ({
+    width: 0, height: 0,
+    getContext: () => ({ createRadialGradient: () => ({ addColorStop() {} }), fillRect() {}, fillStyle: '' }),
+  })
+  view.click('Matcap')
+  const matcap = view.first.mesh.material as unknown as import('three').MeshMatcapMaterial
+  const matcapDisposals = disposeCounts(t, [matcap, matcap.matcap!])
+  view.click('UV Checker')
+  assert.ok(matcapDisposals.every(spy => spy.mock.callCount() === 1))
+  const checker = view.first.mesh.material as unknown as import('three').MeshBasicMaterial
+  const checkerDisposals = disposeCounts(t, [checker, checker.map!])
+  view.unmount()
+  assert.ok(checkerDisposals.every(spy => spy.mock.callCount() === 1))
 })

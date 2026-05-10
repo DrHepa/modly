@@ -1,17 +1,20 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import path from 'node:path'
+import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
+const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const viewerToolbarEntry = path.join(projectRoot, 'src/areas/generate/components/ViewerToolbar.tsx')
 
 async function loadViewerToolbarModule() {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-viewer-toolbar-'))
+  const tempDir = await mkdtemp(path.join(tmpdir(), 'modly-viewer-toolbar-'))
   const outfile = path.join(tempDir, 'ViewerToolbar.bundle.mjs')
 
   await build({
@@ -21,7 +24,9 @@ async function loadViewerToolbarModule() {
     format: 'esm',
     platform: 'node',
     tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    external: ['react', 'react/jsx-runtime'],
+    plugins: [{ name: 'installed-react', setup(builder) {
+      builder.onResolve({ filter: /^react(?:\/.*)?$/ }, args => ({ path: require.resolve(args.path), external: true }))
+    } }],
   })
 
   const module = await import(pathToFileURL(outfile).href)
@@ -41,6 +46,7 @@ async function renderToolbar(props: Record<string, unknown>) {
     return renderToStaticMarkup(createElement(module.ViewerToolbar, {
       viewMode: 'solid',
       autoRotate: false,
+      hasRig: false,
       onViewMode: () => undefined,
       onAutoRotate: () => undefined,
       onScreenshot: () => undefined,
@@ -64,6 +70,9 @@ test('ViewerToolbar disables one animation control when no clips are available a
   assert.doesNotMatch(html, /aria-pressed=/)
   assert.match(html, /title="Solid"/)
   assert.match(html, /title="Wireframe"/)
+  assert.match(html, /title="Rig bones \(rig only\)"/)
+  assert.match(html, /title="Rig joints \(rig only\)"/)
+  assert.match(html, /title="Bone influence \(rig only\)"/)
   assert.match(html, /title="Auto-rotate"/)
   assert.match(html, /title="Screenshot"/)
 })
@@ -94,4 +103,25 @@ test('ViewerToolbar renders one pressed Pause animation control while playing', 
   assert.match(html, /aria-label="Pause animation"/)
   assert.match(html, /aria-pressed="true"/)
   assert.doesNotMatch(html, /title="Play animation"/)
+})
+
+test('ViewerToolbar enables rig inspection controls when a skeleton is available', async () => {
+  const html = await renderToolbar({
+    hasRig: true,
+    hasAnimations: false,
+    animationPlaying: false,
+    onAnimationToggle: () => undefined,
+  })
+
+  assert.match(html, /title="Rig bones"/)
+  assert.match(html, /title="Rig joints"/)
+  assert.match(html, /title="Bone influence"/)
+  assert.doesNotMatch(html, /Rig bones \(rig only\)/)
+})
+
+test('ViewerToolbar hides all mesh and rig modes for splats while retaining actions', async () => {
+  const html = await renderToolbar({ showViewModes: false, hasRig: true })
+  assert.doesNotMatch(html, /title="(?:Solid|Wireframe|Normals|Matcap|UV Checker|Rig bones|Rig joints|Bone influence)"/)
+  assert.match(html, /title="Auto-rotate"/)
+  assert.match(html, /title="Screenshot"/)
 })

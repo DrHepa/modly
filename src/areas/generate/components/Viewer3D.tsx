@@ -29,6 +29,186 @@ const SELECTION_OUTLINE_BLUR = false
 const SELECTION_OUTLINE_MULTISAMPLING = 0
 const SELECTION_OUTLINE_RESOLUTION_SCALE = 0.5
 
+type RigStats = {
+  hasRig: boolean
+  skinnedMeshCount: number
+  boneCount: number
+  jointCount: number
+}
+
+type JointMarker = {
+  bone: THREE.Bone
+  marker: THREE.Mesh
+}
+
+const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
+
+function isRigViewMode(viewMode: ViewMode): boolean {
+  return RIG_VIEW_MODES.includes(viewMode)
+}
+
+function collectRigStats(scene: THREE.Object3D): RigStats {
+  const bones = new Set<THREE.Bone>()
+  let skinnedMeshCount = 0
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+    skinnedMeshCount += 1
+    child.skeleton.bones.forEach((bone) => bones.add(bone))
+  })
+
+  return {
+    hasRig: skinnedMeshCount > 0 && bones.size > 0,
+    skinnedMeshCount,
+    boneCount: bones.size,
+    jointCount: bones.size,
+  }
+}
+
+function buildInfluencePalette(size: number): THREE.Color[] {
+  return Array.from({ length: Math.max(size, 1) }, (_, index) => {
+    const color = new THREE.Color()
+    color.setHSL((index * 0.61803398875) % 1, 0.72, 0.58)
+    return color
+  })
+}
+
+function ensureInfluenceColors(geometry: THREE.BufferGeometry, palette: THREE.Color[]): void {
+  const position = geometry.getAttribute('position')
+  const skinIndex = geometry.getAttribute('skinIndex')
+  const skinWeight = geometry.getAttribute('skinWeight')
+
+  if (!position || !skinIndex || !skinWeight) return
+
+  const vertexCount = position.count
+  const colors = new Float32Array(vertexCount * 3)
+  const neutral = new THREE.Color('#27272a')
+
+  for (let index = 0; index < vertexCount; index += 1) {
+    let bestWeight = -1
+    let bestBoneIndex = 0
+
+    for (let slot = 0; slot < 4; slot += 1) {
+      const weight = skinWeight.getComponent(index, slot)
+      if (weight > bestWeight) {
+        bestWeight = weight
+        bestBoneIndex = skinIndex.getComponent(index, slot)
+      }
+    }
+
+    const color = neutral.clone().lerp(palette[bestBoneIndex % palette.length] ?? new THREE.Color('#a855f7'), Math.max(0.2, bestWeight))
+    colors[index * 3] = color.r
+    colors[index * 3 + 1] = color.g
+    colors[index * 3 + 2] = color.b
+  }
+
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+}
+
+function createInfluenceMaterial(): THREE.MeshStandardMaterial {
+  const material = new THREE.MeshStandardMaterial({
+    color: '#ffffff',
+    roughness: 0.72,
+    metalness: 0.08,
+    vertexColors: true,
+    side: THREE.DoubleSide,
+  })
+  material.toneMapped = true
+  return material
+}
+
+function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    color: '#18181b',
+    roughness: 0.9,
+    metalness: 0.0,
+    side: THREE.DoubleSide,
+  })
+}
+
+const EMPTY_RIG_STATS: RigStats = { hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 }
+
+// Auxiliary objects never enter the source hierarchy, BVH, stats or Select.
+// Keep Three's SkeletonHelper for this inspection view; it owns the line data.
+function RigInspectionOverlay({ scene, viewMode }: { scene: THREE.Object3D; viewMode: ViewMode }): JSX.Element {
+  const overlay = useMemo(() => {
+    const group = new THREE.Group()
+    group.name = 'RigInspectionOverlay'
+    group.matrixAutoUpdate = false
+    return group
+  }, [scene])
+  const skeletonHelpers = useRef<THREE.SkeletonHelper[]>([])
+  const jointMarkers = useRef<JointMarker[]>([])
+  const sceneInverse = useMemo(() => new THREE.Matrix4(), [])
+
+  useEffect(() => {
+    const bones = new Set<THREE.Bone>()
+    const roots = new Set<THREE.Object3D>()
+    scene.traverse((child) => {
+      if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+      child.skeleton.bones.forEach((bone) => {
+        bones.add(bone)
+        let root: THREE.Object3D = bone
+        while (root.parent instanceof THREE.Bone) root = root.parent
+        roots.add(root)
+      })
+    })
+    roots.forEach((root) => {
+      const helper = new THREE.SkeletonHelper(root)
+      // SkeletonHelper aliases root.matrixWorld by default. This sibling
+      // overlay supplies the source transform, so use a separate local matrix.
+      helper.matrix = new THREE.Matrix4()
+      const material = helper.material as THREE.LineBasicMaterial
+      material.depthTest = false
+      material.transparent = true
+      material.opacity = viewMode === 'influence' ? 0.88 : 1
+      material.color.set(viewMode === 'influence' ? '#f8fafc' : '#a78bfa')
+      helper.renderOrder = 2
+      helper.raycast = () => undefined
+      overlay.add(helper)
+      skeletonHelpers.current.push(helper)
+    })
+    if (viewMode === 'joints' || viewMode === 'influence') {
+      bones.forEach((bone) => {
+        const marker = new THREE.Mesh(
+          new THREE.OctahedronGeometry(0.032, 0),
+          new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08 }),
+        )
+        marker.renderOrder = 3
+        marker.raycast = () => undefined
+        overlay.add(marker)
+        jointMarkers.current.push({ bone, marker })
+      })
+    }
+    return () => {
+      skeletonHelpers.current.forEach((helper) => helper.dispose())
+      jointMarkers.current.forEach(({ marker }) => {
+        marker.geometry.dispose()
+        ;(marker.material as THREE.Material).dispose()
+      })
+      skeletonHelpers.current = []
+      jointMarkers.current = []
+      overlay.clear()
+    }
+  }, [scene, viewMode, overlay])
+
+  // Mixer updates run at -1, before this normal-priority inspection update.
+  useFrame(() => {
+    scene.updateWorldMatrix(true, true)
+    overlay.matrix.copy(scene.matrix)
+    sceneInverse.copy(scene.matrixWorld).invert()
+    skeletonHelpers.current.forEach((helper) => {
+      helper.matrix.multiplyMatrices(sceneInverse, helper.root.matrixWorld)
+    })
+    jointMarkers.current.forEach(({ bone, marker }) => {
+      marker.position.setFromMatrixPosition(bone.matrixWorld).applyMatrix4(sceneInverse)
+    })
+    overlay.updateMatrixWorld(true)
+  })
+
+  return <primitive object={overlay} />
+}
+
 // ---------------------------------------------------------------------------
 // Procedural textures
 // ---------------------------------------------------------------------------
@@ -199,6 +379,7 @@ interface MeshModelProps {
   onSelect: () => void
   onObject: (obj: THREE.Object3D | null) => void
   onAnimationAvailability: (hasAnimations: boolean) => void
+  onRigStats: (stats: RigStats) => void
 }
 
 function MeshModel(props: MeshModelProps): JSX.Element {
@@ -241,7 +422,7 @@ function GltfMeshModel(props: MeshModelProps): JSX.Element {
     if (animationPlaying && mixerRef.current) {
       mixerRef.current.update(delta)
     }
-  })
+  }, -1)
 
   return <SceneMeshModel {...props} scene={scene} loaderType="gltf" />
 }
@@ -260,6 +441,7 @@ function SceneMeshModel({
   onStats,
   onSelect,
   onObject,
+  onRigStats,
   scene,
   loaderType,
 }: MeshModelProps & {
@@ -267,7 +449,13 @@ function SceneMeshModel({
   loaderType: 'gltf' | 'obj'
 }): JSX.Element {
   const captured = useRef(false)
-  const edgeHelpers = useRef<THREE.LineSegments[]>([])
+  const rigStats = useMemo(() => collectRigStats(scene), [scene])
+  const effectiveViewMode = isRigViewMode(viewMode) && !rigStats.hasRig ? 'solid' : viewMode
+
+  useEffect(() => {
+    onRigStats(rigStats)
+    return () => onRigStats(EMPTY_RIG_STATS)
+  }, [rigStats, onRigStats])
 
   // Expose the scene object so Viewer3D can attach the transform gizmo to it.
   useEffect(() => {
@@ -275,41 +463,37 @@ function SceneMeshModel({
     return () => onObject(null)
   }, [scene, onObject])
 
-  // Free GPU resources and loader cache when this model is replaced or unmounted
+  // Snapshot source resources before material overrides. Teardown must release
+  // originals even when an influence clone is still mounted; shared assets once.
   useEffect(() => {
+    const geometries = new Set<THREE.BufferGeometry>()
+    const materials = new Set<THREE.Material>()
+    scene.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return
+      geometries.add(child.geometry)
+      const meshMaterials = Array.isArray(child.material) ? child.material : [child.material]
+      meshMaterials.forEach((material) => materials.add(material))
+    })
     return () => {
-      if (loaderType === 'obj') {
-        useLoader.clear(OBJLoader, url)
-      } else {
-        useGLTF.clear(url)
-      }
-      scene.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          child.geometry.dispose()
-          const materials = Array.isArray(child.material) ? child.material : [child.material]
-          materials.forEach((m: THREE.Material) => m.dispose())
-        }
-      })
+      if (loaderType === 'obj') useLoader.clear(OBJLoader, url)
+      else useGLTF.clear(url)
+      geometries.forEach((geometry) => geometry.dispose())
+      materials.forEach((material) => material.dispose())
     }
   }, [loaderType, scene, url])
 
-  // Compute BVH on all geometries for fast raycasting (O(log N) vs O(N)).
-  // Also force DoubleSide on every material so faces with inverted normals
-  // (a known artifact of the flexible-dual-grid mesh decoder) are still visible.
+  // Only source geometry participates in BVH and DoubleSide setup.
   useEffect(() => {
+    const geometries = new Set<THREE.BufferGeometry>()
     scene.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        (child.geometry as any).computeBoundsTree()
-        const mats = Array.isArray(child.material) ? child.material : [child.material]
-        mats.forEach((m: THREE.Material) => { m.side = THREE.DoubleSide })
-      }
+      if (!(child instanceof THREE.Mesh)) return
+      geometries.add(child.geometry)
+      const mats = Array.isArray(child.material) ? child.material : [child.material]
+      mats.forEach((material: THREE.Material) => { material.side = THREE.DoubleSide })
     })
+    geometries.forEach((geometry) => (geometry as any).computeBoundsTree())
     return () => {
-      scene.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          (child.geometry as any).disposeBoundsTree?.()
-        }
-      })
+      geometries.forEach((geometry) => (geometry as any).disposeBoundsTree?.())
     }
   }, [scene])
 
@@ -347,52 +531,68 @@ function SceneMeshModel({
     captured.current = false
   }, [url])
 
-  // Material swapping based on viewMode
+  // Each mode owns only its temporary material, textures and influence geometry.
+  // Restoring object references also preserves material arrays and vertex colors.
   useEffect(() => {
-    // Remove any edge helpers from previous wireframe pass
-    edgeHelpers.current.forEach((lines) => lines.parent?.remove(lines))
-    edgeHelpers.current = []
-
+    const restore: (() => void)[] = []
     scene.traverse((child) => {
       if (!(child instanceof THREE.Mesh)) return
-
-      // Save original material on first visit
-      if (!child.userData.originalMaterial) {
-        child.userData.originalMaterial = child.material
-      }
-
-      let next: THREE.Material
-      switch (viewMode) {
-        case 'wireframe': {
+      const originalMaterial = child.material
+      const originalGeometry: THREE.BufferGeometry = child.geometry
+      let next: THREE.Material | THREE.Material[] = originalMaterial
+      let geometry: THREE.BufferGeometry | undefined
+      let texture: THREE.Texture | undefined
+      switch (effectiveViewMode) {
+        case 'influence':
+          if (child instanceof THREE.SkinnedMesh && child.skeleton) {
+            geometry = originalGeometry.clone()
+            ensureInfluenceColors(geometry, buildInfluencePalette(child.skeleton.bones.length))
+            child.geometry = geometry
+            next = createInfluenceMaterial()
+          } else {
+            next = createMutedRigBackdropMaterial()
+          }
+          break
+        case 'wireframe':
           next = new THREE.MeshBasicMaterial({ color: 0x4ade80, wireframe: true })
           break
-        }
         case 'normals':
-          // Ensure vertex normals exist — AI-generated meshes often skip this
           child.geometry.computeVertexNormals()
           next = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide })
           break
         case 'matcap':
-          next = new THREE.MeshMatcapMaterial({ matcap: createMatcapTexture() })
+          texture = createMatcapTexture()
+          next = new THREE.MeshMatcapMaterial({ matcap: texture })
           break
         case 'uv':
-          next = new THREE.MeshBasicMaterial({ map: createCheckerTexture() })
+          texture = createCheckerTexture()
+          next = new THREE.MeshBasicMaterial({ map: texture })
           break
-        default:
-          next = child.userData.originalMaterial as THREE.Material
       }
-
       child.material = next
+      restore.push(() => {
+        child.material = originalMaterial
+        child.geometry = originalGeometry
+        if (next !== originalMaterial) (next as THREE.Material).dispose()
+        texture?.dispose()
+        geometry?.dispose()
+      })
     })
-  }, [scene, viewMode])
+    return () => restore.forEach((cleanup) => cleanup())
+  }, [scene, effectiveViewMode])
 
   return (
-    <Select enabled={selected}>
-      <primitive
-        object={scene}
-        onClick={(e: { stopPropagation: () => void }) => { e.stopPropagation(); onSelect() }}
-      />
-    </Select>
+    <>
+      <Select enabled={selected}>
+        <primitive
+          object={scene}
+          onClick={(e: { stopPropagation: () => void }) => { e.stopPropagation(); onSelect() }}
+        />
+      </Select>
+      {rigStats.hasRig && isRigViewMode(effectiveViewMode) && (
+        <RigInspectionOverlay scene={scene} viewMode={effectiveViewMode} />
+      )}
+    </>
   )
 
 }
@@ -977,6 +1177,7 @@ export default function Viewer3D({
 
   const [viewMode, setViewMode] = useState<ViewMode>('solid')
   const [autoRotate, setAutoRotate] = useState(false)
+  const [rigSource, setRigSource] = useState<{ url: string | null; stats: RigStats } | null>(null)
   const [playingUrl, setPlayingUrl] = useState<string | null>(null)
   const [animationSource, setAnimationSource] = useState<{ url: string | null; available: boolean } | null>(null)
   const selected = useAppStore((s) => s.meshSelected)
@@ -1005,6 +1206,7 @@ export default function Viewer3D({
   // effect must not erase a child's availability report on the initial mount.
   const hasAnimations = !!modelUrl && !isSplat && animationSource?.url === modelUrl && animationSource.available
   const animationPlaying = hasAnimations && playingUrl === modelUrl
+  const hasRig = !!modelUrl && !isSplat && rigSource?.url === modelUrl && rigSource.stats.hasRig
 
   // The splat viewer needs binary .splat — route raw workspace .ply through the
   // conversion endpoint; import URLs already point at a .splat via serve-file.
@@ -1067,6 +1269,11 @@ export default function Viewer3D({
     if (!available) {
       setPlayingUrl(null)
     }
+  }, [modelUrl])
+
+  const handleRigStats = useCallback((stats: RigStats) => {
+    setRigSource({ url: modelUrl, stats })
+    if (!stats.hasRig) setViewMode((mode) => isRigViewMode(mode) ? 'solid' : mode)
   }, [modelUrl])
 
   // Snapshot the pre-drag pose when a gizmo manipulation starts.
@@ -1189,6 +1396,7 @@ export default function Viewer3D({
                   onSelect={handleMeshSelect}
                   onObject={setMeshObject}
                   onAnimationAvailability={handleAnimationAvailability}
+                  onRigStats={handleRigStats}
                 />
               </Suspense>
             </Selection>
@@ -1247,6 +1455,7 @@ export default function Viewer3D({
             autoRotate={autoRotate}
             animationPlaying={animationPlaying}
             hasAnimations={hasAnimations}
+            hasRig={hasRig}
             onViewMode={setViewMode}
             onAutoRotate={() => setAutoRotate((v) => !v)}
             onAnimationToggle={() => setPlayingUrl((url) => hasAnimations && url !== modelUrl ? modelUrl : null)}

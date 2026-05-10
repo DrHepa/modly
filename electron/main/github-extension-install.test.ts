@@ -351,6 +351,57 @@ test('commitInstallPlan removes incomplete fresh children when a post-copy step 
   })
 })
 
+test('commitInstallPlan restores replaced user extensions when a post-copy step fails', async () => {
+  const { discoverInstallCandidates, validateInstallCandidates, commitInstallPlan } = await import(serviceModuleUrl)
+
+  await withFixtureRepo('bundle-valid', async (repoDir) => {
+    const extensionsDir = await mkdtemp(join(tmpdir(), 'modly-installed-extensions-'))
+    const existingDir = join(extensionsDir, 'image-model')
+    const sourceDir = join(repoDir, 'extensions', 'image-model')
+    let postCopyCalls = 0
+
+    try {
+      await cp(sourceDir, existingDir, { recursive: true })
+      await writeFile(join(existingDir, 'user-owned.txt'), 'keep-me', 'utf-8')
+      const previousManifest = await readFile(join(existingDir, 'manifest.json'), 'utf-8')
+      await writeFile(join(sourceDir, 'replacement-only.txt'), 'new-version', 'utf-8')
+      const plan = await validateInstallCandidates({
+        repoDir,
+        sourceRepo: 'https://github.com/acme/bundle-valid',
+        discovery: await discoverInstallCandidates(repoDir),
+      })
+
+      await assert.rejects(
+        () => commitInstallPlan({
+          plan: { ...plan, candidates: [plan.candidates[0]!] },
+          extensionsDir,
+          builtinExtensionIds: new Set(),
+          postCopyStep: async ({ candidateId, destinationDir, replacedExisting }: CommitPostCopyContext) => {
+            postCopyCalls += 1
+            assert.equal(candidateId, 'image-model')
+            assert.equal(destinationDir, existingDir)
+            assert.equal(replacedExisting, true)
+            assert.equal(await readFile(join(destinationDir, 'replacement-only.txt'), 'utf-8'), 'new-version')
+            const backups = (await readDirNames(extensionsDir)).filter((name) => name.startsWith('.modly-backup-image-model-'))
+            assert.equal(backups.length, 1)
+            assert.equal(await readFile(join(extensionsDir, backups[0]!, 'user-owned.txt'), 'utf-8'), 'keep-me')
+            throw new Error('simulated setup failure after replacement copy')
+          },
+        }),
+        /simulated setup failure after replacement copy/i,
+      )
+
+      assert.equal(postCopyCalls, 1)
+      assert.equal(await readFile(join(existingDir, 'user-owned.txt'), 'utf-8'), 'keep-me')
+      assert.equal(await readFile(join(existingDir, 'manifest.json'), 'utf-8'), previousManifest)
+      assert.equal(await stat(join(existingDir, 'replacement-only.txt')).then(() => true, () => false), false)
+      assert.deepEqual(await readDirNames(extensionsDir), ['image-model'])
+    } finally {
+      await rm(extensionsDir, { recursive: true, force: true })
+    }
+  })
+})
+
 test('installGitHubExtensionRepo returns legacy-compatible success output and reloads exactly once for a single installed child', async () => {
   const { installGitHubExtensionRepo } = await import(serviceModuleUrl)
 
@@ -563,6 +614,7 @@ test('installGitHubExtensionRepo never reports failed setup or npm children as i
       assert.equal(result.warnings.length, 0)
       assert.equal(result.reloaded, false)
       assert.equal(reloadCalls, 0)
+      assert.deepEqual(await readDirNames(extensionsDir), [])
 
       const childStatuses = progressEvents
         .filter((event) => event.step === 'child_result')
@@ -786,19 +838,33 @@ test('failed setup restores a healthy previous version and does not expose a fai
     try {
       await cp(repoDir, join(root, 'legacy-root-model'), { recursive: true })
       await writeFile(join(root, 'legacy-root-model/old.txt'), 'previous')
+      const previousManifest = await readFile(join(root, 'legacy-root-model/manifest.json'), 'utf8')
       await writeFile(join(repoDir, 'setup.py'), 'fixture only')
+      let reloadCalls = 0
       const result = await installGitHubExtensionRepo({
         githubUrl: 'https://github.com/acme/legacy', extensionsDir: root, builtinExtensionIds: new Set(), trustedRepos: new Set(),
         operations: {
           async downloadTarball() {},
           async extractTarball({ extractDir }: ExtractTarballInput) { await cp(repoDir, extractDir, { recursive: true }) },
           async runExtensionSetup({ destinationDir }: RunExtensionSetupInput) { assert.equal(destinationDir, join(root, 'legacy-root-model')); throw new Error('fixture setup failed') },
-          async reloadExtensions() { return { reloaded: true, models: ['legacy-root-model/generate-mesh'], errors: {} } },
+          async reloadExtensions() {
+            reloadCalls += 1
+            assert.equal(await readFile(join(root, 'legacy-root-model/old.txt'), 'utf8'), 'previous')
+            return { reloaded: true, models: ['legacy-root-model/generate-mesh'], errors: {} }
+          },
         },
       })
+      assert.equal(result.success, false)
+      assert.equal(result.status, 'error')
       assert.deepEqual(result.installed, [])
+      assert.equal(result.failed.length, 1)
+      assert.equal(result.failed[0]?.extensionId, 'legacy-root-model')
       assert.equal(result.failed[0]?.stage, 'setup')
+      assert.deepEqual(result.warnings, [])
+      assert.equal(result.reloaded, true)
+      assert.equal(reloadCalls, 1)
       assert.equal(await readFile(join(root, 'legacy-root-model/old.txt'), 'utf8'), 'previous')
+      assert.equal(await readFile(join(root, 'legacy-root-model/manifest.json'), 'utf8'), previousManifest)
       assert.deepEqual(await readDirNames(root), ['legacy-root-model'])
     } finally { await rm(root, { recursive: true, force: true }) }
   })

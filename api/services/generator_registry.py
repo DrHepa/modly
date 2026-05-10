@@ -69,6 +69,9 @@ print(f"[Registry] MODELS_DIR     = {MODELS_DIR}")
 print(f"[Registry] WORKSPACE_DIR  = {WORKSPACE_DIR}")
 print(f"[Registry] EXTENSIONS_DIR = {EXTENSIONS_DIR or '(not set)'}")
 
+# Optional read-only diagnostics have a bounded budget independent of model load.
+_DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
+
 
 def is_within_workspace(resolved_path: Path) -> bool:
     """True when an already-resolved path is the current workspace or inside it.
@@ -763,7 +766,7 @@ class GeneratorRegistry:
         self._legacy_imports = _LegacyImportManager()
         self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
         self._runtime_readiness_ttl_seconds = 30.0
-        self._runtime_readiness_timeout_seconds = 5.0
+        self._runtime_readiness_timeout_seconds = _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
         self._runtime_readiness_epoch = 0
         self._runtime_readiness_cache: Dict[tuple, tuple[float, dict]] = {}
         self._runtime_readiness_inflight: Dict[tuple, Future] = {}

@@ -27,6 +27,10 @@ _AUTO_REPAIR_PACKAGE_MAP = {
     "PIL": "Pillow",
 }
 
+# Optional diagnostics may perform slow, read-only cold import checks.
+# This bound neither starts a worker nor imposes a model-load deadline.
+_RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS = 30.0
+
 
 class RuntimeReadinessUnavailable(RuntimeError):
     """Host-authored diagnostic state, safe to expose without exception text."""
@@ -66,7 +70,7 @@ class ExtensionProcess:
         self._readiness_lock = threading.Lock()
         self._readiness_pending = None
         self._runtime_revision = 0
-        self._readiness_timeout = 5.0
+        self._readiness_timeout = _RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS
 
         # Mirrors BaseGenerator attributes used by the registry
         self.hf_repo          = manifest.get("hf_repo", "")
@@ -453,6 +457,10 @@ class ExtensionProcess:
                 raise RuntimeError(f"[{self.MODEL_ID}] Subprocess died during generation")
 
             t = msg.get("type")
+            if t in ("progress", "done", "error", "cancelled") and msg.get("id") != req_id:
+                # A late or foreign generation reply must not settle this
+                # request, report progress, or invalidate its loaded model.
+                continue
 
             if t == "progress":
                 if progress_cb:

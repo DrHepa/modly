@@ -7,7 +7,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from services.extension_process import ExtensionProcess
-from services.generator_registry import GeneratorRegistry, _LegacyGeneratorProxy
+from services.generator_registry import (
+    GeneratorRegistry, _LegacyGeneratorProxy,
+    _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS,
+)
 os.environ.setdefault("EXTENSION_DIR", "/tmp/modly-test-extension")
 import runner
 
@@ -289,6 +292,13 @@ def test_registry_returns_stale_cache_on_error_and_sanitized_failure_without_cac
     assert "secret" not in str(timed_out)
 
 
+def test_registry_uses_bounded_longer_default_runtime_readiness_timeout():
+    registry = GeneratorRegistry()
+
+    assert registry._runtime_readiness_timeout_seconds == _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
+    assert registry._runtime_readiness_timeout_seconds == 30.0
+
+
 def test_registry_marks_models_without_readiness_as_unsupported_contract():
     registry = _registry("legacy-ext/image-to-mesh", LegacyGenerator())
 
@@ -300,9 +310,24 @@ def test_registry_marks_models_without_readiness_as_unsupported_contract():
 
 
 def test_extension_process_sends_runtime_readiness_action_with_bounded_timeout(monkeypatch):
+    from types import SimpleNamespace
+
     process = ExtensionProcess(Path('/unused'), {"id": "runtime-ext/text-to-image"})
     process._proc = type('FakeWorker', (), {'poll': lambda self: None})()
     sent: list[dict] = []
+    mailbox_timeouts = []
+
+    class ObservedMailbox(queue.Queue):
+        def get(self, block=True, timeout=None):
+            mailbox_timeouts.append(timeout)
+            return super().get(block=block, timeout=timeout)
+
+    monkeypatch.setattr('services.extension_process.queue', SimpleNamespace(
+        Queue=ObservedMailbox, Empty=queue.Empty,
+    ))
+    monkeypatch.setattr(process, '_recv', lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError('Diagnostics must not read the shared model queue')
+    ))
     def send(message):
         sent.append(message)
         process._route_readiness_reply(process._proc, {
@@ -316,7 +341,8 @@ def test_extension_process_sends_runtime_readiness_action_with_bounded_timeout(m
     assert len(sent) == 1
     assert sent[0]['action'] == 'runtime_readiness'
     assert sent[0]['id'].startswith('readiness:')
-    assert process._readiness_timeout == 5.0
+    assert process._readiness_timeout == 30.0
+    assert mailbox_timeouts == [30.0]
     assert status == {"ok": True, "machine_code": "ready"}
 
 

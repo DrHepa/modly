@@ -229,8 +229,7 @@ class GenerateErrorLoadedFlagTests(unittest.TestCase):
     def _failing_generate(self, error_msg: dict) -> ExtensionProcess:
         proc = _make_proc()
         proc._loaded = True
-        proc._send = lambda msg: None  # type: ignore[assignment]
-        proc._queue.put(error_msg)
+        proc._send = lambda request: proc._queue.put({**error_msg, "id": request["id"]})
         with self.assertRaises(RuntimeError):
             proc.generate(b"", {})
         return proc
@@ -254,11 +253,10 @@ class GenerateErrorLoadedFlagTests(unittest.TestCase):
     def test_error_still_propagates_the_original_cause(self) -> None:
         proc = _make_proc()
         proc._loaded = True
-        proc._send = lambda msg: None  # type: ignore[assignment]
-        proc._queue.put(
-            {"type": "error", "message": "short", "traceback": "full traceback here",
-             "loaded": False}
-        )
+        proc._send = lambda request: proc._queue.put({
+            "type": "error", "id": request["id"], "message": "short",
+            "traceback": "full traceback here", "loaded": False,
+        })
         with self.assertRaises(RuntimeError) as ctx:
             proc.generate(b"", {})
         self.assertIn("full traceback here", str(ctx.exception))

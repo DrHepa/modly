@@ -318,7 +318,7 @@ test('commitInstallPlan rejects unsafe candidate ids before copying', async () =
   }
 })
 
-test('commitInstallPlan keeps committed children installed when a post-copy step fails', async () => {
+test('commitInstallPlan removes newly copied children when a post-copy step fails', async () => {
   const { discoverInstallCandidates, validateInstallCandidates, commitInstallPlan } = await import(serviceModuleUrl)
 
   await withFixtureRepo('bundle-valid', async (repoDir) => {
@@ -346,12 +346,48 @@ test('commitInstallPlan keeps committed children installed when a post-copy step
         /simulated setup failure after copy/i,
       )
 
-      assert.equal(await stat(join(extensionsDir, 'image-model')).then(() => true, () => false), true)
+      assert.equal(await stat(join(extensionsDir, 'image-model')).then(() => true, () => false), false)
       assert.equal(await stat(join(extensionsDir, 'mesh-process')).then(() => true, () => false), false)
+    } finally {
+      await rm(extensionsDir, { recursive: true, force: true })
+    }
+  })
+})
 
-      const copiedManifest = await readJson(join(extensionsDir, 'image-model', 'manifest.json')) as { id?: string; source?: string }
-      assert.equal(copiedManifest.id, 'image-model')
-      assert.equal(copiedManifest.source, 'https://github.com/acme/bundle-valid')
+test('commitInstallPlan restores replaced user extensions when a post-copy step fails', async () => {
+  const { discoverInstallCandidates, validateInstallCandidates, commitInstallPlan } = await import(serviceModuleUrl)
+
+  await withFixtureRepo('bundle-valid', async (repoDir) => {
+    const discovery = await discoverInstallCandidates(repoDir)
+    const plan = await validateInstallCandidates({
+      repoDir,
+      sourceRepo: 'https://github.com/acme/bundle-valid',
+      discovery,
+    })
+
+    const extensionsDir = await mkdtemp(join(tmpdir(), 'modly-installed-extensions-'))
+    const existingDir = join(extensionsDir, 'image-model')
+    await cp(join(fixturesRoot, 'legacy-root'), existingDir, { recursive: true })
+    await writeFile(join(existingDir, 'user-owned.txt'), 'keep-me', 'utf-8')
+
+    try {
+      await assert.rejects(
+        () => commitInstallPlan({
+          plan: { ...plan, candidates: [plan.candidates[0]!] },
+          extensionsDir,
+          builtinExtensionIds: new Set(),
+          postCopyStep: async () => {
+            throw new Error('simulated setup failure after replacement copy')
+          },
+        }),
+        /simulated setup failure after replacement copy/i,
+      )
+
+      assert.equal(await stat(existingDir).then(() => true, () => false), true)
+      assert.equal(await readFile(join(existingDir, 'user-owned.txt'), 'utf-8'), 'keep-me')
+      const restoredManifest = await readJson(join(existingDir, 'manifest.json')) as { id?: string }
+      assert.equal(restoredManifest.id, 'legacy-root-model')
+      assert.deepEqual(await readDirNames(extensionsDir), ['image-model'])
     } finally {
       await rm(extensionsDir, { recursive: true, force: true })
     }
@@ -511,7 +547,7 @@ test('installGitHubExtensionRepo installs bundled children as flattened top-leve
   })
 })
 
-test('installGitHubExtensionRepo reports partial aggregate results when copied children fail setup or npm install and still reloads once', async () => {
+test('installGitHubExtensionRepo rolls back new installs when setup or npm install fail and does not reload', async () => {
   const { installGitHubExtensionRepo } = await import(serviceModuleUrl)
 
   await withFixtureRepo('bundle-valid', async (repoDir) => {
@@ -552,17 +588,10 @@ test('installGitHubExtensionRepo reports partial aggregate results when copied c
         },
       })
 
-      assert.equal(result.success, true)
-      assert.equal(result.status, 'partial')
+      assert.equal(result.success, false)
+      assert.equal(result.status, 'error')
       assert.equal(result.extensionId, undefined)
-      assert.equal(result.installed.length, 2)
-      assert.deepEqual(
-        result.installed.map((entry: InstalledExtensionResult) => ({ extensionId: entry.extensionId, status: entry.status })),
-        [
-          { extensionId: 'image-model', status: 'partial' },
-          { extensionId: 'mesh-process', status: 'partial' },
-        ],
-      )
+      assert.deepEqual(result.installed, [])
       assert.deepEqual(
         result.failed.map((entry: FailedExtensionResult) => ({ extensionId: entry.extensionId, stage: entry.stage })),
         [
@@ -570,29 +599,30 @@ test('installGitHubExtensionRepo reports partial aggregate results when copied c
           { extensionId: 'mesh-process', stage: 'npm' },
         ],
       )
-      assert.equal(result.warnings.length, 2)
-      assert.equal(result.reloaded, true)
-      assert.equal(reloadCalls, 1)
+      assert.deepEqual(result.warnings, [])
+      assert.equal(result.reloaded, false)
+      assert.equal(reloadCalls, 0)
+      assert.deepEqual(await readDirNames(extensionsDir), [])
 
       const childStatuses = progressEvents
         .filter((event) => event.step === 'child_result')
         .map((event) => ({ extensionId: event.extensionId, status: event.status }))
       assert.deepEqual(childStatuses, [
-        { extensionId: 'image-model', status: 'partial' },
-        { extensionId: 'mesh-process', status: 'partial' },
+        { extensionId: 'image-model', status: 'error' },
+        { extensionId: 'mesh-process', status: 'error' },
       ])
 
       const finalEvent = progressEvents.at(-1)
-      assert.equal(finalEvent?.step, 'done')
-      assert.equal(finalEvent?.status, 'partial')
-      assert.equal(finalEvent?.reloaded, true)
+      assert.equal(finalEvent?.step, 'error')
+      assert.equal(finalEvent?.status, 'error')
+      assert.equal(finalEvent?.reloaded, false)
     } finally {
       await rm(extensionsDir, { recursive: true, force: true })
     }
   })
 })
 
-test('installGitHubExtensionRepo reports explicit mixed partial results when one bundled child succeeds and another fails setup', async () => {
+test('installGitHubExtensionRepo keeps mixed bundles partially successful while omitting setup failures', async () => {
   const { installGitHubExtensionRepo } = await import(serviceModuleUrl)
 
   await withFixtureRepo('bundle-valid', async (repoDir) => {
@@ -631,27 +661,75 @@ test('installGitHubExtensionRepo reports explicit mixed partial results when one
       assert.equal(result.status, 'partial')
       assert.deepEqual(
         result.installed.map((entry: InstalledExtensionResult) => ({ extensionId: entry.extensionId, status: entry.status })),
-        [
-          { extensionId: 'image-model', status: 'partial' },
-          { extensionId: 'mesh-process', status: 'success' },
-        ],
+        [{ extensionId: 'mesh-process', status: 'success' }],
       )
       assert.deepEqual(
         result.failed.map((entry: FailedExtensionResult) => ({ extensionId: entry.extensionId, stage: entry.stage })),
         [{ extensionId: 'image-model', stage: 'setup' }],
       )
-      assert.deepEqual(result.warnings, ['image-model: simulated setup failure'])
+      assert.deepEqual(result.warnings, [])
       assert.equal(result.reloaded, true)
       assert.equal(reloadCalls, 1)
-      assert.deepEqual(await readDirNames(extensionsDir), ['image-model', 'mesh-process'])
+      assert.deepEqual(await readDirNames(extensionsDir), ['mesh-process'])
 
       const childStatuses = progressEvents
         .filter((event) => event.step === 'child_result')
         .map((event) => ({ extensionId: event.extensionId, status: event.status }))
       assert.deepEqual(childStatuses, [
-        { extensionId: 'image-model', status: 'partial' },
+        { extensionId: 'image-model', status: 'error' },
         { extensionId: 'mesh-process', status: 'success' },
       ])
+    } finally {
+      await rm(extensionsDir, { recursive: true, force: true })
+    }
+  })
+})
+
+test('installGitHubExtensionRepo restores a previous extension when replacement setup fails', async () => {
+  const { installGitHubExtensionRepo } = await import(serviceModuleUrl)
+
+  await withFixtureRepo('legacy-root', async (repoDir) => {
+    await writeFile(join(repoDir, 'setup.py'), 'print("setup")\n', 'utf-8')
+
+    const extensionsDir = await mkdtemp(join(tmpdir(), 'modly-installed-extensions-'))
+    const existingDir = join(extensionsDir, 'legacy-root-model')
+    await cp(join(fixturesRoot, 'legacy-root'), existingDir, { recursive: true })
+    await writeFile(join(existingDir, 'user-owned.txt'), 'keep-me', 'utf-8')
+    let reloadCalls = 0
+
+    try {
+      const result = await installGitHubExtensionRepo({
+        githubUrl: 'https://github.com/acme/legacy-root-model',
+        extensionsDir,
+        builtinExtensionIds: new Set(),
+        trustedRepos: new Set(['https://github.com/acme/legacy-root-model']),
+        operations: {
+          async downloadTarball() {},
+          async extractTarball({ extractDir }: ExtractTarballInput) {
+            await cp(repoDir, extractDir, { recursive: true })
+          },
+          async runExtensionSetup() {
+            throw new Error('simulated replacement setup failure')
+          },
+          async reloadExtensions() {
+            reloadCalls += 1
+          },
+        },
+      })
+
+      assert.equal(result.success, false)
+      assert.equal(result.status, 'error')
+      assert.deepEqual(result.installed, [])
+      assert.deepEqual(
+        result.failed.map((entry: FailedExtensionResult) => ({ extensionId: entry.extensionId, stage: entry.stage })),
+        [{ extensionId: 'legacy-root-model', stage: 'setup' }],
+      )
+      assert.equal(result.reloaded, false)
+      assert.equal(reloadCalls, 0)
+      assert.equal(await readFile(join(existingDir, 'user-owned.txt'), 'utf-8'), 'keep-me')
+      const restoredManifest = await readJson(join(existingDir, 'manifest.json')) as { id?: string }
+      assert.equal(restoredManifest.id, 'legacy-root-model')
+      assert.deepEqual(await readDirNames(extensionsDir), ['legacy-root-model'])
     } finally {
       await rm(extensionsDir, { recursive: true, force: true })
     }

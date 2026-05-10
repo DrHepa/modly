@@ -15,11 +15,17 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
 _RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
+
+# Runtime readiness can legitimately take longer than ordinary control-plane RPCs
+# because some extensions perform managed import smoke/setup checks on cold start.
+# Keep the timeout bounded so hung subprocesses still fail closed.
+_RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS = 30.0
 
 
 def _venv_python(ext_dir: Path) -> Path:
@@ -41,10 +47,11 @@ class ExtensionProcess:
         self.model_dir     = None   # set by registry after init
         self.outputs_dir   = None   # set by registry after init
 
-        self._proc:   Optional[subprocess.Popen] = None
-        self._queue:  queue.Queue                = queue.Queue()
-        self._lock:   threading.Lock             = threading.Lock()
-        self._loaded: bool                       = False
+        self._proc:         Optional[subprocess.Popen] = None
+        self._queue:        queue.Queue                = queue.Queue()
+        self._lock:         threading.Lock             = threading.Lock()
+        self._request_lock: threading.Lock             = threading.Lock()
+        self._loaded:       bool                       = False
 
         # Mirrors BaseGenerator attributes used by the registry
         self.hf_repo          = manifest.get("hf_repo", "")
@@ -154,9 +161,42 @@ class ExtensionProcess:
             raise RuntimeError(f"[{self.MODEL_ID}] Subprocess died unexpectedly")
         return msg
 
+    def _recv_matching(
+        self,
+        *,
+        expected_types: set[str],
+        timeout: float | None,
+        ignored_types: set[str] | None = None,
+        context: str,
+    ) -> dict:
+        ignored = ignored_types or set()
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            msg = self._recv(timeout=remaining)
+            msg_type = msg.get("type")
+
+            if msg_type in expected_types:
+                return msg
+
+            if msg_type in ignored:
+                if msg_type == "log":
+                    print(f"[{self.MODEL_ID}] {msg.get('message', '')}", file=sys.stderr)
+                continue
+
+            raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to {context}: {msg}")
+
     def _ensure_started(self) -> None:
         if self._proc is None or self._proc.poll() is not None:
             self._start()
+
+    def _get_request_lock(self) -> threading.Lock:
+        lock = getattr(self, "_request_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._request_lock = lock
+        return lock
 
     # ------------------------------------------------------------------ #
     # BaseGenerator-compatible interface
@@ -171,26 +211,32 @@ class ExtensionProcess:
         return self._loaded and self._proc is not None and self._proc.poll() is None
 
     def load(self) -> None:
-        self._ensure_started()
-        self._send({"action": "load"})
+        with self._get_request_lock():
+            self._ensure_started()
+            self._send({"action": "load"})
 
-        msg = self._recv(timeout=None)  # model load can be arbitrarily slow
-        if msg.get("type") == "unloaded":
-            msg = self._recv(timeout=None)
-        if msg.get("type") == "loaded":
-            self._loaded = True
-        elif msg.get("type") == "error":
-            raise RuntimeError(msg.get("traceback") or msg.get("message"))
-        else:
-            raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to load: {msg}")
+            while True:
+                msg = self._recv_matching(
+                    expected_types={"loaded", "unloaded", "error"},
+                    ignored_types={"runtime_readiness", "log"},
+                    timeout=None,
+                    context="load",
+                )
+                if msg.get("type") == "unloaded":
+                    continue
+                if msg.get("type") == "loaded":
+                    self._loaded = True
+                    return
+                raise RuntimeError(msg.get("traceback") or msg.get("message"))
 
     def unload(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._send({"action": "unload"})
-                self._recv(timeout=30.0)
-            except Exception:
-                pass
+        with self._get_request_lock():
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._send({"action": "unload"})
+                    self._recv(timeout=30.0)
+                except Exception:
+                    pass
         self._loaded = False
 
     def generate(
@@ -202,73 +248,90 @@ class ExtensionProcess:
     ) -> Path:
         from services.generators.base import GenerationCancelled
 
-        req_id = str(uuid.uuid4())
-        self._send({
-            "action":      "generate",
-            "id":          req_id,
-            "image_b64":   base64.b64encode(image_bytes).decode(),
-            "params":      params,
-            "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
-        })
+        with self._get_request_lock():
+            self._ensure_started()
+            req_id = str(uuid.uuid4())
+            self._send({
+                "action":      "generate",
+                "id":          req_id,
+                "image_b64":   base64.b64encode(image_bytes).decode(),
+                "params":      params,
+                "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+            })
 
-        while True:
-            # Check for cancellation
-            if cancel_event and cancel_event.is_set():
-                self._send({"action": "cancel", "id": req_id})
-                # Drain until the subprocess acknowledges
-                while True:
-                    msg = self._recv(timeout=30.0)
-                    if msg.get("type") in ("cancelled", "done", "error"):
-                        raise GenerationCancelled()
+            while True:
+                # Check for cancellation
+                if cancel_event and cancel_event.is_set():
+                    self._send({"action": "cancel", "id": req_id})
+                    # Drain until the subprocess acknowledges
+                    while True:
+                        msg = self._recv(timeout=30.0)
+                        msg_id = msg.get("id")
+                        msg_type = msg.get("type")
+                        if msg_type == "log":
+                            print(f"[{self.MODEL_ID}] {msg.get('message', '')}", file=sys.stderr)
+                            continue
+                        if msg_type in ("runtime_readiness", "loaded", "unloaded"):
+                            continue
+                        if msg_type in ("cancelled", "done", "error") and msg_id == req_id:
+                            raise GenerationCancelled()
 
-            # Poll queue with short timeout so we can re-check cancel_event
-            try:
-                msg = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
+                # Poll queue with short timeout so we can re-check cancel_event
+                try:
+                    msg = self._recv(timeout=0.5)
+                except TimeoutError:
+                    continue
 
-            if msg is None:
-                raise RuntimeError(f"[{self.MODEL_ID}] Subprocess died during generation")
+                t = msg.get("type")
+                msg_id = msg.get("id")
 
-            t = msg.get("type")
+                if t in ("runtime_readiness", "loaded", "unloaded"):
+                    continue
 
-            if t == "progress":
-                if progress_cb:
-                    progress_cb(msg.get("pct", 0), msg.get("step", ""))
+                if t == "progress" and msg_id == req_id:
+                    if progress_cb:
+                        progress_cb(msg.get("pct", 0), msg.get("step", ""))
 
-            elif t == "done":
-                return Path(msg["output_path"])
+                elif t == "done" and msg_id == req_id:
+                    return Path(msg["output_path"])
 
-            elif t == "error":
-                raise RuntimeError(msg.get("traceback") or msg.get("message", "Unknown error"))
+                elif t == "error" and msg_id == req_id:
+                    raise RuntimeError(msg.get("traceback") or msg.get("message", "Unknown error"))
 
-            elif t == "cancelled":
-                raise GenerationCancelled()
+                elif t == "cancelled" and msg_id == req_id:
+                    raise GenerationCancelled()
 
-            elif t == "log":
-                print(f"[{self.MODEL_ID}] {msg.get('message', '')}", file=sys.stderr)
+                elif t == "log":
+                    print(f"[{self.MODEL_ID}] {msg.get('message', '')}", file=sys.stderr)
 
     def params_schema(self) -> list:
         return self._params_schema
 
     def readiness_status(self) -> dict:
         """Read-only optional runtime readiness from the extension runner."""
-        self._ensure_started()
-        self._send({"action": "runtime_readiness"})
-        msg = self._recv(timeout=5.0)
-        if msg.get("type") == "runtime_readiness":
-            return msg.get("status") or {}
-        if msg.get("type") == "error":
-            raise RuntimeError(msg.get("message") or "Runtime readiness check failed")
-        raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to runtime_readiness: {msg}")
+        with self._get_request_lock():
+            self._ensure_started()
+            self._send({"action": "runtime_readiness"})
+            msg = self._recv_matching(
+                expected_types={"runtime_readiness", "error"},
+                ignored_types={"loaded", "unloaded", "log"},
+                timeout=_RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS,
+                context="runtime_readiness",
+            )
+            if msg.get("type") == "runtime_readiness":
+                return msg.get("status") or {}
+            if msg.get("type") == "error":
+                raise RuntimeError(msg.get("message") or "Runtime readiness check failed")
+            raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to runtime_readiness: {msg}")
 
     def stop(self) -> None:
         """Gracefully shut down the subprocess."""
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._send({"action": "shutdown"})
-                self._proc.wait(timeout=15)
-            except Exception:
-                self._proc.kill()
+        with self._get_request_lock():
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._send({"action": "shutdown"})
+                    self._proc.wait(timeout=15)
+                except Exception:
+                    self._proc.kill()
         self._loaded = False
         self._proc   = None

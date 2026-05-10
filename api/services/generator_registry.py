@@ -43,6 +43,11 @@ print(f"[Registry] MODELS_DIR     = {MODELS_DIR}")
 print(f"[Registry] WORKSPACE_DIR  = {WORKSPACE_DIR}")
 print(f"[Registry] EXTENSIONS_DIR = {EXTENSIONS_DIR or '(not set)'}")
 
+# Runtime readiness may execute slow, read-only extension self-checks (for example
+# cold managed import smoke) so the default must be longer than normal request
+# timeouts while still remaining bounded.
+_DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
+
 
 # ------------------------------------------------------------------ #
 # Extension loader
@@ -190,7 +195,7 @@ class GeneratorRegistry:
         self._errors:     Dict[str, str]           = {}
         self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
         self._runtime_readiness_ttl_seconds = 30.0
-        self._runtime_readiness_timeout_seconds = 5.0
+        self._runtime_readiness_timeout_seconds = _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
         self._runtime_readiness_cache: Dict[str, tuple[float, dict]] = {}
         self._runtime_readiness_inflight: Dict[str, Future] = {}
         self._runtime_readiness_lock = threading.Lock()

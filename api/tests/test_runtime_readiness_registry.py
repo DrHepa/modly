@@ -4,7 +4,10 @@ import time
 import os
 
 from services.extension_process import ExtensionProcess
-from services.generator_registry import GeneratorRegistry
+from services.generator_registry import (
+    GeneratorRegistry,
+    _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS,
+)
 os.environ.setdefault("EXTENSION_DIR", "/tmp/modly-test-extension")
 import runner
 
@@ -273,6 +276,13 @@ def test_registry_returns_stale_cache_on_error_and_sanitized_failure_without_cac
     assert "secret" not in str(timed_out)
 
 
+def test_registry_uses_bounded_longer_default_runtime_readiness_timeout():
+    registry = GeneratorRegistry()
+
+    assert registry._runtime_readiness_timeout_seconds == _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
+    assert 5.0 < registry._runtime_readiness_timeout_seconds <= 45.0
+
+
 def test_registry_marks_models_without_readiness_as_unsupported_contract():
     registry = _registry("legacy-ext/image-to-mesh", LegacyGenerator())
 
@@ -288,14 +298,22 @@ def test_extension_process_sends_runtime_readiness_action_with_bounded_timeout(m
     process.MODEL_ID = "runtime-ext/text-to-image"
     process._queue = queue.Queue()
     sent: list[dict] = []
+    recv_timeouts: list[float | None] = []
     monkeypatch.setattr(process, "_ensure_started", lambda: None)
     monkeypatch.setattr(process, "_send", sent.append)
-    monkeypatch.setattr(process, "_recv", lambda timeout: {"type": "runtime_readiness", "status": {"ok": True, "machine_code": "ready"}})
+
+    def fake_recv(timeout):
+        recv_timeouts.append(timeout)
+        return {"type": "runtime_readiness", "status": {"ok": True, "machine_code": "ready"}}
+
+    monkeypatch.setattr(process, "_recv", fake_recv)
 
     status = process.readiness_status()
 
     assert sent == [{"action": "runtime_readiness"}]
     assert status == {"ok": True, "machine_code": "ready"}
+    assert len(recv_timeouts) == 1
+    assert _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS - 0.5 <= recv_timeouts[0] <= _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
 
 
 def test_runner_returns_generator_readiness_or_unsupported_contract():

@@ -136,6 +136,56 @@ test('validateInstallCandidates fails atomically when bundled children repeat th
     })
 })
 
+test('validateInstallCandidates rejects bundled children with traversal ids before commit', async () => {
+  const { discoverInstallCandidates, validateInstallCandidates } = await import(serviceModuleUrl)
+
+  await withFixtureRepo('bundle-valid', async (repoDir) => {
+    await writeFile(join(repoDir, 'extensions', 'image-model', 'manifest.json'), `${JSON.stringify({
+      id: '../escape',
+      type: 'model',
+      generator_class: 'ImageModel',
+      nodes: [{ id: 'generate', input: 'image', output: 'mesh' }],
+    }, null, 2)}\n`, 'utf-8')
+
+    const discovery = await discoverInstallCandidates(repoDir)
+
+    await assert.rejects(
+      () => validateInstallCandidates({
+        repoDir,
+        sourceRepo: 'https://github.com/acme/bundle-valid',
+        discovery,
+      }),
+      /path separators|must match|absolute path/i,
+    )
+  })
+})
+
+test('discoverInstallCandidates drops legacy root manifests with absolute ids from the installable path', async () => {
+  const { discoverInstallCandidates, validateInstallCandidates } = await import(serviceModuleUrl)
+
+  await withFixtureRepo('legacy-root', async (repoDir) => {
+    await writeFile(join(repoDir, 'manifest.json'), `${JSON.stringify({
+      id: '/abs/path',
+      type: 'model',
+      generator_class: 'LegacyRootModel',
+      source: 'https://example.com/not-canonical',
+      nodes: [{ id: 'generate-mesh', input: 'image', output: 'mesh' }],
+    }, null, 2)}\n`, 'utf-8')
+
+    const discovery = await discoverInstallCandidates(repoDir)
+
+    assert.equal(discovery.candidates.length, 0)
+    await assert.rejects(
+      () => validateInstallCandidates({
+        repoDir,
+        sourceRepo: 'https://github.com/acme/legacy-root-model/',
+        discovery,
+      }),
+      /No installable extensions found in repository/i,
+    )
+  })
+})
+
 test('validateInstallCandidates plans a single reload for a multi-child bundle', async () => {
   const { discoverInstallCandidates, validateInstallCandidates } = await import(serviceModuleUrl)
 
@@ -226,6 +276,46 @@ test('commitInstallPlan restores replaced user extensions when copy fails during
       await rm(extensionsDir, { recursive: true, force: true })
     }
   })
+})
+
+test('commitInstallPlan rejects unsafe candidate ids before copying', async () => {
+  const { commitInstallPlan } = await import(serviceModuleUrl)
+
+  const extensionsDir = await mkdtemp(join(tmpdir(), 'modly-installed-extensions-'))
+  let copied = false
+
+  try {
+    await assert.rejects(
+      () => commitInstallPlan({
+        plan: {
+          mode: 'legacy',
+          reloadCount: 1,
+          sourceRepo: 'https://github.com/acme/legacy-root-model',
+          candidates: [{
+            id: '../escape',
+            type: 'model',
+            sourceDir: fixturesRoot,
+            relativePath: '.',
+            manifest: { id: '../escape', type: 'model', generator_class: 'Fake', nodes: [{ id: 'generate', input: 'image', output: 'mesh' }] },
+            entryFile: 'generator.py',
+            requiresSetup: false,
+          }],
+        },
+        extensionsDir,
+        builtinExtensionIds: new Set(),
+        operations: {
+          async copyDirectory() {
+            copied = true
+          },
+        },
+      }),
+      /path separators/i,
+    )
+
+    assert.equal(copied, false)
+  } finally {
+    await rm(extensionsDir, { recursive: true, force: true })
+  }
 })
 
 test('commitInstallPlan keeps committed children installed when a post-copy step fails', async () => {

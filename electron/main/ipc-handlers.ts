@@ -34,6 +34,7 @@ import type { ProcessInput } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
 import { installGitHubExtensionRepo } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
+import { assertSafeExtensionId, resolveExtensionPathWithinRoot } from './extension-path-guard'
 
 type WindowGetter = () => BrowserWindow | null
 
@@ -644,22 +645,23 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // Uninstall an extension — built-ins cannot be uninstalled
   ipcMain.handle('extensions:uninstall', async (_, extensionId: string) => {
     const userData      = app.getPath('userData')
-    const builtinPath   = join(getBuiltinExtensionsDir(), extensionId)
+    const safeExtensionId = assertSafeExtensionId(extensionId)
+    const builtinPath   = resolveExtensionPathWithinRoot(getBuiltinExtensionsDir(), safeExtensionId)
     if (existsSync(builtinPath)) {
-      return { success: false, error: `"${extensionId}" is a built-in extension and cannot be uninstalled.` }
+      return { success: false, error: `"${safeExtensionId}" is a built-in extension and cannot be uninstalled.` }
     }
 
     const extensionsDir = getSettings(userData).extensionsDir
-    const extPath       = join(extensionsDir, extensionId)
+    const extPath       = resolveExtensionPathWithinRoot(extensionsDir, safeExtensionId)
     try {
-      const { extensions } = await resolveOwnershipContext(userData, extensionId)
-      const cleanupPlans = createExtensionUninstallCleanupPlan(getSettings(userData).modelsDir, extensions, extensionId)
+      const { extensions } = await resolveOwnershipContext(userData, safeExtensionId)
+      const cleanupPlans = createExtensionUninstallCleanupPlan(getSettings(userData).modelsDir, extensions, safeExtensionId)
 
       // Terminate process runner if it's a process extension
-      terminateProcessRunner(extensionId)
+      terminateProcessRunner(safeExtensionId)
 
       for (const extension of extensions) {
-        if (extension.type !== 'model' || extension.id !== extensionId) continue
+        if (extension.type !== 'model' || extension.id !== safeExtensionId) continue
         for (const node of extension.nodes) {
           const capabilityId = node.capabilityId ?? `${extension.id}/${node.id}`
           try {
@@ -687,7 +689,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // Re-run setup.py for a model extension (creates the venv if missing)
   ipcMain.handle('extensions:repair', async (_, extensionId: string) => {
     try {
-      const extDir = join(getSettings(app.getPath('userData')).extensionsDir, extensionId)
+      const safeExtensionId = assertSafeExtensionId(extensionId)
+      const extDir = resolveExtensionPathWithinRoot(getSettings(app.getPath('userData')).extensionsDir, safeExtensionId)
       if (!existsSync(join(extDir, 'setup.py'))) {
         return { success: false, error: 'No setup.py found for this extension' }
       }

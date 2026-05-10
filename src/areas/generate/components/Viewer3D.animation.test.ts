@@ -404,7 +404,7 @@ function rigOverlay(view: Awaited<ReturnType<typeof mount>>) {
   return node.props.object as import('three').Group
 }
 
-function singleMaterial(mesh: import('three').Mesh): import('three').Material {
+function singleMaterial(mesh: import('three').Mesh | import('three').LineSegments): import('three').Material {
   assert.ok(!Array.isArray(mesh.material))
   return mesh.material
 }
@@ -484,21 +484,35 @@ test('Viewer3D owns influence clones, preserves source colors and material array
   assert.equal(view.harness.frames.size, 0)
 })
 
-test('Viewer3D SkeletonHelper and unique joints follow transformed animated bones after mixer updates and pause', async t => {
+test('Viewer3D source-local segments and unique joints follow transformed animated bones after mixer updates and pause', async t => {
   let rig!: ReturnType<typeof rigAsset>
   const view = await mount(t, '/rig.glb', harness => { rig = rigAsset(harness) })
   view.click('Rig joints')
   const overlay = rigOverlay(view)
-  const helper = overlay.children.find(child => child instanceof THREE.SkeletonHelper) as import('three').SkeletonHelper
-  assert.ok(helper, 'Pick36 keeps SkeletonHelper rather than preapplying custom line rendering')
+  const helper = overlay.children.find(child => child instanceof THREE.LineSegments && !(child instanceof THREE.SkeletonHelper)) as import('three').LineSegments
+  assert.ok(helper, 'Rig overlays use owned line segments, not hierarchy-traversing SkeletonHelper')
+  const commonParent = new THREE.Group()
+  const selectionGroup = new THREE.Group()
+  commonParent.add(selectionGroup, overlay)
+  selectionGroup.add(rig.scene)
+  commonParent.position.set(3, -1, 5)
+  commonParent.rotation.set(0.3, 0.5, -0.2)
+  commonParent.scale.set(0.7, 1.6, -1.2)
   assert.equal(overlay.children.filter(child => child instanceof THREE.Mesh).length, 2, 'Shared bones receive one marker each')
   rig.scene.position.set(8, -2, 3)
   rig.scene.rotation.set(0.3, -0.7, 0.2)
-  rig.scene.scale.set(2, 0.5, 1.2)
+  rig.scene.scale.set(-2, 0.5, 1.2)
+  rig.scene.updateMatrix()
+  rig.scene.matrixAutoUpdate = false
+  const originalPositions = helper.geometry.getAttribute('position')
   const checkAlignment = () => {
     const tipWorld = rig.tip.getWorldPosition(new THREE.Vector3())
     const positions = helper.geometry.getAttribute('position')
-    const endpoint = new THREE.Vector3().fromBufferAttribute(positions, 0).applyMatrix4(helper.matrixWorld)
+    assert.equal(positions, originalPositions, 'Frames update the existing position buffer')
+    assert.equal(positions.count, 2)
+    const start = new THREE.Vector3().fromBufferAttribute(positions, 0).applyMatrix4(helper.matrixWorld)
+    assert.ok(start.distanceTo(rig.root.getWorldPosition(new THREE.Vector3())) < 1e-5)
+    const endpoint = new THREE.Vector3().fromBufferAttribute(positions, 1).applyMatrix4(helper.matrixWorld)
     assert.ok(endpoint.distanceTo(tipWorld) < 1e-5, `Skeleton endpoint ${endpoint.toArray()} vs ${tipWorld.toArray()}`)
     const markers = overlay.children.filter(child => child instanceof THREE.Mesh)
     assert.ok(markers.some(marker => marker.getWorldPosition(new THREE.Vector3()).distanceTo(tipWorld) < 1e-6))
@@ -510,6 +524,9 @@ test('Viewer3D SkeletonHelper and unique joints follow transformed animated bone
   assert.equal(rig.tip.position.x, 0.5)
   checkAlignment()
   view.click('Pause animation')
+  commonParent.position.x += 4
+  commonParent.rotation.z += 0.4
+  rig.scene.matrix.setPosition(-3, 2, 1)
   view.frame(0.25)
   assert.equal(rig.tip.position.x, 0.5)
   checkAlignment()
@@ -586,4 +603,106 @@ test('Viewer3D releases mode-owned matcap and checker textures without disposing
   const checkerDisposals = disposeCounts(t, [checker, checker.map!])
   view.unmount()
   assert.ok(checkerDisposals.every(spy => spy.mock.callCount() === 1))
+})
+
+
+test('Viewer3D draws only unique skeleton-member edges across roots and detached references', async t => {
+  let rig!: ReturnType<typeof rigAsset>
+  const detachedParent = new THREE.Bone()
+  const detachedChild = new THREE.Bone()
+  detachedChild.position.set(0, 2, 0)
+  detachedParent.add(detachedChild)
+  const externalHost = new THREE.Group()
+  externalHost.add(detachedParent)
+  externalHost.position.set(4, -2, 3)
+  externalHost.rotation.set(0.5, -0.2, 0.3)
+  const foreignParent = new THREE.Bone()
+  const memberWithForeignParent = new THREE.Bone()
+  memberWithForeignParent.position.set(1, 3, 1)
+  foreignParent.add(memberWithForeignParent)
+  externalHost.add(foreignParent)
+  const isolatedRoot = new THREE.Bone()
+  const view = await mount(t, '/rig.glb', harness => {
+    rig = rigAsset(harness)
+    const unlistedChild = new THREE.Bone()
+    rig.tip.add(unlistedChild)
+    rig.parent.add(isolatedRoot)
+    rig.skeleton.bones.push(detachedParent, detachedChild, memberWithForeignParent, isolatedRoot)
+    externalHost.updateMatrixWorld(true)
+    rig.skeleton.calculateInverses()
+  })
+  view.click('Rig joints')
+  const overlay = rigOverlay(view)
+  const line = overlay.children.find(child => child instanceof THREE.LineSegments && !(child instanceof THREE.SkeletonHelper)) as import('three').LineSegments
+  assert.ok(line)
+  const positions = line.geometry.getAttribute('position')
+  assert.equal(positions.count, 4, 'Exactly two member-to-member edges, not foreign parent or unlisted descendant links')
+  const markers = overlay.children.filter(child => child instanceof THREE.Mesh)
+  assert.equal(markers.length, 6, 'Shared skeleton members are unique, including isolated and foreign-parent members')
+  const check = () => {
+    const expected = [rig.root, rig.tip, detachedParent, detachedChild]
+    expected.forEach((bone, index) => {
+      const actual = new THREE.Vector3().fromBufferAttribute(positions, index).applyMatrix4(line.matrixWorld)
+      assert.ok(actual.distanceTo(bone.getWorldPosition(new THREE.Vector3())) < 1e-5)
+    })
+    const memberWorld = memberWithForeignParent.getWorldPosition(new THREE.Vector3())
+    assert.ok(markers.some(marker => marker.getWorldPosition(new THREE.Vector3()).distanceTo(memberWorld) < 1e-5))
+  }
+  view.frame(0)
+  check()
+  externalHost.position.x += 3
+  detachedParent.rotation.z = 0.7
+  detachedChild.position.y = 4
+  view.frame(0)
+  check()
+  assert.equal(line.geometry.getAttribute('position'), positions)
+  assert.equal(overlay.children.filter(child => child instanceof THREE.LineSegments).length, 1)
+  const resources = disposeCounts(t, overlayResources(overlay))
+  view.switchTo('/animated.glb')
+  assert.ok(resources.every(spy => spy.mock.callCount() === 1))
+  assert.equal(overlay.children.length, 0)
+})
+
+test('Viewer3D rig shells and overlays use translucent depth flags and restore owned resources across modes and teardown', async t => {
+  let rig!: ReturnType<typeof rigAsset>
+  const view = await mount(t, '/rig.glb', harness => { rig = rigAsset(harness) })
+  const sourceDisposals = disposeCounts(t, [rig.geometry, ...rig.materials])
+  const originalFlags = rig.materials.map(material => ({ transparent: material.transparent, opacity: material.opacity, depthWrite: material.depthWrite }))
+  for (const mode of ['Rig bones', 'Rig joints', 'Bone influence']) {
+    view.click(mode)
+    const overlay = rigOverlay(view)
+    const line = overlay.children.find(child => child instanceof THREE.LineSegments) as import('three').LineSegments
+    const lineMaterial = singleMaterial(line)
+    assert.equal(lineMaterial.depthTest, false)
+    assert.equal(lineMaterial.depthWrite, false)
+    assert.equal(lineMaterial.transparent, true)
+    assert.equal(lineMaterial.opacity, mode === 'Bone influence' ? 0.72 : 0.98)
+    assert.equal(line.frustumCulled, false)
+    assert.equal(line.renderOrder, 4)
+    for (const marker of overlay.children.filter(child => child instanceof THREE.Mesh)) {
+      assert.equal(singleMaterial(marker).depthTest, false)
+      assert.equal(singleMaterial(marker).depthWrite, false)
+      assert.equal(marker.frustumCulled, false)
+      assert.equal(marker.renderOrder, 5)
+    }
+    for (const mesh of [rig.first, rig.second, rig.backdrop]) {
+      const material = singleMaterial(mesh)
+      assert.equal(material.transparent, true)
+      assert.equal(material.depthWrite, false)
+      assert.equal(material.depthTest, true)
+      assert.equal(material.side, THREE.DoubleSide)
+      assert.equal(material.opacity, mode === 'Bone influence' ? (mesh === rig.backdrop ? 0.18 : 0.84) : 0.28)
+    }
+    assert.equal(rig.geometry.getAttribute('color'), rig.colors)
+    assert.deepEqual(rig.materials.map(material => ({ transparent: material.transparent, opacity: material.opacity, depthWrite: material.depthWrite })), originalFlags)
+    const owned = [singleMaterial(rig.first), singleMaterial(rig.second), singleMaterial(rig.backdrop), ...overlayResources(overlay)]
+    if (mode === 'Bone influence') owned.push(rig.first.geometry, rig.second.geometry)
+    const disposals = disposeCounts(t, owned)
+    if (mode === 'Bone influence') view.unmount()
+    else view.click('Solid')
+    assert.ok(disposals.every(spy => spy.mock.callCount() === 1))
+    assert.equal(rig.first.material, rig.materials)
+    assert.equal(rig.first.geometry, rig.geometry)
+    assert.ok(sourceDisposals.every(spy => spy.mock.callCount() === (mode === 'Bone influence' ? 1 : 0)))
+  }
 })

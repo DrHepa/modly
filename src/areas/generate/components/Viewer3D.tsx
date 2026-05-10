@@ -41,6 +41,16 @@ type JointMarker = {
   marker: THREE.Mesh
 }
 
+type BoneSegment = {
+  parent: THREE.Bone
+  child: THREE.Bone
+}
+
+type RigLineOverlay = {
+  line: THREE.LineSegments
+  segments: BoneSegment[]
+}
+
 const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
 
 function isRigViewMode(viewMode: ViewMode): boolean {
@@ -111,10 +121,25 @@ function createInfluenceMaterial(): THREE.MeshStandardMaterial {
     roughness: 0.72,
     metalness: 0.08,
     vertexColors: true,
+    transparent: true,
+    opacity: 0.84,
+    depthWrite: false,
     side: THREE.DoubleSide,
   })
   material.toneMapped = true
   return material
+}
+
+function createRigShellMaterial(): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    color: '#f8fafc',
+    roughness: 0.82,
+    metalness: 0.02,
+    transparent: true,
+    opacity: 0.28,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  })
 }
 
 function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
@@ -122,6 +147,9 @@ function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
     color: '#18181b',
     roughness: 0.9,
     metalness: 0.0,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
     side: THREE.DoubleSide,
   })
 }
@@ -129,7 +157,7 @@ function createMutedRigBackdropMaterial(): THREE.MeshStandardMaterial {
 const EMPTY_RIG_STATS: RigStats = { hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 }
 
 // Auxiliary objects never enter the source hierarchy, BVH, stats or Select.
-// Keep Three's SkeletonHelper for this inspection view; it owns the line data.
+// One owned line buffer connects only bones referenced by the source skeletons.
 function RigInspectionOverlay({ scene, viewMode }: { scene: THREE.Object3D; viewMode: ViewMode }): JSX.Element {
   const overlay = useMemo(() => {
     const group = new THREE.Group()
@@ -137,56 +165,63 @@ function RigInspectionOverlay({ scene, viewMode }: { scene: THREE.Object3D; view
     group.matrixAutoUpdate = false
     return group
   }, [scene])
-  const skeletonHelpers = useRef<THREE.SkeletonHelper[]>([])
+  const rigLineOverlay = useRef<RigLineOverlay | null>(null)
   const jointMarkers = useRef<JointMarker[]>([])
   const sceneInverse = useMemo(() => new THREE.Matrix4(), [])
+  const localPosition = useMemo(() => new THREE.Vector3(), [])
 
   useEffect(() => {
     const bones = new Set<THREE.Bone>()
-    const roots = new Set<THREE.Object3D>()
     scene.traverse((child) => {
       if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
-      child.skeleton.bones.forEach((bone) => {
-        bones.add(bone)
-        let root: THREE.Object3D = bone
-        while (root.parent instanceof THREE.Bone) root = root.parent
-        roots.add(root)
+      child.skeleton.bones.forEach((bone) => bones.add(bone))
+    })
+    const segments: BoneSegment[] = []
+    bones.forEach((bone) => {
+      if (bone.parent instanceof THREE.Bone && bones.has(bone.parent)) {
+        segments.push({ parent: bone.parent, child: bone })
+      }
+    })
+    if (segments.length > 0) {
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segments.length * 6), 3))
+      const material = new THREE.LineBasicMaterial({
+        color: viewMode === 'influence' ? '#f8fafc' : '#38bdf8',
+        transparent: true,
+        opacity: viewMode === 'influence' ? 0.72 : 0.98,
+        depthTest: false,
+        depthWrite: false,
       })
-    })
-    roots.forEach((root) => {
-      const helper = new THREE.SkeletonHelper(root)
-      // SkeletonHelper aliases root.matrixWorld by default. This sibling
-      // overlay supplies the source transform, so use a separate local matrix.
-      helper.matrix = new THREE.Matrix4()
-      const material = helper.material as THREE.LineBasicMaterial
-      material.depthTest = false
-      material.transparent = true
-      material.opacity = viewMode === 'influence' ? 0.88 : 1
-      material.color.set(viewMode === 'influence' ? '#f8fafc' : '#a78bfa')
-      helper.renderOrder = 2
-      helper.raycast = () => undefined
-      overlay.add(helper)
-      skeletonHelpers.current.push(helper)
-    })
+      const line = new THREE.LineSegments(geometry, material)
+      line.frustumCulled = false
+      line.renderOrder = 4
+      line.raycast = () => undefined
+      overlay.add(line)
+      rigLineOverlay.current = { line, segments }
+    }
     if (viewMode === 'joints' || viewMode === 'influence') {
       bones.forEach((bone) => {
         const marker = new THREE.Mesh(
-          new THREE.OctahedronGeometry(0.032, 0),
-          new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08 }),
+          new THREE.OctahedronGeometry(0.026, 0),
+          new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08, depthTest: false, depthWrite: false }),
         )
-        marker.renderOrder = 3
+        marker.frustumCulled = false
+        marker.renderOrder = 5
         marker.raycast = () => undefined
         overlay.add(marker)
         jointMarkers.current.push({ bone, marker })
       })
     }
     return () => {
-      skeletonHelpers.current.forEach((helper) => helper.dispose())
+      if (rigLineOverlay.current) {
+        rigLineOverlay.current.line.geometry.dispose()
+        ;(rigLineOverlay.current.line.material as THREE.Material).dispose()
+        rigLineOverlay.current = null
+      }
       jointMarkers.current.forEach(({ marker }) => {
         marker.geometry.dispose()
         ;(marker.material as THREE.Material).dispose()
       })
-      skeletonHelpers.current = []
       jointMarkers.current = []
       overlay.clear()
     }
@@ -197,12 +232,22 @@ function RigInspectionOverlay({ scene, viewMode }: { scene: THREE.Object3D; view
     scene.updateWorldMatrix(true, true)
     overlay.matrix.copy(scene.matrix)
     sceneInverse.copy(scene.matrixWorld).invert()
-    skeletonHelpers.current.forEach((helper) => {
-      helper.matrix.multiplyMatrices(sceneInverse, helper.root.matrixWorld)
-    })
-    jointMarkers.current.forEach(({ bone, marker }) => {
-      marker.position.setFromMatrixPosition(bone.matrixWorld).applyMatrix4(sceneInverse)
-    })
+    const lineOverlay = rigLineOverlay.current
+    if (lineOverlay) {
+      const position = lineOverlay.line.geometry.getAttribute('position') as THREE.BufferAttribute
+      for (let index = 0; index < lineOverlay.segments.length; index += 1) {
+        const { parent, child } = lineOverlay.segments[index]
+        // getWorldPosition updates ancestors, including detached skeleton roots.
+        parent.getWorldPosition(localPosition).applyMatrix4(sceneInverse)
+        position.setXYZ(index * 2, localPosition.x, localPosition.y, localPosition.z)
+        child.getWorldPosition(localPosition).applyMatrix4(sceneInverse)
+        position.setXYZ(index * 2 + 1, localPosition.x, localPosition.y, localPosition.z)
+      }
+      position.needsUpdate = true
+    }
+    for (const { bone, marker } of jointMarkers.current) {
+      bone.getWorldPosition(marker.position).applyMatrix4(sceneInverse)
+    }
     overlay.updateMatrixWorld(true)
   })
 
@@ -543,6 +588,10 @@ function SceneMeshModel({
       let geometry: THREE.BufferGeometry | undefined
       let texture: THREE.Texture | undefined
       switch (effectiveViewMode) {
+        case 'bones':
+        case 'joints':
+          next = createRigShellMaterial()
+          break
         case 'influence':
           if (child instanceof THREE.SkinnedMesh && child.skeleton) {
             geometry = originalGeometry.clone()

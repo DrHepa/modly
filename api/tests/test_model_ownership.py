@@ -151,6 +151,52 @@ def test_extension_process_and_runner_keep_capability_id_with_owner_model_dir(
     assert model_dir == owner_model_dir
 
 
+def test_runner_injects_resolved_node_id_into_generator_even_when_owner_dir_name_differs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _, models_dir, workspace_dir, extensions_dir = _build_registry(monkeypatch, tmp_path)
+    ext_dir = _write_extension_bundle(extensions_dir)
+    owner_model_dir = models_dir / "image-bundle/shared-base"
+
+    monkeypatch.setenv("EXTENSION_DIR", str(ext_dir))
+    monkeypatch.setenv("MODELS_DIR", str(models_dir))
+    monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
+    monkeypatch.setenv("MODLY_API_DIR", str(API_DIR))
+    monkeypatch.setenv("MODEL_DIR", str(owner_model_dir))
+    monkeypatch.setenv("MODEL_ID", "image-bundle/sdxl-base")
+    sys.modules.pop("runner", None)
+    runner_module = importlib.import_module("runner")
+
+    instances: list[object] = []
+
+    class CaptureGenerator:
+        params_schema = staticmethod(lambda: [])
+
+        def __init__(self, model_dir: Path, outputs_dir: Path):
+            self.model_dir = model_dir
+            self.outputs_dir = outputs_dir
+            self.node_id = ""
+            instances.append(self)
+
+        def load(self) -> None:
+            raise RuntimeError("stop after injection")
+
+        def unload(self) -> None:
+            return None
+
+    sent: list[dict] = []
+    monkeypatch.setattr(runner_module, "load_generator", lambda _manifest: CaptureGenerator)
+    monkeypatch.setattr(runner_module, "recv", lambda: iter(([{"action": "load", "id": "req-1"}])))
+    monkeypatch.setattr(runner_module, "send", sent.append)
+
+    runner_module.main()
+
+    assert sent[0] == {"type": "ready", "params_schema": []}
+    assert sent[1]["type"] == "error"
+    assert sent[1]["message"] == "Unexpected runner error"
+    assert "stop after injection" in sent[1]["traceback"]
+    assert len(instances) == 1
+    assert instances[0].node_id == "sdxl-base"
+
+
 def test_extension_process_load_ignores_stale_unloaded_ack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     process = ExtensionProcess(tmp_path, {"id": "kimodo-soma-rp/animate-rigged-mesh"})
     responses = iter([

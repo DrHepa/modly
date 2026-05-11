@@ -143,7 +143,11 @@ def main() -> None:
     # so its last component matches the node id.
     node, model_dir = resolve_runner_context(manifest)
     gen = GenClass(model_dir, WORKSPACE_DIR)
-    _apply_manifest_metadata(gen, manifest, node)
+    gen.node_id          = node.get("id", "")
+    gen.hf_repo          = manifest.get("hf_repo", "")          or node.get("hf_repo", "")
+    gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", []) or node.get("hf_skip_prefixes", [])
+    gen.download_check   = manifest.get("download_check", "")   or node.get("download_check", "")
+    gen._params_schema   = manifest.get("params_schema", [])    or node.get("params_schema", [])
 
     # Active cancel events keyed by request id
     _cancel: dict[str, threading.Event] = {}

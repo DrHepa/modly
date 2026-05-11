@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import {
   useAgentStore, PROVIDERS,
   type ThinkingMode, type ProviderId, type ExternalConfig,
@@ -138,12 +138,17 @@ export function AgentSection(): JSX.Element {
 
   // External provider drafts
   const extCfg = external[provider]
-  const [keyDraft, setKeyDraft]           = useState(extCfg?.apiKey ?? '')
-  const [extModelDraft, setExtModelDraft] = useState(extCfg?.model ?? '')
-  const [baseUrlDraft, setBaseUrlDraft]   = useState(extCfg?.baseUrl ?? '')
+  // Only edited fields override settings, so asynchronous hydration still works.
+  // Keep each provider's unsaved edits separate from another provider's results.
+  const [extDrafts, setExtDrafts] = useState<Partial<Record<ProviderId, Partial<ExternalConfig>>>>({})
+  const keyDraft      = extDrafts[provider]?.apiKey ?? extCfg?.apiKey ?? ''
+  const extModelDraft = extDrafts[provider]?.model ?? extCfg?.model ?? ''
+  const baseUrlDraft  = extDrafts[provider]?.baseUrl ?? extCfg?.baseUrl ?? ''
   const [extModels, setExtModels]         = useState<string[]>([])
   const [extTesting, setExtTesting]       = useState(false)
   const [extResult, setExtResult]         = useState<'ok' | 'error' | null>(null)
+  const extRequest = useRef(0)
+  const modelRevision = useRef(0)
 
   const [mcpClient, setMcpClient] = useState<McpClient>('claude')
 
@@ -195,23 +200,32 @@ export function AgentSection(): JSX.Element {
 
   useEffect(() => { void refreshLocal() }, [refreshLocal])
 
-  // Sync drafts when switching provider
-  useEffect(() => {
-    const cfg = useAgentStore.getState().external[provider]
-    setKeyDraft(cfg?.apiKey ?? '')
-    setExtModelDraft(cfg?.model ?? '')
-    setBaseUrlDraft(cfg?.baseUrl ?? '')
+  // Invalidate at commit, before a response can settle against a new context.
+  useLayoutEffect(() => {
+    extRequest.current += 1
     setExtModels([])
     setExtResult(null)
-  }, [provider])
+    setExtTesting(false)
+    return () => { extRequest.current += 1 }
+  }, [apiUrl, provider, keyDraft, baseUrlDraft])
+
+  useLayoutEffect(() => { modelRevision.current += 1 }, [extModelDraft])
+
+  function updateExternalDraft(patch: Partial<ExternalConfig>) {
+    if (patch.model !== undefined) modelRevision.current += 1
+    setExtDrafts((current) => ({ ...current, [provider]: { ...current[provider], ...patch } }))
+  }
 
   function saveExternal() {
+    modelRevision.current += 1
     const cfg: ExternalConfig = { apiKey: keyDraft.trim(), model: extModelDraft.trim() }
     if (provider === 'custom') cfg.baseUrl = baseUrlDraft.trim().replace(/\/$/, '')
     setExternal(provider, cfg)
   }
 
   async function handleTestExternal() {
+    const request = ++extRequest.current
+    const revision = modelRevision.current
     setExtTesting(true)
     setExtResult(null)
     try {
@@ -223,14 +237,22 @@ export function AgentSection(): JSX.Element {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ base_url: base, api_key: keyDraft.trim() }),
       })
+      if (!res.ok) throw new Error('Model discovery failed')
       const data: { models?: string[] } = await res.json()
-      const found = (data.models ?? []).length > 0
-      setExtModels(data.models ?? [])
+      if (request !== extRequest.current) return
+      const nextModels = data.models ?? []
+      const found = nextModels.length > 0
+      setExtModels(nextModels)
+      if (found && revision === modelRevision.current && !nextModels.includes(extModelDraft)) {
+        updateExternalDraft({ model: nextModels[0] })
+      }
       setExtResult(found ? 'ok' : 'error')
     } catch {
+      if (request !== extRequest.current) return
+      setExtModels([])
       setExtResult('error')
     } finally {
-      setExtTesting(false)
+      if (request === extRequest.current) setExtTesting(false)
     }
   }
 
@@ -342,7 +364,7 @@ export function AgentSection(): JSX.Element {
                 <Block label="Base URL" hint="Any OpenAI-compatible endpoint (llama-server, vLLM, LM Studio…). Without the trailing /chat/completions.">
                   <input
                     value={baseUrlDraft}
-                    onChange={(e) => { setBaseUrlDraft(e.target.value); setExtResult(null) }}
+                    onChange={(e) => updateExternalDraft({ baseUrl: e.target.value })}
                     placeholder="http://192.168.1.20:8080/v1"
                     className={inputCls}
                   />
@@ -359,7 +381,7 @@ export function AgentSection(): JSX.Element {
                   <input
                     type="password"
                     value={keyDraft}
-                    onChange={(e) => { setKeyDraft(e.target.value); setExtResult(null) }}
+                    onChange={(e) => updateExternalDraft({ apiKey: e.target.value })}
                     placeholder={PROVIDERS[provider].noKey ? '' : 'sk-…'}
                     className={inputCls}
                   />
@@ -381,7 +403,7 @@ export function AgentSection(): JSX.Element {
 
               <Block label="Model" hint="Model name used for the chat.">
                 {extModels.length > 0 ? (
-                  <select value={extModelDraft} onChange={(e) => setExtModelDraft(e.target.value)} className={`${inputCls} cursor-pointer`}>
+                  <select value={extModelDraft} onChange={(e) => updateExternalDraft({ model: e.target.value })} className={`${inputCls} cursor-pointer`}>
                     {/* Without it the browser shows the first model while the draft
                       * stays '' — Save then persisted an empty model name. */}
                     {!extModelDraft && <option value="" disabled>Select a model…</option>}
@@ -391,7 +413,7 @@ export function AgentSection(): JSX.Element {
                 ) : (
                   <input
                     value={extModelDraft}
-                    onChange={(e) => setExtModelDraft(e.target.value)}
+                    onChange={(e) => updateExternalDraft({ model: e.target.value })}
                     placeholder={provider === 'anthropic' ? 'claude-sonnet-5' : provider === 'openai' ? 'gpt-5.2' : provider === 'ollama' ? 'qwen2.5:3b' : 'model name'}
                     className={inputCls}
                   />

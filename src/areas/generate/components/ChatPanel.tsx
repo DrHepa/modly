@@ -288,6 +288,10 @@ export default function ChatPanel(): JSX.Element {
     [modelExtensions, processExtensions],
   )
 
+  useEffect(() => {
+    setThinkingMode(defaultThinking)
+  }, [defaultThinking])
+
   // Close model picker on outside click
   useEffect(() => {
     if (!showModelPicker) return

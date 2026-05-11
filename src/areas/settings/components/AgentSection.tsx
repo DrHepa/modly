@@ -43,11 +43,18 @@ export function AgentSection(): JSX.Element {
     setModelDraft(defaultModel)
   }, [defaultModel])
 
+  function applyAvailableModels(nextModels: string[]) {
+    setModels(nextModels)
+    if (nextModels.length > 0) {
+      setModelDraft((current) => nextModels.includes(current) ? current : nextModels[0])
+    }
+  }
+
   async function fetchModels(url: string) {
     try {
       const res = await fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(url)}`)
       const data = await res.json()
-      setModels(data.models ?? [])
+      applyAvailableModels(data.models ?? [])
     } catch {
       setModels([])
     }
@@ -61,7 +68,7 @@ export function AgentSection(): JSX.Element {
       const data = await res.json()
       const found = (data.models ?? []).length > 0
       setTestResult(found ? 'ok' : 'error')
-      if (found) setModels(data.models)
+      if (found) applyAvailableModels(data.models)
     } catch {
       setTestResult('error')
     } finally {
@@ -70,8 +77,10 @@ export function AgentSection(): JSX.Element {
   }
 
   function handleSaveOllama() {
+    const modelToSave = models.length > 0 && !models.includes(modelDraft) ? models[0] : modelDraft
     setOllamaUrl(urlDraft)
-    setDefaultModel(modelDraft)
+    setDefaultModel(modelToSave)
+    setModelDraft(modelToSave)
     fetchModels(urlDraft)
   }
 

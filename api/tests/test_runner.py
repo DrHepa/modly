@@ -276,6 +276,81 @@ class _RunnerDriver:
 
 
 class RuntimeIdentityTests(unittest.TestCase):
+    def test_runner_injects_resolved_node_id_independently_of_owner_storage(self):
+        instances = []
+
+        class CaptureGenerator:
+            @classmethod
+            def params_schema(cls):
+                raise RuntimeError("use selected node schema")
+
+            def __init__(self, model_dir, outputs_dir):
+                self.model_dir = model_dir
+                self.outputs_dir = outputs_dir
+                self.node_id = ""
+                instances.append(self)
+
+            def load(self):
+                raise RuntimeError("stop after injection")
+
+        def metadata(name):
+            return {
+                "hf_repo": f"acme/{name}",
+                "hf_skip_prefixes": [f"{name}/"],
+                "download_check": f"{name}/weights.bin",
+                "params_schema": [{"id": "quality", "default": name}],
+            }
+
+        manifest = {
+            "id": "image-bundle", **metadata("root"),
+            "nodes": [{"id": name, **metadata(name)} for name in ("fast", "quality")],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ext_dir = root / "extension"
+            ext_dir.mkdir()
+            (ext_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            owner_dir = root / "models" / "image-bundle" / "shared-base"
+            shared_dirs = {"common": root / "models" / "image-bundle" / "_shared" / "common"}
+            workspace = root / "workspace"
+            for capability, override, selected in (
+                ("fast", "", "fast"),
+                ("quality", "", "quality"),
+                ("fast", "quality", "quality"),
+            ):
+                with self.subTest(capability=capability, override=override):
+                    instances.clear()
+                    sent = []
+                    with patch.multiple(
+                        runner, EXT_DIR=ext_dir, WORKSPACE_DIR=workspace,
+                        _MODEL_ID_OVERRIDE=f"image-bundle/{capability}",
+                        _MODEL_NODE_ID_OVERRIDE=override,
+                        _MODEL_DIR_OVERRIDE=str(owner_dir), _SHARED_MODEL_DIRS=shared_dirs,
+                    ), patch.object(runner, "load_generator", return_value=CaptureGenerator), \
+                         patch.object(runner, "recv", return_value=iter([{"action": "load", "id": "req-1"}])), \
+                         patch.object(runner, "send", side_effect=sent.append):
+                        runner.main()
+
+                    self.assertEqual(len(sent), 2)
+                    self.assertEqual(sent[0], {"type": "ready", "params_schema": metadata(selected)["params_schema"]})
+                    self.assertEqual(sent[1]["type"], "error")
+                    self.assertEqual(sent[1]["id"], "req-1")
+                    self.assertEqual(sent[1]["message"], "Unexpected runner error")
+                    self.assertIn("stop after injection", sent[1]["traceback"])
+                    self.assertEqual(len(instances), 1)
+                    gen = instances[0]
+                    self.assertEqual(gen.MODEL_ID, f"image-bundle/{capability}")
+                    self.assertEqual(gen.MODEL_NODE_ID, selected)
+                    self.assertEqual(gen.model_dir, owner_dir)
+                    self.assertEqual(gen.outputs_dir, workspace)
+                    self.assertEqual(gen.shared_model_dirs, shared_dirs)
+                    self.assertIsNot(gen.shared_model_dirs, shared_dirs)
+                    self.assertEqual(gen.hf_repo, metadata(selected)["hf_repo"])
+                    self.assertEqual(gen.hf_skip_prefixes, metadata(selected)["hf_skip_prefixes"])
+                    self.assertEqual(gen.download_check, metadata(selected)["download_check"])
+                    self.assertEqual(gen._params_schema, metadata(selected)["params_schema"])
+                    self.assertEqual(gen.node_id, selected)
+
     def test_runner_exposes_selected_identity_independently_of_storage(self):
         from unittest.mock import patch
         driver = _RunnerDriver(_FAKE_TEXGEN_GENERATOR, "FakeTexGen")

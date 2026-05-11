@@ -250,6 +250,7 @@ def main() -> None:
     gen = GenClass(model_dir, WORKSPACE_DIR)
     gen.MODEL_ID = model_id
     gen.MODEL_NODE_ID = node.get("id", "")
+    gen.node_id = node.get("id", "")
     gen.shared_model_dirs = dict(_SHARED_MODEL_DIRS)
     _apply_manifest_metadata(gen, manifest, node)
 

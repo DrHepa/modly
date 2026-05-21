@@ -107,3 +107,15 @@ test('reachesSceneOutput is false when no path reaches an output', () => {
   const edges = [edge('proc', 'img')]
   assert.equal(reachesSceneOutput('proc', edges, nodes), false)
 })
+
+test('Landmarks is a structural manual boundary while preview sink identities stay distinct', () => {
+  assert.equal(isBranchStarter('landmarksNode'), true)
+  assert.equal(isPassthrough('previewImageNode'), false)
+  assert.equal(isPassthrough('previewNode'), false)
+  for (const type of ['imagePreviewNode']) {
+    const nodes = mapOf(node('source', 'meshNode'), node('wait', 'landmarksNode'), node('preview', type))
+    const edges = [edge('source', 'wait'), edge('wait', 'preview')]
+    assert.equal(resolveDataSource('preview', edges, nodes), 'source')
+    assert.equal(resolveDataSource('preview', edges, nodes, new Map([['wait', {}]])), 'wait')
+  }
+})

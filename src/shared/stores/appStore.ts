@@ -13,6 +13,8 @@ export type GenerationStatus =
   | 'done'
   | 'error'
 
+export type GenerationPreviewKind = 'workflow-checkpoint'
+
 export interface GenerationJob {
   id: string
   imageFile: string
@@ -20,6 +22,7 @@ export interface GenerationJob {
   progress: number
   step?: string
   outputUrl?: string
+  previewKind?: GenerationPreviewKind
   originalOutputUrl?: string   // mesh URL before any optimization
   thumbnailUrl?: string
   modelId?: string             // model used for this generation

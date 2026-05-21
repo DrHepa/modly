@@ -14,6 +14,34 @@ import { assignSlotFilePaths } from './slotInputs'
 import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import type { SlotInputType } from './slotInputs'
 
+import type { ArtifactRef, ArtifactLineage, ArtifactSubstitutionPoint, ArtifactReplacementResult } from '../../shared/types/artifacts'
+import {
+  artifactRefToLegacyOutput, legacyOutputToArtifactRef, createArtifactLineage,
+  createDeclaredArtifactSubstitutionPoint, resolveArtifactReplacement, buildWaitArtifactLineage,
+  buildWaitReplacementArtifactRef, sameCheckpointOwner, buildLandmarkSidecarLineageMetadata,
+  type CheckpointOwner, type CheckpointContinueOptions, type LandmarkSidecarLineageMetadata,
+} from './workflowArtifacts'
+import {
+  REQUIRED_LANDMARK_IDS, isLandmarkId, isLandmarkCaptureComplete, getMissingRequiredLandmarkIds,
+  createLandmarkCaptureIdentity, buildLandmarkSidecarV1, validateLandmarkSidecarV1,
+  type LandmarkCaptureState, type LandmarkCaptureIdentity, type LandmarkPoint, type LandmarkId,
+} from './landmarks'
+
+export interface WorkflowLandmarkSession extends Omit<LandmarkCaptureState, 'sidecarPath'>, LandmarkCaptureIdentity {
+  sidecarStatus: 'not_started' | 'pending-write' | 'ready' | 'error'
+}
+
+export interface WorkflowCheckpoint {
+  owner: CheckpointOwner
+  input?: NodeOutput
+  substitutionPoint?: ArtifactSubstitutionPoint
+  pendingReplacement?: ArtifactRef
+  replacementResult?: ArtifactReplacementResult
+  lineage?: ArtifactLineage
+  landmarkCapture?: WorkflowLandmarkSession
+  landmarkSidecar?: LandmarkSidecarLineageMetadata
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface WorkflowRunState {
@@ -24,6 +52,9 @@ export interface WorkflowRunState {
   blockStep:     string
   outputUrl?:    string
   outputPath?:   string
+  artifact?:     ArtifactRef
+  substitutionPoint?: ArtifactSubstitutionPoint
+  replacementResult?: ArtifactReplacementResult
   error?:        string
 }
 
@@ -35,6 +66,7 @@ const IDLE: WorkflowRunState = {
 
 // ─── Module-level run context (survives between run() and continueRun(id)) ───
 
+let executionEpoch = 0
 const _cancel      = { current: false }
 const _activeJobId = { current: null as string | null }
 // While container (manual mode) pause/resume — set by continueWhile()/retryWhile().
@@ -140,6 +172,13 @@ export function fromWorkspaceUrl(url: string, workspaceDir: string): string {
 }
 
 interface RunContext {
+  runId: string
+  epoch: number
+  jobId: string
+  checkpoints: Map<string, WorkflowCheckpoint>
+  nodeArtifacts: Map<string, ArtifactRef>
+  outputRevisions: Map<string, number>
+  checkpointRevision: number
   workflow:           Workflow
   allExtensions:      WorkflowExtension[]
   client:             AxiosInstance
@@ -161,6 +200,90 @@ interface RunContext {
   lastSceneMesh?:     string
 }
 const _ctx = { current: null as RunContext | null }
+
+function isCurrentContext(ctx: RunContext): boolean {
+  return _ctx.current === ctx && executionEpoch === ctx.epoch && !_cancel.current
+}
+
+function assertCurrentContext(ctx: RunContext): void {
+  if (!isCurrentContext(ctx)) throw new Error('Stale workflow execution')
+}
+
+function updateOwnedJob(ctx: RunContext, patch: Parameters<ReturnType<typeof useAppStore.getState>['updateCurrentJob']>[0]): void {
+  if (isCurrentContext(ctx) && useAppStore.getState().currentJob?.id === ctx.jobId) {
+    useAppStore.getState().updateCurrentJob(patch)
+  }
+}
+
+function recordNodeArtifact(ctx: RunContext, nodeId: string): void {
+  const revision = (ctx.outputRevisions.get(nodeId) ?? 0) + 1
+  ctx.outputRevisions.set(nodeId, revision)
+  const artifact = legacyOutputToArtifactRef(ctx.nodeOutputs.get(nodeId), {
+    artifactId: `${ctx.runId}:${nodeId}`, versionId: `${ctx.runId}:${nodeId}:${revision}`,
+  })
+  if (artifact && artifactRefToLegacyOutput(artifact)) ctx.nodeArtifacts.set(nodeId, artifact)
+  else ctx.nodeArtifacts.delete(nodeId)
+}
+
+function incomingCheckpointSource(ctx: RunContext, nodeId: string): string | undefined {
+  const edge = ctx.workflow.edges.find((edge) => edge.target === nodeId)
+  return edge && resolveDataSource(edge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
+}
+
+function materializeCheckpoint(ctx: RunContext, nodeId: string): WorkflowCheckpoint {
+  const sourceId = incomingCheckpointSource(ctx, nodeId)
+  const input = sourceId ? ctx.nodeOutputs.get(sourceId) : undefined
+  const artifact = sourceId ? ctx.nodeArtifacts.get(sourceId) : undefined
+  const owner: CheckpointOwner = {
+    runId: ctx.runId, nodeId, inputArtifactId: artifact?.id ?? `${ctx.runId}:${sourceId ?? nodeId}`,
+    inputVersionId: artifact?.versionId ?? `${ctx.runId}:${sourceId ?? nodeId}:${ctx.outputRevisions.get(sourceId ?? '') ?? 0}`,
+    revision: ++ctx.checkpointRevision,
+  }
+  const checkpoint: WorkflowCheckpoint = {
+    owner, input: input && { ...input },
+    substitutionPoint: artifact && createDeclaredArtifactSubstitutionPoint({ nodeId, inputArtifact: artifact }),
+    lineage: artifact && createArtifactLineage(artifact),
+  }
+  if (ctx.nodeMap.get(nodeId)?.type === 'landmarksNode') {
+    if (artifact?.kind !== 'mesh') throw new Error('Landmarks node requires a mesh checkpoint input')
+    checkpoint.landmarkCapture = {
+      ...createLandmarkCaptureIdentity(ctx.runId, nodeId), nodeId, targetArtifact: artifact,
+      activeLandmarkId: REQUIRED_LANDMARK_IDS[0], completed: {},
+      validity: { valid: false, missing: [...REQUIRED_LANDMARK_IDS] }, canContinue: false,
+      sidecarStatus: 'not_started',
+    }
+  }
+  ctx.checkpoints.set(nodeId, checkpoint)
+  // Materialization is branch-local. Never replace the shared upstream output.
+  if (input) ctx.nodeOutputs.set(nodeId, { ...input })
+  if (artifact) ctx.nodeArtifacts.set(nodeId, artifact)
+  return checkpoint
+}
+
+function runtimeCheckpointOutput(output: NodeOutput, workspaceDir: string): NodeOutput {
+  if (!output.filePath) return { ...output }
+  let filePath = output.filePath.replace(/\\/g, '/')
+  if (filePath.startsWith('/workspace/')) filePath = fromWorkspaceUrl(filePath, workspaceDir)
+  else if (!filePath.startsWith('/') && !/^[A-Za-z]:\//.test(filePath)) {
+    if (filePath.split('/').some((part) => !part || part === '.' || part === '..') || filePath.includes(':')) throw new Error('Invalid checkpoint artifact path')
+    filePath = `${workspaceDir.replace(/\/+$/, '')}/${filePath}`
+  }
+  return { ...output, filePath }
+}
+
+function incomingLandmarkSidecar(ctx: RunContext, nodeId: string): string | undefined {
+  for (const edge of ctx.workflow.edges.filter((edge) => edge.target === nodeId)) {
+    const source = resolveDataSource(edge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
+    const checkpoint = source ? ctx.checkpoints.get(source) : undefined
+    if (checkpoint?.landmarkSidecar) return checkpoint.landmarkSidecar.sidecarWorkspacePath
+  }
+  return undefined
+}
+
+function consumesLandmarks(ext: WorkflowExtension): boolean {
+  // Capability identity, never a translated/display name, controls this narrow adapter.
+  return [ext.extensionId, ext.nodeId].some((id) => /(?:^|[-_/])(unirig|uni-rig|rig-mesh|rig_mesh)(?:$|[-_/])/.test(id))
+}
 
 // ─── Topological sort (DFS preorder, branch-first) ───────────────────────────
 
@@ -292,10 +415,12 @@ async function executeIteratorNode(
 
   if (kind.outputType === 'text') {
     const text = await readTextFile(path)
+    assertCurrentContext(ctx)
     ctx.nodeOutputs.set(node.id, { text, outputType: 'text' })
   } else {
     ctx.nodeOutputs.set(node.id, { filePath: path, outputType: kind.outputType })
   }
+  recordNodeArtifact(ctx, node.id)
   setRunState((s) => ({ ...s, blockProgress: 100, blockStep: `Loaded ${name}` }))
 }
 
@@ -309,6 +434,7 @@ async function executeExtensionNode(
   ctx:         RunContext,
   setRunState: (updater: (s: WorkflowRunState) => WorkflowRunState) => void,
 ): Promise<void> {
+  assertCurrentContext(ctx)
   if (isIterator(node.type)) {
     await executeIteratorNode(node, ctx, setRunState)
     return
@@ -326,7 +452,7 @@ async function executeExtensionNode(
   const liveParams = hydrateWorkflowNodeParams(ext, _liveParams.current.get(node.id) ?? node.data.params ?? {})
 
   const resolveSource = (sourceId: string): NodeOutput | undefined => {
-    const realId = resolveDataSource(sourceId, workflow.edges, nodeMap)
+    const realId = resolveDataSource(sourceId, workflow.edges, nodeMap, nodeOutputs)
     return realId ? nodeOutputs.get(realId) : undefined
   }
 
@@ -443,12 +569,15 @@ async function executeExtensionNode(
       blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
     } else if (!isTextInput && !isSceneInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
+      assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
       blob = new Blob([bytes], { type: 'image/png' })
       fname = activeImagePath?.split(/[\\/]/).pop() ?? 'image.png'
     }
 
     const extraParams: Record<string, unknown> = {}
+    const sidecar = consumesLandmarks(ext) ? incomingLandmarkSidecar(ctx, node.id) : undefined
+    if (sidecar) extraParams.landmarks_sidecar_path = sidecar
     if (nodeInputMeshPath) {
       extraParams.mesh_path = normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
     }
@@ -514,20 +643,31 @@ async function executeExtensionNode(
       submission = await client.post('/generate/from-image', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
     }
     const { data } = submission
-    _activeJobId.current = data.job_id
+    if (!isCurrentContext(ctx)) {
+      // Cancellation can precede the submission acknowledgement. Clean up only
+      // this invocation's returned job through its own client, never the global
+      // active id, which may already belong to a newer run.
+      const backendJobId: unknown = data?.job_id
+      if (typeof backendJobId === 'string' && backendJobId.trim().length > 0) {
+        try { await client.post(`/generate/cancel/${backendJobId}`) } catch { /* Best-effort cleanup. */ }
+      }
+      throw new Error('Stale workflow execution')
+    }
+    const backendJobId = data.job_id
+    _activeJobId.current = backendJobId
 
     while (true) {
-      if (_cancel.current) {
-        await client.post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
-        _activeJobId.current = null
-        throw new Error('Cancelled')
+      if (!isCurrentContext(ctx)) {
+        throw new Error('Stale workflow execution')
       }
       await new Promise((r) => setTimeout(r, 1200))
+      assertCurrentContext(ctx)
 
       const { data: st } = await client.get<{
         status: string; progress?: number; step?: string; output_url?: string; error?: string
-      }>(`/generate/status/${_activeJobId.current}`)
+      }>(`/generate/status/${backendJobId}`)
 
+      assertCurrentContext(ctx)
       if (st.status === 'done' && st.output_url) {
         const rel = st.output_url.replace(/^\/workspace\//, '')
         nodeInputPath = `${workspaceDir}/${rel}`
@@ -539,7 +679,7 @@ async function executeExtensionNode(
       if (st.status === 'error') throw new Error(st.error ?? 'Generation failed')
 
       setRunState((s) => ({ ...s, blockProgress: st.progress ?? s.blockProgress, blockStep: st.step ?? 'Generating…' }))
-      useAppStore.getState().updateCurrentJob({ status: 'generating', progress: st.progress, step: st.step })
+      updateOwnedJob(ctx, { status: 'generating', progress: st.progress, step: st.step, previewKind: undefined })
     }
   } else {
     if (!hasNamedInputs && ext?.input === 'mesh'  && !nodeInputMeshPath && !nodeInputPath) throw new Error(`${ext.name} needs an incoming mesh connection`)
@@ -551,6 +691,8 @@ async function executeExtensionNode(
     // multi-image process node re-run inside a loop also picks up edits made while
     // paused rather than the snapshot captured at run start.
     const processParams: Record<string, unknown> = { ...liveParams }
+    const sidecar = consumesLandmarks(ext) ? incomingLandmarkSidecar(ctx, node.id) : undefined
+    if (sidecar) processParams.landmarks_sidecar_path = sidecar
     if (nodeInputMeshPath && nodeInputPath) {
       // Texture node: mesh is filePath, all images in extra_image_paths
       processParams.extra_image_paths = [nodeInputPath, ...extraImagePaths]
@@ -577,6 +719,7 @@ async function executeExtensionNode(
       nodeInputText = undefined
     }
     const result = await window.electron.extensions.runProcess(ext.extensionId, processInput, processParams)
+    assertCurrentContext(ctx)
     if (!result.success) throw new Error(result.error ?? 'Process extension failed')
     nodeInputPath = result.result?.filePath ?? nodeInputPath
     nodeInputText = result.result?.text     ?? nodeInputText
@@ -586,11 +729,12 @@ async function executeExtensionNode(
   const outputType = ext.output
   nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
 
+  recordNodeArtifact(ctx, node.id)
   const output = nodeOutputs.get(node.id)
   const url = isSceneMeshOutput(output) ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
   if (url && reachesSceneOutput(node.id, workflow.edges, nodeMap)) {
     ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
-    useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
+    updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
   }
 }
 
@@ -624,12 +768,12 @@ function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
     if (owners.size !== 1 || [...owners][0] !== waitId) continue
     const inEdge = ctx.workflow.edges.find((e) => e.target === node.id)
     if (!inEdge) continue
-    const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap)
+    const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
     const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
     const url = isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
     if (url) {
       ctx.lastSceneMesh = url
-      useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
+      updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
     }
   }
 }
@@ -638,6 +782,19 @@ function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
 
 interface WorkflowRunStore {
   runState:         WorkflowRunState
+  executionId: string | null
+  checkpoints: Record<string, WorkflowCheckpoint>
+  activeCheckpointNodeId: string | null
+  nodeArtifacts: Record<string, ArtifactRef>
+  artifactLineages: Record<string, ArtifactLineage>
+  landmarkSidecars: Record<string, LandmarkSidecarLineageMetadata>
+  getCheckpointOwner: (nodeId: string) => CheckpointOwner | undefined
+  selectCheckpoint: (owner: CheckpointOwner) => boolean
+  setPendingReplacement: (owner: CheckpointOwner, artifact?: ArtifactRef) => boolean
+  getPendingReplacement: (owner: CheckpointOwner) => ArtifactRef | undefined
+  markLandmark: (owner: CheckpointOwner, point: LandmarkPoint) => boolean
+  setActiveLandmark: (owner: CheckpointOwner, id: LandmarkId) => boolean
+  clearLandmarks: (owner: CheckpointOwner) => boolean
   activeNodeId:     string | null
   activeWorkflowId: string | null
   nodeImageOutputs: Record<string, string>
@@ -651,7 +808,7 @@ interface WorkflowRunStore {
   run:         (workflow: Workflow, allExtensions: WorkflowExtension[], overrideImageData?: string) => Promise<void>
   cancel:      () => void
   reset:       () => void
-  continueRun: (waitId: string) => Promise<void>
+  continueRun: (waitId: string, options?: CheckpointContinueOptions) => Promise<void>
   /** While container: resume past the loop (Continue) */
   continueWhile: () => void
   /** While container: resume and re-run the loop body once more (Retry) */
@@ -665,6 +822,34 @@ interface WorkflowRunStore {
 export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
   const setRunState = (updater: (s: WorkflowRunState) => WorkflowRunState): void => {
     set((s) => ({ runState: updater(s.runState) }))
+  }
+
+  const syncCheckpoints = (ctx: RunContext): void => {
+    if (!isCurrentContext(ctx)) return
+    set({ checkpoints: Object.fromEntries(ctx.checkpoints), nodeArtifacts: Object.fromEntries(ctx.nodeArtifacts),
+      artifactLineages: Object.fromEntries([...ctx.checkpoints].flatMap(([id, cp]) => cp.lineage ? [[id, cp.lineage]] : [])),
+      landmarkSidecars: Object.fromEntries([...ctx.checkpoints].flatMap(([id, cp]) => cp.landmarkSidecar ? [[id, cp.landmarkSidecar]] : [])),
+    })
+  }
+
+  const ownedCheckpoint = (owner: CheckpointOwner, allowCaptureWrite = false): { ctx: RunContext; checkpoint: WorkflowCheckpoint } | undefined => {
+    const ctx = _ctx.current
+    if (!ctx || !isCurrentContext(ctx) || !owner) return undefined
+    const running = get().runningBranchId
+    if (running !== null && !(allowCaptureWrite && running === owner.nodeId && ctx.checkpoints.get(owner.nodeId)?.landmarkCapture?.sidecarStatus === 'pending-write')) return undefined
+    const checkpoint = ctx.checkpoints.get(owner.nodeId)
+    if (!checkpoint || !sameCheckpointOwner(checkpoint.owner, owner)) return undefined
+    const status = get().waitStates[owner.nodeId]
+    if (get().runState.status === 'running' || (status === 'pending' && get().runState.status === 'error')) return undefined
+    if (status !== 'pending' && status !== 'done' && status !== 'error') return undefined
+    return { ctx, checkpoint }
+  }
+
+  const publishCheckpointPreview = (ctx: RunContext, checkpoint: WorkflowCheckpoint): void => {
+    const output = checkpoint.input
+    if (output?.outputType !== 'mesh' || !output.filePath) return
+    const outputUrl = toWorkspaceUrl(output.filePath, ctx.workspaceDir)
+    if (outputUrl) updateOwnedJob(ctx, { status: 'generating', outputUrl, previewKind: 'workflow-checkpoint', step: 'Temporary workflow checkpoint' })
   }
 
   const collectImageOutputs = (ctx: RunContext): Record<string, string> => {
@@ -681,6 +866,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
   }
 
   const finalize = (ctx: RunContext, finalWaitStates?: Record<string, WaitState>): void => {
+    if (!isCurrentContext(ctx)) return
+    syncCheckpoints(ctx)
     // Prefer the mesh of the last branch the user actually ran — it's already in the
     // viewer, and topo order must not override the user's last action.
     let outputUrl:  string | undefined = ctx.lastSceneMesh
@@ -696,7 +883,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       }
     }
     if (!outputUrl) {
-      for (const [, o] of ctx.nodeOutputs) {
+      for (const [id, o] of ctx.nodeOutputs) {
+        // Merely previewing a manual boundary cannot make its input a final result.
+        if (ctx.checkpoints.size && !isExecutable(ctx.nodeMap.get(id)!)) continue
         if (o.filePath) {
           if (o.outputType === 'audio' || o.outputType === 'scene') {
             outputPath = o.filePath
@@ -709,7 +898,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       }
     }
 
+    const finalPath = outputUrl ? fromWorkspaceUrl(outputUrl, ctx.workspaceDir) : outputPath
+    const artifact = finalPath ? [...ctx.nodeArtifacts.values()].reverse().find((ref) =>
+      artifactRefToLegacyOutput(ref)?.filePath && runtimeCheckpointOutput(artifactRefToLegacyOutput(ref)!, ctx.workspaceDir).filePath === finalPath) : undefined
     set((s) => ({
+      activeCheckpointNodeId: null,
       activeNodeId:     null,
       runningBranchId:  null,
       whileProgress:    {},
@@ -724,14 +917,17 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         blockStep:     'Done',
         outputUrl,
         outputPath,
+        artifact,
       },
     }))
-    useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl })
+    updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl, previewKind: undefined, step: undefined })
     void showCompletionNotification('Workflow run complete')
   }
 
   return {
     runState:         IDLE,
+    executionId: null, checkpoints: {}, activeCheckpointNodeId: null,
+    nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {},
     activeNodeId:     null,
     activeWorkflowId: null,
     nodeImageOutputs: {},
@@ -741,6 +937,19 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     pausedGroup:      [],
 
     async run(workflow, allExtensions, overrideImageData?) {
+      // Snapshot a legitimate Current Mesh before clearing the previous job.
+      // A disposable checkpoint preview is not an input to the next workflow.
+      const startingJob = useAppStore.getState().currentJob
+      const currentMeshUrl = startingJob?.previewKind === 'workflow-checkpoint' ? undefined : startingJob?.outputUrl
+      const previous = _ctx.current
+      if (previous) updateOwnedJob(previous, { outputUrl: undefined, previewKind: undefined, step: undefined })
+      const epoch = ++executionEpoch
+      const runId = crypto.randomUUID()
+      const jobId = runId
+      flushResume()
+      _ctx.current = null
+      _activeJobId.current = null
+      set({ executionId: runId, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {} })
       _cancel.current = false
       _pauseRequested.current = false
       // Seed live params from the snapshot; UI edits during the run override these.
@@ -767,9 +976,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         if (!dir) { fail('For Each: pick a folder first', 'No folder selected'); return }
         try {
           const files = await listIteratorFiles(dir, iteratorConfig(w).exts)
+          if (epoch !== executionEpoch || _cancel.current) return
           if (files.length === 0) { fail(`For Each: no matching files in ${dir}`, 'Empty folder'); return }
           iteratorFiles.set(w.id, files)
         } catch (err) {
+          if (epoch !== executionEpoch || _cancel.current) return
           fail(String(err), 'Failed to read folder'); return
         }
       }
@@ -845,7 +1056,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
       const selectedImagePath = appState.selectedImagePath ?? undefined
       const selectedImageData = overrideImageData ?? appState.selectedImageData ?? undefined
-      const currentMeshUrl    = appState.currentJob?.outputUrl
 
       set({
         activeWorkflowId: workflow.id,
@@ -862,7 +1072,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       })
 
       appState.setCurrentJob({
-        id:        crypto.randomUUID(),
+        id:        jobId,
         imageFile: selectedImagePath ?? '__workflow__',
         status:    'generating',
         progress:  0,
@@ -872,6 +1082,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       try {
         const client       = axios.create({ baseURL: apiUrl })
         const settings     = await window.electron.settings.get()
+        if (epoch !== executionEpoch || _cancel.current) return
         const workspaceDir = settings.workspaceDir.replace(/\\/g, '/')
 
         const tmpAbsPath = settings.workspaceDir.replace(/[\\/]+$/, '') + '/tmp'
@@ -916,10 +1127,13 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         }
 
         const ctx: RunContext = {
+          runId, epoch, jobId, checkpoints: new Map(), nodeArtifacts: new Map(), outputRevisions: new Map(), checkpointRevision: 0,
           workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
           overrideImageData, nodeOutputs, nodeMap, ordered, branches, waitIds, parentWait, iteratorFiles,
         }
         _ctx.current = ctx
+        for (const id of nodeOutputs.keys()) recordNodeArtifact(ctx, id)
+        const ownedSetRunState = (updater: (s: WorkflowRunState) => WorkflowRunState): void => { if (isCurrentContext(ctx)) setRunState(updater) }
 
         // While the runner is replaying a loop body, this holds the body nodes of the
         // active loop (or the union of several For Each loops sharing a boundary);
@@ -962,7 +1176,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
               set({ activeNodeId: groupIds[0], runningBranchId: groupIds[0], pausedGroup: groupIds })
               setRunState((s) => ({ ...s, status: 'paused', blockStep: 'Paused — Continue or Retry' }))
               await new Promise<void>((resolve) => { _resume.current = resolve })
-              if (_cancel.current) return 'cancel'
+              if (!isCurrentContext(ctx)) return 'cancel'
               set({ runningBranchId: null, pausedGroup: [] })
               setRunState((s) => ({ ...s, status: 'running' }))
               if (_retry.current) {   // re-run the current file(s), no advance
@@ -1010,7 +1224,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           set({ activeNodeId: whileLoop.whileId, runningBranchId: whileLoop.whileId })
           setRunState((s) => ({ ...s, status: 'paused', blockStep: 'Loop finished — Continue or Retry' }))
           await new Promise<void>((resolve) => { _resume.current = resolve })
-          if (_cancel.current) return 'cancel'
+          if (!isCurrentContext(ctx)) return 'cancel'
           set({ runningBranchId: null })
           setRunState((s) => ({ ...s, status: 'running' }))
           if (_retry.current) {
@@ -1026,7 +1240,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         // Pre-phase: nodes that don't belong to any single branch (sources + merges).
         let stepsDone = 0
         for (let i = 0; i < preExecExtNodes.length; i++) {
-          if (_cancel.current) { _ctx.current = null; set({ runState: IDLE, activeNodeId: null }); return }
+          if (!isCurrentContext(ctx)) return
           const node = preExecExtNodes[i]
           // During a loop replay, only re-run the active loop's body members.
           if (activeLoopBody && !activeLoopBody.has(node.id)) continue
@@ -1034,15 +1248,23 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             activeNodeId: node.id,
             runState: { ...s.runState, blockIndex: stepsDone, blockProgress: 0, blockStep: 'Starting…' },
           }))
-          await executeExtensionNode(node, ctx, setRunState)
+          await executeExtensionNode(node, ctx, ownedSetRunState)
+          if (!isCurrentContext(ctx)) return
           stepsDone++
 
           const jump = await handleLoopEnd(i)
-          if (jump === 'cancel') { _ctx.current = null; set({ runState: IDLE, activeNodeId: null }); return }
+          if (jump === 'cancel' || !isCurrentContext(ctx)) return
           if (jump !== undefined) { i = jump - 1 }
         }
 
         if (waitIds.length > 0) {
+          for (const id of waitIds) if (!parentWait.get(id)) materializeCheckpoint(ctx, id)
+          syncCheckpoints(ctx)
+          const first = ctx.checkpoints.values().next().value
+          if (first) {
+            set({ activeCheckpointNodeId: first.owner.nodeId })
+            publishCheckpointPreview(ctx, first)
+          }
           // Hand off to the user — branches run on demand via continueRun(id).
           set((s) => ({
             activeNodeId: null,
@@ -1053,17 +1275,17 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
         finalize(ctx)
       } catch (err) {
-        if (!_cancel.current) {
+        if (epoch === executionEpoch && !_cancel.current) {
           set((s) => ({ runState: { ...s.runState, status: 'error', error: String(err) }, activeNodeId: null }))
-          useAppStore.getState().updateCurrentJob({ status: 'error', error: String(err) })
+          if (useAppStore.getState().currentJob?.id === jobId) useAppStore.getState().updateCurrentJob({ status: 'error', error: String(err), outputUrl: undefined, previewKind: undefined, step: undefined })
           void showErrorNotification(String(err), 'Workflow run failed')
         }
       }
     },
 
-    async continueRun(waitId) {
+    async continueRun(waitId, options) {
       const state = get()
-      if (state.runningBranchId !== null) return
+      if (state.runningBranchId !== null || state.runState.status === 'running') return
       // Only runnable Waits: blocked (parent not done) and running are not.
       const ws = state.waitStates[waitId]
       if (ws !== 'pending' && ws !== 'done' && ws !== 'error') return
@@ -1076,6 +1298,70 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         return
       }
 
+      if (!isCurrentContext(ctx)) return
+      // A descendant marked error because its parent failed must not bypass its parent.
+      const parent = ctx.parentWait.get(waitId)
+      if (parent && state.waitStates[parent] !== 'done') return
+      let checkpoint = ctx.checkpoints.get(waitId)
+      if (!checkpoint) return
+      if (options && !sameCheckpointOwner(options.owner, checkpoint.owner)) return
+      const replacement = options?.replacementArtifact
+      const result = checkpoint.substitutionPoint
+        ? resolveArtifactReplacement(checkpoint.substitutionPoint, replacement) : undefined
+      if (replacement && (!result || result.status !== 'accepted')) return
+      let replacementOutput: NodeOutput | undefined
+      try { if (result?.status === 'accepted') replacementOutput = runtimeCheckpointOutput(result.legacy, ctx.workspaceDir) }
+      catch { return }
+      // Landmarks annotate their original mesh; replacement belongs to a preceding Wait.
+      if (replacement && checkpoint.landmarkCapture) return
+      if (checkpoint.landmarkCapture) {
+        const capture = checkpoint.landmarkCapture
+        if (!isLandmarkCaptureComplete(Object.values(capture.completed))) return
+        const attempt = { ...capture, sidecarStatus: 'pending-write' as const, error: undefined }
+        checkpoint = { ...checkpoint, landmarkCapture: attempt }
+        ctx.checkpoints.set(waitId, checkpoint)
+        set({ runningBranchId: waitId })
+        syncCheckpoints(ctx)
+        try {
+          const targetPath = artifactRefToLegacyOutput(capture.targetArtifact)?.filePath
+          const meshPath = targetPath && normalizeWorkflowPath(targetPath, ctx.workspaceDir).replace(/^\/workspace\//, '')
+          if (!meshPath || meshPath.startsWith('/') || /^[A-Za-z]:/.test(meshPath) || meshPath.split('/').some((p) => !p || p === '..')) throw new Error('Landmark mesh must be inside the workspace')
+          const sidecar = buildLandmarkSidecarV1({ runId: ctx.runId, nodeId: waitId,
+            sidecarPath: attempt.sidecarPath, targetArtifact: capture.targetArtifact, meshPath,
+            landmarks: Object.values(capture.completed) })
+          const validation = validateLandmarkSidecarV1(sidecar)
+          if (!validation.valid) throw new Error(validation.errors.join(', '))
+          const written = await window.electron.workspace.artifacts.writeLandmarkSidecar({
+            sourceWorkspacePath: meshPath, sidecarWorkspacePath: attempt.sidecarPath, sidecar,
+          })
+          if (!isCurrentContext(ctx) || ctx.checkpoints.get(waitId) !== checkpoint || checkpoint.landmarkCapture !== attempt) return
+          if (!written.success) throw new Error(written.error)
+          if (written.sidecarWorkspacePath !== attempt.sidecarPath || JSON.stringify(written.sidecar) !== JSON.stringify(sidecar)) throw new Error('Landmark sidecar response does not match this capture')
+          checkpoint = { ...checkpoint, landmarkCapture: { ...attempt, sidecarStatus: 'ready' },
+            landmarkSidecar: buildLandmarkSidecarLineageMetadata({ runId: ctx.runId, nodeId: waitId,
+              sidecarWorkspacePath: written.sidecarWorkspacePath, targetArtifact: capture.targetArtifact, targetMeshPath: meshPath }) }
+          ctx.checkpoints.set(waitId, checkpoint)
+        } catch (err) {
+          if (!isCurrentContext(ctx) || ctx.checkpoints.get(waitId) !== checkpoint) return
+          ctx.checkpoints.set(waitId, { ...checkpoint, landmarkCapture: { ...attempt, sidecarStatus: 'error', error: String(err) } })
+          set({ runningBranchId: null })
+          syncCheckpoints(ctx)
+          return
+        }
+      }
+      // Consuming a checkpoint invalidates every previously captured editor token.
+      const original = checkpoint.substitutionPoint?.inputArtifact
+      const edited = result?.status === 'accepted' && original ? buildWaitReplacementArtifactRef(original, result.artifact) : undefined
+      checkpoint = { ...checkpoint, owner: { ...checkpoint.owner, revision: ++ctx.checkpointRevision },
+        pendingReplacement: undefined, replacementResult: result,
+        lineage: edited && original ? buildWaitArtifactLineage(checkpoint.lineage, original, edited)
+          : checkpoint.lineage && original ? { ...checkpoint.lineage, currentVersionId: original.versionId } : checkpoint.lineage }
+      ctx.checkpoints.set(waitId, checkpoint)
+      const chosen = edited ? replacementOutput : checkpoint.input
+      if (chosen) ctx.nodeOutputs.set(waitId, { ...chosen })
+      if (edited || original) ctx.nodeArtifacts.set(waitId, (edited ?? original)!)
+      updateOwnedJob(ctx, { outputUrl: undefined, previewKind: undefined, step: undefined })
+      set({ activeCheckpointNodeId: null })
       const branch = ctx.branches.get(waitId) ?? []
       // Re-running a Wait invalidates everything downstream: descendant branches
       // were computed against the old output, so drop their outputs and reset
@@ -1085,8 +1371,12 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       _cancel.current = false
 
       // Reset outputs for this branch's nodes so Retry re-executes cleanly.
-      for (const node of branch) ctx.nodeOutputs.delete(node.id)
-      for (const d of descendants) for (const node of ctx.branches.get(d) ?? []) ctx.nodeOutputs.delete(node.id)
+      for (const node of branch) { ctx.nodeOutputs.delete(node.id); ctx.nodeArtifacts.delete(node.id) }
+      for (const d of descendants) {
+        ctx.checkpoints.delete(d); ctx.nodeOutputs.delete(d); ctx.nodeArtifacts.delete(d)
+        for (const node of ctx.branches.get(d) ?? []) { ctx.nodeOutputs.delete(node.id); ctx.nodeArtifacts.delete(node.id) }
+      }
+      syncCheckpoints(ctx)
 
       set((s) => {
         const waitStates = { ...s.waitStates, [waitId]: 'running' as WaitState }
@@ -1099,15 +1389,19 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       })
 
       const finishBranch = (next: WaitState, err?: string): void => {
-        if (_cancel.current) return
+        if (!isCurrentContext(ctx)) return
         const newWaitStates = { ...get().waitStates, [waitId]: next }
         // Unblock nested Waits whose parent branch just finished, and push this
         // branch's scene output to the viewer.
         if (next === 'done') {
           for (const w of ctx.waitIds) {
-            if (ctx.parentWait.get(w) === waitId && newWaitStates[w] === 'blocked') newWaitStates[w] = 'pending'
+            if (ctx.parentWait.get(w) === waitId && newWaitStates[w] === 'blocked') {
+              materializeCheckpoint(ctx, w)
+              newWaitStates[w] = 'pending'
+            }
           }
           pushBranchSceneMesh(ctx, waitId)
+          syncCheckpoints(ctx)
         }
         // A failed branch can never feed its descendants — surface them as error
         // too, otherwise they stay 'blocked' and the run hangs on 'paused' forever.
@@ -1138,13 +1432,14 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
       try {
         for (let i = 0; i < branch.length; i++) {
-          if (_cancel.current) return
+          if (!isCurrentContext(ctx)) return
           const node = branch[i]
           set((s) => ({
             activeNodeId: node.id,
             runState: { ...s.runState, blockIndex: i, blockProgress: 0, blockStep: 'Starting…' },
           }))
-          await executeExtensionNode(node, ctx, setRunState)
+          await executeExtensionNode(node, ctx, (updater) => { if (isCurrentContext(ctx)) setRunState(updater) })
+          if (!isCurrentContext(ctx)) return
         }
         finishBranch('done')
       } catch (err) {
@@ -1153,6 +1448,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     },
 
     cancel() {
+      const ctx = _ctx.current
+      if (ctx) updateOwnedJob(ctx, { outputUrl: undefined, previewKind: undefined, step: undefined })
+      ++executionEpoch
       _cancel.current = true
       _pauseRequested.current = false
       flushResume()   // unblock a manual While pause so the run can tear down
@@ -1162,13 +1460,93 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         _activeJobId.current = null
       }
       _ctx.current = null
-      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
-      useAppStore.getState().setCurrentJob(null)
+      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      if (ctx && useAppStore.getState().currentJob?.id === ctx.jobId) useAppStore.getState().setCurrentJob(null)
     },
 
     reset() {
+      const ctx = _ctx.current
+      if (ctx) updateOwnedJob(ctx, { outputUrl: undefined, previewKind: undefined, step: undefined })
+      ++executionEpoch
+      _cancel.current = true
+      _pauseRequested.current = false
+      flushResume()
       _ctx.current = null
-      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+    },
+
+    getCheckpointOwner(nodeId) {
+      const ctx = _ctx.current
+      const owner = ctx && isCurrentContext(ctx) ? ctx.checkpoints.get(nodeId)?.owner : undefined
+      return owner && { ...owner }
+    },
+
+    selectCheckpoint(owner) {
+      const match = ownedCheckpoint(owner)
+      if (!match) return false
+      set({ activeCheckpointNodeId: owner.nodeId })
+      publishCheckpointPreview(match.ctx, match.checkpoint)
+      return true
+    },
+
+    setPendingReplacement(owner, artifact) {
+      const match = ownedCheckpoint(owner)
+      if (!match || match.checkpoint.landmarkCapture || !match.checkpoint.substitutionPoint) return false
+      if (artifact) {
+        const result = resolveArtifactReplacement(match.checkpoint.substitutionPoint, artifact)
+        if (result.status !== 'accepted') return false
+        try { runtimeCheckpointOutput(result.legacy, match.ctx.workspaceDir) } catch { return false }
+      }
+      // Detach caller-owned values: an exporter must not mutate a pending artifact later.
+      const pendingReplacement = artifact && { ...artifact, legacy: artifact.legacy && { ...artifact.legacy } }
+      match.ctx.checkpoints.set(owner.nodeId, { ...match.checkpoint, owner: { ...match.checkpoint.owner, revision: ++match.ctx.checkpointRevision }, pendingReplacement })
+      syncCheckpoints(match.ctx)
+      return true
+    },
+
+    getPendingReplacement(owner) {
+      return ownedCheckpoint(owner)?.checkpoint.pendingReplacement
+    },
+
+    markLandmark(owner, point) {
+      const match = ownedCheckpoint(owner, true)
+      const capture = match?.checkpoint.landmarkCapture
+      if (!match || !capture || !isLandmarkId(point.id) || point.source !== 'manual' || point.confidence !== 1
+        || typeof point.name !== 'string' || !point.name.trim() || !point.world || ![point.world.x, point.world.y, point.world.z].every(Number.isFinite)) return false
+      const completed = { ...capture.completed, [point.id]: { ...point, world: { ...point.world } } }
+      const valid = isLandmarkCaptureComplete(Object.values(completed))
+      match.ctx.checkpoints.set(owner.nodeId, { ...match.checkpoint, landmarkSidecar: undefined, landmarkCapture: {
+        ...capture, ...createLandmarkCaptureIdentity(match.ctx.runId, owner.nodeId, capture.captureRevision + 1),
+        completed, validity: { valid, missing: getMissingRequiredLandmarkIds(Object.values(completed)) },
+        canContinue: valid, error: undefined, sidecarStatus: 'not_started',
+        activeLandmarkId: REQUIRED_LANDMARK_IDS.find((id) => !completed[id]) ?? point.id,
+      } })
+      if (get().runningBranchId === owner.nodeId) set({ runningBranchId: null })
+      syncCheckpoints(match.ctx)
+      return true
+    },
+
+    setActiveLandmark(owner, id) {
+      const match = ownedCheckpoint(owner)
+      const capture = match?.checkpoint.landmarkCapture
+      if (!match || !capture || !isLandmarkId(id)) return false
+      match.ctx.checkpoints.set(owner.nodeId, { ...match.checkpoint, landmarkCapture: { ...capture, activeLandmarkId: id } })
+      syncCheckpoints(match.ctx)
+      return true
+    },
+
+    clearLandmarks(owner) {
+      const match = ownedCheckpoint(owner, true)
+      const capture = match?.checkpoint.landmarkCapture
+      if (!match || !capture) return false
+      match.ctx.checkpoints.set(owner.nodeId, { ...match.checkpoint, landmarkSidecar: undefined, landmarkCapture: {
+        ...capture, ...createLandmarkCaptureIdentity(match.ctx.runId, owner.nodeId, capture.captureRevision + 1),
+        completed: {}, validity: { valid: false, missing: [...REQUIRED_LANDMARK_IDS] }, canContinue: false,
+        activeLandmarkId: REQUIRED_LANDMARK_IDS[0], error: undefined, sidecarStatus: 'not_started',
+      } })
+      if (get().runningBranchId === owner.nodeId) set({ runningBranchId: null })
+      syncCheckpoints(match.ctx)
+      return true
     },
 
     continueWhile() {

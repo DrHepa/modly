@@ -158,3 +158,20 @@ test('named bindings resolve Wait sources and retain the actual artifact kind an
   ], allExtensions: [createProcessExtension([{ name: 'coarse_mesh', type: 'mesh' }])], nodeOutputs: new Map([['source', { filePath: '/mesh.glb', outputType: 'mesh' }]]) })
   assert.deepEqual(input.inputs?.coarse_mesh, { type: 'mesh', sourceNodeId: 'source', filePath: '/mesh.glb' })
 })
+
+test('runtime process input stops at materialized checkpoints without changing structural sources', () => {
+  const source = createNode('source', 'meshNode')
+  const wait = createNode('wait', 'waitNode')
+  const preview = createNode('preview', 'imagePreviewNode')
+  const target = createNode('target', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const edges = [
+    { id: 'a', source: 'source', target: 'wait' },
+    { id: 'b', source: 'wait', target: 'preview' },
+    { id: 'c', source: 'preview', target: 'target', targetHandle: 'coarse_mesh' },
+  ]
+  const outputs = new Map([['source', { filePath: '/source.glb', outputType: 'mesh' }], ['wait', { filePath: '/edited.glb', outputType: 'mesh' }]])
+  const result = buildProcessExecutionInput({ node: target, nodes: [source, wait, preview, target], edges, allExtensions: [createProcessExtension([{ name: 'coarse_mesh', type: 'mesh' }])], nodeOutputs: outputs })
+  assert.equal(result.inputs?.coarse_mesh.filePath, '/edited.glb')
+  assert.equal(result.inputs?.coarse_mesh.sourceNodeId, 'wait')
+  assert.equal(outputs.get('source')?.filePath, '/source.glb')
+})

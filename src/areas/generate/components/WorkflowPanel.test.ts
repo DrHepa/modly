@@ -6,6 +6,10 @@ import test from 'node:test'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import type { ArtifactRef, ArtifactSubstitutionPoint } from '../../../shared/types/artifacts'
+import type { ArtifactHistoryRow, CheckpointOwner } from '../../workflows/workflowArtifacts'
+type Panel = typeof import('./WorkflowPanel')
+const landmarkOwner: CheckpointOwner = { nodeId: 'landmarks-node', runId: 'run', inputArtifactId: 'mesh', inputVersionId: 'v1', revision: 1 }
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const workflowPanelEntry = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
@@ -17,13 +21,14 @@ async function loadWorkflowPanelModule() {
     bundle: true,
     format: 'cjs',
     platform: 'node',
+    loader: { '.webp': 'dataurl' },
     tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
     external: ['react', 'react-dom/server', 'react/jsx-runtime', '@xyflow/react', 'zustand', 'axios'],
   })
 
   const module = { exports: {} as typeof import('./WorkflowPanel') }
   vm.runInNewContext(result.outputFiles[0].text, {
-    module, exports: module.exports, require: createRequire(import.meta.url), console, process,
+    module, exports: module.exports, require: createRequire(import.meta.url), console, process, Promise,
     // The SSR fixture never reads or writes the user's persisted browser state.
     localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
   })
@@ -42,6 +47,146 @@ async function renderWorkflowRunFeedback(props: Parameters<typeof import('./Work
     await cleanup()
   }
 }
+
+async function renderArtifactHistoryDisclosure(props: Parameters<Panel['ArtifactHistoryDisclosure']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return renderToStaticMarkup(createElement(module.ArtifactHistoryDisclosure, props))
+  } finally {
+    await cleanup()
+  }
+}
+
+async function deriveWaitParamRowArtifactHistoryRows(input: Parameters<Panel['deriveWaitParamRowArtifactHistoryRows']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return JSON.parse(JSON.stringify(module.deriveWaitParamRowArtifactHistoryRows(input)))
+  } finally {
+    await cleanup()
+  }
+}
+
+async function resolveWorkflowPanelLandmarkGuidance(input: Parameters<Panel['resolveWorkflowPanelLandmarkGuidance']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return JSON.parse(JSON.stringify(module.resolveWorkflowPanelLandmarkGuidance(input)))
+  } finally {
+    await cleanup()
+  }
+}
+
+async function resolveWorkflowRunPrimaryAction(input: Parameters<Panel['resolveWorkflowRunPrimaryAction']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return JSON.parse(JSON.stringify(module.resolveWorkflowRunPrimaryAction(input)))
+  } finally {
+    await cleanup()
+  }
+}
+
+async function executeWorkflowRunPrimaryAction(action: Parameters<Panel['executeWorkflowRunPrimaryAction']>[0], handlers: Parameters<Panel['executeWorkflowRunPrimaryAction']>[1]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return module.executeWorkflowRunPrimaryAction(action, handlers)
+  } finally {
+    await cleanup()
+  }
+}
+
+async function executeWorkflowLandmarkGuidanceAction(action: Parameters<Panel['executeWorkflowLandmarkGuidanceAction']>[0], handlers: Parameters<Panel['executeWorkflowLandmarkGuidanceAction']>[1]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return module.executeWorkflowLandmarkGuidanceAction(action, handlers)
+  } finally {
+    await cleanup()
+  }
+}
+
+async function renderWorkflowLandmarkGuidance(props: Parameters<Panel['WorkflowLandmarkGuidance']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return renderToStaticMarkup(createElement(module.WorkflowLandmarkGuidance, props))
+  } finally {
+    await cleanup()
+  }
+}
+
+async function renderWorkflowRunFooter(props: Parameters<Panel['WorkflowRunFooter']>[0]) {
+  const { module, cleanup } = await loadWorkflowPanelModule()
+
+  try {
+    return renderToStaticMarkup(createElement(module.WorkflowRunFooter, props))
+  } finally {
+    await cleanup()
+  }
+}
+
+function meshArtifact(id: string, filePath: string, versionId: string): ArtifactRef {
+  return {
+    id,
+    kind: 'mesh',
+    uri: filePath,
+    versionId,
+    legacy: { filePath, outputType: 'mesh' },
+  }
+}
+
+function substitutionPoint(nodeId: string, inputArtifact: ArtifactRef): ArtifactSubstitutionPoint {
+  return {
+    kind: 'artifact_substitution',
+    nodeId,
+    inputArtifactId: inputArtifact.id,
+    inputArtifact,
+    allowedKinds: ['mesh'],
+    status: 'declared',
+    interaction: {
+      boundary: 'ui_only',
+      headless: false,
+      editor: 'none',
+      continueMode: 'manual',
+    },
+  }
+}
+
+const artifactHistoryRows: ArtifactHistoryRow[] = [
+  {
+    kind: 'checkpoint-original',
+    label: 'Temporary checkpoint',
+    description: 'Starting artifact: mesh at /workspace/original.glb (version v1).',
+    status: 'available',
+  },
+  {
+    kind: 'pending-edited-copy',
+    label: 'Edited copy pending',
+    description: 'Edited copy: mesh at /workspace/edited.glb (version v2). It will only be used if you continue with it.',
+    status: 'pending',
+  },
+  {
+    kind: 'replacement-used',
+    label: 'Replacement used',
+    description: 'Continue used the edited artifact: mesh at /workspace/edited.glb (version v2).',
+    status: 'used',
+  },
+  {
+    kind: 'original-used',
+    label: 'Original used',
+    description: 'Continue kept the original artifact: mesh at /workspace/original.glb (version v1). No replacement was applied.',
+    status: 'skipped',
+  },
+  {
+    kind: 'final-output',
+    label: 'Final output',
+    description: 'Current output: mesh at /workspace/final.glb (version v3).',
+    status: 'available',
+  },
+]
 
 test('WorkflowRunFeedback surfaces prompt-required and metadata dispatch errors with actionable copy', async () => {
   const promptRequiredHtml = await renderWorkflowRunFeedback({
@@ -77,6 +222,89 @@ test('WorkflowRunFeedback surfaces prompt-required and metadata dispatch errors 
   assert.match(missingMetadataHtml, /Modly cannot determine the input required by this model\./i)
 })
 
+test('deriveWaitParamRowArtifactHistoryRows maps original checkpoint and pending replacement from WaitParamRow inputs', async () => {
+  const original = meshArtifact('mesh-asset', '/workspace/checkpoints/original.glb', 'mesh-asset-original')
+  const pendingReplacement = meshArtifact('mesh-asset', '/workspace/checkpoints/original-edited.glb', 'mesh-asset-edited')
+
+  const rows = await deriveWaitParamRowArtifactHistoryRows({
+    waitNodeId: 'wait-node',
+    nodeArtifacts: { 'wait-node': original },
+    artifactLineages: {},
+    substitutionPoint: substitutionPoint('wait-node', original),
+    pendingReplacement,
+  })
+
+  assert.deepEqual(rows.map((row: { kind: string }) => row.kind), ['checkpoint-original', 'pending-edited-copy'])
+})
+
+test('deriveWaitParamRowArtifactHistoryRows maps accepted replacement and final output from WaitParamRow inputs', async () => {
+  const original = meshArtifact('mesh-asset', '/workspace/checkpoints/original.glb', 'mesh-asset-original')
+  const replacement = meshArtifact('mesh-asset', '/workspace/checkpoints/replacement.glb', 'mesh-asset-replacement')
+  const finalOutput = meshArtifact('final-mesh', '/workspace/output/final.glb', 'final-v1')
+
+  const rows = await deriveWaitParamRowArtifactHistoryRows({
+    waitNodeId: 'wait-node',
+    nodeArtifacts: { 'wait-node': original },
+    artifactLineages: {},
+    substitutionPoint: substitutionPoint('wait-node', original),
+    runArtifact: finalOutput,
+    replacementResult: {
+      status: 'accepted',
+      artifact: replacement,
+      legacy: { filePath: replacement.uri, outputType: 'mesh' },
+    },
+  })
+
+  assert.deepEqual(rows.map((row: { kind: string }) => row.kind), ['checkpoint-original', 'replacement-used', 'final-output'])
+})
+
+test('deriveWaitParamRowArtifactHistoryRows includes landmark sidecar history when available', async () => {
+  const original = meshArtifact('mesh-asset', '/workspace/checkpoints/original.glb', 'mesh-asset-original')
+
+  const rows = await deriveWaitParamRowArtifactHistoryRows({
+    waitNodeId: 'landmarks-node',
+    nodeArtifacts: { 'landmarks-node': original },
+    artifactLineages: {},
+    landmarkSidecar: {
+      sidecarRole: 'landmarks-sidecar',
+      runId: 'workflow-landmarks-runtime',
+      nodeId: 'landmarks-node',
+      sidecarWorkspacePath: 'Workflows/landmarks/workflow-landmarks-runtime/landmarks-node.landmarks.v1.json',
+      targetArtifactId: 'mesh-asset',
+      targetVersionId: 'mesh-asset-original',
+      targetMeshPath: '/workspace/checkpoints/original.glb',
+      downstreamParam: 'landmarks_sidecar_path',
+    },
+  })
+
+  assert.deepEqual(rows.map((row: { kind: string }) => row.kind), ['checkpoint-original', 'landmark-sidecar'])
+  assert.match(rows[1].description, /Workflows\/landmarks\/workflow-landmarks-runtime\/landmarks-node\.landmarks\.v1\.json/)
+})
+
+test('deriveWaitParamRowArtifactHistoryRows does not mutate WaitParamRow artifact inputs', async () => {
+  const original = meshArtifact('mesh-asset', '/workspace/checkpoints/original.glb', 'mesh-asset-original')
+  const pendingReplacement = meshArtifact('mesh-asset', '/workspace/checkpoints/original-edited.glb', 'mesh-asset-edited')
+  const input: Parameters<Panel['deriveWaitParamRowArtifactHistoryRows']>[0] = {
+    waitNodeId: 'wait-node',
+    nodeArtifacts: { 'wait-node': original },
+    artifactLineages: {
+      'mesh-asset': {
+        artifactId: original.id,
+        originalVersionId: original.versionId,
+        currentVersionId: original.versionId,
+        versions: [{ id: original.versionId, role: 'original', ref: original, createdAt: '2026-05-17T16:00:00.000Z' }],
+      },
+    },
+    substitutionPoint: substitutionPoint('wait-node', original),
+    pendingReplacement,
+  }
+  const before = structuredClone(input)
+
+  await deriveWaitParamRowArtifactHistoryRows(input)
+
+  assert.deepEqual(input, before)
+})
+
 test('WorkflowRunFeedback keeps validation copy and explains unsupported capability modes', async () => {
   const unsupportedModeHtml = await renderWorkflowRunFeedback({
     runState: {
@@ -109,4 +337,292 @@ test('WorkflowRunFeedback keeps validation copy and explains unsupported capabil
   })
 
   assert.match(validationHtml, /Required port &quot;prompt&quot; is missing\./i)
+})
+
+test('ArtifactHistoryDisclosure is a collapsed secondary Wait checkpoint entry by default', async () => {
+  const html = await renderArtifactHistoryDisclosure({ rows: artifactHistoryRows })
+
+  assert.match(html, /Artifact history/i)
+  assert.match(html, /Review the checkpoint artifact before you continue\./i)
+  assert.doesNotMatch(html, /Temporary checkpoint/i)
+  assert.doesNotMatch(html, /Final output/i)
+})
+
+test('ArtifactHistoryDisclosure shows short beginner-friendly artifact rows when expanded', async () => {
+  const html = await renderArtifactHistoryDisclosure({ rows: artifactHistoryRows, defaultExpanded: true })
+
+  assert.match(html, /Artifact history/i)
+  assert.match(html, /Temporary checkpoint/i)
+  assert.match(html, /Edited copy pending/i)
+  assert.match(html, /Replacement used/i)
+  assert.match(html, /Original used/i)
+  assert.match(html, /Final output/i)
+  assert.match(html, /It will only be used if you continue with it\./i)
+})
+
+test('ArtifactHistoryDisclosure degrades gracefully when the Wait checkpoint has no artifact context', async () => {
+  const html = await renderArtifactHistoryDisclosure({ rows: [], defaultExpanded: true })
+
+  assert.match(html, /Artifact history/i)
+  assert.match(html, /No artifact history yet\./i)
+  assert.doesNotMatch(html, /Temporary checkpoint/i)
+})
+
+test('ArtifactHistoryDisclosure stays hidden outside the Wait checkpoint context', async () => {
+  const html = await renderArtifactHistoryDisclosure({ rows: artifactHistoryRows, isWaitCheckpoint: false })
+
+  assert.equal(html, '')
+})
+
+test('resolveWorkflowPanelLandmarkGuidance shows current landmark, progress, remaining, and disabled continue copy', async () => {
+  const guidance = await resolveWorkflowPanelLandmarkGuidance({
+    nodeId: 'landmarks-node',
+    canContinue: true,
+    session: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'hip',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: false, missing: ['hip', 'left_knee', 'right_knee'] },
+      canContinue: false,
+    },
+  })
+
+  assert.equal(guidance.isActive, true)
+  assert.equal(guidance.currentLabel, 'Hip')
+  assert.equal(guidance.currentToken, 'H')
+  assert.equal(guidance.progressLabel, '2 of 5 landmarks marked')
+  assert.equal(guidance.remainingLabel, 'Still needed: Hip, Left knee, Right knee')
+  assert.deepEqual(guidance.remainingLandmarks.map((landmark: { label: string; token: string }) => [landmark.label, landmark.token]), [
+    ['Hip', 'H'],
+    ['Left knee', 'LK'],
+    ['Right knee', 'RK'],
+  ])
+  assert.equal(guidance.continueDisabled, true)
+  assert.match(guidance.instruction, /Click the mesh in the 3D viewer/i)
+})
+
+test('resolveWorkflowPanelLandmarkGuidance enables continue and uses completion copy when all required landmarks are marked', async () => {
+  const guidance = await resolveWorkflowPanelLandmarkGuidance({
+    nodeId: 'landmarks-node',
+    canContinue: true,
+    session: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'right_knee',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        hip: { id: 'hip', name: 'hip', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        left_knee: { id: 'left_knee', name: 'left_knee', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_knee: { id: 'right_knee', name: 'right_knee', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: true, missing: [] },
+      canContinue: true,
+    },
+  })
+
+  assert.equal(guidance.currentLabel, 'Right knee')
+  assert.equal(guidance.currentToken, 'RK')
+  assert.equal(guidance.progressLabel, '5 of 5 landmarks marked')
+  assert.equal(guidance.remainingLabel, 'All required landmarks are marked. You can continue.')
+  assert.equal(guidance.continueDisabled, false)
+})
+
+test('WorkflowLandmarkGuidance renders beginner-friendly controls and disables Continue until completion', async () => {
+  const html = await renderWorkflowLandmarkGuidance({
+    nodeId: 'landmarks-node',
+    canContinue: true,
+    session: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'left_knee',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        hip: { id: 'hip', name: 'hip', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: false, missing: ['left_knee', 'right_knee'] },
+      canContinue: false,
+      error: 'Missing required landmarks: left_knee, right_knee',
+    },
+  })
+
+  assert.match(html, /Mark:/i)
+  assert.match(html, /Left knee/i)
+  assert.match(html, /LK/i)
+  assert.match(html, /3 of 5 landmarks marked/i)
+  assert.match(html, /Still needed: Left knee, Right knee/i)
+  assert.match(html, /Next points/i)
+  assert.match(html, /Click the mesh in the 3D viewer/i)
+  assert.match(html, /Clear landmarks/i)
+  assert.match(html, /To re-mark a point, click the same landmark again in the viewer/i)
+  assert.match(html, /disabled=""/i)
+  assert.match(html, /Finish all landmarks to continue/i)
+})
+
+test('WorkflowLandmarkGuidance renders compact re-mark actions for already placed landmarks', async () => {
+  const html = await renderWorkflowLandmarkGuidance({
+    nodeId: 'landmarks-node',
+    canContinue: true,
+    session: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'right_knee',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        hip: { id: 'hip', name: 'hip', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: false, missing: ['left_knee', 'right_knee'] },
+      canContinue: false,
+    },
+  })
+
+  assert.match(html, /Placed landmarks/i)
+  assert.match(html, /Re-mark LS Left shoulder/i)
+  assert.match(html, /Re-mark RS Right shoulder/i)
+  assert.match(html, /Re-mark H Hip/i)
+  assert.doesNotMatch(html, /Re-mark Left knee/i)
+})
+
+test('resolveWorkflowRunPrimaryAction exposes enabled Continue for completed paused landmarks', async () => {
+  const action = await resolveWorkflowRunPrimaryAction({
+    runState: {
+      status: 'paused',
+    },
+    canContinue: true,
+    checkpoint: { owner: landmarkOwner, landmarkCapture: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'right_knee',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        hip: { id: 'hip', name: 'hip', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        left_knee: { id: 'left_knee', name: 'left_knee', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_knee: { id: 'right_knee', name: 'right_knee', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: true, missing: [] },
+      canContinue: true,
+    } },
+    hasRunValidationIssue: false,
+  })
+
+  assert.deepEqual(action, {
+    kind: 'continue-landmarks', nodeId: 'landmarks-node',
+    label: 'Continue workflow',
+    disabled: false,
+  })
+})
+
+test('resolveWorkflowRunPrimaryAction keeps paused incomplete landmarks actionable but disabled', async () => {
+  const action = await resolveWorkflowRunPrimaryAction({
+    runState: {
+      status: 'paused',
+    },
+    canContinue: true,
+    checkpoint: { owner: landmarkOwner, landmarkCapture: {
+      sidecarStatus: 'not_started',
+      nodeId: 'landmarks-node',
+      activeLandmarkId: 'left_knee',
+      completed: {
+        left_shoulder: { id: 'left_shoulder', name: 'left_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        right_shoulder: { id: 'right_shoulder', name: 'right_shoulder', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+        hip: { id: 'hip', name: 'hip', world: { x: 0, y: 0, z: 0 }, confidence: 1, source: 'manual' },
+      },
+      validity: { valid: false, missing: ['left_knee', 'right_knee'] },
+      canContinue: false,
+    } },
+    hasRunValidationIssue: false,
+  })
+
+  assert.deepEqual(action, {
+    kind: 'continue-landmarks', nodeId: 'landmarks-node',
+    label: 'Finish all landmarks to continue',
+    disabled: true,
+  })
+})
+
+test('executeWorkflowRunPrimaryAction dispatches per-node continueRun only for enabled landmarks continue action', async () => {
+  let continueCalls = 0
+  let cancelCalls = 0
+  let generateCalls = 0
+
+  await executeWorkflowRunPrimaryAction(
+    { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Continue workflow', disabled: false },
+    {
+      continueRun: () => { continueCalls += 1 },
+      cancel: () => { cancelCalls += 1 },
+      generate: () => { generateCalls += 1 },
+    },
+  )
+
+  assert.equal(continueCalls, 1)
+  assert.equal(cancelCalls, 0)
+  assert.equal(generateCalls, 0)
+
+  await executeWorkflowRunPrimaryAction(
+    { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Finish all landmarks to continue', disabled: true },
+    {
+      continueRun: () => { continueCalls += 1 },
+      cancel: () => { cancelCalls += 1 },
+      generate: () => { generateCalls += 1 },
+    },
+  )
+
+  assert.equal(continueCalls, 1)
+})
+
+test('executeWorkflowLandmarkGuidanceAction clears landmarks through the owner-scoped clear action', async () => {
+  const resetCalls: string[] = []
+  const continueCalls: string[] = []
+
+  await executeWorkflowLandmarkGuidanceAction(
+    { kind: 'clear-landmarks', owner: { nodeId: 'landmarks-node', runId: 'run', inputArtifactId: 'mesh', inputVersionId: 'v1', revision: 1 }, disabled: false },
+    {
+      clearLandmarks: (owner: { nodeId: string }) => { resetCalls.push(owner.nodeId) },
+      continueRun: () => { continueCalls.push('continue') },
+    },
+  )
+
+  assert.deepEqual(resetCalls, ['landmarks-node'])
+  assert.deepEqual(continueCalls, [])
+})
+
+test('WorkflowRunFooter renders the real Generate CTA for unpinned paused landmarks', async () => {
+  const html = await renderWorkflowRunFooter({
+    primaryAction: { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Finish all landmarks to continue', disabled: true },
+    runState: { status: 'paused', blockIndex: 0, blockTotal: 1, blockProgress: 0, blockStep: '' },
+    runValidationIssue: null,
+    isRunning: true,
+    onGenerate: () => {},
+    onCancel: () => {},
+    onContinueRun: () => {},
+  })
+
+  assert.match(html, /Finish all landmarks to continue/i)
+  assert.match(html, /disabled=""/i)
+  assert.doesNotMatch(html, /Clear landmarks/i)
+})
+
+test('WorkflowRunFooter renders enabled Continue and Clear for completed unpinned landmarks', async () => {
+  const html = await renderWorkflowRunFooter({
+    primaryAction: { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Continue workflow', disabled: false },
+    runState: { status: 'paused', blockIndex: 0, blockTotal: 1, blockProgress: 0, blockStep: '' },
+    runValidationIssue: null,
+    isRunning: true,
+    landmarkClearAction: { kind: 'clear-landmarks', owner: { nodeId: 'landmarks-node', runId: 'run', inputArtifactId: 'mesh', inputVersionId: 'v1', revision: 1 }, disabled: false },
+    onGenerate: () => {},
+    onCancel: () => {},
+    onContinueRun: () => {},
+    onClearLandmarks: () => {},
+  })
+
+  assert.match(html, /Continue workflow/i)
+  assert.match(html, /Clear landmarks/i)
+  assert.doesNotMatch(html, /disabled=""/i)
 })

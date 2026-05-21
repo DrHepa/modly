@@ -9,6 +9,8 @@ import WorkflowParamControl from '../components/WorkflowParamControl'
 import { isWorkflowParamVisible, resolveWorkflowParamValues } from '../components/workflowParamControlState'
 import { isMissingWeightVariant, withWeightVariantAvailability } from '@shared/utils/weightVariants'
 import { useWorkflowRunStore } from '../workflowRunStore'
+import AdvancedOptionsSection from '../components/AdvancedOptionsSection'
+import { partitionAdvancedParams } from '../workflowParamSchema'
 import BaseNode from './BaseNode'
 
 // ─── Handle colors ────────────────────────────────────────────────────────────
@@ -69,6 +71,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   }, [id, data.params, updateNodeData])
 
   const resolvedParams = resolveWorkflowParamValues(ext?.params ?? [], data.params)
+
+  const paramSections = partitionAdvancedParams((ext?.params ?? []).filter((param) => isWorkflowParamVisible(param, resolvedParams)))
 
   // ── IO subheader ─────────────────────────────────────────────────────────
   const ioSubheader = isMulti ? (
@@ -171,8 +175,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     >
       {hasParams && (
         <div className="px-3 pb-3 pt-2.5 flex flex-col gap-2">
-          {(() => {
-            return ext!.params.filter((param) => isWorkflowParamVisible(param, resolvedParams)).map((param) => {
+          {[paramSections.basic, paramSections.advanced].map((params, section) => {
+            const controls = params.map((param) => {
               const val = (data.params[param.id] ?? param.default) as boolean | number | string
               return (
                 <div key={JSON.stringify([id, data.extensionId, param.id])} className="flex items-start gap-2 min-w-0">
@@ -197,7 +201,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
                 </div>
               )
             })
-          })()}
+            return section === 0 ? controls : <AdvancedOptionsSection key="advanced">{controls}</AdvancedOptionsSection>
+          })}
         </div>
       )}
     </BaseNode>

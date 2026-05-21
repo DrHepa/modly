@@ -187,7 +187,13 @@ function actualOwner(file, functionName, constants, env, callback = false) {
   visit(ast)
   assert.ok(body, `${functionName} not found`)
   const code = transformSync(`${declarations.join('\n')}\n${body}\n globalThis.result = ${functionName}`, { loader: 'tsx', jsx: 'automatic', format: 'cjs' }).code
-  const context = { ...env, require }
+  const additions = { exports: {} }
+  vm.runInNewContext(buildSync({
+    stdin: { contents: "export { partitionAdvancedParams } from './src/areas/workflows/workflowParamSchema'; export { default as AdvancedOptionsSection } from './src/areas/workflows/components/AdvancedOptionsSection'", resolveDir: process.cwd() },
+    tsconfig: 'tsconfig.web.json', bundle: true, platform: 'node', format: 'cjs', write: false,
+    external: ['react', 'react/*'],
+  }).outputFiles[0].text, { module: additions, exports: additions.exports, require })
+  const context = { ...additions.exports, ...env, require }
   vm.runInNewContext(code, context)
   return context.result
 }

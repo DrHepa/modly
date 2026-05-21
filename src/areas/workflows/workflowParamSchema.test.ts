@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { buildAllWorkflowExtensions } from './mockExtensions.ts'
-import { normalizeWorkflowParams } from './workflowParamSchema.ts'
+import { normalizeWorkflowParams, partitionAdvancedParams } from './workflowParamSchema.ts'
 
 test('normalizes legacy select, string, int, and float descriptors without changing defaults', () => {
   const params = normalizeWorkflowParams([
@@ -138,6 +138,94 @@ test('leaves legacy string metadata implicit (the shared control retains upstrea
   })
 })
 
+test('normalizes known advanced metadata without changing legacy defaults', () => {
+  const [param] = normalizeWorkflowParams([
+    {
+      id: 'seed',
+      label: 'Seed',
+      type: 'int',
+      default: 42,
+      advanced: true,
+      group: 'Sampling',
+      ui: {
+        control: 'slider',
+        collapsed: true,
+        order: 20,
+        help: 'Use a fixed seed for reproducible output.',
+      },
+    },
+  ])
+
+  assert.deepEqual(param, {
+    id: 'seed',
+    label: 'Seed',
+    type: 'int',
+    default: 42,
+    advanced: true,
+    group: 'Sampling',
+    ui: {
+      control: 'slider',
+      collapsed: true,
+      order: 20,
+      help: 'Use a fixed seed for reproducible output.',
+    },
+  })
+})
+
+test('ignores invalid advanced metadata while preserving supported schema fields', () => {
+  const [param] = normalizeWorkflowParams([
+    {
+      id: 'prompt',
+      label: 'Prompt',
+      type: 'string',
+      default: 'a mesh',
+      tooltip: 'Legacy tooltip remains intact',
+      advanced: 'yes',
+      group: 123,
+      ui: {
+        control: 7,
+        collapsed: 'true',
+        order: Number.NaN,
+        help: false,
+      },
+    },
+  ])
+
+  assert.deepEqual(param, {
+    id: 'prompt',
+    label: 'Prompt',
+    type: 'string',
+    default: 'a mesh',
+    tooltip: 'Legacy tooltip remains intact',
+  })
+})
+
+test('partitions basic and advanced params without changing their relative order', () => {
+  const params = normalizeWorkflowParams([
+    { id: 'prompt', label: 'Prompt', type: 'string', default: 'chair' },
+    { id: 'seed', label: 'Seed', type: 'int', default: 42, advanced: true },
+    { id: 'quality', label: 'Quality', type: 'select', default: 'high', options: [{ value: 'high', label: 'High' }] },
+    { id: 'sampler', label: 'Sampler', type: 'string', default: 'ddim', advanced: true },
+  ])
+
+  const partitioned = partitionAdvancedParams(params)
+
+  assert.deepEqual(partitioned.basic.map((param) => param.id), ['prompt', 'quality'])
+  assert.deepEqual(partitioned.advanced.map((param) => param.id), ['seed', 'sampler'])
+})
+
+test('keeps legacy params in the basic section when no advanced metadata exists', () => {
+  const params = normalizeWorkflowParams([
+    { id: 'steps', label: 'Steps', type: 'int', default: 25 },
+    { id: 'strength', label: 'Strength', type: 'float', default: 0.4 },
+  ])
+
+  const partitioned = partitionAdvancedParams(params)
+
+  assert.deepEqual(partitioned.basic.map((param) => param.id), ['steps', 'strength'])
+  assert.deepEqual(partitioned.advanced, [])
+})
+
 test('drops picker metadata when the picker intent cannot be resolved explicitly', () => {
   const [param] = normalizeWorkflowParams([
     {
@@ -206,4 +294,30 @@ test('keeps unsupported descriptors visible as explicit fallback labels in workf
       rawType: 'json',
     },
   ])
+})
+
+
+test('file-select keeps advanced metadata together with visibility and directory dependencies', () => {
+  const [param] = normalizeWorkflowParams([{
+    id: 'preset', label: 'Preset', type: 'file-select', default: 'first.json',
+    dir_from: 'folder', extensions: ['json'], show_if: { enabled: true },
+    advanced: true, group: 'Presets', ui: { collapsed: true, order: 2 },
+  }])
+  assert.deepEqual(param, {
+    id: 'preset', label: 'Preset', type: 'file-select', default: 'first.json',
+    dir_from: 'folder', extensions: ['json'], show_if: { enabled: true },
+    advanced: true, group: 'Presets', ui: { collapsed: true, order: 2 },
+  })
+  assert.deepEqual(partitionAdvancedParams([param]).advanced, [param])
+})
+
+test('every descriptor branch retains show_if and advanced metadata without coercing defaults', () => {
+  for (const [type, defaultValue] of [['boolean', false], ['int', 0], ['float', 0.5], ['string', ''], ['select', 1], ['file-select', ''], ['unsupported-type', { untouched: true }]] as const) {
+    const [param] = normalizeWorkflowParams([{ id: type, label: type, type, default: defaultValue, show_if: { enabled: [false, 0, 'no'] }, advanced: true, group: 'Details', ui: { collapsed: false } }])
+    assert.deepEqual(param.default, defaultValue)
+    assert.deepEqual(param.show_if, { enabled: [false, 0, 'no'] })
+    assert.equal(param.advanced, true)
+    assert.equal(param.group, 'Details')
+    assert.deepEqual(param.ui, { collapsed: false })
+  }
 })

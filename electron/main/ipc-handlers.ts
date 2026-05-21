@@ -80,6 +80,7 @@ import { ModelWeightOperations } from './model-weight-operations'
 import { readLocalFileBase64 } from './bounded-file-reader'
 import { encryptSecret, decryptSecret } from './secure-store'
 import { getHfToken, initHfToken, setHfToken } from './hf-token'
+import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -1006,6 +1007,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     join(getSettings(app.getPath('userData')).workspaceDir, ...parts)
 
   registerWorkspaceAssetLibraryIpcHandlers({
+    ipcMain,
+    getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
+  })
+  registerArtifactRegistryIpcHandlers({
     ipcMain,
     getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
   })

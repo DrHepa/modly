@@ -24,6 +24,7 @@ export interface NodeBehavior {
 
 const BEHAVIORS: Record<string, NodeBehavior> = {
   waitNode:         { passthrough: true, branchStarter: true },
+  landmarksNode:    { passthrough: true, branchStarter: true },
   outputNode:       { sceneOutput: true, branchConsumer: true },
   extensionNode:    { branchConsumer: true },
   imagePreviewNode: { passthrough: true },
@@ -39,16 +40,19 @@ export const isBranchConsumer = (type: string | undefined): boolean => !!type &&
 /**
  * Walks `sourceId` backwards through passthrough nodes (following each one's
  * incoming edge) until it hits a non-passthrough node. Returns its id, or
- * undefined if a passthrough has no incoming edge.
+ * undefined if a passthrough has no incoming edge. Structural callers omit
+ * materialized; runtime callers stop at an available manual checkpoint output.
  */
 export function resolveDataSource(
   sourceId: string,
   edges:    WFEdge[],
   nodeMap:  Map<string, WFNode>,
+  materialized?: ReadonlyMap<string, unknown>,
 ): string | undefined {
   let cur = sourceId
   const seen = new Set<string>()
   while (isPassthrough(nodeMap.get(cur)?.type) && !seen.has(cur)) {
+    if (isBranchStarter(nodeMap.get(cur)?.type) && materialized?.has(cur)) return cur
     seen.add(cur)
     const parent = edges.find((e) => e.target === cur)
     if (!parent) return undefined

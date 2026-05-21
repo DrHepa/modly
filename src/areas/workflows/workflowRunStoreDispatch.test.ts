@@ -41,6 +41,11 @@ let fsReadCalls: string[]
 let iteratorFileNames: string[]
 let workspaceDir: string
 let onProcessRun: ((call: RunProcessCall) => void) | undefined
+let processResult: ((call: RunProcessCall) => Promise<unknown>) | undefined
+let writeSidecar: (input: any) => Promise<any>
+let sidecarWrites: any[]
+let readFile: ((filePath: string) => Promise<string>) | undefined
+let settingsGet: (() => Promise<{ workspaceDir: string }>) | undefined
 let appState: {
   apiUrl: string
   selectedImagePath: string | undefined
@@ -60,6 +65,11 @@ beforeEach(() => {
   iteratorFileNames = []
   workspaceDir = '/workspace'
   onProcessRun = undefined
+  processResult = undefined
+  readFile = undefined
+  settingsGet = undefined
+  sidecarWrites = []
+  writeSidecar = async (input) => { sidecarWrites.push(input); return { success: true, sidecarWorkspacePath: input.sidecarWorkspacePath, sidecar: input.sidecar } }
   appState = {
     apiUrl: 'http://inert.invalid', currentJob: null,
     selectedImagePath: '/tmp/source.png', selectedImageData: Buffer.from('png-bytes').toString('base64'),
@@ -68,19 +78,20 @@ beforeEach(() => {
   }
   const fixture = { app: appState, get client() { return axiosClientMock } }
   const window = { electron: {
-    settings: { get: async () => ({ workspaceDir }) },
+    settings: { get: async () => settingsGet ? settingsGet() : ({ workspaceDir }) },
+    workspace: { artifacts: { writeLandmarkSidecar: (input: unknown) => writeSidecar(input) } },
     fs: {
       deleteDirectory: async () => ({ success: true }),
       listFiles: async () => iteratorFileNames,
       readFileBase64: async (filePath: string) => {
         fsReadCalls.push(filePath)
-        return Buffer.from('fs-bytes').toString('base64')
+        return readFile ? readFile(filePath) : Buffer.from('fs-bytes').toString('base64')
       },
     },
     extensions: { runProcess: async (extensionId: string, input: unknown, params: Record<string, unknown>) => {
       runProcessCalls.push(JSON.parse(JSON.stringify({ extensionId, input, params })))
       onProcessRun?.(runProcessCalls.at(-1)!)
-      return { success: true, result: { filePath: '/workspace/output/process.glb' } }
+      return processResult ? processResult(runProcessCalls.at(-1)!) : { success: true, result: { filePath: '/workspace/output/process.glb' } }
     } },
   } }
   const module = { exports: {} as { useWorkflowRunStore: WorkflowRunStore } }
@@ -88,7 +99,7 @@ beforeEach(() => {
     module, exports: module.exports, require: createRequire(import.meta.url), fixture, window,
     process, console, crypto, Blob, FormData, atob,
     // Polling delay is inert; each client is a bounded in-memory fixture.
-    setTimeout: (callback: () => void) => { callback(); return 0 }, clearTimeout: () => {},
+    setTimeout: (callback: () => void) => setTimeout(callback, 0), clearTimeout, TextDecoder,
   })
   useWorkflowRunStore = module.exports.useWorkflowRunStore
 })
@@ -1407,7 +1418,7 @@ for (const kind of ['model', 'named-model', 'process'] as const) {
     }
     const pending = useWorkflowRunStore.getState().run(workflow, [ext])
     try {
-      for (let i = 0; i < 100 && useWorkflowRunStore.getState().runState.status !== 'paused'; i++) await Promise.resolve()
+      await waitFor(() => useWorkflowRunStore.getState().runState.status === 'paused')
       assert.equal(useWorkflowRunStore.getState().runState.status, 'paused')
       useWorkflowRunStore.getState().continueWhile()
       await pending
@@ -1439,3 +1450,562 @@ for (const supplied of [{}, { prompt: '' }, { prompt: 'explicit' }]) {
     assert.deepEqual(fsReadCalls, [])
   })
 }
+
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.fail('Inert workflow did not reach the expected state within 200 event-loop turns')
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+function checkpointWorkflow(type = 'waitNode'): Workflow {
+  return {
+    ...createWorkflow(createExtensionNode('unused')),
+    nodes: [createNode('source', 'meshNode', { enabled: true, params: { source: 'file', filePath: '/workspace/source.glb' } }), createNode('wait', type)],
+    edges: [{ id: 'source-wait', source: 'source', target: 'wait' }],
+  }
+}
+
+function editedRef(versionId = 'edited') {
+  return { id: 'edited-asset', versionId, kind: 'mesh' as const, uri: '/workspace/edited.glb', legacy: { filePath: '/workspace/edited.glb', outputType: 'mesh' as const } }
+}
+
+function owner(id = 'wait') {
+  const token = useWorkflowRunStore.getState().getCheckpointOwner(id)
+  assert.ok(token)
+  return token
+}
+
+function addProcess(workflow: Workflow, id: string, wait: string, named = false) {
+  const ext = createWorkflowExtension({ id: `ext/${id}`, nodeId: id, input: 'mesh', type: 'process', ...(named ? { inputs: [{ name: 'mesh', type: 'mesh', required: true }] } : {}) })
+  workflow.nodes.push(createNode(id, 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }))
+  workflow.edges.push({ id: `${wait}-${id}`, source: wait, target: id, ...(named ? { targetHandle: 'mesh' } : {}) })
+  return ext
+}
+
+for (const named of [false, true]) {
+  test(`checkpoint replacement reaches ${named ? 'named' : 'positional'} PROCESS and preserves its independent sibling`, async () => {
+    const workflow = checkpointWorkflow()
+    workflow.nodes.push(createNode('sibling', 'waitNode'), createNode('preview', 'imagePreviewNode'))
+    workflow.edges.push({ id: 'source-sibling', source: 'source', target: 'sibling' }, { id: 'wait-preview', source: 'wait', target: 'preview' })
+    const a = addProcess(workflow, 'first', 'preview', named)
+    const b = addProcess(workflow, 'second', 'sibling', named)
+    await useWorkflowRunStore.getState().run(workflow, [a, b])
+    assert.equal(useWorkflowRunStore.getState().setPendingReplacement(owner(), editedRef()), true)
+    assert.equal(useWorkflowRunStore.getState().checkpoints.sibling.pendingReplacement, undefined)
+    await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+    await useWorkflowRunStore.getState().continueRun('sibling')
+    assert.equal((runProcessCalls[0].input as any)[named ? 'inputs' : 'filePath']?.mesh?.filePath ?? (runProcessCalls[0].input as any).filePath, '/workspace/edited.glb')
+    assert.equal((runProcessCalls[1].input as any).inputs?.mesh?.filePath ?? (runProcessCalls[1].input as any).filePath, '/workspace/source.glb')
+    assert.equal(useWorkflowRunStore.getState().nodeArtifacts.source.uri, '/workspace/source.glb')
+    assert.equal(appState.currentJob?.previewKind, undefined)
+  })
+}
+
+test('normal Continue explicitly ignores pending edits and preview never becomes final output', async () => {
+  await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+  assert.equal(appState.currentJob?.previewKind, 'workflow-checkpoint')
+  assert.equal(appState.currentJob?.outputUrl, '/workspace/source.glb')
+  const token = owner()
+  useWorkflowRunStore.getState().setPendingReplacement(token, editedRef())
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(useWorkflowRunStore.getState().checkpoints.wait.replacementResult?.status, 'noop')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
+  assert.equal(appState.currentJob?.outputUrl, undefined)
+  assert.equal(appState.currentJob?.previewKind, undefined)
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(token, editedRef()), false)
+})
+
+test('owner mismatch rejects run/node/input version/revision without resuming or selecting', async () => {
+  const workflow = checkpointWorkflow()
+  const ext = addProcess(workflow, 'process', 'wait')
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  const token = owner()
+  for (const patch of [{ runId: 'other' }, { nodeId: 'other' }, { inputArtifactId: 'other' }, { inputVersionId: 'other' }, { revision: token.revision + 1 }]) {
+    const stale = { ...token, ...patch }
+    assert.equal(useWorkflowRunStore.getState().setPendingReplacement(stale, editedRef()), false)
+    await useWorkflowRunStore.getState().continueRun('wait', { owner: stale, replacementArtifact: editedRef() })
+    assert.equal(runProcessCalls.length, 0)
+  }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.notEqual(owner().runId, token.runId)
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(token, editedRef()), false)
+})
+
+test('nested waits materialize edited parent outputs and retry invalidates descendant owners', async () => {
+  const workflow = checkpointWorkflow()
+  workflow.nodes.push(createNode('nested', 'waitNode'))
+  const ext = addProcess(workflow, 'process', 'wait')
+  workflow.edges.push({ id: 'process-nested', source: 'process', target: 'nested' })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().getCheckpointOwner('nested'), undefined)
+  await useWorkflowRunStore.getState().continueRun('nested')
+  assert.equal(runProcessCalls.length, 0)
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+  const firstNested = owner('nested')
+  assert.equal(useWorkflowRunStore.getState().checkpoints.nested.input?.filePath, '/workspace/output/process.glb')
+  await useWorkflowRunStore.getState().continueRun('nested')
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.notEqual(owner('nested').inputVersionId, firstNested.inputVersionId)
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(firstNested, editedRef()), false)
+  assert.equal((runProcessCalls[1].input as any).filePath, '/workspace/source.glb')
+})
+
+for (const operation of ['cancel', 'reset', 'new-run'] as const) {
+  test(`late process result cannot publish after ${operation}`, async () => {
+    const workflow = checkpointWorkflow()
+    const ext = addProcess(workflow, 'process', 'wait')
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    const response = deferred<any>()
+    processResult = () => response.promise
+    const oldOwner = owner()
+    const branch = useWorkflowRunStore.getState().continueRun('wait')
+    await waitFor(() => runProcessCalls.length === 1)
+    if (operation === 'new-run') await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+    else useWorkflowRunStore.getState()[operation]()
+    const before = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    response.resolve({ success: true, result: { filePath: '/workspace/late.glb' } })
+    await branch
+    assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), before)
+    assert.equal(useWorkflowRunStore.getState().setPendingReplacement(oldOwner, editedRef()), false)
+  })
+}
+
+const landmarkIds = ['left_shoulder', 'right_shoulder', 'hip', 'left_knee', 'right_knee'] as const
+function completeCapture() {
+  for (const [i, id] of landmarkIds.entries()) assert.equal(useWorkflowRunStore.getState().markLandmark(owner(), { id, name: id, source: 'manual', confidence: 1, world: { x: i, y: 1, z: 2 } }), true)
+}
+
+test('Landmarks is a manual mesh boundary without extension identity, with scoped sidecar routing', async () => {
+  const workflow = checkpointWorkflow('landmarksNode')
+  const ext = addProcess(workflow, 'rig-mesh', 'wait', true)
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(runProcessCalls.length, 0)
+  assert.equal(useWorkflowRunStore.getState().markLandmark(owner(), { id: 'hip', name: 'Hip', source: 'manual', confidence: 1, world: { x: NaN, y: 0, z: 0 } }), false)
+  completeCapture()
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(runProcessCalls.length, 1)
+  assert.equal((runProcessCalls[0].input as any).inputs.mesh.filePath, '/workspace/source.glb')
+  assert.equal(runProcessCalls[0].params.landmarks_sidecar_path, sidecarWrites[0].sidecarWorkspacePath)
+  assert.equal(sidecarWrites[0].sidecar.runId, useWorkflowRunStore.getState().executionId)
+  assert.notEqual(sidecarWrites[0].sidecar.runId, workflow.id)
+})
+
+for (const operation of ['clear', 'remark', 'cancel', 'reset', 'new-run'] as const) {
+  test(`deferred landmark capture cannot continue or publish after ${operation}`, async () => {
+    await useWorkflowRunStore.getState().run(checkpointWorkflow('landmarksNode'), [])
+    completeCapture()
+    const response = deferred<any>()
+    let request: any
+    writeSidecar = async (input) => { request = input; return response.promise }
+    const token = owner()
+    const pending = useWorkflowRunStore.getState().continueRun('wait')
+    await waitFor(() => !!request)
+    if (operation === 'new-run') await useWorkflowRunStore.getState().run(checkpointWorkflow('landmarksNode'), [])
+    else if (operation === 'clear') useWorkflowRunStore.getState().clearLandmarks(token)
+    else if (operation === 'remark') useWorkflowRunStore.getState().markLandmark(token, { id: 'hip', name: 'Hip', source: 'manual', confidence: 1, world: { x: 99, y: 0, z: 0 } })
+    else useWorkflowRunStore.getState()[operation]()
+    const before = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    response.resolve({ success: true, sidecarWorkspacePath: request.sidecarWorkspacePath, sidecar: request.sidecar })
+    await pending
+    assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), before)
+    assert.equal(sidecarWrites.length, 0)
+  })
+}
+
+for (const preview of ['imagePreviewNode']) {
+  test(`edited mesh reaches named MODEL and explicit scene through ${preview}`, async () => {
+    const workflow = checkpointWorkflow()
+    workflow.nodes.push(createNode('preview', preview), createNode('text', 'textNode', { enabled: true, params: { text: 'walk' } }))
+    const ext = createNamedTextMeshModelExtension()
+    workflow.nodes.push(createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }))
+    workflow.edges.push({ id: 'preview', source: 'wait', target: 'preview' }, { id: 'mesh', source: 'preview', target: 'animate', targetHandle: 'rigged_mesh' }, { id: 'text', source: 'text', target: 'animate', targetHandle: 'prompt' })
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+    assert.equal((posts[0].params as any).rigged_mesh_path, 'edited.glb')
+    assert.equal((posts[0].params as any).model_id, ext.id)
+    assert.equal((posts[0].params as any).node_id, ext.nodeId)
+    assert.equal(useWorkflowRunStore.getState().nodeArtifacts.source.uri, '/workspace/source.glb')
+  })
+}
+
+test('MODEL reads only an explicitly selected edited image through Wait and keeps selected image state', async () => {
+  const ext = createNamedImageModelExtension()
+  const workflow = checkpointWorkflow()
+  workflow.nodes[0] = createNode('source', 'imageNode', { enabled: true, params: { filePath: '/workspace/original.png' } })
+  workflow.nodes.push(createNode('preview', 'imagePreviewNode'), createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }))
+  workflow.edges.push({ id: 'p', source: 'wait', target: 'preview' }, { id: 'm', source: 'preview', target: 'model', targetHandle: 'front' })
+  const posts = captureImageRequests()
+  const selected = appState.selectedImagePath
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: { id: 'edit', versionId: 'v2', kind: 'image', uri: '/workspace/edited.png' } })
+  assert.deepEqual(fsReadCalls, ['/workspace/edited.png'])
+  assert.equal((posts[0].get('image') as File).name, 'edited.png')
+  assert.equal(appState.selectedImagePath, selected)
+  assert.equal(useWorkflowRunStore.getState().nodeImageOutputs.wait, '/workspace/edited.png')
+})
+
+test('explicit Wait-to-scene continuation is final, unlike a mere checkpoint preview', async () => {
+  const workflow = checkpointWorkflow()
+  workflow.nodes.push(createNode('output', 'outputNode'))
+  workflow.edges.push({ id: 'output', source: 'wait', target: 'output' })
+  await useWorkflowRunStore.getState().run(workflow, [])
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/edited.glb')
+  assert.equal(useWorkflowRunStore.getState().runState.artifact?.uri, '/workspace/edited.glb')
+  assert.equal(appState.currentJob?.previewKind, undefined)
+})
+
+for (const output of ['audio']) {
+  test(`${output} PROCESS output remains non-mesh across a checkpoint`, async () => {
+    const workflow = checkpointWorkflow()
+    const ext = addProcess(workflow, 'process', 'wait')
+    ext.output = output
+    const path = `/workspace/final.${output === 'audio' ? 'wav' : 'json'}`
+    processResult = async () => ({ success: true, result: { filePath: path } })
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    await useWorkflowRunStore.getState().continueRun('wait')
+    assert.equal(useWorkflowRunStore.getState().runState.outputPath, path)
+    assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
+    assert.equal(appState.currentJob?.outputUrl, undefined)
+  })
+}
+
+test('failed branch stays retryable, but descendants cannot bypass their failed parent', async () => {
+  const workflow = checkpointWorkflow()
+  const ext = addProcess(workflow, 'process', 'wait')
+  workflow.nodes.push(createNode('nested', 'waitNode'))
+  workflow.edges.push({ id: 'nested', source: 'process', target: 'nested' })
+  processResult = async () => ({ success: false, error: 'injected failure' })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(useWorkflowRunStore.getState().waitStates.wait, 'error')
+  await useWorkflowRunStore.getState().continueRun('nested')
+  assert.equal(useWorkflowRunStore.getState().waitStates.nested, 'error')
+  processResult = undefined
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(useWorkflowRunStore.getState().waitStates.nested, 'pending')
+  await useWorkflowRunStore.getState().continueRun('nested')
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('While manual Retry reads live params; its Continue does not resume an unrelated Wait', async () => {
+  const ext = createWorkflowExtension({ type: 'process' })
+  const target = createExtensionNode(ext.id)
+  target.parentId = 'loop'
+  const workflow = createWorkflow(target)
+  for (const node of workflow.nodes) node.position = { x: 1000, y: 1000 }
+  const loop = createNode('loop', 'whileNode', { enabled: true, params: {} })
+  loop.width = 500; loop.height = 300
+  workflow.nodes.push(loop, createNode('wait', 'waitNode'))
+  workflow.edges.push({ id: 'wait', source: target.id, target: 'wait' })
+  const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+  await waitFor(() => useWorkflowRunStore.getState().runState.status === 'paused')
+  assert.equal(runProcessCalls.length, 1)
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(runProcessCalls.length, 1)
+  useWorkflowRunStore.getState().setLiveNodeParams(target.id, { count: 0, live: false })
+  useWorkflowRunStore.getState().retryWhile()
+  await waitFor(() => runProcessCalls.length === 2 && useWorkflowRunStore.getState().runState.status === 'paused')
+  assert.deepEqual(runProcessCalls[1].params, { count: 0, live: false })
+  useWorkflowRunStore.getState().continueWhile()
+  await pending
+  assert.equal(useWorkflowRunStore.getState().waitStates.wait, 'pending')
+  assert.ok(owner())
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('For Each lockstep pause/retry preserves current files, advances together and reads live params', async () => {
+  iteratorFileNames = ['a.glb', 'b.glb']
+  const ext = createWorkflowExtension({ type: 'process', input: 'mesh', inputs: ['mesh', 'mesh'] })
+  const target = createExtensionNode(ext.id)
+  const workflow = { ...checkpointWorkflow(), nodes: [createNode('one', 'forEachNode', { enabled: true, params: { mode: 'mesh', dir: '/one' } }), createNode('two', 'forEachNode', { enabled: true, params: { mode: 'mesh', dir: '/two' } }), target], edges: [
+    { id: 'one', source: 'one', target: target.id, targetHandle: 'input-0' }, { id: 'two', source: 'two', target: target.id, targetHandle: 'input-1' },
+  ] }
+  onProcessRun = () => { if (runProcessCalls.length <= 2) useWorkflowRunStore.getState().pauseWhile() }
+  const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+  await waitFor(() => useWorkflowRunStore.getState().runState.status === 'paused')
+  assert.deepEqual([...useWorkflowRunStore.getState().pausedGroup].sort(), ['one', 'two'])
+  useWorkflowRunStore.getState().setLiveNodeParams(target.id, { live: true })
+  useWorkflowRunStore.getState().retryWhile()
+  await waitFor(() => runProcessCalls.length === 2 && useWorkflowRunStore.getState().runState.status === 'paused')
+  assert.equal((runProcessCalls[0].input as any).filePath, (runProcessCalls[1].input as any).filePath)
+  assert.deepEqual(runProcessCalls[1].params, { live: true })
+  useWorkflowRunStore.getState().continueWhile()
+  await pending
+  assert.equal(runProcessCalls.length, 3)
+  assert.match((runProcessCalls[2].input as any).filePath, /b\.glb$/)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+for (const operation of ['cancel', 'reset', 'new-run'] as const) {
+  test(`late model status cannot publish after ${operation}`, async () => {
+    const ext = createWorkflowExtension({ input: 'text' })
+    const workflow = { ...checkpointWorkflow(), nodes: [createExtensionNode(ext.id)], edges: [] }
+    const response = deferred<any>()
+    let polling = false
+    axiosClientMock = { async post() { return { data: { job_id: 'old' } } }, async get() { polling = true; return response.promise } }
+    const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => polling)
+    if (operation === 'new-run') await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+    else useWorkflowRunStore.getState()[operation]()
+    const before = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    response.resolve({ data: { status: 'done', output_url: '/workspace/late.glb' } })
+    await pending
+    assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), before)
+  })
+}
+
+test('preview and cancel do not overwrite an unrelated current job', async () => {
+  await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+  const otherJob = { id: 'unrelated', outputUrl: '/unrelated.glb', previewKind: 'external' }
+  appState.setCurrentJob(otherJob)
+  useWorkflowRunStore.getState().selectCheckpoint(owner())
+  useWorkflowRunStore.getState().cancel()
+  assert.deepEqual(appState.currentJob, otherJob)
+})
+
+
+test('workspace-relative edited copies are materialized as absolute runtime PROCESS input', async () => {
+  const workflow = checkpointWorkflow()
+  const ext = addProcess(workflow, 'process', 'wait')
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: { id: 'edit', versionId: 'v2', kind: 'mesh', uri: 'Workflows/edited/edit.glb' } })
+  assert.equal((runProcessCalls[0].input as any).filePath, '/workspace/Workflows/edited/edit.glb')
+})
+
+test('scene MODEL preserves from-artifact routing and outputPath through a manual boundary', async () => {
+  const workflow = checkpointWorkflow()
+  workflow.nodes[0] = createNode('source', 'sceneNode', { enabled: true, params: { manifestPath: 'input/scene.json' } })
+  const ext = addProcess(workflow, 'model', 'wait')
+  ext.type = 'model'; ext.input = 'scene'; ext.output = 'scene'
+  const requests: any[] = []
+  axiosClientMock = { async post(path, body) { requests.push(JSON.parse(JSON.stringify({ path, body }))); return { data: { job_id: 'scene' } } }, async get() { return { data: { status: 'done', output_url: '/workspace/final/scene.json' } } } }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.deepEqual(requests, [{ path: '/generate/from-artifact', body: { input_kind: 'scene', input_path: 'input/scene.json', model_id: ext.id, collection: 'Workflows', params: {} } }])
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/final/scene.json')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
+  assert.deepEqual(fsReadCalls, [])
+})
+
+test('unsupported scene PROCESS declaration remains rejected before dispatch', async () => {
+  const workflow = checkpointWorkflow()
+  const ext = addProcess(workflow, 'process', 'wait'); ext.output = 'scene'
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal(runProcessCalls.length, 0)
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /unsupported scene/)
+})
+
+test('audio PROCESS input remains an audio path and is never coerced into checkpoint mesh', async () => {
+  const workflow = checkpointWorkflow()
+  const producer = createWorkflowExtension({ id: 'audio/generate', extensionId: 'audio', nodeId: 'generate', input: 'text', type: 'process', output: 'audio' })
+  workflow.nodes[0] = createNode('source', 'extensionNode', { enabled: true, params: {}, extensionId: producer.id })
+  workflow.nodes.push(createNode('text', 'textNode', { enabled: true, params: { text: 'sound' } }))
+  workflow.edges.push({ id: 'text', source: 'text', target: 'source' })
+  const consumer = addProcess(workflow, 'process', 'wait'); consumer.input = 'audio'; consumer.output = 'audio'
+  processResult = async () => ({ success: true, result: { filePath: '/workspace/audio.wav' } })
+  await useWorkflowRunStore.getState().run(workflow, [producer, consumer])
+  assert.equal(appState.currentJob?.previewKind, undefined)
+  await useWorkflowRunStore.getState().continueRun('wait')
+  assert.equal((runProcessCalls[1].input as any).filePath, '/workspace/audio.wav')
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/audio.wav')
+})
+
+test('clearing pending edits invalidates captured exporters and original Retry resets lineage selection', async () => {
+  await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+  const captured = owner()
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(captured, undefined), true)
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(captured, editedRef()), false)
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+  const cp = useWorkflowRunStore.getState().checkpoints.wait
+  assert.notEqual(cp.lineage?.currentVersionId, cp.lineage?.originalVersionId)
+  await useWorkflowRunStore.getState().continueRun('wait')
+  const original = useWorkflowRunStore.getState().checkpoints.wait
+  assert.equal(original.lineage?.currentVersionId, original.lineage?.originalVersionId)
+  assert.equal(original.lineage?.versions.length, 2)
+})
+
+for (const finishPrevious of [true, false]) {
+  test(`Current Mesh keeps a prior final output but not a checkpoint preview (${finishPrevious})`, async () => {
+    workspaceDir = '/real/workspace'
+    const first = checkpointWorkflow()
+    const ext = addProcess(first, 'process', 'wait')
+    first.nodes.push(createNode('scene', 'outputNode'))
+    first.edges.push({ id: 'process-scene', source: 'process', target: 'scene' })
+    processResult = async () => ({ success: true, result: { filePath: `${workspaceDir}/output/result.glb` } })
+    // Keep the checkpoint source in the actual workspace, not a /workspace URL.
+    first.nodes[0].data.params.filePath = `${workspaceDir}/source.glb`
+    await useWorkflowRunStore.getState().run(first, [ext])
+    if (finishPrevious) await useWorkflowRunStore.getState().continueRun('wait')
+    assert.equal(appState.currentJob?.previewKind, finishPrevious ? undefined : 'workflow-checkpoint')
+    assert.equal(appState.currentJob?.outputUrl, finishPrevious ? '/workspace/output/result.glb' : '/workspace/source.glb')
+
+    const next = checkpointWorkflow()
+    next.nodes = [createNode('current', 'meshNode', { enabled: true, params: { source: 'current' } }), createNode('next', 'extensionNode', { enabled: true, extensionId: ext.id, params: {} })]
+    next.edges = [{ id: 'current-next', source: 'current', target: 'next' }]
+    await useWorkflowRunStore.getState().run(next, [ext])
+    if (finishPrevious) {
+      assert.equal(runProcessCalls.length, 2)
+      assert.equal((runProcessCalls[1].input as { filePath: string }).filePath, '/real/workspace/output/result.glb')
+      assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    } else {
+      assert.equal(runProcessCalls.length, 0)
+      assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+      assert.match(useWorkflowRunStore.getState().runState.error ?? '', /needs an incoming mesh/)
+    }
+  })
+}
+
+for (const rejectCleanup of [false, true]) {
+  test(`late cancelled MODEL submission cleans its own job without unhandled cleanup rejection (${rejectCleanup})`, async () => {
+    const ext = createWorkflowExtension({ input: 'text' })
+    const workflow = { ...checkpointWorkflow(), nodes: [createExtensionNode(ext.id)], edges: [] }
+    const response = deferred<{ data: { job_id: string } }>()
+    const paths: string[] = []
+    axiosClientMock = {
+      async post(path) {
+        paths.push(path)
+        if (path === '/generate/from-text') return response.promise
+        assert.equal(path, '/generate/cancel/late-owned-job')
+        if (rejectCleanup) throw new Error('Injected cancellation failure')
+        return { data: {} }
+      },
+      async get() { assert.fail('A cancelled late submission must never be polled') },
+    }
+    const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => paths.length === 1)
+    useWorkflowRunStore.getState().cancel()
+    const cancelled = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    response.resolve({ data: { job_id: 'late-owned-job' } })
+    await pending
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.deepEqual(paths, ['/generate/from-text', '/generate/cancel/late-owned-job'])
+    assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), cancelled)
+  })
+}
+
+for (const rejectCleanup of [false, true]) {
+  test(`old MODEL acknowledgement uses old client and leaves newer active backend job intact (${rejectCleanup})`, async () => {
+    const ext = createWorkflowExtension({ input: 'text' })
+    const workflow = { ...checkpointWorkflow(), nodes: [createExtensionNode(ext.id)], edges: [] }
+    const oldResponse = deferred<{ data: { job_id: string } }>()
+    const oldPaths: string[] = []
+    axiosClientMock = {
+      async post(path) {
+        oldPaths.push(path)
+        if (path === '/generate/from-text') return oldResponse.promise
+        assert.equal(path, '/generate/cancel/old-owned-job')
+        if (rejectCleanup) throw new Error('Old client cancellation rejected')
+        return { data: {} }
+      },
+      async get() { assert.fail('Old submission must never be polled after cancellation') },
+    }
+    const oldRun = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => oldPaths.length === 1)
+    useWorkflowRunStore.getState().cancel()
+
+    const newStatus = deferred<{ data: { status: string; output_url: string } }>()
+    const newPaths: string[] = []
+    const newPolls: string[] = []
+    axiosClientMock = {
+      async post(path) {
+        newPaths.push(path)
+        if (path === '/generate/from-text') return { data: { job_id: 'new-owned-job' } }
+        assert.equal(path, '/generate/cancel/new-owned-job')
+        return { data: {} }
+      },
+      async get(path) { newPolls.push(path); return newStatus.promise },
+    }
+    const newRun = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => newPolls.length === 1)
+    const newerState = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    oldResponse.resolve({ data: { job_id: 'old-owned-job' } })
+    await oldRun
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.deepEqual(oldPaths, ['/generate/from-text', '/generate/cancel/old-owned-job'])
+    assert.deepEqual(newPaths, ['/generate/from-text'])
+    assert.deepEqual(newPolls, ['/generate/status/new-owned-job'])
+    assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), newerState)
+    // The old acknowledgement must not overwrite OR clear the newer global job id.
+    useWorkflowRunStore.getState().cancel()
+    assert.deepEqual(newPaths, ['/generate/from-text', '/generate/cancel/new-owned-job'])
+    newStatus.resolve({ data: { status: 'done', output_url: '/workspace/late-new.glb' } })
+    await newRun
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'idle')
+  })
+}
+
+for (const [label, responseValue] of [
+  ['absent data', {}], ['null data', { data: null }],
+  ['absent id', { data: {} }], ['null id', { data: { job_id: null } }],
+  ['empty id', { data: { job_id: '' } }], ['blank id', { data: { job_id: ' \t\n ' } }],
+  ['numeric id', { data: { job_id: 27 } }], ['true id', { data: { job_id: true } }],
+  ['false id', { data: { job_id: false } }], ['object id', { data: { job_id: {} } }],
+  ['array id', { data: { job_id: ['new-owned-job'] } }], ['empty array id', { data: { job_id: [] } }],
+] as const) {
+  test(`malformed late MODEL acknowledgement never targets the newer backend job (${label})`, async () => {
+    const ext = createWorkflowExtension({ input: 'text' })
+    const workflow = { ...checkpointWorkflow(), nodes: [createExtensionNode(ext.id)], edges: [] }
+    const response = deferred<unknown>()
+    const oldPaths: string[] = []
+    axiosClientMock = {
+      async post(path) { oldPaths.push(path); return path === '/generate/from-text' ? response.promise : { data: {} } },
+      async get() { assert.fail('A stale acknowledgement must never be polled') },
+    }
+    const oldRun = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => oldPaths.length === 1)
+    useWorkflowRunStore.getState().cancel()
+
+    const status = deferred<unknown>(), newPaths: string[] = [], newPolls: string[] = []
+    axiosClientMock = {
+      async post(path) { newPaths.push(path); return { data: { job_id: 'new-owned-job' } } },
+      async get(path) { newPolls.push(path); return status.promise },
+    }
+    const newRun = useWorkflowRunStore.getState().run(workflow, [ext])
+    await waitFor(() => newPolls.length === 1)
+    const newerState = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+    response.resolve(responseValue)
+    await oldRun
+    try {
+      assert.deepEqual(oldPaths, ['/generate/from-text'], 'malformed ids must not be coerced into cancellation paths')
+      assert.deepEqual(newPaths, ['/generate/from-text'])
+      assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), newerState)
+    } finally {
+      useWorkflowRunStore.getState().cancel()
+      status.resolve({ data: { status: 'done', output_url: '/workspace/new.glb' } })
+      await newRun
+    }
+    assert.deepEqual(newPaths, ['/generate/from-text', '/generate/cancel/new-owned-job'])
+    assert.deepEqual(newPolls, ['/generate/status/new-owned-job'])
+  })
+}
+
+test('late MODEL cleanup preserves a non-blank opaque string id without trimming it', async () => {
+  const ext = createWorkflowExtension({ input: 'text' })
+  const workflow = { ...checkpointWorkflow(), nodes: [createExtensionNode(ext.id)], edges: [] }
+  const response = deferred<unknown>(), paths: string[] = []
+  axiosClientMock = {
+    async post(path) { paths.push(path); return path === '/generate/from-text' ? response.promise : { data: {} } },
+    async get() { assert.fail('A cancelled MODEL must not be polled') },
+  }
+  const run = useWorkflowRunStore.getState().run(workflow, [ext])
+  await waitFor(() => paths.length === 1)
+  useWorkflowRunStore.getState().cancel()
+  response.resolve({ data: { job_id: ' opaque-job:27 ' } })
+  await run
+  assert.deepEqual(paths, ['/generate/from-text', '/generate/cancel/ opaque-job:27 '])
+})

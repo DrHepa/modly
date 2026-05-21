@@ -7,6 +7,7 @@ import LoadSceneNode from './nodes/LoadSceneNode'
 import ImagePreviewNode from './nodes/ImagePreviewNode'
 import PreviewImageNode from './nodes/PreviewImageNode'
 import PreviewViewsNode from './nodes/PreviewViewsNode'
+import LandmarksNode from './nodes/LandmarksNode'
 import WaitNode from './nodes/WaitNode'
 import WhileNode from './nodes/WhileNode'
 import ForEachNode from './nodes/ForEachNode'
@@ -23,6 +24,7 @@ export const WORKFLOW_NODE_TYPES = {
   imagePreviewNode: ImagePreviewNode,
   [PREVIEW_IMAGE_NODE_TYPE]: PreviewImageNode,
   [PREVIEW_VIEWS_NODE_TYPE]: PreviewViewsNode,
+  landmarksNode: LandmarksNode,
   waitNode: WaitNode,
   whileNode: WhileNode,
   forEachNode: ForEachNode,

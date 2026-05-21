@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult, RuntimeReadinessResponse, RuntimeReadinessAction, RuntimeReadinessActionResult } from '../../src/shared/types/electron.d'
+import type { AnyExtension, ExtensionInstallResult, ExtensionInstallProgress, ProcessInput, ProcessResult, RuntimeReadinessResponse, RuntimeReadinessAction, RuntimeReadinessActionResult, ArtifactRegistryReadRequest, ArtifactRegistryReadResult, ArtifactRegistryWriteRequest, ArtifactRegistryWriteResult, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../src/shared/types/electron.d'
 import { invokeExtensionsRunProcess } from './run-process-ipc'
 import type { AutomationCapabilitiesResponse } from '../../src/shared/types/electron'
 import type {
@@ -247,6 +247,17 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         ipcRenderer.invoke('workspace:saveJobMeta', { collection, filename, meta }) as Promise<void>,
       deleteJob: (collection: string, filename: string): Promise<void> =>
         ipcRenderer.invoke('workspace:deleteJob', { collection, filename }) as Promise<void>,
+      artifacts: {
+        writeSidecar: (request: ArtifactRegistryWriteRequest): Promise<ArtifactRegistryWriteResult> => ipcRenderer.invoke('workspace:artifact:writeSidecar', request) as Promise<ArtifactRegistryWriteResult>,
+        readSidecar: (request: ArtifactRegistryReadRequest): Promise<ArtifactRegistryReadResult> => ipcRenderer.invoke('workspace:artifact:readSidecar', request) as Promise<ArtifactRegistryReadResult>,
+        writeEditedSceneArtifact: (request: EditedSceneArtifactWriteRequest): Promise<EditedSceneArtifactWriteResult> => ipcRenderer.invoke('workspace:artifact:writeEditedSceneArtifact', request) as Promise<EditedSceneArtifactWriteResult>,
+        writeLandmarkSidecar: (request: LandmarkSidecarWriteRequest): Promise<LandmarkSidecarWriteResult> => ipcRenderer.invoke('workspace:artifact:writeLandmarkSidecar', request) as Promise<LandmarkSidecarWriteResult>,
+        writePoseClipSidecar: (request: PoseClipSidecarWriteRequest): Promise<PoseClipSidecarWriteResult> => ipcRenderer.invoke('workspace:artifact:writePoseClipSidecar', request) as Promise<PoseClipSidecarWriteResult>,
+        readPoseClipSidecar: (request: PoseClipSidecarReadRequest): Promise<PoseClipSidecarReadResult> => ipcRenderer.invoke('workspace:artifact:readPoseClipSidecar', request) as Promise<PoseClipSidecarReadResult>,
+        writeRigRenameSidecar: (request: RigRenameSidecarWriteRequest): Promise<RigRenameSidecarWriteResult> => ipcRenderer.invoke('workspace:artifact:writeRigRenameSidecar', request) as Promise<RigRenameSidecarWriteResult>,
+        readRigRenameSidecar: (request: RigRenameSidecarReadRequest): Promise<RigRenameSidecarReadResult> => ipcRenderer.invoke('workspace:artifact:readRigRenameSidecar', request) as Promise<RigRenameSidecarReadResult>,
+        readRigMetaSidecar: (request: RigMetaSidecarReadRequest): Promise<RigMetaSidecarReadResult> => ipcRenderer.invoke('workspace:artifact:readRigMetaSidecar', request) as Promise<RigMetaSidecarReadResult>,
+      },
       library: {
         list: (): Promise<AssetLibraryListResult> => ipcRenderer.invoke('workspace:library:list') as Promise<AssetLibraryListResult>,
         read: (request: AssetLibraryReadRequest): Promise<AssetLibraryReadResult> => ipcRenderer.invoke('workspace:library:read', request) as Promise<AssetLibraryReadResult>,

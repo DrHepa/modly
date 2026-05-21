@@ -20,7 +20,14 @@ import WorkflowParamControl from '@areas/workflows/components/WorkflowParamContr
 import { isWorkflowParamVisible, resolveWorkflowParamValues } from '@areas/workflows/components/workflowParamControlState'
 import { isMissingWeightVariant, withWeightVariantAvailability } from '@shared/utils/weightVariants'
 import ChatPanel from './ChatPanel'
-import type { WorkflowRunState } from '@areas/workflows/workflowRunStore'
+import type { WorkflowRunState, WorkflowCheckpoint, WorkflowLandmarkSession } from '@areas/workflows/workflowRunStore'
+
+import AdvancedOptionsSection from '@areas/workflows/components/AdvancedOptionsSection'
+import { partitionAdvancedParams } from '@areas/workflows/workflowParamSchema'
+import { resolveWaitCheckpointUiState } from '@areas/workflows/nodes/WaitNode'
+import { REQUIRED_LANDMARK_IDS, isLandmarkCaptureComplete, type LandmarkId } from '@areas/workflows/landmarks'
+import { LANDMARK_GUIDE_ITEM_BY_ID } from '@areas/workflows/landmarkGuideModel'
+import { deriveArtifactHistoryRows, type ArtifactHistoryRow, type DeriveArtifactHistoryRowsInput, type CheckpointOwner } from '@areas/workflows/workflowArtifacts'
 
 type PanelMode = 'basic' | 'chat'
 
@@ -67,6 +74,224 @@ function topoSortNodes(nodes: Workflow['nodes'], edges: Workflow['edges']): WFNo
 type WorkflowRunErrorCopy = {
   title: string
   detail: string
+}
+
+type WorkflowPanelLandmarkSession = Pick<
+  WorkflowLandmarkSession,
+  'nodeId' | 'activeLandmarkId' | 'completed' | 'validity' | 'canContinue' | 'error' | 'sidecarStatus'
+>
+
+type WorkflowPanelCheckpoint = Pick<WorkflowCheckpoint, 'owner'> & { landmarkCapture?: WorkflowPanelLandmarkSession }
+
+type LandmarkLabelCopy = { id: LandmarkId; label: string; token: string }
+
+export type WorkflowPanelLandmarkGuidance = {
+  isActive: boolean
+  currentLabel: string
+  currentToken: string
+  progressLabel: string
+  remainingLabel: string
+  remainingLandmarks: LandmarkLabelCopy[]
+  instruction: string
+  continueLabel: string
+  continueDisabled: boolean
+  placedLandmarks: LandmarkLabelCopy[]
+  error?: string
+}
+
+export type WorkflowRunPrimaryAction =
+  | { kind: 'generate'; label: 'Generate 3D Model'; disabled: boolean }
+  | { kind: 'stop'; label: 'Stop'; disabled: false }
+  | { kind: 'continue-landmarks'; nodeId: string; label: string; disabled: boolean }
+
+export type WorkflowLandmarkGuidanceAction =
+  | { kind: 'continue-landmarks'; nodeId: string; disabled: boolean }
+  | { kind: 'clear-landmarks'; owner: CheckpointOwner; disabled: boolean }
+
+export type WorkflowRunLandmarkClearAction = { kind: 'clear-landmarks'; owner: CheckpointOwner; disabled: boolean }
+
+function formatLandmarkLabel(id: LandmarkId): string {
+  return LANDMARK_GUIDE_ITEM_BY_ID[id].label
+}
+
+function formatLandmarkToken(id: LandmarkId): string {
+  return LANDMARK_GUIDE_ITEM_BY_ID[id].token
+}
+
+function formatLandmarkCopy(id: LandmarkId): LandmarkLabelCopy {
+  return { id, label: formatLandmarkLabel(id), token: formatLandmarkToken(id) }
+}
+
+function countCompletedRequiredLandmarks(session: WorkflowPanelLandmarkSession): number {
+  return REQUIRED_LANDMARK_IDS.filter((id) => session.completed[id] !== undefined).length
+}
+
+export function resolveWorkflowPanelLandmarkGuidance(input: {
+  nodeId: string
+  canContinue: boolean
+  session?: WorkflowPanelLandmarkSession
+}): WorkflowPanelLandmarkGuidance {
+  const isActive = input.session?.nodeId === input.nodeId
+
+  if (!isActive || !input.session) {
+    return {
+      isActive: false,
+      currentLabel: 'Landmarks',
+      currentToken: '•',
+      progressLabel: 'Waiting for the workflow to pause here.',
+      remainingLabel: 'Run the workflow to start guided landmark capture.',
+      remainingLandmarks: REQUIRED_LANDMARK_IDS.map(formatLandmarkCopy),
+      instruction: 'When this step is active, Modly will guide you through five mesh clicks.',
+      continueLabel: 'Continue workflow',
+      continueDisabled: true,
+      placedLandmarks: [],
+    }
+  }
+
+  const session = input.session
+  const complete = session.canContinue && isLandmarkCaptureComplete(Object.values(session.completed))
+
+  const completedCount = countCompletedRequiredLandmarks(session)
+  const totalCount = REQUIRED_LANDMARK_IDS.length
+  const remainingLabel = session.validity.missing.length === 0
+    ? 'All required landmarks are marked. You can continue.'
+    : `Still needed: ${session.validity.missing.map(formatLandmarkLabel).join(', ')}`
+  const remainingLandmarks = session.validity.missing.map(formatLandmarkCopy)
+
+  return {
+    isActive: true,
+    currentLabel: formatLandmarkLabel(session.activeLandmarkId),
+    currentToken: formatLandmarkToken(session.activeLandmarkId),
+    progressLabel: `${completedCount} of ${totalCount} landmarks marked`,
+    remainingLabel,
+    remainingLandmarks,
+    instruction: 'Click the mesh in the 3D viewer to place this point. To re-mark a point, click the same landmark again in the viewer.',
+    continueLabel: complete ? 'Continue workflow' : 'Finish all landmarks to continue',
+    continueDisabled: !complete || !input.canContinue || session.sidecarStatus === 'pending-write',
+    placedLandmarks: REQUIRED_LANDMARK_IDS
+      .filter((id) => session.completed[id] !== undefined)
+      .map(formatLandmarkCopy),
+    error: session.error,
+  }
+}
+
+export function resolveWorkflowRunPrimaryAction(input: {
+  runState: Pick<WorkflowRunState, 'status'>
+  checkpoint?: WorkflowPanelCheckpoint
+  canContinue: boolean
+  hasRunValidationIssue: boolean
+}): WorkflowRunPrimaryAction {
+  const session = input.checkpoint?.landmarkCapture
+  if (session && input.checkpoint) {
+    const guidance = resolveWorkflowPanelLandmarkGuidance({ nodeId: input.checkpoint.owner.nodeId, session, canContinue: input.canContinue })
+    return { kind: 'continue-landmarks', nodeId: input.checkpoint.owner.nodeId, label: guidance.continueLabel, disabled: guidance.continueDisabled }
+  }
+  if (input.runState.status === 'running' || input.runState.status === 'paused') {
+    return { kind: 'stop', label: 'Stop', disabled: false }
+  }
+  return { kind: 'generate', label: 'Generate 3D Model', disabled: input.hasRunValidationIssue }
+}
+
+export function resolveWorkflowRunLandmarkClearAction(input: {
+  checkpoint?: WorkflowPanelCheckpoint
+  canContinue: boolean
+}): WorkflowRunLandmarkClearAction | undefined {
+  const session = input.checkpoint?.landmarkCapture
+  if (!input.checkpoint || !session || countCompletedRequiredLandmarks(session) === 0) return undefined
+  return { kind: 'clear-landmarks', owner: input.checkpoint.owner, disabled: !input.canContinue || session.sidecarStatus === 'pending-write' }
+}
+
+export function executeWorkflowRunPrimaryAction(
+  action: WorkflowRunPrimaryAction,
+  handlers: { generate: () => void; cancel: () => void; continueRun: (nodeId: string) => void },
+): void {
+  if (action.disabled) return
+  if (action.kind === 'continue-landmarks') {
+    handlers.continueRun(action.nodeId)
+    return
+  }
+  if (action.kind === 'stop') {
+    handlers.cancel()
+    return
+  }
+  handlers.generate()
+}
+
+export function executeWorkflowLandmarkGuidanceAction(
+  action: WorkflowLandmarkGuidanceAction,
+  handlers: { continueRun: (nodeId: string) => void; clearLandmarks: (owner: CheckpointOwner) => void },
+): void {
+  if (action.disabled) return
+  if (action.kind === 'clear-landmarks') {
+    handlers.clearLandmarks(action.owner)
+    return
+  }
+  handlers.continueRun(action.nodeId)
+}
+
+export function WorkflowRunFooter({
+  primaryAction,
+  landmarkClearAction,
+  landmarkError,
+  runState,
+  runValidationIssue,
+  isRunning,
+  onGenerate,
+  onCancel,
+  onContinueRun,
+  onClearLandmarks,
+}: {
+  primaryAction: WorkflowRunPrimaryAction
+  landmarkClearAction?: WorkflowRunLandmarkClearAction
+  landmarkError?: string
+  runState: WorkflowRunState
+  runValidationIssue: { message: string } | null
+  isRunning: boolean
+  onGenerate: () => void
+  onCancel: () => void
+  onContinueRun: (nodeId: string) => void
+  onClearLandmarks?: (owner: CheckpointOwner) => void
+}) {
+  const handlers = { generate: onGenerate, cancel: onCancel, continueRun: onContinueRun }
+  const buttonClass = primaryAction.kind === 'stop'
+    ? 'w-full py-2.5 rounded-lg text-sm font-semibold bg-red-600 hover:bg-red-700 text-white transition-colors'
+    : primaryAction.kind === 'continue-landmarks'
+      ? 'w-full py-2.5 rounded-lg text-sm font-semibold bg-amber-500 hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 transition-colors'
+      : 'w-full py-2.5 rounded-lg text-sm font-semibold bg-accent hover:bg-accent-dark disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors'
+
+  return (
+    <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
+      <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
+      {primaryAction.kind === 'continue-landmarks' && landmarkError && (
+        <p role="alert" className="px-2.5 py-1.5 rounded-md bg-red-950/40 border border-red-800/50 text-[10px] text-red-300 leading-relaxed">
+          {landmarkError}
+        </p>
+      )}
+      <button
+        onClick={() => executeWorkflowRunPrimaryAction(primaryAction, handlers)}
+        disabled={primaryAction.disabled}
+        className={buttonClass}
+      >
+        {primaryAction.label}
+      </button>
+      {primaryAction.kind === 'continue-landmarks' && isRunning && (
+        <button type="button" onClick={onCancel} className="w-full py-2 rounded-lg text-xs font-semibold text-red-400 hover:text-red-300">Stop</button>
+      )}
+      {landmarkClearAction && (
+        <button
+          type="button"
+          onClick={() => executeWorkflowLandmarkGuidanceAction(landmarkClearAction, {
+            continueRun: onContinueRun,
+            clearLandmarks: (owner) => onClearLandmarks?.(owner),
+          })}
+          disabled={landmarkClearAction.disabled}
+          className="w-full py-2 rounded-lg text-xs font-semibold border border-zinc-700 text-zinc-300 hover:border-amber-400/60 hover:text-amber-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          Clear landmarks
+        </button>
+      )}
+    </div>
+  )
 }
 
 function normalizeWorkflowRunError(error?: string): string {
@@ -358,8 +583,79 @@ function TextParamRow({ nodeId, nodes, onPatch }: { nodeId: string; nodes: FlowN
   )
 }
 
-function WaitParamRow({ nodeId }: { nodeId: string }) {
-  const { waitState, canContinue, isRunning, label, buttonClass, onContinue } = useWaitButton(nodeId)
+export function ArtifactHistoryDisclosure({
+  rows,
+  defaultExpanded = false,
+  isWaitCheckpoint = true,
+}: {
+  rows: ArtifactHistoryRow[]
+  defaultExpanded?: boolean
+  isWaitCheckpoint?: boolean
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded)
+
+  if (!isWaitCheckpoint) return null
+
+  return (
+    <div className="rounded-md border border-zinc-800/80 bg-zinc-900/45 px-2.5 py-2">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        className="w-full flex items-center justify-between gap-2 text-left"
+      >
+        <span className="flex flex-col gap-0.5 min-w-0">
+          <span className="text-[10px] font-semibold text-zinc-300">Artifact history</span>
+          <span className="text-[10px] text-zinc-500 leading-relaxed">Review the checkpoint artifact before you continue.</span>
+        </span>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+          className={`shrink-0 text-zinc-600 transition-transform ${expanded ? 'rotate-180' : ''}`}>
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
+
+      {expanded && (
+        rows.length > 0 ? (
+          <div className="mt-2 flex flex-col gap-1.5">
+            {rows.map((row) => (
+              <div key={`${row.kind}-${row.artifact?.id ?? row.label}-${row.artifact?.versionId ?? row.status ?? 'row'}`} className="rounded-md bg-zinc-950/40 border border-zinc-800/60 px-2 py-1.5">
+                <p className="text-[10px] font-medium text-zinc-300">{row.label}</p>
+                <p className="mt-0.5 text-[10px] text-zinc-500 leading-relaxed">{row.description}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-[10px] text-zinc-500 leading-relaxed">No artifact history yet.</p>
+        )
+      )}
+    </div>
+  )
+}
+
+export function deriveWaitParamRowArtifactHistoryRows(input: DeriveArtifactHistoryRowsInput): ArtifactHistoryRow[] {
+  return deriveArtifactHistoryRows(input)
+}
+
+export function WaitParamRow({ nodeId }: { nodeId: string }) {
+  const { waitState, canContinue, isRunning, label, buttonClass, statusText, onContinue } = useWaitButton(nodeId)
+  const checkpoint = useWorkflowRunStore((s) => s.checkpoints[nodeId])
+  const continueRun = useWorkflowRunStore((s) => s.continueRun)
+  const selectCheckpoint = useWorkflowRunStore((s) => s.selectCheckpoint)
+  const nodeArtifact = useWorkflowRunStore((s) => s.nodeArtifacts[nodeId])
+  const checkpointUi = resolveWaitCheckpointUiState({ nodeId, checkpoint, waitState })
+  const artifactHistoryRows = deriveWaitParamRowArtifactHistoryRows({
+    waitNodeId: nodeId,
+    nodeArtifacts: nodeArtifact ? { [nodeId]: nodeArtifact } : {},
+    artifactLineages: checkpoint?.lineage ? { [nodeId]: checkpoint.lineage } : {},
+    substitutionPoint: checkpoint?.substitutionPoint,
+    replacementResult: checkpoint?.replacementResult,
+    pendingReplacement: checkpoint?.pendingReplacement,
+    landmarkSidecar: checkpoint?.landmarkSidecar,
+  })
+  const handleContinueWithReplacement = useCallback(() => {
+    if (!canContinue || !checkpoint?.pendingReplacement) return
+    void continueRun(nodeId, { owner: checkpoint.owner, replacementArtifact: checkpoint.pendingReplacement })
+  }, [nodeId, canContinue, continueRun, checkpoint])
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -370,35 +666,183 @@ function WaitParamRow({ nodeId }: { nodeId: string }) {
         <span className="text-[11px] font-medium text-zinc-300">Wait</span>
       </div>
       {waitState ? (
-        <button
-          onClick={onContinue}
-          disabled={!canContinue}
-          className={`w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md border transition-colors text-[11px] font-medium ${buttonClass} ${
-            canContinue ? (waitState === 'pending' ? 'animate-pulse' : '') : 'opacity-40 cursor-not-allowed'
-          }`}
-        >
-          {isRunning ? (
-            <>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="animate-spin">
-                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-              </svg>
-              Running…
-            </>
-          ) : (
-            <>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="5 3 19 12 5 21 5 3"/>
-              </svg>
-              {label}
-            </>
+        <div className="flex flex-col gap-1.5">
+          {checkpointUi.isCheckpoint && (
+            <div className="px-2.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/25">
+              <p className="text-[9px] uppercase tracking-wide text-amber-300 font-semibold">{checkpointUi.statusLabel}</p>
+              <p className="mt-0.5 text-[10px] text-zinc-400 leading-relaxed">{checkpointUi.description}</p>
+            </div>
           )}
-        </button>
+          <button
+            onClick={onContinue}
+            disabled={!canContinue}
+            className={`w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md border transition-colors text-[11px] font-medium disabled:opacity-40 disabled:cursor-not-allowed ${buttonClass}`}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            {isRunning ? 'Running…' : label}
+          </button>
+          {checkpointUi.showSubstitutedContinue && (
+            <button
+              onClick={handleContinueWithReplacement}
+              disabled={!canContinue}
+              className="w-full px-2.5 py-2 rounded-md bg-violet-500/15 border border-violet-500/30 text-violet-200 hover:bg-violet-500/25 transition-colors text-[11px] font-medium"
+            >
+              {checkpointUi.substitutedContinueLabel}
+            </button>
+          )}
+          <p className="text-[10px] text-zinc-500">{statusText}</p>
+          {checkpoint && <button type="button" disabled={!canContinue} onClick={() => selectCheckpoint(checkpoint.owner)} className="text-[10px] text-zinc-400 disabled:opacity-40">Show checkpoint</button>}
+          <ArtifactHistoryDisclosure rows={artifactHistoryRows} />
+        </div>
       ) : (
-        <p className="text-[10px] text-zinc-600 italic px-0.5">
-          Pauses the workflow until you click Continue.
+        <>
+          <p className="text-[10px] text-zinc-600 italic px-0.5">
+            {checkpointUi.description}
+          </p>
+          {artifactHistoryRows.length > 0 && (
+            <ArtifactHistoryDisclosure rows={artifactHistoryRows} />
+          )}
+        </>
+      )}
+      {checkpointUi.rejectionCopy && (
+        <p className="text-[10px] text-zinc-500 leading-relaxed px-0.5">
+          {checkpointUi.rejectionCopy}
         </p>
       )}
     </div>
+  )
+}
+
+export function WorkflowLandmarkGuidance({
+  nodeId,
+  canContinue,
+  owner,
+  session,
+  onContinue,
+  onReset,
+  onSelectLandmark,
+}: {
+  nodeId: string
+  canContinue: boolean
+  owner?: CheckpointOwner
+  session?: WorkflowPanelLandmarkSession
+  onContinue?: () => void
+  onReset?: () => void
+  onSelectLandmark?: (id: LandmarkId) => void
+}) {
+  const guidance = resolveWorkflowPanelLandmarkGuidance({ nodeId, canContinue, session })
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-1.5">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2">
+          <path d="M12 2v20"/><path d="M5 9h14"/><path d="M7 16h10"/>
+        </svg>
+        <span className="text-[11px] font-medium text-zinc-300">Landmarks</span>
+      </div>
+
+      {guidance.isActive ? (
+        <div className="flex flex-col gap-1.5">
+          <div className="px-2.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/25">
+            <p className="text-[9px] uppercase tracking-wide text-amber-300 font-semibold">Mark: <span className="inline-flex items-center justify-center min-w-5 rounded-full bg-amber-400/20 px-1 text-amber-100">{guidance.currentToken}</span> {guidance.currentLabel}</p>
+            <p className="mt-0.5 text-[10px] text-zinc-400 leading-relaxed">{guidance.instruction}</p>
+            <p className="mt-1 text-[10px] text-zinc-300 font-medium">{guidance.progressLabel}</p>
+            <p className="mt-0.5 text-[10px] text-zinc-500 leading-relaxed">{guidance.remainingLabel}</p>
+            {guidance.remainingLandmarks.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                <span className="text-[9px] uppercase tracking-wide text-zinc-500 font-semibold">Next points</span>
+                {guidance.remainingLandmarks.map((landmark) => (
+                  <span key={landmark.id} className="rounded-full border border-zinc-700/70 px-1.5 py-0.5 text-[9px] text-zinc-300">
+                    {landmark.token} {landmark.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {guidance.error && (
+            <p role="alert" className="px-2.5 py-1.5 rounded-md bg-red-950/40 border border-red-800/50 text-[10px] text-red-300 leading-relaxed">
+              {guidance.error}
+            </p>
+          )}
+
+          {guidance.placedLandmarks.length > 0 && (
+            <div className="rounded-md border border-zinc-800/70 bg-zinc-950/30 px-2.5 py-2">
+              <p className="text-[9px] uppercase tracking-wide text-zinc-500 font-semibold">Placed landmarks</p>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {guidance.placedLandmarks.map((landmark) => (
+                  <button
+                    key={landmark.id}
+                    type="button"
+                    onClick={() => onSelectLandmark?.(landmark.id)}
+                    disabled={!canContinue || session?.sidecarStatus === 'pending-write'}
+                    className="rounded-md border border-zinc-700/70 px-2 py-1 text-[10px] font-medium text-zinc-300 hover:border-amber-400/50 hover:text-amber-200 transition-colors"
+                  >
+                    Re-mark {landmark.token} {landmark.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => executeWorkflowLandmarkGuidanceAction({ kind: 'continue-landmarks', nodeId, disabled: guidance.continueDisabled }, {
+              continueRun: onContinue ?? (() => {}),
+              clearLandmarks: () => {},
+            })}
+            disabled={guidance.continueDisabled}
+            className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-400 hover:bg-amber-500/25 disabled:opacity-45 disabled:cursor-not-allowed transition-colors text-[11px] font-medium"
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            {guidance.continueLabel}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => owner && executeWorkflowLandmarkGuidanceAction({ kind: 'clear-landmarks', owner, disabled: !canContinue || session?.sidecarStatus === 'pending-write' }, {
+              continueRun: () => {},
+              clearLandmarks: () => onReset?.(),
+            })}
+            disabled={!owner || !canContinue || session?.sidecarStatus === 'pending-write'}
+            className="w-full px-2.5 py-1.5 rounded-md border border-zinc-700/70 text-[10px] font-medium text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors"
+          >
+            Clear landmarks
+          </button>
+        </div>
+      ) : (
+        <p className="text-[10px] text-zinc-600 italic px-0.5 leading-relaxed">
+          {guidance.instruction}
+        </p>
+      )}
+    </div>
+  )
+}
+
+export function LandmarksParamRow({ nodeId }: { nodeId: string }) {
+  const checkpoint = useWorkflowRunStore((s) => s.checkpoints[nodeId])
+  const continueRun = useWorkflowRunStore((s) => s.continueRun)
+  const clearLandmarks = useWorkflowRunStore((s) => s.clearLandmarks)
+  const setActiveLandmark = useWorkflowRunStore((s) => s.setActiveLandmark)
+  const selectCheckpoint = useWorkflowRunStore((s) => s.selectCheckpoint)
+  const { canContinue } = useWaitButton(nodeId)
+  return (
+    <>
+      {checkpoint && <button type="button" disabled={!canContinue} onClick={() => selectCheckpoint(checkpoint.owner)} className="text-[10px] text-zinc-400 disabled:opacity-40">Show checkpoint</button>}
+      <WorkflowLandmarkGuidance
+        nodeId={nodeId}
+        canContinue={canContinue}
+        owner={checkpoint?.owner}
+        session={checkpoint?.landmarkCapture}
+        onContinue={() => { void continueRun(nodeId) }}
+        onReset={() => { if (checkpoint) clearLandmarks(checkpoint.owner) }}
+        onSelectLandmark={(id) => { if (checkpoint && selectCheckpoint(checkpoint.owner)) setActiveLandmark(checkpoint.owner, id) }}
+      />
+    </>
   )
 }
 
@@ -411,6 +855,7 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
   const enabled = data?.enabled ?? true
 
   const resolvedParams = resolveWorkflowParamValues(ext.params, data?.params ?? {})
+  const paramSections = partitionAdvancedParams(ext.params.filter((param) => isWorkflowParamVisible(param, resolvedParams)))
   const inputColor  = TYPE_COLOR[ext.input]  ?? '#71717a'
   const outputColor = TYPE_COLOR[ext.output] ?? '#71717a'
 
@@ -448,26 +893,29 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
 
       {expanded && ext.params.length > 0 && (
         <div className="mt-2 flex flex-col gap-2">
-          {ext.params.filter((param) => isWorkflowParamVisible(param, resolvedParams)).map((param) => {
-            const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
-            return (
-              <div key={JSON.stringify([nodeId, ext.id, param.id])} className="flex items-start gap-2 min-w-0">
-                <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate leading-tight">{param.label}</label>
-                <div className="min-w-0 flex-1">
-                  <WorkflowParamControl resolvedParams={resolvedParams} param={withWeightVariantAvailability(param, ext.weightVariants, installedVariants)} value={val}
-                    onChange={(v) => onPatch(nodeId, { params: { ...(data?.params ?? {}), [param.id]: v } })} />
-                  {/* Offer the install instead of leaving the panel on selection. */}
-                  {isMissingWeightVariant(param.id, val, ext.weightVariants, installedVariants) && (
-                    <button
-                      onClick={() => openExtension(ext.extensionId)}
-                      className="mt-1 text-[10px] text-amber-400 hover:text-amber-300 hover:underline"
-                    >
-                      Not installed — install it
-                    </button>
-                  )}
+          {[paramSections.basic, paramSections.advanced].map((params, section) => {
+            const controls = params.map((param) => {
+              const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
+              return (
+                <div key={JSON.stringify([nodeId, ext.id, param.id])} className="flex items-start gap-2 min-w-0">
+                  <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate leading-tight">{param.label}</label>
+                  <div className="min-w-0 flex-1">
+                    <WorkflowParamControl resolvedParams={resolvedParams} param={withWeightVariantAvailability(param, ext.weightVariants, installedVariants)} value={val}
+                      onChange={(v) => onPatch(nodeId, { params: { ...(data?.params ?? {}), [param.id]: v } })} />
+                    {/* Offer the install instead of leaving the panel on selection. */}
+                    {isMissingWeightVariant(param.id, val, ext.weightVariants, installedVariants) && (
+                      <button
+                        onClick={() => openExtension(ext.extensionId)}
+                        className="mt-1 text-[10px] text-amber-400 hover:text-amber-300 hover:underline"
+                      >
+                        Not installed — install it
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )
+              )
+            })
+            return section === 0 ? controls : <AdvancedOptionsSection key="advanced">{controls}</AdvancedOptionsSection>
           })}
         </div>
       )}
@@ -542,7 +990,9 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
 
   const currentMeshUrl = useAppStore((s) => s.currentJob?.outputUrl)
   const showToast = useAppStore((s) => s.showToast)
-  const { runState, run, cancel } = useWorkflowRunStore()
+  const { runState, run, cancel, continueRun, clearLandmarks } = useWorkflowRunStore()
+  const checkpoint = useWorkflowRunStore((s) => s.activeCheckpointNodeId ? s.checkpoints[s.activeCheckpointNodeId] : undefined)
+  const { canContinue } = useWaitButton(checkpoint?.owner.nodeId ?? '')
   const isRunning = runState.status === 'running' || runState.status === 'paused'
 
   // Update AddToScene node when run completes
@@ -567,7 +1017,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   )
 
   const paramNodes = sortedNodes.filter((n) =>
-    (n.type === 'imageNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode')
+    (n.type === 'imageNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode')
     && (n.data as { showInGenerate?: boolean }).showInGenerate === true,
   )
 
@@ -589,6 +1039,14 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     run(wf, allExtensions)
   }, [firstPreflightIssue, nodes, edges, workflow, allExtensions, run, showToast, saveAndClaim])
 
+  const primaryAction = resolveWorkflowRunPrimaryAction({
+    runState,
+    checkpoint,
+    canContinue,
+    hasRunValidationIssue: Boolean(firstPreflightIssue),
+  })
+  const landmarkClearAction = resolveWorkflowRunLandmarkClearAction({ checkpoint, canContinue })
+
   return (
     <div className="flex flex-col flex-1 min-h-0">
 
@@ -602,6 +1060,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
               {node.type === 'textNode'  && <TextParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'meshNode'  && <MeshParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'waitNode'  && <WaitParamRow  nodeId={node.id} />}
+              {node.type === 'landmarksNode' && <LandmarksParamRow nodeId={node.id} />}
               {node.type === 'extensionNode' && (() => {
                 const ext = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
                 return ext ? <ExtensionParamRow nodeId={node.id} ext={ext} nodes={nodes} onPatch={patchNode} /> : null
@@ -633,29 +1092,18 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
       </div>
 
       {/* Footer */}
-      <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
-        <WorkflowRunFeedback runState={runState} runValidationIssue={null} isRunning={isRunning} />
-        {firstPreflightIssue && !isRunning && (
-          <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-amber-950/40 border border-amber-800/50">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-300 shrink-0">
-              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-            </svg>
-            <span className="text-[10px] text-amber-300 font-medium">{firstPreflightIssue}</span>
-          </div>
-        )}
-        {isRunning ? (
-          <button onClick={() => cancel()}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold bg-red-600 hover:bg-red-700 text-white transition-colors">
-            Stop
-          </button>
-        ) : (
-          <button onClick={handleGenerate} disabled={Boolean(firstPreflightIssue)}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold bg-accent hover:bg-accent-dark disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors">
-            Generate 3D Model
-          </button>
-        )}
-      </div>
+      <WorkflowRunFooter
+        primaryAction={primaryAction}
+        landmarkClearAction={landmarkClearAction}
+        landmarkError={checkpoint?.landmarkCapture?.nodeId === checkpoint?.owner.nodeId ? checkpoint?.landmarkCapture?.error : undefined}
+        runState={runState}
+        runValidationIssue={preflightIssues[0] ?? null}
+        isRunning={isRunning}
+        onGenerate={handleGenerate}
+        onCancel={cancel}
+        onContinueRun={continueRun}
+        onClearLandmarks={clearLandmarks}
+      />
     </div>
   )
 }

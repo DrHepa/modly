@@ -60,7 +60,7 @@ export function buildProcessExecutionInput({
   const hasNamedInputs = hasNamedProcessInputs(extension?.inputs)
   const nodeMap = new Map(nodes.map((source) => [source.id, source]))
   const resolveOutput = (sourceId: string) => {
-    const realId = resolveDataSource(sourceId, edges, nodeMap)
+    const realId = resolveDataSource(sourceId, edges, nodeMap, nodeOutputs)
     return realId ? nodeOutputs.get(realId) : undefined
   }
 
@@ -109,7 +109,7 @@ export function buildProcessExecutionInput({
     const targetPort = extension ? getProcessTargetPort(extension, targetHandle) : null
     if (!targetPort || targetPort.isLegacy) continue
 
-    const sourceNodeId = resolveDataSource(edge.source, edges, nodeMap)
+    const sourceNodeId = resolveDataSource(edge.source, edges, nodeMap, nodeOutputs)
     const sourceOutput = sourceNodeId ? nodeOutputs.get(sourceNodeId) : undefined
     if (!sourceOutput || (sourceOutput.filePath === undefined && sourceOutput.text === undefined)) continue
 

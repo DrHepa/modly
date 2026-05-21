@@ -9,6 +9,10 @@ export interface AnimationToggleState {
   pressed?: boolean
 }
 
+export interface AnimationIsolationSnapshot {
+  wasPlaying: boolean
+}
+
 export interface AnimationActionLike {
   enabled: boolean
   paused: boolean
@@ -46,4 +50,16 @@ export function syncAnimationActions(actions: readonly AnimationActionLike[], an
       action.play()
     }
   }
+}
+
+export function isolateAnimationForPoseClipPreview(
+  actions: readonly AnimationActionLike[],
+  animationPlaying: boolean,
+): AnimationIsolationSnapshot {
+  for (const action of actions) {
+    action.enabled = true
+    action.paused = true
+  }
+
+  return { wasPlaying: animationPlaying }
 }

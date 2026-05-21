@@ -1,10 +1,10 @@
-import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, ErrorInfo } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { Environment, GizmoHelper, Lightformer, OrbitControls, useGizmoContext, useGLTF } from '@react-three/drei'
-import { EffectComposer, Outline, Select, Selection } from '@react-three/postprocessing'
+import type { ThreeEvent } from '@react-three/fiber'
+import { Environment, GizmoHelper, Html, Lightformer, OrbitControls, useGizmoContext, useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
-import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js'
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
 
 // Patch THREE pour utiliser BVH sur tous les meshes — réduit le raycast O(N) → O(log N)
@@ -14,10 +14,33 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast
 import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
-import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
-import { resolveAnimationAvailability, syncAnimationActions } from './viewerAnimation'
+import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
+import { RigEditorPanel } from './RigEditorPanel'
+import { RigOverlay } from './RigOverlay'
+import { createLandmarkPointIntent, deriveLandmarkMarkers, resolveLandmarkMarkerRenderModels, type LandmarkMarkerViewModel } from './viewerLandmarkPicking'
+import { isolateAnimationForPoseClipPreview, resolveAnimationAvailability, syncAnimationActions, type AnimationActionLike, type AnimationIsolationSnapshot } from './viewerAnimation'
+import { PoseClipPanel, type PoseClipDrawerMode, type PoseClipLoadState, type PoseClipPanelWarning, type PoseClipPreviewState, type PoseClipSaveState } from './PoseClipPanel'
+import { resolveViewerModelSource, type ViewerModelSource } from '../viewerModelSource'
+import { collectSceneParts, createEditPlan, editPlanReducer } from '../sceneEdit'
+import type { EditPlan, ScenePart } from '../sceneEdit.types'
+import { buildRigSelectionOverlay, collectRigSkeletonSummary, type RigBoneId, type RigSelectionOverlayViewModel, type RigSkeletonSummary, type RigSkinnedMeshContext } from '../rigSkeleton.ts'
+import { buildRigRenameSidecarV1, createRigRenamePlan, createRigRenameSidecarWorkspacePath, hydrateRigRenamePlanFromSidecar, reduceRigRenamePlan, validateRigRenamePlan, type RigRenamePlan, type RigRenameValidationResult } from '../rigRenamePlan.ts'
+import { buildPoseClipSidecarV1, clampPoseClipTime, createPoseClipCaptureKeyframeId, createPoseClipPlan, createPoseClipSidecarWorkspacePath, hydratePoseClipPlanFromSidecar, reducePoseClipPlan, type PoseClipPlan, type PoseClipQuaternion, type PoseClipSidecarV1 } from '../poseClipPlan.ts'
+import { applyLocalPoseClipRotation, evaluatePoseClipPreview, resetPoseClipPreview, resetPoseClipSelectedBone, restoreThenEvaluatePoseClipPreview, takePoseClipQuaternionSnapshot, type ApplyLocalPoseClipRotationResult, type EvaluatePoseClipPreviewResult, type PoseClipQuaternionSnapshot, type PoseClipRotationAxis } from '../poseClipPreview.ts'
+import { resolveRigDisplayNames, type RigDisplayNamingResult } from '../rigDisplayNames.ts'
+import { normalizeRigMetaNaming, type RigMetaNamingMap } from '../rigMetaNaming.ts'
+import { resolveRigEffectiveNaming, type RigEffectiveNamingResult } from '../rigEffectiveNaming.ts'
+import {
+  saveEditedScenePendingReplacement,
+  resolveSceneEditControlsVisibility,
+  resolveSceneEditSourceDescriptor,
+  resolveScenePartIdForObject,
+} from '../sceneEditExportRuntime'
+import { useWorkflowRunStore } from '../../workflows/workflowRunStore'
+import type { LandmarkId, LandmarkPoint } from '../../workflows/landmarks'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
+import type { PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../../shared/types/electron.d'
 
 type RigStats = {
   hasRig: boolean
@@ -28,41 +51,159 @@ type RigStats = {
 
 type JointMarker = {
   bone: THREE.Bone
+  boneId?: RigBoneId
   marker: THREE.Mesh
 }
 
 type BoneSegment = {
   parent: THREE.Bone
   child: THREE.Bone
+  childBoneId?: RigBoneId
 }
 
 type RigLineOverlay = {
   line: THREE.LineSegments
   segments: BoneSegment[]
+  tone: RigHelperTone
+}
+
+type MeshModelClickEvent = ThreeEvent<MouseEvent> & {
+  object: THREE.Object3D
+  point: THREE.Vector3
+  intersections: Array<{ object: THREE.Object3D; point: THREE.Vector3 }>
 }
 
 const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
+
+type RigHelperTone = 'default' | 'selected'
+
+type RigHelperMarkerStyle = {
+  tone: RigHelperTone
+  color: string
+  emissive: string
+  emissiveIntensity: number
+  scale: number
+  renderOrder: number
+}
+
+type RigHelperSegmentStyle = {
+  tone: RigHelperTone
+  color: string
+  opacity: number
+  renderOrder: number
+}
+
+type RigHelperStyles = {
+  markerStylesByBoneId: Record<RigBoneId, RigHelperMarkerStyle>
+  segmentStylesByChildBoneId: Record<RigBoneId, RigHelperSegmentStyle>
+  requiresNewMarker: false
+}
+
+const DEFAULT_RIG_HELPER_MARKER_STYLE: RigHelperMarkerStyle = {
+  tone: 'default',
+  color: '#f5f3ff',
+  emissive: '#7c3aed',
+  emissiveIntensity: 0.55,
+  scale: 1,
+  renderOrder: 5,
+}
+
+const SELECTED_RIG_HELPER_MARKER_STYLE: RigHelperMarkerStyle = {
+  tone: 'selected',
+  color: '#22d3ee',
+  emissive: '#67e8f9',
+  emissiveIntensity: 1.35,
+  scale: 1.45,
+  renderOrder: 7,
+}
+
+const DEFAULT_RIG_HELPER_SEGMENT_STYLE: RigHelperSegmentStyle = {
+  tone: 'default',
+  color: '#38bdf8',
+  opacity: 0.98,
+  renderOrder: 4,
+}
+
+const SELECTED_RIG_HELPER_SEGMENT_STYLE: RigHelperSegmentStyle = {
+  tone: 'selected',
+  color: '#22d3ee',
+  opacity: 1,
+  renderOrder: 6,
+}
 
 function isRigViewMode(viewMode: ViewMode): boolean {
   return RIG_VIEW_MODES.includes(viewMode)
 }
 
-function collectRigStats(scene: THREE.Object3D): RigStats {
-  const bones = new Set<THREE.Bone>()
-  let skinnedMeshCount = 0
+export function resolveViewer3DRigHelperStyles(
+  summary: RigSkeletonSummary | undefined,
+  selectedBoneId: RigBoneId | undefined,
+): RigHelperStyles {
+  const selectedExists = Boolean(selectedBoneId && summary?.bones.some((bone) => bone.boneId === selectedBoneId))
+  const markerStylesByBoneId: Record<RigBoneId, RigHelperMarkerStyle> = {}
+  const segmentStylesByChildBoneId: Record<RigBoneId, RigHelperSegmentStyle> = {}
+
+  for (const bone of summary?.bones ?? []) {
+    markerStylesByBoneId[bone.boneId] = selectedExists && bone.boneId === selectedBoneId
+      ? SELECTED_RIG_HELPER_MARKER_STYLE
+      : DEFAULT_RIG_HELPER_MARKER_STYLE
+    if (bone.parentId) {
+      segmentStylesByChildBoneId[bone.boneId] = selectedExists && bone.boneId === selectedBoneId
+        ? SELECTED_RIG_HELPER_SEGMENT_STYLE
+        : DEFAULT_RIG_HELPER_SEGMENT_STYLE
+    }
+  }
+
+  return { markerStylesByBoneId, segmentStylesByChildBoneId, requiresNewMarker: false }
+}
+
+function collectRigSkeletonSummaryFromScene(scene: THREE.Object3D, sourceWorkspacePath?: string): RigSkeletonSummary {
+  const skinnedMeshes: RigSkinnedMeshContext[] = []
 
   scene.traverse((child) => {
     if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
-    skinnedMeshCount += 1
-    child.skeleton.bones.forEach((bone) => bones.add(bone))
+    skinnedMeshes.push({
+      name: child.name,
+      path: resolveObjectPath(scene, child),
+      skeletonIndex: skinnedMeshes.length,
+      skeleton: child.skeleton,
+    })
   })
 
-  return {
-    hasRig: skinnedMeshCount > 0 && bones.size > 0,
-    skinnedMeshCount,
-    boneCount: bones.size,
-    jointCount: bones.size,
+  return collectRigSkeletonSummary({ sourceWorkspacePath, skinnedMeshes })
+}
+
+function collectPoseClipBonesByIdFromScene(scene: THREE.Object3D, summary: RigSkeletonSummary): Map<RigBoneId, THREE.Bone> {
+  const orderedBones: THREE.Bone[] = []
+  const seen = new Set<THREE.Bone>()
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
+    child.skeleton.bones.forEach((bone) => {
+      if (seen.has(bone)) return
+      seen.add(bone)
+      orderedBones.push(bone)
+    })
+  })
+
+  const bonesById = new Map<RigBoneId, THREE.Bone>()
+  summary.bones.forEach((bone, index) => {
+    const currentBone = orderedBones[index]
+    if (currentBone) bonesById.set(bone.boneId, currentBone)
+  })
+  return bonesById
+}
+
+function resolveObjectPath(root: THREE.Object3D, target: THREE.Object3D): string[] {
+  const path: string[] = []
+  let cursor: THREE.Object3D | null = target
+
+  while (cursor && cursor !== root) {
+    path.unshift(cursor.name || cursor.type)
+    cursor = cursor.parent
   }
+
+  return path.length > 0 ? path : [target.name || target.type]
 }
 
 function buildInfluencePalette(size: number): THREE.Color[] {
@@ -256,15 +397,28 @@ function ModelLoadError(): JSX.Element {
 
 interface MeshModelProps {
   url: string
+  rigSourceWorkspacePath?: string
   viewMode: ViewMode
   animationPlaying: boolean
   onStats: (stats: { vertices: number; triangles: number }) => void
-  onSelect: () => void
+  editMode: boolean
+  sceneParts: readonly ScenePart[]
+  onSelect: (partId: string | null) => void
   onAnimationAvailability: (hasAnimations: boolean) => void
   onRigStats: (stats: RigStats) => void
+  onRigSkeletonSummary: (summary: RigSkeletonSummary) => void
+  onPoseClipBonesReady?: (bonesById: Map<RigBoneId, THREE.Bone>) => void
+  rigSkeletonSummary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  onSceneReady: (scene: THREE.Object3D, parts: ScenePart[]) => void
+  landmarkPicking?: {
+    activeLandmarkId: LandmarkId
+    canvas: HTMLCanvasElement | null
+    onPoint: (point: LandmarkPoint) => void
+  }
 }
 
-function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnimationAvailability, onRigStats }: MeshModelProps): JSX.Element {
+function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, editMode, sceneParts, onStats, onSelect, onAnimationAvailability, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady, rigSkeletonSummary, selectedBoneId, onSceneReady, landmarkPicking }: MeshModelProps): JSX.Element {
   const { scene, animations } = useGLTF(url)
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
@@ -279,8 +433,21 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
   }, [animations, onAnimationAvailability])
 
   useEffect(() => {
-    onRigStats(collectRigStats(scene))
-  }, [scene, onRigStats])
+    const summary = collectRigSkeletonSummaryFromScene(scene, rigSourceWorkspacePath)
+    onRigStats({
+      hasRig: summary.hasRig,
+      skinnedMeshCount: summary.stats.skinnedMeshCount,
+      boneCount: summary.stats.boneCount,
+      jointCount: summary.stats.boneCount,
+    })
+    onRigSkeletonSummary(summary)
+    onPoseClipBonesReady?.(collectPoseClipBonesByIdFromScene(scene, summary))
+  }, [scene, rigSourceWorkspacePath, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady])
+
+  useEffect(() => {
+    const animatedNodeNames = animations.flatMap((clip) => clip.tracks.map((track) => track.name.split('.')[0]).filter(Boolean))
+    onSceneReady(scene, collectSceneParts(scene, { animatedNodeNames }))
+  }, [scene, animations, onSceneReady])
 
   useEffect(() => {
     const mixer = new THREE.AnimationMixer(scene)
@@ -483,57 +650,145 @@ function MeshModel({ url, viewMode, animationPlaying, onStats, onSelect, onAnima
 
     if (isRigViewMode(viewMode)) {
       const bones = new Set<THREE.Bone>()
+      const orderedBones: THREE.Bone[] = []
 
       scene.traverse((child) => {
         if (!(child instanceof THREE.SkinnedMesh) || !child.skeleton) return
-        child.skeleton.bones.forEach((bone) => bones.add(bone))
+        child.skeleton.bones.forEach((bone) => {
+          if (bones.has(bone)) return
+          bones.add(bone)
+          orderedBones.push(bone)
+        })
       })
+
+      const boneIdsByBone = new Map<THREE.Bone, RigBoneId>()
+      orderedBones.forEach((bone, index) => {
+        const boneId = rigSkeletonSummary?.bones[index]?.boneId
+        if (boneId) boneIdsByBone.set(bone, boneId)
+      })
+      const helperStyles = resolveViewer3DRigHelperStyles(rigSkeletonSummary, selectedBoneId)
 
       const segments = Array.from(bones)
         .filter((bone) => bone.parent instanceof THREE.Bone && bones.has(bone.parent))
-        .map((bone) => ({ parent: bone.parent as THREE.Bone, child: bone }))
+        .map((bone) => ({ parent: bone.parent as THREE.Bone, child: bone, childBoneId: boneIdsByBone.get(bone) }))
 
       if (segments.length > 0) {
-        const geometry = new THREE.BufferGeometry()
-        geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segments.length * 2 * 3), 3))
-        const material = new THREE.LineBasicMaterial({
-          color: viewMode === 'influence' ? '#f8fafc' : '#38bdf8',
-          transparent: true,
-          opacity: viewMode === 'influence' ? 0.72 : 0.98,
-          depthTest: false,
-          depthWrite: false,
-        })
-        const line = new THREE.LineSegments(geometry, material)
-        line.frustumCulled = false
-        line.renderOrder = 4
-        scene.add(line)
-        rigLineOverlaysRef.current.push({ line, segments })
+        const selectedSegments = segments.filter((segment) => segment.childBoneId && helperStyles.segmentStylesByChildBoneId[segment.childBoneId]?.tone === 'selected')
+        const defaultSegments = segments.filter((segment) => !selectedSegments.includes(segment))
+
+        const addLineOverlay = (lineSegments: BoneSegment[], style: RigHelperSegmentStyle) => {
+          if (lineSegments.length === 0) return
+          const geometry = new THREE.BufferGeometry()
+          geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(lineSegments.length * 2 * 3), 3))
+          const material = new THREE.LineBasicMaterial({
+            color: viewMode === 'influence' && style.tone === 'default' ? '#f8fafc' : style.color,
+            transparent: true,
+            opacity: viewMode === 'influence' && style.tone === 'default' ? 0.72 : style.opacity,
+            depthTest: false,
+            depthWrite: false,
+          })
+          const line = new THREE.LineSegments(geometry, material)
+          line.frustumCulled = false
+          line.renderOrder = style.renderOrder
+          scene.add(line)
+          rigLineOverlaysRef.current.push({ line, segments: lineSegments, tone: style.tone })
+        }
+
+        addLineOverlay(defaultSegments, DEFAULT_RIG_HELPER_SEGMENT_STYLE)
+        addLineOverlay(selectedSegments, SELECTED_RIG_HELPER_SEGMENT_STYLE)
       }
 
       if (viewMode === 'joints' || viewMode === 'influence') {
         bones.forEach((bone) => {
+          const boneId = boneIdsByBone.get(bone)
+          const markerStyle = boneId ? helperStyles.markerStylesByBoneId[boneId] ?? DEFAULT_RIG_HELPER_MARKER_STYLE : DEFAULT_RIG_HELPER_MARKER_STYLE
           const marker = new THREE.Mesh(
             new THREE.OctahedronGeometry(0.026, 0),
-            new THREE.MeshStandardMaterial({ color: '#f5f3ff', emissive: '#7c3aed', emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.08, depthTest: false, depthWrite: false }),
+            new THREE.MeshStandardMaterial({ color: markerStyle.color, emissive: markerStyle.emissive, emissiveIntensity: markerStyle.emissiveIntensity, roughness: 0.35, metalness: 0.08, depthTest: false, depthWrite: false }),
           )
           marker.frustumCulled = false
-          marker.renderOrder = 5
+          marker.renderOrder = markerStyle.renderOrder
+          marker.scale.setScalar(markerStyle.scale)
           scene.add(marker)
-          jointMarkersRef.current.push({ bone, marker })
+          jointMarkersRef.current.push({ bone, boneId, marker })
         })
       }
     }
-  }, [scene, viewMode])
+  }, [scene, viewMode, rigSkeletonSummary, selectedBoneId])
 
   return (
-    <Select enabled={selected}>
-      <primitive
-        object={scene}
-        onClick={(e: { stopPropagation: () => void }) => { e.stopPropagation(); onSelect() }}
-      />
-    </Select>
+    <primitive
+      object={scene}
+      onClick={(e: MeshModelClickEvent) => {
+        e.stopPropagation()
+        if (landmarkPicking?.canvas) {
+          const sourceEvent = e.nativeEvent
+          const intersections = e.intersections.length > 0
+            ? e.intersections.map((intersection) => ({ object: intersection.object, point: intersection.point }))
+            : [{ object: e.object, point: e.point }]
+          const intent = createLandmarkPointIntent({
+            activeLandmarkId: landmarkPicking.activeLandmarkId,
+            pointer: { clientX: sourceEvent.clientX, clientY: sourceEvent.clientY },
+            canvas: landmarkPicking.canvas,
+            intersections,
+            clickableObjects: [scene],
+          })
+          if (intent) landmarkPicking.onPoint(intent.point)
+          return
+        }
+        if (!editMode) {
+          onSelect(null)
+          return
+        }
+        onSelect(resolveScenePartIdForObject({ scene, target: e.object, parts: sceneParts }))
+      }}
+    />
   )
 
+}
+
+function LandmarkMarkers({
+  markers,
+  onSelectLandmark,
+}: {
+  markers: readonly LandmarkMarkerViewModel[]
+  onSelectLandmark?: (id: LandmarkId) => void
+}): JSX.Element | null {
+  const [hoveredMarkerId, setHoveredMarkerId] = useState<LandmarkId | null>(null)
+  const renderModels = resolveLandmarkMarkerRenderModels(markers, hoveredMarkerId)
+  if (markers.length === 0) return null
+
+  return (
+    <group>
+      {renderModels.map((marker) => {
+        return (
+          <group key={marker.id} position={[marker.position.x, marker.position.y, marker.position.z]}>
+            <mesh
+              renderOrder={6}
+              onClick={(event) => { event.stopPropagation(); onSelectLandmark?.(marker.id) }}
+              onPointerOver={(event) => { event.stopPropagation(); setHoveredMarkerId(marker.id) }}
+              onPointerOut={() => setHoveredMarkerId((current) => current === marker.id ? null : current)}
+            >
+              <sphereGeometry args={[0.035, 12, 12]} />
+              <meshBasicMaterial color={marker.color} depthTest={false} toneMapped={false} />
+            </mesh>
+            <Html position={[0, 0.055, 0]} center distanceFactor={5} zIndexRange={[10, 0]}>
+              <span className="pointer-events-none inline-flex min-w-4 items-center justify-center rounded-full bg-zinc-950/85 border border-white/20 px-1 py-0.5 text-[8px] font-bold leading-none text-white shadow">
+                {marker.badgeLabel}
+              </span>
+            </Html>
+            {marker.showFullLabel && (
+              <Html position={[0, 0.105, 0]} center distanceFactor={5} zIndexRange={[11, 0]}>
+                <span className="pointer-events-none whitespace-nowrap rounded bg-zinc-950/90 border border-amber-400/40 px-1 py-0.5 text-[9px] font-medium leading-none text-amber-100 shadow">
+                  {marker.fullLabel}
+                </span>
+              </Html>
+            )}
+          </group>
+        )
+      })}
+    </group>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,37 +1290,1279 @@ function EmptyState(): JSX.Element {
 // Viewer3D
 // ---------------------------------------------------------------------------
 
-type TransformSnapshot = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3 }
+type Viewer3DPresentation = {
+  modelUrl: string | null
+  checkpointLabel: string | null
+  canDeleteSelectedModel: boolean
+  selectedHint: string
+  idleHint: string
+}
 
-export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmoMode = null, gizmoUndoRef }: { lightSettings?: LightSettings; gizmoMode?: GizmoMode | null; gizmoUndoRef?: MutableRefObject<(() => boolean) | null> }): JSX.Element {
+type Viewer3DOverlayLayout = {
+  viewRailClassName: string
+  editRailClassName: string | null
+  editPanelClassName: string
+  rigEditorPanelSlot: 'top-right'
+  poseClipPanelSlot: 'bottom-drawer'
+  poseClipPanelClassName: string
+  commonViewportUsability: 'capped-internal-scroll'
+  hintClassName: string
+  rigOverlayClassName: string
+  rigOverlaySafeArea: 'below-top-left-toolbar' | 'above-minimized-pose-clip-controls'
+}
+
+type SceneEditSaveState =
+  | { status: 'idle' }
+  | { status: 'saving' }
+  | { status: 'saved'; glbWorkspacePath: string; sidecarWorkspacePath: string }
+  | { status: 'error'; message: string }
+
+type RigRenameSaveState =
+  | { status: 'idle' }
+  | { status: 'saving' }
+  | { status: 'saved'; sidecarWorkspacePath: string }
+  | { status: 'error'; message: string }
+
+export type Viewer3DRigHydrationWarning = {
+  status: 'warning'
+  messages: string[]
+}
+
+export type Viewer3DRigHydrationToken = {
+  modelUrl: string | null
+  sourceWorkspacePath: string
+  skeletonContextId: string
+}
+
+export interface Viewer3DRigEditorState {
+  summary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  renamePlan: RigRenamePlan
+  rigMetaNamingByBoneId: RigMetaNamingMap
+  isRenamePlanDirty?: boolean
+}
+
+export interface Viewer3DRigEditorVisibilityState {
+  isOpen: boolean
+  skeletonContextId?: string
+}
+
+export interface Viewer3DPoseClipState {
+  summary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  selectedKeyframeId?: string
+  plan: PoseClipPlan
+  currentTimeSeconds: number
+  previewState: PoseClipPreviewState
+  saveState: PoseClipSaveState
+  loadState: PoseClipLoadState
+  warning: Viewer3DRigHydrationWarning | null
+  saveError?: string
+  loadError?: string
+}
+
+export interface Viewer3DPoseClipVisibilityState {
+  isOpen: boolean
+  skeletonContextId?: string
+  drawerMode: PoseClipDrawerMode
+}
+
+export interface Viewer3DSelectedRigTargetState {
+  skeletonContextId?: string
+  selectedBoneId?: RigBoneId
+}
+
+export type Viewer3DRigAuthoringMode = 'rig-editor' | 'pose-clip' | 'none'
+
+export interface Viewer3DRigTargetState {
+  summary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  activeMode: Viewer3DRigAuthoringMode
+}
+
+export type Viewer3DPoseClipAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'select-bone'; summary: RigSkeletonSummary; boneId: RigBoneId }
+  | { type: 'set-current-time'; timeSeconds: number }
+  | { type: 'set-clip-metadata'; summary: RigSkeletonSummary; durationSeconds?: number; fps?: number; name?: string; id?: string }
+  | { type: 'hydrate-plan'; plan: PoseClipPlan }
+  | { type: 'capture-keyframe'; summary: RigSkeletonSummary; keyframeId?: string; boneId: RigBoneId; timeSeconds: number; rotation: PoseClipQuaternion }
+  | { type: 'capture-and-advance'; summary: RigSkeletonSummary; boneId: RigBoneId; rotation: PoseClipQuaternion }
+  | { type: 'select-keyframe'; summary: RigSkeletonSummary; keyframeId: string }
+  | { type: 'update-selected-keyframe'; summary: RigSkeletonSummary; boneId: RigBoneId; rotation: PoseClipQuaternion }
+  | { type: 'delete-keyframe'; summary: RigSkeletonSummary; keyframeId: string }
+  | { type: 'delete-selected-keyframe'; summary: RigSkeletonSummary }
+  | { type: 'move-selected-keyframe'; summary: RigSkeletonSummary; timeSeconds: number }
+  | { type: 'shift-selected-keyframe'; summary: RigSkeletonSummary; deltaSeconds: number }
+  | { type: 'duplicate-selected-keyframe'; summary: RigSkeletonSummary; timeSeconds?: number }
+  | { type: 'set-preview'; previewState: PoseClipPreviewState; currentTimeSeconds?: number }
+  | { type: 'reset-preview' }
+
+export type Viewer3DPoseClipVisibilityAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'toggle'; summary?: RigSkeletonSummary }
+  | { type: 'set-drawer-mode'; drawerMode: PoseClipDrawerMode }
+  | { type: 'close' }
+
+export type Viewer3DRigEditorAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'hydrate-aliases'; plan: RigRenamePlan }
+  | { type: 'select-bone'; boneId: RigBoneId }
+  | { type: 'set-alias'; boneId: RigBoneId; alias: string }
+  | { type: 'cancel-alias'; boneId: RigBoneId }
+  | { type: 'revert-aliases' }
+
+export type Viewer3DRigEditorVisibilityAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'toggle'; summary?: RigSkeletonSummary }
+  | { type: 'close' }
+
+export type Viewer3DSelectedRigTargetAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'select-bone'; summary: RigSkeletonSummary; boneId: RigBoneId }
+
+type Viewer3DRigEditorCallbacks = {
+  onSelectBone?: (boneId: RigBoneId) => void
+  onAliasChange?: (boneId: RigBoneId, alias: string) => void
+  onCancelAlias?: (boneId: RigBoneId) => void
+  onRevertAliases?: () => void
+  onSaveAliases?: () => void
+}
+
+type Viewer3DRigOverlayCallbacks = {
+  onSelectBone?: (boneId: RigBoneId) => void
+}
+
+const EMPTY_RIG_RENAME_PLAN: RigRenamePlan = { skeletonContextId: 'rig:none|skeleton:0', aliases: {} }
+const EMPTY_RIG_META_NAMING: RigMetaNamingMap = {}
+
+export function createViewer3DRigEditorState(summary?: RigSkeletonSummary): Viewer3DRigEditorState {
+  if (!summary) {
+    return { summary, selectedBoneId: undefined, renamePlan: EMPTY_RIG_RENAME_PLAN, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING }
+  }
+
+  return {
+    summary,
+    selectedBoneId: summary.hasRig ? (summary.rootBoneIds[0] ?? summary.bones[0]?.boneId) : undefined,
+    renamePlan: createRigRenamePlan(summary),
+    rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING,
+    isRenamePlanDirty: false,
+  }
+}
+
+export function createViewer3DRigEditorVisibilityState(summary?: RigSkeletonSummary): Viewer3DRigEditorVisibilityState {
+  return { isOpen: false, skeletonContextId: summary?.skeletonContextId }
+}
+
+export function createViewer3DPoseClipState(summary?: RigSkeletonSummary): Viewer3DPoseClipState {
+  const plan = createPoseClipPlan({ skeletonContextId: summary?.skeletonContextId ?? 'rig:none|skeleton:0' })
+  return {
+    summary,
+    selectedBoneId: summary?.hasRig ? (summary.rootBoneIds[0] ?? summary.bones[0]?.boneId) : undefined,
+    plan,
+    currentTimeSeconds: 0,
+    previewState: 'idle',
+    saveState: 'idle',
+    loadState: 'idle',
+    warning: null,
+  }
+}
+
+export function createViewer3DPoseClipVisibilityState(summary?: RigSkeletonSummary): Viewer3DPoseClipVisibilityState {
+  return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'expanded' }
+}
+
+export function createViewer3DSelectedRigTargetState(summary?: RigSkeletonSummary): Viewer3DSelectedRigTargetState {
+  return {
+    skeletonContextId: summary?.skeletonContextId,
+    selectedBoneId: resolveDefaultRigSelectedBoneId(summary),
+  }
+}
+
+export function reduceViewer3DSelectedRigTargetState(
+  state: Viewer3DSelectedRigTargetState,
+  action: Viewer3DSelectedRigTargetAction,
+): Viewer3DSelectedRigTargetState {
+  if (action.type === 'select-bone') {
+    if (!action.summary.hasRig) return createViewer3DSelectedRigTargetState(action.summary)
+    const selectedBoneId = action.summary.bones.some((bone) => bone.boneId === action.boneId)
+      ? action.boneId
+      : resolveValidRigSelectedBoneId(action.summary, state.selectedBoneId)
+    return { skeletonContextId: action.summary.skeletonContextId, selectedBoneId }
+  }
+
+  const skeletonContextId = action.summary?.skeletonContextId
+  if (state.skeletonContextId === skeletonContextId) {
+    return {
+      skeletonContextId,
+      selectedBoneId: resolveValidRigSelectedBoneId(action.summary, state.selectedBoneId),
+    }
+  }
+  return createViewer3DSelectedRigTargetState(action.summary)
+}
+
+export function reduceViewer3DPoseClipVisibilityState(
+  state: Viewer3DPoseClipVisibilityState,
+  action: Viewer3DPoseClipVisibilityAction,
+): Viewer3DPoseClipVisibilityState {
+  if (action.type === 'close') return { ...state, isOpen: false }
+  if (action.type === 'set-drawer-mode') return { ...state, drawerMode: action.drawerMode }
+  const skeletonContextId = action.summary?.skeletonContextId
+  if (action.type === 'set-summary') {
+    if (state.skeletonContextId !== skeletonContextId) return createViewer3DPoseClipVisibilityState(action.summary)
+    return { ...state, skeletonContextId }
+  }
+  if (!action.summary?.hasRig) return { skeletonContextId, isOpen: false, drawerMode: state.drawerMode }
+  return { skeletonContextId, isOpen: !state.isOpen, drawerMode: state.drawerMode }
+}
+
+export function reduceViewer3DPoseClipState(
+  state: Viewer3DPoseClipState,
+  action: Viewer3DPoseClipAction,
+): Viewer3DPoseClipState {
+  if (action.type === 'set-summary') {
+    if (state.summary?.skeletonContextId === action.summary?.skeletonContextId) {
+      const selectedBoneId = state.selectedBoneId && action.summary?.bones.some((bone) => bone.boneId === state.selectedBoneId)
+        ? state.selectedBoneId
+        : action.summary?.rootBoneIds[0] ?? action.summary?.bones[0]?.boneId
+      const selectedKeyframeId = state.selectedKeyframeId && state.plan.keyframes.some((keyframe) => keyframe.id === state.selectedKeyframeId)
+        ? state.selectedKeyframeId
+        : undefined
+      return { ...state, summary: action.summary, selectedBoneId, selectedKeyframeId, plan: { ...state.plan, skeletonContextId: action.summary?.skeletonContextId ?? state.plan.skeletonContextId } }
+    }
+    return createViewer3DPoseClipState(action.summary)
+  }
+
+  if (action.type === 'hydrate-plan') {
+    return { ...state, plan: action.plan, selectedBoneId: action.plan.selectedBoneId ?? state.selectedBoneId, selectedKeyframeId: undefined, currentTimeSeconds: clampPoseClipTime(state.currentTimeSeconds, action.plan.clip.durationSeconds), loadState: 'loaded', warning: null, loadError: undefined }
+  }
+
+  if (action.type === 'set-current-time') {
+    return { ...state, currentTimeSeconds: clampPoseClipTime(action.timeSeconds, state.plan.clip.durationSeconds) }
+  }
+
+  if (action.type === 'set-clip-metadata') {
+    const nextPlan = reducePoseClipPlan(action.summary, state.plan, {
+      type: 'set-clip-metadata',
+      durationSeconds: action.durationSeconds,
+      fps: action.fps,
+      name: action.name,
+      id: action.id,
+    })
+    const selectedKeyframe = state.selectedKeyframeId
+      ? nextPlan.keyframes.find((keyframe) => keyframe.id === state.selectedKeyframeId)
+      : undefined
+    return {
+      ...state,
+      summary: action.summary,
+      plan: nextPlan,
+      currentTimeSeconds: clampPoseClipTime(state.currentTimeSeconds, nextPlan.clip.durationSeconds),
+      selectedKeyframeId: selectedKeyframe?.id,
+    }
+  }
+
+  if (action.type === 'set-preview') {
+    return { ...state, previewState: action.previewState, currentTimeSeconds: action.currentTimeSeconds ?? state.currentTimeSeconds }
+  }
+
+  if (action.type === 'reset-preview') {
+    return { ...state, previewState: 'idle', currentTimeSeconds: 0 }
+  }
+
+  if (action.type === 'select-bone') {
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: action.boneId,
+      plan: reducePoseClipPlan(action.summary, state.plan, { type: 'select-bone', boneId: action.boneId }),
+    }
+  }
+
+  if (action.type === 'select-keyframe') {
+    const keyframe = state.plan.keyframes.find((candidate) => candidate.id === action.keyframeId)
+    if (!keyframe || !action.summary.bones.some((bone) => bone.boneId === keyframe.boneId)) {
+      return { ...state, summary: action.summary, selectedKeyframeId: undefined }
+    }
+    const selectedPlan = reducePoseClipPlan(action.summary, state.plan, { type: 'select-bone', boneId: keyframe.boneId })
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: keyframe.boneId,
+      selectedKeyframeId: keyframe.id,
+      currentTimeSeconds: clampPoseClipTime(keyframe.timeSeconds, state.plan.clip.durationSeconds),
+      plan: selectedPlan,
+      previewState: state.previewState === 'playing' ? 'paused' : state.previewState,
+    }
+  }
+
+  if (action.type === 'delete-keyframe') {
+    return {
+      ...state,
+      plan: reducePoseClipPlan(action.summary, state.plan, { type: 'delete-keyframe', keyframeId: action.keyframeId }),
+      selectedKeyframeId: state.selectedKeyframeId === action.keyframeId ? undefined : state.selectedKeyframeId,
+    }
+  }
+
+  if (action.type === 'delete-selected-keyframe') {
+    if (!state.selectedKeyframeId) return state
+    return {
+      ...state,
+      summary: action.summary,
+      plan: reducePoseClipPlan(action.summary, state.plan, { type: 'delete-keyframe', keyframeId: state.selectedKeyframeId }),
+      selectedKeyframeId: undefined,
+    }
+  }
+
+  if (action.type === 'update-selected-keyframe') {
+    if (!state.selectedKeyframeId || !action.summary.bones.some((bone) => bone.boneId === action.boneId)) return state
+    const selectedPlan = reducePoseClipPlan(action.summary, state.plan, { type: 'select-bone', boneId: action.boneId })
+    const nextPlan = reducePoseClipPlan(action.summary, selectedPlan, {
+      type: 'update-keyframe',
+      keyframeId: state.selectedKeyframeId,
+      timeSeconds: state.currentTimeSeconds,
+      rotation: action.rotation,
+    })
+    const updatedKeyframe = nextPlan.keyframes.find((keyframe) => keyframe.id === state.selectedKeyframeId)
+    if (!updatedKeyframe) return { ...state, summary: action.summary, selectedKeyframeId: undefined, plan: nextPlan }
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: action.boneId,
+      selectedKeyframeId: updatedKeyframe.id,
+      currentTimeSeconds: updatedKeyframe.timeSeconds,
+      plan: nextPlan,
+      previewState: state.previewState === 'playing' ? 'paused' : state.previewState,
+    }
+  }
+
+  if (action.type === 'move-selected-keyframe' || action.type === 'shift-selected-keyframe') {
+    if (!state.selectedKeyframeId) return state
+    const nextPlan = reducePoseClipPlan(action.summary, state.plan, action.type === 'move-selected-keyframe'
+      ? { type: 'move-keyframe', keyframeId: state.selectedKeyframeId, timeSeconds: action.timeSeconds }
+      : { type: 'shift-keyframe', keyframeId: state.selectedKeyframeId, deltaSeconds: action.deltaSeconds })
+    const selectedKeyframe = nextPlan.keyframes.find((keyframe) => keyframe.id === state.selectedKeyframeId)
+    if (!selectedKeyframe) return { ...state, summary: action.summary, selectedKeyframeId: undefined, plan: nextPlan }
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: selectedKeyframe.boneId,
+      selectedKeyframeId: selectedKeyframe.id,
+      currentTimeSeconds: selectedKeyframe.timeSeconds,
+      plan: nextPlan,
+      previewState: state.previewState === 'playing' ? 'paused' : state.previewState,
+    }
+  }
+
+  if (action.type === 'duplicate-selected-keyframe') {
+    if (!state.selectedKeyframeId) return state
+    const beforeIds = new Set(state.plan.keyframes.map((keyframe) => keyframe.id))
+    const nextPlan = reducePoseClipPlan(action.summary, state.plan, { type: 'duplicate-keyframe', keyframeId: state.selectedKeyframeId, timeSeconds: action.timeSeconds })
+    const duplicate = nextPlan.keyframes.find((keyframe) => !beforeIds.has(keyframe.id))
+    if (!duplicate) return { ...state, summary: action.summary, plan: nextPlan, selectedKeyframeId: undefined }
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: duplicate.boneId,
+      selectedKeyframeId: duplicate.id,
+      currentTimeSeconds: duplicate.timeSeconds,
+      plan: reducePoseClipPlan(action.summary, nextPlan, { type: 'select-bone', boneId: duplicate.boneId }),
+      previewState: state.previewState === 'playing' ? 'paused' : state.previewState,
+    }
+  }
+
+  if (action.type === 'capture-and-advance') {
+    if (!action.summary.bones.some((bone) => bone.boneId === action.boneId)) return state
+    const captureTime = clampPoseClipTime(state.currentTimeSeconds, state.plan.clip.durationSeconds)
+    const selectedPlan = reducePoseClipPlan(action.summary, state.plan, { type: 'select-bone', boneId: action.boneId })
+    const keyframeId = createPoseClipCaptureKeyframeId(selectedPlan, action.boneId, captureTime)
+    const nextPlan = reducePoseClipPlan(action.summary, selectedPlan, {
+      type: 'capture-keyframe',
+      keyframeId,
+      timeSeconds: captureTime,
+      rotation: action.rotation,
+    })
+    return {
+      ...state,
+      summary: action.summary,
+      selectedBoneId: action.boneId,
+      selectedKeyframeId: keyframeId,
+      currentTimeSeconds: clampPoseClipTime(captureTime + 1 / Math.max(nextPlan.clip.fps, 1), nextPlan.clip.durationSeconds),
+      plan: nextPlan,
+      previewState: state.previewState === 'playing' ? 'paused' : state.previewState,
+    }
+  }
+
+  const captureTime = clampPoseClipTime(action.timeSeconds, state.plan.clip.durationSeconds)
+  const selectedPlan = reducePoseClipPlan(action.summary, state.plan, { type: 'select-bone', boneId: action.boneId })
+  const keyframeId = action.keyframeId ?? createPoseClipCaptureKeyframeId(selectedPlan, action.boneId, captureTime)
+  return {
+    ...state,
+    summary: action.summary,
+    selectedBoneId: action.boneId,
+    currentTimeSeconds: captureTime,
+    selectedKeyframeId: keyframeId,
+    plan: reducePoseClipPlan(action.summary, selectedPlan, {
+      type: 'capture-keyframe',
+      keyframeId,
+      timeSeconds: captureTime,
+      rotation: action.rotation,
+    }),
+  }
+}
+
+export function reduceViewer3DRigEditorVisibilityState(
+  state: Viewer3DRigEditorVisibilityState,
+  action: Viewer3DRigEditorVisibilityAction,
+): Viewer3DRigEditorVisibilityState {
+  if (action.type === 'close') return { ...state, isOpen: false }
+
+  const skeletonContextId = action.summary?.skeletonContextId
+  if (action.type === 'set-summary') {
+    if (state.skeletonContextId !== skeletonContextId) return createViewer3DRigEditorVisibilityState(action.summary)
+    if (!action.summary?.hasRig) return { skeletonContextId, isOpen: false }
+    return { ...state, skeletonContextId }
+  }
+
+  if (!action.summary?.hasRig) return { skeletonContextId, isOpen: false }
+  return { skeletonContextId, isOpen: !state.isOpen }
+}
+
+export function reduceViewer3DRigEditorState(
+  state: Viewer3DRigEditorState,
+  action: Viewer3DRigEditorAction,
+): Viewer3DRigEditorState {
+  if (action.type === 'set-summary') {
+    if (state.summary?.skeletonContextId === action.summary?.skeletonContextId) {
+      return preserveValidRigSelection({ ...state, summary: action.summary })
+    }
+    return createViewer3DRigEditorState(action.summary)
+  }
+
+  const summary = state.summary
+  if (!summary?.hasRig) return state
+
+  if (action.type === 'hydrate-aliases') {
+    return { ...state, renamePlan: action.plan, isRenamePlanDirty: false }
+  }
+
+  if (action.type === 'select-bone') {
+    const selectedBoneId = summary.bones.some((bone) => bone.boneId === action.boneId)
+      ? action.boneId
+      : state.selectedBoneId
+    return { ...state, selectedBoneId }
+  }
+
+  if (action.type === 'revert-aliases') {
+    return { ...state, renamePlan: reduceRigRenamePlan(summary, state.renamePlan, { type: 'revert-all' }), isRenamePlanDirty: true }
+  }
+
+  if (action.type === 'cancel-alias') {
+    return { ...state, renamePlan: reduceRigRenamePlan(summary, state.renamePlan, action), isRenamePlanDirty: true }
+  }
+
+  return { ...state, renamePlan: reduceRigRenamePlan(summary, state.renamePlan, action), isRenamePlanDirty: true }
+}
+
+export function resolveViewer3DRigEditorPanelProps(
+  state: Viewer3DRigEditorState,
+  callbacks: Viewer3DRigEditorCallbacks,
+  hydrationWarning?: Viewer3DRigHydrationWarning | null,
+): {
+  summary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  renamePlan: RigRenamePlan
+  rigMetaNamingByBoneId: RigMetaNamingMap
+  effectiveNaming?: RigEffectiveNamingResult
+  validation: RigRenameValidationResult
+  hydrationWarning?: Viewer3DRigHydrationWarning | null
+  onSelectBone: (boneId: RigBoneId) => void
+  onAliasChange: (boneId: RigBoneId, alias: string) => void
+  onCancelAlias: (boneId: RigBoneId) => void
+  onRevertAliases: () => void
+  onSaveAliases: () => void
+} {
+  return {
+    summary: state.summary,
+    selectedBoneId: state.selectedBoneId,
+    renamePlan: state.renamePlan,
+    rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
+    effectiveNaming: state.summary?.hasRig ? resolveRigEffectiveNaming(state.summary, state.renamePlan, state.rigMetaNamingByBoneId) : undefined,
+    validation: state.summary?.hasRig ? validateRigRenamePlan(state.summary, state.renamePlan) : { valid: true, errors: [] },
+    hydrationWarning,
+    onSelectBone: callbacks.onSelectBone ?? (() => undefined),
+    onAliasChange: callbacks.onAliasChange ?? (() => undefined),
+    onCancelAlias: callbacks.onCancelAlias ?? (() => undefined),
+    onRevertAliases: callbacks.onRevertAliases ?? (() => undefined),
+    onSaveAliases: callbacks.onSaveAliases ?? (() => undefined),
+  }
+}
+
+export function resolveViewer3DRigEditorPanelRenderState({
+  modelUrl,
+  rigState,
+  visibility,
+}: {
+  modelUrl: string | null
+  rigState: Viewer3DRigEditorState
+  visibility: Viewer3DRigEditorVisibilityState
+}): { shouldRenderPanel: boolean } {
+  return { shouldRenderPanel: Boolean(modelUrl && rigState.summary && visibility.isOpen) }
+}
+
+export function resolveViewer3DPoseClipPanelRenderState({
+  modelUrl,
+  poseState,
+  visibility,
+}: {
+  modelUrl: string | null
+  poseState: Viewer3DPoseClipState
+  visibility: Viewer3DPoseClipVisibilityState
+}): { shouldRenderPanel: boolean } {
+  return { shouldRenderPanel: Boolean(modelUrl && poseState.summary && visibility.isOpen) }
+}
+
+type Viewer3DPoseClipCallbacks = {
+  onSelectBone?: (boneId: RigBoneId) => void
+  onCurrentTimeChange?: (timeSeconds: number) => void
+  onClipMetadataChange?: (metadata: { durationSeconds?: number; fps?: number }) => void
+  onCaptureKeyframe?: (boneId: RigBoneId, timeSeconds: number) => void
+  onCaptureAndAdvance?: (boneId: RigBoneId) => void
+  onSelectKeyframe?: (keyframeId: string, boneId: RigBoneId) => void
+  onDeleteKeyframe?: (keyframeId: string, boneId: RigBoneId) => void
+  onUpdateSelectedKeyframe?: (keyframeId: string, boneId: RigBoneId) => void
+  onDeleteSelectedKeyframe?: (keyframeId: string, boneId: RigBoneId) => void
+  onMoveSelectedKeyframe?: (keyframeId: string, timeSeconds: number) => void
+  onShiftSelectedKeyframe?: (keyframeId: string, deltaSeconds: number) => void
+  onDuplicateSelectedKeyframe?: (keyframeId: string) => void
+  onPreviewPlay?: () => void
+  onPreviewPause?: () => void
+  onPreviewReset?: () => void
+  onRotateSelectedTarget?: (boneId: RigBoneId, axis: PoseClipRotationAxis, degreesDelta: number) => void
+  onResetSelectedTarget?: (boneId: RigBoneId) => void
+  onSaveSidecar?: () => void
+  onLoadSidecar?: () => void
+  drawerMode?: PoseClipDrawerMode
+  onDrawerModeChange?: (drawerMode: PoseClipDrawerMode) => void
+}
+
+export function resolveViewer3DPoseClipPanelProps(
+  state: Viewer3DPoseClipState,
+  callbacks: Viewer3DPoseClipCallbacks,
+  effectiveNaming?: RigEffectiveNamingResult,
+): {
+  summary?: RigSkeletonSummary
+  selectedBoneId?: RigBoneId
+  rigDisplayNames?: RigDisplayNamingResult
+  keyframes: PoseClipPlan['keyframes']
+  selectedKeyframeId?: string
+  currentTimeSeconds: number
+  durationSeconds: number
+  fps: number
+  previewState: PoseClipPreviewState
+  saveState: PoseClipSaveState
+  loadState: PoseClipLoadState
+  warnings: PoseClipPanelWarning[]
+  saveError?: string
+  loadError?: string
+  drawerMode?: PoseClipDrawerMode
+  onDrawerModeChange?: (drawerMode: PoseClipDrawerMode) => void
+  onCurrentTimeChange: (timeSeconds: number) => void
+  onClipMetadataChange: (metadata: { durationSeconds?: number; fps?: number }) => void
+  onCaptureKeyframe: (boneId: RigBoneId, timeSeconds: number) => void
+  onCaptureAndAdvance: (boneId: RigBoneId) => void
+  onSelectKeyframe: (keyframeId: string, boneId: RigBoneId) => void
+  onDeleteKeyframe: (keyframeId: string, boneId: RigBoneId) => void
+  onUpdateSelectedKeyframe: (keyframeId: string, boneId: RigBoneId) => void
+  onDeleteSelectedKeyframe: (keyframeId: string, boneId: RigBoneId) => void
+  onMoveSelectedKeyframe: (keyframeId: string, timeSeconds: number) => void
+  onShiftSelectedKeyframe: (keyframeId: string, deltaSeconds: number) => void
+  onDuplicateSelectedKeyframe: (keyframeId: string) => void
+  onPreviewPlay: () => void
+  onPreviewPause: () => void
+  onPreviewReset: () => void
+  onRotateSelectedTarget: (boneId: RigBoneId, axis: PoseClipRotationAxis, degreesDelta: number) => void
+  onResetSelectedTarget: (boneId: RigBoneId) => void
+  onSaveSidecar: () => void
+  onLoadSidecar: () => void
+  onSelectBone: (boneId: RigBoneId) => void
+} {
+  return {
+    summary: state.summary,
+    selectedBoneId: state.selectedBoneId,
+    rigDisplayNames: state.summary?.hasRig ? resolveRigDisplayNames({ summary: state.summary, effectiveNaming }) : undefined,
+    keyframes: state.plan.keyframes,
+    selectedKeyframeId: state.selectedKeyframeId,
+    currentTimeSeconds: state.currentTimeSeconds,
+    durationSeconds: state.plan.clip.durationSeconds,
+    fps: state.plan.clip.fps,
+    previewState: state.previewState,
+    saveState: state.saveState,
+    loadState: state.loadState,
+    warnings: state.warning?.messages.map((message) => ({ kind: 'invalid-sidecar' as const, message })) ?? [],
+    saveError: state.saveError,
+    loadError: state.loadError,
+    drawerMode: callbacks.drawerMode,
+    onDrawerModeChange: callbacks.onDrawerModeChange,
+    onCurrentTimeChange: callbacks.onCurrentTimeChange ?? (() => undefined),
+    onClipMetadataChange: callbacks.onClipMetadataChange ?? (() => undefined),
+    onCaptureKeyframe: callbacks.onCaptureKeyframe ?? (() => undefined),
+    onCaptureAndAdvance: callbacks.onCaptureAndAdvance ?? (() => undefined),
+    onSelectKeyframe: callbacks.onSelectKeyframe ?? (() => undefined),
+    onDeleteKeyframe: callbacks.onDeleteKeyframe ?? (() => undefined),
+    onUpdateSelectedKeyframe: callbacks.onUpdateSelectedKeyframe ?? (() => undefined),
+    onDeleteSelectedKeyframe: callbacks.onDeleteSelectedKeyframe ?? (() => undefined),
+    onMoveSelectedKeyframe: callbacks.onMoveSelectedKeyframe ?? (() => undefined),
+    onShiftSelectedKeyframe: callbacks.onShiftSelectedKeyframe ?? (() => undefined),
+    onDuplicateSelectedKeyframe: callbacks.onDuplicateSelectedKeyframe ?? (() => undefined),
+    onPreviewPlay: callbacks.onPreviewPlay ?? (() => undefined),
+    onPreviewPause: callbacks.onPreviewPause ?? (() => undefined),
+    onPreviewReset: callbacks.onPreviewReset ?? (() => undefined),
+    onRotateSelectedTarget: callbacks.onRotateSelectedTarget ?? (() => undefined),
+    onResetSelectedTarget: callbacks.onResetSelectedTarget ?? (() => undefined),
+    onSaveSidecar: callbacks.onSaveSidecar ?? (() => undefined),
+    onLoadSidecar: callbacks.onLoadSidecar ?? (() => undefined),
+    onSelectBone: callbacks.onSelectBone ?? (() => undefined),
+  }
+}
+
+export function resolveViewer3DActiveRigTargetState({
+  rigEditorState,
+  rigEditorVisibility,
+  poseClipState,
+  poseClipVisibility,
+  selectedTarget,
+}: {
+  rigEditorState: Viewer3DRigEditorState
+  rigEditorVisibility: Viewer3DRigEditorVisibilityState
+  poseClipState: Viewer3DPoseClipState
+  poseClipVisibility: Viewer3DPoseClipVisibilityState
+  selectedTarget?: Viewer3DSelectedRigTargetState
+}): Viewer3DRigTargetState {
+  const resolveSelectedBoneId = (summary: RigSkeletonSummary | undefined, fallback?: RigBoneId): RigBoneId | undefined => {
+    if (!selectedTarget || summary?.skeletonContextId !== selectedTarget.skeletonContextId) return fallback
+    return resolveValidRigSelectedBoneId(summary, selectedTarget.selectedBoneId)
+  }
+  if (rigEditorVisibility.isOpen && rigEditorState.summary?.hasRig) {
+    return { summary: rigEditorState.summary, selectedBoneId: resolveSelectedBoneId(rigEditorState.summary, rigEditorState.selectedBoneId), activeMode: 'rig-editor' }
+  }
+  if (poseClipVisibility.isOpen && poseClipState.summary?.hasRig) {
+    return { summary: poseClipState.summary, selectedBoneId: resolveSelectedBoneId(poseClipState.summary, poseClipState.selectedBoneId), activeMode: 'pose-clip' }
+  }
+  if (rigEditorState.summary?.hasRig) {
+    return { summary: rigEditorState.summary, selectedBoneId: resolveSelectedBoneId(rigEditorState.summary, rigEditorState.selectedBoneId), activeMode: 'none' }
+  }
+  return { summary: poseClipState.summary, selectedBoneId: resolveSelectedBoneId(poseClipState.summary, poseClipState.selectedBoneId), activeMode: 'none' }
+}
+
+export function resolveViewer3DRigOverlayProps(
+  state: Viewer3DRigEditorState | Viewer3DRigTargetState,
+  callbacks: Viewer3DRigOverlayCallbacks,
+  visibility?: Viewer3DRigEditorVisibilityState,
+  effectiveNaming?: RigEffectiveNamingResult,
+): {
+  overlay: RigSelectionOverlayViewModel | null
+  onSelectBone: (boneId: RigBoneId) => void
+} {
+  const isSharedTargetState = 'activeMode' in state
+  const shouldShowOverlay = isSharedTargetState ? state.activeMode !== 'none' : visibility?.isOpen
+  const overlay = shouldShowOverlay && state.summary?.hasRig ? buildRigSelectionOverlay(state.summary, state.selectedBoneId) : null
+  const effectiveSelectedLabel = overlay ? effectiveNaming?.byBoneId[overlay.selectedBoneId]?.label : undefined
+  return {
+    overlay: overlay && effectiveSelectedLabel ? { ...overlay, selectedLabel: effectiveSelectedLabel } : overlay,
+    onSelectBone: callbacks.onSelectBone ?? (() => undefined),
+  }
+}
+
+export async function writeViewer3DRigRenameSidecar({
+  state,
+  createdAt = new Date().toISOString(),
+  writer,
+}: {
+  state: Viewer3DRigEditorState
+  createdAt?: string
+  writer: (request: RigRenameSidecarWriteRequest) => Promise<RigRenameSidecarWriteResult>
+}): Promise<RigRenameSidecarWriteResult> {
+  const summary = state.summary
+  const validation = summary?.hasRig ? validateRigRenamePlan(summary, state.renamePlan) : { valid: false, errors: [] }
+  if (!summary?.hasRig || !summary.sourceWorkspacePath || !validation.valid || Object.keys(state.renamePlan.aliases).length === 0) {
+    return { success: false, error: 'Rig rename sidecar requires a valid source-backed alias plan.' }
+  }
+
+  const sidecar = buildRigRenameSidecarV1({ summary, plan: state.renamePlan, createdAt })
+  const request: RigRenameSidecarWriteRequest = {
+    sidecarWorkspacePath: createRigRenameSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+    sidecar,
+  }
+
+  return writer(request)
+}
+
+export function resolveViewer3DRigHydrationRequest(summary?: RigSkeletonSummary): RigRenameSidecarReadRequest | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  return {
+    sidecarWorkspacePath: createRigRenameSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+  }
+}
+
+export function resolveViewer3DPoseClipHydrationRequest(summary?: RigSkeletonSummary): PoseClipSidecarReadRequest | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  return {
+    sidecarWorkspacePath: createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+  }
+}
+
+export function resolveViewer3DRigMetaHydrationRequest(summary?: RigSkeletonSummary): RigMetaSidecarReadRequest | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  return { sourceWorkspacePath: summary.sourceWorkspacePath }
+}
+
+export function createViewer3DRigHydrationToken({
+  modelUrl,
+  summary,
+}: {
+  modelUrl: string | null
+  summary?: RigSkeletonSummary
+}): Viewer3DRigHydrationToken | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  return {
+    modelUrl,
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+    skeletonContextId: summary.skeletonContextId,
+  }
+}
+
+export const createViewer3DRigMetaHydrationToken = createViewer3DRigHydrationToken
+export const createViewer3DPoseClipHydrationToken = createViewer3DRigHydrationToken
+
+export function areViewer3DRigHydrationTokensEqual(
+  left: Viewer3DRigHydrationToken | null,
+  right: Viewer3DRigHydrationToken | null,
+): boolean {
+  return Boolean(
+    left &&
+    right &&
+    left.modelUrl === right.modelUrl &&
+    left.sourceWorkspacePath === right.sourceWorkspacePath &&
+    left.skeletonContextId === right.skeletonContextId,
+  )
+}
+
+export function applyViewer3DRigHydrationResult({
+  state,
+  result,
+  token,
+  currentToken,
+}: {
+  state: Viewer3DRigEditorState
+  result: RigRenameSidecarReadResult
+  token: Viewer3DRigHydrationToken | null
+  currentToken: Viewer3DRigHydrationToken | null
+}): {
+  state: Viewer3DRigEditorState
+  warning: Viewer3DRigHydrationWarning | null
+  stale: boolean
+  dirtySkipped: boolean
+} {
+  if (!areViewer3DRigHydrationTokensEqual(token, currentToken)) {
+    return { state, warning: null, stale: true, dirtySkipped: false }
+  }
+
+  if (!state.summary?.hasRig || !token) {
+    return { state, warning: null, stale: false, dirtySkipped: false }
+  }
+
+  if (!result.success) {
+    return { state, warning: { status: 'warning', messages: [result.error] }, stale: false, dirtySkipped: false }
+  }
+
+  if (result.status === 'not-found') {
+    return { state, warning: null, stale: false, dirtySkipped: false }
+  }
+
+  if (state.isRenamePlanDirty) {
+    return { state, warning: null, stale: false, dirtySkipped: true }
+  }
+
+  const hydrated = hydrateRigRenamePlanFromSidecar(state.summary, result.sidecar, { sourceWorkspacePath: token.sourceWorkspacePath })
+  if (!hydrated.valid) {
+    return { state, warning: { status: 'warning', messages: hydrated.warnings }, stale: false, dirtySkipped: false }
+  }
+
+  return {
+    state: reduceViewer3DRigEditorState(state, { type: 'hydrate-aliases', plan: hydrated.plan }),
+    warning: null,
+    stale: false,
+    dirtySkipped: false,
+  }
+}
+
+export function applyViewer3DRigMetaHydrationResult({
+  state,
+  result,
+  token,
+  currentToken,
+}: {
+  state: Viewer3DRigEditorState
+  result: RigMetaSidecarReadResult
+  token: Viewer3DRigHydrationToken | null
+  currentToken: Viewer3DRigHydrationToken | null
+}): {
+  state: Viewer3DRigEditorState
+  warning: Viewer3DRigHydrationWarning | null
+  stale: boolean
+} {
+  if (!areViewer3DRigHydrationTokensEqual(token, currentToken)) {
+    return { state, warning: null, stale: true }
+  }
+
+  if (!state.summary?.hasRig || !token) {
+    return { state: { ...state, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING }, warning: null, stale: false }
+  }
+
+  if (!result.success) {
+    return {
+      state: { ...state, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING },
+      warning: { status: 'warning', messages: [result.message] },
+      stale: false,
+    }
+  }
+
+  if (result.status === 'not-found') {
+    return { state: { ...state, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING }, warning: null, stale: false }
+  }
+
+  const normalized = normalizeRigMetaNaming(result.rigMeta, { expectedSourceWorkspacePath: token.sourceWorkspacePath })
+  const warning = normalized.warnings.length > 0 ? { status: 'warning' as const, messages: normalized.warnings } : null
+
+  return {
+    state: { ...state, rigMetaNamingByBoneId: normalized.namingByBoneId },
+    warning,
+    stale: false,
+  }
+}
+
+export async function writeViewer3DPoseClipSidecar({
+  state,
+  createdAt = new Date().toISOString(),
+  writer,
+}: {
+  state: Viewer3DPoseClipState
+  createdAt?: string
+  writer: (request: PoseClipSidecarWriteRequest) => Promise<PoseClipSidecarWriteResult>
+}): Promise<PoseClipSidecarWriteResult> {
+  const summary = state.summary
+  if (!summary?.hasRig || !summary.sourceWorkspacePath || state.plan.keyframes.length === 0) {
+    return { success: false, error: 'Pose clip sidecar requires a valid source-backed rig and at least one keyframe.' }
+  }
+
+  const sidecar = buildPoseClipSidecarV1({ summary, plan: state.plan, createdAt }) as unknown as PoseClipSidecarV1
+  return writer({
+    sidecarWorkspacePath: createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+    sidecar: sidecar as unknown as PoseClipSidecarWriteRequest['sidecar'],
+  })
+}
+
+export function applyViewer3DPoseClipHydrationResult({
+  state,
+  result,
+  token,
+  currentToken,
+}: {
+  state: Viewer3DPoseClipState
+  result: PoseClipSidecarReadResult
+  token: Viewer3DRigHydrationToken | null
+  currentToken: Viewer3DRigHydrationToken | null
+}): {
+  state: Viewer3DPoseClipState
+  warning: Viewer3DRigHydrationWarning | null
+  stale: boolean
+} {
+  if (!areViewer3DRigHydrationTokensEqual(token, currentToken)) {
+    return { state, warning: null, stale: true }
+  }
+  if (!state.summary?.hasRig || !token) return { state, warning: null, stale: false }
+  if (!result.success) {
+    const warning = { status: 'warning' as const, messages: [result.error] }
+    return { state: { ...state, warning, loadState: 'error', loadError: result.error }, warning, stale: false }
+  }
+  if (result.status === 'not-found') return { state: { ...state, loadState: 'idle' }, warning: null, stale: false }
+
+  const hydrated = hydratePoseClipPlanFromSidecar(state.summary, result.sidecar, {
+    sourceWorkspacePath: token.sourceWorkspacePath,
+    skeletonContextId: token.skeletonContextId,
+  })
+  const warning = hydrated.warnings.length > 0 ? { status: 'warning' as const, messages: hydrated.warnings } : null
+  if (!hydrated.valid) {
+    return { state: { ...state, warning, loadState: 'error', loadError: hydrated.warnings.join(' ') }, warning, stale: false }
+  }
+  return {
+    state: { ...state, plan: hydrated.plan, selectedKeyframeId: undefined, currentTimeSeconds: 0, previewState: 'idle', loadState: 'loaded', warning, loadError: undefined },
+    warning,
+    stale: false,
+  }
+}
+
+export function startViewer3DPoseClipPreview({
+  state,
+  bonesById,
+  gltfActions,
+  gltfAnimationPlaying,
+  timeSeconds,
+}: {
+  state: Viewer3DPoseClipState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  timeSeconds?: number
+}): {
+  state: Viewer3DPoseClipState
+  poseSnapshot: PoseClipQuaternionSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+} {
+  const poseSnapshot = takePoseClipQuaternionSnapshot(bonesById)
+  const gltfAnimationSnapshot = isolateAnimationForPoseClipPreview(gltfActions, gltfAnimationPlaying)
+  const nextTime = timeSeconds ?? state.currentTimeSeconds
+  evaluatePoseClipPreview({ plan: state.plan, bonesById, timeSeconds: nextTime })
+  return {
+    state: { ...state, previewState: 'playing', currentTimeSeconds: nextTime },
+    poseSnapshot,
+    gltfAnimationSnapshot,
+  }
+}
+
+export function resetViewer3DPoseClipPreview({
+  state,
+  bonesById,
+  snapshot,
+}: {
+  state: Viewer3DPoseClipState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  snapshot: ReadonlyMap<RigBoneId, THREE.Quaternion>
+}): { state: Viewer3DPoseClipState; restoredBoneIds: RigBoneId[] } {
+  const reset = resetPoseClipPreview({ bonesById, snapshot })
+  return { state: { ...state, previewState: 'idle', currentTimeSeconds: 0 }, restoredBoneIds: reset.restoredBoneIds }
+}
+
+export const takeViewer3DPoseClipSnapshot = takePoseClipQuaternionSnapshot
+
+export function scrubViewer3DPoseClipPreviewTime({
+  state,
+  bonesById,
+  poseSnapshot,
+  gltfActions,
+  gltfAnimationPlaying,
+  timeSeconds,
+}: {
+  state: Viewer3DPoseClipState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: PoseClipQuaternionSnapshot | null
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  timeSeconds: number
+}): {
+  state: Viewer3DPoseClipState
+  poseSnapshot: PoseClipQuaternionSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+  preview: EvaluatePoseClipPreviewResult
+  restoredBoneIds: RigBoneId[]
+} {
+  const snapshot = poseSnapshot ?? takePoseClipQuaternionSnapshot(bonesById)
+  const gltfAnimationSnapshot = isolateAnimationForPoseClipPreview(gltfActions, gltfAnimationPlaying)
+  const nextState = reduceViewer3DPoseClipState(state, { type: 'set-current-time', timeSeconds })
+  const evaluated = restoreThenEvaluatePoseClipPreview({
+    plan: nextState.plan,
+    bonesById,
+    snapshot,
+    timeSeconds: nextState.currentTimeSeconds,
+  })
+  return {
+    state: { ...nextState, previewState: 'paused' },
+    poseSnapshot: snapshot,
+    gltfAnimationSnapshot,
+    preview: evaluated.preview,
+    restoredBoneIds: evaluated.restoredBoneIds,
+  }
+}
+
+export function selectViewer3DPoseClipKeyframePreview({
+  state,
+  summary,
+  bonesById,
+  poseSnapshot,
+  gltfActions,
+  gltfAnimationPlaying,
+  keyframeId,
+}: {
+  state: Viewer3DPoseClipState
+  summary: RigSkeletonSummary
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: PoseClipQuaternionSnapshot | null
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  keyframeId: string
+}): {
+  state: Viewer3DPoseClipState
+  poseSnapshot: PoseClipQuaternionSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+  preview: EvaluatePoseClipPreviewResult
+  restoredBoneIds: RigBoneId[]
+} {
+  const nextState = reduceViewer3DPoseClipState(state, { type: 'select-keyframe', summary, keyframeId })
+  return scrubViewer3DPoseClipPreviewTime({
+    state: nextState,
+    bonesById,
+    poseSnapshot,
+    gltfActions,
+    gltfAnimationPlaying,
+    timeSeconds: nextState.currentTimeSeconds,
+  })
+}
+
+export function updateViewer3DSelectedPoseClipKeyframePreview({
+  state,
+  summary,
+  bonesById,
+  poseSnapshot,
+  gltfActions,
+  gltfAnimationPlaying,
+  boneId,
+  rotation,
+}: {
+  state: Viewer3DPoseClipState
+  summary: RigSkeletonSummary
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: PoseClipQuaternionSnapshot | null
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  boneId: RigBoneId
+  rotation: PoseClipQuaternion
+}): {
+  state: Viewer3DPoseClipState
+  poseSnapshot: PoseClipQuaternionSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+  preview: EvaluatePoseClipPreviewResult
+  restoredBoneIds: RigBoneId[]
+} {
+  const nextState = reduceViewer3DPoseClipState(state, { type: 'update-selected-keyframe', summary, boneId, rotation })
+  return scrubViewer3DPoseClipPreviewTime({
+    state: nextState,
+    bonesById,
+    poseSnapshot,
+    gltfActions,
+    gltfAnimationPlaying,
+    timeSeconds: nextState.currentTimeSeconds,
+  })
+}
+
+export function applyViewer3DPoseClipLocalRotation({
+  state,
+  bonesById,
+  poseSnapshot,
+  boneId,
+  axis,
+  degreesDelta,
+}: {
+  state: Viewer3DPoseClipState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: PoseClipQuaternionSnapshot | null
+  boneId: RigBoneId
+  axis: PoseClipRotationAxis
+  degreesDelta: number
+}): { state: Viewer3DPoseClipState; poseSnapshot: PoseClipQuaternionSnapshot | null; result: ApplyLocalPoseClipRotationResult } {
+  const nextSnapshot = poseSnapshot ?? takePoseClipQuaternionSnapshot(bonesById)
+  const result = applyLocalPoseClipRotation({ bonesById, boneId, axis, degreesDelta })
+  return { state: { ...state, previewState: 'paused' }, poseSnapshot: nextSnapshot, result }
+}
+
+export function resetViewer3DPoseClipSelectedBone({
+  state,
+  bonesById,
+  snapshot,
+  boneId,
+}: {
+  state: Viewer3DPoseClipState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  snapshot: ReadonlyMap<RigBoneId, THREE.Quaternion>
+  boneId: RigBoneId
+}): { state: Viewer3DPoseClipState; restoredBoneIds: RigBoneId[] } {
+  const reset = resetPoseClipSelectedBone({ bonesById, snapshot, boneId })
+  return { state: { ...state, previewState: 'idle' }, restoredBoneIds: reset.restoredBoneIds }
+}
+
+function preserveValidRigSelection(state: Viewer3DRigEditorState): Viewer3DRigEditorState {
+  if (!state.summary?.hasRig) return createViewer3DRigEditorState(state.summary)
+  const selectedBoneId = resolveValidRigSelectedBoneId(state.summary, state.selectedBoneId)
+  if (selectedBoneId === state.selectedBoneId) return state
+  return { ...state, selectedBoneId }
+}
+
+function resolveDefaultRigSelectedBoneId(summary?: RigSkeletonSummary): RigBoneId | undefined {
+  if (!summary?.hasRig) return undefined
+  return summary.rootBoneIds[0] ?? summary.bones[0]?.boneId
+}
+
+function resolveValidRigSelectedBoneId(summary: RigSkeletonSummary | undefined, selectedBoneId: RigBoneId | undefined): RigBoneId | undefined {
+  if (!summary?.hasRig) return undefined
+  return selectedBoneId && summary.bones.some((bone) => bone.boneId === selectedBoneId)
+    ? selectedBoneId
+    : resolveDefaultRigSelectedBoneId(summary)
+}
+
+export function resolveViewer3DPresentation(modelSource: ViewerModelSource): Viewer3DPresentation {
+  const checkpointLabel = modelSource.kind === 'workflow-checkpoint' ? modelSource.label : null
+
+  return {
+    modelUrl: modelSource.modelUrl,
+    checkpointLabel,
+    canDeleteSelectedModel: modelSource.kind === 'final',
+    selectedHint: checkpointLabel ?? 'Click mesh to select • Delete to remove',
+    idleHint: 'Drag to rotate • Scroll to zoom',
+  }
+}
+
+export function resolveViewer3DRigSourceWorkspacePath(modelSource: ViewerModelSource): string | undefined {
+  if (!modelSource.modelUrl) return undefined
+
+  const marker = '/workspace/'
+  const markerIndex = modelSource.modelUrl.indexOf(marker)
+  if (markerIndex < 0) return undefined
+
+  const workspacePath = decodeURIComponent(modelSource.modelUrl.slice(markerIndex + marker.length))
+    .replace(/\?.*$/, '')
+    .replace(/#.*$/, '')
+    .replace(/\\/g, '/')
+
+  if (!isSafeRigSourceWorkspacePath(workspacePath)) return undefined
+  return workspacePath
+}
+
+function isSafeRigSourceWorkspacePath(workspacePath: string): boolean {
+  const lower = workspacePath.toLowerCase()
+  return (
+    workspacePath.trim().length > 0 &&
+    !workspacePath.startsWith('/') &&
+    !/^[A-Za-z]:\//.test(workspacePath) &&
+    !workspacePath.split('/').some((segment) => segment === '..') &&
+    (lower.endsWith('.glb') || lower.endsWith('.gltf'))
+  )
+}
+
+export function resolveViewer3DOverlayLayout({ modelUrl, hasEditRail, poseClipVisibility }: { modelUrl: string | null; hasEditRail: boolean; poseClipVisibility?: Viewer3DPoseClipVisibilityState }): Viewer3DOverlayLayout {
+  const editRailClassName = modelUrl && hasEditRail ? 'right-4 top-1/2 -translate-y-1/2 z-20' : null
+  const rightOverlayClassName = editRailClassName ? 'right-16' : 'right-4'
+  const isPoseClipMinimized = Boolean(poseClipVisibility?.isOpen && poseClipVisibility.drawerMode === 'minimized')
+
+  return {
+    viewRailClassName: 'left-4 top-1/2 -translate-y-1/2 z-20',
+    editRailClassName,
+    editPanelClassName: rightOverlayClassName,
+    rigEditorPanelSlot: 'top-right',
+    poseClipPanelSlot: 'bottom-drawer',
+    poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
+    commonViewportUsability: 'capped-internal-scroll',
+    hintClassName: rightOverlayClassName,
+    rigOverlayClassName: isPoseClipMinimized ? 'left-4 bottom-24 z-20' : 'left-4 top-24 z-20',
+    rigOverlaySafeArea: isPoseClipMinimized ? 'above-minimized-pose-clip-controls' : 'below-top-left-toolbar',
+  }
+}
+
+export const resolveViewer3DLandmarkMarkers = deriveLandmarkMarkers
+
+export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { lightSettings?: LightSettings }): JSX.Element {
   const { currentJob } = useGeneration()
   const apiUrl = useAppStore((s) => s.apiUrl)
 
   const setStoreMeshStats = useAppStore((s) => s.setMeshStats)
   const meshStats = useAppStore((s) => s.meshStats)
   const setCurrentJob = useAppStore((s) => s.setCurrentJob)
+  const workflowRunState = useWorkflowRunStore((s) => s.runState)
+  const setPendingReplacement = useWorkflowRunStore((s) => s.setPendingReplacement)
+  const landmarkSession = useWorkflowRunStore((s) => s.landmarkSession)
+  const markLandmark = useWorkflowRunStore((s) => s.markLandmark)
+  const selectLandmarkForEditing = useWorkflowRunStore((s) => s.selectLandmarkForEditing)
 
   const [viewMode, setViewMode] = useState<ViewMode>('solid')
   const [autoRotate, setAutoRotate] = useState(false)
   const [animationPlaying, setAnimationPlaying] = useState(false)
   const [hasAnimations, setHasAnimations] = useState(false)
   const [rigStats, setRigStats] = useState<RigStats>({ hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 })
+  const [rigEditorState, setRigEditorState] = useState<Viewer3DRigEditorState>(() => createViewer3DRigEditorState())
+  const [rigEditorVisibility, setRigEditorVisibility] = useState<Viewer3DRigEditorVisibilityState>(() => createViewer3DRigEditorVisibilityState())
+  const [poseClipState, setPoseClipState] = useState<Viewer3DPoseClipState>(() => createViewer3DPoseClipState())
+  const [poseClipVisibility, setPoseClipVisibility] = useState<Viewer3DPoseClipVisibilityState>(() => createViewer3DPoseClipVisibilityState())
+  const [selectedRigTarget, setSelectedRigTarget] = useState<Viewer3DSelectedRigTargetState>(() => createViewer3DSelectedRigTargetState())
   const [selected, setSelected] = useState(false)
+  const [sceneEditMode, setSceneEditMode] = useState<'idle' | 'editing'>('idle')
+  const [sceneParts, setSceneParts] = useState<ScenePart[]>([])
+  const [editPlan, setEditPlan] = useState<EditPlan | null>(null)
+  const [saveState, setSaveState] = useState<SceneEditSaveState>({ status: 'idle' })
+  const [rigRenameSaveState, setRigRenameSaveState] = useState<RigRenameSaveState>({ status: 'idle' })
+  const [rigRenameHydrationWarning, setRigRenameHydrationWarning] = useState<Viewer3DRigHydrationWarning | null>(null)
+  const [rigMetaHydrationWarning, setRigMetaHydrationWarning] = useState<Viewer3DRigHydrationWarning | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const splatRef = useRef<SplatViewerHandle | null>(null)
+  const sceneRef = useRef<THREE.Object3D | null>(null)
+  const poseClipBonesRef = useRef<Map<RigBoneId, THREE.Bone>>(new Map())
+  const poseClipSnapshotRef = useRef<PoseClipQuaternionSnapshot | null>(null)
 
-  const [meshObject, setMeshObject] = useState<THREE.Object3D | null>(null)
+  const modelSource = resolveViewerModelSource(currentJob, apiUrl)
+  const viewerPresentation = resolveViewer3DPresentation(modelSource)
+  const { modelUrl } = viewerPresentation
+  const rigSourceWorkspacePath = resolveViewer3DRigSourceWorkspacePath(modelSource)
+  const sceneEditSource = resolveSceneEditSourceDescriptor({ currentJobId: currentJob?.id, modelSource })
+  const sceneEditVisibility = resolveSceneEditControlsVisibility({ modelSource, source: sceneEditSource?.artifact ?? null })
+  const canShowSceneEditControls = sceneEditVisibility.visible
+  const hasRigEditorRail = Boolean(modelUrl && rigEditorState.summary)
+  const hasPoseClipRail = Boolean(modelUrl && poseClipState.summary)
+  const overlayLayout = resolveViewer3DOverlayLayout({ modelUrl, hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasPoseClipRail, poseClipVisibility })
+  const activeCheckpointArtifact = workflowRunState.status === 'paused' ? workflowRunState.substitutionPoint?.inputArtifact : undefined
+  const selectedPart = editPlan?.selectedPartId ? sceneParts.find((part) => part.id === editPlan.selectedPartId) : undefined
+  const canSaveEditedCopy = Boolean(editPlan && editPlan.excludedPartIds.length > 0 && saveState.status !== 'saving')
+  const landmarkMarkers = useMemo(() => resolveViewer3DLandmarkMarkers(landmarkSession?.completed), [landmarkSession?.completed])
+  const rigTargetState = resolveViewer3DActiveRigTargetState({ rigEditorState, rigEditorVisibility, poseClipState, poseClipVisibility, selectedTarget: selectedRigTarget })
+  const rigEditorPanelRenderState = resolveViewer3DRigEditorPanelRenderState({ modelUrl, rigState: rigEditorState, visibility: rigEditorVisibility })
+  const poseClipPanelRenderState = resolveViewer3DPoseClipPanelRenderState({ modelUrl, poseState: poseClipState, visibility: poseClipVisibility })
+  const rigHydrationWarning = rigRenameHydrationWarning && rigMetaHydrationWarning
+    ? { status: 'warning' as const, messages: [...rigRenameHydrationWarning.messages, ...rigMetaHydrationWarning.messages] }
+    : rigRenameHydrationWarning ?? rigMetaHydrationWarning
 
-  // Local gizmo-transform history (live TRS), undoable with Ctrl+Z. A snapshot
-  // is taken when a drag starts and committed on release only if it changed.
-  const transformHistory = useRef<TransformSnapshot[]>([])
-  const pendingTransform = useRef<TransformSnapshot | null>(null)
+  const handleSelectRigEditorBone = useCallback((boneId: RigBoneId) => {
+    setSelectedRigTarget((current) => {
+      const summary = rigEditorState.summary
+      return summary?.hasRig ? reduceViewer3DSelectedRigTargetState(current, { type: 'select-bone', summary, boneId }) : current
+    })
+    setRigEditorState((current) => reduceViewer3DRigEditorState(current, { type: 'select-bone', boneId }))
+  }, [rigEditorState.summary])
 
-  const outputUrl = currentJob?.outputUrl ?? ''
-  const modelUrl =
-    currentJob?.status === 'done' && currentJob.outputUrl
-      ? `${apiUrl}${currentJob.outputUrl}`
-      : null
+  const handleSelectPoseClipBone = useCallback((boneId: RigBoneId) => {
+    setSelectedRigTarget((current) => {
+      const summary = poseClipState.summary
+      return summary?.hasRig ? reduceViewer3DSelectedRigTargetState(current, { type: 'select-bone', summary, boneId }) : current
+    })
+    setPoseClipState((current) => {
+      const summary = current.summary
+      return summary?.hasRig ? reduceViewer3DPoseClipState(current, { type: 'select-bone', summary, boneId }) : current
+    })
+  }, [poseClipState.summary])
+
+  const handleSelectActiveRigTarget = useCallback((boneId: RigBoneId) => {
+    if (rigTargetState.activeMode === 'pose-clip') {
+      handleSelectPoseClipBone(boneId)
+      return
+    }
+    if (rigTargetState.activeMode === 'rig-editor') handleSelectRigEditorBone(boneId)
+  }, [handleSelectPoseClipBone, handleSelectRigEditorBone, rigTargetState.activeMode])
+
+  const rigEffectiveNaming = rigEditorPanelRenderState.shouldRenderPanel || poseClipPanelRenderState.shouldRenderPanel
+    ? resolveRigEffectiveNaming(rigEditorState.summary ?? poseClipState.summary!, rigEditorState.renamePlan, rigEditorState.rigMetaNamingByBoneId)
+    : undefined
+
+  const rigOverlayProps = resolveViewer3DRigOverlayProps(rigTargetState, {
+    onSelectBone: handleSelectActiveRigTarget,
+  }, undefined, rigEffectiveNaming)
 
   // A .ply/.splat reaching the viewer is always a Gaussian splat here: mesh
   // plys are converted to GLB on import and workflow mesh outputs are .glb.
@@ -1084,13 +2581,126 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
     setAnimationPlaying(false)
     setHasAnimations(false)
     setRigStats({ hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 })
+    setRigEditorState(createViewer3DRigEditorState())
+    setRigEditorVisibility(createViewer3DRigEditorVisibilityState())
+    setSelectedRigTarget(createViewer3DSelectedRigTargetState())
+    if (poseClipSnapshotRef.current) {
+      resetPoseClipPreview({ bonesById: poseClipBonesRef.current, snapshot: poseClipSnapshotRef.current })
+      poseClipSnapshotRef.current = null
+    }
+    setPoseClipState(createViewer3DPoseClipState())
+    setPoseClipVisibility(createViewer3DPoseClipVisibilityState())
+    setSceneEditMode('idle')
+    setSceneParts([])
+    setEditPlan(null)
+    setSaveState({ status: 'idle' })
+    setRigRenameSaveState({ status: 'idle' })
+    setRigRenameHydrationWarning(null)
+    setRigMetaHydrationWarning(null)
+    sceneRef.current = null
+    poseClipBonesRef.current = new Map()
     setStoreMeshStats(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the model changes; setters are stable
   }, [modelUrl])
 
-  // Clear the shared selection when the viewer unmounts — the store would
-  // otherwise keep it set and flash a stale selection on the next mount.
-  useEffect(() => () => setSelected(false), [setSelected])
+  useEffect(() => {
+    const request = resolveViewer3DRigMetaHydrationRequest(rigEditorState.summary)
+    const token = createViewer3DRigMetaHydrationToken({ modelUrl, summary: rigEditorState.summary })
+    const reader = window.electron?.workspace?.artifacts?.readRigMetaSidecar
+    if (!request || !token || !reader) {
+      setRigMetaHydrationWarning(null)
+      return
+    }
+
+    let cancelled = false
+    setRigMetaHydrationWarning(null)
+    reader(request).then((result) => {
+      if (cancelled) return
+      setRigEditorState((current) => {
+        const currentToken = createViewer3DRigMetaHydrationToken({ modelUrl, summary: current.summary })
+        const hydration = applyViewer3DRigMetaHydrationResult({ state: current, result, token, currentToken })
+        setRigMetaHydrationWarning(hydration.warning)
+        return hydration.state
+      })
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      const message = error instanceof Error ? error.message : 'Failed to read rigmeta sidecar.'
+      setRigMetaHydrationWarning({ status: 'warning', messages: [message] })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [modelUrl, rigEditorState.summary?.hasRig, rigEditorState.summary?.sourceWorkspacePath, rigEditorState.summary?.skeletonContextId])
+
+  useEffect(() => {
+    const request = resolveViewer3DRigHydrationRequest(rigEditorState.summary)
+    const token = createViewer3DRigHydrationToken({ modelUrl, summary: rigEditorState.summary })
+    const reader = window.electron?.workspace?.artifacts?.readRigRenameSidecar
+    if (!request || !token || !reader) {
+      setRigRenameHydrationWarning(null)
+      return
+    }
+
+    let cancelled = false
+    setRigRenameHydrationWarning(null)
+    reader(request).then((result) => {
+      if (cancelled) return
+      setRigEditorState((current) => {
+        const currentToken = createViewer3DRigHydrationToken({ modelUrl, summary: current.summary })
+        const hydration = applyViewer3DRigHydrationResult({ state: current, result, token, currentToken })
+        setRigRenameHydrationWarning(hydration.warning)
+        return hydration.state
+      })
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      const message = error instanceof Error ? error.message : 'Failed to read rig rename sidecar.'
+      setRigRenameHydrationWarning({ status: 'warning', messages: [message] })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [modelUrl, rigEditorState.summary?.hasRig, rigEditorState.summary?.sourceWorkspacePath, rigEditorState.summary?.skeletonContextId])
+
+  useEffect(() => {
+    const request = resolveViewer3DPoseClipHydrationRequest(poseClipState.summary)
+    const token = createViewer3DPoseClipHydrationToken({ modelUrl, summary: poseClipState.summary })
+    const reader = window.electron?.workspace?.artifacts?.readPoseClipSidecar
+    if (!request || !token || !reader) return
+
+    let cancelled = false
+    reader(request).then((result) => {
+      if (cancelled) return
+      setPoseClipState((current) => {
+        const currentToken = createViewer3DPoseClipHydrationToken({ modelUrl, summary: current.summary })
+        return applyViewer3DPoseClipHydrationResult({ state: current, result, token, currentToken }).state
+      })
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      const message = error instanceof Error ? error.message : 'Failed to read pose clip sidecar.'
+      setPoseClipState((current) => ({ ...current, loadState: 'error', loadError: message, warning: { status: 'warning', messages: [message] } }))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [modelUrl, poseClipState.summary?.hasRig, poseClipState.summary?.sourceWorkspacePath, poseClipState.summary?.skeletonContextId])
+
+  useEffect(() => {
+    if (!canShowSceneEditControls || !sceneEditSource) {
+      setSceneEditMode('idle')
+      setEditPlan(null)
+      return
+    }
+
+    const sourceArtifactId = activeCheckpointArtifact?.id ?? sceneEditSource.artifactId
+    setEditPlan(createEditPlan({
+      sourceArtifactId,
+      ...(activeCheckpointArtifact?.versionId !== undefined ? { sourceVersionId: activeCheckpointArtifact.versionId } : {}),
+      sourceWorkspacePath: sceneEditSource.artifact.workspacePath,
+    }))
+  }, [activeCheckpointArtifact?.id, activeCheckpointArtifact?.versionId, canShowSceneEditControls, sceneEditSource?.artifactId, sceneEditSource?.artifact.workspacePath])
 
   // Delete key removes the model from the scene
   useEffect(() => {
@@ -1098,13 +2708,16 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
       if (e.key !== 'Delete') return
       if (document.activeElement instanceof HTMLInputElement) return
       if (!selected) return
+      if (!viewerPresentation.canDeleteSelectedModel) {
+        setSelected(false)
+        return
+      }
       setCurrentJob(null)
       setSelected(false)
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- setSelected is a stable store setter
-  }, [selected, setCurrentJob])
+  }, [selected, setCurrentJob, viewerPresentation.canDeleteSelectedModel])
 
   const handleScreenshot = () => {
     const dataUrl = isSplat
@@ -1123,6 +2736,301 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
       setAnimationPlaying(false)
     }
   }
+
+  const handleRigSkeletonSummary = useCallback((summary: RigSkeletonSummary) => {
+    setRigEditorState((current) => reduceViewer3DRigEditorState(current, { type: 'set-summary', summary }))
+    setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'set-summary', summary }))
+    setPoseClipState((current) => reduceViewer3DPoseClipState(current, { type: 'set-summary', summary }))
+    setPoseClipVisibility((current) => reduceViewer3DPoseClipVisibilityState(current, { type: 'set-summary', summary }))
+    setSelectedRigTarget((current) => reduceViewer3DSelectedRigTargetState(current, { type: 'set-summary', summary }))
+  }, [])
+
+  const handlePoseClipBonesReady = useCallback((bonesById: Map<RigBoneId, THREE.Bone>) => {
+    poseClipBonesRef.current = bonesById
+  }, [])
+
+  const handleSceneReady = useCallback((scene: THREE.Object3D, parts: ScenePart[]) => {
+    sceneRef.current = scene
+    setSceneParts(parts)
+  }, [])
+
+  const handleSceneSelect = (partId: string | null) => {
+    setSelected(true)
+    if (!editPlan || sceneEditMode !== 'editing') return
+    if (!partId) return
+    setEditPlan(editPlanReducer(editPlan, { type: 'select-part', partId }))
+  }
+
+  const handleHideSelectedPart = () => {
+    if (!editPlan?.selectedPartId || saveState.status === 'saving') return
+    setEditPlan(editPlanReducer(editPlan, { type: 'exclude-selected-part' }))
+    setSaveState({ status: 'idle' })
+  }
+
+  const handleResetSceneEdit = () => {
+    if (!editPlan || saveState.status === 'saving') return
+    setEditPlan(editPlanReducer(editPlan, { type: 'reset' }))
+    setSaveState({ status: 'idle' })
+  }
+
+  const handleClearSceneEdit = () => {
+    if (!editPlan || saveState.status === 'saving') return
+    setEditPlan(editPlanReducer(editPlan, { type: 'clear' }))
+    setSaveState({ status: 'idle' })
+  }
+
+  const handleSaveEditedCopy = async () => {
+    const scene = sceneRef.current
+    if (!scene || !editPlan || !canSaveEditedCopy) return
+    const writer = window.electron?.workspace?.artifacts?.writeEditedSceneArtifact
+    if (!writer) {
+      setSaveState({ status: 'error', message: 'Workspace artifact writer is unavailable.' })
+      return
+    }
+    if (!activeCheckpointArtifact) {
+      setSaveState({ status: 'error', message: 'No active Wait checkpoint is available for replacement.' })
+      return
+    }
+
+    setSaveState({ status: 'saving' })
+    const gltfExporter = new GLTFExporter()
+    const result = await saveEditedScenePendingReplacement({
+      scene,
+      parts: sceneParts,
+      editPlan,
+      createdAt: new Date().toISOString(),
+      sourceArtifact: activeCheckpointArtifact,
+      setPendingReplacement,
+      exporter: {
+        parse: (input, onDone, onError, options) => gltfExporter.parse(input, onDone, (error) => onError?.(error), options),
+      },
+      writer,
+    })
+
+    if (result.success) {
+      setSaveState({ status: 'saved', glbWorkspacePath: result.glbWorkspacePath, sidecarWorkspacePath: result.sidecarWorkspacePath })
+      return
+    }
+
+    setSaveState({ status: 'error', message: result.error })
+  }
+
+  const handleSaveRigAliases = async () => {
+    const writer = window.electron?.workspace?.artifacts?.writeRigRenameSidecar
+    if (!writer) {
+      setRigRenameSaveState({ status: 'error', message: 'Workspace rig alias writer is unavailable.' })
+      return
+    }
+
+    setRigRenameSaveState({ status: 'saving' })
+    const result = await writeViewer3DRigRenameSidecar({ state: rigEditorState, writer })
+    if (result.success) {
+      setRigRenameSaveState({ status: 'saved', sidecarWorkspacePath: result.sidecarWorkspacePath })
+      return
+    }
+
+    setRigRenameSaveState({ status: 'error', message: result.error })
+  }
+
+  const handleCapturePoseClipKeyframe = (boneId: RigBoneId, timeSeconds: number) => {
+    const summary = poseClipState.summary
+    const bone = poseClipBonesRef.current.get(boneId)
+    if (!summary?.hasRig || !bone) return
+    setPoseClipState((current) => reduceViewer3DPoseClipState(current, {
+      type: 'capture-keyframe',
+      summary,
+      boneId,
+      timeSeconds,
+      rotation: { x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w },
+    }))
+  }
+
+  const handlePoseClipCurrentTimeChange = useCallback((timeSeconds: number) => {
+    const bonesById = poseClipBonesRef.current
+    if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+    setAnimationPlaying(false)
+    setPoseClipState((current) => {
+      const next = reduceViewer3DPoseClipState(current, { type: 'set-current-time', timeSeconds })
+      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+      }
+      return { ...next, previewState: 'paused' }
+    })
+  }, [])
+
+  const handlePoseClipMetadataChange = useCallback((metadata: { durationSeconds?: number; fps?: number }) => {
+    setPoseClipState((current) => {
+      const summary = current.summary
+      return summary?.hasRig ? reduceViewer3DPoseClipState(current, { type: 'set-clip-metadata', summary, ...metadata }) : current
+    })
+  }, [])
+
+  const handleCaptureAndAdvancePoseClipKeyframe = useCallback((boneId: RigBoneId) => {
+    const summary = poseClipState.summary
+    const bone = poseClipBonesRef.current.get(boneId)
+    if (!summary?.hasRig || !bone) return
+    setPoseClipState((current) => reduceViewer3DPoseClipState(current, {
+      type: 'capture-and-advance',
+      summary,
+      boneId,
+      rotation: { x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w },
+    }))
+  }, [poseClipState.summary])
+
+  const handleUpdateSelectedPoseClipKeyframe = useCallback((_keyframeId: string, boneId: RigBoneId) => {
+    const summary = poseClipState.summary
+    const bone = poseClipBonesRef.current.get(boneId)
+    const bonesById = poseClipBonesRef.current
+    if (!summary?.hasRig || !bone) return
+    if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+    setAnimationPlaying(false)
+    setPoseClipState((current) => {
+      const next = reduceViewer3DPoseClipState(current, {
+        type: 'update-selected-keyframe',
+        summary,
+        boneId,
+        rotation: { x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w },
+      })
+      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+      }
+      return { ...next, previewState: 'paused' }
+    })
+  }, [poseClipState.summary])
+
+  const handleDeleteSelectedPoseClipKeyframe = useCallback((_keyframeId: string) => {
+    const summary = poseClipState.summary
+    if (!summary?.hasRig) return
+    setPoseClipState((current) => reduceViewer3DPoseClipState(current, { type: 'delete-selected-keyframe', summary }))
+  }, [poseClipState.summary])
+
+  const handleMoveSelectedPoseClipKeyframe = useCallback((_keyframeId: string, timeSeconds: number) => {
+    const summary = poseClipState.summary
+    const bonesById = poseClipBonesRef.current
+    if (!summary?.hasRig) return
+    setAnimationPlaying(false)
+    setPoseClipState((current) => {
+      const next = reduceViewer3DPoseClipState(current, { type: 'move-selected-keyframe', summary, timeSeconds })
+      if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+      }
+      return { ...next, previewState: 'paused' }
+    })
+  }, [poseClipState.summary])
+
+  const handleShiftSelectedPoseClipKeyframe = useCallback((_keyframeId: string, deltaSeconds: number) => {
+    const summary = poseClipState.summary
+    const bonesById = poseClipBonesRef.current
+    if (!summary?.hasRig) return
+    setAnimationPlaying(false)
+    setPoseClipState((current) => {
+      const next = reduceViewer3DPoseClipState(current, { type: 'shift-selected-keyframe', summary, deltaSeconds })
+      if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+      }
+      return { ...next, previewState: 'paused' }
+    })
+  }, [poseClipState.summary])
+
+  const handleDuplicateSelectedPoseClipKeyframe = useCallback((_keyframeId: string) => {
+    const summary = poseClipState.summary
+    const bonesById = poseClipBonesRef.current
+    if (!summary?.hasRig) return
+    setAnimationPlaying(false)
+    setPoseClipState((current) => {
+      const next = reduceViewer3DPoseClipState(current, { type: 'duplicate-selected-keyframe', summary })
+      if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+      }
+      return { ...next, previewState: 'paused' }
+    })
+  }, [poseClipState.summary])
+
+  const handlePoseClipPreviewPlay = () => {
+    const bonesById = poseClipBonesRef.current
+    if (poseClipState.plan.keyframes.length === 0 || bonesById.size === 0) return
+    if (!poseClipSnapshotRef.current) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+    setAnimationPlaying(false)
+    restoreThenEvaluatePoseClipPreview({ plan: poseClipState.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: poseClipState.currentTimeSeconds })
+    setPoseClipState((current) => ({ ...current, previewState: 'playing' }))
+  }
+
+  const handlePoseClipPreviewPause = () => {
+    setPoseClipState((current) => ({ ...current, previewState: 'paused' }))
+  }
+
+  const handlePoseClipPreviewReset = useCallback(() => {
+    if (poseClipSnapshotRef.current) {
+      resetPoseClipPreview({ bonesById: poseClipBonesRef.current, snapshot: poseClipSnapshotRef.current })
+      poseClipSnapshotRef.current = null
+    }
+    setPoseClipState((current) => ({ ...current, previewState: 'idle', currentTimeSeconds: 0 }))
+  }, [])
+
+  const handleRotatePoseClipSelectedTarget = useCallback((boneId: RigBoneId, axis: PoseClipRotationAxis, degreesDelta: number) => {
+    const bonesById = poseClipBonesRef.current
+    if (!poseClipSnapshotRef.current) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+    const result = applyLocalPoseClipRotation({ bonesById, boneId, axis, degreesDelta })
+    if (!result.applied) return
+    setPoseClipState((current) => ({ ...current, previewState: 'paused' }))
+  }, [])
+
+  const handleResetPoseClipSelectedTarget = useCallback((boneId: RigBoneId) => {
+    if (!poseClipSnapshotRef.current) return
+    resetPoseClipSelectedBone({ bonesById: poseClipBonesRef.current, snapshot: poseClipSnapshotRef.current, boneId })
+    setPoseClipState((current) => ({ ...current, previewState: 'idle' }))
+  }, [])
+
+  const handleSavePoseClipSidecar = async () => {
+    const writer = window.electron?.workspace?.artifacts?.writePoseClipSidecar
+    if (!writer) {
+      setPoseClipState((current) => ({ ...current, saveState: 'error', saveError: 'Workspace pose clip writer is unavailable.' }))
+      return
+    }
+    setPoseClipState((current) => ({ ...current, saveState: 'saving', saveError: undefined }))
+    const result = await writeViewer3DPoseClipSidecar({ state: poseClipState, writer })
+    setPoseClipState((current) => result.success
+      ? { ...current, saveState: 'saved', saveError: undefined }
+      : { ...current, saveState: 'error', saveError: result.error })
+  }
+
+  const handleLoadPoseClipSidecar = async () => {
+    const reader = window.electron?.workspace?.artifacts?.readPoseClipSidecar
+    const request = resolveViewer3DPoseClipHydrationRequest(poseClipState.summary)
+    const token = createViewer3DPoseClipHydrationToken({ modelUrl, summary: poseClipState.summary })
+    if (!reader || !request || !token) {
+      setPoseClipState((current) => ({ ...current, loadState: 'error', loadError: 'Workspace pose clip reader is unavailable for this rig.' }))
+      return
+    }
+    setPoseClipState((current) => ({ ...current, loadState: 'loading', loadError: undefined }))
+    const result = await reader(request)
+    setPoseClipState((current) => applyViewer3DPoseClipHydrationResult({ state: current, result, token, currentToken: createViewer3DPoseClipHydrationToken({ modelUrl, summary: current.summary }) }).state)
+  }
+
+  useEffect(() => {
+    if (poseClipState.previewState !== 'playing') return
+    const interval = window.setInterval(() => {
+      setPoseClipState((current) => {
+        if (current.previewState !== 'playing') return current
+        const nextTime = current.currentTimeSeconds >= current.plan.clip.durationSeconds ? 0 : Math.min(current.plan.clip.durationSeconds, current.currentTimeSeconds + 1 / current.plan.clip.fps)
+        if (poseClipSnapshotRef.current) {
+          restoreThenEvaluatePoseClipPreview({ plan: current.plan, bonesById: poseClipBonesRef.current, snapshot: poseClipSnapshotRef.current, timeSeconds: nextTime })
+        } else {
+          evaluatePoseClipPreview({ plan: current.plan, bonesById: poseClipBonesRef.current, timeSeconds: nextTime })
+        }
+        return { ...current, currentTimeSeconds: nextTime }
+      })
+    }, 1000 / Math.max(1, poseClipState.plan.clip.fps))
+    return () => window.clearInterval(interval)
+  }, [poseClipState.previewState, poseClipState.plan.clip.fps])
+
+  useEffect(() => {
+    if (poseClipVisibility.isOpen) return
+    handlePoseClipPreviewReset()
+  }, [poseClipVisibility.isOpen, handlePoseClipPreviewReset])
 
 
   return (
@@ -1160,17 +3068,31 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
 
           {modelUrl && currentJob ? (
             <Suspense fallback={null}>
-<directionalLight position={[5, 8, 5]} color={lightSettings.mainColor} intensity={lightSettings.mainIntensity} castShadow />
+              <directionalLight position={[5, 8, 5]} color={lightSettings.mainColor} intensity={lightSettings.mainIntensity} castShadow />
               <directionalLight position={[-4, 2, -4]} color={lightSettings.fillColor} intensity={lightSettings.fillIntensity} />
               <MeshModel
                 url={modelUrl}
+                rigSourceWorkspacePath={rigSourceWorkspacePath}
                 viewMode={viewMode}
                 animationPlaying={animationPlaying}
+                editMode={sceneEditMode === 'editing'}
+                sceneParts={sceneParts}
                 onStats={setStoreMeshStats}
-                onSelect={() => setSelected(true)}
+                onSelect={handleSceneSelect}
                 onAnimationAvailability={handleAnimationAvailability}
                 onRigStats={setRigStats}
+                onRigSkeletonSummary={handleRigSkeletonSummary}
+                onPoseClipBonesReady={handlePoseClipBonesReady}
+                rigSkeletonSummary={rigTargetState.summary}
+                selectedBoneId={rigTargetState.selectedBoneId}
+                onSceneReady={handleSceneReady}
+                landmarkPicking={landmarkSession ? {
+                  activeLandmarkId: landmarkSession.activeLandmarkId,
+                  canvas: canvasRef.current,
+                  onPoint: markLandmark,
+                } : undefined}
               />
+              <LandmarkMarkers markers={landmarkMarkers} onSelectLandmark={selectLandmarkForEditing} />
             </Suspense>
           ) : null}
 
@@ -1203,20 +3125,149 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
         </Canvas>
         )}
 
-        {/* Left toolbar — visible only when a model is loaded */}
+        {viewerPresentation.checkpointLabel && (
+          <div className="absolute top-4 left-4 pointer-events-none">
+            <span className="rounded-full border border-amber-400/40 bg-amber-950/70 px-3 py-1 text-xs font-medium text-amber-100 shadow-sm">
+              {viewerPresentation.checkpointLabel}
+            </span>
+          </div>
+        )}
+
+        {/* Viewer rails — visible only when a model is loaded */}
         {modelUrl && (
-          <ViewerToolbar
-            viewMode={viewMode}
-            autoRotate={autoRotate}
-            animationPlaying={animationPlaying}
-            hasAnimations={hasAnimations}
-            hasRig={rigStats.hasRig}
-            onViewMode={setViewMode}
-            onAutoRotate={() => setAutoRotate((v) => !v)}
-            onAnimationToggle={() => setAnimationPlaying((v) => hasAnimations ? !v : false)}
-            onScreenshot={handleScreenshot}
-            showViewModes={!isSplat}
-          />
+          <>
+            <ViewerViewToolbar
+              viewMode={viewMode}
+              autoRotate={autoRotate}
+              animationPlaying={animationPlaying}
+              hasAnimations={hasAnimations}
+              hasRig={rigStats.hasRig}
+              onViewMode={setViewMode}
+              onAutoRotate={() => setAutoRotate((v) => !v)}
+              onAnimationToggle={() => setAnimationPlaying((v) => hasAnimations ? !v : false)}
+              onScreenshot={handleScreenshot}
+            />
+            <ViewerEditToolbar
+              sceneEditControls={canShowSceneEditControls && editPlan ? {
+                mode: sceneEditMode === 'editing' ? 'editing' : 'available',
+                selectedPartLabel: selectedPart?.label,
+                excludedCount: editPlan.excludedPartIds.length,
+                canSave: canSaveEditedCopy,
+                saving: saveState.status === 'saving',
+                onEditCheckpoint: () => setSceneEditMode((mode) => mode === 'editing' ? 'idle' : 'editing'),
+                onHideSelected: handleHideSelectedPart,
+                onReset: handleResetSceneEdit,
+                onClear: handleClearSceneEdit,
+                onSave: handleSaveEditedCopy,
+              } : undefined}
+              rigEditorControls={rigEditorState.summary ? {
+                active: Boolean(rigEditorState.summary.hasRig && rigEditorVisibility.isOpen),
+                summary: rigEditorState.summary,
+                onOpenRigEditor: () => setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })),
+              } : undefined}
+              poseClipControls={poseClipState.summary ? {
+                active: Boolean(poseClipState.summary.hasRig && poseClipVisibility.isOpen),
+                summary: poseClipState.summary,
+                onOpenPoseClip: () => setPoseClipVisibility((current) => reduceViewer3DPoseClipVisibilityState(current, { type: 'toggle', summary: poseClipState.summary })),
+              } : undefined}
+            />
+          </>
+        )}
+
+        {rigEditorPanelRenderState.shouldRenderPanel && (
+          <div className={`absolute top-4 ${overlayLayout.editPanelClassName} z-20 w-80 max-w-[calc(100%-5rem)]`}>
+            <RigEditorPanel
+              {...resolveViewer3DRigEditorPanelProps({ ...rigEditorState, selectedBoneId: rigTargetState.selectedBoneId }, {
+                onSelectBone: handleSelectRigEditorBone,
+                onAliasChange: (boneId, alias) => setRigEditorState((current) => reduceViewer3DRigEditorState(current, { type: 'set-alias', boneId, alias })),
+                onCancelAlias: (boneId) => setRigEditorState((current) => reduceViewer3DRigEditorState(current, { type: 'cancel-alias', boneId })),
+                onRevertAliases: () => setRigEditorState((current) => reduceViewer3DRigEditorState(current, { type: 'revert-aliases' })),
+                onSaveAliases: handleSaveRigAliases,
+              }, rigHydrationWarning)}
+            />
+            {rigRenameSaveState.status === 'saved' && <p className="mt-2 rounded-lg bg-emerald-500/10 p-2 text-xs text-emerald-200">Saved sidecar: {rigRenameSaveState.sidecarWorkspacePath}</p>}
+            {rigRenameSaveState.status === 'error' && <p className="mt-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-200">{rigRenameSaveState.message}</p>}
+          </div>
+        )}
+
+        {poseClipPanelRenderState.shouldRenderPanel && (
+          <div className={`absolute ${overlayLayout.poseClipPanelClassName} z-20 max-w-[calc(100%-5rem)]`}>
+            <PoseClipPanel
+              {...resolveViewer3DPoseClipPanelProps({ ...poseClipState, selectedBoneId: rigTargetState.selectedBoneId }, {
+                onSelectBone: handleSelectPoseClipBone,
+                onCurrentTimeChange: handlePoseClipCurrentTimeChange,
+                onClipMetadataChange: handlePoseClipMetadataChange,
+                onCaptureKeyframe: handleCapturePoseClipKeyframe,
+                onCaptureAndAdvance: handleCaptureAndAdvancePoseClipKeyframe,
+                onSelectKeyframe: (keyframeId, boneId) => {
+                  const summary = poseClipState.summary
+                  if (summary?.hasRig) {
+                    const bonesById = poseClipBonesRef.current
+                    if (!poseClipSnapshotRef.current && bonesById.size > 0) poseClipSnapshotRef.current = takePoseClipQuaternionSnapshot(bonesById)
+                    setAnimationPlaying(false)
+                    setSelectedRigTarget((current) => reduceViewer3DSelectedRigTargetState(current, { type: 'select-bone', summary, boneId }))
+                    setPoseClipState((current) => {
+                      const next = reduceViewer3DPoseClipState(current, { type: 'select-keyframe', summary, keyframeId })
+                      if (poseClipSnapshotRef.current && bonesById.size > 0) {
+                        restoreThenEvaluatePoseClipPreview({ plan: next.plan, bonesById, snapshot: poseClipSnapshotRef.current, timeSeconds: next.currentTimeSeconds })
+                      }
+                      return { ...next, previewState: 'paused' }
+                    })
+                  }
+                },
+                onDeleteKeyframe: (keyframeId) => {
+                  const summary = poseClipState.summary
+                  if (summary?.hasRig) setPoseClipState((current) => reduceViewer3DPoseClipState(current, { type: 'delete-keyframe', summary, keyframeId }))
+                },
+                onUpdateSelectedKeyframe: handleUpdateSelectedPoseClipKeyframe,
+                onDeleteSelectedKeyframe: handleDeleteSelectedPoseClipKeyframe,
+                onMoveSelectedKeyframe: handleMoveSelectedPoseClipKeyframe,
+                onShiftSelectedKeyframe: handleShiftSelectedPoseClipKeyframe,
+                onDuplicateSelectedKeyframe: handleDuplicateSelectedPoseClipKeyframe,
+                onPreviewPlay: handlePoseClipPreviewPlay,
+                onPreviewPause: handlePoseClipPreviewPause,
+                onPreviewReset: handlePoseClipPreviewReset,
+                onRotateSelectedTarget: handleRotatePoseClipSelectedTarget,
+                onResetSelectedTarget: handleResetPoseClipSelectedTarget,
+                onSaveSidecar: handleSavePoseClipSidecar,
+                onLoadSidecar: handleLoadPoseClipSidecar,
+                drawerMode: poseClipVisibility.drawerMode,
+                onDrawerModeChange: (drawerMode) => setPoseClipVisibility((current) => reduceViewer3DPoseClipVisibilityState(current, { type: 'set-drawer-mode', drawerMode })),
+              }, rigEffectiveNaming)}
+            />
+          </div>
+        )}
+
+        {modelUrl && rigOverlayProps.overlay && (
+          <div className={`absolute ${overlayLayout.rigOverlayClassName} max-w-xs`}>
+            <RigOverlay {...rigOverlayProps} />
+          </div>
+        )}
+
+        {canShowSceneEditControls && sceneEditMode === 'editing' && editPlan && (
+          <div className={`absolute top-4 ${overlayLayout.editPanelClassName} z-20 w-72 max-w-[calc(100%-5rem)] rounded-2xl border border-zinc-700/60 bg-zinc-950/85 p-3 text-xs text-zinc-200 shadow-xl backdrop-blur-sm`}>
+            <p className="font-medium text-zinc-100">Edit checkpoint</p>
+            <p className="mt-1 text-zinc-400">Select a mesh/node, then hide it from the edited copy. This does not delete the checkpoint.</p>
+            <div className="mt-3 max-h-40 overflow-auto space-y-1">
+              {sceneParts.filter((part) => part.selectable).map((part) => (
+                <button
+                  key={part.id}
+                  type="button"
+                  onClick={() => setEditPlan(editPlanReducer(editPlan, { type: 'select-part', partId: part.id }))}
+                  className={`block w-full rounded-lg px-2 py-1 text-left ${editPlan.selectedPartId === part.id ? 'bg-violet-600 text-white' : 'text-zinc-300 hover:bg-zinc-800'}`}
+                >
+                  {part.label}{editPlan.excludedPartIds.includes(part.id) ? ' — excluded' : ''}
+                </button>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" disabled={!selectedPart || saveState.status === 'saving'} onClick={handleHideSelectedPart} className="rounded-lg bg-zinc-800 px-2 py-1 disabled:opacity-50">Hide from edited copy</button>
+              <button type="button" disabled={editPlan.excludedPartIds.length === 0 || saveState.status === 'saving'} onClick={handleResetSceneEdit} className="rounded-lg bg-zinc-800 px-2 py-1 disabled:opacity-50">Reset</button>
+              <button type="button" disabled={!canSaveEditedCopy} onClick={handleSaveEditedCopy} className="rounded-lg bg-violet-600 px-2 py-1 text-white disabled:opacity-50">Save edited copy</button>
+            </div>
+            {saveState.status === 'saved' && <p className="mt-2 text-emerald-300">Saved: {saveState.glbWorkspacePath}</p>}
+            {saveState.status === 'error' && <p className="mt-2 text-red-300">{saveState.message}</p>}
+          </div>
         )}
 
         {/* Bottom-left stats overlay */}
@@ -1230,12 +3281,9 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
 
         {/* Bottom-right hint */}
         {modelUrl && (
-          <div className="absolute bottom-4 right-4 pointer-events-none">
+          <div className={`absolute bottom-4 ${overlayLayout.hintClassName} pointer-events-none`}>
             <p className="text-xs text-zinc-600">
-              {selected
-                ? <>Click mesh to select &bull; <span className="text-zinc-500">Delete</span> to remove</>
-                : 'Drag to rotate \u2022 Scroll to zoom'
-              }
+              {selected ? viewerPresentation.selectedHint : viewerPresentation.idleHint}
             </p>
           </div>
         )}

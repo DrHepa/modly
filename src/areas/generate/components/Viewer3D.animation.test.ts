@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -9,6 +9,8 @@ import { build } from 'esbuild'
 import { createElement } from 'react'
 
 const require = createRequire(import.meta.url)
+// Preload the canonical Node transport before installing inert browser globals.
+const axios = require('axios')
 const THREE: typeof import('three') = require('three')
 const reconciler = require('react-reconciler')
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
@@ -99,11 +101,12 @@ export function useGLTF(url) { harness.loads.push(['gltf', url]); const asset = 
 useGLTF.clear = url => harness.cleared.push(['gltf', url])
 export function useLoader(loader, url) { harness.loads.push([loader.name, url]); return harness.obj.get(url) }
 useLoader.clear = (loader, url) => harness.cleared.push([loader.name, url])
-export const useThree = () => ({ gl: { domElement: { toDataURL: () => 'data:image/png;base64,fixture' } } })
+export const useThree = () => ({ gl: { domElement: { toDataURL: () => 'data:image/png;base64,fixture', getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) } } })
 export const useGizmoContext = () => ({})
 export const Environment = () => null
 export const GizmoHelper = () => null
 export const Lightformer = () => null
+export const Html = props => createElement('test-html', props, props.children)
 export const OrbitControls = props => createElement('test-orbit', props)
 export const EffectComposer = props => createElement('test-composer', props, props.children)
 export const Outline = props => createElement('test-outline', props)
@@ -115,6 +118,9 @@ export default forwardRef(function SplatViewer(props, ref) { return createElemen
 async function mount(t: any, initialPath: string | null = '/animated.glb', initialise?: (harness: any) => void) {
   const directory = await mkdtemp(path.join(tmpdir(), 'modly-viewer-animation-'))
   const saved = new Map<string, PropertyDescriptor | undefined>()
+  const requests: unknown[] = []
+  const originalAdapter = axios.defaults.adapter
+  axios.defaults.adapter = async (request: unknown) => { requests.push(request); throw new Error('Unexpected transport request') }
   let unmount = () => undefined as void
   t.after(async () => {
     try {
@@ -124,15 +130,17 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
         if (descriptor) Object.defineProperty(globalThis, name, descriptor)
         else Reflect.deleteProperty(globalThis, name)
       }
+      axios.defaults.adapter = originalAdapter
       await rm(directory, { recursive: true, force: true })
+      assert.deepEqual(requests, [], 'No network request may leave the CPU harness')
     }
   })
   const events = new EventTarget()
   const storage = new Map<string, string>()
   const localStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) }
   for (const [name, value] of Object.entries({
-    window: { addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events), localStorage },
-    document: { activeElement: null },
+    window: { addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events), setInterval, clearInterval, localStorage },
+    document: { activeElement: null, hasFocus: () => true },
     HTMLInputElement: class {},
     localStorage,
   })) {
@@ -142,7 +150,7 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
   const outfile = path.join(directory, 'viewer.mjs')
   await build({
     stdin: {
-      contents: `export { default as Viewer3D } from './src/areas/generate/components/Viewer3D'; export { useAppStore } from './src/shared/stores/appStore'; export { harness } from '@react-three/fiber'`,
+      contents: `export * from './src/areas/generate/components/Viewer3D'; export { default as Viewer3D } from './src/areas/generate/components/Viewer3D'; export { useAppStore } from './src/shared/stores/appStore'; export { useWorkflowRunStore } from './src/areas/workflows/workflowRunStore'; export { harness } from '@react-three/fiber'`,
       resolveDir: projectRoot,
       loader: 'tsx',
     },
@@ -161,11 +169,12 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
         // Bundle the real import entry, not the installed self-requiring UMD.
         // Bare Three stays external below so fixtures and BVH share constructors.
         builder.onResolve({ filter: /^three-mesh-bvh$/ }, () => ({ path: fileURLToPath(import.meta.resolve('three-mesh-bvh')) }))
-        builder.onResolve({ filter: /^(react(?:\/.*)?|three(?:\/.*)?|zustand(?:\/.*)?)$/ }, args => ({ path: require.resolve(args.path), external: true }))
+        builder.onResolve({ filter: /^(react(?:\/.*)?|three(?:\/.*)?|axios|zustand(?:\/.*)?)$/ }, args => ({ path: require.resolve(args.path), external: true }))
       },
     }],
   })
-  const { Viewer3D, useAppStore, harness } = await import(pathToFileURL(outfile).href)
+  const viewerModule = await import(pathToFileURL(outfile).href)
+  const { Viewer3D, useAppStore, useWorkflowRunStore, harness } = viewerModule
   const mixers: import('three').AnimationMixer[] = []
   const uncached: import('three').Object3D[] = []
   const originalClipAction = THREE.AnimationMixer.prototype.clipAction
@@ -189,6 +198,7 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
   }
   const first = asset('/animated.glb')
   initialise?.(harness)
+  if (harness.electron) window.electron = harness.electron
   const host: Host = { type: 'root', props: {}, children: [] }
   const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
   const undo = { current: null as (() => boolean) | null }
@@ -201,6 +211,16 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
   const render = () => flush(() => renderer.updateContainer(createElement(Viewer3D, props), root, null))
   unmount = () => flush(() => renderer.updateContainer(null, root, null))
   render()
+  const component = (name: string): any => {
+    const walk = (fiber: any): any => {
+      if (!fiber) return undefined
+      if (fiber.type?.name === name) return fiber.memoizedProps
+      return walk(fiber.child) ?? walk(fiber.sibling)
+    }
+    const props = walk(root.current)
+    assert.ok(props, `Missing mounted component ${name}`)
+    return props
+  }
   const node = (type: string) => find(host, entry => entry.type === type)
   const button = (label: string) => {
     const result = find(host, entry => entry.type === 'button' && entry.props.title === label)
@@ -210,7 +230,7 @@ async function mount(t: any, initialPath: string | null = '/animated.glb', initi
   const click = (label: string) => flush(() => button(label).props.onClick())
   const switchTo = (url: string | null) => flush(() => job(url))
   const frame = (delta: number) => { for (const callback of [...harness.frames.values()].sort((a: any, b: any) => a.priority - b.priority)) (callback as (delta: number) => void)(delta) }
-  return { harness, host, node, button, click, switchTo, frame, render, unmount, asset, first, clip, mixers, uncached, useAppStore, undo, pointSelections, lightChanges }
+  return { harness, host, node, component, viewerModule, button, click, switchTo, frame, render, unmount, asset, first, clip, mixers, uncached, useAppStore, useWorkflowRunStore, undo, pointSelections, lightChanges }
 }
 
 test('Viewer3D mounts animated GLTF paused, plays and resumes the same real mixer without losing shared selection or gizmo undo', async t => {
@@ -705,4 +725,489 @@ test('Viewer3D rig shells and overlays use translucent depth flags and restore o
     assert.equal(rig.first.geometry, rig.geometry)
     assert.ok(sourceDisposals.every(spy => spy.mock.callCount() === (mode === 'Bone influence' ? 1 : 0)))
   }
+})
+
+function deferred<T = any>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+async function settle() {
+  for (let index = 0; index < 8; index++) { await Promise.resolve(); flush(() => undefined) }
+}
+
+function authoringAsset(harness: any, url = '/workspace/rig.glb') {
+  const scene = new THREE.Group()
+  const root = new THREE.Bone(); root.name = 'root'
+  const child = new THREE.Bone(); child.name = 'child'; child.position.y = 1; root.add(child)
+  const geometry = new THREE.BoxGeometry()
+  const count = geometry.getAttribute('position').count
+  geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(new Uint16Array(count * 4), 4))
+  const weights = new Float32Array(count * 4)
+  for (let index = 0; index < count; index++) weights[index * 4] = 1
+  geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(weights, 4))
+  const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshStandardMaterial())
+  mesh.name = 'body'; scene.add(root, mesh)
+  mesh.bind(new THREE.Skeleton([child, root])) // Deliberately opposite to hierarchy order.
+  const shared = new THREE.SkinnedMesh(geometry, mesh.material); shared.name = 'shared'
+  scene.add(shared); shared.bind(mesh.skeleton)
+  const prop = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial()); prop.name = 'removable'; scene.add(prop)
+  const clip = new THREE.AnimationClip('root motion', 1, [new THREE.QuaternionKeyframeTrack('root.quaternion', [0, 1], [0, 0, 0, 1, 0, Math.sin(0.5), 0, Math.cos(0.5)])])
+  harness.gltf.set(url, { scene, animations: [clip] })
+  return { scene, root, child, mesh, shared, prop, clip }
+}
+
+test('Viewer3D source preflight rejects malformed encoding, escaped separators and foreign URL lookalikes', async t => {
+  const view = await mount(t, null)
+  const source = (modelUrl: string) => ({ kind: 'final', modelUrl, isCheckpointPreview: false, label: 'Final output' })
+  const resolve = view.viewerModule.resolveViewer3DRigSourceWorkspacePath
+  for (const url of ['http://evil.test/workspace/a.glb', 'http://local.test/other/workspace/a.glb', '/workspace/bad%.glb', '/workspace/a%00.glb', '/workspace/a%2fb.glb', '/workspace/%252e%252e/a.glb', '/workspace/a.glb%3fx=1', '/workspace/a.glb#ambiguous']) {
+    assert.doesNotThrow(() => resolve(source(url), 'http://local.test'))
+    assert.equal(resolve(source(url), 'http://local.test'), undefined, url)
+  }
+  for (const url of ['http://local.test?file=/workspace/rig.glb', 'http://local.test?file=/workspace/rig.glb?cache=1', '/workspace/rig.glb?cache=%']) assert.equal(resolve(source(url), 'http://local.test'), undefined, url)
+  assert.equal(resolve(source('http://local.test/workspace/folder/a%20b.glb?cache=1'), 'http://local.test'), 'folder/a b.glb')
+})
+
+test('Viewer3D mounted stable selection rotates the real out-of-order Bone and excludes the GLTF writer until global Play', async t => {
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, '/workspace/rig.glb', h => { rig = authoringAsset(h) })
+  view.click('Open Pose/Clip (2 bones)')
+  let panel = view.component('PoseClipPanel')
+  assert.equal(panel.selectedBoneId, undefined, 'No implicit first target')
+  const childId = panel.summary.bones.find((bone: any) => bone.originalName === 'child').boneId
+  flush(() => panel.onSelectBone(childId))
+  panel = view.component('PoseClipPanel')
+  assert.equal(panel.selectedBoneId, childId)
+  view.click('Play animation'); view.frame(0.2)
+  const rootBefore = rig!.root.quaternion.clone(); const childBefore = rig!.child.quaternion.clone()
+  flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(childId, 'x', 30))
+  assert.ok(rig!.root.quaternion.equals(rootBefore)); assert.ok(!rig!.child.quaternion.equals(childBefore))
+  const posed = rig!.child.quaternion.clone(); view.frame(0.4)
+  assert.ok(rig!.child.quaternion.equals(posed)); assert.ok(rig!.root.quaternion.equals(rootBefore))
+  flush(() => view.component('PoseClipPanel').onCaptureKeyframe(childId, 0))
+  assert.equal(view.component('PoseClipPanel').keyframes[0].boneId, childId)
+  flush(() => view.component('PoseClipPanel').onCurrentTimeChange(0))
+  flush(() => view.component('PoseClipPanel').onDeleteKeyframe(view.component('PoseClipPanel').keyframes[0].id, childId))
+  assert.ok(rig!.child.quaternion.equals(childBefore), 'Deleting final key restores captured original')
+  flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(childId, 'z', 30))
+  view.click('Play animation')
+  assert.ok(rig!.child.quaternion.equals(childBefore)); view.frame(0.2)
+  assert.ok(!rig!.root.quaternion.equals(rootBefore))
+  assert.equal(rig!.root.name, 'root'); assert.equal(rig!.child.name, 'child')
+})
+
+test('Viewer3D same-URL replacement restores only old pose Bone objects and keeps new rig capability', async t => {
+  let first: ReturnType<typeof authoringAsset>
+  const view = await mount(t, '/workspace/rig.glb', h => { first = authoringAsset(h) })
+  view.click('Open Pose/Clip (2 bones)')
+  const panel = view.component('PoseClipPanel'); const id = panel.summary.bones[0].boneId
+  const before = first!.root.quaternion.clone()
+  flush(() => panel.onRotateSelectedTarget(id, 'x', 45))
+  const second = authoringAsset(view.harness); second.root.quaternion.setFromAxisAngle(new THREE.Vector3(0, 0, 1), 0.2)
+  const secondBefore = second.root.quaternion.clone()
+  view.render()
+  assert.ok(first!.root.quaternion.equals(before)); assert.ok(second.root.quaternion.equals(secondBefore))
+  assert.equal(view.button('Rig bones').props.disabled, false)
+  view.click('Open Pose/Clip (2 bones)')
+  assert.equal(view.component('PoseClipPanel').keyframes.length, 0)
+  assert.equal(view.component('PoseClipPanel').selectedBoneId, undefined)
+  view.unmount(); assert.ok(second.root.quaternion.equals(secondBefore))
+})
+
+test('Viewer3D aliases persist an empty revision, recover rejected saves, and preserve a newer dirty revision', async t => {
+  const writes: any[] = []; const pending = deferred(); let rejectNext = false
+  const view = await mount(t, '/workspace/rig.glb', h => {
+    authoringAsset(h)
+    h.electron = { workspace: { artifacts: { writeRigRenameSidecar: (request: any) => {
+      writes.push(request)
+      if (rejectNext) return Promise.reject(new Error('alias write rejected'))
+      return writes.length === 1 ? pending.promise : Promise.resolve({ success: true, sidecarWorkspacePath: request.sidecarWorkspacePath })
+    } } } }
+  })
+  view.click('Open Rig Editor (2 bones)')
+  let panel = view.component('RigEditorPanel'); const id = panel.summary.bones[0].boneId
+  flush(() => panel.onSelectBone(id)); flush(() => view.component('RigEditorPanel').onAliasChange(id, 'Root alias'))
+  const saving = view.component('RigEditorPanel').onSaveAliases(); await settle()
+  assert.equal(writes.length, 1); assert.equal(view.component('RigEditorPanel').saveState, 'saving')
+  flush(() => view.component('RigEditorPanel').onAliasChange(id, 'Newer alias'))
+  pending.resolve({ success: true, sidecarWorkspacePath: writes[0].sidecarWorkspacePath }); await saving; await settle()
+  assert.equal(view.component('RigEditorPanel').saveState, 'idle'); assert.equal(view.component('RigEditorPanel').aliasesDirty, true)
+  await view.component('RigEditorPanel').onSaveAliases(); await settle()
+  assert.equal(view.component('RigEditorPanel').aliasesDirty, false)
+  flush(() => view.component('RigEditorPanel').onCancelAlias(id))
+  assert.equal(view.component('RigEditorPanel').aliasesDirty, true)
+  await view.component('RigEditorPanel').onSaveAliases(); await settle()
+  assert.deepEqual(writes.at(-1).sidecar.aliases, {}); assert.equal(view.component('RigEditorPanel').aliasesDirty, false)
+  flush(() => view.component('RigEditorPanel').onAliasChange(id, 'Will fail')); rejectNext = true
+  await view.component('RigEditorPanel').onSaveAliases(); await settle()
+  assert.equal(view.component('RigEditorPanel').saveState, 'error')
+  assert.match(view.component('RigEditorPanel').saveError, /rejected/)
+  rejectNext = false; await view.component('RigEditorPanel').onSaveAliases(); await settle()
+  assert.equal(view.component('RigEditorPanel').saveState, 'saved')
+})
+
+test('Viewer3D automatic pose hydration cannot overwrite authored keys and explicit Load handles rejection and same-URL replacement', async t => {
+  const initial = deferred(); let reader = () => initial.promise
+  const writes: any[] = []
+  const view = await mount(t, '/workspace/rig.glb', h => {
+    authoringAsset(h)
+    h.electron = { workspace: { artifacts: {
+      readPoseClipSidecar: () => reader(), writePoseClipSidecar: async (request: any) => { writes.push(request); return { success: true, sidecarWorkspacePath: request.sidecarWorkspacePath } },
+    } } }
+  })
+  view.click('Open Pose/Clip (2 bones)'); await settle()
+  let panel = view.component('PoseClipPanel'); const id = panel.summary.bones[0].boneId
+  // Direct invocation of the actual mounted callback models an already queued edit.
+  flush(() => panel.onCaptureKeyframe(id, 0))
+  initial.resolve({ success: false, error: 'late read failed' }); await settle()
+  assert.equal(view.component('PoseClipPanel').keyframes.length, 1)
+  assert.equal(view.component('PoseClipPanel').loadState, 'idle')
+  await view.component('PoseClipPanel').onSaveSidecar(); await settle()
+  assert.equal(writes.length, 1); assert.equal(view.component('PoseClipPanel').saveState, 'saved')
+  reader = () => Promise.reject(new Error('explicit read rejected'))
+  await view.component('PoseClipPanel').onLoadSidecar(); await settle()
+  assert.equal(view.component('PoseClipPanel').loadState, 'error')
+  const late = deferred(); reader = () => late.promise
+  const loading = view.component('PoseClipPanel').onLoadSidecar()
+  reader = async () => ({ success: true, status: 'not-found' })
+  authoringAsset(view.harness); view.render(); view.click('Open Pose/Clip (2 bones)')
+  late.resolve({ success: false, error: 'old source error' }); await loading; await settle()
+  assert.equal(view.component('PoseClipPanel').keyframes.length, 0)
+  assert.equal(view.component('PoseClipPanel').loadState, 'idle')
+  assert.equal(view.component('PoseClipPanel').loadError, undefined)
+})
+
+async function bridgeFixture(t: any) {
+  const workspaceDir = await mkdtemp(path.join(tmpdir(), 'modly-viewer-checkpoint-'))
+  t.after(() => rm(workspaceDir, { recursive: true, force: true }))
+  await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+  const sourceBytes = Buffer.from('unchanged source fixture')
+  await writeFile(path.join(workspaceDir, 'Workflows/rig.glb'), sourceBytes)
+  const service = await import(pathToFileURL(path.join(projectRoot, 'electron/main/artifact-registry-service.ts')).href)
+  const preloadPath = path.join(workspaceDir, 'preload.mjs')
+  await build({ entryPoints: [path.join(projectRoot, 'electron/preload/electron-api.ts')], outfile: preloadPath, bundle: true, format: 'esm', platform: 'node' })
+  const { createElectronApi } = await import(pathToFileURL(preloadPath).href)
+  const calls: any[] = []
+  const writes: any[] = []
+  const routes: Record<string, string> = {
+    'workspace:artifact:writeEditedSceneArtifact': 'writeEditedSceneArtifact',
+    'workspace:artifact:writeRigRenameSidecar': 'writeRigRenameSidecar',
+    'workspace:artifact:readRigRenameSidecar': 'readRigRenameSidecar',
+    'workspace:artifact:writePoseClipSidecar': 'writePoseClipSidecar',
+    'workspace:artifact:readPoseClipSidecar': 'readPoseClipSidecar',
+    'workspace:artifact:readRigMetaSidecar': 'readRigMetaSidecar',
+  }
+  const electron = createElectronApi({ send() {}, on() {}, removeAllListeners() {}, async invoke(channel: string, ...args: any[]) {
+    calls.push([channel, ...args])
+    if (channel === 'settings:get') return { workspaceDir }
+    if (channel === 'fs:deleteDirectory') return { success: true } // Explicitly inert store cleanup port.
+    const route = routes[channel]
+    assert.ok(route, `Unexpected bridge call ${channel}`)
+    if (route.startsWith('write')) writes.push(args[0])
+    return service[route]({ workspaceDir, ...args[0] })
+  } }, { setZoomFactor() {} }, { getPathForFile: () => '' })
+  return { workspaceDir, electron, calls, writes, sourceBytes }
+}
+
+function checkpointGraph(workspaceDir: string, kind = 'waitNode', sibling = false) {
+  return { id: 'viewer-checkpoint', name: 'Viewer checkpoint', description: '', createdAt: '', updatedAt: '',
+    nodes: [
+      { id: 'source', type: 'meshNode', position: { x: 0, y: 0 }, data: { params: { source: 'file', filePath: path.join(workspaceDir, 'Workflows/rig.glb') } } },
+      { id: 'wait', type: kind, position: { x: 1, y: 0 }, data: { params: {} } },
+      ...(sibling ? [{ id: 'other', type: 'waitNode', position: { x: 1, y: 1 }, data: { params: {} } }] : []),
+    ], edges: [{ id: 'source-wait', source: 'source', target: 'wait' }, ...(sibling ? [{ id: 'source-other', source: 'source', target: 'other' }] : [])],
+  }
+}
+
+async function withCpuFileReader(work: () => Promise<void>) {
+  const before = Object.getOwnPropertyDescriptor(globalThis, 'FileReader')
+  class MemoryFileReader {
+    result: ArrayBuffer | null = null
+    onloadend: (() => void) | null = null
+    readAsArrayBuffer(blob: Blob) { void blob.arrayBuffer().then(value => { this.result = value; this.onloadend?.() }) }
+  }
+  Object.defineProperty(globalThis, 'FileReader', { configurable: true, value: MemoryFileReader })
+  try { await work() } finally {
+    if (before) Object.defineProperty(globalThis, 'FileReader', before)
+    else Reflect.deleteProperty(globalThis, 'FileReader')
+  }
+}
+
+test('Viewer3D actual checkpoint owner exports influence originals and animations through preload/main without transient pose leakage', async t => {
+  const bridge = await bridgeFixture(t)
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, null, h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  await view.useWorkflowRunStore.getState().run(checkpointGraph(bridge.workspaceDir, 'waitNode', true), []); await settle()
+  const owner = view.useWorkflowRunStore.getState().getCheckpointOwner('wait'); assert.ok(owner)
+  const edit = view.component('ViewerEditToolbar').sceneEditControls; assert.ok(edit)
+  view.click('Bone influence')
+  const diagnosticGeometry = rig!.mesh.geometry
+  const originalGeometry = rig!.shared.skeleton.bones[0] // Keep a real source object identity sentinel.
+  const before = rig!.root.quaternion.clone()
+  view.click('Open Pose/Clip (2 bones)')
+  const pose = view.component('PoseClipPanel'); const id = pose.summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+  flush(() => pose.onRotateSelectedTarget(id, 'z', 45))
+  assert.ok(!rig!.root.quaternion.equals(before))
+  flush(() => edit.onEditCheckpoint())
+  const primitive = find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene)!
+  flush(() => primitive.props.onClick({ object: rig!.prop, stopPropagation() {} }))
+  assert.equal(view.useAppStore.getState().meshSelected, false, 'Eligible part selection takes precedence over ordinary scene selection')
+  flush(() => view.component('ViewerEditToolbar').sceneEditControls.onHideSelected())
+  assert.equal(view.component('ViewerEditToolbar').sceneEditControls.canSave, true)
+  await withCpuFileReader(async () => { await view.component('ViewerEditToolbar').sceneEditControls.onSave(); await settle() })
+  assert.ok(rig!.root.quaternion.equals(before), 'Transient local rotation restored before export')
+  assert.equal(rig!.mesh.geometry, diagnosticGeometry, 'No live diagnostic resource swapping')
+  assert.equal(rig!.shared.skeleton.bones[0], originalGeometry)
+  const store = view.useWorkflowRunStore.getState(); const currentOwner = store.getCheckpointOwner('wait')
+  assert.ok(currentOwner.revision > owner.revision)
+  assert.ok(find(view.host, node => node.type === '#text' && String(node.props.text).includes('Saved:')), 'Own successful CAS retains saved UI')
+  const replacement = store.getPendingReplacement(currentOwner); assert.ok(replacement, JSON.stringify(bridge.writes))
+  assert.equal(store.getPendingReplacement(store.getCheckpointOwner('other')), undefined)
+  const savedBytes = await readFile(path.join(bridge.workspaceDir, replacement.uri))
+  const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js')
+  const loaded = await new GLTFLoader().parseAsync(Uint8Array.from(savedBytes).buffer, '')
+  assert.equal(loaded.animations.length, 1)
+  assert.equal(loaded.scene.getObjectByName('removable'), undefined)
+  assert.equal(loaded.scene.getObjectByName('RigInspectionOverlay'), undefined)
+  const exportedMesh = loaded.scene.getObjectByName('body') as import('three').Mesh
+  assert.equal(exportedMesh.geometry.getAttribute('color'), undefined, 'Influence-only vertex colors not exported')
+  assert.equal((exportedMesh.material as import('three').MeshStandardMaterial).transparent, false)
+  assert.ok((loaded.scene.getObjectByName('root') as import('three').Bone).quaternion.angleTo(before) < 1e-6)
+  assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
+  assert.equal(store.waitStates.wait, 'pending', 'Save never Continues')
+  await store.continueRun('wait', { owner: currentOwner, replacementArtifact: replacement }); await settle()
+  assert.equal(view.useWorkflowRunStore.getState().waitStates.wait, 'done')
+  assert.equal(view.useWorkflowRunStore.getState().waitStates.other, 'pending')
+})
+
+test('Viewer3D checkpoint settings race cannot borrow a newly selected owner or writer', async t => {
+  const bridge = await bridgeFixture(t)
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, null, h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  await view.useWorkflowRunStore.getState().run(checkpointGraph(bridge.workspaceDir, 'waitNode', true), []); await settle()
+  flush(() => view.component('ViewerEditToolbar').sceneEditControls.onEditCheckpoint())
+  flush(() => find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene)!.props.onClick({ object: rig!.prop, stopPropagation() {} }))
+  flush(() => view.component('ViewerEditToolbar').sceneEditControls.onHideSelected())
+  const pendingSettings = deferred(); const oldGet = window.electron.settings.get
+  window.electron.settings.get = () => pendingSettings.promise
+  const saving = view.component('ViewerEditToolbar').sceneEditControls.onSave()
+  const store = view.useWorkflowRunStore.getState(); const other = store.getCheckpointOwner('other')
+  flush(() => store.selectCheckpoint(other))
+  pendingSettings.resolve({ workspaceDir: bridge.workspaceDir }); await saving; await settle()
+  window.electron.settings.get = oldGet
+  assert.equal(bridge.writes.length, 0)
+  assert.equal(view.useWorkflowRunStore.getState().getPendingReplacement(other), undefined)
+  assert.equal(view.component('ViewerEditToolbar').sceneEditControls.saving, false)
+})
+
+test('Viewer3D actual landmark owner receives current source pointer hits, not foreign/helpers or ordinary selection', async t => {
+  const bridge = await bridgeFixture(t)
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, null, h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  await view.useWorkflowRunStore.getState().run(checkpointGraph(bridge.workspaceDir, 'landmarksNode'), []); await settle()
+  const source = find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene)!
+  const hit = (object: import('three').Object3D, clientX = 50) => ({ nativeEvent: { clientX, clientY: 50 },
+    intersections: [{ object, point: new THREE.Vector3(1, 2, 3) }], stopPropagation() {} })
+  flush(() => source.props.onClick(hit(new THREE.Mesh())))
+  assert.deepEqual(view.useWorkflowRunStore.getState().checkpoints.wait.landmarkCapture.completed, {})
+  flush(() => source.props.onClick(hit(rig!.prop, Number.NaN)))
+  assert.deepEqual(view.useWorkflowRunStore.getState().checkpoints.wait.landmarkCapture.completed, {})
+  flush(() => source.props.onClick(hit(rig!.prop)))
+  assert.equal(view.useWorkflowRunStore.getState().checkpoints.wait.landmarkCapture.completed.left_shoulder.world.x, 1)
+  assert.equal(view.useAppStore.getState().meshSelected, false)
+  const marker = find(view.host, node => node.type === 'mesh' && node.props.renderOrder === 6)!
+  let stopped = false
+  flush(() => marker.props.onClick({ stopPropagation() { stopped = true } }))
+  assert.equal(stopped, true)
+  assert.equal(view.useWorkflowRunStore.getState().checkpoints.wait.landmarkCapture.activeLandmarkId, 'left_shoulder')
+  const oldClick = source.props.onClick
+  view.switchTo('/animated.glb')
+  flush(() => oldClick(hit(rig!.prop)))
+  assert.equal(Object.keys(view.useWorkflowRunStore.getState().checkpoints.wait.landmarkCapture.completed).length, 1)
+})
+
+
+test('Viewer3D alias hydration ignores dirty edits and retired same-URL errors, with real preload/main empty persistence', async t => {
+  const bridge = await bridgeFixture(t)
+  const delayed = deferred()
+  const actualRead = bridge.electron.workspace.artifacts.readRigRenameSidecar
+  bridge.electron.workspace.artifacts.readRigRenameSidecar = () => delayed.promise
+  const view = await mount(t, '/workspace/Workflows/rig.glb', h => { authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  view.click('Open Rig Editor (2 bones)'); await settle()
+  let panel = view.component('RigEditorPanel'); const id = panel.summary.bones[0].boneId
+  flush(() => panel.onSelectBone(id)); flush(() => view.component('RigEditorPanel').onAliasChange(id, 'Authored alias'))
+  delayed.reject(new Error('late alias read rejection')); await settle()
+  panel = view.component('RigEditorPanel')
+  assert.equal(panel.loadState, 'idle'); assert.equal(panel.aliasesDirty, true)
+  assert.equal(panel.renamePlan.aliases[id].alias, 'Authored alias')
+  bridge.electron.workspace.artifacts.readRigRenameSidecar = actualRead
+  await panel.onSaveAliases(); await settle()
+  assert.equal(view.component('RigEditorPanel').aliasesDirty, false)
+  flush(() => view.component('RigEditorPanel').onCancelAlias(id))
+  await view.component('RigEditorPanel').onSaveAliases(); await settle()
+  const request = bridge.writes.at(-1); assert.deepEqual(request.sidecar.aliases, {})
+  const read = await actualRead({ sourceWorkspacePath: 'Workflows/rig.glb', sidecarWorkspacePath: request.sidecarWorkspacePath })
+  assert.equal(read.status, 'found'); assert.deepEqual(read.sidecar.aliases, {})
+  const retired = deferred()
+  bridge.electron.workspace.artifacts.readRigRenameSidecar = () => retired.promise
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle()
+  let hydration: Promise<unknown> | undefined
+  bridge.electron.workspace.artifacts.readRigRenameSidecar = (request: any) => { hydration = actualRead(request); return hydration }
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle()
+  await hydration; await settle()
+  view.click('Open Rig Editor (2 bones)')
+  retired.reject(new Error('retired scene error')); await settle()
+  panel = view.component('RigEditorPanel')
+  assert.equal(panel.loadState, 'loaded'); assert.equal(panel.loadError, undefined)
+  assert.deepEqual(panel.renamePlan.aliases, {}); assert.equal(panel.aliasesDirty, false)
+})
+
+test('Viewer3D pose saves retain dirty revisions, recover rejection and ignore old scene completion', async t => {
+  let next = deferred(); const writes: any[] = []
+  const view = await mount(t, '/workspace/rig.glb', h => { authoringAsset(h); h.electron = { workspace: { artifacts: {
+    writePoseClipSidecar: (request: any) => { writes.push(request); return next.promise },
+  } } } })
+  view.click('Open Pose/Clip (2 bones)')
+  let panel = view.component('PoseClipPanel'); const id = panel.summary.bones[0].boneId
+  flush(() => panel.onSelectBone(id)); flush(() => view.component('PoseClipPanel').onCaptureKeyframe(id, 0))
+  const first = view.component('PoseClipPanel').onSaveSidecar(); await settle()
+  assert.equal(view.component('PoseClipPanel').saveState, 'saving')
+  flush(() => view.component('PoseClipPanel').onClipMetadataChange({ name: 'New authored revision' }))
+  next.resolve({ success: true, sidecarWorkspacePath: writes[0].sidecarWorkspacePath }); await first; await settle()
+  assert.equal(view.component('PoseClipPanel').saveState, 'idle'); assert.equal(view.component('PoseClipPanel').canSaveSidecar, true)
+  next = deferred(); const second = view.component('PoseClipPanel').onSaveSidecar()
+  next.reject(new Error('pose write rejection')); await second; await settle()
+  assert.equal(view.component('PoseClipPanel').saveState, 'error'); assert.match(view.component('PoseClipPanel').saveError, /rejection/)
+  next = deferred(); const third = view.component('PoseClipPanel').onSaveSidecar()
+  next.resolve({ success: true, sidecarWorkspacePath: writes.at(-1).sidecarWorkspacePath }); await third; await settle()
+  assert.equal(view.component('PoseClipPanel').saveState, 'saved'); assert.equal(view.component('PoseClipPanel').canSaveSidecar, false)
+  flush(() => view.component('PoseClipPanel').onClipMetadataChange({ name: 'Retired revision' }))
+  next = deferred(); const stale = view.component('PoseClipPanel').onSaveSidecar()
+  authoringAsset(view.harness); view.render(); view.click('Open Pose/Clip (2 bones)')
+  next.resolve({ success: true, sidecarWorkspacePath: writes.at(-1).sidecarWorkspacePath }); await stale; await settle()
+  panel = view.component('PoseClipPanel')
+  assert.equal(panel.saveState, 'idle'); assert.equal(panel.keyframes.length, 0); assert.equal(panel.canSaveSidecar, false)
+})
+
+test('Viewer3D pose minimize, close and unmount restore captured Bone references and stop preview writers', async t => {
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, '/workspace/rig.glb', h => { rig = authoringAsset(h) })
+  view.click('Open Pose/Clip (2 bones)')
+  const id = view.component('PoseClipPanel').summary.bones[0].boneId
+  const before = rig!.root.quaternion.clone()
+  flush(() => view.component('PoseClipPanel').onSelectBone(id))
+  flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(id, 'z', 30))
+  flush(() => view.component('PoseClipPanel').onCaptureKeyframe(id, 0))
+  flush(() => view.component('PoseClipPanel').onPreviewPlay())
+  assert.equal(view.component('PoseClipPanel').previewState, 'playing')
+  flush(() => view.component('PoseClipPanel').onDrawerModeChange('minimized'))
+  assert.ok(rig!.root.quaternion.equals(before)); assert.equal(view.component('PoseClipPanel').previewState, 'idle')
+  assert.equal(view.component('PoseClipPanel').keyframes.length, 1)
+  flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(id, 'x', 20))
+  flush(() => view.component('ViewerEditToolbar').poseClipControls.onOpenPoseClip())
+  assert.ok(rig!.root.quaternion.equals(before))
+  view.click('Open Pose/Clip (2 bones)')
+  flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(id, 'y', 20))
+  view.unmount(); assert.ok(rig!.root.quaternion.equals(before)); assert.equal(view.harness.frames.size, 0)
+})
+
+for (const change of ['revision', 'run'] as const) {
+  test(`Viewer3D physical save after checkpoint ${change} change cannot publish or claim selected success`, async t => {
+    const bridge = await bridgeFixture(t)
+    const reachedWriter = deferred(); const releaseWriter = deferred()
+    const actualWrite = bridge.electron.workspace.artifacts.writeEditedSceneArtifact
+    bridge.electron.workspace.artifacts.writeEditedSceneArtifact = async (request: any) => {
+      reachedWriter.resolve(undefined); await releaseWriter.promise
+      return actualWrite(request)
+    }
+    let rig: ReturnType<typeof authoringAsset>
+    const view = await mount(t, null, h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+    const graph = checkpointGraph(bridge.workspaceDir)
+    await view.useWorkflowRunStore.getState().run(graph, []); await settle()
+    const oldOwner = view.useWorkflowRunStore.getState().getCheckpointOwner('wait')
+    flush(() => view.component('ViewerEditToolbar').sceneEditControls.onEditCheckpoint())
+    flush(() => find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene)!.props.onClick({ object: rig!.prop, stopPropagation() {} }))
+    flush(() => view.component('ViewerEditToolbar').sceneEditControls.onHideSelected())
+    await withCpuFileReader(async () => {
+      const saving = view.component('ViewerEditToolbar').sceneEditControls.onSave()
+      await reachedWriter.promise
+      if (change === 'revision') flush(() => assert.equal(view.useWorkflowRunStore.getState().setPendingReplacement(oldOwner), true))
+      else await view.useWorkflowRunStore.getState().run(graph, [])
+      await settle()
+      releaseWriter.resolve(undefined); await saving; await settle()
+    })
+    assert.equal(bridge.writes.length, 1, 'Physical save is allowed once already underway')
+    const store = view.useWorkflowRunStore.getState(); const owner = store.getCheckpointOwner('wait')
+    assert.equal(store.getPendingReplacement(owner), undefined, 'No newer owner can be borrowed')
+    assert.equal(store.waitStates.wait, 'pending')
+    assert.equal(find(view.host, node => node.type === '#text' && String(node.props.text).includes('Saved:')), undefined)
+    if (change === 'revision') assert.ok(find(view.host, node => node.type === '#text' && String(node.props.text).includes('was not selected')))
+    else {
+      assert.notEqual(owner.runId, oldOwner.runId)
+      assert.equal(find(view.host, node => node.type === '#text' && String(node.props.text).includes('was not selected')), undefined, 'Retired run cannot update new run UI')
+    }
+  })
+}
+
+
+test('Viewer3D source click scope rejects foreign objects without swallowing their events', async t => {
+  const view = await mount(t)
+  const primitive = view.node('primitive')!
+  let stopped = 0
+  flush(() => primitive.props.onClick({ object: new THREE.Mesh(), stopPropagation() { stopped++ } }))
+  assert.equal(stopped, 0); assert.equal(view.useAppStore.getState().meshSelected, false)
+  flush(() => primitive.props.onClick({ object: view.first.mesh, stopPropagation() { stopped++ } }))
+  assert.equal(stopped, 1); assert.equal(view.useAppStore.getState().meshSelected, true)
+})
+
+test('Viewer3D consecutive owner revisions retain authored edits while validation is unavailable and a new run still resets them', async t => {
+  const bridge = await bridgeFixture(t)
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, null, h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  const graph = checkpointGraph(bridge.workspaceDir, 'waitNode', true)
+  await view.useWorkflowRunStore.getState().run(graph, []); await settle()
+  flush(() => view.component('ViewerEditToolbar').sceneEditControls.onEditCheckpoint())
+  flush(() => find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene)!.props.onClick({ object: rig!.prop, stopPropagation() {} }))
+  flush(() => view.component('ViewerEditToolbar').sceneEditControls.onHideSelected())
+  await withCpuFileReader(async () => { await view.component('ViewerEditToolbar').sceneEditControls.onSave(); await settle() })
+  const current = () => view.useWorkflowRunStore.getState()
+  let owner = current().getCheckpointOwner('wait')
+  const chosen = current().getPendingReplacement(owner); assert.ok(chosen)
+  const before = view.component('ViewerEditToolbar').sceneEditControls
+  assert.equal(before.mode, 'editing'); assert.equal(before.excludedCount, 1)
+  const first = deferred(); const second = deferred()
+  const originalGet = window.electron.settings.get
+  let reads = 0
+  window.electron.settings.get = () => (++reads === 1 ? first.promise : second.promise)
+  try {
+    flush(() => assert.equal(current().setPendingReplacement(owner), true)); await settle()
+    assert.equal(reads, 1)
+    assert.equal(view.component('ViewerEditToolbar').sceneEditControls, undefined, 'Pending validation confers no edit/save capability')
+    owner = current().getCheckpointOwner('wait')
+    flush(() => assert.equal(current().setPendingReplacement(owner, chosen), true)); await settle()
+    assert.equal(reads, 2)
+    assert.equal(view.component('ViewerEditToolbar').sceneEditControls, undefined)
+    first.resolve({ workspaceDir: bridge.workspaceDir }); await settle()
+    assert.equal(view.component('ViewerEditToolbar').sceneEditControls, undefined, 'Retired revision validation cannot enable current authority')
+    assert.equal(bridge.writes.length, 1)
+    second.resolve({ workspaceDir: bridge.workspaceDir }); await settle()
+  } finally {
+    first.resolve({ workspaceDir: bridge.workspaceDir }); second.resolve({ workspaceDir: bridge.workspaceDir })
+    window.electron.settings.get = originalGet
+  }
+  const after = view.component('ViewerEditToolbar').sceneEditControls
+  const ownerAfter = current().getCheckpointOwner('wait')
+  assert.equal(ownerAfter.runId, owner.runId); assert.equal(ownerAfter.inputArtifactId, owner.inputArtifactId); assert.equal(ownerAfter.inputVersionId, owner.inputVersionId)
+  assert.ok(find(view.host, node => node.type === 'primitive' && node.props.object === rig!.scene))
+  assert.equal(current().getPendingReplacement(ownerAfter).versionId, chosen.versionId)
+  assert.equal(after.excludedCount, 1, 'Revision-only revalidation preserves authored exclusions')
+  assert.equal(after.mode, 'editing', 'Revision-only revalidation preserves edit mode')
+  assert.equal(after.canSave, true)
+  await current().run(graph, []); await settle()
+  assert.notEqual(current().getCheckpointOwner('wait').runId, ownerAfter.runId)
+  assert.equal(view.component('ViewerEditToolbar').sceneEditControls.excludedCount, 0, 'A genuinely new run retires the authored context')
+  assert.equal(view.component('ViewerEditToolbar').sceneEditControls.mode, 'available')
 })

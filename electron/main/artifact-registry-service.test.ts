@@ -988,7 +988,7 @@ test('validates rig rename sidecar v1 schema and source metadata before writing 
       { sidecar: rigRenameSidecar({ schema: 'modly.landmarks' }), message: /schema/i },
       { sidecar: rigRenameSidecar({ version: 2 }), message: /version/i },
       { sidecar: rigRenameSidecar({ source: { workspacePath: 'Workflows/checkpoints/other.glb' } }), message: /source|workspacePath/i },
-      { sidecar: rigRenameSidecar({ aliases: {} }), message: /aliases/i },
+      { sidecar: rigRenameSidecar({ aliases: [] }), message: /aliases/i },
     ]
 
     for (const invalid of invalidSidecars) {
@@ -1728,3 +1728,160 @@ test('external inner symlinks never read or overwrite the external target', () =
   assert.equal((await writeArtifactSidecar({ workspaceDir, workspacePath: 'external/mesh.glb', artifactId: 'mesh', metadata: {} })).success, false)
   assert.equal(await readFile(path.join(outside, 'mesh.glb.artifact.json'), 'utf8'), 'external bytes')
 })))
+
+for (const kind of ['rig', 'pose'] as const) {
+  test(`${kind} sidecar refuses different same-basename owner and malformed existing records without changing bytes`, () => withTempWorkspace(async (workspaceDir) => {
+    const writer = kind === 'rig' ? artifactRegistryService.writeRigRenameSidecar : writePoseClipSidecar
+    const makeSidecar = kind === 'rig' ? rigRenameSidecar : poseClipSidecar
+    const sidecarWorkspacePath = kind === 'rig' ? 'Workflows/rig-edits/hero-rig-aliases.rig.v1.json' : 'Workflows/pose-clips/hero.pose-clip.v1.json'
+    const sourceA = 'A/hero.glb'; const sourceB = 'B/hero.glb'
+    await createRegularSource(workspaceDir, sourceA); await createRegularSource(workspaceDir, sourceB)
+    const request = (sourceWorkspacePath: string) => ({ workspaceDir, sourceWorkspacePath, sidecarWorkspacePath, sidecar: makeSidecar({ source: { workspacePath: sourceWorkspacePath } }) })
+    assert.equal((await writer(request(sourceA))).success, true)
+    const target = path.join(workspaceDir, sidecarWorkspacePath); const before = await readFile(target)
+    const rejected = await writer(request(sourceB))
+    assert.equal(rejected.success, false)
+    assert.match(!rejected.success ? rejected.error : '', /owner|different source/i)
+    assert.deepEqual(await readFile(target), before)
+    assert.equal((await writer(request(sourceA))).success, true)
+    for (const contents of ['{bad', '{}', JSON.stringify({ source: { workspacePath: sourceA } })]) {
+      await writeFile(target, contents)
+      const invalid = await writer(request(sourceA))
+      assert.equal(invalid.success, false)
+      assert.match(!invalid.success ? invalid.error : '', /owner|existing/i)
+      assert.equal(await readFile(target, 'utf8'), contents)
+    }
+    for (const source of [sourceA, sourceB]) assert.equal(await readFile(path.join(workspaceDir, source), 'utf8'), 'owned regular source fixture')
+  }))
+
+  test(`${kind} sidecar serializes concurrent destination ownership while allowing same-owner updates`, () => withTempWorkspace(async (workspaceDir) => {
+    const fs = await import('node:fs/promises')
+    const writer = kind === 'rig' ? artifactRegistryService.writeRigRenameSidecar : writePoseClipSidecar
+    const makeSidecar = kind === 'rig' ? rigRenameSidecar : poseClipSidecar
+    const sidecarWorkspacePath = kind === 'rig' ? 'Workflows/rig-edits/hero.rig.v1.json' : 'Workflows/pose-clips/hero.pose-clip.v1.json'
+    const sources = ['A/hero.glb', 'B/hero.glb']; for (const source of sources) await createRegularSource(workspaceDir, source)
+    const request = (sourceWorkspacePath: string, revision = 0) => ({ workspaceDir, sourceWorkspacePath, sidecarWorkspacePath, sidecar: makeSidecar({ source: { workspacePath: sourceWorkspacePath }, createdAt: `revision-${revision}` }) })
+    const results = await Promise.all(sources.map((source) => writer(request(source))))
+    assert.equal(results.filter((result) => result.success).length, 1)
+    const winner = sources[results.findIndex((result) => result.success)]
+    const loaded = JSON.parse(await readFile(path.join(workspaceDir, sidecarWorkspacePath), 'utf8'))
+    assert.equal(loaded.source.workspacePath, winner)
+    const sameOwner = await Promise.all(Array.from({ length: 8 }, (_, revision) => writer(request(winner, revision))))
+    assert.equal(sameOwner.every((result) => result.success), true)
+    assert.deepEqual(await fs.readdir(path.dirname(path.join(workspaceDir, sidecarWorkspacePath))), [path.basename(sidecarWorkspacePath)])
+  }))
+}
+
+for (const kind of ['rig', 'pose'] as const) {
+  test(`${kind} ownership queue releases after failed publication and unreadable existing content`, () => withTempWorkspace(async (workspaceDir) => {
+    const fs = await import('node:fs/promises')
+    let failRename = true; let failRead = false
+    let releaseFirst!: () => void; let enteredFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const firstEntered = new Promise<void>((resolve) => { enteredFirst = resolve })
+    let pathCalls = 0
+    const service = await loadArtifactServiceWithFs({
+      realpath: async (...args: Parameters<typeof fs.realpath>) => {
+        if (++pathCalls === 1) { enteredFirst(); await firstGate }
+        return fs.realpath(...args)
+      },
+      rename: async (...args: Parameters<typeof fs.rename>) => {
+        if (failRename) { failRename = false; throw new Error('Injected publish failure') }
+        return fs.rename(...args)
+      },
+      open: async (...args: Parameters<typeof fs.open>) => {
+        if (failRead) throw Object.assign(new Error('Injected owner read failure'), { code: 'EACCES' })
+        return fs.open(...args)
+      },
+    })
+    const writer = kind === 'rig' ? service.writeRigRenameSidecar : service.writePoseClipSidecar
+    const sidecarWorkspacePath = kind === 'rig' ? 'Workflows/rig-edits/hero.rig.v1.json' : 'Workflows/pose-clips/hero.pose-clip.v1.json'
+    const sidecar = (kind === 'rig' ? rigRenameSidecar : poseClipSidecar)({ source: { workspacePath: 'A/hero.glb' } })
+    await createRegularSource(workspaceDir, 'A/hero.glb')
+    const request = { workspaceDir, sourceWorkspacePath: 'A/hero.glb', sidecarWorkspacePath, sidecar }
+    const requests = [
+      { ...request, sidecar: { ...sidecar, createdAt: 'first-caller' } },
+      { ...request, sidecar: { ...sidecar, createdAt: 'second-caller' } },
+    ]
+    const first = writer(requests[0])
+    await firstEntered
+    // Force the second caller to reach publication first; queue arrival is after IO.
+    const second = await writer(requests[1])
+    releaseFirst()
+    const results = [await first, second]
+    assert.equal(results.filter((result) => result.success).length, 1)
+    const failed = results.find((result) => !result.success)
+    assert.ok(failed && !failed.success)
+    assert.match(failed.error, /Injected publish failure/)
+    const winner = requests[results.findIndex((result) => result.success)]
+    const target = path.join(workspaceDir, sidecarWorkspacePath); const before = await readFile(target)
+    assert.deepEqual(JSON.parse(before.toString()), JSON.parse(JSON.stringify(winner.sidecar)))
+    failRead = true
+    assert.equal((await writer(request)).success, false)
+    assert.deepEqual(await readFile(target), before)
+    failRead = false
+    assert.equal((await writer(request)).success, true)
+    assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), JSON.parse(JSON.stringify(request.sidecar)))
+    assert.deepEqual(await fs.readdir(path.dirname(target)), [path.basename(target)])
+  }))
+
+  test(`${kind} ownership key covers physical-root aliases but not different workspaces`, () => withTempWorkspace(async (parent) => {
+    const roots = [path.join(parent, 'one'), path.join(parent, 'two')]
+    for (const root of roots) { await mkdir(root); await createRegularSource(root, 'A/hero.glb'); await createRegularSource(root, 'B/hero.glb') }
+    const alias = path.join(parent, 'alias'); await symlink(roots[0], alias)
+    const writer = kind === 'rig' ? artifactRegistryService.writeRigRenameSidecar : writePoseClipSidecar
+    const makeSidecar = kind === 'rig' ? rigRenameSidecar : poseClipSidecar
+    const sidecarWorkspacePath = kind === 'rig' ? 'Workflows/rig-edits/hero.rig.v1.json' : 'Workflows/pose-clips/hero.pose-clip.v1.json'
+    const request = (workspaceDir: string, sourceWorkspacePath: string) => ({ workspaceDir, sourceWorkspacePath, sidecarWorkspacePath, sidecar: makeSidecar({ source: { workspacePath: sourceWorkspacePath } }) })
+    const results = await Promise.all([writer(request(roots[0], 'A/hero.glb')), writer(request(alias, 'B/hero.glb'))])
+    assert.equal(results.filter((result) => result.success).length, 1)
+    const differentRoot = await writer(request(roots[1], 'B/hero.glb'))
+    assert.equal(differentRoot.success, true)
+    assert.equal(JSON.parse(await readFile(path.join(roots[1], sidecarWorkspacePath), 'utf8')).source.workspacePath, 'B/hero.glb')
+  }))
+}
+
+
+test('last alias cancel and revert persist an empty same-source v1 plan and hydrate without resurrection', () => withTempWorkspace(async (workspaceDir) => {
+  // These are real renderer modules at runtime, not additions to the node TS project.
+  const rename = await import(new URL('../../src/areas/generate/rigRenamePlan.ts', import.meta.url).href)
+  const { collectRigSkeletonSummary } = await import(new URL('../../src/areas/generate/rigSkeleton.ts', import.meta.url).href)
+  const sourceWorkspacePath = 'A/hero.glb'
+  await createRegularSource(workspaceDir, sourceWorkspacePath)
+  await createRegularSource(workspaceDir, 'B/hero.glb')
+  const summary = collectRigSkeletonSummary({ sourceWorkspacePath, skinnedMeshes: [{ name: 'Body', skeleton: { bones: [{ name: 'Hips' }] } }] })
+  const boneId = summary.bones[0].boneId
+  const aliased = rename.reduceRigRenamePlan(summary, rename.createRigRenamePlan(summary), { type: 'set-alias', boneId, alias: 'Pelvis' })
+  const sidecarWorkspacePath = rename.createRigRenameSidecarWorkspacePath(sourceWorkspacePath)
+  const request = { workspaceDir, sourceWorkspacePath, sidecarWorkspacePath }
+  const writer = artifactRegistryService.writeRigRenameSidecar
+  const target = path.join(workspaceDir, sidecarWorkspacePath)
+  for (const action of [{ type: 'cancel-alias', boneId }, { type: 'revert-all' }] as const) {
+    assert.equal((await writer({ ...request, sidecar: rename.buildRigRenameSidecarV1({ summary, plan: aliased }) })).success, true)
+    const cleared = rename.reduceRigRenamePlan(summary, aliased, action)
+    const emptySidecar = rename.buildRigRenameSidecarV1({ summary, plan: cleared })
+    assert.deepEqual(emptySidecar.aliases, {}); assert.deepEqual(emptySidecar.skeleton.bones, [])
+    const saved = await writer({ ...request, sidecar: emptySidecar })
+    assert.equal(saved.success, true)
+    const read = await readRigRenameSidecar(request)
+    assert.ok(read.success && read.status === 'found')
+    const hydrated = rename.hydrateRigRenamePlanFromSidecar(summary, read.sidecar, { sourceWorkspacePath })
+    assert.equal(hydrated.valid, true); assert.deepEqual(hydrated.plan.aliases, {})
+    const persisted = await readFile(target)
+    assert.deepEqual(JSON.parse(persisted.toString()), JSON.parse(JSON.stringify(emptySidecar)))
+    assert.equal((await writer({ ...request, sidecar: emptySidecar })).success, true)
+    const foreign = await writer({ ...request, sourceWorkspacePath: 'B/hero.glb', sidecar: { ...emptySidecar, source: { workspacePath: 'B/hero.glb' } } })
+    assert.equal(foreign.success, false)
+    assert.deepEqual(await readFile(target), persisted)
+    for (const invalid of [
+      { ...emptySidecar, aliases: [] }, { ...emptySidecar, skeletonContextId: '' },
+      { ...emptySidecar, source: {} }, { ...emptySidecar, skeleton: { ...emptySidecar.skeleton, boneCount: 0 } },
+      { ...emptySidecar, aliases: aliased.aliases },
+    ]) {
+      assert.equal((await writer({ ...request, sidecar: invalid as never })).success, false)
+      assert.deepEqual(await readFile(target), persisted)
+    }
+  }
+  assert.equal(await readFile(path.join(workspaceDir, sourceWorkspacePath), 'utf8'), 'owned regular source fixture')
+  assert.equal(await readFile(path.join(workspaceDir, 'B/hero.glb'), 'utf8'), 'owned regular source fixture')
+}))

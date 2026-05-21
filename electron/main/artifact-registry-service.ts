@@ -821,6 +821,8 @@ function validateRigRenameSidecarV1Payload(value: unknown, sourceWorkspacePath: 
   if (!isRecord(value)) return ['invalid_sidecar']
 
   const errors: string[] = []
+  // A source/context-bound empty plan persists removal of the final saved alias.
+  const emptyAliases = isRecord(value.aliases) && Object.keys(value.aliases).length === 0
   if (value.schema !== 'modly.rig.rename-plan') errors.push('invalid_schema')
   if (value.version !== 1) errors.push('invalid_version')
   if (typeof value.createdAt !== 'string' || value.createdAt.length === 0) errors.push('invalid_created_at')
@@ -839,7 +841,7 @@ function validateRigRenameSidecarV1Payload(value: unknown, sourceWorkspacePath: 
   } else {
     if (!Array.isArray(value.skeleton.rootBoneIds) || value.skeleton.rootBoneIds.some((id) => typeof id !== 'string' || id.length === 0)) errors.push('invalid_skeleton_root_bone_ids')
     if (typeof value.skeleton.boneCount !== 'number' || !Number.isInteger(value.skeleton.boneCount) || value.skeleton.boneCount < 1) errors.push('invalid_skeleton_bone_count')
-    if (!Array.isArray(value.skeleton.bones) || value.skeleton.bones.length === 0) {
+    if (!Array.isArray(value.skeleton.bones) || (value.skeleton.bones.length === 0 && !emptyAliases)) {
       errors.push('invalid_skeleton_bones')
     } else {
       for (const bone of value.skeleton.bones) {
@@ -851,7 +853,7 @@ function validateRigRenameSidecarV1Payload(value: unknown, sourceWorkspacePath: 
     }
   }
 
-  if (!isRecord(value.aliases) || Object.keys(value.aliases).length === 0) {
+  if (!isRecord(value.aliases)) {
     errors.push('invalid_aliases')
   } else {
     for (const [boneId, aliasEntry] of Object.entries(value.aliases)) {
@@ -1168,6 +1170,50 @@ async function publishArtifactFiles(
   }
 }
 
+// Shared across both IPC writers; the key includes the physical workspace root.
+// This coordinates in-process writes, not hostile external directory replacement.
+const authoredSidecarPublications = new Map<string, Promise<void>>()
+
+async function publishSourceOwnedSidecar(
+  workspaceDir: string,
+  workspacePath: string,
+  sourceWorkspacePath: string,
+  bytes: string,
+  validate: (value: unknown, sourceWorkspacePath: string) => string[],
+): Promise<void> {
+  const target = await physicalArtifactPath(workspaceDir, workspacePath, 'optional')
+  const previous = authoredSidecarPublications.get(target.absolutePath) ?? Promise.resolve()
+  let release!: () => void
+  const turn = new Promise<void>((resolve) => { release = resolve })
+  const queued = previous.then(() => turn)
+  authoredSidecarPublications.set(target.absolutePath, queued)
+  await previous
+  try {
+    let existing: unknown
+    try {
+      existing = await readArtifactJson(workspaceDir, workspacePath)
+    } catch (error) {
+      if (!isRecord(error) || error.code !== 'ENOENT') {
+        throw new Error('Existing sidecar ownership cannot be read; preserve or relocate it before saving.', { cause: error })
+      }
+    }
+    if (existing !== undefined) {
+      // Validate the entire stored record, not an untrusted source field alone.
+      if (!isRecord(existing) || !isRecord(existing.source) || typeof existing.source.workspacePath !== 'string'
+        || validate(existing, existing.source.workspacePath).length > 0) {
+        throw new Error('Existing sidecar ownership is invalid; preserve or relocate it before saving.')
+      }
+      if (existing.source.workspacePath !== sourceWorkspacePath) {
+        throw new Error('Existing sidecar belongs to a different source owner; use a distinct sidecar path.')
+      }
+    }
+    await publishArtifactFiles(workspaceDir, [{ workspacePath, bytes }], true)
+  } finally {
+    release()
+    if (authoredSidecarPublications.get(target.absolutePath) === queued) authoredSidecarPublications.delete(target.absolutePath)
+  }
+}
+
 export async function writeArtifactSidecar(request: ArtifactRegistryWriteRequest): Promise<ArtifactRegistryWriteResult> {
   try {
     const assetPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.workspacePath)
@@ -1302,7 +1348,7 @@ export async function writeRigRenameSidecar(request: RigRenameSidecarWriteServic
     const sidecar = serializedSidecar as RigRenameSidecarWriteRequest['sidecar']
 
     await physicalArtifactPath(request.workspaceDir, sourcePath.workspacePath)
-    await publishArtifactFiles(request.workspaceDir, [{ workspacePath: sidecarPath.workspacePath, bytes: sidecarBytes }], true)
+    await publishSourceOwnedSidecar(request.workspaceDir, sidecarPath.workspacePath, sourcePath.workspacePath, sidecarBytes, validateRigRenameSidecarV1Payload)
 
     return {
       success: true,
@@ -1374,7 +1420,7 @@ export async function writePoseClipSidecar(request: PoseClipSidecarWriteServiceR
     }
 
     await physicalArtifactPath(request.workspaceDir, sourcePath.workspacePath)
-    await publishArtifactFiles(request.workspaceDir, [{ workspacePath: sidecarPath.workspacePath, bytes: sidecarBytes }], true)
+    await publishSourceOwnedSidecar(request.workspaceDir, sidecarPath.workspacePath, sourcePath.workspacePath, sidecarBytes, validatePoseClipSidecarV1Payload)
 
     return {
       success: true,

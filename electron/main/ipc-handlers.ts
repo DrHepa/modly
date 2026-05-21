@@ -35,6 +35,7 @@ import { runProcessExtensionWithDeps } from './run-process-handler'
 import { installGitHubExtensionRepo } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { assertSafeExtensionId, resolveExtensionPathWithinRoot } from './extension-path-guard'
+import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -720,7 +721,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   const workspacePath = (...parts: string[]) =>
     join(getSettings(app.getPath('userData')).workspaceDir, ...parts)
 
-  registerWorkspaceAssetLibraryIpcHandlers({
+  registerArtifactRegistryIpcHandlers({
     ipcMain,
     getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
   })

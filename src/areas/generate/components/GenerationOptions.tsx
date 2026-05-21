@@ -2,28 +2,21 @@ import { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { FieldLabel, Tooltip, ConfirmModal } from '@shared/components/ui'
+import AdvancedOptionsSection from '@areas/workflows/components/AdvancedOptionsSection'
+import { partitionAdvancedParams } from '@areas/workflows/workflowParamSchema'
+import type { ParamSchema } from '@shared/types/electron.d'
 
 import type { CatalogModel } from '../models'
+
+type SelectGenerationParam = Extract<ParamSchema, { type: 'select' }>
+type FloatGenerationParam = Extract<ParamSchema, { type: 'float' }>
+type IntGenerationParam = Extract<ParamSchema, { type: 'int' }>
 
 const REMESH_OPTIONS = [
   { label: 'Quad-Dominant', value: 'quad'     },
   { label: 'Triangle', value: 'triangle' },
   { label: 'None',     value: 'none'     },
 ] as const
-
-// ─── Schema types ──────────────────────────────────────────────────────────────
-
-interface ParamSchema {
-  id: string
-  label: string
-  type: 'select' | 'float' | 'int'
-  default: any
-  min?: number
-  max?: number
-  step?: number
-  options?: { value: any; label: string }[]
-  tooltip?: string
-}
 
 // ─── Dynamic parameter renderers ───────────────────────────────────────────────
 
@@ -38,7 +31,7 @@ function ShuffleIcon(): JSX.Element {
   )
 }
 
-function SelectParam({ schema, value, onChange }: { schema: ParamSchema; value: any; onChange: (v: any) => void }): JSX.Element {
+function SelectParam({ schema, value, onChange }: { schema: SelectGenerationParam; value: any; onChange: (v: any) => void }): JSX.Element {
   return (
     <div className="flex flex-col gap-1.5">
       <FieldLabel label={schema.label} tooltip={schema.tooltip} />
@@ -61,7 +54,7 @@ function SelectParam({ schema, value, onChange }: { schema: ParamSchema; value: 
   )
 }
 
-function FloatParam({ schema, value, onChange }: { schema: ParamSchema; value: any; onChange: (v: any) => void }): JSX.Element {
+function FloatParam({ schema, value, onChange }: { schema: FloatGenerationParam; value: any; onChange: (v: any) => void }): JSX.Element {
   const step = schema.step ?? 0.1
   return (
     <div className="flex flex-col gap-1.5">
@@ -109,7 +102,7 @@ function IntInput({ value, onChange, placeholder, className }: { value: number; 
   )
 }
 
-function IntParam({ schema, value, onChange }: { schema: ParamSchema; value: any; onChange: (v: any) => void }): JSX.Element {
+function IntParam({ schema, value, onChange }: { schema: IntGenerationParam; value: any; onChange: (v: any) => void }): JSX.Element {
   const isSeed = schema.id === 'seed'
   return (
     <div className="flex flex-col gap-1.5">
@@ -360,6 +353,8 @@ export default function GenerationOptions(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- load once backend is ready; getAllModelsStatus is re-created each render (would loop)
   }, [apiUrl])
 
+  const modelParamSections = partitionAdvancedParams(schema)
+
   return (
     <>
     <div className={`flex flex-col px-4 pb-4 gap-3 ${isDisabled ? 'opacity-50 pointer-events-none' : ''}`}>
@@ -403,7 +398,7 @@ export default function GenerationOptions(): JSX.Element {
       </div>
 
       {/* Dynamic model params */}
-      {schema.map((param) => (
+      {modelParamSections.basic.map((param) => (
         <DynamicParam
           key={param.id}
           schema={param}
@@ -411,6 +406,17 @@ export default function GenerationOptions(): JSX.Element {
           onChange={(val) => setModelParam(param.id, val)}
         />
       ))}
+
+      <AdvancedOptionsSection>
+        {modelParamSections.advanced.map((param) => (
+          <DynamicParam
+            key={param.id}
+            schema={param}
+            value={generationOptions.modelParams[param.id] ?? param.default}
+            onChange={(val) => setModelParam(param.id, val)}
+          />
+        ))}
+      </AdvancedOptionsSection>
 
       {/* Separator */}
       <div className="flex items-center gap-2 pt-1">

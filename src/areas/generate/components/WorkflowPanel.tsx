@@ -17,9 +17,21 @@ import ChatPanel from './ChatPanel'
 
 type PanelMode = 'basic' | 'chat'
 import { validateWorkflowProcessRun } from '@areas/workflows/processConnectionRules'
+import AdvancedOptionsSection from '@areas/workflows/components/AdvancedOptionsSection'
 import WorkflowParamControl from '@areas/workflows/components/WorkflowParamControl'
+import { partitionAdvancedParams } from '@areas/workflows/workflowParamSchema'
+import { resolveWaitCheckpointUiState } from '@areas/workflows/nodes/WaitNode'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
 import type { WorkflowRunState } from '@areas/workflows/workflowRunStore'
+import { REQUIRED_LANDMARK_IDS, type LandmarkCaptureState, type LandmarkId } from '@areas/workflows/landmarks'
+import { LANDMARK_GUIDE_ITEM_BY_ID } from '@areas/workflows/landmarkGuideModel'
+import { deriveArtifactHistoryRows, type ArtifactHistoryRow, type LandmarkSidecarLineageMetadata } from '@areas/workflows/workflowArtifacts'
+import type {
+  ArtifactLineage,
+  ArtifactRef,
+  ArtifactReplacementResult,
+  ArtifactSubstitutionPoint,
+} from '@shared/types/artifacts'
 
 const toFlowNodes = (nodes: WFNode[]): FlowNode[] => nodes as unknown as FlowNode[]
 const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
@@ -69,6 +81,222 @@ function mimeFromPath(p: string): string {
 type WorkflowRunErrorCopy = {
   title: string
   detail: string
+}
+
+type WorkflowPanelLandmarkSession = Pick<
+  LandmarkCaptureState,
+  'nodeId' | 'activeLandmarkId' | 'completed' | 'validity' | 'canContinue' | 'error'
+>
+
+type LandmarkLabelCopy = { id: LandmarkId; label: string; token: string }
+
+export type WorkflowPanelLandmarkGuidance = {
+  isActive: boolean
+  currentLabel: string
+  currentToken: string
+  progressLabel: string
+  remainingLabel: string
+  remainingLandmarks: LandmarkLabelCopy[]
+  instruction: string
+  continueLabel: string
+  continueDisabled: boolean
+  placedLandmarks: LandmarkLabelCopy[]
+  error?: string
+}
+
+export type WorkflowRunPrimaryAction =
+  | { kind: 'generate'; label: 'Generate 3D Model'; disabled: boolean }
+  | { kind: 'stop'; label: 'Stop'; disabled: false }
+  | { kind: 'continue-landmarks'; label: string; disabled: boolean }
+
+export type WorkflowLandmarkGuidanceAction =
+  | { kind: 'continue-landmarks'; disabled: boolean }
+  | { kind: 'clear-landmarks'; nodeId: string; disabled: boolean }
+
+export type WorkflowRunLandmarkClearAction = { kind: 'clear-landmarks'; nodeId: string; disabled: boolean }
+
+function formatLandmarkLabel(id: LandmarkId): string {
+  return LANDMARK_GUIDE_ITEM_BY_ID[id].label
+}
+
+function formatLandmarkToken(id: LandmarkId): string {
+  return LANDMARK_GUIDE_ITEM_BY_ID[id].token
+}
+
+function formatLandmarkCopy(id: LandmarkId): LandmarkLabelCopy {
+  return { id, label: formatLandmarkLabel(id), token: formatLandmarkToken(id) }
+}
+
+function countCompletedRequiredLandmarks(session: WorkflowPanelLandmarkSession): number {
+  return REQUIRED_LANDMARK_IDS.filter((id) => session.completed[id] !== undefined).length
+}
+
+export function resolveWorkflowPanelLandmarkGuidance(input: {
+  nodeId: string
+  activeNodeId: string | null
+  session?: WorkflowPanelLandmarkSession
+}): WorkflowPanelLandmarkGuidance {
+  const isActive = input.activeNodeId === input.nodeId && input.session?.nodeId === input.nodeId
+
+  if (!isActive || !input.session) {
+    return {
+      isActive: false,
+      currentLabel: 'Landmarks',
+      currentToken: '•',
+      progressLabel: 'Waiting for the workflow to pause here.',
+      remainingLabel: 'Run the workflow to start guided landmark capture.',
+      remainingLandmarks: REQUIRED_LANDMARK_IDS.map(formatLandmarkCopy),
+      instruction: 'When this step is active, Modly will guide you through five mesh clicks.',
+      continueLabel: 'Continue workflow',
+      continueDisabled: true,
+      placedLandmarks: [],
+    }
+  }
+
+  const session = input.session
+
+  const completedCount = countCompletedRequiredLandmarks(session)
+  const totalCount = REQUIRED_LANDMARK_IDS.length
+  const remainingLabel = session.validity.missing.length === 0
+    ? 'All required landmarks are marked. You can continue.'
+    : `Still needed: ${session.validity.missing.map(formatLandmarkLabel).join(', ')}`
+  const remainingLandmarks = session.validity.missing.map(formatLandmarkCopy)
+
+  return {
+    isActive: true,
+    currentLabel: formatLandmarkLabel(session.activeLandmarkId),
+    currentToken: formatLandmarkToken(session.activeLandmarkId),
+    progressLabel: `${completedCount} of ${totalCount} landmarks marked`,
+    remainingLabel,
+    remainingLandmarks,
+    instruction: 'Click the mesh in the 3D viewer to place this point. To re-mark a point, click the same landmark again in the viewer.',
+    continueLabel: session.canContinue ? 'Continue workflow' : 'Finish all landmarks to continue',
+    continueDisabled: !session.canContinue,
+    placedLandmarks: REQUIRED_LANDMARK_IDS
+      .filter((id) => session.completed[id] !== undefined)
+      .map(formatLandmarkCopy),
+    error: session.error,
+  }
+}
+
+export function resolveWorkflowRunPrimaryAction(input: {
+  runState: Pick<WorkflowRunState, 'status' | 'blockStep' | 'substitutionPoint'>
+  activeNodeId: string | null
+  landmarkSession?: WorkflowPanelLandmarkSession
+  hasRunValidationIssue: boolean
+}): WorkflowRunPrimaryAction {
+  const pausedLandmarksNodeId = input.runState.status === 'paused' && input.runState.blockStep === 'Paused — mark required landmarks'
+    ? input.runState.substitutionPoint?.nodeId
+    : undefined
+
+  if (pausedLandmarksNodeId && input.activeNodeId === pausedLandmarksNodeId && input.landmarkSession?.nodeId === pausedLandmarksNodeId) {
+    return {
+      kind: 'continue-landmarks',
+      label: input.landmarkSession.canContinue ? 'Continue workflow' : 'Finish all landmarks to continue',
+      disabled: !input.landmarkSession.canContinue,
+    }
+  }
+
+  if (input.runState.status === 'running' || input.runState.status === 'paused') {
+    return { kind: 'stop', label: 'Stop', disabled: false }
+  }
+
+  return { kind: 'generate', label: 'Generate 3D Model', disabled: input.hasRunValidationIssue }
+}
+
+export function resolveWorkflowRunLandmarkClearAction(input: {
+  runState: Pick<WorkflowRunState, 'status' | 'blockStep' | 'substitutionPoint'>
+  landmarkSession?: WorkflowPanelLandmarkSession
+}): WorkflowRunLandmarkClearAction | undefined {
+  const pausedLandmarksNodeId = input.runState.status === 'paused' && input.runState.blockStep === 'Paused — mark required landmarks'
+    ? input.runState.substitutionPoint?.nodeId
+    : undefined
+  if (!pausedLandmarksNodeId || input.landmarkSession?.nodeId !== pausedLandmarksNodeId) return undefined
+  if (countCompletedRequiredLandmarks(input.landmarkSession) === 0) return undefined
+  return { kind: 'clear-landmarks', nodeId: pausedLandmarksNodeId, disabled: false }
+}
+
+export function executeWorkflowRunPrimaryAction(
+  action: WorkflowRunPrimaryAction,
+  handlers: { generate: () => void; cancel: () => void; continueRun: () => void },
+): void {
+  if (action.disabled) return
+  if (action.kind === 'continue-landmarks') {
+    handlers.continueRun()
+    return
+  }
+  if (action.kind === 'stop') {
+    handlers.cancel()
+    return
+  }
+  handlers.generate()
+}
+
+export function executeWorkflowLandmarkGuidanceAction(
+  action: WorkflowLandmarkGuidanceAction,
+  handlers: { continueRun: () => void; resetLandmarks: (nodeId: string) => void },
+): void {
+  if (action.disabled) return
+  if (action.kind === 'clear-landmarks') {
+    handlers.resetLandmarks(action.nodeId)
+    return
+  }
+  handlers.continueRun()
+}
+
+export function WorkflowRunFooter({
+  primaryAction,
+  landmarkClearAction,
+  runState,
+  runValidationIssue,
+  isRunning,
+  onGenerate,
+  onCancel,
+  onContinueRun,
+  onResetLandmarks,
+}: {
+  primaryAction: WorkflowRunPrimaryAction
+  landmarkClearAction?: WorkflowRunLandmarkClearAction
+  runState: WorkflowRunState
+  runValidationIssue: { message: string } | null
+  isRunning: boolean
+  onGenerate: () => void
+  onCancel: () => void
+  onContinueRun: () => void
+  onResetLandmarks?: (nodeId: string) => void
+}) {
+  const handlers = { generate: onGenerate, cancel: onCancel, continueRun: onContinueRun }
+  const buttonClass = primaryAction.kind === 'stop'
+    ? 'w-full py-2.5 rounded-lg text-sm font-semibold bg-red-600 hover:bg-red-700 text-white transition-colors'
+    : primaryAction.kind === 'continue-landmarks'
+      ? 'w-full py-2.5 rounded-lg text-sm font-semibold bg-amber-500 hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 transition-colors'
+      : 'w-full py-2.5 rounded-lg text-sm font-semibold bg-accent hover:bg-accent-dark disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors'
+
+  return (
+    <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
+      <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
+      <button
+        onClick={() => executeWorkflowRunPrimaryAction(primaryAction, handlers)}
+        disabled={primaryAction.disabled}
+        className={buttonClass}
+      >
+        {primaryAction.label}
+      </button>
+      {landmarkClearAction && (
+        <button
+          type="button"
+          onClick={() => executeWorkflowLandmarkGuidanceAction(landmarkClearAction, {
+            continueRun: onContinueRun,
+            resetLandmarks: (nodeId) => onResetLandmarks?.(nodeId),
+          })}
+          disabled={landmarkClearAction.disabled}
+          className="w-full py-2 rounded-lg text-xs font-semibold border border-zinc-700 text-zinc-300 hover:border-amber-400/60 hover:text-amber-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          Clear landmarks
+        </button>
+      )}
+    </div>
+  )
 }
 
 function normalizeWorkflowRunError(error?: string): string {
@@ -337,8 +565,96 @@ function TextParamRow({ nodeId, nodes, onPatch }: { nodeId: string; nodes: FlowN
   )
 }
 
+export function ArtifactHistoryDisclosure({
+  rows,
+  defaultExpanded = false,
+  isWaitCheckpoint = true,
+}: {
+  rows: ArtifactHistoryRow[]
+  defaultExpanded?: boolean
+  isWaitCheckpoint?: boolean
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded)
+
+  if (!isWaitCheckpoint) return null
+
+  return (
+    <div className="rounded-md border border-zinc-800/80 bg-zinc-900/45 px-2.5 py-2">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        className="w-full flex items-center justify-between gap-2 text-left"
+      >
+        <span className="flex flex-col gap-0.5 min-w-0">
+          <span className="text-[10px] font-semibold text-zinc-300">Artifact history</span>
+          <span className="text-[10px] text-zinc-500 leading-relaxed">Review the checkpoint artifact before you continue.</span>
+        </span>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+          className={`shrink-0 text-zinc-600 transition-transform ${expanded ? 'rotate-180' : ''}`}>
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
+
+      {expanded && (
+        rows.length > 0 ? (
+          <div className="mt-2 flex flex-col gap-1.5">
+            {rows.map((row) => (
+              <div key={`${row.kind}-${row.artifact?.id ?? row.label}-${row.artifact?.versionId ?? row.status ?? 'row'}`} className="rounded-md bg-zinc-950/40 border border-zinc-800/60 px-2 py-1.5">
+                <p className="text-[10px] font-medium text-zinc-300">{row.label}</p>
+                <p className="mt-0.5 text-[10px] text-zinc-500 leading-relaxed">{row.description}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-[10px] text-zinc-500 leading-relaxed">No artifact history yet.</p>
+        )
+      )}
+    </div>
+  )
+}
+
+export function deriveWaitParamRowArtifactHistoryRows(input: {
+  waitNodeId: string
+  nodeArtifacts: Record<string, ArtifactRef>
+  artifactLineages: Record<string, ArtifactLineage>
+  substitutionPoint?: ArtifactSubstitutionPoint
+  runArtifact?: ArtifactRef
+  replacementResult?: ArtifactReplacementResult
+  pendingReplacement?: ArtifactRef
+  landmarkSidecar?: LandmarkSidecarLineageMetadata
+}): ArtifactHistoryRow[] {
+  return deriveArtifactHistoryRows(input)
+}
+
 function WaitParamRow({ nodeId }: { nodeId: string }) {
-  const { waitState, canContinue, isRunning, label, buttonClass, onContinue } = useWaitButton(nodeId)
+  const runState           = useWorkflowRunStore((s) => s.runState)
+  const activeNodeId       = useWorkflowRunStore((s) => s.activeNodeId)
+  const continueRun        = useWorkflowRunStore((s) => s.continueRun)
+  const pendingReplacement = useWorkflowRunStore((s) => s.pendingReplacement)
+  const nodeArtifacts      = useWorkflowRunStore((s) => s.nodeArtifacts)
+  const artifactLineages   = useWorkflowRunStore((s) => s.artifactLineages)
+  const landmarkSidecars   = useWorkflowRunStore((s) => s.landmarkSidecars)
+  const checkpointUi          = resolveWaitCheckpointUiState({ nodeId, activeNodeId, runState, pendingReplacement })
+  const artifactHistoryRows = deriveWaitParamRowArtifactHistoryRows({
+    waitNodeId: nodeId,
+    nodeArtifacts,
+    artifactLineages,
+    substitutionPoint: runState.substitutionPoint,
+    runArtifact: runState.artifact,
+    replacementResult: runState.replacementResult,
+    pendingReplacement,
+    landmarkSidecar: landmarkSidecars[nodeId],
+  })
+
+  const handleContinue = useCallback(() => {
+    continueRun()
+  }, [continueRun])
+
+  const handleContinueWithReplacement = useCallback(() => {
+    if (!pendingReplacement) return
+    continueRun({ replacementArtifact: pendingReplacement })
+  }, [continueRun, pendingReplacement])
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -348,36 +664,180 @@ function WaitParamRow({ nodeId }: { nodeId: string }) {
         </svg>
         <span className="text-[11px] font-medium text-zinc-300">Wait</span>
       </div>
-      {waitState ? (
-        <button
-          onClick={onContinue}
-          disabled={!canContinue}
-          className={`w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md border transition-colors text-[11px] font-medium ${buttonClass} ${
-            canContinue ? (waitState === 'pending' ? 'animate-pulse' : '') : 'opacity-40 cursor-not-allowed'
-          }`}
-        >
-          {isRunning ? (
-            <>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="animate-spin">
-                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-              </svg>
-              Running…
-            </>
-          ) : (
-            <>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="5 3 19 12 5 21 5 3"/>
-              </svg>
-              {label}
-            </>
+      {checkpointUi.isPaused ? (
+        <div className="flex flex-col gap-1.5">
+          {checkpointUi.isCheckpoint && (
+            <div className="px-2.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/25">
+              <p className="text-[9px] uppercase tracking-wide text-amber-300 font-semibold">{checkpointUi.statusLabel}</p>
+              <p className="mt-0.5 text-[10px] text-zinc-400 leading-relaxed">{checkpointUi.description}</p>
+            </div>
           )}
-        </button>
+          <button
+            onClick={handleContinue}
+            className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-400 hover:bg-amber-500/25 transition-colors text-[11px] font-medium animate-pulse"
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            {checkpointUi.normalContinueLabel}
+          </button>
+          {checkpointUi.showSubstitutedContinue && (
+            <button
+              onClick={handleContinueWithReplacement}
+              className="w-full px-2.5 py-2 rounded-md bg-violet-500/15 border border-violet-500/30 text-violet-200 hover:bg-violet-500/25 transition-colors text-[11px] font-medium"
+            >
+              {checkpointUi.substitutedContinueLabel}
+            </button>
+          )}
+          <ArtifactHistoryDisclosure rows={artifactHistoryRows} />
+        </div>
       ) : (
-        <p className="text-[10px] text-zinc-600 italic px-0.5">
-          Pauses the workflow until you click Continue.
+        <>
+          <p className="text-[10px] text-zinc-600 italic px-0.5">
+            {checkpointUi.description}
+          </p>
+          {artifactHistoryRows.length > 0 && (
+            <ArtifactHistoryDisclosure rows={artifactHistoryRows} />
+          )}
+        </>
+      )}
+      {checkpointUi.rejectionCopy && (
+        <p className="text-[10px] text-zinc-500 leading-relaxed px-0.5">
+          {checkpointUi.rejectionCopy}
         </p>
       )}
     </div>
+  )
+}
+
+export function WorkflowLandmarkGuidance({
+  nodeId,
+  activeNodeId,
+  session,
+  onContinue,
+  onReset,
+  onSelectLandmark,
+}: {
+  nodeId: string
+  activeNodeId: string | null
+  session?: WorkflowPanelLandmarkSession
+  onContinue?: () => void
+  onReset?: () => void
+  onSelectLandmark?: (id: LandmarkId) => void
+}) {
+  const guidance = resolveWorkflowPanelLandmarkGuidance({ nodeId, activeNodeId, session })
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-1.5">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2">
+          <path d="M12 2v20"/><path d="M5 9h14"/><path d="M7 16h10"/>
+        </svg>
+        <span className="text-[11px] font-medium text-zinc-300">Landmarks</span>
+      </div>
+
+      {guidance.isActive ? (
+        <div className="flex flex-col gap-1.5">
+          <div className="px-2.5 py-2 rounded-md bg-amber-500/10 border border-amber-500/25">
+            <p className="text-[9px] uppercase tracking-wide text-amber-300 font-semibold">Mark: <span className="inline-flex items-center justify-center min-w-5 rounded-full bg-amber-400/20 px-1 text-amber-100">{guidance.currentToken}</span> {guidance.currentLabel}</p>
+            <p className="mt-0.5 text-[10px] text-zinc-400 leading-relaxed">{guidance.instruction}</p>
+            <p className="mt-1 text-[10px] text-zinc-300 font-medium">{guidance.progressLabel}</p>
+            <p className="mt-0.5 text-[10px] text-zinc-500 leading-relaxed">{guidance.remainingLabel}</p>
+            {guidance.remainingLandmarks.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                <span className="text-[9px] uppercase tracking-wide text-zinc-500 font-semibold">Next points</span>
+                {guidance.remainingLandmarks.map((landmark) => (
+                  <span key={landmark.id} className="rounded-full border border-zinc-700/70 px-1.5 py-0.5 text-[9px] text-zinc-300">
+                    {landmark.token} {landmark.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {guidance.error && (
+            <p className="px-2.5 py-1.5 rounded-md bg-red-950/40 border border-red-800/50 text-[10px] text-red-300 leading-relaxed">
+              {guidance.error}
+            </p>
+          )}
+
+          {guidance.placedLandmarks.length > 0 && (
+            <div className="rounded-md border border-zinc-800/70 bg-zinc-950/30 px-2.5 py-2">
+              <p className="text-[9px] uppercase tracking-wide text-zinc-500 font-semibold">Placed landmarks</p>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {guidance.placedLandmarks.map((landmark) => (
+                  <button
+                    key={landmark.id}
+                    type="button"
+                    onClick={() => onSelectLandmark?.(landmark.id)}
+                    className="rounded-md border border-zinc-700/70 px-2 py-1 text-[10px] font-medium text-zinc-300 hover:border-amber-400/50 hover:text-amber-200 transition-colors"
+                  >
+                    Re-mark {landmark.token} {landmark.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => executeWorkflowLandmarkGuidanceAction({ kind: 'continue-landmarks', disabled: guidance.continueDisabled }, {
+              continueRun: onContinue ?? (() => {}),
+              resetLandmarks: () => {},
+            })}
+            disabled={guidance.continueDisabled}
+            className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-400 hover:bg-amber-500/25 disabled:opacity-45 disabled:cursor-not-allowed transition-colors text-[11px] font-medium"
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            {guidance.continueLabel}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => executeWorkflowLandmarkGuidanceAction({ kind: 'clear-landmarks', nodeId, disabled: false }, {
+              continueRun: () => {},
+              resetLandmarks: () => onReset?.(),
+            })}
+            className="w-full px-2.5 py-1.5 rounded-md border border-zinc-700/70 text-[10px] font-medium text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors"
+          >
+            Clear landmarks
+          </button>
+        </div>
+      ) : (
+        <p className="text-[10px] text-zinc-600 italic px-0.5 leading-relaxed">
+          {guidance.instruction}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function LandmarksParamRow({ nodeId }: { nodeId: string }) {
+  const activeNodeId = useWorkflowRunStore((s) => s.activeNodeId)
+  const landmarkSession = useWorkflowRunStore((s) => s.landmarkSession)
+  const continueRun = useWorkflowRunStore((s) => s.continueRun)
+  const resetLandmarks = useWorkflowRunStore((s) => s.resetLandmarks)
+  const selectLandmarkForEditing = useWorkflowRunStore((s) => s.selectLandmarkForEditing)
+
+  const handleContinue = useCallback(() => {
+    continueRun()
+  }, [continueRun])
+
+  const handleReset = useCallback(() => {
+    resetLandmarks(nodeId)
+  }, [nodeId, resetLandmarks])
+
+  return (
+    <WorkflowLandmarkGuidance
+      nodeId={nodeId}
+      activeNodeId={activeNodeId}
+      session={landmarkSession}
+      onContinue={handleContinue}
+      onReset={handleReset}
+      onSelectLandmark={selectLandmarkForEditing}
+    />
   )
 }
 
@@ -386,6 +846,7 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
   const node    = nodes.find((n) => n.id === nodeId)
   const data    = node?.data as { enabled: boolean; params: Record<string, unknown> } | undefined
   const enabled = data?.enabled ?? true
+  const paramSections = partitionAdvancedParams(ext.params)
 
   const inputColor  = TYPE_COLOR[ext.input]  ?? '#71717a'
   const outputColor = TYPE_COLOR[ext.output] ?? '#71717a'
@@ -424,7 +885,7 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
 
       {expanded && ext.params.length > 0 && (
         <div className="mt-2 flex flex-col gap-2">
-          {ext.params.map((param) => {
+          {paramSections.basic.map((param) => {
             const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
             return (
               <div key={param.id} className="flex items-start gap-2 min-w-0">
@@ -436,6 +897,20 @@ function ExtensionParamRow({ nodeId, ext, nodes, onPatch }: { nodeId: string; ex
               </div>
             )
           })}
+          <AdvancedOptionsSection>
+            {paramSections.advanced.map((param) => {
+              const val = ((data?.params[param.id] ?? param.default) as boolean | number | string)
+              return (
+                <div key={param.id} className="flex items-start gap-2 min-w-0">
+                  <label className="text-[10px] text-zinc-500 w-20 shrink-0 truncate leading-tight">{param.label}</label>
+                  <div className="min-w-0 flex-1">
+                    <WorkflowParamControl param={param} value={val}
+                      onChange={(v) => onPatch(nodeId, { params: { ...(data?.params ?? {}), [param.id]: v } })} />
+                  </div>
+                </div>
+              )
+            })}
+          </AdvancedOptionsSection>
         </div>
       )}
     </div>
@@ -464,7 +939,13 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     }
   }, [setNodes])
 
-  const { runState, run, cancel } = useWorkflowRunStore()
+  const runState = useWorkflowRunStore((s) => s.runState)
+  const run = useWorkflowRunStore((s) => s.run)
+  const cancel = useWorkflowRunStore((s) => s.cancel)
+  const activeNodeId = useWorkflowRunStore((s) => s.activeNodeId)
+  const landmarkSession = useWorkflowRunStore((s) => s.landmarkSession)
+  const continueRun = useWorkflowRunStore((s) => s.continueRun)
+  const resetLandmarks = useWorkflowRunStore((s) => s.resetLandmarks)
   const isRunning = runState.status === 'running' || runState.status === 'paused'
 
   // Update AddToScene node when run completes
@@ -488,7 +969,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   )
 
   const paramNodes = sortedNodes.filter((n) =>
-    (n.type === 'imageNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode')
+    (n.type === 'imageNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode')
     && (n.data as { showInGenerate?: boolean }).showInGenerate === true,
   )
 
@@ -496,6 +977,14 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
     run(wf, allExtensions)
   }, [firstPreflightIssue, nodes, edges, workflow, allExtensions, run, showToast])
+
+  const primaryAction = resolveWorkflowRunPrimaryAction({
+    runState,
+    activeNodeId,
+    landmarkSession,
+    hasRunValidationIssue: Boolean(runValidationIssue),
+  })
+  const landmarkClearAction = resolveWorkflowRunLandmarkClearAction({ runState, landmarkSession })
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
@@ -510,6 +999,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
               {node.type === 'textNode'  && <TextParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'meshNode'  && <MeshParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'waitNode'  && <WaitParamRow  nodeId={node.id} />}
+              {node.type === 'landmarksNode' && <LandmarksParamRow nodeId={node.id} />}
               {node.type === 'extensionNode' && (() => {
                 const ext = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
                 return ext ? <ExtensionParamRow nodeId={node.id} ext={ext} nodes={nodes} onPatch={patchNode} /> : null
@@ -541,20 +1031,17 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
       </div>
 
       {/* Footer */}
-      <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
-        <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
-        {isRunning ? (
-          <button onClick={() => cancel()}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold bg-red-600 hover:bg-red-700 text-white transition-colors">
-            Stop
-          </button>
-        ) : (
-          <button onClick={handleGenerate} disabled={Boolean(runValidationIssue)}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold bg-accent hover:bg-accent-dark disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors">
-            Generate 3D Model
-          </button>
-        )}
-      </div>
+      <WorkflowRunFooter
+        primaryAction={primaryAction}
+        landmarkClearAction={landmarkClearAction}
+        runState={runState}
+        runValidationIssue={runValidationIssue}
+        isRunning={isRunning}
+        onGenerate={handleGenerate}
+        onCancel={cancel}
+        onContinueRun={continueRun}
+        onResetLandmarks={resetLandmarks}
+      />
     </div>
   )
 }

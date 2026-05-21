@@ -1,5 +1,6 @@
 import type {
   ParamSchema,
+  ParamUiHints,
   RawParamSchema,
   UnsupportedParamSchema,
   WorkflowParamFilter,
@@ -21,6 +22,39 @@ function readString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function normalizeUiHints(value: unknown): ParamUiHints | undefined {
+  if (!isRecord(value)) return undefined
+
+  const control = readString(value.control)
+  const collapsed = readBoolean(value.collapsed)
+  const order = readNumber(value.order)
+  const help = readString(value.help)
+  const ui = {
+    ...(control ? { control } : {}),
+    ...(collapsed !== undefined ? { collapsed } : {}),
+    ...(order !== undefined ? { order } : {}),
+    ...(help ? { help } : {}),
+  }
+
+  return Object.keys(ui).length > 0 ? ui : undefined
+}
+
+function normalizeParamMetadata(raw: Record<string, unknown>) {
+  const advanced = readBoolean(raw.advanced)
+  const group = readString(raw.group)
+  const ui = normalizeUiHints(raw.ui)
+
+  return {
+    ...(advanced !== undefined ? { advanced } : {}),
+    ...(group ? { group } : {}),
+    ...(ui ? { ui } : {}),
+  }
 }
 
 function readPickerIntent(value: unknown): WorkflowPickerIntent | undefined {
@@ -75,6 +109,7 @@ function unsupportedParam(raw: Record<string, unknown>, index: number, reason: s
     default: '',
     reason,
     ...(rawType ? { rawType } : {}),
+    ...normalizeParamMetadata(raw),
   }
 }
 
@@ -93,6 +128,7 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
   const id = readString(raw.id)
   const label = readString(raw.label)
   const tooltip = readString(raw.tooltip)
+  const metadata = normalizeParamMetadata(raw)
 
   if (!id || !label || !type) {
     return unsupportedParam(raw, index, 'Param descriptor is missing id, label, or type')
@@ -113,6 +149,7 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
       default: defaultValue,
       ...(tooltip ? { tooltip } : {}),
       ...(options ? { options } : {}),
+      ...metadata,
     }
   }
 
@@ -132,6 +169,7 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
       ...(tooltip ? { tooltip } : {}),
       ...(pickerIntent ? { pickerIntent } : {}),
       ...(filters ? { filters } : {}),
+      ...metadata,
     }
   }
 
@@ -154,6 +192,7 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
       ...(min !== undefined ? { min } : {}),
       ...(max !== undefined ? { max } : {}),
       ...(step !== undefined ? { step } : {}),
+      ...metadata,
     }
   }
 
@@ -168,6 +207,7 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
       type,
       default: raw.default,
       ...(tooltip ? { tooltip } : {}),
+      ...metadata,
     }
   }
 
@@ -177,6 +217,26 @@ export function normalizeWorkflowParam(raw: RawParamSchema | unknown, index = 0)
 export function normalizeWorkflowParams(raw: unknown): ParamSchema[] {
   if (!Array.isArray(raw)) return []
   return raw.map((param, index) => normalizeWorkflowParam(param, index))
+}
+
+export interface PartitionedWorkflowParams<T extends { advanced?: boolean }> {
+  basic: T[]
+  advanced: T[]
+}
+
+export function partitionAdvancedParams<T extends { advanced?: boolean }>(params: readonly T[]): PartitionedWorkflowParams<T> {
+  const basic: T[] = []
+  const advanced: T[] = []
+
+  for (const param of params) {
+    if (param.advanced === true) {
+      advanced.push(param)
+    } else {
+      basic.push(param)
+    }
+  }
+
+  return { basic, advanced }
 }
 
 export function isSupportedWorkflowParam(param: ParamSchema): param is SupportedWorkflowParam {

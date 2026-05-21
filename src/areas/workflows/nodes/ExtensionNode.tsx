@@ -6,7 +6,9 @@ import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
 import { getProcessTargetPorts, PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
 import { useWorkflowRunStore } from '../workflowRunStore'
+import AdvancedOptionsSection from '../components/AdvancedOptionsSection'
 import WorkflowParamControl from '../components/WorkflowParamControl'
+import { partitionAdvancedParams } from '../workflowParamSchema'
 import BaseNode from './BaseNode'
 
 // ─── Handle colors ────────────────────────────────────────────────────────────
@@ -42,6 +44,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const hasNamedTargetPorts = targetPorts.length > 1 || targetPorts.some((port) => !port.isLegacy)
   const outputColor = PROCESS_PORT_HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams = (ext?.params.length ?? 0) > 0
+  const paramSections = partitionAdvancedParams(ext?.params ?? [])
 
   const patchParam = useCallback((key: string, val: boolean | number | string) => {
     updateNodeData(id, { params: { ...data.params, [key]: val } })
@@ -136,7 +139,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     >
       {hasParams && (
         <div className="px-3 pb-3 pt-2.5 flex flex-col gap-2">
-          {ext!.params.filter(isVisible).map((param) => {
+          {paramSections.basic.filter(isVisible).map((param) => {
             const val = (data.params[param.id] ?? param.default) as boolean | number | string
             return (
               <div key={param.id} className="flex items-start gap-2 min-w-0">
@@ -146,18 +149,20 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
                 </div>
               </div>
             )
-            return ext!.params.filter(isVisible).map((param) => {
-              const val = (data.params[param.id] ?? param.default) as number | string
+          })}
+          <AdvancedOptionsSection>
+            {paramSections.advanced.filter(isVisible).map((param) => {
+              const val = (data.params[param.id] ?? param.default) as boolean | number | string
               return (
-                <div key={param.id} className="flex items-center gap-2">
+                <div key={param.id} className="flex items-start gap-2 min-w-0">
                   <label className="text-[10px] text-zinc-500 w-24 shrink-0 leading-tight">{param.label}</label>
-                  <div className="flex-1">
-                    <ParamControl param={param} value={val} onChange={(v) => patchParam(param.id, v)} resolvedParams={resolvedParams} />
+                  <div className="min-w-0 flex-1">
+                    <WorkflowParamControl param={param} value={val} onChange={(v) => patchParam(param.id, v)} />
                   </div>
                 </div>
               )
-            })
-          })()}
+            })}
+          </AdvancedOptionsSection>
         </div>
       )}
     </BaseNode>

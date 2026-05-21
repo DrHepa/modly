@@ -45,7 +45,27 @@ type AutomationProcessCapability = {
   output?: 'image' | 'text' | 'mesh'
   inputs?: ProcessPort[]
   params_schema?: unknown
+  automation?: CapabilityAutomationMetadata
   ready?: null
+}
+
+type CapabilityPauseMetadata = {
+  supported: boolean
+  checkpoint?: 'interactive'
+}
+
+type CapabilitySubstitutionMetadata = {
+  supported: boolean
+  artifactKinds?: Array<'image' | 'text' | 'mesh'>
+  boundary?: 'ui_only' | 'electron'
+  headless?: boolean
+}
+
+type CapabilityAutomationMetadata = {
+  boundary: 'electron' | 'ui_only'
+  headless: boolean
+  pause: CapabilityPauseMetadata
+  substitution: CapabilitySubstitutionMetadata
 }
 
 export type ProcessPort = {
@@ -62,6 +82,7 @@ type AutomationUiOnlyCapability = {
   type: string
   label: string
   reason: string
+  automation?: CapabilityAutomationMetadata
 }
 
 export type AutomationCapabilitiesResponse = {
@@ -136,6 +157,20 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
     label: 'Add to Scene',
     reason: 'Canvas output node from WorkflowsPage; it targets desktop scene composition only and is intentionally excluded from automation discovery.',
   },
+  {
+    kind: 'ui_only',
+    source: 'ui-only',
+    id: 'artifact-substitution',
+    type: 'artifactSubstitution',
+    label: 'Artifact substitution',
+    reason: 'Pause/edit/continue is declarative only in automation; artifact editing and replacement remain Electron/UI-owned and are not executable headlessly.',
+    automation: {
+      boundary: 'ui_only',
+      headless: false,
+      pause: { supported: true, checkpoint: 'interactive' },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh'], boundary: 'ui_only', headless: false },
+    },
+  },
 ]
 
 export type ParsedManifest = {
@@ -160,6 +195,7 @@ export type ParsedManifest = {
       download_check?: string
       hf_skip_prefixes?: string[]
       weight_owner_id?: string
+      automation?: PartialCapabilityAutomationMetadata
     }[]
 }
 
@@ -178,6 +214,49 @@ export type ListedExtensionNode = {
   weightOwnerId?: string
   sharedOwner?: boolean
   legacyPaths?: string[]
+  automation?: CapabilityAutomationMetadata
+}
+
+type PartialCapabilityPauseMetadata = {
+  supported?: unknown
+  checkpoint?: unknown
+}
+
+type PartialCapabilitySubstitutionMetadata = {
+  supported?: unknown
+  artifactKinds?: unknown
+  boundary?: unknown
+}
+
+type PartialCapabilityAutomationMetadata = {
+  pause?: PartialCapabilityPauseMetadata
+  substitution?: PartialCapabilitySubstitutionMetadata
+}
+
+const CAPABILITY_ARTIFACT_KINDS = new Set(['image', 'text', 'mesh'])
+
+function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
+  const pauseSupported = input?.pause?.supported === true
+  const checkpoint = input?.pause?.checkpoint === 'interactive' ? 'interactive' : undefined
+  const rawArtifactKinds = Array.isArray(input?.substitution?.artifactKinds)
+    ? input.substitution.artifactKinds.filter((kind): kind is 'image' | 'text' | 'mesh' => typeof kind === 'string' && CAPABILITY_ARTIFACT_KINDS.has(kind))
+    : undefined
+  const substitutionSupported = input?.substitution?.supported === true
+  const substitutionBoundary = input?.substitution?.boundary === 'ui_only' ? 'ui_only' : undefined
+
+  return {
+    boundary: 'electron',
+    headless: true,
+    pause: {
+      supported: pauseSupported,
+      ...(checkpoint ? { checkpoint } : {}),
+    },
+    substitution: {
+      supported: substitutionSupported,
+      ...(rawArtifactKinds && rawArtifactKinds.length > 0 ? { artifactKinds: rawArtifactKinds } : {}),
+      ...(substitutionBoundary ? { boundary: substitutionBoundary, headless: false } : {}),
+    },
+  }
 }
 
 function normalizeProcessPorts(inputs: ProcessPort[] | undefined): ProcessPort[] | undefined {
@@ -300,6 +379,10 @@ export function parseExtensionManifest(
           legacyPaths,
         }
 
+    const automationMetadata = parsed.type === 'process' || node.automation
+      ? { automation: normalizeCapabilityAutomationMetadata(node.automation) }
+      : {}
+
     return {
       id: node.id,
       name: node.name ?? node.id,
@@ -310,6 +393,7 @@ export function parseExtensionManifest(
       hfRepo: node.hf_repo,
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
+      ...automationMetadata,
       ...modelOwnership,
     }
   })
@@ -745,6 +829,7 @@ export async function getManifestProcesses(options: {
       output: node.output,
       ...(node.inputs ? { inputs: node.inputs } : {}),
       params_schema: node.paramsSchema,
+      automation: node.automation,
       ready: null,
     }))
   })

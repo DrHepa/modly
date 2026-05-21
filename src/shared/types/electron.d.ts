@@ -1,4 +1,20 @@
 // Type declarations for the Electron API exposed via preload
+import type { ArtifactRef, ArtifactSidecar } from './artifacts'
+import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
+
+export type {
+  ArtifactKind,
+  ArtifactLineage,
+  ArtifactRef,
+  ArtifactSidecar,
+  ArtifactSubstitutionPoint,
+  ArtifactSubstitution,
+  ArtifactSubstitutionStatus,
+  ArtifactVersion,
+  ArtifactVersionRole,
+  LegacyArtifactPayload,
+} from './artifacts'
+
 export {}
 
 import type {
@@ -26,6 +42,26 @@ export interface ExtensionNode {
   weightOwnerId?:   string
   sharedOwner?:     boolean
   legacyPaths?:     string[]
+  automation?:      CapabilityAutomationMetadata
+}
+
+export interface CapabilityPauseMetadata {
+  supported: boolean
+  checkpoint?: 'interactive'
+}
+
+export interface CapabilitySubstitutionMetadata {
+  supported: boolean
+  artifactKinds?: ('image' | 'text' | 'mesh')[]
+  boundary?: 'ui_only' | 'electron'
+  headless?: boolean
+}
+
+export interface CapabilityAutomationMetadata {
+  boundary: 'electron' | 'ui_only'
+  headless: boolean
+  pause: CapabilityPauseMetadata
+  substitution: CapabilitySubstitutionMetadata
 }
 
 export interface ModelOwnershipMetadata {
@@ -80,10 +116,20 @@ export interface WorkflowParamOption {
   label: string
 }
 
+export interface ParamUiHints {
+  control?: string
+  collapsed?: boolean
+  order?: number
+  help?: string
+}
+
 interface WorkflowParamSchemaBase {
   id:       string
   label:    string
   tooltip?: string
+  advanced?: boolean
+  group?:    string
+  ui?:       ParamUiHints
   show_if?: Record<string, boolean | number | string | (boolean | number | string)[]>
 }
 
@@ -262,7 +308,256 @@ export interface ProcessInput {
 export interface ProcessResult {
   filePath?: string
   text?:     string
+  outputType?: 'image' | 'text' | 'mesh'
+  artifact?: ArtifactRef
 }
+
+export interface ArtifactRegistryReadResult {
+  success: boolean
+  sidecar?: ArtifactSidecar
+  error?: string
+}
+
+export interface ArtifactRegistryReadRequest {
+  workspacePath: string
+}
+
+export interface ArtifactRegistryWriteRequest extends ArtifactRegistryReadRequest {
+  artifactId: string
+  metadata: Record<string, unknown>
+}
+
+export interface ArtifactRegistryWriteResult {
+  success: boolean
+  sidecar?: ArtifactSidecar
+  sidecarPath?: string
+  error?: string
+}
+
+export interface EditedSceneArtifactWriteRequest {
+  glbWorkspacePath: string
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  bytes: Uint8Array | ArrayBuffer
+  metadata: Record<string, unknown>
+}
+
+export interface LandmarkSidecarWriteRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  sidecar: LandmarkSidecarV1
+}
+
+export type PoseClipRigBoneId = string
+
+export interface PoseClipVector3 {
+  x: number
+  y: number
+  z: number
+}
+
+export interface PoseClipQuaternion extends PoseClipVector3 {
+  w: number
+}
+
+export interface PoseClipMetadata {
+  id: string
+  name: string
+  durationSeconds: number
+  fps: number
+}
+
+export interface PoseClipSidecarV1 {
+  schema: 'modly.pose-clip'
+  version: 1
+  createdAt: string
+  source: {
+    workspacePath: string
+    artifactId?: string
+    versionId?: string
+  }
+  skeletonContextId: string
+  clip: PoseClipMetadata
+  skeleton: {
+    rootBoneIds: PoseClipRigBoneId[]
+    boneCount: number
+    bones: Array<{
+      boneId: PoseClipRigBoneId
+      label: string
+      originalName: string
+      path: string[]
+    }>
+  }
+  keyframes: Array<{
+    id: string
+    timeSeconds: number
+    boneId: PoseClipRigBoneId
+    rotation: PoseClipQuaternion
+    translation?: PoseClipVector3
+    scale?: PoseClipVector3
+  }>
+}
+
+export interface PoseClipSidecarWriteRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  sidecar: PoseClipSidecarV1
+}
+
+export interface PoseClipSidecarReadRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+}
+
+export interface RigRenameSidecarV1 {
+  schema: 'modly.rig.rename-plan'
+  version: 1
+  createdAt: string
+  source: {
+    workspacePath: string
+    artifactId?: string
+    versionId?: string
+  }
+  skeletonContextId: string
+  skeleton: {
+    rootBoneIds: string[]
+    boneCount: number
+    bones: Array<{
+      boneId: string
+      oldLabel: string
+      originalName: string
+      path: string[]
+    }>
+  }
+  aliases: Record<string, { oldLabel: string; alias: string }>
+}
+
+export interface RigRenameSidecarWriteRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  sidecar: RigRenameSidecarV1
+}
+
+export interface RigRenameSidecarReadRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+}
+
+export interface RigMetaSidecarReadRequest {
+  sourceWorkspacePath: string
+}
+
+export type RigMetaNamingSource = 'semantic_candidates' | 'humanoid_contract'
+
+export interface RigMetaNamingEntry {
+  label: string
+  source: RigMetaNamingSource
+}
+
+export type RigMetaNamingMap = Record<string, RigMetaNamingEntry>
+
+export type LandmarkSidecarWriteResult =
+  | {
+      success: true
+      sidecarWorkspacePath: string
+      sidecar: LandmarkSidecarV1
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type PoseClipSidecarWriteResult =
+  | {
+      success: true
+      sidecarWorkspacePath: string
+      sidecar: PoseClipSidecarV1
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type PoseClipSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      sidecarWorkspacePath: string
+      sidecar: PoseClipSidecarV1
+    }
+  | {
+      success: true
+      status: 'not-found'
+      sidecarWorkspacePath: string
+    }
+  | {
+      success: false
+      status: 'invalid' | 'error'
+      sidecarWorkspacePath?: string
+      error: string
+    }
+
+export type RigRenameSidecarWriteResult =
+  | {
+      success: true
+      sidecarWorkspacePath: string
+      sidecar: RigRenameSidecarV1
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type RigRenameSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      sidecarWorkspacePath: string
+      sidecar: RigRenameSidecarV1
+    }
+  | {
+      success: true
+      status: 'not-found'
+      sidecarWorkspacePath: string
+    }
+  | {
+      success: false
+      status: 'invalid' | 'error'
+      error: string
+    }
+
+export type RigMetaSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      rigMetaWorkspacePath: string
+      rigMeta: unknown
+      namingByBoneId: RigMetaNamingMap
+      warnings: string[]
+    }
+  | {
+      success: true
+      status: 'not-found'
+      rigMetaWorkspacePath: string
+    }
+  | {
+      success: false
+      status: 'invalid'
+      rigMetaWorkspacePath?: string
+      message: string
+    }
+
+export type EditedSceneArtifactWriteResult =
+  | {
+      success: true
+      glbWorkspacePath: string
+      sidecarWorkspacePath: string
+      metadata: Record<string, unknown>
+    }
+  | {
+      success: false
+      error: string
+    }
 
 export interface WFNodeData {
   [key: string]: unknown
@@ -346,6 +641,7 @@ export interface AutomationProcessCapability {
   output?: 'image' | 'text' | 'mesh'
   inputs?: ProcessPort[]
   params_schema?: unknown
+  automation?: CapabilityAutomationMetadata
   ready?: boolean | null
 }
 
@@ -356,6 +652,7 @@ export interface AutomationUiOnlyCapability {
   type?: string
   label: string
   reason: string
+  automation?: CapabilityAutomationMetadata
 }
 
 export interface AutomationCapabilityError {
@@ -490,10 +787,16 @@ declare global {
         listJobs: (collection: string) => Promise<unknown[]>
         saveJobMeta: (collection: string, filename: string, meta: unknown) => Promise<void>
         deleteJob: (collection: string, filename: string) => Promise<void>
-        library: {
-          list: () => Promise<AssetLibraryListResult>
-          read: (request: AssetLibraryReadRequest) => Promise<AssetLibraryReadResult>
-          open: (request: AssetLibraryOpenRequest) => Promise<AssetLibraryOpenResult>
+        artifacts: {
+          writeSidecar: (request: ArtifactRegistryWriteRequest) => Promise<ArtifactRegistryWriteResult>
+          readSidecar: (request: ArtifactRegistryReadRequest) => Promise<ArtifactRegistryReadResult>
+          writeEditedSceneArtifact: (request: EditedSceneArtifactWriteRequest) => Promise<EditedSceneArtifactWriteResult>
+          writeLandmarkSidecar: (request: LandmarkSidecarWriteRequest) => Promise<LandmarkSidecarWriteResult>
+          writePoseClipSidecar: (request: PoseClipSidecarWriteRequest) => Promise<PoseClipSidecarWriteResult>
+          readPoseClipSidecar: (request: PoseClipSidecarReadRequest) => Promise<PoseClipSidecarReadResult>
+          writeRigRenameSidecar: (request: RigRenameSidecarWriteRequest) => Promise<RigRenameSidecarWriteResult>
+          readRigRenameSidecar: (request: RigRenameSidecarReadRequest) => Promise<RigRenameSidecarReadResult>
+          readRigMetaSidecar: (request: RigMetaSidecarReadRequest) => Promise<RigMetaSidecarReadResult>
         }
       }
       setup: {

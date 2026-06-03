@@ -27,6 +27,9 @@ export interface RigBoneNode {
   boneId: RigBoneId
   label: string
   originalName: string
+  /** Index in the first owning mesh's skeleton.bones, not a GLTF node index or stable ID. */
+  nodeIndex?: number
+  role?: string
   path: string[]
   siblingIndex: number
   parentId?: RigBoneId
@@ -116,6 +119,7 @@ export function collectRigSkeletonBinding<Bone extends RigBoneLike>(
       const originalName = bone.name ?? ''
       const node: RigBoneNode = {
         boneId, label, originalName, path: [...(parent?.path ?? []), label], siblingIndex,
+        nodeIndex: mesh.skeleton.bones.indexOf(bone),
         parentId: parent?.boneId, childIds: [],
         warnings: !originalName.trim() ? ['empty-name'] : (counts.get(originalName.trim()) ?? 0) > 1 ? ['duplicate-name'] : [],
       }

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Bone } from 'three'
 
-import { buildRigSelectionOverlay, collectRigSkeletonSummary } from './rigSkeleton.ts'
+import { buildRigSelectionOverlay, collectRigSkeletonBinding, collectRigSkeletonSummary, type RigBoneNode } from './rigSkeleton.ts'
+import { CANONICAL_SEMANTIC_ROLE_IDS, normalizeSemanticRoleId, type SemanticRoleId } from './semanticRoles.ts'
 
 function namedBone(name: string): Bone {
   const bone = new Bone()
@@ -227,7 +228,14 @@ test('unnamed bone IDs and non-bone-parent root ordering survive skeleton-array 
   firstGroup.add(first); secondGroup.add(second); first.add(unnamed, child)
   const bind = (bones: Bone[]) => collectRigSkeletonBinding({ skinnedMeshes: [{ name: 'Body', skeleton: { bones } }] })
   const original = bind([first, unnamed, child, second]); const shuffled = bind([child, second, unnamed, first])
-  assert.deepEqual(shuffled.summary, original.summary)
+  // Source-array indices can change; all stable summary identity must remain unchanged.
+  const withoutSourceIndices = (summary: typeof original.summary) => ({
+    ...summary,
+    bones: summary.bones.map(({ nodeIndex: _nodeIndex, ...node }) => node),
+  })
+  assert.deepEqual(withoutSourceIndices(shuffled.summary), withoutSourceIndices(original.summary))
+  assert.deepEqual(original.summary.bones.map(node => node.nodeIndex), [0, 1, 2, 3])
+  assert.deepEqual(shuffled.summary.bones.map(node => node.nodeIndex), [3, 2, 0, 1])
   assert.deepEqual([...shuffled.bonesById], [...original.bonesById])
   const mixer = new AnimationMixer(scene)
   const track = new QuaternionKeyframeTrack('Tracked.quaternion', [0, 1], [0, 0, 0, 1, 0, 1, 0, 0])
@@ -236,4 +244,68 @@ test('unnamed bone IDs and non-bone-parent root ordering survive skeleton-array 
   assert.equal(child.name, 'Tracked'); assert.equal(track.name, 'Tracked.quaternion')
   assert.equal(unnamed.name, '')
   mixer.stopAllAction(); mixer.uncacheRoot(scene)
+})
+
+
+test('bone metadata retains source-array indices with shared bones and independent contexts', () => {
+  const root = namedBone('Root'); const unnamed = namedBone(''); const named = namedBone(' Named ')
+  root.add(unnamed, named)
+  const otherRoot = namedBone('Root'); const otherChild = namedBone('Child'); otherRoot.add(otherChild)
+  const input = { skinnedMeshes: [
+    { name: 'a b', skeleton: { bones: [named, root, unnamed, named] } },
+    { name: 'Clothing', skeleton: { bones: [unnamed, named, root] } },
+    { name: 'a_b', skeleton: { bones: [otherChild, otherRoot] } },
+  ] }
+  const binding = collectRigSkeletonBinding(input)
+  assert.deepEqual(binding.summary, collectRigSkeletonSummary(input))
+  assert.equal(binding.summary.stats.skinnedMeshCount, 3)
+  assert.equal(binding.summary.bones.length, 5)
+  assert.equal(binding.bonesById.size, 5)
+  assert.equal(new Set(binding.summary.skinnedMeshContexts).size, 2)
+  const expected = new Map([[root, 1], [unnamed, 2], [named, 0], [otherRoot, 1], [otherChild, 0]])
+  for (const node of binding.summary.bones) {
+    const bone = binding.bonesById.get(node.boneId)!
+    assert.equal(node.nodeIndex, expected.get(bone), node.boneId)
+    assert.equal(node.originalName, bone.name)
+    assert.equal(node.role, undefined, 'collection must not infer semantic roles from names')
+  }
+  const unnamedNode = binding.summary.bones.find(node => binding.bonesById.get(node.boneId) === unnamed)!
+  assert.equal(unnamedNode.label, 'Bone 2')
+  assert.equal(unnamedNode.originalName, '')
+  assert.deepEqual([root.name, unnamed.name, named.name], ['Root', '', ' Named '])
+
+  // Metadata is optional for existing consumers, and roles are not restricted at this boundary.
+  const { nodeIndex: _nodeIndex, ...legacyNode }: RigBoneNode = unnamedNode
+  const enrichedNode: RigBoneNode = { ...legacyNode, nodeIndex: 2, role: 'provider_specific_role' }
+  assert.equal(enrichedNode.role, 'provider_specific_role')
+})
+
+test('semantic role contract uses canonical ids and aliases only at ingestion boundaries', () => {
+  assert.deepEqual(CANONICAL_SEMANTIC_ROLE_IDS, [
+    'hips', 'spine', 'chest', 'neck', 'head',
+    'left_upper_arm', 'left_lower_arm', 'left_hand',
+    'right_upper_arm', 'right_lower_arm', 'right_hand',
+    'left_upper_leg', 'left_lower_leg', 'left_foot',
+    'right_upper_leg', 'right_lower_leg', 'right_foot',
+    'left_fingers', 'right_fingers', 'left_toes', 'right_toes',
+  ] satisfies SemanticRoleId[])
+  for (const role of CANONICAL_SEMANTIC_ROLE_IDS) {
+    assert.equal(normalizeSemanticRoleId(role), role)
+  }
+  const aliases: [string, SemanticRoleId][] = [
+    ['hip', 'hips'], ['pelvis', 'hips'], ['root', 'hips'],
+    ['spine1', 'spine'], ['spine2', 'chest'], ['spine3', 'chest'], ['upper chest', 'chest'],
+    ['left_arm', 'left_upper_arm'], ['lupperarm', 'left_upper_arm'], ['L upper arm', 'left_upper_arm'],
+    ['left_forearm', 'left_lower_arm'], ['leftelbow', 'left_lower_arm'],
+    ['right_arm', 'right_upper_arm'], ['rupperarm', 'right_upper_arm'],
+    ['right_forearm', 'right_lower_arm'], ['right_elbow', 'right_lower_arm'],
+    ['left_leg', 'left_upper_leg'], ['leftthigh', 'left_upper_leg'], ['left_shin', 'left_lower_leg'],
+    ['right_leg', 'right_upper_leg'], ['right_thigh', 'right_upper_leg'], ['right_shin', 'right_lower_leg'],
+    ['left_toe_base', 'left_toes'], ['righttoebase', 'right_toes'],
+    ['  LEFT--LOWER ARM  ', 'left_lower_arm'], [' Right ForeArm ', 'right_lower_arm'],
+  ]
+  for (const [alias, expected] of aliases) assert.equal(normalizeSemanticRoleId(alias), expected, alias)
+  for (const unknown of [undefined, '', '   ', 'bone_4', 'unknown_role', 'constructor', ' CONSTRUCTOR ', 'c_o_n_s_t_r_u_c_t_o_r', '__proto__', 'toString']) {
+    assert.equal(normalizeSemanticRoleId(unknown), undefined, String(unknown))
+  }
 })

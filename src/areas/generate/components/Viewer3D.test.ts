@@ -929,6 +929,7 @@ test('Viewer3D rigmeta hydration feeds top-level trusted humanoid contract namin
       boneId: leftUpperLegId,
       label: 'bone_20',
       originalName: 'bone_20',
+      nodeIndex: 0,
       path: ['bone_0', 'bone_20'],
       siblingIndex: 0,
       parentId: summary.rootBoneIds[0],

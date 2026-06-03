@@ -3,6 +3,7 @@ import test from 'node:test'
 import { Bone } from 'three'
 
 import { buildRigSelectionOverlay, collectRigSkeletonSummary } from './rigSkeleton.ts'
+import { CANONICAL_SEMANTIC_ROLE_IDS, normalizeSemanticRoleId } from './semanticRoles.ts'
 
 function namedBone(name: string): Bone {
   const bone = new Bone()
@@ -171,4 +172,13 @@ test('buildRigSelectionOverlay returns null for unknown selected bone IDs', () =
   })
 
   assert.equal(buildRigSelectionOverlay(summary, 'missing-bone'), null)
+})
+
+test('semantic role contract uses canonical ids and aliases only at ingestion boundaries', () => {
+  assert.ok(CANONICAL_SEMANTIC_ROLE_IDS.includes('left_lower_arm'))
+  assert.ok(CANONICAL_SEMANTIC_ROLE_IDS.includes('right_lower_leg'))
+  assert.equal(normalizeSemanticRoleId('left_forearm'), 'left_lower_arm')
+  assert.equal(normalizeSemanticRoleId('right_shin'), 'right_lower_leg')
+  assert.equal(normalizeSemanticRoleId('left_arm'), 'left_upper_arm')
+  assert.equal(normalizeSemanticRoleId('bone_4'), undefined)
 })

@@ -27,6 +27,8 @@ export interface RigBoneNode {
   boneId: RigBoneId
   label: string
   originalName: string
+  nodeIndex?: number
+  role?: string
   path: string[]
   siblingIndex: number
   parentId?: RigBoneId
@@ -186,6 +188,7 @@ function visitBone(input: {
     boneId,
     label: input.prepared.label,
     originalName: input.prepared.originalName,
+    nodeIndex: input.prepared.globalIndex,
     path,
     siblingIndex,
     parentId: input.parentId,

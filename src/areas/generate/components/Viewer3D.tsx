@@ -25,7 +25,7 @@ import { collectSceneParts, createEditPlan, editPlanReducer } from '../sceneEdit
 import type { EditPlan, ScenePart } from '../sceneEdit.types'
 import { buildRigSelectionOverlay, collectRigSkeletonSummary, type RigBoneId, type RigSelectionOverlayViewModel, type RigSkeletonSummary, type RigSkinnedMeshContext } from '../rigSkeleton.ts'
 import { buildRigRenameSidecarV1, createRigRenamePlan, createRigRenameSidecarWorkspacePath, hydrateRigRenamePlanFromSidecar, reduceRigRenamePlan, validateRigRenamePlan, type RigRenamePlan, type RigRenameValidationResult } from '../rigRenamePlan.ts'
-import { buildPoseClipSidecarV1, clampPoseClipTime, createPoseClipCaptureKeyframeId, createPoseClipPlan, createPoseClipSidecarWorkspacePath, hydratePoseClipPlanFromSidecar, reducePoseClipPlan, type PoseClipPlan, type PoseClipQuaternion, type PoseClipSidecarV1 } from '../poseClipPlan.ts'
+import { buildPoseClipSidecarV1, clampPoseClipTime, createLegacyPoseClipSidecarWorkspacePath, createPoseClipCaptureKeyframeId, createPoseClipPlan, createPoseClipSidecarWorkspacePath, hydratePoseClipPlanFromSidecar, reducePoseClipPlan, type PoseClipPlan, type PoseClipQuaternion, type PoseClipSidecarV1 } from '../poseClipPlan.ts'
 import { applyLocalPoseClipRotation, evaluatePoseClipPreview, resetPoseClipPreview, resetPoseClipSelectedBone, restoreThenEvaluatePoseClipPreview, takePoseClipQuaternionSnapshot, type ApplyLocalPoseClipRotationResult, type EvaluatePoseClipPreviewResult, type PoseClipQuaternionSnapshot, type PoseClipRotationAxis } from '../poseClipPreview.ts'
 import { resolveRigDisplayNames, type RigDisplayNamingResult } from '../rigDisplayNames.ts'
 import { normalizeRigMetaNaming, type RigMetaNamingMap } from '../rigMetaNaming.ts'
@@ -2008,8 +2008,12 @@ export function resolveViewer3DRigHydrationRequest(summary?: RigSkeletonSummary)
 
 export function resolveViewer3DPoseClipHydrationRequest(summary?: RigSkeletonSummary): PoseClipSidecarReadRequest | null {
   if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  const sidecarWorkspacePath = createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath)
+  if (!sidecarWorkspacePath) return null
+  const legacySidecarWorkspacePath = createLegacyPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath)
   return {
-    sidecarWorkspacePath: createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sidecarWorkspacePath,
+    ...(legacySidecarWorkspacePath && legacySidecarWorkspacePath !== sidecarWorkspacePath ? { legacySidecarWorkspacePath } : {}),
     sourceWorkspacePath: summary.sourceWorkspacePath,
   }
 }
@@ -2157,10 +2161,14 @@ export async function writeViewer3DPoseClipSidecar({
   if (!summary?.hasRig || !summary.sourceWorkspacePath || state.plan.keyframes.length === 0) {
     return { success: false, error: 'Pose clip sidecar requires a valid source-backed rig and at least one keyframe.' }
   }
+  const sidecarWorkspacePath = createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath)
+  if (!sidecarWorkspacePath) {
+    return { success: false, error: 'Pose clip sidecar requires a safe workspace-relative source path.' }
+  }
 
   const sidecar = buildPoseClipSidecarV1({ summary, plan: state.plan, createdAt }) as unknown as PoseClipSidecarV1
   return writer({
-    sidecarWorkspacePath: createPoseClipSidecarWorkspacePath(summary.sourceWorkspacePath),
+    sidecarWorkspacePath,
     sourceWorkspacePath: summary.sourceWorkspacePath,
     sidecar: sidecar as unknown as PoseClipSidecarWriteRequest['sidecar'],
   })

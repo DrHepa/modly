@@ -5,6 +5,7 @@ import {
   buildPoseClipSidecarV1,
   clampPoseClipTime,
   createPoseClipCaptureKeyframeId,
+  createLegacyPoseClipSidecarWorkspacePath,
   createPoseClipDuplicateKeyframeId,
   createPoseClipPlan,
   createPoseClipSidecarWorkspacePath,
@@ -196,10 +197,70 @@ test('buildPoseClipSidecarV1 creates sidecar-first schema metadata and determini
   })
   assert.equal(
     createPoseClipSidecarWorkspacePath('Workflows/generated/nested/hero character.glb'),
-    'Workflows/pose-clips/hero-character.pose-clip.v1.json',
+    'Workflows/pose-clips/hero-character--src-017862172bbbcc46.pose-clip.v1.json',
   )
   assert.deepEqual(plan, planBefore)
   assert.deepEqual(rigSummary, summaryBefore)
+})
+
+test('createPoseClipSidecarWorkspacePath should derive distinct sidecars for same-basename workflow sources', () => {
+  const sourceA = 'Workflows/run-a/animated.glb'
+  const sourceB = 'Workflows/run-b/animated.glb'
+
+  const sidecarA = createPoseClipSidecarWorkspacePath(sourceA)
+  const sidecarB = createPoseClipSidecarWorkspacePath(sourceB)
+
+  assert.equal(sidecarA, 'Workflows/pose-clips/animated--src-9d243f14d9c41ea6.pose-clip.v1.json')
+  assert.equal(sidecarB, 'Workflows/pose-clips/animated--src-47c514e2ff697745.pose-clip.v1.json')
+  assert.notEqual(
+    sidecarA,
+    sidecarB,
+    'Pose/Clip sidecar paths must include collision-resistant source identity, not only the source basename.',
+  )
+})
+
+test('createPoseClipSidecarWorkspacePath is deterministic, readable and rejects unsafe source paths with null', () => {
+  const source = 'Workflows/generated/hero character.glb'
+
+  assert.equal(
+    createPoseClipSidecarWorkspacePath(source),
+    createPoseClipSidecarWorkspacePath(source),
+  )
+  assert.match(
+    createPoseClipSidecarWorkspacePath(source) ?? '',
+    /^Workflows\/pose-clips\/hero-character--src-[0-9a-f]{16}\.pose-clip\.v1\.json$/,
+  )
+
+  for (const unsafeSource of [
+    '',
+    '/Workflows/generated/hero.glb',
+    'C:\\Workflows\\generated\\hero.glb',
+    'Workflows\\generated\\hero.glb',
+    'Workflows/generated/../hero.glb',
+  ]) {
+    assert.equal(createPoseClipSidecarWorkspacePath(unsafeSource), null, unsafeSource)
+  }
+})
+
+test('createLegacyPoseClipSidecarWorkspacePath derives only backward-compatible basename sidecars and rejects unsafe source paths', () => {
+  assert.equal(
+    createLegacyPoseClipSidecarWorkspacePath('Workflows/run-a/animated.glb'),
+    'Workflows/pose-clips/animated.pose-clip.v1.json',
+  )
+  assert.equal(
+    createLegacyPoseClipSidecarWorkspacePath('Workflows/run-b/animated.glb'),
+    'Workflows/pose-clips/animated.pose-clip.v1.json',
+  )
+
+  for (const unsafeSource of [
+    '',
+    '/Workflows/generated/hero.glb',
+    'C:\\Workflows\\generated\\hero.glb',
+    'Workflows\\generated\\hero.glb',
+    'Workflows/generated/../hero.glb',
+  ]) {
+    assert.equal(createLegacyPoseClipSidecarWorkspacePath(unsafeSource), null, unsafeSource)
+  }
 })
 
 test('buildPoseClipSidecarV1 preserves the v1 sidecar schema without persisting timeline UI state or embedded export metadata', () => {

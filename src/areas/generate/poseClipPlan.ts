@@ -7,6 +7,11 @@ export const POSE_CLIP_WORKSPACE_SUFFIX = '.pose-clip.v1.json'
 export const MIN_POSE_CLIP_DURATION_SECONDS = 0.001
 export const MIN_POSE_CLIP_FPS = 1
 
+const POSE_CLIP_SOURCE_HASH_SEPARATOR = '--src-'
+const POSE_CLIP_SOURCE_HASH_OFFSET = 0xcbf29ce484222325n
+const POSE_CLIP_SOURCE_HASH_PRIME = 0x100000001b3n
+const POSE_CLIP_SOURCE_HASH_MASK = 0xffffffffffffffffn
+
 export interface PoseClipVector3 {
   x: number
   y: number
@@ -321,8 +326,18 @@ export function hydratePoseClipPlanFromSidecar(
   }
 }
 
-export function createPoseClipSidecarWorkspacePath(sourceWorkspacePath: string): string {
-  return `${POSE_CLIP_WORKSPACE_PREFIX}${createPoseClipSidecarStem(sourceWorkspacePath)}${POSE_CLIP_WORKSPACE_SUFFIX}`
+export function createPoseClipSidecarWorkspacePath(sourceWorkspacePath: string): string | null {
+  const normalizedSourceWorkspacePath = normalizeSafePoseClipSourceWorkspacePath(sourceWorkspacePath)
+  if (!normalizedSourceWorkspacePath) return null
+  const sourceStem = createPoseClipSidecarStem(normalizedSourceWorkspacePath)
+  const sourceHash = hashPoseClipSourceWorkspacePath(normalizedSourceWorkspacePath)
+  return `${POSE_CLIP_WORKSPACE_PREFIX}${sourceStem}${POSE_CLIP_SOURCE_HASH_SEPARATOR}${sourceHash}${POSE_CLIP_WORKSPACE_SUFFIX}`
+}
+
+export function createLegacyPoseClipSidecarWorkspacePath(sourceWorkspacePath: string): string | null {
+  const normalizedSourceWorkspacePath = normalizeSafePoseClipSourceWorkspacePath(sourceWorkspacePath)
+  if (!normalizedSourceWorkspacePath) return null
+  return `${POSE_CLIP_WORKSPACE_PREFIX}${createPoseClipSidecarStem(normalizedSourceWorkspacePath)}${POSE_CLIP_WORKSPACE_SUFFIX}`
 }
 
 export function validatePoseClipSidecarWorkspacePath(input: ValidatePoseClipSidecarWorkspacePathInput): PoseClipValidationResult {
@@ -522,6 +537,26 @@ function createPoseClipSidecarStem(sourceWorkspacePath: string): string {
   const filename = normalized.split('/').filter(Boolean).at(-1) ?? 'pose-clip'
   const withoutExtension = filename.replace(/\.[^.]+$/, '') || 'pose-clip'
   return withoutExtension.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'pose-clip'
+}
+
+function normalizeSafePoseClipSourceWorkspacePath(sourceWorkspacePath: string): string | null {
+  const trimmed = sourceWorkspacePath.trim()
+  if (!trimmed) return null
+  if (trimmed.includes('\\')) return null
+  if (trimmed.startsWith('/') || /^[a-zA-Z]:[\/]/.test(trimmed)) return null
+
+  const segments = trimmed.split('/').filter((segment) => segment.length > 0 && segment !== '.')
+  if (segments.length === 0 || segments.includes('..')) return null
+  return segments.join('/')
+}
+
+function hashPoseClipSourceWorkspacePath(normalizedSourceWorkspacePath: string): string {
+  let hash = POSE_CLIP_SOURCE_HASH_OFFSET
+  for (const character of normalizedSourceWorkspacePath) {
+    hash ^= BigInt(character.codePointAt(0) ?? 0)
+    hash = (hash * POSE_CLIP_SOURCE_HASH_PRIME) & POSE_CLIP_SOURCE_HASH_MASK
+  }
+  return hash.toString(16).padStart(16, '0')
 }
 
 function normalizeWorkspacePath(path: string): string {

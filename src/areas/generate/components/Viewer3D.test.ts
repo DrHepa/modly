@@ -1768,16 +1768,18 @@ test('Viewer3D pose clip save/load uses preload sidecar APIs with workspace-safe
     })
 
     assert.equal(requests.length, 1)
-    assert.equal((requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath, 'Workflows/pose-clips/hero.pose-clip.v1.json')
+    assert.equal((requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath, 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json')
     assert.equal((requests[0] as { sourceWorkspacePath: string }).sourceWorkspacePath, 'Workflows/outputs/hero.glb')
+    assert.equal('legacySidecarWorkspacePath' in (requests[0] as Record<string, unknown>), false)
     assert.equal((requests[0] as { sidecar: { schema: string; source: { workspacePath: string }; skeletonContextId: string; keyframes: unknown[] } }).sidecar.schema, 'modly.pose-clip')
     assert.equal((requests[0] as { sidecar: { source: { workspacePath: string } } }).sidecar.source.workspacePath, 'Workflows/outputs/hero.glb')
     assert.equal((requests[0] as { sidecar: { skeletonContextId: string } }).sidecar.skeletonContextId, 'rig:hero|skeleton:0')
     assert.equal((requests[0] as { sidecar: { keyframes: unknown[] } }).sidecar.keyframes.length, 1)
-    assert.deepEqual(result, { success: true, sidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json', sidecar: (requests[0] as { sidecar: unknown }).sidecar })
+    assert.deepEqual(result, { success: true, sidecarWorkspacePath: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json', sidecar: (requests[0] as { sidecar: unknown }).sidecar })
 
     assert.deepEqual(module.resolveViewer3DPoseClipHydrationRequest(rigSummary), {
-      sidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json',
+      sidecarWorkspacePath: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json',
+      legacySidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json',
       sourceWorkspacePath: 'Workflows/outputs/hero.glb',
     })
   } finally {
@@ -1816,10 +1818,11 @@ test('Viewer3D pose clip save/load regression stays renderer-to-Electron sidecar
 
     assert.equal(requests.length, 1)
     assert.deepEqual((requests[0] as { sidecarWorkspacePath: string; sourceWorkspacePath: string }), {
-      sidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json',
+      sidecarWorkspacePath: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json',
       sourceWorkspacePath: 'Workflows/outputs/hero.glb',
       sidecar: (requests[0] as { sidecar: unknown }).sidecar,
     })
+    assert.equal('legacySidecarWorkspacePath' in (requests[0] as Record<string, unknown>), false)
     assert.equal(result.success, true)
     assert.deepEqual((requests[0] as { sidecar: { keyframes: { timeSeconds: number }[] } }).sidecar.keyframes.map((keyframe) => keyframe.timeSeconds), [0, 0.1])
     assert.deepEqual(Object.keys((requests[0] as { sidecar: Record<string, unknown> }).sidecar), ['schema', 'version', 'createdAt', 'source', 'skeletonContextId', 'clip', 'skeleton', 'keyframes'])
@@ -1827,9 +1830,45 @@ test('Viewer3D pose clip save/load regression stays renderer-to-Electron sidecar
     assert.equal('selectedKeyframeId' in ((requests[0] as { sidecar: Record<string, unknown> }).sidecar), false)
     assert.equal('selectedBoneId' in ((requests[0] as { sidecar: Record<string, unknown> }).sidecar), false)
     assert.deepEqual(module.resolveViewer3DPoseClipHydrationRequest(rigSummary), {
-      sidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json',
+      sidecarWorkspacePath: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json',
+      legacySidecarWorkspacePath: 'Workflows/pose-clips/hero.pose-clip.v1.json',
       sourceWorkspacePath: 'Workflows/outputs/hero.glb',
     })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D pose clip save/load refuses unsafe source paths without deriving sidecars or invoking IPC writers', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    for (const sourceWorkspacePath of [undefined, null, '', '/Workflows/outputs/hero.glb', 'C:\\Workflows\\outputs\\hero.glb', 'Workflows\\outputs\\hero.glb', 'Workflows/outputs/../hero.glb']) {
+      const unsafeSummary = { ...rigSummary, sourceWorkspacePath } as typeof rigSummary
+      let poseState = module.createViewer3DPoseClipState(unsafeSummary)
+      poseState = module.reduceViewer3DPoseClipState(poseState, {
+        type: 'capture-keyframe',
+        summary: unsafeSummary,
+        keyframeId: 'kf-unsafe-source',
+        boneId: 'rig:hero|skeleton:0|bone:hips#0',
+        timeSeconds: 0,
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+      })
+      const requests: unknown[] = []
+
+      assert.equal(module.resolveViewer3DPoseClipHydrationRequest(unsafeSummary), null, String(sourceWorkspacePath))
+      const result = await module.writeViewer3DPoseClipSidecar({
+        state: poseState,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        writer: async (request: unknown) => {
+          requests.push(request)
+          return { success: true, sidecarWorkspacePath: (request as { sidecarWorkspacePath: string }).sidecarWorkspacePath, sidecar: (request as { sidecar: unknown }).sidecar }
+        },
+      })
+
+      assert.equal(result.success, false, String(sourceWorkspacePath))
+      assert.equal(requests.length, 0, String(sourceWorkspacePath))
+    }
   } finally {
     await cleanup()
   }
@@ -1853,7 +1892,7 @@ test('Viewer3D Pose/Clip seams avoid FastAPI orchestration, new IPC contracts, a
     )
     const poseClipSource = [poseClipPanelSource, poseClipPlanSource, poseClipPreviewSource, poseClipLogic, poseClipRuntimeHandlers].join('\n')
 
-    assert.equal(module.resolveViewer3DPoseClipHydrationRequest(rigSummary)?.sidecarWorkspacePath, 'Workflows/pose-clips/hero.pose-clip.v1.json')
+    assert.equal(module.resolveViewer3DPoseClipHydrationRequest(rigSummary)?.sidecarWorkspacePath, 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json')
     assert.match(poseClipRuntimeHandlers, /window\.electron\?\.workspace\?\.artifacts\?\.writePoseClipSidecar/)
     assert.match(poseClipRuntimeHandlers, /window\.electron\?\.workspace\?\.artifacts\?\.readPoseClipSidecar/)
     assert.doesNotMatch(poseClipSource, /fetch\s*\(|axios\.|useGeneration|workflowRun|createFromImage|processRun|FastAPI|8000\/generate|GLTFExporter|exportGLB|writePoseClipEmbedded/i)

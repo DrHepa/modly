@@ -65,6 +65,7 @@ export interface PoseClipSidecarWriteServiceRequest {
 export interface PoseClipSidecarReadServiceRequest {
   workspaceDir: string
   sidecarWorkspacePath: string
+  legacySidecarWorkspacePath?: string
   sourceWorkspacePath: string
 }
 
@@ -308,6 +309,7 @@ function parsePoseClipSidecarReadPayload(payload: unknown, workspaceDir: string)
   return {
     workspaceDir,
     sidecarWorkspacePath: payload.sidecarWorkspacePath,
+    legacySidecarWorkspacePath: typeof payload.legacySidecarWorkspacePath === 'string' ? payload.legacySidecarWorkspacePath : undefined,
     sourceWorkspacePath: payload.sourceWorkspacePath,
   }
 }
@@ -369,6 +371,14 @@ function assertPoseClipSidecarPath(sidecarWorkspacePath: string): void {
   if (!sidecarWorkspacePath.endsWith(POSE_CLIP_SIDECAR_SUFFIX)) {
     throw new Error('Pose clip sidecar path must end with .pose-clip.v1.json')
   }
+}
+
+function isLegacyBasenamePoseClipSidecarPath(sidecarWorkspacePath: string, sourceWorkspacePath: string): boolean {
+  const sidecarName = basename(sidecarWorkspacePath)
+  if (!sidecarName.endsWith(POSE_CLIP_SIDECAR_SUFFIX)) return false
+  const sidecarStem = sidecarName.slice(0, -POSE_CLIP_SIDECAR_SUFFIX.length)
+  const sourceName = basename(sourceWorkspacePath).replace(/\.[^.]+$/, '')
+  return sidecarStem === sourceName
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -873,13 +883,37 @@ export async function readPoseClipSidecar(request: PoseClipSidecarReadServiceReq
   try {
     const sidecarPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sidecarWorkspacePath)
     const sourcePath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sourceWorkspacePath)
+    const legacySidecarPath = request.legacySidecarWorkspacePath
+      ? normalizeWorkspaceArtifactPath(request.workspaceDir, request.legacySidecarWorkspacePath)
+      : null
 
     assertPoseClipSidecarPath(sidecarPath.workspacePath)
+    if (legacySidecarPath) assertPoseClipSidecarPath(legacySidecarPath.workspacePath)
 
     if (sidecarPath.workspacePath === sourcePath.workspacePath || sidecarPath.absolutePath === sourcePath.absolutePath) {
       throw new Error('Pose clip sidecar path must not overwrite the source artifact')
     }
+    if (legacySidecarPath && (legacySidecarPath.workspacePath === sourcePath.workspacePath || legacySidecarPath.absolutePath === sourcePath.absolutePath)) {
+      throw new Error('Pose clip sidecar path must not overwrite the source artifact')
+    }
 
+    const primaryResult = await readPoseClipSidecarAtPath(sidecarPath, sourcePath, true)
+    if (primaryResult.status !== 'not-found' || !legacySidecarPath || legacySidecarPath.workspacePath === sidecarPath.workspacePath) {
+      return primaryResult
+    }
+
+    return await readPoseClipSidecarAtPath(legacySidecarPath, sourcePath, true)
+  } catch (error) {
+    return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function readPoseClipSidecarAtPath(
+  sidecarPath: NormalizedWorkspaceArtifactPath,
+  sourcePath: NormalizedWorkspaceArtifactPath,
+  allowLegacySourceMismatch: boolean,
+): Promise<PoseClipSidecarReadResult> {
+  try {
     let parsedSidecar: unknown
     try {
       parsedSidecar = JSON.parse(await readFile(sidecarPath.absolutePath, 'utf-8'))
@@ -895,6 +929,14 @@ export async function readPoseClipSidecar(request: PoseClipSidecarReadServiceReq
 
     const validationErrors = validatePoseClipSidecarV1Payload(parsedSidecar, sourcePath.workspacePath)
     if (validationErrors.length > 0) {
+      if (
+        allowLegacySourceMismatch
+        && validationErrors.length === 1
+        && validationErrors[0] === 'invalid_source_workspacePath'
+        && isLegacyBasenamePoseClipSidecarPath(sidecarPath.workspacePath, sourcePath.workspacePath)
+      ) {
+        return { success: true, status: 'not-found', sidecarWorkspacePath: sidecarPath.workspacePath }
+      }
       throw new Error(`Invalid pose clip sidecar v1: ${validationErrors.join(', ')}`)
     }
 

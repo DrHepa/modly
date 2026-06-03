@@ -622,10 +622,8 @@ function normalizeRigMetaNamingForRead(rigMeta: unknown, sourceWorkspacePath: st
   }
 
   collectRigMetaNamingRecord(rigMeta.semantic_candidates, 'semantic_candidates', namingByBoneId, warnings)
-  const humanoidContract = isRecord(rigMeta.humanoid_contract) && isRecord(rigMeta.humanoid_contract.bones)
-    ? rigMeta.humanoid_contract.bones
-    : rigMeta.humanoid_contract
-  collectRigMetaNamingRecord(humanoidContract, 'humanoid_contract', namingByBoneId, warnings)
+  collectHumanoidDraftNaming(rigMeta.humanoid_draft, namingByBoneId, warnings)
+  collectHumanoidContractNaming(rigMeta.humanoid_contract, rigMeta, namingByBoneId, warnings)
 
   if (Object.keys(namingByBoneId).length === 0) {
     warnings.push('Rigmeta did not contain supported naming entries.')
@@ -634,16 +632,70 @@ function normalizeRigMetaNamingForRead(rigMeta: unknown, sourceWorkspacePath: st
   return { namingByBoneId, warnings }
 }
 
+function collectHumanoidContractNaming(
+  value: unknown,
+  rigMeta: Record<string, unknown>,
+  output: Extract<RigMetaSidecarReadResult, { status: 'found' }>['namingByBoneId'],
+  warnings: string[],
+): void {
+  if (!isRecord(value)) return
+
+  if (isRecord(value.required_roles)) {
+    collectTrustedHumanoidContractRequiredRoles(value, rigMeta, output)
+    return
+  }
+
+  const humanoidContract = isRecord(value.bones) ? value.bones : value
+  collectRigMetaNamingRecord(humanoidContract, 'humanoid_contract', output, warnings)
+}
+
+function collectTrustedHumanoidContractRequiredRoles(
+  contract: Record<string, unknown>,
+  rigMeta: Record<string, unknown>,
+  output: Extract<RigMetaSidecarReadResult, { status: 'found' }>['namingByBoneId'],
+): void {
+  if (!isTrustedHumanoidRequiredRolesContract(contract, rigMeta)) return
+
+  const knownBoneIds = new Set(Object.keys(output))
+  for (const [role, assignment] of Object.entries(contract.required_roles as Record<string, unknown>)) {
+    const boneId = extractHumanoidContractAssignmentKey(assignment)
+    const label = humanizeRigMetaRoleLabel(role)
+    if (!boneId || !label || !knownBoneIds.has(boneId)) continue
+
+    output[boneId] = { label, source: 'humanoid_contract' }
+  }
+}
+
+function isTrustedHumanoidRequiredRolesContract(contract: Record<string, unknown>, rigMeta: Record<string, unknown>): boolean {
+  if (contract.schema !== 'modly.humanoid.v1') return false
+  if ((contract.humanoid_contract_status ?? rigMeta.humanoid_contract_status) !== 'trusted') return false
+  if (!isRecord(contract.validation) || contract.validation.status !== 'validated') return false
+
+  const trustScope = isRecord(contract.provenance) && isRecord(contract.provenance.trust_scope)
+    ? contract.provenance.trust_scope.trusted
+    : null
+  return Array.isArray(trustScope) && trustScope.includes('required_roles')
+}
+
+function extractHumanoidContractAssignmentKey(assignment: unknown): string | null {
+  if (typeof assignment === 'string') return normalizeRigMetaLabel(assignment)
+  if (!isRecord(assignment)) return null
+  return normalizeRigMetaLabel(assignment.boneId)
+}
+
 function collectRigMetaNamingRecord(
   value: unknown,
   source: 'semantic_candidates' | 'humanoid_contract',
   output: Extract<RigMetaSidecarReadResult, { status: 'found' }>['namingByBoneId'],
   warnings: string[],
 ): void {
-  if (!isRecord(value)) return
+  const record = source === 'semantic_candidates'
+    ? resolveSemanticCandidatesNamingRecord(value)
+    : value
+  if (!isRecord(record)) return
 
   let invalidCount = 0
-  for (const [boneId, candidate] of Object.entries(value)) {
+  for (const [boneId, candidate] of Object.entries(record)) {
     const label = extractRigMetaLabel(candidate)
     if (!label) {
       invalidCount += 1
@@ -654,6 +706,33 @@ function collectRigMetaNamingRecord(
   if (invalidCount > 0) {
     warnings.push(`Rigmeta naming was partially loaded; ${invalidCount} candidate label(s) were ignored.`)
   }
+}
+
+function collectHumanoidDraftNaming(
+  value: unknown,
+  output: Extract<RigMetaSidecarReadResult, { status: 'found' }>['namingByBoneId'],
+  warnings: string[],
+): void {
+  if (!isRecord(value) || !isRecord(value.assignments) || !isRecord(value.assignments.roles)) return
+
+  let invalidCount = 0
+  for (const [role, boneId] of Object.entries(value.assignments.roles)) {
+    const normalizedBoneId = normalizeRigMetaLabel(boneId)
+    const label = humanizeRigMetaRoleLabel(role)
+    if (!normalizedBoneId || !label) {
+      invalidCount += 1
+      continue
+    }
+    output[normalizedBoneId] = { label, source: 'humanoid_draft' }
+  }
+  if (invalidCount > 0) {
+    warnings.push(`Rigmeta naming was partially loaded; ${invalidCount} candidate label(s) were ignored.`)
+  }
+}
+
+function resolveSemanticCandidatesNamingRecord(value: unknown): unknown {
+  if (!isRecord(value)) return value
+  return isRecord(value.roles) ? value.roles : value
 }
 
 function extractRigMetaLabel(candidate: unknown): string | null {
@@ -671,6 +750,16 @@ function normalizeRigMetaLabel(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const label = value.trim()
   return label.length > 0 ? label : null
+}
+
+function humanizeRigMetaRoleLabel(value: string): string | null {
+  const normalized = normalizeRigMetaLabel(value)
+  if (!normalized) return null
+  return normalized
+    .split(/[_-]+/)
+    .filter((segment) => segment.length > 0)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(' ')
 }
 
 async function assertPathDoesNotExist(absolutePath: string, label: string): Promise<void> {

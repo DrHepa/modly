@@ -448,7 +448,7 @@ export interface RigMetaSidecarReadRequest {
   sourceWorkspacePath: string
 }
 
-export type RigMetaNamingSource = 'semantic_candidates' | 'humanoid_contract'
+export type RigMetaNamingSource = 'semantic_candidates' | 'humanoid_contract' | 'humanoid_draft' | 'humanoid_promotion'
 
 export interface RigMetaNamingEntry {
   label: string

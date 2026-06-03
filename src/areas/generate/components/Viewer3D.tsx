@@ -2138,7 +2138,10 @@ export function applyViewer3DRigMetaHydrationResult({
     return { state: { ...state, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING }, warning: null, stale: false }
   }
 
-  const normalized = normalizeRigMetaNaming(result.rigMeta, { expectedSourceWorkspacePath: token.sourceWorkspacePath })
+  const normalized = normalizeRigMetaNaming(result.rigMeta, {
+    expectedSourceWorkspacePath: token.sourceWorkspacePath,
+    summary: state.summary,
+  })
   const warning = normalized.warnings.length > 0 ? { status: 'warning' as const, messages: normalized.warnings } : null
 
   return {

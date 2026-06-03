@@ -174,6 +174,124 @@ function createLongRigSummary(count = 32): RigSkeletonSummary {
   }
 }
 
+function createRawBoneRigSummary(): RigSkeletonSummary {
+  const contextualIds = {
+    hips: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0',
+    spine: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0',
+    unmapped: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0',
+    chest: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0',
+    neck: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0',
+    head: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0/bone_5#0',
+  }
+
+  return {
+    hasRig: true,
+    sourceWorkspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb',
+    skeletonContextId: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0',
+    skinnedMeshContexts: ['rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0'],
+    bones: [
+      {
+        boneId: contextualIds.hips,
+        label: 'bone_0',
+        originalName: 'bone_0',
+        path: ['bone_0'],
+        siblingIndex: 0,
+        childIds: [contextualIds.spine],
+        warnings: [],
+      },
+      {
+        boneId: contextualIds.spine,
+        label: 'bone_1',
+        originalName: 'bone_1',
+        path: ['bone_0', 'bone_1'],
+        siblingIndex: 0,
+        parentId: contextualIds.hips,
+        childIds: [contextualIds.unmapped],
+        warnings: [],
+      },
+      {
+        boneId: contextualIds.unmapped,
+        label: 'bone_2',
+        originalName: 'bone_2',
+        path: ['bone_0', 'bone_1', 'bone_2'],
+        siblingIndex: 0,
+        parentId: contextualIds.spine,
+        childIds: [contextualIds.chest],
+        warnings: [],
+      },
+      {
+        boneId: contextualIds.chest,
+        label: 'bone_3',
+        originalName: 'bone_3',
+        path: ['bone_0', 'bone_1', 'bone_2', 'bone_3'],
+        siblingIndex: 0,
+        parentId: contextualIds.unmapped,
+        childIds: [contextualIds.neck],
+        warnings: [],
+      },
+      {
+        boneId: contextualIds.neck,
+        label: 'bone_4',
+        originalName: 'bone_4',
+        path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4'],
+        siblingIndex: 0,
+        parentId: contextualIds.chest,
+        childIds: [contextualIds.head],
+        warnings: [],
+      },
+      {
+        boneId: contextualIds.head,
+        label: 'bone_5',
+        originalName: 'bone_5',
+        path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4', 'bone_5'],
+        siblingIndex: 0,
+        parentId: contextualIds.neck,
+        childIds: [],
+        warnings: [],
+      },
+    ],
+    rootBoneIds: [contextualIds.hips],
+    stats: { skinnedMeshCount: 1, boneCount: 6 },
+    warnings: [],
+  }
+}
+
+function createRawBone20RigSummary(): RigSkeletonSummary {
+  const rootId = 'rig:Workflows/raw-bone20-unirig.glb|skeleton:0|bone:bone_0#0'
+  const leftUpperLegId = `${rootId}/bone_20#0`
+
+  return {
+    hasRig: true,
+    sourceWorkspacePath: 'Workflows/raw-bone20-unirig.glb',
+    skeletonContextId: 'rig:Workflows/raw-bone20-unirig.glb|skeleton:0',
+    skinnedMeshContexts: ['rig:Workflows/raw-bone20-unirig.glb|skeleton:0'],
+    bones: [
+      {
+        boneId: rootId,
+        label: 'bone_0',
+        originalName: 'bone_0',
+        path: ['bone_0'],
+        siblingIndex: 0,
+        childIds: [leftUpperLegId],
+        warnings: [],
+      },
+      {
+        boneId: leftUpperLegId,
+        label: 'bone_20',
+        originalName: 'bone_20',
+        path: ['bone_0', 'bone_20'],
+        siblingIndex: 0,
+        parentId: rootId,
+        childIds: [],
+        warnings: [],
+      },
+    ],
+    rootBoneIds: [rootId],
+    stats: { skinnedMeshCount: 1, boneCount: 2 },
+    warnings: [],
+  }
+}
+
 function createPlan(summary: RigSkeletonSummary, aliases: RigRenamePlan['aliases'] = {}): RigRenamePlan {
   return { skeletonContextId: summary.skeletonContextId, aliases }
 }
@@ -541,6 +659,67 @@ test('RigEditorPanel gives manual aliases priority over UniRig labels and keeps 
   }
 })
 
+test('RigEditorPanel displays contract-derived semantic labels while keeping original raw bone names and stable alias ids', async () => {
+  const { module, cleanup } = await loadRigEditorPanelModule()
+  const summary = createRawBone20RigSummary()
+  const selectedBone = summary.bones[1]
+  const aliases: Array<[string, string]> = []
+  const effectiveNaming = createEffectiveNaming(summary, {
+    [selectedBone.boneId]: { label: 'Left Upper Leg', provenance: 'unirig' },
+  })
+
+  try {
+    const element = module.RigEditorPanel({
+      ...defaultPanelProps(summary),
+      selectedBoneId: selectedBone.boneId,
+      effectiveNaming,
+      onAliasChange: (boneId: string, alias: string) => aliases.push([boneId, alias]),
+    })
+    const html = renderToStaticMarkup(element)
+
+    assert.match(html, /aria-label="Select bone Left Upper Leg"[^>]*aria-selected="true"/)
+    assert.match(html, /Selected: Left Upper Leg/)
+    assert.match(html, /Name source: UniRig/)
+    assert.match(html, /Original name: bone_20/)
+    assert.doesNotMatch(html, /Selected: bone_20/)
+
+    const aliasInput = findElementByAriaLabel(element, 'Alias for Left Upper Leg')
+    assert.ok(aliasInput, 'expected contract-derived label to be used as input context')
+    ;(aliasInput.props as { onChange: (event: { currentTarget: { value: string } }) => void }).onChange({ currentTarget: { value: 'Manual Leg FK' } })
+
+    assert.deepEqual(aliases, [[selectedBone.boneId, 'Manual Leg FK']])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('RigEditorPanel keeps manual aliases above contract-derived labels for raw-only rigs', async () => {
+  const { module, cleanup } = await loadRigEditorPanelModule()
+  const summary = createRawBone20RigSummary()
+  const selectedBone = summary.bones[1]
+
+  try {
+    const html = renderPanel(module.RigEditorPanel, {
+      ...defaultPanelProps(summary),
+      selectedBoneId: selectedBone.boneId,
+      renamePlan: createPlan(summary, {
+        [selectedBone.boneId]: { oldLabel: selectedBone.label, alias: 'Manual Upper Leg' },
+      }),
+      effectiveNaming: createEffectiveNaming(summary, {
+        [selectedBone.boneId]: { label: 'Manual Upper Leg', provenance: 'manual' },
+      }),
+    })
+
+    assert.match(html, /aria-label="Select bone Manual Upper Leg"[^>]*aria-selected="true"/)
+    assert.match(html, /Selected: Manual Upper Leg/)
+    assert.match(html, /Name source: manual/)
+    assert.match(html, /Original name: bone_20/)
+    assert.doesNotMatch(html, /Selected: Left Upper Leg/)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('RigEditorPanel falls back to raw GLB labels and raw provenance when no alias or UniRig label exists', async () => {
   const { module, cleanup } = await loadRigEditorPanelModule()
   const summary = createRigSummary()
@@ -592,6 +771,41 @@ test('RigEditorPanel callbacks continue to use stable boneId even when effective
     assert.deepEqual(selected, [summary.bones[2].boneId])
     assert.deepEqual(aliases, [[summary.bones[0].boneId, 'Manual Pelvis']])
     assert.deepEqual(summary, beforeSummary)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('RigEditorPanel uses semantic draft labels for raw-bone selected details and hierarchy when effective naming exists', async () => {
+  const { module, cleanup } = await loadRigEditorPanelModule()
+  const summary = createRawBoneRigSummary()
+
+  try {
+    const html = renderPanel(module.RigEditorPanel, {
+      ...defaultPanelProps(summary),
+      selectedBoneId: summary.bones[3]!.boneId,
+      effectiveNaming: createEffectiveNaming(summary, {
+        [summary.bones[0]!.boneId]: { label: 'Hip', provenance: 'manual' },
+        [summary.bones[1]!.boneId]: { label: 'Spine', provenance: 'unirig' },
+        [summary.bones[3]!.boneId]: { label: 'Chest', provenance: 'unirig' },
+        [summary.bones[4]!.boneId]: { label: 'Neck', provenance: 'unirig' },
+        [summary.bones[5]!.boneId]: { label: 'Head', provenance: 'unirig' },
+      }),
+    })
+
+    assert.match(html, /Selected: Chest/)
+    assert.match(html, /Parent: bone_2/)
+    assert.match(html, /Children \(1\): Neck/)
+    assert.match(html, /Path: Hip \/ Spine \/ bone_2 \/ Chest/)
+    assert.match(html, /aria-label="Select bone Hip"/)
+    assert.match(html, /aria-label="Select bone Spine"/)
+    assert.match(html, /aria-label="Select bone Chest"/)
+    assert.match(html, /aria-label="Select bone Neck"/)
+    assert.match(html, /aria-label="Select bone Head"/)
+    assert.doesNotMatch(html, /aria-label="Select bone bone_1"/)
+    assert.doesNotMatch(html, /aria-label="Select bone bone_3"/)
+    assert.doesNotMatch(html, /aria-label="Select bone bone_4"/)
+    assert.doesNotMatch(html, /aria-label="Select bone bone_5"/)
   } finally {
     await cleanup()
   }

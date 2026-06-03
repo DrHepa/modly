@@ -45,7 +45,7 @@ export function RigTargetBrowser({
             <p className="text-xs text-zinc-300">Name source: {formatNameProvenance(selected.provenance)}</p>
             <p className="text-xs text-zinc-300">Parent: {resolveParentLabel(summary.bones, selected.bone, effectiveNaming)}</p>
             <p className="text-xs text-zinc-300">Children ({selected.bone.childIds.length}): {resolveChildrenLabel(summary.bones, selected.bone, effectiveNaming)}</p>
-            <p className="text-xs text-zinc-400">Path: {selected.bone.path.join(' / ')}</p>
+            <p className="text-xs text-zinc-400">Path: {resolvePathLabel(summary.bones, selected.bone, effectiveNaming)}</p>
             <p className="text-xs text-zinc-400">Original name: {selected.bone.originalName || 'Unnamed bone'}</p>
           </div>
 
@@ -93,6 +93,18 @@ function resolveChildrenLabel(bones: RigBoneNode[], selectedBone: RigBoneNode, e
       return child ? resolveBoneDisplayName(child, effectiveNaming) : 'Unknown child'
     })
     .join(', ')
+}
+
+function resolvePathLabel(bones: RigBoneNode[], selectedBone: RigBoneNode, effectiveNaming?: RigEffectiveNamingResult): string {
+  const labels: string[] = []
+  let current: RigBoneNode | undefined = selectedBone
+
+  while (current) {
+    labels.unshift(resolveBoneDisplayName(current, effectiveNaming))
+    current = current.parentId ? bones.find((bone) => bone.boneId === current?.parentId) : undefined
+  }
+
+  return labels.length > 0 ? labels.join(' / ') : selectedBone.path.join(' / ')
 }
 
 function resolveBoneDisplayName(bone: RigBoneNode, effectiveNaming?: RigEffectiveNamingResult): string {

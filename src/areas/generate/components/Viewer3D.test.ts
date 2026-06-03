@@ -877,6 +877,69 @@ test('Viewer3D rigmeta hydration normalizes valid rigmeta into panel props witho
   }
 })
 
+test('Viewer3D rigmeta hydration feeds top-level trusted humanoid contract naming into Rig Editor effective labels', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const { collectRigSkeletonSummary } = await import('../rigSkeleton.ts')
+    const hips = new THREE.Bone(); hips.name = 'bone_0'
+    const leg = new THREE.Bone(); leg.name = 'bone_20'; hips.add(leg)
+    const summary = Object.freeze(collectRigSkeletonSummary({
+      sourceWorkspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb',
+      skinnedMeshes: [{ name: 'Body', skeleton: { bones: [leg, hips] } }],
+    }))
+    const leftUpperLegId = summary.bones.find((bone) => bone.originalName === 'bone_20')!.boneId
+    const state = module.createViewer3DRigEditorState(summary)
+    const token = module.createViewer3DRigMetaHydrationToken({ modelUrl: '1779522315_382fd9a5_unirig.glb', summary })
+
+    const hydrated = module.applyViewer3DRigMetaHydrationResult({
+      state,
+      result: {
+        success: true,
+        status: 'found',
+        rigMetaWorkspacePath: 'Workflows/1779522315_382fd9a5_unirig.rigmeta.json',
+        warnings: [],
+        namingByBoneId: {},
+        rigMeta: {
+          schema: 'modly.unirig.rigmeta',
+          source: { workspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb' },
+          humanoid_contract_status: 'trusted',
+          humanoid_contract: {
+            schema: 'modly.humanoid.v1',
+            required_roles: {
+              hips: 'bone_0',
+              left_upper_leg: 'bone_20',
+            },
+            validation: { status: 'validated' },
+            provenance: { trust_scope: { trusted: ['required_roles', 'role_chains'] } },
+          },
+        },
+      },
+      token,
+      currentToken: token,
+    })
+    const panelProps = module.resolveViewer3DRigEditorPanelProps({ ...hydrated.state, selectedBoneId: leftUpperLegId }, {})
+
+    assert.equal(hydrated.warning, null)
+    assert.deepEqual(hydrated.state.rigMetaNamingByBoneId[leftUpperLegId], { label: 'Left Upper Leg', source: 'humanoid_contract' })
+    assert.equal(panelProps.effectiveNaming.byBoneId[leftUpperLegId].label, 'Left Upper Leg')
+    assert.equal(panelProps.effectiveNaming.byBoneId[leftUpperLegId].rawLabel, 'bone_20')
+    assert.equal(panelProps.effectiveNaming.byBoneId[leftUpperLegId].provenance, 'unirig')
+    assert.deepEqual(summary.bones.at(-1), {
+      boneId: leftUpperLegId,
+      label: 'bone_20',
+      originalName: 'bone_20',
+      path: ['bone_0', 'bone_20'],
+      siblingIndex: 0,
+      parentId: summary.rootBoneIds[0],
+      childIds: [],
+      warnings: [],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
 test('Viewer3D rigmeta hydration keeps invalid rigmeta non-blocking with empty naming and warning', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
@@ -2538,3 +2601,18 @@ function assertQuaternionClose(actual: THREE.Quaternion | undefined, expected: T
   assert.ok(Math.abs(actual.z - expected.z) <= epsilon, `z expected ${expected.z} got ${actual.z}`)
   assert.ok(Math.abs(actual.w - expected.w) <= epsilon, `w expected ${expected.w} got ${actual.w}`)
 }
+
+test('Viewer3D rigmeta hydration preserves main read diagnostics alongside current-summary normalization', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const state = module.createViewer3DRigEditorState(rigSummary)
+    const token = module.createViewer3DRigMetaHydrationToken({ modelUrl: 'hero.glb', summary: rigSummary })
+    const hydrated = module.applyViewer3DRigMetaHydrationResult({ state, token, currentToken: token, result: {
+      success: true, status: 'found', rigMetaWorkspacePath: 'Workflows/outputs/hero.rigmeta.json',
+      rigMeta: { semantic_candidates: { [rigSummary.bones[0]!.boneId]: 'Pelvis' } },
+      namingByBoneId: {}, warnings: ['An optional metadata entry was ignored by the reader.'],
+    } })
+    assert.deepEqual(hydrated.warning?.messages, ['An optional metadata entry was ignored by the reader.'])
+    assert.equal(hydrated.state.rigMetaNamingByBoneId[rigSummary.bones[0]!.boneId].label, 'Pelvis')
+  } finally { await cleanup() }
+})

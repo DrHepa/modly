@@ -1261,3 +1261,88 @@ test('Viewer3D migrates a matching legacy pose through mounted Load and hashed S
   assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
   assert.deepEqual(await readFile(path.join(bridge.workspaceDir, sourceB)), bridge.sourceBytes)
 })
+
+test('Viewer3D mounted adjacent trusted contract resolves real names and IDs without disturbing authored aliases or animation names', async t => {
+  const bridge = await bridgeFixture(t)
+  const metaPath = path.join(bridge.workspaceDir, 'Workflows/rig.rigmeta.json')
+  const meta = { schema: 'modly.unirig.rigmeta', output_mesh: 'rig.glb', humanoid_contract: {
+    schema: 'modly.humanoid.v1', humanoid_contract_status: 'trusted', required_roles: { hips: 'root', head: { boneId: 'child', label: 'Look Control' } },
+    validation: { status: 'validated' }, provenance: { trust_scope: { trusted: ['required_roles'] } },
+  } }
+  await writeFile(metaPath, JSON.stringify(meta))
+  const delayed = deferred()
+  const actualRead = bridge.electron.workspace.artifacts.readRigMetaSidecar
+  let pendingResult: any
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = async (request: any) => { pendingResult = await actualRead(request); return delayed.promise }
+  let rig: ReturnType<typeof authoringAsset>
+  const view = await mount(t, '/workspace/Workflows/rig.glb', h => { rig = authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  view.click('Open Rig Editor (2 bones)')
+  const firstPanel = view.component('RigEditorPanel')
+  const rootId = firstPanel.summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+  const childId = firstPanel.summary.bones.find((bone: any) => bone.originalName === 'child').boneId
+  flush(() => firstPanel.onAliasChange(rootId, 'Manual Pelvis'))
+  // Complete real filesystem IO before releasing the independently deferred UI response.
+  for (let i = 0; !pendingResult && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(pendingResult?.success && pendingResult.status === 'found')
+  delayed.resolve(pendingResult); await settle()
+  const panel = view.component('RigEditorPanel')
+  assert.equal(panel.effectiveNaming.byBoneId[rootId].label, 'Manual Pelvis')
+  assert.equal(panel.effectiveNaming.byBoneId[rootId].provenance, 'manual')
+  assert.equal(panel.effectiveNaming.byBoneId[childId].label, 'Look Control')
+  assert.equal(panel.effectiveNaming.byBoneId[childId].provenance, 'unirig')
+  assert.equal(panel.aliasesDirty, true)
+  flush(() => panel.onCancelAlias(rootId))
+  assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Hips')
+  assert.deepEqual([rig!.root.name, rig!.child.name, rig!.clip.name, rig!.clip.tracks[0].name], ['root', 'child', 'root motion', 'root.quaternion'])
+  assert.equal(await readFile(metaPath, 'utf8'), JSON.stringify(meta))
+  assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
+})
+
+test('Viewer3D metadata captures the reader before awaiting and retires same-URL success and rejection without blocking authoring', async t => {
+  const bridge = await bridgeFixture(t)
+  const metaPath = path.join(bridge.workspaceDir, 'Workflows/rig.rigmeta.json')
+  const metadata = (label: string) => ({ schema: 'modly.unirig.rigmeta', output_mesh: 'rig.glb', humanoid_contract: {
+    schema: 'modly.humanoid.v1', humanoid_contract_status: 'trusted', required_roles: { hips: { boneId: 'root', label } },
+    validation: { status: 'validated' }, provenance: { trust_scope: { trusted: ['required_roles'] } },
+  } })
+  await writeFile(metaPath, JSON.stringify(metadata('Retired Pelvis')))
+  const actualRead = bridge.electron.workspace.artifacts.readRigMetaSidecar
+  const initial = deferred(); const captured = deferred(); let initialRequests = 0
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = async (request: any) => {
+    initialRequests += 1; captured.resolve(await actualRead(request)); return initial.promise
+  }
+  const view = await mount(t, '/workspace/Workflows/rig.glb', h => { authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  // The queued read must use the port captured by its source effect, not this replacement.
+  let wrongReaderCalls = 0
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = async () => { wrongReaderCalls++; throw new Error('wrong reader') }
+  const oldRead = await captured.promise
+  assert.equal(initialRequests, 1); assert.equal(wrongReaderCalls, 0)
+  assert.ok(oldRead.success && oldRead.status === 'found')
+  await writeFile(metaPath, JSON.stringify(metadata('Current Pelvis')))
+  let currentRead: Promise<any> | undefined
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = (request: any) => { currentRead = actualRead(request); return currentRead }
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle(); await currentRead; await settle()
+  view.click('Open Rig Editor (2 bones)')
+  const rootId = view.component('RigEditorPanel').summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+  assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Current Pelvis')
+  initial.resolve(oldRead); await settle()
+  assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Current Pelvis')
+  const rejected = deferred()
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = () => rejected.promise
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle()
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = (request: any) => { currentRead = actualRead(request); return currentRead }
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle(); await currentRead; await settle()
+  view.click('Open Rig Editor (2 bones)')
+  rejected.reject(new Error('retired metadata failure')); await settle()
+  assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Current Pelvis')
+  assert.ok(!view.component('RigEditorPanel').hydrationWarning?.messages.some((message: string) => message.includes('retired metadata failure')))
+  bridge.electron.workspace.artifacts.readRigMetaSidecar = async () => { throw new Error('current metadata failure') }
+  authoringAsset(view.harness, '/workspace/Workflows/rig.glb'); view.render(); await settle()
+  view.click('Open Rig Editor (2 bones)')
+  const panel = view.component('RigEditorPanel')
+  assert.equal(panel.effectiveNaming.byBoneId[rootId].provenance, 'raw')
+  assert.match(panel.hydrationWarning.messages.join('\n'), /current metadata failure/)
+  flush(() => panel.onAliasChange(rootId, 'Still Editable'))
+  assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Still Editable')
+  assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
+})

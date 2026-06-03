@@ -256,6 +256,7 @@ import {
 } from './artifact-registry-service.ts'
 
 import type { LandmarkSidecarV1 } from '../../src/areas/workflows/landmarks.ts'
+import type { RigMetaSidecarReadResult } from '../../src/shared/types/electron.d.ts'
 
 const artifactRegistryService = await import(new URL('./artifact-registry-service.ts', import.meta.url).href)
 
@@ -1513,7 +1514,7 @@ test('reads an adjacent UniRig rigmeta sidecar derived from a safe source mesh p
     await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
     await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMeta, null, 2), 'utf-8')
 
-    const result = await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: 'Workflows/foo_unirig.glb' })
+    const result = await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: 'Workflows/foo_unirig.glb' }) as RigMetaSidecarReadResult
 
     assert.deepEqual(result, {
       success: true,
@@ -1529,6 +1530,143 @@ test('reads an adjacent UniRig rigmeta sidecar derived from a safe source mesh p
     })
     assert.deepEqual(await readFile(sourceMesh), Buffer.from([0x67, 0x6c, 0x62]))
     assert.equal(await readFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), 'utf-8'), JSON.stringify(rigMeta, null, 2))
+  })
+})
+
+test('readRigMetaSidecar exposes humanoid draft role naming and ignores semantic candidate structural fields', async () => {
+  const readRigMetaSidecar = getRigMetaSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+    const sourceMesh = path.join(workspaceDir, 'Workflows', 'foo_unirig.glb')
+    const rigMetaWorkspacePath = 'Workflows/foo_unirig.rigmeta.json'
+    const rigMeta = rigMetaSidecar({
+      semantic_candidates: {
+        schema: 'unirig.semantic_candidates.v1',
+        diagnostics: [{ code: 'missing_core_roles' }],
+        producer: { resolver: 'semantic_humanoid_resolver' },
+        roles: {},
+        chains: {},
+        topology: { joint_count: 52 },
+        transforms: { status: 'available' },
+        trust: { status: 'blocked' },
+      },
+      humanoid_contract: undefined,
+      humanoid_draft: {
+        assignments: {
+          roles: {
+            hips: 'bone_0',
+            spine: 'bone_1',
+          },
+        },
+      },
+    })
+    await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMeta, null, 2), 'utf-8')
+
+    const result = await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: 'Workflows/foo_unirig.glb' }) as RigMetaSidecarReadResult
+
+    assert.equal(result.success, true)
+    assert.equal(result.status, 'found')
+    if (result.success !== true || result.status !== 'found') {
+      assert.fail('expected found rigmeta result')
+    }
+    assert.deepEqual(result.namingByBoneId, {
+      bone_0: { label: 'Hips', source: 'humanoid_draft' },
+      bone_1: { label: 'Spine', source: 'humanoid_draft' },
+    })
+    assert.equal(result.warnings.some((warning: string) => warning.includes('candidate label(s) were ignored')), false)
+  })
+})
+
+test('readRigMetaSidecar extracts trusted humanoid contract required_roles only for known rigmeta bone keys', async () => {
+  const readRigMetaSidecar = getRigMetaSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+    const sourceMesh = path.join(workspaceDir, 'Workflows', 'foo_unirig.glb')
+    const rigMetaWorkspacePath = 'Workflows/foo_unirig.rigmeta.json'
+    const rigMeta = rigMetaSidecar({
+      semantic_candidates: {
+        bone_0: { label: 'Generated pelvis' },
+        bone_1: { label: 'Generated spine' },
+      },
+      humanoid_contract_status: 'trusted',
+      humanoid_contract: {
+        schema: 'modly.humanoid.v1',
+        basis: 'unirig',
+        required_roles: {
+          hips: 'bone_0',
+          spine: 'bone_1',
+          left_upper_leg: 'UpperLeg.L',
+        },
+        chains: {
+          spine: ['hips', 'spine'],
+        },
+        optional_roles: {},
+        validation: { status: 'validated' },
+        provenance: {
+          trust_scope: { trusted: ['required_roles', 'role_chains'] },
+        },
+      },
+    })
+    await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMeta, null, 2), 'utf-8')
+
+    const result = await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: 'Workflows/foo_unirig.glb' }) as RigMetaSidecarReadResult
+
+    assert.equal(result.success, true)
+    assert.equal(result.status, 'found')
+    if (result.success !== true || result.status !== 'found') {
+      assert.fail('expected found rigmeta result')
+    }
+    assert.deepEqual(result.namingByBoneId, {
+      bone_0: { label: 'Hips', source: 'humanoid_contract' },
+      bone_1: { label: 'Spine', source: 'humanoid_contract' },
+    })
+    assert.equal(Object.hasOwn(result.namingByBoneId, 'UpperLeg.L'), false)
+    assert.equal(result.warnings.some((warning: string) => warning.includes('candidate label(s) were ignored')), false)
+  })
+})
+
+test('readRigMetaSidecar does not over-promise raw-name required_roles resolution without a skeleton summary', async () => {
+  const readRigMetaSidecar = getRigMetaSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+    const sourceMesh = path.join(workspaceDir, 'Workflows', 'foo_unirig.glb')
+    const rigMetaWorkspacePath = 'Workflows/foo_unirig.rigmeta.json'
+    const rigMeta = rigMetaSidecar({
+      semantic_candidates: {
+        bone_0: { label: 'Generated pelvis' },
+      },
+      humanoid_contract_status: 'trusted',
+      humanoid_contract: {
+        schema: 'modly.humanoid.v1',
+        required_roles: {
+          hips: 'Hips',
+        },
+        validation: { status: 'validated' },
+        provenance: {
+          trust_scope: { trusted: ['required_roles'] },
+        },
+      },
+    })
+    await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMeta, null, 2), 'utf-8')
+
+    const result = await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: 'Workflows/foo_unirig.glb' }) as RigMetaSidecarReadResult
+
+    assert.equal(result.success, true)
+    assert.equal(result.status, 'found')
+    if (result.success !== true || result.status !== 'found') {
+      assert.fail('expected found rigmeta result')
+    }
+    assert.deepEqual(result.namingByBoneId, {
+      bone_0: { label: 'Generated pelvis', source: 'semantic_candidates' },
+    })
+    assert.equal(Object.hasOwn(result.namingByBoneId, 'Hips'), false)
+    assert.equal(result.warnings.some((warning: string) => warning.includes('candidate label(s) were ignored')), false)
   })
 })
 
@@ -2107,3 +2245,26 @@ test('Pose/Clip IPC forwards source-bound legacy fallback without trusting paylo
   const result = await handlers.get('workspace:artifact:readPoseClipSidecar')!({}, { sourceWorkspacePath, sidecarWorkspacePath, legacySidecarWorkspacePath, workspaceDir: '/ignored' })
   assert.deepEqual(result, { success: true, status: 'found', sidecarWorkspacePath: legacySidecarWorkspacePath, sidecar })
 }))
+
+test('rigmeta read keeps supported draft objects and rejects same-target role collisions without changing source bytes', async () => {
+  await withTempWorkspace(async workspaceDir => {
+    const sourceWorkspacePath = 'Workflows/foo_unirig.glb'
+    await createRegularSource(workspaceDir, sourceWorkspacePath)
+    const sourceBefore = await readFile(path.join(workspaceDir, sourceWorkspacePath))
+    const metadata = rigMetaSidecar({ semantic_candidates: { bone_0: 'Generated pelvis' }, humanoid_contract: undefined,
+      humanoid_draft: { assignments: { roles: { head: { boneId: 'bone_5', label: 'Look Control' }, hips: 'bone_0', spine: { boneId: 'bone_0' } } } },
+    })
+    const metaPath = path.join(workspaceDir, 'Workflows/foo_unirig.rigmeta.json')
+    const bytes = JSON.stringify(metadata)
+    await writeFile(metaPath, bytes)
+    const result = await getRigMetaSidecarReader()({ workspaceDir, sourceWorkspacePath }) as RigMetaSidecarReadResult
+    assert.ok(result.success && result.status === 'found')
+    assert.deepEqual(result.namingByBoneId, {
+      bone_0: { label: 'Generated pelvis', source: 'semantic_candidates' },
+      bone_5: { label: 'Look Control', source: 'humanoid_draft' },
+    })
+    assert.match(result.warnings.join('\n'), /multiple.*roles|roles.*same/i)
+    assert.equal(await readFile(metaPath, 'utf8'), bytes)
+    assert.deepEqual(await readFile(path.join(workspaceDir, sourceWorkspacePath)), sourceBefore)
+  })
+})

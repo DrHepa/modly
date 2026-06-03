@@ -431,6 +431,7 @@ export interface PoseClipSidecarWriteRequest {
 
 export interface PoseClipSidecarReadRequest {
   sidecarWorkspacePath: string
+  legacySidecarWorkspacePath?: string
   sourceWorkspacePath: string
 }
 

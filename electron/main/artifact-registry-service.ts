@@ -431,6 +431,7 @@ export interface PoseClipSidecarWriteServiceRequest {
 export interface PoseClipSidecarReadServiceRequest {
   workspaceDir: string
   sidecarWorkspacePath: string
+  legacySidecarWorkspacePath?: string
   sourceWorkspacePath: string
 }
 
@@ -673,6 +674,7 @@ function parsePoseClipSidecarReadPayload(payload: unknown, workspaceDir: string)
   return {
     workspaceDir,
     sidecarWorkspacePath: payload.sidecarWorkspacePath,
+    legacySidecarWorkspacePath: typeof payload.legacySidecarWorkspacePath === 'string' ? payload.legacySidecarWorkspacePath : undefined,
     sourceWorkspacePath: payload.sourceWorkspacePath,
   }
 }
@@ -734,6 +736,13 @@ function assertPoseClipSidecarPath(sidecarWorkspacePath: string): void {
   if (!sidecarWorkspacePath.endsWith(POSE_CLIP_SIDECAR_SUFFIX)) {
     throw new Error('Pose clip sidecar path must end with .pose-clip.v1.json')
   }
+}
+
+function isLegacyBasenamePoseClipSidecarPath(sidecarWorkspacePath: string, sourceWorkspacePath: string): boolean {
+  // Match the renderer's pre-hash slug, including spaces, Unicode and punctuation.
+  const sourceName = basename(sourceWorkspacePath).replace(/\.[^.]+$/, '') || 'pose-clip'
+  const sourceStem = sourceName.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'pose-clip'
+  return sidecarWorkspacePath === `${POSE_CLIP_SIDECAR_PREFIX}${sourceStem}${POSE_CLIP_SIDECAR_SUFFIX}`
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -1436,17 +1445,39 @@ export async function readPoseClipSidecar(request: PoseClipSidecarReadServiceReq
   try {
     const sidecarPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sidecarWorkspacePath)
     const sourcePath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sourceWorkspacePath)
+    const legacySidecarPath = request.legacySidecarWorkspacePath
+      ? normalizeWorkspaceArtifactPath(request.workspaceDir, request.legacySidecarWorkspacePath)
+      : null
 
-    assertPoseClipSidecarPath(sidecarPath.workspacePath)
-
-    if (sidecarPath.workspacePath === sourcePath.workspacePath || sidecarPath.absolutePath === sourcePath.absolutePath) {
-      throw new Error('Pose clip sidecar path must not overwrite the source artifact')
+    for (const candidate of [sidecarPath, legacySidecarPath]) {
+      if (!candidate) continue
+      assertPoseClipSidecarPath(candidate.workspacePath)
+      if (candidate.workspacePath === sourcePath.workspacePath || candidate.absolutePath === sourcePath.absolutePath) {
+        throw new Error('Pose clip sidecar path must not overwrite the source artifact')
+      }
     }
 
     await physicalArtifactPath(request.workspaceDir, sourcePath.workspacePath)
+    const primaryResult = await readPoseClipSidecarAtPath(request.workspaceDir, sidecarPath, sourcePath)
+    if (primaryResult.status !== 'not-found' || !legacySidecarPath || legacySidecarPath.workspacePath === sidecarPath.workspacePath) {
+      return primaryResult
+    }
+    // Invalid or unreadable primary files never fall through to older data.
+    return await readPoseClipSidecarAtPath(request.workspaceDir, legacySidecarPath, sourcePath)
+  } catch (error) {
+    return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function readPoseClipSidecarAtPath(
+  workspaceDir: string,
+  sidecarPath: NormalizedWorkspaceArtifactPath,
+  sourcePath: NormalizedWorkspaceArtifactPath,
+): Promise<PoseClipSidecarReadResult> {
+  try {
     let parsedSidecar: unknown
     try {
-      parsedSidecar = await readArtifactJson(request.workspaceDir, sidecarPath.workspacePath)
+      parsedSidecar = await readArtifactJson(workspaceDir, sidecarPath.workspacePath)
     } catch (error) {
       if (isRecord(error) && error.code === 'ENOENT') {
         return { success: true, status: 'not-found', sidecarWorkspacePath: sidecarPath.workspacePath }
@@ -1459,6 +1490,16 @@ export async function readPoseClipSidecar(request: PoseClipSidecarReadServiceReq
 
     const validationErrors = validatePoseClipSidecarV1Payload(parsedSidecar, sourcePath.workspacePath)
     if (validationErrors.length > 0) {
+      if (validationErrors.length === 1 && validationErrors[0] === 'invalid_source_workspacePath'
+        && isLegacyBasenamePoseClipSidecarPath(sidecarPath.workspacePath, sourcePath.workspacePath)
+        && isRecord(parsedSidecar) && isRecord(parsedSidecar.source)
+        && typeof parsedSidecar.source.workspacePath === 'string'
+        && parsedSidecar.source.workspacePath.length > 0
+        && assertSafeWorkspacePathInput(parsedSidecar.source.workspacePath) === parsedSidecar.source.workspacePath) {
+        // A valid legacy file owned by another source is a basename collision,
+        // not this source's saved plan. Malformed owners remain visible errors.
+        return { success: true, status: 'not-found', sidecarWorkspacePath: sidecarPath.workspacePath }
+      }
       throw new Error(`Invalid pose clip sidecar v1: ${validationErrors.join(', ')}`)
     }
 

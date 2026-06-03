@@ -5,6 +5,7 @@ import {
   buildPoseClipSidecarV1,
   clampPoseClipTime,
   createPoseClipCaptureKeyframeId,
+  createLegacyPoseClipSidecarWorkspacePath,
   createPoseClipDuplicateKeyframeId,
   createPoseClipPlan,
   createPoseClipSidecarWorkspacePath,
@@ -196,10 +197,70 @@ test('buildPoseClipSidecarV1 creates sidecar-first schema metadata and determini
   })
   assert.equal(
     createPoseClipSidecarWorkspacePath('Workflows/generated/nested/hero character.glb'),
-    'Workflows/pose-clips/hero-character.pose-clip.v1.json',
+    'Workflows/pose-clips/hero-character--src-017862172bbbcc46.pose-clip.v1.json',
   )
   assert.deepEqual(plan, planBefore)
   assert.deepEqual(rigSummary, summaryBefore)
+})
+
+test('createPoseClipSidecarWorkspacePath should derive distinct sidecars for same-basename workflow sources', () => {
+  const sourceA = 'Workflows/run-a/animated.glb'
+  const sourceB = 'Workflows/run-b/animated.glb'
+
+  const sidecarA = createPoseClipSidecarWorkspacePath(sourceA)
+  const sidecarB = createPoseClipSidecarWorkspacePath(sourceB)
+
+  assert.equal(sidecarA, 'Workflows/pose-clips/animated--src-9d243f14d9c41ea6.pose-clip.v1.json')
+  assert.equal(sidecarB, 'Workflows/pose-clips/animated--src-47c514e2ff697745.pose-clip.v1.json')
+  assert.notEqual(
+    sidecarA,
+    sidecarB,
+    'Pose/Clip sidecar paths must include collision-resistant source identity, not only the source basename.',
+  )
+})
+
+test('createPoseClipSidecarWorkspacePath is deterministic, readable and rejects unsafe source paths with null', () => {
+  const source = 'Workflows/generated/hero character.glb'
+
+  assert.equal(
+    createPoseClipSidecarWorkspacePath(source),
+    createPoseClipSidecarWorkspacePath(source),
+  )
+  assert.match(
+    createPoseClipSidecarWorkspacePath(source) ?? '',
+    /^Workflows\/pose-clips\/hero-character--src-[0-9a-f]{16}\.pose-clip\.v1\.json$/,
+  )
+
+  for (const unsafeSource of [
+    '',
+    '/Workflows/generated/hero.glb',
+    'C:\\Workflows\\generated\\hero.glb',
+    'Workflows\\generated\\hero.glb',
+    'Workflows/generated/../hero.glb',
+  ]) {
+    assert.equal(createPoseClipSidecarWorkspacePath(unsafeSource), null, unsafeSource)
+  }
+})
+
+test('createLegacyPoseClipSidecarWorkspacePath derives only backward-compatible basename sidecars and rejects unsafe source paths', () => {
+  assert.equal(
+    createLegacyPoseClipSidecarWorkspacePath('Workflows/run-a/animated.glb'),
+    'Workflows/pose-clips/animated.pose-clip.v1.json',
+  )
+  assert.equal(
+    createLegacyPoseClipSidecarWorkspacePath('Workflows/run-b/animated.glb'),
+    'Workflows/pose-clips/animated.pose-clip.v1.json',
+  )
+
+  for (const unsafeSource of [
+    '',
+    '/Workflows/generated/hero.glb',
+    'C:\\Workflows\\generated\\hero.glb',
+    'Workflows\\generated\\hero.glb',
+    'Workflows/generated/../hero.glb',
+  ]) {
+    assert.equal(createLegacyPoseClipSidecarWorkspacePath(unsafeSource), null, unsafeSource)
+  }
 })
 
 test('buildPoseClipSidecarV1 preserves the v1 sidecar schema without persisting timeline UI state or embedded export metadata', () => {
@@ -534,4 +595,36 @@ test('pose reducer rejects invalid rotations and reused capture IDs, preserves m
   assert.deepEqual(sidecar.keyframes[0].translation, capture.translation)
   assert.deepEqual(sidecar.keyframes[0].scale, capture.scale)
   assert.throws(() => buildPoseClipSidecarV1({ summary: rigSummary, plan: { ...plan, skeletonContextId: 'other' } }), /context/i)
+})
+
+
+test('Pose/Clip routing normalizes supported relative forms but does not decode names or accept encoded escapes', () => {
+  const source = 'Workflows/generated/hero%20character.glb'
+  for (const variant of [source, ` ./Workflows//generated/./hero%20character.glb `]) {
+    assert.equal(createPoseClipSidecarWorkspacePath(variant), createPoseClipSidecarWorkspacePath(source))
+    assert.equal(createLegacyPoseClipSidecarWorkspacePath(variant), createLegacyPoseClipSidecarWorkspacePath(source))
+  }
+  assert.notEqual(createPoseClipSidecarWorkspacePath(source), createPoseClipSidecarWorkspacePath('Workflows/generated/hero character.glb'))
+  for (const unsafe of ['Workflows/a%2fb.glb', 'Workflows/a%5Cb.glb', 'Workflows/%2e%2e/a.glb', 'Workflows/a\0.glb']) {
+    assert.equal(createPoseClipSidecarWorkspacePath(unsafe), null, unsafe)
+    assert.equal(createLegacyPoseClipSidecarWorkspacePath(unsafe), null, unsafe)
+  }
+})
+
+
+test('Pose/Clip renderer routing matches main boundary fixtures for supported names', () => {
+  const fixtures = [
+    ['Workflows/run-b/hero character.glb', 'Workflows/pose-clips/hero-character--src-dac34d68cd2b28e7.pose-clip.v1.json', 'Workflows/pose-clips/hero-character.pose-clip.v1.json'],
+    ['Workflows/run-b/hero%20character.glb', 'Workflows/pose-clips/hero-20character--src-1061d109a060e674.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    ['Workflows/run-b/骨骼.glb', 'Workflows/pose-clips/pose-clip--src-bc40ad4fa6793064.pose-clip.v1.json', 'Workflows/pose-clips/pose-clip.pose-clip.v1.json'],
+    ['Workflows/run-b/---.glb', 'Workflows/pose-clips/pose-clip--src-8c69b281d6a56feb.pose-clip.v1.json', 'Workflows/pose-clips/pose-clip.pose-clip.v1.json'],
+    ['Workflows/a/hero%20character.glb', 'Workflows/pose-clips/hero-20character--src-7d36eb3879a390db.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    ['Workflows/b/hero%20character.glb', 'Workflows/pose-clips/hero-20character--src-5f7c443a52d681cc.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    ['Workflows/hero.glb', 'Workflows/pose-clips/hero--src-8a3ec10a74f65eaf.pose-clip.v1.json', 'Workflows/pose-clips/hero.pose-clip.v1.json'],
+    ['Workflows/hero character.glb', 'Workflows/pose-clips/hero-character--src-33c09f294e20c9a4.pose-clip.v1.json', 'Workflows/pose-clips/hero-character.pose-clip.v1.json'],
+  ]
+  for (const [source, hashed, legacy] of fixtures) {
+    assert.equal(createPoseClipSidecarWorkspacePath(source), hashed)
+    assert.equal(createLegacyPoseClipSidecarWorkspacePath(source), legacy)
+  }
 })

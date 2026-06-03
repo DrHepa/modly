@@ -287,6 +287,7 @@ type PoseClipSidecarWriter = (request: {
 type PoseClipSidecarReader = (request: {
   workspaceDir: string
   sidecarWorkspacePath: string
+  legacySidecarWorkspacePath?: string
   sourceWorkspacePath: string
 }) => Promise<unknown>
 
@@ -1293,6 +1294,124 @@ test('reads found, not-found, and invalid pose clip sidecars with source compati
   })
 })
 
+test('treats a legacy basename-derived Pose/Clip sidecar for a different same-basename source as not found', async () => {
+  const readPoseClipSidecar = getPoseClipSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'pose-clips'), { recursive: true })
+    const sourceA = 'Workflows/run-a/animated.glb'
+    const sourceB = 'Workflows/run-b/animated.glb'
+    await createRegularSource(workspaceDir, sourceB)
+    const legacySidecarWorkspacePath = 'Workflows/pose-clips/animated.pose-clip.v1.json'
+    const legacySidecarForSourceA = poseClipSidecar({ source: { workspacePath: sourceA } })
+    await writeFile(
+      path.join(workspaceDir, ...legacySidecarWorkspacePath.split('/')),
+      JSON.stringify(legacySidecarForSourceA, null, 2),
+      'utf-8',
+    )
+
+    const result = await readPoseClipSidecar({
+      workspaceDir,
+      sidecarWorkspacePath: legacySidecarWorkspacePath,
+      sourceWorkspacePath: sourceB,
+    })
+
+    assert.deepEqual(result, {
+      success: true,
+      status: 'not-found',
+      sidecarWorkspacePath: legacySidecarWorkspacePath,
+    })
+  })
+})
+
+test('reads the hashed Pose/Clip sidecar before a colliding legacy basename fallback', async () => {
+  const readPoseClipSidecar = getPoseClipSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'pose-clips'), { recursive: true })
+    const sourceA = 'Workflows/run-a/animated.glb'
+    const sourceB = 'Workflows/run-b/animated.glb'
+    await createRegularSource(workspaceDir, sourceB)
+    const legacySidecarWorkspacePath = 'Workflows/pose-clips/animated.pose-clip.v1.json'
+    const hashedSidecarWorkspacePath = 'Workflows/pose-clips/animated--src-bbbbbbbbbbbbbbbb.pose-clip.v1.json'
+    const legacySidecarForSourceA = poseClipSidecar({ source: { workspacePath: sourceA }, clip: { id: 'legacy', name: 'Legacy Clip', durationSeconds: 1, fps: 24 } })
+    const hashedSidecarForSourceB = poseClipSidecar({ source: { workspacePath: sourceB }, clip: { id: 'hashed', name: 'Hashed Clip', durationSeconds: 2, fps: 30 } })
+
+    await writeFile(path.join(workspaceDir, ...legacySidecarWorkspacePath.split('/')), JSON.stringify(legacySidecarForSourceA, null, 2), 'utf-8')
+    await writeFile(path.join(workspaceDir, ...hashedSidecarWorkspacePath.split('/')), JSON.stringify(hashedSidecarForSourceB, null, 2), 'utf-8')
+
+    const result = await readPoseClipSidecar({
+      workspaceDir,
+      sidecarWorkspacePath: hashedSidecarWorkspacePath,
+      legacySidecarWorkspacePath,
+      sourceWorkspacePath: sourceB,
+    })
+
+    assert.deepEqual(result, {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: hashedSidecarWorkspacePath,
+      sidecar: hashedSidecarForSourceB,
+    })
+  })
+})
+
+test('falls back to a matching legacy Pose/Clip basename sidecar only when the hashed sidecar is missing', async () => {
+  const readPoseClipSidecar = getPoseClipSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'pose-clips'), { recursive: true })
+    const sourceWorkspacePath = 'Workflows/run-a/animated.glb'
+    await createRegularSource(workspaceDir, sourceWorkspacePath)
+    const legacySidecarWorkspacePath = 'Workflows/pose-clips/animated.pose-clip.v1.json'
+    const missingHashedSidecarWorkspacePath = 'Workflows/pose-clips/animated--src-aaaaaaaaaaaaaaaa.pose-clip.v1.json'
+    const legacySidecar = poseClipSidecar({ source: { workspacePath: sourceWorkspacePath } })
+    await writeFile(path.join(workspaceDir, ...legacySidecarWorkspacePath.split('/')), JSON.stringify(legacySidecar, null, 2), 'utf-8')
+
+    const result = await readPoseClipSidecar({
+      workspaceDir,
+      sidecarWorkspacePath: missingHashedSidecarWorkspacePath,
+      legacySidecarWorkspacePath,
+      sourceWorkspacePath,
+    })
+
+    assert.deepEqual(result, {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: legacySidecarWorkspacePath,
+      sidecar: legacySidecar,
+    })
+  })
+})
+
+test('keeps invalid legacy Pose/Clip fallback schema errors visible when hashed sidecar is missing', async () => {
+  const readPoseClipSidecar = getPoseClipSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'pose-clips'), { recursive: true })
+    const sourceWorkspacePath = 'Workflows/run-a/animated.glb'
+    await createRegularSource(workspaceDir, sourceWorkspacePath)
+    const legacySidecarWorkspacePath = 'Workflows/pose-clips/animated.pose-clip.v1.json'
+    const missingHashedSidecarWorkspacePath = 'Workflows/pose-clips/animated--src-aaaaaaaaaaaaaaaa.pose-clip.v1.json'
+    await writeFile(
+      path.join(workspaceDir, ...legacySidecarWorkspacePath.split('/')),
+      JSON.stringify(poseClipSidecar({ source: { workspacePath: sourceWorkspacePath }, schema: 'modly.landmarks' }), null, 2),
+      'utf-8',
+    )
+
+    const result = await readPoseClipSidecar({
+      workspaceDir,
+      sidecarWorkspacePath: missingHashedSidecarWorkspacePath,
+      legacySidecarWorkspacePath,
+      sourceWorkspacePath,
+    })
+
+    assert.equal((result as { success?: unknown }).success, false)
+    assert.equal((result as { status?: unknown }).status, 'invalid')
+    assert.match(String((result as { error?: unknown }).error), /schema/i)
+  })
+})
+
 test('returns invalid for malformed pose clip JSON, schema, skeleton, or keyframes instead of throwing', async () => {
   const readPoseClipSidecar = getPoseClipSidecarReader()
 
@@ -1884,4 +2003,107 @@ test('last alias cancel and revert persist an empty same-source v1 plan and hydr
   }
   assert.equal(await readFile(path.join(workspaceDir, sourceWorkspacePath), 'utf8'), 'owned regular source fixture')
   assert.equal(await readFile(path.join(workspaceDir, 'B/hero.glb'), 'utf8'), 'owned regular source fixture')
+}))
+
+
+// Fixed renderer routing fixtures: main accepts source-owned paths, not a renderer module dependency.
+function poseClipRoutingFixture(sourceWorkspacePath: string) {
+  const paths: Record<string, [string, string]> = {
+    'Workflows/run-b/hero character.glb': ['Workflows/pose-clips/hero-character--src-dac34d68cd2b28e7.pose-clip.v1.json', 'Workflows/pose-clips/hero-character.pose-clip.v1.json'],
+    'Workflows/run-b/hero%20character.glb': ['Workflows/pose-clips/hero-20character--src-1061d109a060e674.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    'Workflows/run-b/骨骼.glb': ['Workflows/pose-clips/pose-clip--src-bc40ad4fa6793064.pose-clip.v1.json', 'Workflows/pose-clips/pose-clip.pose-clip.v1.json'],
+    'Workflows/run-b/---.glb': ['Workflows/pose-clips/pose-clip--src-8c69b281d6a56feb.pose-clip.v1.json', 'Workflows/pose-clips/pose-clip.pose-clip.v1.json'],
+    'Workflows/a/hero%20character.glb': ['Workflows/pose-clips/hero-20character--src-7d36eb3879a390db.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    'Workflows/b/hero%20character.glb': ['Workflows/pose-clips/hero-20character--src-5f7c443a52d681cc.pose-clip.v1.json', 'Workflows/pose-clips/hero-20character.pose-clip.v1.json'],
+    'Workflows/hero.glb': ['Workflows/pose-clips/hero--src-8a3ec10a74f65eaf.pose-clip.v1.json', 'Workflows/pose-clips/hero.pose-clip.v1.json'],
+    'Workflows/hero character.glb': ['Workflows/pose-clips/hero-character--src-33c09f294e20c9a4.pose-clip.v1.json', 'Workflows/pose-clips/hero-character.pose-clip.v1.json'],
+  }
+  assert.ok(paths[sourceWorkspacePath], sourceWorkspacePath)
+  const [hashed, legacy] = paths[sourceWorkspacePath]
+  return { hashed, legacy }
+}
+
+test('Pose/Clip migration recognizes sanitized legacy names without hiding malformed owners', () => withTempWorkspace(async workspaceDir => {
+  for (const name of ['hero character', 'hero%20character', '骨骼', '---']) {
+    const sourceWorkspacePath = `Workflows/run-b/${name}.glb`
+    await createRegularSource(workspaceDir, sourceWorkspacePath)
+    const legacySidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).legacy
+    const sidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).hashed
+    const target = path.join(workspaceDir, legacySidecarWorkspacePath)
+    await mkdir(path.dirname(target), { recursive: true })
+    const foreign = poseClipSidecar({ source: { workspacePath: `Workflows/run-a/${name}.glb` } })
+    await writeFile(target, JSON.stringify(foreign))
+    for (const primary of [sidecarWorkspacePath, legacySidecarWorkspacePath]) {
+      const result = await readPoseClipSidecar({ workspaceDir, sourceWorkspacePath, sidecarWorkspacePath: primary, legacySidecarWorkspacePath })
+      assert.equal(result.status, 'not-found', name)
+    }
+    for (const source of [{}, { workspacePath: null }, { workspacePath: '' }, { workspacePath: '../foreign.glb' }]) {
+      await writeFile(target, JSON.stringify(poseClipSidecar({ source })))
+      const result = await readPoseClipSidecar({ workspaceDir, sourceWorkspacePath, sidecarWorkspacePath, legacySidecarWorkspacePath })
+      assert.equal(result.status, 'invalid', `${name}: ${JSON.stringify(source)}`)
+    }
+  }
+}))
+
+test('Pose/Clip hashed routing keeps same-basename sources independent and still enforces stored ownership', () => withTempWorkspace(async workspaceDir => {
+  const sources = ['Workflows/a/hero%20character.glb', 'Workflows/b/hero%20character.glb']
+  const requests = sources.map(sourceWorkspacePath => ({ workspaceDir, sourceWorkspacePath,
+    sidecarWorkspacePath: poseClipRoutingFixture(sourceWorkspacePath).hashed, sidecar: poseClipSidecar({ source: { workspacePath: sourceWorkspacePath } }) }))
+  for (const source of sources) await createRegularSource(workspaceDir, source)
+  assert.notEqual(requests[0].sidecarWorkspacePath, requests[1].sidecarWorkspacePath)
+  assert.deepEqual((await Promise.all(requests.map(request => writePoseClipSidecar(request)))).map(result => result.success), [true, true])
+  for (const request of requests) {
+    const result = await readPoseClipSidecar(request)
+    assert.equal(result.status, 'found')
+    assert.deepEqual(result.success && result.status === 'found' && result.sidecar, request.sidecar)
+  }
+  const target = path.join(workspaceDir, requests[0].sidecarWorkspacePath)
+  const bytes = await readFile(target)
+  const foreignRoute = { ...requests[1], sidecarWorkspacePath: requests[0].sidecarWorkspacePath }
+  assert.equal((await writePoseClipSidecar(foreignRoute)).success, false)
+  assert.equal((await readPoseClipSidecar(foreignRoute)).status, 'invalid')
+  assert.deepEqual(await readFile(target), bytes)
+  assert.equal((await writePoseClipSidecar({ ...requests[0], sidecar: { ...requests[0].sidecar, clip: { ...requests[0].sidecar.clip, name: 'Updated' } } })).success, true)
+  for (const source of sources) assert.equal(await readFile(path.join(workspaceDir, source), 'utf8'), 'owned regular source fixture')
+}))
+
+test('Pose/Clip fallback never masks an invalid or unreadable primary and preserves source checks', () => withTempWorkspace(async workspaceDir => {
+  const sourceWorkspacePath = 'Workflows/hero.glb'
+  await createRegularSource(workspaceDir, sourceWorkspacePath)
+  const sidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).hashed
+  const legacySidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).legacy
+  const primary = path.join(workspaceDir, sidecarWorkspacePath)
+  const legacy = path.join(workspaceDir, legacySidecarWorkspacePath)
+  await mkdir(path.dirname(primary), { recursive: true })
+  const sidecar = poseClipSidecar({ source: { workspacePath: sourceWorkspacePath } })
+  await writeFile(legacy, JSON.stringify(sidecar))
+  const request = { workspaceDir, sourceWorkspacePath, sidecarWorkspacePath, legacySidecarWorkspacePath }
+  for (const bytes of ['{broken', JSON.stringify({ ...sidecar, schema: 'bad' }), JSON.stringify({ ...sidecar, source: { workspacePath: 'Workflows/other.glb' } })]) {
+    await writeFile(primary, bytes)
+    assert.equal((await readPoseClipSidecar(request)).status, 'invalid')
+    assert.equal(await readFile(primary, 'utf8'), bytes)
+  }
+  await rm(primary); await symlink(legacy, primary)
+  assert.equal((await readPoseClipSidecar(request)).status, 'invalid')
+  await rm(primary)
+  assert.equal((await readPoseClipSidecar(request)).status, 'found')
+  await rm(legacy); await symlink(path.join(workspaceDir, 'missing.json'), legacy)
+  assert.equal((await readPoseClipSidecar(request)).status, 'invalid')
+  await rm(legacy); await writeFile(legacy, JSON.stringify(sidecar))
+  await rm(path.join(workspaceDir, sourceWorkspacePath))
+  assert.equal((await readPoseClipSidecar(request)).status, 'invalid')
+}))
+
+test('Pose/Clip IPC forwards source-bound legacy fallback without trusting payload workspaceDir', () => withTempWorkspace(async workspaceDir => {
+  const sourceWorkspacePath = 'Workflows/hero character.glb'
+  await createRegularSource(workspaceDir, sourceWorkspacePath)
+  const sidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).hashed
+  const legacySidecarWorkspacePath = poseClipRoutingFixture(sourceWorkspacePath).legacy
+  const sidecar = poseClipSidecar({ source: { workspacePath: sourceWorkspacePath } })
+  const target = path.join(workspaceDir, legacySidecarWorkspacePath)
+  await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, JSON.stringify(sidecar))
+  const handlers = new Map<string, (event: unknown, payload: unknown) => Promise<unknown>>()
+  registerArtifactRegistryIpcHandlers({ ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }, getWorkspaceDir: () => workspaceDir })
+  const result = await handlers.get('workspace:artifact:readPoseClipSidecar')!({}, { sourceWorkspacePath, sidecarWorkspacePath, legacySidecarWorkspacePath, workspaceDir: '/ignored' })
+  assert.deepEqual(result, { success: true, status: 'found', sidecarWorkspacePath: legacySidecarWorkspacePath, sidecar })
 }))

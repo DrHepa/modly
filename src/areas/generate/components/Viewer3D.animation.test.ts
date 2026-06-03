@@ -1211,3 +1211,53 @@ test('Viewer3D consecutive owner revisions retain authored edits while validatio
   assert.equal(view.component('ViewerEditToolbar').sceneEditControls.excludedCount, 0, 'A genuinely new run retires the authored context')
   assert.equal(view.component('ViewerEditToolbar').sceneEditControls.mode, 'available')
 })
+
+
+test('Viewer3D migrates a matching legacy pose through mounted Load and hashed Save without changing legacy or source bytes', async t => {
+  const bridge = await bridgeFixture(t)
+  const actualRead = bridge.electron.workspace.artifacts.readPoseClipSidecar
+  let hydration: Promise<unknown> | undefined
+  bridge.electron.workspace.artifacts.readPoseClipSidecar = (request: any) => { hydration = actualRead(request); return hydration }
+  const view = await mount(t, '/workspace/Workflows/rig.glb', h => { authoringAsset(h, '/workspace/Workflows/rig.glb'); h.electron = bridge.electron })
+  view.click('Open Pose/Clip (2 bones)'); await settle(); await hydration; await settle()
+  let panel = view.component('PoseClipPanel')
+  const summary = panel.summary
+  const request = view.viewerModule.resolveViewer3DPoseClipHydrationRequest(summary)
+  assert.ok(request.legacySidecarWorkspacePath)
+  assert.notEqual(request.sidecarWorkspacePath, request.legacySidecarWorkspacePath)
+  let state = view.viewerModule.createViewer3DPoseClipState(summary)
+  state = view.viewerModule.reduceViewer3DPoseClipState(state, { type: 'capture-keyframe', summary,
+    keyframeId: 'legacy-key', boneId: summary.bones[0].boneId, timeSeconds: 0, rotation: { x: 0, y: 0, z: 0, w: 1 } })
+  let legacySidecar: any
+  await view.viewerModule.writeViewer3DPoseClipSidecar({ state, writer: async (write: any) => {
+    legacySidecar = write.sidecar; return { success: true, sidecarWorkspacePath: write.sidecarWorkspacePath }
+  } })
+  const legacyPath = path.join(bridge.workspaceDir, request.legacySidecarWorkspacePath)
+  await mkdir(path.dirname(legacyPath), { recursive: true })
+  const legacyBytes = JSON.stringify(legacySidecar)
+  await writeFile(legacyPath, legacyBytes)
+  await panel.onLoadSidecar(); await settle()
+  panel = view.component('PoseClipPanel')
+  assert.equal(panel.loadState, 'loaded'); assert.equal(panel.keyframes[0].id, 'legacy-key')
+  flush(() => panel.onClipMetadataChange({ fps: 30 }))
+  await view.component('PoseClipPanel').onSaveSidecar(); await settle()
+  assert.equal(view.component('PoseClipPanel').saveState, 'saved')
+  assert.equal(bridge.writes.at(-1).sidecarWorkspacePath, request.sidecarWorkspacePath)
+  assert.equal('legacySidecarWorkspacePath' in bridge.writes.at(-1), false)
+  assert.equal(await readFile(legacyPath, 'utf8'), legacyBytes)
+  const hashed = JSON.parse(await readFile(path.join(bridge.workspaceDir, request.sidecarWorkspacePath), 'utf8'))
+  assert.equal(hashed.schema, 'modly.pose-clip'); assert.equal(hashed.version, 1)
+  assert.equal(hashed.clip.fps, 30); assert.equal(hashed.source.workspacePath, summary.sourceWorkspacePath)
+  await view.component('PoseClipPanel').onLoadSidecar(); await settle()
+  assert.equal(view.component('PoseClipPanel').fps, 30, 'Hashed sidecar takes precedence over older legacy data')
+  const sourceB = 'Workflows/b/rig.glb'
+  await mkdir(path.join(bridge.workspaceDir, 'Workflows/b'), { recursive: true })
+  await writeFile(path.join(bridge.workspaceDir, sourceB), bridge.sourceBytes)
+  authoringAsset(view.harness, '/workspace/Workflows/b/rig.glb'); view.switchTo('/workspace/Workflows/b/rig.glb'); view.render()
+  view.click('Open Pose/Clip (2 bones)'); await settle(); await hydration; await settle()
+  assert.equal(view.component('PoseClipPanel').keyframes.length, 0)
+  assert.equal(view.component('PoseClipPanel').loadState, 'idle')
+  assert.equal(await readFile(legacyPath, 'utf8'), legacyBytes)
+  assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
+  assert.deepEqual(await readFile(path.join(bridge.workspaceDir, sourceB)), bridge.sourceBytes)
+})

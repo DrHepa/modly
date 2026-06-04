@@ -402,6 +402,44 @@ test('ViewerEditToolbar exposes Pose/Clip as a separate right-rail entry that ca
   assert.doesNotMatch(html, /title="Pause animation"/)
 })
 
+test('ViewerEditToolbar exposes Motion Retarget as a separate right-rail entry that can coexist with Rig Editor and Pose/Clip', async () => {
+  const html = await renderToolbarExport('ViewerEditToolbar', {
+    rigEditorControls: {
+      active: false,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenRigEditor: () => undefined,
+    },
+    motionRetargetControls: {
+      active: true,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenMotionRetarget: () => undefined,
+    },
+    poseClipControls: {
+      active: false,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenPoseClip: () => undefined,
+    },
+  })
+
+  assert.match(html, /aria-label="Viewer edit controls"/)
+  assert.match(html, /title="Open Rig Editor \(3 bones\)"/)
+  assert.match(html, /title="Close Motion Retarget \(3 bones\)"[^>]*aria-label="Close Motion Retarget \(3 bones\)"[^>]*aria-pressed="true"/)
+  assert.match(html, /title="Open Pose\/Clip \(3 bones\)"/)
+  assert.doesNotMatch(html, /title="Play animation"/)
+})
+
 test('ViewerEditToolbar keeps Pose/Clip available as a no-rig empty state without opening Rig Editor', async () => {
   const html = await renderToolbarExport('ViewerEditToolbar', {
     poseClipControls: {
@@ -419,4 +457,23 @@ test('ViewerEditToolbar keeps Pose/Clip available as a no-rig empty state withou
   assert.match(html, /Load a rigged character to author pose clips/)
   assert.doesNotMatch(html, /Open Rig Editor/)
   assert.doesNotMatch(html, /Export GLB/)
+})
+
+test('ViewerEditToolbar keeps Motion Retarget available as a no-rig empty state without opening other authoring rails', async () => {
+  const html = await renderToolbarExport('ViewerEditToolbar', {
+    motionRetargetControls: {
+      active: false,
+      summary: {
+        hasRig: false,
+        stats: { boneCount: 0, skinnedMeshCount: 0 },
+        warnings: ['No skeleton bones were found.'],
+      },
+      onOpenMotionRetarget: () => undefined,
+    },
+  })
+
+  assert.match(html, /No rig for Motion Retarget/)
+  assert.match(html, /Load a rigged character to inspect a Kimodo retarget session/)
+  assert.doesNotMatch(html, /Open Rig Editor/)
+  assert.doesNotMatch(html, /Open Pose\/Clip/)
 })

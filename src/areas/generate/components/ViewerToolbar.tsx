@@ -18,12 +18,14 @@ interface ViewerViewToolbarProps {
 interface ViewerToolbarProps extends ViewerViewToolbarProps {
   sceneEditControls?: ViewerToolbarSceneEditControls
   rigEditorControls?: ViewerToolbarRigEditorControls
+  motionRetargetControls?: ViewerToolbarMotionRetargetControls
   poseClipControls?: ViewerToolbarPoseClipControls
 }
 
 interface ViewerEditToolbarProps {
   sceneEditControls?: ViewerToolbarSceneEditControls
   rigEditorControls?: ViewerToolbarRigEditorControls
+  motionRetargetControls?: ViewerToolbarMotionRetargetControls
   poseClipControls?: ViewerToolbarPoseClipControls
 }
 
@@ -44,6 +46,12 @@ export interface ViewerToolbarPoseClipControls {
   active: boolean
   summary: ViewerToolbarRigEditorControls['summary']
   onOpenPoseClip: () => void
+}
+
+export interface ViewerToolbarMotionRetargetControls {
+  active: boolean
+  summary: ViewerToolbarRigEditorControls['summary']
+  onOpenMotionRetarget: () => void
 }
 
 export interface ViewerToolbarSceneEditControls {
@@ -158,7 +166,7 @@ export function ViewerToolbar(props: ViewerToolbarProps): JSX.Element {
   return (
     <>
       <ViewerViewToolbar {...props} />
-      <ViewerEditToolbar sceneEditControls={props.sceneEditControls} rigEditorControls={props.rigEditorControls} poseClipControls={props.poseClipControls} />
+      <ViewerEditToolbar sceneEditControls={props.sceneEditControls} rigEditorControls={props.rigEditorControls} motionRetargetControls={props.motionRetargetControls} poseClipControls={props.poseClipControls} />
     </>
   )
 }
@@ -243,8 +251,8 @@ export function ViewerViewToolbar({
   )
 }
 
-export function ViewerEditToolbar({ sceneEditControls, rigEditorControls, poseClipControls }: ViewerEditToolbarProps): JSX.Element | null {
-  if (!sceneEditControls && !rigEditorControls && !poseClipControls) return null
+export function ViewerEditToolbar({ sceneEditControls, rigEditorControls, motionRetargetControls, poseClipControls }: ViewerEditToolbarProps): JSX.Element | null {
+  if (!sceneEditControls && !rigEditorControls && !motionRetargetControls && !poseClipControls) return null
 
   return (
     <CanvasToolbar side="right" ariaLabel="Viewer edit controls">
@@ -303,11 +311,15 @@ export function ViewerEditToolbar({ sceneEditControls, rigEditorControls, poseCl
         </>
       ) : null}
 
-      {sceneEditControls && (rigEditorControls || poseClipControls) ? <CanvasToolbarSeparator /> : null}
+      {sceneEditControls && (rigEditorControls || motionRetargetControls || poseClipControls) ? <CanvasToolbarSeparator /> : null}
 
       {rigEditorControls ? <RigEditorToolbarEntry controls={rigEditorControls} /> : null}
 
-      {rigEditorControls && poseClipControls ? <CanvasToolbarSeparator /> : null}
+      {rigEditorControls && (motionRetargetControls || poseClipControls) ? <CanvasToolbarSeparator /> : null}
+
+      {motionRetargetControls ? <MotionRetargetToolbarEntry controls={motionRetargetControls} /> : null}
+
+      {motionRetargetControls && poseClipControls ? <CanvasToolbarSeparator /> : null}
 
       {poseClipControls ? <PoseClipToolbarEntry controls={poseClipControls} /> : null}
     </CanvasToolbar>
@@ -364,6 +376,33 @@ function PoseClipToolbarEntry({ controls }: { controls: ViewerToolbarPoseClipCon
     >
       <span aria-hidden="true">◇</span>
       <span className="sr-only">Pose/Clip — {boneLabel}</span>
+    </CanvasToolbarButton>
+  )
+}
+
+function MotionRetargetToolbarEntry({ controls }: { controls: ViewerToolbarMotionRetargetControls }): JSX.Element {
+  if (!controls.summary.hasRig) {
+    return (
+      <div className="w-44 px-2 py-1.5 text-xs text-zinc-300" aria-label="Motion Retarget empty state">
+        <p className="font-medium text-zinc-100">No rig for Motion Retarget</p>
+        <p>Load a rigged character to inspect a Kimodo retarget session.</p>
+      </div>
+    )
+  }
+
+  const boneCount = controls.summary.stats.boneCount
+  const boneLabel = boneCount === 1 ? '1 bone' : `${boneCount} bones`
+  const actionLabel = controls.active ? 'Close Motion Retarget' : 'Open Motion Retarget'
+
+  return (
+    <CanvasToolbarButton
+      active={controls.active}
+      label={`${actionLabel} (${boneLabel})`}
+      ariaPressed={controls.active}
+      onClick={controls.onOpenMotionRetarget}
+    >
+      <span aria-hidden="true">⇄</span>
+      <span className="sr-only">Motion Retarget — {boneLabel}</span>
     </CanvasToolbarButton>
   )
 }

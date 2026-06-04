@@ -1,0 +1,44 @@
+{
+  "humanoid_contract_status": "draft",
+  "humanoid_draft": {
+    "chains": {
+      "left_arm": ["left_upper_arm", "left_lower_arm", "left_hand"],
+      "left_leg": ["left_upper_leg", "left_lower_leg", "left_foot"],
+      "right_arm": ["right_upper_arm", "right_lower_arm", "right_hand"],
+      "right_leg": ["right_upper_leg", "right_lower_leg", "right_foot"],
+      "spine": ["hips", "spine", "chest", "neck", "head"]
+    },
+    "completeness": {
+      "requiredRolesMissing": [],
+      "score": 1.0
+    },
+    "roles": {
+      "chest": "chest",
+      "head": "head",
+      "hips": "hips",
+      "left_foot": "left_foot",
+      "left_hand": "left_hand",
+      "left_lower_arm": "left_lower_arm",
+      "left_lower_leg": "left_lower_leg",
+      "left_upper_arm": "left_upper_arm",
+      "left_upper_leg": "left_upper_leg",
+      "neck": "neck",
+      "right_foot": "right_foot",
+      "right_hand": "right_hand",
+      "right_lower_arm": "right_lower_arm",
+      "right_lower_leg": "right_lower_leg",
+      "right_upper_arm": "right_upper_arm",
+      "right_upper_leg": "right_upper_leg",
+      "spine": "spine"
+    },
+    "schema": "modly.humanoid-draft.v1",
+    "trust": {
+      "reasons": ["semantic_passive_noncontract_subtree", "sleeve_branch_under_arm"],
+      "status": "draft",
+      "trusted": false
+    }
+  },
+  "humanoid_source_kind": "semantic_resolver",
+  "metadata_mode": "auto",
+  "trusted_stabilization_status": "ineligible"
+}

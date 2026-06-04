@@ -1,0 +1,61 @@
+{
+  "schema": "modly.humanoid-draft.v1",
+  "version": 1,
+  "source": { "workspacePath": "source/promoted_avatar.gltf" },
+  "output": { "workspacePath": "promoted_avatar.gltf" },
+  "meshOutputSha256": "__MESH_SHA256__",
+  "rigmetaSha256": "__RIGMETA_SHA256__",
+  "draftSha256": "__DRAFT_SHA256__",
+  "trust": {
+    "status": "draft",
+    "reasons": ["trust_gates_failed"],
+    "trusted": false
+  },
+  "provenance": {
+    "producer": "unirig",
+    "runId": "run-promoted-1",
+    "extensionId": "unirig-extension",
+    "createdAt": "2026-05-22T00:00:00Z"
+  },
+  "assignments": {
+    "roles": {
+      "chest": { "node_name": "chest", "node_index": 2 },
+      "head": { "node_name": "head", "node_index": 4 },
+      "hips": { "node_name": "hips", "node_index": 0 },
+      "left_foot": { "node_name": "left_foot", "node_index": 13 },
+      "left_hand": { "node_name": "left_hand", "node_index": 7 },
+      "left_lower_arm": { "node_name": "left_lower_arm", "node_index": 6 },
+      "left_lower_leg": { "node_name": "left_lower_leg", "node_index": 12 },
+      "left_upper_arm": { "node_name": "left_upper_arm", "node_index": 5 },
+      "left_upper_leg": { "node_name": "left_upper_leg", "node_index": 11 },
+      "neck": { "node_name": "neck", "node_index": 3 },
+      "right_foot": { "node_name": "right_foot", "node_index": 16 },
+      "right_hand": { "node_name": "right_hand", "node_index": 10 },
+      "right_lower_arm": { "node_name": "right_lower_arm", "node_index": 9 },
+      "right_lower_leg": { "node_name": "right_lower_leg", "node_index": 15 },
+      "right_upper_arm": { "node_name": "right_upper_arm", "node_index": 8 },
+      "right_upper_leg": { "node_name": "right_upper_leg", "node_index": 14 },
+      "spine": { "node_name": "spine", "node_index": 1 }
+    },
+    "chains": {
+      "torso": ["hips", "spine", "chest", "neck", "head"],
+      "left_arm": ["left_upper_arm", "left_lower_arm", "left_hand"],
+      "right_arm": ["right_upper_arm", "right_lower_arm", "right_hand"],
+      "left_leg": ["left_upper_leg", "left_lower_leg", "left_foot"],
+      "right_leg": ["right_upper_leg", "right_lower_leg", "right_foot"]
+    }
+  },
+  "confidence": {
+    "overall": 0.84,
+    "byRole": {
+      "hips": 0.99,
+      "spine": 0.97,
+      "head": 0.95
+    }
+  },
+  "completeness": {
+    "requiredRolesMissing": [],
+    "score": 1.0
+  },
+  "diagnostics": ["draft_generated_from_viable_hypothesis"]
+}

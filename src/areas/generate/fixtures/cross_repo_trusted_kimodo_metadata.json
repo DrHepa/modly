@@ -1,0 +1,111 @@
+{
+  "runtime_status": "success",
+  "retarget_status": "success",
+  "animation_mapping_status": "trusted_contract",
+  "stabilization_status": "not_evaluated",
+  "visual_quality_status": "warning",
+  "source_kind": "unirig_recommended",
+  "mapping_confidence": "calibrated",
+  "clip_name": "Kimodo Cross Repo Trusted",
+  "canonical_motion_artifact": "motion.npz",
+  "motion_bvh_artifact": "motion.bvh",
+  "artifacts": ["animated.glb", "metadata.json", "motion.bvh", "motion.npz", "preview.glb"],
+  "warnings": ["humanoid_contract_calibrated_mapping"],
+  "diagnostics": {
+    "humanoid_contract": {
+      "trusted": true,
+      "diagnostics": ["humanoid_contract_validated"]
+    }
+  },
+  "kimodo_motion_retarget": {
+    "schema": "kimodo.motion-retarget.v1",
+    "contract_version": 1,
+    "producer": {
+      "extension_id": "kimodo-soma-rp",
+      "node_id": "animate-rigged-mesh"
+    },
+    "source_contract": {
+      "schema": "modly.humanoid.v1",
+      "status": "trusted",
+      "trusted": true,
+      "sidecar_payload_sha256": "fixture-trusted-sha256"
+    },
+    "mapping_status": "trusted_contract",
+    "mapping_confidence": "calibrated",
+    "fps": 30,
+    "duration_seconds": 0.0666667,
+    "time_semantics": "seconds_from_clip_start",
+    "source_bones": [
+      { "source_bone_id": "Hips", "label": "Hips", "raw_label": "Hips" },
+      { "source_bone_id": "Spine", "label": "Spine", "raw_label": "Spine", "parent_source_bone_id": "Hips" },
+      { "source_bone_id": "LeftUpperArm", "label": "LeftUpperArm", "raw_label": "LeftUpperArm", "parent_source_bone_id": "Spine" }
+    ],
+    "target_tracks": [
+      {
+        "target_node_name": "hips",
+        "target_node_index": 0,
+        "target_role": "hips",
+        "rotations": [
+          { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+          { "time_seconds": 0.0333333, "x": 0, "y": 0.1305262, "z": 0, "w": 0.9914449 }
+        ]
+      },
+      {
+        "target_node_name": "spine",
+        "target_node_index": 1,
+        "target_role": "spine",
+        "rotations": [
+          { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+          { "time_seconds": 0.0333333, "x": 0, "y": 0, "z": 0, "w": 1 }
+        ]
+      },
+      {
+        "target_node_name": "left_upper_arm",
+        "target_node_index": 5,
+        "target_role": "left_upper_arm",
+        "rotations": [
+          { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+          { "time_seconds": 0.0333333, "x": 0.1305262, "y": 0, "z": 0, "w": 0.9914449 }
+        ]
+      }
+    ],
+    "pose_clip_companion": {
+      "clip": {
+        "id": "kimodo-motion-retarget",
+        "name": "Kimodo Cross Repo Trusted",
+        "durationSeconds": 0.0666667,
+        "fps": 30,
+        "timeSemantics": "seconds_from_clip_start"
+      },
+      "target_tracks": [
+        {
+          "target_node_name": "hips",
+          "target_node_index": 0,
+          "target_role": "hips",
+          "rotations": [
+            { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+            { "time_seconds": 0.0333333, "x": 0, "y": 0.1305262, "z": 0, "w": 0.9914449 }
+          ]
+        },
+        {
+          "target_node_name": "spine",
+          "target_node_index": 1,
+          "target_role": "spine",
+          "rotations": [
+            { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+            { "time_seconds": 0.0333333, "x": 0, "y": 0, "z": 0, "w": 1 }
+          ]
+        },
+        {
+          "target_node_name": "left_upper_arm",
+          "target_node_index": 5,
+          "target_role": "left_upper_arm",
+          "rotations": [
+            { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+            { "time_seconds": 0.0333333, "x": 0.1305262, "y": 0, "z": 0, "w": 0.9914449 }
+          ]
+        }
+      ]
+    }
+  }
+}

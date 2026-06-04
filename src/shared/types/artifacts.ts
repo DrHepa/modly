@@ -21,6 +21,13 @@ export interface LegacyArtifactPayload {
   outputType?: ArtifactKind
 }
 
+export interface ArtifactProvenance {
+  workflowId: string
+  workflowNodeId: string
+  extensionId?: string
+  extensionNodeId?: string
+}
+
 export interface ArtifactRef {
   id: string
   kind: ArtifactKind
@@ -28,6 +35,7 @@ export interface ArtifactRef {
   text?: string
   versionId: string
   legacy?: LegacyArtifactPayload
+  provenance?: ArtifactProvenance
 }
 
 export interface ArtifactVersion {

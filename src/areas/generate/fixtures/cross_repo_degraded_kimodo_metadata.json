@@ -1,0 +1,52 @@
+{
+  "runtime_status": "success",
+  "retarget_status": "success",
+  "animation_mapping_status": "best_effort",
+  "stabilization_status": "not_evaluated",
+  "visual_quality_status": "warning",
+  "source_kind": "load_mesh_existing",
+  "mapping_confidence": "best_effort",
+  "clip_name": "Kimodo Cross Repo Degraded",
+  "canonical_motion_artifact": "motion.npz",
+  "motion_bvh_artifact": "motion.bvh",
+  "artifacts": ["animated.glb", "metadata.json", "motion.bvh", "motion.npz", "preview.glb"],
+  "warnings": ["classification_unknown_or_non_humanoid"],
+  "diagnostics": {
+    "humanoid_contract": {
+      "trusted": false,
+      "diagnostics": ["humanoid_contract_missing:metadata_mode_auto"]
+    }
+  },
+  "kimodo_motion_retarget": {
+    "schema": "kimodo.motion-retarget.v1",
+    "contract_version": 1,
+    "producer": {
+      "extension_id": "kimodo-soma-rp",
+      "node_id": "animate-rigged-mesh"
+    },
+    "source_contract": {
+      "schema": "modly.humanoid.v1",
+      "status": "contract_missing_or_untrusted",
+      "trusted": false
+    },
+    "mapping_status": "best_effort",
+    "mapping_confidence": "best_effort",
+    "fps": 30,
+    "duration_seconds": 0.0666667,
+    "time_semantics": "seconds_from_clip_start",
+    "source_bones": [
+      { "source_bone_id": "Hips", "label": "Hips", "raw_label": "Hips" }
+    ],
+    "target_tracks": [
+      {
+        "target_node_name": "hips",
+        "target_node_index": 0,
+        "target_role": "hips",
+        "rotations": [
+          { "time_seconds": 0, "x": 0, "y": 0, "z": 0, "w": 1 },
+          { "time_seconds": 0.0333333, "x": 0, "y": 0.1305262, "z": 0, "w": 0.9914449 }
+        ]
+      }
+    ]
+  }
+}

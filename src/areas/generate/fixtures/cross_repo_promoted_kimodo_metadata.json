@@ -1,0 +1,18 @@
+{
+  "contract_status": "manual_confirmed",
+  "animation_mapping_status": "manual_confirmed",
+  "kimodo_motion_retarget": {
+    "source_contract": {
+      "schema": "modly.humanoid-promotion.v1",
+      "status": "manual_confirmed",
+      "trusted": false
+    },
+    "mapping_status": "manual_confirmed",
+    "target_tracks": [
+      { "target_role": "hips", "target_node_name": "hips", "target_node_index": 0 },
+      { "target_role": "spine", "target_node_name": "spine", "target_node_index": 1 },
+      { "target_role": "head", "target_node_name": "head", "target_node_index": 4 }
+    ]
+  },
+  "warnings_excluded": ["humanoid_contract_missing_or_untrusted"]
+}

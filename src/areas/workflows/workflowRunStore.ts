@@ -14,7 +14,7 @@ import { assignSlotFilePaths } from './slotInputs'
 import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import type { SlotInputType } from './slotInputs'
 
-import type { ArtifactRef, ArtifactLineage, ArtifactSubstitutionPoint, ArtifactReplacementResult } from '../../shared/types/artifacts'
+import type { ArtifactRef, ArtifactLineage, ArtifactProvenance, ArtifactSubstitutionPoint, ArtifactReplacementResult } from '../../shared/types/artifacts'
 import {
   artifactRefToLegacyOutput, legacyOutputToArtifactRef, createArtifactLineage,
   createDeclaredArtifactSubstitutionPoint, resolveArtifactReplacement, buildWaitArtifactLineage,
@@ -232,11 +232,12 @@ function updateOwnedJob(ctx: RunContext, patch: Parameters<ReturnType<typeof use
   }
 }
 
-function recordNodeArtifact(ctx: RunContext, nodeId: string): void {
+function recordNodeArtifact(ctx: RunContext, nodeId: string, provenance?: ArtifactProvenance): void {
   const revision = (ctx.outputRevisions.get(nodeId) ?? 0) + 1
   ctx.outputRevisions.set(nodeId, revision)
   const artifact = legacyOutputToArtifactRef(ctx.nodeOutputs.get(nodeId), {
     artifactId: `${ctx.runId}:${nodeId}`, versionId: `${ctx.runId}:${nodeId}:${revision}`,
+    provenance,
   })
   if (artifact && artifactRefToLegacyOutput(artifact)) ctx.nodeArtifacts.set(nodeId, artifact)
   else ctx.nodeArtifacts.delete(nodeId)
@@ -667,7 +668,8 @@ async function executeExtensionNode(
   }
   // Freshest params at the moment the node starts (so loop iterations / Retry pick
   // up edits made while paused, not the values captured at run start).
-  const liveParams = hydrateWorkflowNodeParams(ext, _liveParams.current.get(node.id) ?? node.data.params ?? {})
+  const rawParams = _liveParams.current.get(node.id) ?? node.data.params ?? {}
+  const liveParams = hydrateWorkflowNodeParams(ext, rawParams)
 
   const resolveSource = (sourceId: string): NodeOutput | undefined => {
     const realId = resolveDataSource(sourceId, workflow.edges, nodeMap, nodeOutputs)
@@ -832,9 +834,22 @@ async function executeExtensionNode(
       })
     } else if (isTextInput) {
       const { prompt: _prompt, ...params } = effectiveParams
-      const prompt = resolveWorkflowPrompt(effectiveParams, nodeInputText)
-      if (promptPort && promptPort.required !== false && !prompt.trim()) {
-        throw new Error(`Missing required prompt input for extension ${ext.id}`)
+      const isRiggedMotion = ext.input === 'text' && isHumanoidConsumer(ext)
+      const explicitMotion = isRiggedMotion && Object.hasOwn(rawParams, 'prompt') && typeof rawParams.prompt === 'string'
+        ? rawParams.prompt : undefined
+      const resolvedPrompt = explicitMotion ?? resolveWorkflowPrompt(effectiveParams, nodeInputText)
+      const prompt = isRiggedMotion ? resolvedPrompt.trim() : resolvedPrompt
+      if ((explicitMotion !== undefined || (promptPort && promptPort.required !== false)) && !prompt.trim()) {
+        throw new Error(`Missing required ${isRiggedMotion ? 'motion prompt' : 'prompt'} input for extension ${ext.id}`)
+      }
+      if (isRiggedMotion) {
+        extraParams.motion_prompt = prompt
+        // Keep existing wire aliases coherent, without changing ordinary MODELs.
+        if (Object.hasOwn(extraParams, 'prompt')) extraParams.prompt = prompt
+        if (Object.hasOwn(extraParams, 'text') || Object.hasOwn(params, 'text')) extraParams.text = prompt
+        delete params.character_prompt
+        const characterPrompt = nodeInputText?.trim()
+        if (explicitMotion !== undefined && characterPrompt && characterPrompt !== prompt) extraParams.character_prompt = characterPrompt
       }
       // This is the specialized text + rigged_mesh adapter, not a multi-mesh ABI.
       const riggedMeshPath = meshPaths.get('rigged_mesh')
@@ -958,7 +973,10 @@ async function executeExtensionNode(
   const outputType = ext.output
   nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
 
-  recordNodeArtifact(ctx, node.id)
+  recordNodeArtifact(ctx, node.id, {
+    workflowId: workflow.id, workflowNodeId: node.id,
+    extensionId: ext.extensionId, extensionNodeId: ext.nodeId,
+  })
   const output = nodeOutputs.get(node.id)
   const url = isSceneMeshOutput(output) ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
   if (url && reachesSceneOutput(node.id, workflow.edges, nodeMap)) {

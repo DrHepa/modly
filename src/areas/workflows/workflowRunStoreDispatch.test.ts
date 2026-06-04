@@ -8,6 +8,7 @@ import vm from 'node:vm'
 import type { Workflow, WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
+import { artifactRefToLegacyOutput, legacyOutputToArtifactRef } from './workflowArtifacts.ts'
 import React from 'react'
 import { useStore } from 'zustand'
 
@@ -274,7 +275,13 @@ function createMultiInputWorkflow(args: {
   }
 }
 
-function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePath?: string; includeMeshEdge?: boolean }): Workflow {
+function createTextMeshWorkflow(args: {
+  node: WFNode
+  text?: string
+  meshFilePath?: string
+  includeMeshEdge?: boolean
+  meshTargetHandle?: string
+}): Workflow {
   const nodes = [
     createNode('text-source', 'textNode', { enabled: true, params: { text: args.text ?? 'Walk forward' } }),
     createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/rigs/avatar.glb' } }),
@@ -283,7 +290,9 @@ function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePat
   ]
   const edges: WFEdge[] = [
     { id: 'edge-text', source: 'text-source', target: args.node.id, targetHandle: 'prompt' },
-    ...(args.includeMeshEdge === false ? [] : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: 'rigged_mesh' }]),
+    ...(args.includeMeshEdge === false
+      ? []
+      : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: args.meshTargetHandle ?? 'rigged_mesh' }]),
     { id: 'edge-output', source: args.node.id, target: 'output-node' },
   ]
 
@@ -981,10 +990,113 @@ test('workflowRunStore routes named rigged mesh input into text generation param
       mesh_path: 'rigs/avatar.glb',
       node_id: 'animate-rigged-mesh',
       model_id: ext.id,
+      motion_prompt: 'Jump and wave',
     },
   })
   assert.deepEqual(fsReadCalls, [])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual({ ...useWorkflowRunStore.getState().runState.artifact?.provenance }, {
+    workflowId: 'workflow-text-mesh',
+    workflowNodeId: 'animate-node',
+    extensionId: 'kimodo-soma-rp',
+    extensionNodeId: 'animate-rigged-mesh',
+  })
+  assert.deepEqual({ ...useWorkflowRunStore.getState().nodeArtifacts['animate-node']?.provenance }, {
+    workflowId: 'workflow-text-mesh',
+    workflowNodeId: 'animate-node',
+    extensionId: 'kimodo-soma-rp',
+    extensionNodeId: 'animate-rigged-mesh',
+  })
+})
+
+test('workflowRunStore routes Animate Rigged Mesh node prompt as motion prompt and keeps source text separate', async () => {
+  const ext = createKimodoAnimateExtension({
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: '' },
+      { id: 'duration', label: 'Duration', type: 'float', default: 5 },
+    ],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {
+        prompt: 'a person walking',
+        duration: 3,
+      },
+    }),
+    text: 'Nekomimi Woman, blue jeans, T-Pose, Full PBR',
+    meshFilePath: '/workspace/rigs/nekomimi.glb',
+  })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-motion-prompt' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal(postCalls[0].path, '/generate/from-text')
+  assert.equal(postCalls[0].data.prompt, 'a person walking')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).motion_prompt, 'a person walking')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).character_prompt, 'Nekomimi Woman, blue jeans, T-Pose, Full PBR')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).prompt, 'a person walking')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).text, 'a person walking')
+  assert.notEqual(postCalls[0].data.prompt, 'Nekomimi Woman, blue jeans, T-Pose, Full PBR')
+})
+test('workflowRunStore blocks Animate Rigged Mesh when node motion prompt is empty even if source text exists', async () => {
+  const ext = createKimodoAnimateExtension({
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: '' }],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { prompt: '   ' },
+    }),
+    text: 'Nekomimi Woman, blue jeans, T-Pose, Full PBR',
+    meshFilePath: '/workspace/rigs/nekomimi.glb',
+  })
+  let postCalls = 0
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls += 1
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      throw new Error('Unexpected axios.get call')
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required motion prompt input for extension kimodo\/animate-rigged-mesh/)
+})
+test('workflowRunStore rejects stale named mesh handles instead of authorizing a single-mesh fallback', async () => {
+  const ext = createKimodoAnimateExtension()
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    text: 'Jump and wave', meshTargetHandle: 'mesh',
+  })
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(posts.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
+  assert.deepEqual(humanoidPromotionReadCalls, [])
 })
 
 test('workflowRunStore blocks animate-rigged-mesh before generation when rigged mesh is missing', async () => {
@@ -2196,9 +2308,11 @@ test('workflowRunStore continues Wait before Kimodo fail-closed when only a huma
       mesh_path: 'Workflows/generated/avatar.glb',
       node_id: 'animate-rigged-mesh',
       model_id: kimodoExt.id,
+      motion_prompt: 'Walk forward',
     },
   })
 })
+
 test('workflowRunStore forwards only manual_confirmed humanoid promotion references downstream after Wait', async () => {
   const kimodoExt = createKimodoAnimateExtension()
   const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-promoted' })
@@ -2254,9 +2368,11 @@ test('workflowRunStore forwards only manual_confirmed humanoid promotion referen
       model_id: kimodoExt.id,
       humanoid_input_status: 'manual_confirmed',
       humanoid_promotion_sidecar_path: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+      motion_prompt: 'Walk forward',
     },
   })
 })
+
 test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo and does not forward it', async () => {
   const kimodoExt = createKimodoAnimateExtension()
   const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-stale' })
@@ -2308,6 +2424,7 @@ test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo an
     mesh_path: 'Workflows/generated/avatar.glb',
     node_id: 'animate-rigged-mesh',
     model_id: kimodoExt.id,
+    motion_prompt: 'Walk forward',
   })
 })
 
@@ -2648,4 +2765,271 @@ test('mounted cancellation clears busy state and late rejection cannot clear a n
     assert.equal(useWorkflowRunStore.getState().runningBranchId, null)
     assert.equal(posts.length, 0)
   } finally { old.resolve(noPromotion()); await operation; h.unmount(); useWorkflowRunStore.getState().reset() }
+})
+
+// Original54: provenance is descriptive lineage, never a humanoid trust receipt.
+test('artifact adapter adds optional provenance without changing identity, legacy payload or absent behavior', () => {
+  const provenance = { workflowId: 'workflow', workflowNodeId: 'node', extensionId: 'resolved', extensionNodeId: 'capability' }
+  for (const outputType of ['image', 'mesh', 'text']) {
+    const output = outputType === 'text' ? { text: '', outputType } : { filePath: `/workspace/result.${outputType}`, outputType }
+    const original = legacyOutputToArtifactRef(output)!
+    const described = legacyOutputToArtifactRef(output, { provenance })!
+    assert.deepEqual(described, { ...original, provenance })
+    assert.deepEqual(artifactRefToLegacyOutput(described), artifactRefToLegacyOutput(original))
+    assert.equal(Object.hasOwn(original, 'provenance'), false)
+    assert.deepEqual(legacyOutputToArtifactRef(output, { artifactId: 'run:node', versionId: 'run:node:2', provenance }), {
+      ...original, id: 'run:node', versionId: 'run:node:2', provenance,
+    })
+  }
+  for (const absent of [undefined, {}, { outputType: 'mesh' }, { filePath: '/unsupported', outputType: 'unknown' }, { filePath: '/result.wav', outputType: 'audio' }, { filePath: '/result.mp4', outputType: 'video' }, { filePath: '/scene.json', outputType: 'scene' }]) {
+    assert.equal(legacyOutputToArtifactRef(absent, { provenance }), undefined)
+  }
+  assert.equal(legacyOutputToArtifactRef({ text: 'legacy text', outputType: 'unknown' }, { provenance })?.kind, 'text')
+})
+
+for (const raw of [{ prompt: '' }, { prompt: ' \n ' }]) {
+  test(`only explicit blank rigged motion fails even with optional prompt and character text: ${JSON.stringify(raw)}`, async () => {
+    const ext = createKimodoAnimateExtension({ inputs: [{ name: 'prompt', type: 'text', required: false }, { name: 'rigged_mesh', type: 'mesh' }] })
+    const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: raw }), text: 'Character description' })
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(posts.length, 0)
+    assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required motion prompt/)
+    assert.deepEqual(humanoidPromotionReadCalls, [])
+  })
+}
+
+for (const scenario of [
+  { name: 'default is not explicit', raw: {}, connected: ' Character description ', expected: 'Character description' },
+  { name: 'missing connected text uses default', raw: {}, connected: undefined, expected: 'Default motion' },
+  { name: 'explicit motion is trimmed', raw: { prompt: '  Turn left  ', text: 'stale alias', motion_prompt: 'stale motion', character_prompt: 'stale character', zero: 0, flag: false }, connected: ' Character description ', expected: 'Turn left' },
+  { name: 'matching character text is not duplicated', raw: { prompt: ' Turn left ', character_prompt: 'stale character' }, connected: 'Turn left', expected: 'Turn left' },
+  { name: 'blank character text is not forwarded', raw: { prompt: 'Turn left', character_prompt: 'stale character' }, connected: '   ', expected: 'Turn left' },
+  { name: 'non-string own prompt is not explicit motion', raw: { prompt: false }, connected: 'Character description', expected: 'Character description' },
+] as const) {
+  test(`rigged motion parameter presence: ${scenario.name}`, async () => {
+    const ext = createKimodoAnimateExtension({ params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: 'Default motion' }] })
+    const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: { ...scenario.raw } }), text: scenario.connected })
+    if (scenario.connected === undefined) workflow.edges = workflow.edges.filter((edge) => edge.source !== 'text-source')
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done', useWorkflowRunStore.getState().runState.error)
+    assert.equal(posts.length, 1)
+    const params = posts[0].params as Record<string, unknown>
+    assert.equal(posts[0].prompt, scenario.expected)
+    assert.equal(params.motion_prompt, scenario.expected)
+    for (const alias of ['prompt', 'text']) if (Object.hasOwn(params, alias)) assert.equal(params[alias], scenario.expected)
+    assert.equal(params.character_prompt, scenario.name === 'explicit motion is trimmed' ? 'Character description' : undefined)
+    if (scenario.name === 'explicit motion is trimmed') {
+      assert.equal(params.zero, 0)
+      assert.equal(params.flag, false)
+    }
+    assert.deepEqual(workflow.nodes.find((node) => node.id === 'animate')!.data.params, scenario.raw)
+  })
+}
+
+for (const overrides of [
+  { extensionId: 'other-provider', id: 'other/animate-rigged-mesh' },
+  { nodeId: 'not-animate-rigged-mesh', id: 'kimodo/prefix-animate-rigged-mesh' },
+  { inputs: undefined },
+  { inputs: ['text'] },
+] satisfies Partial<WorkflowExtension>[]) {
+  test(`ordinary MODEL prompt precedence is not selected by label or id substring: ${JSON.stringify(overrides)}`, async () => {
+    const ext = createKimodoAnimateExtension(overrides)
+    const raw = { prompt: '', text: 'alias', motion_prompt: 'user motion', character_prompt: 'user character', zero: 0, flag: false, unknown: { retained: true } }
+    const workflow = createTextMeshWorkflow({ node: createNode('ordinary', 'extensionNode', { extensionId: ext.id, enabled: true, params: raw }), text: '  Connected text  ' })
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    assert.equal(posts[0].prompt, '  Connected text  ')
+    const params = posts[0].params as Record<string, unknown>
+    assert.equal(params.prompt, '  Connected text  ')
+    assert.equal(params.text, '  Connected text  ')
+    assert.equal(params.motion_prompt, 'user motion')
+    assert.equal(params.character_prompt, 'user character')
+    assert.equal(params.zero, 0)
+    assert.equal(params.flag, false)
+    assert.deepEqual(params.unknown, { retained: true })
+  })
+}
+
+test('named Kimodo PROCESS retains separate prompt and typed text input instead of applying MODEL motion routing', async () => {
+  const ext = createKimodoAnimateExtension({ type: 'process' })
+  const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: { prompt: '', text: 'own alias', motion_prompt: 'own motion' } }), text: 'Character description' })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0].params, { prompt: '', text: 'own alias', motion_prompt: 'own motion' })
+  assert.equal((runProcessCalls[0].input as any).inputs.prompt.text, 'Character description')
+})
+
+for (const targetHandle of [undefined, 'input-0']) {
+  test(`legacy positional text MODEL remains connected-first without named semantics: ${targetHandle ?? 'no handle'}`, async () => {
+    const ext = createKimodoAnimateExtension({ inputs: ['text'] })
+    const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: { prompt: 'Own prompt' } }), text: 'Legacy connected', includeMeshEdge: false })
+    workflow.edges[0].targetHandle = targetHandle
+    const posts = captureTextRequests()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    assert.equal(posts[0].prompt, 'Legacy connected')
+    assert.equal((posts[0].params as Record<string, unknown>).motion_prompt, undefined)
+  })
+}
+
+for (const targetHandle of [undefined, 'input-0']) {
+  test(`single-input legacy UniRig PROCESS keeps routing and landmark sidecar: ${targetHandle ?? 'no handle'}`, async () => {
+    const workflow = checkpointWorkflow('landmarksNode')
+    const ext = addProcess(workflow, 'rig-mesh', 'wait')
+    ext.extensionId = 'unirig-tools'
+    ext.name = 'UniRig Rig Mesh'
+    ext.params = [{ id: 'quality', label: 'Quality', type: 'string', default: 'draft' }]
+    workflow.edges.find((edge) => edge.target === 'rig-mesh')!.targetHandle = targetHandle
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    completeCapture()
+    await useWorkflowRunStore.getState().continueRun('wait')
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    assert.equal(runProcessCalls.length, 1)
+    assert.deepEqual(runProcessCalls[0], { extensionId: 'unirig-tools', input: { filePath: '/workspace/source.glb', nodeId: 'rig-mesh' }, params: {
+      quality: 'draft', landmarks_sidecar_path: sidecarWrites[0].sidecarWorkspacePath,
+    } })
+    assert.equal(sidecarWrites[0].sidecar.runId, useWorkflowRunStore.getState().executionId)
+    assert.equal(useWorkflowRunStore.getState().nodeArtifacts.source.provenance, undefined)
+    assert.deepEqual({ ...useWorkflowRunStore.getState().nodeArtifacts['rig-mesh'].provenance }, { workflowId: workflow.id, workflowNodeId: 'rig-mesh', extensionId: 'unirig-tools', extensionNodeId: 'rig-mesh' })
+  })
+}
+
+test('motion MODEL reads fresh explicit params at paused Continue and failed Retry without losing revision identity', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'motion-live-retry' })
+  workflow.nodes.find((node) => node.id === 'kimodo-node')!.data.params = { prompt: 'Saved motion' }
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  await waitForHumanoidReview()
+  const source = useWorkflowRunStore.getState().nodeArtifacts['mesh-source']
+  const runId = useWorkflowRunStore.getState().executionId!
+  assert.equal(source.provenance, undefined)
+  useWorkflowRunStore.getState().setLiveNodeParams('kimodo-node', { prompt: '' })
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  assert.equal(posts.length, 0)
+  assert.equal(useWorkflowRunStore.getState().waitStates['wait-node'], 'error')
+  useWorkflowRunStore.getState().setLiveNodeParams('kimodo-node', { prompt: ' Live motion ' })
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  assert.equal(posts[0].prompt, 'Live motion')
+  const first = useWorkflowRunStore.getState().nodeArtifacts['kimodo-node']
+  assert.equal(first.id, `${runId}:kimodo-node`)
+  assert.equal(first.versionId, `${runId}:kimodo-node:1`)
+  assert.deepEqual({ ...first.provenance }, { workflowId: workflow.id, workflowNodeId: 'kimodo-node', extensionId: ext.extensionId, extensionNodeId: ext.nodeId })
+  assert.deepEqual(useWorkflowRunStore.getState().runState.artifact, first)
+  useWorkflowRunStore.getState().setLiveNodeParams('kimodo-node', { prompt: 'Retry motion' })
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  const second = useWorkflowRunStore.getState().nodeArtifacts['kimodo-node']
+  assert.equal(posts[1].prompt, 'Retry motion')
+  assert.equal(second.id, first.id)
+  assert.equal(second.versionId, `${runId}:kimodo-node:2`)
+  assert.deepEqual(second.provenance, first.provenance)
+  assert.deepEqual(useWorkflowRunStore.getState().checkpoints['wait-node'].lineage?.versions[0].ref, source)
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.notEqual(useWorkflowRunStore.getState().executionId, runId)
+  assert.notEqual(useWorkflowRunStore.getState().nodeArtifacts['mesh-source'].id, source.id)
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['kimodo-node'], undefined)
+})
+
+test('motion MODEL recaptures raw explicit presence on While Retry and falls back to connected text when removed', async () => {
+  const ext = createKimodoAnimateExtension()
+  const target = createNode('animate', 'extensionNode', { enabled: true, extensionId: ext.id, params: { prompt: 'Initial motion' } })
+  target.parentId = 'loop'
+  const workflow = createTextMeshWorkflow({ node: target, text: 'Connected motion' })
+  for (const node of workflow.nodes) node.position = { x: 1000, y: 1000 }
+  const loop = createNode('loop', 'whileNode', { enabled: true, params: {} })
+  loop.width = 500; loop.height = 300
+  workflow.nodes.push(loop)
+  const posts = captureTextRequests()
+  const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+  try {
+    await waitFor(() => useWorkflowRunStore.getState().runState.status === 'paused')
+    useWorkflowRunStore.getState().setLiveNodeParams(target.id, { prompt: 'Retry motion' })
+    useWorkflowRunStore.getState().retryWhile()
+    await waitFor(() => posts.length === 2 && useWorkflowRunStore.getState().runState.status === 'paused')
+    useWorkflowRunStore.getState().setLiveNodeParams(target.id, {})
+    useWorkflowRunStore.getState().retryWhile()
+    await waitFor(() => posts.length === 3 && useWorkflowRunStore.getState().runState.status === 'paused')
+    useWorkflowRunStore.getState().continueWhile()
+    await pending
+  } finally {
+    if (useWorkflowRunStore.getState().runState.status !== 'done') useWorkflowRunStore.getState().cancel()
+    await pending
+  }
+  assert.deepEqual(posts.map((post) => post.prompt), ['Initial motion', 'Retry motion', 'Connected motion'])
+  assert.deepEqual(posts.map((post) => (post.params as Record<string, unknown>).motion_prompt), ['Initial motion', 'Retry motion', 'Connected motion'])
+  assert.deepEqual(posts.map((post) => (post.params as Record<string, unknown>).character_prompt), ['Connected motion', 'Connected motion', undefined])
+  const artifact = useWorkflowRunStore.getState().nodeArtifacts.animate
+  assert.equal(artifact.versionId, `${useWorkflowRunStore.getState().executionId}:animate:3`)
+  assert.equal(artifact.provenance?.workflowNodeId, 'animate')
+})
+
+for (const type of ['model', 'process'] as const) {
+  for (const targetHandle of [undefined, 'input-0', 'mesh']) {
+    test(`named rigged ${type} rejects non-declared mesh route without borrowing authority: ${targetHandle ?? 'no handle'}`, async () => {
+      const ext = createKimodoAnimateExtension({ type })
+      const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: { prompt: 'Move' } }) })
+      workflow.edges.find((edge) => edge.source === 'mesh-source')!.targetHandle = targetHandle
+      const posts = captureTextRequests()
+      humanoidPromotionReadResult = foundPromotion()
+      await useWorkflowRunStore.getState().run(workflow, [ext])
+      assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+      assert.equal(posts.length, 0)
+      assert.equal(runProcessCalls.length, 0)
+      assert.deepEqual(humanoidPromotionReadCalls, [])
+      assert.equal(useWorkflowRunStore.getState().nodeArtifacts.animate, undefined)
+    })
+  }
+}
+
+test('provenance follows an extension checkpoint original, not the edited copy or source', async () => {
+  const workflow = checkpointWorkflow()
+  const producer = createWorkflowExtension({ id: 'resolved-alias', extensionId: 'actual-provider', nodeId: 'actual-capability', type: 'process', input: 'mesh' })
+  workflow.nodes.push(createNode('producer', 'extensionNode', { extensionId: producer.id, enabled: true, params: {} }))
+  workflow.edges = [{ id: 'source-producer', source: 'source', target: 'producer' }, { id: 'producer-wait', source: 'producer', target: 'wait' }]
+  const consumer = addProcess(workflow, 'consumer', 'wait')
+  await useWorkflowRunStore.getState().run(workflow, [producer, consumer])
+  const first = useWorkflowRunStore.getState().nodeArtifacts.producer
+  assert.deepEqual({ ...first.provenance }, { workflowId: workflow.id, workflowNodeId: 'producer', extensionId: 'actual-provider', extensionNodeId: 'actual-capability' })
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts.source.provenance, undefined)
+  assert.equal(useWorkflowRunStore.getState().checkpoints.wait.substitutionPoint?.inputArtifact, first)
+  assert.equal(useWorkflowRunStore.getState().checkpoints.wait.lineage?.versions[0].ref, first)
+  assert.equal(useWorkflowRunStore.getState().setPendingReplacement(owner(), editedRef()), true)
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner(), replacementArtifact: editedRef() })
+  const state = useWorkflowRunStore.getState()
+  assert.equal(state.nodeArtifacts.wait.provenance, undefined)
+  assert.equal(state.checkpoints.wait.lineage?.versions[0].ref, first)
+  assert.equal(state.checkpoints.wait.lineage?.versions[1].ref.provenance, undefined)
+  assert.equal(state.checkpoints.wait.lineage?.versions[1].parentVersionId, first.versionId)
+  assert.equal(state.nodeArtifacts.consumer.provenance?.workflowNodeId, 'consumer')
+  assert.equal(state.nodeArtifacts.consumer.provenance?.extensionNodeId, consumer.nodeId)
+  assert.equal(Object.hasOwn(state.nodeArtifacts.consumer.provenance!, 'trusted'), false)
+})
+
+test('For Each artifacts remain provenance-free while successful extension revisions retain their resolved producer', async () => {
+  iteratorFileNames = ['a.glb', 'b.glb']
+  const ext = createWorkflowExtension({ type: 'process', input: 'mesh' })
+  const target = createExtensionNode(ext.id)
+  const workflow = { ...checkpointWorkflow(), nodes: [createNode('iterator', 'forEachNode', { enabled: true, params: { mode: 'mesh', dir: '/workspace/rigs' } }), target], edges: [{ id: 'input', source: 'iterator', target: target.id }] }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(runProcessCalls.length, 2)
+  const state = useWorkflowRunStore.getState()
+  assert.equal(state.nodeArtifacts.iterator.provenance, undefined)
+  assert.equal(state.nodeArtifacts.iterator.versionId, `${state.executionId}:iterator:2`)
+  assert.equal(state.nodeArtifacts[target.id].versionId, `${state.executionId}:${target.id}:2`)
+  assert.deepEqual({ ...state.nodeArtifacts[target.id].provenance }, { workflowId: workflow.id, workflowNodeId: target.id, extensionId: ext.extensionId, extensionNodeId: ext.nodeId })
+})
+
+test('inherited raw prompt is not an explicit motion parameter', async () => {
+  const ext = createKimodoAnimateExtension()
+  const raw = Object.create({ prompt: 'Inherited motion' })
+  const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: raw }), text: 'Connected motion' })
+  const posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(posts[0].prompt, 'Connected motion')
+  assert.equal((posts[0].params as Record<string, unknown>).motion_prompt, 'Connected motion')
+  assert.equal((posts[0].params as Record<string, unknown>).character_prompt, undefined)
 })

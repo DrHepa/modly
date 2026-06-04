@@ -1,6 +1,7 @@
 import type {
   ArtifactKind,
   ArtifactLineage,
+  ArtifactProvenance,
   ArtifactReplacementResult,
   ArtifactRef,
   ArtifactSubstitution,
@@ -18,6 +19,7 @@ export interface LegacyWorkflowOutput {
 export interface ArtifactRefAdapterOptions {
   artifactId?: string
   versionId?: string
+  provenance?: ArtifactProvenance
 }
 
 export interface ArtifactLineageOptions {
@@ -159,6 +161,7 @@ export function legacyOutputToArtifactRef(
     ...(output.text !== undefined ? { text: output.text } : {}),
     versionId,
     legacy: legacyPayloadFor(output, kind),
+    ...(options.provenance !== undefined ? { provenance: options.provenance } : {}),
   }
 }
 

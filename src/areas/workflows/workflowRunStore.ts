@@ -12,6 +12,7 @@ import type {
   Workflow,
   WFNode,
   WFEdge,
+} from '../../shared/types/electron.d'
 import type { ArtifactReplacementResult, WorkflowContinueOptions } from '../../shared/types/artifacts.ts'
 import { buildProcessExecutionInput } from './processExecution.ts'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
@@ -406,6 +407,11 @@ function resolveIncomingLandmarkSidecarPath(args: {
   return undefined
 }
 
+function resolveLandmarkSidecarParams(ext: WorkflowExtension, incomingLandmarkSidecarPath: string | undefined): Record<string, string> {
+  if (!incomingLandmarkSidecarPath || !isLandmarkSidecarConsumer(ext)) return {}
+  return { landmarks_sidecar_path: incomingLandmarkSidecarPath }
+}
+
 async function writeLandmarkSidecarForSession(args: {
   workflowId: string
   session: WorkflowLandmarkSession
@@ -586,12 +592,18 @@ function resolveModelMeshRouting(args: {
   const meshPortNames = new Set(meshPorts.map((port) => port.name))
   const routed = new Map<string, string>()
   for (const edge of args.incomingEdges) {
-    const handle = edge.targetHandle ?? (meshPorts.length === 1 ? meshPorts[0].name : undefined)
-    if (!handle || !meshPortNames.has(handle)) continue
-
     const src = args.nodeOutputs.get(edge.source)
     if (!src?.filePath || src.outputType !== 'mesh') continue
-    routed.set(handle, src.filePath)
+
+    const handle = edge.targetHandle ?? undefined
+    if (handle && meshPortNames.has(handle)) {
+      routed.set(handle, src.filePath)
+      continue
+    }
+
+    if (meshPorts.length === 1) {
+      routed.set(meshPorts[0].name, src.filePath)
+    }
   }
 
   return {
@@ -634,22 +646,34 @@ function buildModelGenerationRequest(args: {
 
   if (ext.input === 'text') {
     const promptParam = typeof nodeParams.prompt === 'string' ? nodeParams.prompt : undefined
-    const prompt = nodeInputText ?? promptParam ?? ''
+    const isAnimateRiggedMesh = ext.nodeId === 'animate-rigged-mesh' || ext.id.includes('animate-rigged-mesh')
+    const nodeOwnParams = node.data.params && typeof node.data.params === 'object' ? node.data.params : {}
+    const hasExplicitPromptParam = Object.prototype.hasOwnProperty.call(nodeOwnParams, 'prompt')
+    const prompt = isAnimateRiggedMesh && hasExplicitPromptParam && promptParam !== undefined
+      ? promptParam
+      : nodeInputText ?? promptParam ?? ''
     const { prompt: _prompt, ...params } = nodeParams
     if (!prompt.trim()) {
-      throw new Error(`Missing required prompt input for extension ${ext.id}`)
+      throw new Error(`Missing required ${isAnimateRiggedMesh ? 'motion prompt' : 'prompt'} input for extension ${ext.id}`)
+    }
+    const textParams = { ...params, ...routedMeshParams }
+    if (isAnimateRiggedMesh) {
+      textParams.motion_prompt = prompt.trim()
+      if (hasExplicitPromptParam && promptParam !== undefined && typeof nodeInputText === 'string' && nodeInputText.trim() && nodeInputText.trim() !== prompt.trim()) {
+        textParams.character_prompt = nodeInputText.trim()
+      }
     }
 
     return {
       kind: 'text',
       payload: {
-        prompt,
+        prompt: prompt.trim(),
         model_id: node.data.extensionId ?? '',
         collection: 'Workflows',
         remesh: 'none',
         enable_texture: false,
         texture_resolution: 1024,
-        params: { ...params, ...routedMeshParams },
+        params: textParams,
       },
     }
   }
@@ -1127,8 +1151,20 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       const waitCheckpointHumanoidReviews = new Map<string, WaitCheckpointReviewState>()
       const outputNodeIds = new Set(ordered.filter((n) => n.type === 'outputNode').map((n) => n.id))
 
-      const rememberArtifactOutput = (nodeId: string, output: LegacyWorkflowOutput): ArtifactRef | undefined => {
-        const artifact = legacyOutputToArtifactRef(output, { artifactId: `workflow-${workflow.id}-node-${nodeId}` })
+      const rememberArtifactOutput = (
+        nodeId: string,
+        output: LegacyWorkflowOutput,
+        provenance?: {
+          workflowId: string
+          workflowNodeId: string
+          extensionId?: string
+          extensionNodeId?: string
+        },
+      ): ArtifactRef | undefined => {
+        const artifact = legacyOutputToArtifactRef(output, {
+          artifactId: `workflow-${workflow.id}-node-${nodeId}`,
+          provenance,
+        })
         if (!artifact) return undefined
         nodeArtifacts.set(nodeId, artifact)
         if (!artifactLineages.has(artifact.id)) {
@@ -1432,6 +1468,12 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
         const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
+        const artifactProvenance = {
+          workflowId: workflow.id,
+          workflowNodeId: node.id,
+          extensionId: ext.extensionId,
+          extensionNodeId: ext.nodeId,
+        }
 
         // ── Resolve inputs ────────────────────────────────────────────────
         let nodeInputPath:     string | undefined
@@ -1511,11 +1553,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           if (genericMeshPath) {
             routedMeshParams.mesh_path = normalizeWorkflowPath(genericMeshPath, workspaceDir)
           }
-          if (incomingLandmarkSidecarPath && isLandmarkSidecarConsumer(ext)) {
-            routedMeshParams.landmarks_sidecar_path = incomingLandmarkSidecarPath
-          }
         }
-        Object.assign(routedMeshParams, incomingWaitHumanoidParams)
+        Object.assign(routedMeshParams, resolveLandmarkSidecarParams(ext, incomingLandmarkSidecarPath), incomingWaitHumanoidParams)
 
         set((s) => ({
           activeNodeId: node.id,
@@ -1621,7 +1660,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const outputType = ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
         const nodeOutput = { filePath: nodeInputPath, text: nodeInputText, outputType }
         nodeOutputs.set(node.id, nodeOutput)
-        rememberArtifactOutput(node.id, nodeOutput)
+        rememberArtifactOutput(node.id, nodeOutput, artifactProvenance)
 
         // If this node feeds an Add-to-Scene, push the mesh to currentJob
         // immediately so the 3D viewer loads it without waiting for the rest of the run.

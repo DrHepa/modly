@@ -11,6 +11,7 @@ import type {
   Workflow,
   WFEdge,
   WFNode,
+} from '../../shared/types/electron.d'
 import { REQUIRED_LANDMARK_IDS, type LandmarkCaptureState, type LandmarkId, type LandmarkPoint, type LandmarkSidecarV1 } from './landmarks.ts'
 import { createLandmarkPointIntent, deriveLandmarkMarkers } from '../generate/components/viewerLandmarkPicking.ts'
 import type { WorkflowExtension } from './mockExtensions'
@@ -331,7 +332,13 @@ function createMultiInputWorkflow(args: {
   }
 }
 
-function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePath?: string; includeMeshEdge?: boolean }): Workflow {
+function createTextMeshWorkflow(args: {
+  node: WFNode
+  text?: string
+  meshFilePath?: string
+  includeMeshEdge?: boolean
+  meshTargetHandle?: string
+}): Workflow {
   const nodes = [
     createNode('text-source', 'textNode', { enabled: true, params: { text: args.text ?? 'Walk forward' } }),
     createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/rigs/avatar.glb' } }),
@@ -340,7 +347,9 @@ function createTextMeshWorkflow(args: { node: WFNode; text?: string; meshFilePat
   ]
   const edges: WFEdge[] = [
     { id: 'edge-text', source: 'text-source', target: args.node.id, targetHandle: 'prompt' },
-    ...(args.includeMeshEdge === false ? [] : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: 'rigged_mesh' }]),
+    ...(args.includeMeshEdge === false
+      ? []
+      : [{ id: 'edge-mesh', source: 'mesh-source', target: args.node.id, targetHandle: args.meshTargetHandle ?? 'rigged_mesh' }]),
     { id: 'edge-output', source: args.node.id, target: 'output-node' },
   ]
 
@@ -1073,9 +1082,160 @@ test('workflowRunStore routes named rigged mesh input into text generation param
       mesh_path: 'rigs/avatar.glb',
       node_id: 'animate-rigged-mesh',
       model_id: ext.id,
+      motion_prompt: 'Jump and wave',
     },
   })
   assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.deepEqual(useWorkflowRunStore.getState().runState.artifact?.provenance, {
+    workflowId: 'workflow-text-mesh',
+    workflowNodeId: 'animate-node',
+    extensionId: 'kimodo-soma-rp',
+    extensionNodeId: 'animate-rigged-mesh',
+  })
+  assert.deepEqual(useWorkflowRunStore.getState().nodeArtifacts['animate-node']?.provenance, {
+    workflowId: 'workflow-text-mesh',
+    workflowNodeId: 'animate-node',
+    extensionId: 'kimodo-soma-rp',
+    extensionNodeId: 'animate-rigged-mesh',
+  })
+})
+
+test('workflowRunStore routes Animate Rigged Mesh node prompt as motion prompt and keeps source text separate', async () => {
+  const ext = createKimodoAnimateExtension({
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: '' },
+      { id: 'duration', label: 'Duration', type: 'float', default: 5 },
+    ],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {
+        prompt: 'a person walking',
+        duration: 3,
+      },
+    }),
+    text: 'Nekomimi Woman, blue jeans, T-Pose, Full PBR',
+    meshFilePath: '/workspace/rigs/nekomimi.glb',
+  })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-motion-prompt' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal(postCalls[0].path, '/generate/from-text')
+  assert.equal(postCalls[0].data.prompt, 'a person walking')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).motion_prompt, 'a person walking')
+  assert.equal((postCalls[0].data.params as Record<string, unknown>).character_prompt, 'Nekomimi Woman, blue jeans, T-Pose, Full PBR')
+  assert.notEqual(postCalls[0].data.prompt, 'Nekomimi Woman, blue jeans, T-Pose, Full PBR')
+})
+test('workflowRunStore blocks Animate Rigged Mesh when node motion prompt is empty even if source text exists', async () => {
+  const ext = createKimodoAnimateExtension({
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: '' }],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { prompt: '   ' },
+    }),
+    text: 'Nekomimi Woman, blue jeans, T-Pose, Full PBR',
+    meshFilePath: '/workspace/rigs/nekomimi.glb',
+  })
+  let postCalls = 0
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls += 1
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      throw new Error('Unexpected axios.get call')
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required motion prompt input for extension kimodo\/animate-rigged-mesh/)
+})
+test('workflowRunStore falls back stale mesh target handle into single rigged mesh input', async () => {
+  const ext = createKimodoAnimateExtension({
+    params: [
+      { id: 'prompt', label: 'Prompt', type: 'string', default: '' },
+      { id: 'duration', label: 'Duration', type: 'float', default: 5 },
+    ],
+  })
+  const workflow = createTextMeshWorkflow({
+    node: createNode('animate-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: { duration: 3 },
+    }),
+    text: 'Jump and wave',
+    meshFilePath: '/workspace/rigs/avatar.glb',
+    meshTargetHandle: 'mesh',
+  })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-text-mesh-stale-handle' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Jump and wave',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      duration: 3,
+      rigged_mesh_path: 'rigs/avatar.glb',
+      mesh_path: 'rigs/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: ext.id,
+      motion_prompt: 'Jump and wave',
+    },
+  })
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
@@ -2162,9 +2322,11 @@ test('workflowRunStore continues Wait before Kimodo fail-closed when only a huma
       mesh_path: 'Workflows/generated/avatar.glb',
       node_id: 'animate-rigged-mesh',
       model_id: kimodoExt.id,
+      motion_prompt: 'Walk forward',
     },
   })
 })
+
 test('workflowRunStore forwards only manual_confirmed humanoid promotion references downstream after Wait', async () => {
   const kimodoExt = createKimodoAnimateExtension()
   const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-promoted' })
@@ -2223,9 +2385,11 @@ test('workflowRunStore forwards only manual_confirmed humanoid promotion referen
       model_id: kimodoExt.id,
       humanoid_input_status: 'manual_confirmed',
       humanoid_promotion_sidecar_path: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+      motion_prompt: 'Walk forward',
     },
   })
 })
+
 test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo and does not forward it', async () => {
   const kimodoExt = createKimodoAnimateExtension()
   const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-stale' })
@@ -2280,8 +2444,50 @@ test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo an
     mesh_path: 'Workflows/generated/avatar.glb',
     node_id: 'animate-rigged-mesh',
     model_id: kimodoExt.id,
+    motion_prompt: 'Walk forward',
   })
 })
+
+test('workflowRunStore injects landmarks_sidecar_path into single-input UniRig Rig Mesh process params without model mesh routing', async () => {
+  const rigMeshExt = createWorkflowExtension({
+    id: 'unirig/rig-mesh',
+    extensionId: 'unirig-tools',
+    nodeId: 'rig-mesh',
+    name: 'UniRig Rig Mesh',
+    type: 'process',
+    input: 'mesh',
+    output: 'mesh',
+    params: [{ id: 'quality', label: 'Quality', type: 'string', default: 'draft' }],
+  })
+  const rigNode = createNode('single-input-rig-mesh-node', 'extensionNode', {
+    extensionId: rigMeshExt.id,
+    enabled: true,
+    params: { quality: 'draft' },
+  })
+  const workflow = createLandmarksWorkflow({ id: 'workflow-landmarks-single-input-rig-mesh', afterLandmarksNode: rigNode })
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createLandmarksExtension(), rigMeshExt])
+  await waitForPause()
+
+  markAllRequiredLandmarks()
+  useWorkflowRunStore.getState().continueRun()
+  await runPromise
+
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0].input, {
+    filePath: '/workspace/meshes/original.glb',
+    text: undefined,
+    nodeId: 'rig-mesh',
+  })
+  assert.deepEqual(runProcessCalls[0].params, {
+    quality: 'draft',
+    landmarks_sidecar_path: assertLandmarkCapturePath(
+      landmarkSidecarWriteCalls[0]?.sidecarWorkspacePath,
+      'workflow-landmarks-single-input-rig-mesh',
+    ),
+  })
+})
+
 
 test('workflowRunStore injects landmarks_sidecar_path into Rig Mesh params with the original mesh path', async () => {
   const rigMeshExt = createWorkflowExtension({

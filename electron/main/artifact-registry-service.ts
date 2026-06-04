@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
 import { readdir, readFile, stat, mkdir, rename, rm, writeFile, lstat, realpath, mkdtemp, link, open } from 'node:fs/promises'
@@ -369,7 +370,7 @@ export function registerWorkspaceAssetLibraryIpcHandlers(deps: WorkspaceAssetLib
 }
 
 // Artifact sidecars are also available outside the asset-library roots.
-import type { ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
+import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
 
 const SIDECAR_SUFFIX = '.artifact.json'
 const LANDMARK_SIDECAR_PREFIX = 'Workflows/landmarks/'
@@ -381,6 +382,12 @@ const MOTION_RETARGET_SIDECAR_SUFFIX = '.motion-retarget.v1.json'
 const POSE_CLIP_SIDECAR_PREFIX = 'Workflows/pose-clips/'
 const POSE_CLIP_SIDECAR_SUFFIX = '.pose-clip.v1.json'
 const RIGMETA_MESH_EXTENSION_PATTERN = /\.(glb|gltf)$/i
+const HUMANOID_DRAFT_SCHEMA = 'modly.humanoid-draft.v1'
+const HUMANOID_PROMOTION_SCHEMA = 'modly.humanoid-promotion.v1'
+const HUMANOID_DRAFT_SIDECAR_SUFFIX = '.humanoid-draft.v1.json'
+const HUMANOID_PROMOTION_SIDECAR_SUFFIX = '.humanoid-promotion.v1.json'
+const HUMANOID_PROMOTION_CONFIRMED_BY_PATTERN = /^modly:user:[a-z0-9._-]+:[A-Za-z0-9._-]+$/
+const HUMANOID_PROMOTION_METHODS = new Set(['viewer3d', 'workflow-wait', 'add-to-scene', 'import'])
 const SUPPORTED_RIGMETA_SCHEMA_VALUES = new Set([
   'modly.rigmeta',
   'modly.unirig.rigmeta',
@@ -452,6 +459,21 @@ export interface MotionRetargetSidecarReadServiceRequest {
 export interface RigMetaSidecarReadServiceRequest {
   workspaceDir: string
   sourceWorkspacePath: string
+}
+
+export interface HumanoidDraftSidecarReadServiceRequest {
+  workspaceDir: string
+  meshWorkspacePath: string
+}
+
+export interface HumanoidPromotionSidecarWriteServiceRequest extends Omit<HumanoidPromotionSidecarWriteRequest, 'sidecar'> {
+  workspaceDir: string
+  sidecar: unknown
+}
+
+export interface HumanoidPromotionSidecarReadServiceRequest {
+  workspaceDir: string
+  meshWorkspacePath: string
 }
 
 export type RigRenameSidecarReadResult =
@@ -755,6 +777,40 @@ function parseRigMetaSidecarReadPayload(payload: unknown, workspaceDir: string):
   }
 }
 
+function parseHumanoidDraftSidecarReadPayload(payload: unknown, workspaceDir: string): HumanoidDraftSidecarReadServiceRequest {
+  if (!isRecord(payload) || typeof payload.meshWorkspacePath !== 'string') {
+    throw new Error('Humanoid draft sidecar read requires meshWorkspacePath')
+  }
+
+  return {
+    workspaceDir,
+    meshWorkspacePath: payload.meshWorkspacePath,
+  }
+}
+
+function parseHumanoidPromotionSidecarWritePayload(payload: unknown, workspaceDir: string): HumanoidPromotionSidecarWriteServiceRequest {
+  if (!isRecord(payload) || typeof payload.meshWorkspacePath !== 'string' || !isRecord(payload.sidecar)) {
+    throw new Error('Humanoid promotion sidecar write requires meshWorkspacePath and sidecar')
+  }
+
+  return {
+    workspaceDir,
+    meshWorkspacePath: payload.meshWorkspacePath,
+    sidecar: payload.sidecar,
+  }
+}
+
+function parseHumanoidPromotionSidecarReadPayload(payload: unknown, workspaceDir: string): HumanoidPromotionSidecarReadServiceRequest {
+  if (!isRecord(payload) || typeof payload.meshWorkspacePath !== 'string') {
+    throw new Error('Humanoid promotion sidecar read requires meshWorkspacePath')
+  }
+
+  return {
+    workspaceDir,
+    meshWorkspacePath: payload.meshWorkspacePath,
+  }
+}
+
 function parseWorkspaceArtifactPreviewPayload(payload: unknown, workspaceDir: string): WorkspaceArtifactPreviewServiceRequest {
   if (!isRecord(payload) || typeof payload.workspacePath !== 'string') {
     throw new Error('Workspace artifact preview requires workspacePath')
@@ -957,7 +1013,7 @@ function validateRigRenameSidecarV1Payload(value: unknown, sourceWorkspacePath: 
   if (!isRecord(value.source)) {
     errors.push('invalid_source')
   } else {
-    if (value.source.workspacePath !== sourceWorkspacePath) errors.push('invalid_source_workspacePath')
+    if (!isWorkspaceRelativeString(value.source.workspacePath)) errors.push('invalid_source_workspacePath')
     if (value.source.artifactId !== undefined && typeof value.source.artifactId !== 'string') errors.push('invalid_source_artifact_id')
     if (value.source.versionId !== undefined && typeof value.source.versionId !== 'string') errors.push('invalid_source_version_id')
   }
@@ -993,6 +1049,30 @@ function validateRigRenameSidecarV1Payload(value: unknown, sourceWorkspacePath: 
   }
 
   return errors
+}
+
+async function validateRigRenameSidecarSourceLineage(
+  workspaceDir: string,
+  expectedSourceWorkspacePath: string,
+  sidecar: RigRenameSidecarV1,
+): Promise<string[]> {
+  if (sidecar.source.workspacePath === expectedSourceWorkspacePath) return []
+
+  const rigMetaWorkspacePath = createRigMetaWorkspacePath(expectedSourceWorkspacePath)
+  if (!rigMetaWorkspacePath) {
+    return ['invalid_source_workspacePath']
+  }
+
+  try {
+    const { rigMeta: parsedRigMeta } = await loadValidatedRigMetaState(workspaceDir, expectedSourceWorkspacePath)
+    const lineageSourceWorkspacePath = isRecord(parsedRigMeta) && isRecord(parsedRigMeta.source) && typeof parsedRigMeta.source.workspacePath === 'string'
+      ? parsedRigMeta.source.workspacePath
+      : null
+
+    return lineageSourceWorkspacePath === sidecar.source.workspacePath ? [] : ['invalid_source_workspacePath']
+  } catch {
+    return ['invalid_source_workspacePath']
+  }
 }
 
 /**
@@ -1264,6 +1344,351 @@ function validateRigMetaPayload(value: unknown, sourceWorkspacePath: string): st
 function createRigMetaWorkspacePath(sourceWorkspacePath: string): string | null {
   if (!RIGMETA_MESH_EXTENSION_PATTERN.test(sourceWorkspacePath)) return null
   return sourceWorkspacePath.replace(RIGMETA_MESH_EXTENSION_PATTERN, '.rigmeta.json')
+}
+
+export function getHumanoidDraftWorkspacePath(meshWorkspacePath: string): string | null {
+  if (!RIGMETA_MESH_EXTENSION_PATTERN.test(meshWorkspacePath)) return null
+  return meshWorkspacePath.replace(RIGMETA_MESH_EXTENSION_PATTERN, HUMANOID_DRAFT_SIDECAR_SUFFIX)
+}
+
+export function getHumanoidPromotionWorkspacePath(meshWorkspacePath: string): string | null {
+  if (!RIGMETA_MESH_EXTENSION_PATTERN.test(meshWorkspacePath)) return null
+  return meshWorkspacePath.replace(RIGMETA_MESH_EXTENSION_PATTERN, HUMANOID_PROMOTION_SIDECAR_SUFFIX)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+}
+
+function computeSha256Hex(value: Uint8Array | string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function toCanonicalJson(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value))
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => sortJsonValue(entry))
+  if (!isRecord(value)) return value
+  const sortedEntries = Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entryValue]) => [key, sortJsonValue(entryValue)] as const)
+  return Object.fromEntries(sortedEntries)
+}
+
+function computeHumanoidDraftSha256(sidecar: HumanoidDraftSidecarV1): string {
+  const canonicalPayload = JSON.parse(JSON.stringify(sidecar)) as Record<string, unknown>
+  delete canonicalPayload.draftSha256
+  delete canonicalPayload.draftContentSha256
+  return computeSha256Hex(toCanonicalJson(canonicalPayload))
+}
+
+async function readHumanoidBytes(workspaceDir: string, workspacePath: string): Promise<Buffer> {
+  const target = await physicalArtifactPath(workspaceDir, workspacePath)
+  const file = await open(target.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    if (!(await file.stat()).isFile()) throw new Error('Artifact path must be a regular file')
+    return await file.readFile()
+  } finally { await file.close() }
+}
+
+// A lineage read is deliberately separate from ordinary adjacent rigmeta reads.
+// Output anchoring is mandatory when the producer describes a distinct input.
+async function validateHumanoidLineage(workspaceDir: string, meshWorkspacePath: string, rigMeta: unknown): Promise<void> {
+  const errors = validateRigMetaPayload(rigMeta, meshWorkspacePath)
+  if (!isRecord(rigMeta)) throw new Error('Invalid rigmeta sidecar')
+  const source = isRecord(rigMeta.source) ? rigMeta.source.workspacePath : undefined
+  if (source !== undefined && source !== meshWorkspacePath) {
+    const output = rigMeta.output_mesh ?? rigMeta.outputMesh
+    if (!isWorkspaceRelativeString(source) || !output
+      || errors.some(error => error !== 'source_workspace_path_mismatch')) throw new Error('Invalid rigmeta output/source lineage')
+    const normalized = normalizeWorkspaceArtifactPath(workspaceDir, source)
+    if (normalized.workspacePath !== source || !RIGMETA_MESH_EXTENSION_PATTERN.test(source)) throw new Error('Invalid rigmeta source lineage')
+    await physicalArtifactPath(workspaceDir, source)
+  } else if (errors.length) throw new Error(`Invalid rigmeta sidecar: ${errors.join(', ')}`)
+  await physicalArtifactPath(workspaceDir, meshWorkspacePath)
+}
+
+async function validateHumanoidDraftLineage(workspaceDir: string, meshWorkspacePath: string, draft: HumanoidDraftSidecarV1): Promise<void> {
+  const { rigMeta } = await loadValidatedRigMetaState(workspaceDir, meshWorkspacePath)
+  const lineage = isRecord(rigMeta) && isRecord(rigMeta.source) ? rigMeta.source.workspacePath : undefined
+  if (draft.source.workspacePath === meshWorkspacePath || lineage !== draft.source.workspacePath) throw new Error('Invalid humanoid draft source lineage')
+  await physicalArtifactPath(workspaceDir, draft.source.workspacePath)
+}
+
+async function captureHumanoidSnapshot(workspaceDir: string, meshWorkspacePath: string, sourceWorkspacePath: string): Promise<string> {
+  const paths = [meshWorkspacePath, sourceWorkspacePath, createRigMetaWorkspacePath(meshWorkspacePath)!, getHumanoidDraftWorkspacePath(meshWorkspacePath)!]
+  const hashes = []
+  for (const path of paths) {
+    try { hashes.push([path, computeSha256Hex(await readHumanoidBytes(workspaceDir, path))]) }
+    catch (error) {
+      if (path === paths[3] && isRecord(error) && error.code === 'ENOENT') hashes.push([path, null])
+      else throw error
+    }
+  }
+  return JSON.stringify(hashes)
+}
+
+async function loadValidatedRigMetaState(workspaceDir: string, meshWorkspacePath: string): Promise<{ rigMetaWorkspacePath: string, rigmetaSha256: string, rigMeta: unknown }> {
+  const rigMetaWorkspacePath = createRigMetaWorkspacePath(meshWorkspacePath)
+  if (!rigMetaWorkspacePath) {
+    throw new Error('Rigmeta source path must be a workspace-relative .glb or .gltf mesh path')
+  }
+
+  const rawRigMeta = await readHumanoidBytes(workspaceDir, rigMetaWorkspacePath)
+  const parsedRigMeta: unknown = JSON.parse(rawRigMeta.toString('utf8'))
+  serializeArtifactJson(parsedRigMeta)
+  await validateHumanoidLineage(workspaceDir, meshWorkspacePath, parsedRigMeta)
+
+  return {
+    rigMetaWorkspacePath,
+    rigmetaSha256: computeSha256Hex(rawRigMeta),
+    rigMeta: parsedRigMeta,
+  }
+}
+
+function validateHumanoidPathRecord(value: unknown, field: 'source' | 'output'): string[] {
+  if (!isRecord(value)) return [`invalid_${field}`]
+  if (!isWorkspaceRelativeString(value.workspacePath)) return [`invalid_${field}_workspace_path`]
+  return []
+}
+
+function validateHumanoidDraftSidecarV1Payload(value: unknown): string[] {
+  if (!isRecord(value)) return ['invalid_sidecar']
+
+  const errors: string[] = []
+  if (value.schema !== HUMANOID_DRAFT_SCHEMA) errors.push('invalid_schema')
+  if (value.version !== 1) errors.push('invalid_version')
+  errors.push(...validateHumanoidPathRecord(value.source, 'source'))
+  errors.push(...validateHumanoidPathRecord(value.output, 'output'))
+  if (!isNonEmptyString(value.meshOutputSha256)) errors.push('invalid_mesh_output_sha256')
+  if (!isNonEmptyString(value.rigmetaSha256)) errors.push('invalid_rigmeta_sha256')
+  if (!isNonEmptyString(value.draftSha256)) errors.push('invalid_draft_sha256')
+
+  if (!isRecord(value.trust)) {
+    errors.push('invalid_trust')
+  } else {
+    if (value.trust.status !== 'draft') errors.push('invalid_trust_status')
+    if (!isStringArray(value.trust.reasons)) errors.push('invalid_trust_reasons')
+    if (value.trust.trusted !== undefined && value.trust.trusted !== false) errors.push('invalid_trust_trusted')
+  }
+
+  if (!isRecord(value.provenance)) {
+    errors.push('invalid_provenance')
+  } else {
+    if (!isNonEmptyString(value.provenance.producer)) errors.push('invalid_provenance_producer')
+    if (!isNonEmptyString(value.provenance.createdAt)) errors.push('invalid_provenance_created_at')
+    if (value.provenance.runId !== undefined && !isNonEmptyString(value.provenance.runId)) errors.push('invalid_provenance_run_id')
+    if (value.provenance.extensionId !== undefined && !isNonEmptyString(value.provenance.extensionId)) errors.push('invalid_provenance_extension_id')
+  }
+
+  if (!isRecord(value.assignments)) {
+    errors.push('invalid_assignments')
+  } else {
+    if (!isRecord(value.assignments.roles)) errors.push('invalid_assignments_roles')
+    if (!isRecord(value.assignments.chains)) errors.push('invalid_assignments_chains')
+  }
+
+  if (!isRecord(value.confidence) || !isFiniteNumber(value.confidence.overall)) {
+    errors.push('invalid_confidence')
+  }
+  if (!isRecord(value.completeness) || !isStringArray(value.completeness.requiredRolesMissing) || !isFiniteNumber(value.completeness.score)) {
+    errors.push('invalid_completeness')
+  }
+  if (!isStringArray(value.diagnostics)) errors.push('invalid_diagnostics')
+
+  return errors
+}
+
+// Diagnostic reads retain stale receipt evidence; publication must also validate its shape.
+function validateHumanoidPromotionReceipts(value: unknown): string[] {
+  if (!isRecord(value)) return ['invalid_sidecar']
+  const errors: string[] = []
+  for (const field of ['sourceSha256', 'draftContentSha256']) {
+    if (Object.hasOwn(value, field) && !isNonEmptyString(value[field])) errors.push(`invalid_${field}`)
+  }
+  return errors
+}
+
+function validateHumanoidPromotionSidecarV1Payload(value: unknown): string[] {
+  if (!isRecord(value)) return ['invalid_sidecar']
+
+  const errors: string[] = []
+  if (value.schema !== HUMANOID_PROMOTION_SCHEMA) errors.push('invalid_schema')
+  if (value.version !== 1) errors.push('invalid_version')
+  if (!isNonEmptyString(value.promotionId)) errors.push('invalid_promotion_id')
+  if (value.supersedesPromotionId !== undefined && !isNonEmptyString(value.supersedesPromotionId)) errors.push('invalid_supersedes_promotion_id')
+  errors.push(...validateHumanoidPathRecord(value.source, 'source'))
+  errors.push(...validateHumanoidPathRecord(value.output, 'output'))
+  if (!isNonEmptyString(value.meshOutputSha256)) errors.push('invalid_mesh_output_sha256')
+  if (!isNonEmptyString(value.rigmetaSha256)) errors.push('invalid_rigmeta_sha256')
+  if (!isNonEmptyString(value.draftSha256)) errors.push('invalid_draft_sha256')
+  if (value.draftSchema !== HUMANOID_DRAFT_SCHEMA) errors.push('invalid_draft_schema')
+
+  if (!isRecord(value.promotedAssignments)) {
+    errors.push('invalid_promoted_assignments')
+  } else {
+    if (!isRecord(value.promotedAssignments.roles)) errors.push('invalid_promoted_assignments_roles')
+    if (!isRecord(value.promotedAssignments.chains)) errors.push('invalid_promoted_assignments_chains')
+  }
+
+  if (!isRecord(value.provenance)) {
+    errors.push('invalid_provenance')
+  } else {
+    if (value.provenance.basis !== HUMANOID_DRAFT_SCHEMA) errors.push('invalid_provenance_basis')
+    if (value.provenance.trustStatus !== 'manual_confirmed') errors.push('invalid_provenance_trust_status')
+  }
+
+  if (!isRecord(value.audit)) {
+    errors.push('invalid_audit')
+  } else {
+    if (!isNonEmptyString(value.audit.confirmedBy) || !HUMANOID_PROMOTION_CONFIRMED_BY_PATTERN.test(value.audit.confirmedBy)) errors.push('invalid_audit_confirmed_by')
+    if (value.audit.confirmedByLabel !== undefined && !isNonEmptyString(value.audit.confirmedByLabel)) errors.push('invalid_audit_confirmed_by_label')
+    if (!isNonEmptyString(value.audit.createdAt)) errors.push('invalid_audit_created_at')
+    if (!isNonEmptyString(value.audit.method) || !HUMANOID_PROMOTION_METHODS.has(value.audit.method)) errors.push('invalid_audit_method')
+    if (!isNonEmptyString(value.audit.rationale)) errors.push('invalid_audit_rationale')
+  }
+
+  return errors
+}
+
+async function loadValidatedRigMetaHash(workspaceDir: string, meshWorkspacePath: string): Promise<{ rigMetaWorkspacePath: string, rigmetaSha256: string }> {
+  const { rigMetaWorkspacePath, rigmetaSha256 } = await loadValidatedRigMetaState(workspaceDir, meshWorkspacePath)
+  return { rigMetaWorkspacePath, rigmetaSha256 }
+}
+
+async function resolveCurrentHumanoidBindings(workspaceDir: string, meshWorkspacePath: string): Promise<{ meshOutputSha256: string, rigmetaSha256: string, rigMetaWorkspacePath: string }> {
+  const meshPath = normalizeWorkspaceArtifactPath(workspaceDir, meshWorkspacePath)
+  return {
+    meshOutputSha256: computeSha256Hex(await readHumanoidBytes(workspaceDir, meshPath.workspacePath)),
+    ...(await loadValidatedRigMetaHash(workspaceDir, meshWorkspacePath)),
+  }
+}
+
+function normalizeEmbeddedHumanoidWorkspacePath(candidate: string, anchorDir: string): string {
+  const trimmed = candidate.trim()
+  if (!trimmed) throw new Error('invalid_workspace_path')
+  const normalized = normalizeWorkspaceSeparators(trimmed)
+  const anchored = normalized.includes('/') ? normalized : (anchorDir ? `${anchorDir}/${normalized}` : normalized)
+  return assertSafeWorkspacePathInput(anchored)
+}
+
+function materializeEmbeddedHumanoidDraft(
+  parsedDraft: unknown,
+  options: {
+    meshWorkspacePath: string
+    rigmetaSha256: string
+  },
+): HumanoidDraftSidecarV1 {
+  const validationErrors = validateHumanoidDraftSidecarV1Payload(parsedDraft)
+  if (validationErrors.length > 0) {
+    throw new Error(`Invalid embedded humanoid draft sidecar v1: ${validationErrors.join(', ')}`)
+  }
+
+  const draft = JSON.parse(JSON.stringify(parsedDraft)) as HumanoidDraftSidecarV1
+  const anchorDir = dirname(options.meshWorkspacePath).replace(/\\/g, '/').replace(/^\.$/, '')
+  const normalizedOutputPath = normalizeEmbeddedHumanoidWorkspacePath(draft.output.workspacePath, anchorDir)
+  if (normalizedOutputPath !== options.meshWorkspacePath) {
+    throw new Error('Invalid embedded humanoid draft sidecar v1: invalid_output_workspace_path')
+  }
+
+  const normalizedSourcePath = normalizeEmbeddedHumanoidWorkspacePath(draft.source.workspacePath, anchorDir)
+  if (dirname(normalizedSourcePath).replace(/\\/g, '/') !== anchorDir || normalizedSourcePath === options.meshWorkspacePath) {
+    throw new Error('Invalid embedded humanoid draft sidecar v1: invalid_source_workspace_path')
+  }
+
+  draft.output.workspacePath = normalizedOutputPath
+  draft.source.workspacePath = normalizedSourcePath
+  draft.rigmetaSha256 = options.rigmetaSha256
+  draft.draftSha256 = computeHumanoidDraftSha256(draft)
+  return draft
+}
+
+async function loadEmbeddedHumanoidDraftFallback(
+  workspaceDir: string,
+  meshWorkspacePath: string,
+  sidecarWorkspacePath: string,
+): Promise<HumanoidDraftSidecarReadResult> {
+  const rigMetaState = await loadValidatedRigMetaState(workspaceDir, meshWorkspacePath)
+  if (!isRecord(rigMetaState.rigMeta) || !isRecord(rigMetaState.rigMeta.humanoid_draft)) {
+    return { success: true, status: 'not-found', sidecarWorkspacePath }
+  }
+
+  const sidecar = materializeEmbeddedHumanoidDraft(rigMetaState.rigMeta.humanoid_draft, {
+    meshWorkspacePath,
+    rigmetaSha256: rigMetaState.rigmetaSha256,
+  })
+  await validateHumanoidDraftLineage(workspaceDir, meshWorkspacePath, sidecar)
+  sidecar.draftContentSha256 = computeHumanoidDraftSha256(sidecar)
+  const sourceSha256 = computeSha256Hex(await readHumanoidBytes(workspaceDir, sidecar.source.workspacePath))
+  const bindings = await resolveCurrentHumanoidBindings(workspaceDir, meshWorkspacePath)
+  const staleReasons: string[] = []
+  if (sidecar.meshOutputSha256 !== bindings.meshOutputSha256) staleReasons.push('mesh_output_sha256_mismatch')
+  if (sidecar.rigmetaSha256 !== bindings.rigmetaSha256) staleReasons.push('rigmeta_sha256_mismatch')
+  if (staleReasons.length > 0) {
+    return { success: true, status: 'stale', sidecarWorkspacePath, sidecar, staleReasons }
+  }
+
+  return { success: true, status: 'found', sidecarWorkspacePath, sidecar, sourceSha256 }
+}
+
+async function loadHumanoidDraftSidecar(
+  workspaceDir: string,
+  meshWorkspacePath: string,
+): Promise<HumanoidDraftSidecarReadResult> {
+  const draftWorkspacePath = getHumanoidDraftWorkspacePath(meshWorkspacePath)
+  if (!draftWorkspacePath) {
+    throw new Error('Humanoid draft source path must be a workspace-relative .glb or .gltf mesh path')
+  }
+
+  const draftPath = normalizeWorkspaceArtifactPath(workspaceDir, draftWorkspacePath)
+  let parsedDraft: unknown
+  try {
+    parsedDraft = await readArtifactJson(workspaceDir, draftPath.workspacePath)
+    serializeArtifactJson(parsedDraft)
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') {
+      return await loadEmbeddedHumanoidDraftFallback(workspaceDir, meshWorkspacePath, draftPath.workspacePath)
+    }
+    if (error instanceof SyntaxError) {
+      return { success: false, status: 'invalid', sidecarWorkspacePath: draftPath.workspacePath, error: `Invalid humanoid draft sidecar JSON: ${error.message}` }
+    }
+    throw error
+  }
+
+  const validationErrors = validateHumanoidDraftSidecarV1Payload(parsedDraft)
+  if (validationErrors.length > 0) {
+    return { success: false, status: 'invalid', sidecarWorkspacePath: draftPath.workspacePath, error: `Invalid humanoid draft sidecar v1: ${validationErrors.join(', ')}` }
+  }
+
+  const sidecar = parsedDraft as HumanoidDraftSidecarV1
+  sidecar.draftContentSha256 = computeHumanoidDraftSha256(sidecar)
+  if (sidecar.output.workspacePath !== meshWorkspacePath) {
+    return { success: false, status: 'invalid', sidecarWorkspacePath: draftPath.workspacePath, error: 'Invalid humanoid draft sidecar v1: invalid_output_workspace_path' }
+  }
+
+  const staleReasons: string[] = []
+  let sourceSha256: string | undefined
+  try {
+    await validateHumanoidDraftLineage(workspaceDir, meshWorkspacePath, sidecar)
+    sourceSha256 = computeSha256Hex(await readHumanoidBytes(workspaceDir, sidecar.source.workspacePath))
+    const bindings = await resolveCurrentHumanoidBindings(workspaceDir, meshWorkspacePath)
+    if (sidecar.meshOutputSha256 !== bindings.meshOutputSha256) staleReasons.push('mesh_output_sha256_mismatch')
+    if (sidecar.rigmetaSha256 !== bindings.rigmetaSha256) staleReasons.push('rigmeta_sha256_mismatch')
+  } catch (error) {
+    staleReasons.push(error instanceof Error ? error.message : String(error))
+  }
+
+  if (staleReasons.length > 0) {
+    return { success: true, status: 'stale', sidecarWorkspacePath: draftPath.workspacePath, sidecar, staleReasons }
+  }
+
+  return { success: true, status: 'found', sidecarWorkspacePath: draftPath.workspacePath, sidecar, sourceSha256 }
 }
 
 function normalizeRigMetaNamingForRead(rigMeta: unknown, sourceWorkspacePath: string): Pick<Extract<RigMetaSidecarReadResult, { status: 'found' }>, 'namingByBoneId' | 'warnings'> {
@@ -1543,6 +1968,7 @@ async function publishArtifactFiles(
   workspaceDir: string,
   files: Array<{ workspacePath: string, bytes: string | Uint8Array }>,
   overwrite = false,
+  beforePublish?: () => Promise<void>,
 ): Promise<void> {
   const prepared: PreparedArtifactFile[] = []
   const published: PreparedArtifactFile[] = []
@@ -1550,6 +1976,7 @@ async function publishArtifactFiles(
     for (const file of files) prepared.push(await prepareArtifactFile(workspaceDir, file.workspacePath, file.bytes))
     for (const file of prepared) {
       await physicalArtifactPath(workspaceDir, file.target.workspacePath, 'write')
+      await beforePublish?.()
       if (overwrite) {
         // Only deterministic single-sidecar updates may replace a previous file.
         if (files.length !== 1) throw new Error('Multi-file artifact overwrite is unsupported')
@@ -1578,6 +2005,7 @@ async function publishSourceOwnedSidecar(
   sourceWorkspacePath: string,
   bytes: string,
   validate: (value: unknown, sourceWorkspacePath: string) => string[],
+  revalidate?: () => Promise<void>,
 ): Promise<void> {
   const target = await physicalArtifactPath(workspaceDir, workspacePath, 'optional')
   const previous = authoredSidecarPublications.get(target.absolutePath) ?? Promise.resolve()
@@ -1587,25 +2015,28 @@ async function publishSourceOwnedSidecar(
   authoredSidecarPublications.set(target.absolutePath, queued)
   await previous
   try {
-    let existing: unknown
-    try {
-      existing = await readArtifactJson(workspaceDir, workspacePath)
-    } catch (error) {
-      if (!isRecord(error) || error.code !== 'ENOENT') {
-        throw new Error('Existing sidecar ownership cannot be read; preserve or relocate it before saving.', { cause: error })
+    // Validate after temporary bytes are prepared, still inside the source-owned queue.
+    await publishArtifactFiles(workspaceDir, [{ workspacePath, bytes }], true, async () => {
+      let existing: unknown
+      try {
+        existing = await readArtifactJson(workspaceDir, workspacePath)
+      } catch (error) {
+        if (!isRecord(error) || error.code !== 'ENOENT') {
+          throw new Error('Existing sidecar ownership cannot be read; preserve or relocate it before saving.', { cause: error })
+        }
       }
-    }
-    if (existing !== undefined) {
-      // Validate the entire stored record, not an untrusted source field alone.
-      if (!isRecord(existing) || !isRecord(existing.source) || typeof existing.source.workspacePath !== 'string'
-        || validate(existing, existing.source.workspacePath).length > 0) {
-        throw new Error('Existing sidecar ownership is invalid; preserve or relocate it before saving.')
+      if (existing !== undefined) {
+        // Validate the entire stored record, not an untrusted source field alone.
+        if (!isRecord(existing) || !isRecord(existing.source) || typeof existing.source.workspacePath !== 'string'
+          || validate(existing, existing.source.workspacePath).length > 0) {
+          throw new Error('Existing sidecar ownership is invalid; preserve or relocate it before saving.')
+        }
+        if (existing.source.workspacePath !== sourceWorkspacePath) {
+          throw new Error('Existing sidecar belongs to a different source owner; use a distinct sidecar path.')
+        }
       }
-      if (existing.source.workspacePath !== sourceWorkspacePath) {
-        throw new Error('Existing sidecar belongs to a different source owner; use a distinct sidecar path.')
-      }
-    }
-    await publishArtifactFiles(workspaceDir, [{ workspacePath, bytes }], true)
+      await revalidate?.()
+    })
   } finally {
     release()
     if (authoredSidecarPublications.get(target.absolutePath) === queued) authoredSidecarPublications.delete(target.absolutePath)
@@ -1745,8 +2176,20 @@ export async function writeRigRenameSidecar(request: RigRenameSidecarWriteServic
 
     const sidecar = serializedSidecar as RigRenameSidecarWriteRequest['sidecar']
 
-    await physicalArtifactPath(request.workspaceDir, sourcePath.workspacePath)
-    await publishSourceOwnedSidecar(request.workspaceDir, sidecarPath.workspacePath, sourcePath.workspacePath, sidecarBytes, validateRigRenameSidecarV1Payload)
+    const lineage = async () => {
+      const errors = await validateRigRenameSidecarSourceLineage(request.workspaceDir, sourcePath.workspacePath, sidecar)
+      if (errors.length) throw new Error(`Invalid rig rename sidecar v1: ${errors.join(', ')}`)
+      await physicalArtifactPath(request.workspaceDir, sourcePath.workspacePath)
+    }
+    await lineage()
+    const paths = sidecar.source.workspacePath === sourcePath.workspacePath ? [sourcePath.workspacePath]
+      : [sourcePath.workspacePath, sidecar.source.workspacePath, createRigMetaWorkspacePath(sourcePath.workspacePath)!]
+    const snapshot = await Promise.all(paths.map(async path => computeSha256Hex(await readHumanoidBytes(request.workspaceDir, path))))
+    await publishSourceOwnedSidecar(request.workspaceDir, sidecarPath.workspacePath, sidecar.source.workspacePath, sidecarBytes, validateRigRenameSidecarV1Payload, async () => {
+      await lineage()
+      const current = await Promise.all(paths.map(async path => computeSha256Hex(await readHumanoidBytes(request.workspaceDir, path))))
+      if (JSON.stringify(current) !== JSON.stringify(snapshot)) throw new Error('Rig rename source lineage changed before publication')
+    })
 
     return {
       success: true,
@@ -1784,8 +2227,11 @@ export async function readRigRenameSidecar(request: RigRenameSidecarReadServiceR
     }
 
     const validationErrors = validateRigRenameSidecarV1Payload(parsedSidecar, sourcePath.workspacePath)
-    if (validationErrors.length > 0) {
-      throw new Error(`Invalid rig rename sidecar v1: ${validationErrors.join(', ')}`)
+    const sourceLineageErrors = validationErrors.length === 0
+      ? await validateRigRenameSidecarSourceLineage(request.workspaceDir, sourcePath.workspacePath, parsedSidecar as RigRenameSidecarV1)
+      : []
+    if (validationErrors.length > 0 || sourceLineageErrors.length > 0) {
+      throw new Error(`Invalid rig rename sidecar v1: ${[...validationErrors, ...sourceLineageErrors].join(', ')}`)
     }
 
     return {
@@ -2023,6 +2469,170 @@ export async function readRigMetaSidecar(request: RigMetaSidecarReadServiceReque
   }
 }
 
+export async function readHumanoidDraftSidecar(request: HumanoidDraftSidecarReadServiceRequest): Promise<HumanoidDraftSidecarReadResult> {
+  let sidecarWorkspacePath: string | undefined
+
+  try {
+    const meshPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.meshWorkspacePath)
+    sidecarWorkspacePath = getHumanoidDraftWorkspacePath(meshPath.workspacePath) ?? undefined
+    if (!sidecarWorkspacePath) {
+      throw new Error('Humanoid draft source path must be a workspace-relative .glb or .gltf mesh path')
+    }
+
+    return await loadHumanoidDraftSidecar(request.workspaceDir, meshPath.workspacePath)
+  } catch (error) {
+    return {
+      success: false,
+      status: 'invalid',
+      ...(sidecarWorkspacePath ? { sidecarWorkspacePath } : {}),
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+export async function writeHumanoidPromotionSidecar(request: HumanoidPromotionSidecarWriteServiceRequest): Promise<HumanoidPromotionSidecarWriteResult> {
+  try {
+    const meshPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.meshWorkspacePath)
+    const promotionWorkspacePath = getHumanoidPromotionWorkspacePath(meshPath.workspacePath)
+    if (!promotionWorkspacePath) {
+      throw new Error('Humanoid promotion source path must be a workspace-relative .glb or .gltf mesh path')
+    }
+
+    const promotionPath = normalizeWorkspaceArtifactPath(request.workspaceDir, promotionWorkspacePath)
+    const serializedSidecar: unknown = JSON.parse(serializeArtifactJson(request.sidecar))
+    const validationErrors = [...validateHumanoidPromotionSidecarV1Payload(serializedSidecar), ...validateHumanoidPromotionReceipts(serializedSidecar)]
+    if (validationErrors.length > 0) {
+      throw new Error(`Invalid humanoid promotion sidecar v1: ${validationErrors.join(', ')}`)
+    }
+
+    const sidecar = serializedSidecar as HumanoidPromotionSidecarV1
+    if (sidecar.output.workspacePath !== meshPath.workspacePath) {
+      throw new Error('Invalid humanoid promotion sidecar v1: invalid_output_workspace_path')
+    }
+
+    const draftState = await loadHumanoidDraftSidecar(request.workspaceDir, meshPath.workspacePath)
+    if (draftState.success !== true) {
+      throw new Error(draftState.error)
+    }
+    if (draftState.status === 'not-found') {
+      throw new Error('Cannot write humanoid promotion without an adjacent humanoid draft sidecar')
+    }
+    if (draftState.status === 'stale') {
+      throw new Error(`Cannot write humanoid promotion from a stale humanoid draft sidecar: ${draftState.staleReasons.join(', ')}`)
+    }
+
+    const bindings = await resolveCurrentHumanoidBindings(request.workspaceDir, meshPath.workspacePath)
+    const staleReasons: string[] = []
+    if (sidecar.meshOutputSha256 !== bindings.meshOutputSha256) staleReasons.push('mesh_output_sha256_mismatch')
+    if (sidecar.rigmetaSha256 !== bindings.rigmetaSha256) staleReasons.push('rigmeta_sha256_mismatch')
+    if (sidecar.draftSha256 !== draftState.sidecar.draftSha256) staleReasons.push('draft_sha256_mismatch')
+    if (sidecar.draftContentSha256 !== undefined && sidecar.draftContentSha256 !== draftState.sidecar.draftContentSha256) staleReasons.push('draft_content_sha256_mismatch')
+    if (sidecar.sourceSha256 !== undefined && sidecar.sourceSha256 !== draftState.sourceSha256) staleReasons.push('source_sha256_mismatch')
+    if (sidecar.draftSchema !== draftState.sidecar.schema) staleReasons.push('draft_schema_mismatch')
+    if (sidecar.source.workspacePath !== draftState.sidecar.source.workspacePath) staleReasons.push('source_workspace_path_mismatch')
+    if (staleReasons.length > 0) {
+      throw new Error(`Cannot write stale humanoid promotion sidecar: ${staleReasons.join(', ')}`)
+    }
+
+    sidecar.draftContentSha256 = draftState.sidecar.draftContentSha256
+    sidecar.sourceSha256 = draftState.sourceSha256
+    const snapshot = await captureHumanoidSnapshot(request.workspaceDir, meshPath.workspacePath, sidecar.source.workspacePath)
+    await publishSourceOwnedSidecar(request.workspaceDir, promotionPath.workspacePath, sidecar.source.workspacePath, serializeArtifactJson(sidecar), value => {
+      try { serializeArtifactJson(value) } catch { return ['invalid_non_finite_json'] }
+      const errors = [...validateHumanoidPromotionSidecarV1Payload(value), ...validateHumanoidPromotionReceipts(value)]
+      if (isRecord(value) && isRecord(value.output) && value.output.workspacePath !== meshPath.workspacePath) errors.push('invalid_output_workspace_path')
+      return errors
+    }, async () => {
+      const fresh = await loadHumanoidDraftSidecar(request.workspaceDir, meshPath.workspacePath)
+      if (!fresh.success || fresh.status !== 'found' || fresh.sidecar.draftContentSha256 !== sidecar.draftContentSha256
+        || fresh.sidecar.draftSha256 !== sidecar.draftSha256
+        || sidecar.sourceSha256 !== computeSha256Hex(await readHumanoidBytes(request.workspaceDir, sidecar.source.workspacePath))
+        || snapshot !== await captureHumanoidSnapshot(request.workspaceDir, meshPath.workspacePath, sidecar.source.workspacePath)) {
+        throw new Error('Humanoid source, mesh, rigmeta or draft changed before publication')
+      }
+    })
+
+    return { success: true, sidecarWorkspacePath: promotionPath.workspacePath, sidecar }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export async function readHumanoidPromotionSidecar(request: HumanoidPromotionSidecarReadServiceRequest): Promise<HumanoidPromotionSidecarReadResult> {
+  let sidecarWorkspacePath: string | undefined
+
+  try {
+    const meshPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.meshWorkspacePath)
+    sidecarWorkspacePath = getHumanoidPromotionWorkspacePath(meshPath.workspacePath) ?? undefined
+    if (!sidecarWorkspacePath) {
+      throw new Error('Humanoid promotion source path must be a workspace-relative .glb or .gltf mesh path')
+    }
+
+    const promotionPath = normalizeWorkspaceArtifactPath(request.workspaceDir, sidecarWorkspacePath)
+    let parsedPromotion: unknown
+    try {
+      parsedPromotion = await readArtifactJson(request.workspaceDir, promotionPath.workspacePath)
+      serializeArtifactJson(parsedPromotion)
+    } catch (error) {
+      if (isRecord(error) && error.code === 'ENOENT') {
+        return { success: true, status: 'not-found', sidecarWorkspacePath: promotionPath.workspacePath }
+      }
+      if (error instanceof SyntaxError) {
+        return { success: false, status: 'invalid', sidecarWorkspacePath: promotionPath.workspacePath, error: `Invalid humanoid promotion sidecar JSON: ${error.message}` }
+      }
+      throw error
+    }
+
+    const validationErrors = validateHumanoidPromotionSidecarV1Payload(parsedPromotion)
+    if (validationErrors.length > 0) {
+      return { success: false, status: 'invalid', sidecarWorkspacePath: promotionPath.workspacePath, error: `Invalid humanoid promotion sidecar v1: ${validationErrors.join(', ')}` }
+    }
+
+    const sidecar = parsedPromotion as HumanoidPromotionSidecarV1
+    if (sidecar.output.workspacePath !== meshPath.workspacePath) {
+      return { success: false, status: 'invalid', sidecarWorkspacePath: promotionPath.workspacePath, error: 'Invalid humanoid promotion sidecar v1: invalid_output_workspace_path' }
+    }
+
+    const staleReasons: string[] = []
+    const draftState = await loadHumanoidDraftSidecar(request.workspaceDir, meshPath.workspacePath)
+    if (draftState.success !== true) {
+      return { success: false, status: 'invalid', sidecarWorkspacePath: promotionPath.workspacePath, error: draftState.error }
+    }
+    if (draftState.status === 'not-found') {
+      staleReasons.push('draft_sidecar_missing')
+    } else {
+      if (draftState.status === 'stale') staleReasons.push(...draftState.staleReasons)
+      if (sidecar.draftSha256 !== draftState.sidecar.draftSha256) staleReasons.push('draft_sha256_mismatch')
+    if (sidecar.draftContentSha256 !== undefined && sidecar.draftContentSha256 !== draftState.sidecar.draftContentSha256) staleReasons.push('draft_content_sha256_mismatch')
+      if (sidecar.draftSchema !== draftState.sidecar.schema) staleReasons.push('draft_schema_mismatch')
+      if (sidecar.source.workspacePath !== draftState.sidecar.source.workspacePath) staleReasons.push('source_workspace_path_mismatch')
+    }
+
+    try {
+      const sourceSha256 = computeSha256Hex(await readHumanoidBytes(request.workspaceDir, sidecar.source.workspacePath))
+      if (sidecar.sourceSha256 !== undefined && sidecar.sourceSha256 !== sourceSha256) staleReasons.push('source_sha256_mismatch')
+      const bindings = await resolveCurrentHumanoidBindings(request.workspaceDir, meshPath.workspacePath)
+      if (sidecar.meshOutputSha256 !== bindings.meshOutputSha256) staleReasons.push('mesh_output_sha256_mismatch')
+      if (sidecar.rigmetaSha256 !== bindings.rigmetaSha256) staleReasons.push('rigmeta_sha256_mismatch')
+    } catch (error) {
+      staleReasons.push(error instanceof Error ? error.message : String(error))
+    }
+
+    if (staleReasons.length > 0) {
+      return { success: true, status: 'stale', sidecarWorkspacePath: promotionPath.workspacePath, sidecar, staleReasons }
+    }
+
+    return { success: true, status: 'found', sidecarWorkspacePath: promotionPath.workspacePath, sidecar }
+  } catch (error) {
+    return {
+      success: false,
+      status: 'invalid',
+      ...(sidecarWorkspacePath ? { sidecarWorkspacePath } : {}),
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
 export async function readArtifactSidecar(request: ArtifactRegistryReadRequest): Promise<ArtifactRegistryReadResult> {
   try {
     const sidecarPath = resolveSidecarPath(request.workspaceDir, request.workspacePath)
@@ -2201,6 +2811,30 @@ export function registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir, 
       return writeLandmarkSidecar(parseLandmarkSidecarPayload(payload, getWorkspaceDir()))
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:readHumanoidDraftSidecar', async (_event, payload) => {
+    try {
+      return readHumanoidDraftSidecar(parseHumanoidDraftSidecarReadPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:writeHumanoidPromotionSidecar', async (_event, payload) => {
+    try {
+      return writeHumanoidPromotionSidecar(parseHumanoidPromotionSidecarWritePayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:readHumanoidPromotionSidecar', async (_event, payload) => {
+    try {
+      return readHumanoidPromotionSidecar(parseHumanoidPromotionSidecarReadPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
     }
   })
 

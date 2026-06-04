@@ -20,7 +20,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
 import { MotionRetargetPanel } from './MotionRetargetPanel'
 import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
-import { RigEditorPanel } from './RigEditorPanel'
+import { RigEditorPanel, type RigEditorHumanoidReviewProps } from './RigEditorPanel'
 import { RigOverlay } from './RigOverlay'
 import { createLandmarkPointIntent, deriveLandmarkMarkers, resolveLandmarkMarkerRenderModels, type LandmarkMarkerViewModel } from './viewerLandmarkPicking'
 import { isolateAnimationForPoseClipPreview, resetAnimationPlayback, resolveAnimationAvailability, syncAnimationActions, type AnimationActionLike, type AnimationIsolationSnapshot, type AnimationMixerLike, type AnimationPlaybackResetResult } from './viewerAnimation'
@@ -36,7 +36,7 @@ import { DEFAULT_MOTION_RETARGET_CORRECTIONS, createMotionRetargetCorrectionIden
 import { normalizeKimodoMotionArtifact, type KimodoMotionArtifact } from '../kimodoMotionAdapter.ts'
 import { resolveMotionRetargetPreviewClip, resetMotionRetargetPreview, restoreThenEvaluateMotionRetargetPreview, takeMotionRetargetPreviewSnapshot, type MotionRetargetTransformSnapshot } from '../motionRetargetPreview.ts'
 import { resolveRigDisplayNames, type RigDisplayNamingResult } from '../rigDisplayNames.ts'
-import { normalizeRigMetaNaming, type RigMetaNamingMap } from '../rigMetaNaming.ts'
+import { createRigMetaNamingFromHumanoidAssignments, normalizeRigMetaNaming, translateHumanoidAssignmentsToRigMetaNaming, type RigMetaNamingMap } from '../rigMetaNaming.ts'
 import { resolveRigEffectiveNaming, type RigEffectiveNamingResult } from '../rigEffectiveNaming.ts'
 import {
   saveEditedScenePendingReplacement,
@@ -48,7 +48,7 @@ import { useWorkflowRunStore } from '../../workflows/workflowRunStore'
 import type { LandmarkId, LandmarkPoint } from '../../workflows/landmarks'
 import type { LightSettings, PointLight } from '@shared/stores/appStore'
 import { DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
-import type { MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../../shared/types/electron.d'
+import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../../shared/types/electron.d'
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale'
 
@@ -1482,6 +1482,45 @@ type RigRenameSaveState =
   | { status: 'saved'; sidecarWorkspacePath: string }
   | { status: 'error'; message: string }
 
+type HumanoidPromotionSaveState =
+  | { status: 'idle' }
+  | { status: 'saving' }
+  | { status: 'saved'; sidecarWorkspacePath: string }
+  | { status: 'error'; message: string }
+
+export type Viewer3DHumanoidReviewStateKind = 'trusted' | 'draft' | 'promoted' | 'stale' | 'diagnostics-only'
+
+export type Viewer3DHumanoidProposedAssignments = {
+  roles: Record<string, unknown>
+  chains: Record<string, unknown>
+}
+
+export type Viewer3DHumanoidReviewPresentation = {
+  state: Viewer3DHumanoidReviewStateKind
+  headline: string
+  canPromote: boolean
+  diagnostics: string[]
+}
+
+type Viewer3DHumanoidReviewState = {
+  meshWorkspacePath?: string
+  trustedContractPresent: boolean
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+  proposedAssignments: Viewer3DHumanoidProposedAssignments
+  proposalSourceDraftSha256?: string
+  isProposalDirty: boolean
+  rationale: string
+  confirmationChecked: boolean
+  loadState: 'idle' | 'loading' | 'loaded' | 'error'
+  saveState: HumanoidPromotionSaveState
+}
+
+const DEFAULT_VIEWER3D_HUMANOID_CONFIRMED_BY = 'modly:user:local:manual'
+const DEFAULT_VIEWER3D_HUMANOID_CONFIRMED_BY_LABEL = 'Local manual confirmation (not authenticated)'
+const DEFAULT_VIEWER3D_HUMANOID_PROMOTION_RATIONALE = 'Manual confirmation from Rig Editor'
+const EMPTY_HUMANOID_ASSIGNMENTS: Viewer3DHumanoidProposedAssignments = { roles: {}, chains: {} }
+
 export type Viewer3DRigHydrationWarning = {
   status: 'warning'
   messages: string[]
@@ -1512,6 +1551,7 @@ export interface Viewer3DRigEditorState {
 
 type Viewer3DRigEditorPanelOptions = {
   rigMetaNamingByBoneId?: RigMetaNamingMap
+  humanoidReview?: RigEditorHumanoidReviewProps
 }
 
 export interface Viewer3DRigEditorVisibilityState {
@@ -2142,6 +2182,7 @@ export function resolveViewer3DRigEditorPanelProps(
   renamePlan: RigRenamePlan
   rigMetaNamingByBoneId: RigMetaNamingMap
   effectiveNaming?: RigEffectiveNamingResult
+  humanoidReview?: RigEditorHumanoidReviewProps
   validation: RigRenameValidationResult
   hydrationWarning?: Viewer3DRigHydrationWarning | null
   onSelectBone: (boneId: RigBoneId) => void
@@ -2157,6 +2198,7 @@ export function resolveViewer3DRigEditorPanelProps(
     renamePlan: state.renamePlan,
     rigMetaNamingByBoneId,
     effectiveNaming: state.summary?.hasRig ? resolveRigEffectiveNaming(state.summary, state.renamePlan, rigMetaNamingByBoneId) : undefined,
+    humanoidReview: options?.humanoidReview,
     validation: state.summary?.hasRig ? validateRigRenamePlan(state.summary, state.renamePlan) : { valid: true, errors: [] },
     hydrationWarning,
     onSelectBone: callbacks.onSelectBone ?? (() => undefined),
@@ -2164,6 +2206,94 @@ export function resolveViewer3DRigEditorPanelProps(
     onCancelAlias: callbacks.onCancelAlias ?? (() => undefined),
     onRevertAliases: callbacks.onRevertAliases ?? (() => undefined),
     onSaveAliases: callbacks.onSaveAliases ?? (() => undefined),
+  }
+}
+
+function isHumanoidDraftReadable(result?: HumanoidDraftSidecarReadResult): result is Extract<HumanoidDraftSidecarReadResult, { success: true; status: 'found' | 'stale' }> {
+  return result?.success === true && (result.status === 'found' || result.status === 'stale')
+}
+
+function isHumanoidPromotionReadable(result?: HumanoidPromotionSidecarReadResult): result is Extract<HumanoidPromotionSidecarReadResult, { success: true; status: 'found' | 'stale' }> {
+  return result?.success === true && (result.status === 'found' || result.status === 'stale')
+}
+
+function mergeViewer3DRigDisplayNaming(
+  baseNamingByBoneId: RigMetaNamingMap,
+  overlayNamingByBoneId: RigMetaNamingMap,
+): RigMetaNamingMap {
+  const merged: RigMetaNamingMap = { ...baseNamingByBoneId }
+  for (const [boneId, entry] of Object.entries(overlayNamingByBoneId)) {
+    if (merged[boneId]?.source === 'humanoid_contract') continue
+    merged[boneId as RigBoneId] = entry
+  }
+  return merged
+}
+
+export function resolveViewer3DEffectiveRigMetaNaming({
+  summary,
+  rigMetaNamingByBoneId,
+  draftResult,
+  promotionResult,
+}: {
+  summary?: RigSkeletonSummary
+  rigMetaNamingByBoneId: RigMetaNamingMap
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): RigMetaNamingMap {
+  let merged = { ...rigMetaNamingByBoneId }
+  if (isHumanoidDraftReadable(draftResult)) {
+    const draftNaming = summary?.hasRig
+      ? translateHumanoidAssignmentsToRigMetaNaming({
+        summary,
+        sources: [{ source: 'humanoid_draft', roleMap: draftResult.sidecar.assignments }],
+      }).namingByBoneId
+      : createRigMetaNamingFromHumanoidAssignments(draftResult.sidecar.assignments.roles, 'humanoid_draft')
+    merged = mergeViewer3DRigDisplayNaming(merged, draftNaming)
+  }
+  if (isHumanoidPromotionReadable(promotionResult)) {
+    const promotionNaming = summary?.hasRig
+      ? translateHumanoidAssignmentsToRigMetaNaming({
+        summary,
+        sources: [{ source: 'humanoid_promotion', roleMap: promotionResult.sidecar.promotedAssignments }],
+      }).namingByBoneId
+      : createRigMetaNamingFromHumanoidAssignments(promotionResult.sidecar.promotedAssignments.roles, 'humanoid_promotion')
+    merged = mergeViewer3DRigDisplayNaming(merged, promotionNaming)
+  }
+  return merged
+}
+
+export function resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+  presentation,
+  semanticHydrationSource,
+}: {
+  presentation: Viewer3DHumanoidReviewPresentation
+  semanticHydrationSource?: Viewer3DSemanticHydrationSource
+}): Viewer3DHumanoidReviewPresentation {
+  if (semanticHydrationSource?.sourceKind !== 'kimodo-source') return presentation
+  return {
+    ...presentation,
+    canPromote: false,
+  }
+}
+
+export function resolveViewer3DRigHumanoidReviewProps(props: RigEditorHumanoidReviewProps): RigEditorHumanoidReviewProps {
+  return {
+    presentation: props.presentation,
+    saveState: props.saveState,
+    onPromote: props.onPromote,
+  }
+}
+
+export function resolveViewer3DHumanoidPromotionButtonAudit(args?: {
+  rationale?: string
+  confirmationChecked?: boolean
+}): {
+  rationale: string
+  confirmationChecked: true
+} {
+  return {
+    rationale: args?.rationale?.trim() ? args.rationale.trim() : DEFAULT_VIEWER3D_HUMANOID_PROMOTION_RATIONALE,
+    confirmationChecked: true,
   }
 }
 
@@ -2681,6 +2811,301 @@ export function resolveViewer3DSemanticHydrationSource(args: {
 
 function dedupeViewer3DWarnings(warnings: readonly string[]): string[] {
   return Array.from(new Set(warnings.filter((warning) => typeof warning === 'string' && warning.trim().length > 0)))
+}
+
+function isHumanoidDraftFound(result: HumanoidDraftSidecarReadResult | undefined): result is Extract<HumanoidDraftSidecarReadResult, { success: true, status: 'found' | 'stale' }> {
+  return Boolean(result?.success && (result.status === 'found' || result.status === 'stale'))
+}
+
+function isHumanoidPromotionFound(result: HumanoidPromotionSidecarReadResult | undefined): result is Extract<HumanoidPromotionSidecarReadResult, { success: true, status: 'found' | 'stale' }> {
+  return Boolean(result?.success && (result.status === 'found' || result.status === 'stale'))
+}
+
+function collectHumanoidDiagnostics(
+  draftResult: HumanoidDraftSidecarReadResult | undefined,
+  promotionResult: HumanoidPromotionSidecarReadResult | undefined,
+): string[] {
+  const diagnostics: string[] = []
+
+  if (draftResult?.success === false) diagnostics.push(draftResult.error)
+  if (promotionResult?.success === false) diagnostics.push(promotionResult.error)
+  if (isHumanoidDraftFound(draftResult)) {
+    diagnostics.push(...draftResult.sidecar.diagnostics)
+    if (draftResult.status === 'stale') diagnostics.push(...draftResult.staleReasons)
+  }
+  if (isHumanoidPromotionFound(promotionResult) && promotionResult.status === 'stale') {
+    diagnostics.push(...promotionResult.staleReasons)
+  }
+
+  return dedupeViewer3DWarnings(diagnostics)
+}
+
+export function createViewer3DHumanoidProposedAssignments(
+  draft?: Pick<HumanoidDraftSidecarV1, 'assignments'>,
+): Viewer3DHumanoidProposedAssignments {
+  if (!draft) return structuredClone(EMPTY_HUMANOID_ASSIGNMENTS)
+  return {
+    roles: structuredClone(draft.assignments.roles ?? {}),
+    chains: structuredClone(draft.assignments.chains ?? {}),
+  }
+}
+
+export function applyViewer3DHumanoidRoleProposalChange(
+  assignments: Viewer3DHumanoidProposedAssignments,
+  roleKey: string,
+  nextValue: unknown,
+): Viewer3DHumanoidProposedAssignments {
+  return {
+    roles: { ...structuredClone(assignments.roles), [roleKey]: structuredClone(nextValue) },
+    chains: structuredClone(assignments.chains),
+  }
+}
+
+export function applyViewer3DHumanoidChainProposalChange(
+  assignments: Viewer3DHumanoidProposedAssignments,
+  chainKey: string,
+  nextValue: unknown,
+): Viewer3DHumanoidProposedAssignments {
+  return {
+    roles: structuredClone(assignments.roles),
+    chains: { ...structuredClone(assignments.chains), [chainKey]: structuredClone(nextValue) },
+  }
+}
+
+export function resolveViewer3DHumanoidReviewPresentation({
+  trustedContractPresent,
+  draftResult,
+  promotionResult,
+}: {
+  trustedContractPresent: boolean
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): Viewer3DHumanoidReviewPresentation {
+  const diagnostics = collectHumanoidDiagnostics(draftResult, promotionResult)
+
+  if (trustedContractPresent) {
+    return {
+      state: 'trusted',
+      headline: 'Trusted UniRig humanoid contract is already present.',
+      canPromote: false,
+      diagnostics,
+    }
+  }
+
+  if (isHumanoidPromotionFound(promotionResult) && promotionResult.status === 'found'
+    && isHumanoidDraftFound(draftResult) && draftResult.status === 'found') {
+    return {
+      state: 'promoted',
+      headline: 'Manual promotion is active for this mesh.',
+      canPromote: Boolean(isHumanoidDraftFound(draftResult) && draftResult.status === 'found'),
+      diagnostics,
+    }
+  }
+
+  if (
+    (isHumanoidPromotionFound(promotionResult) && promotionResult.status === 'stale')
+    || (isHumanoidDraftFound(draftResult) && draftResult.status === 'stale')
+  ) {
+    return {
+      state: 'stale',
+      headline: 'Humanoid draft or promotion is stale and blocked.',
+      canPromote: false,
+      diagnostics,
+    }
+  }
+
+  if (isHumanoidDraftFound(draftResult) && draftResult.status === 'found') {
+    return {
+      state: 'draft',
+      headline: 'Draft humanoid proposal available for manual review.',
+      canPromote: true,
+      diagnostics,
+    }
+  }
+
+  return {
+    state: 'diagnostics-only',
+    headline: 'No promotable humanoid draft is available for this mesh.',
+    canPromote: false,
+    diagnostics,
+  }
+}
+
+export function resolveViewer3DHumanoidPromotionGate({
+  presentation,
+  rationale,
+  confirmationChecked,
+  writerAvailable,
+}: {
+  presentation: Viewer3DHumanoidReviewPresentation
+  rationale: string
+  confirmationChecked: boolean
+  writerAvailable: boolean
+}): { allowed: true } | { allowed: false, reason: string } {
+  if (!presentation.canPromote) {
+    return {
+      allowed: false,
+      reason: presentation.state === 'stale'
+        ? 'Promotion is blocked until the stale humanoid artifacts are regenerated.'
+        : 'No valid humanoid draft is available for promotion.',
+    }
+  }
+  if (!confirmationChecked) {
+    return { allowed: false, reason: 'Explicit confirmation is required before manual promotion.' }
+  }
+  if (!rationale.trim()) {
+    return { allowed: false, reason: 'Promotion rationale is required for auditability.' }
+  }
+  if (!writerAvailable) {
+    return { allowed: false, reason: 'Workspace humanoid promotion writer is unavailable.' }
+  }
+  return { allowed: true }
+}
+
+export function buildViewer3DHumanoidPromotionWriteRequest({
+  meshWorkspacePath,
+  draft,
+  sourceSha256,
+  existingPromotion,
+  proposedAssignments,
+  rationale,
+  createdAt,
+  confirmedBy,
+  confirmedByLabel,
+  method,
+  promotionId,
+}: {
+  meshWorkspacePath: string
+  draft: HumanoidDraftSidecarV1
+  sourceSha256?: string
+  existingPromotion?: HumanoidPromotionSidecarV1
+  proposedAssignments: Viewer3DHumanoidProposedAssignments
+  rationale: string
+  createdAt: string
+  confirmedBy: string
+  confirmedByLabel?: string
+  method: HumanoidPromotionMethod
+  promotionId: string
+}): HumanoidPromotionSidecarWriteRequest {
+  return {
+    meshWorkspacePath,
+    sidecar: {
+      schema: 'modly.humanoid-promotion.v1',
+      version: 1,
+      promotionId,
+      ...(existingPromotion?.promotionId ? { supersedesPromotionId: existingPromotion.promotionId } : {}),
+      source: structuredClone(draft.source),
+      output: { workspacePath: meshWorkspacePath },
+      meshOutputSha256: draft.meshOutputSha256,
+      rigmetaSha256: draft.rigmetaSha256,
+      draftSha256: draft.draftSha256,
+      ...(draft.draftContentSha256 ? { draftContentSha256: draft.draftContentSha256 } : {}),
+      ...(sourceSha256 !== undefined ? { sourceSha256 } : {}),
+      draftSchema: draft.schema,
+      promotedAssignments: structuredClone(proposedAssignments),
+      provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+      audit: {
+        confirmedBy,
+        ...(confirmedByLabel ? { confirmedByLabel } : {}),
+        createdAt,
+        method,
+        rationale: rationale.trim(),
+      },
+    },
+  }
+}
+
+function createViewer3DHumanoidReviewState(meshWorkspacePath?: string): Viewer3DHumanoidReviewState {
+  return {
+    meshWorkspacePath,
+    trustedContractPresent: false,
+    proposedAssignments: structuredClone(EMPTY_HUMANOID_ASSIGNMENTS),
+    isProposalDirty: false,
+    rationale: DEFAULT_VIEWER3D_HUMANOID_PROMOTION_RATIONALE,
+    confirmationChecked: true,
+    loadState: 'idle',
+    saveState: { status: 'idle' },
+  }
+}
+
+export function resolveViewer3DHumanoidHydrationRequest(
+  summary?: RigSkeletonSummary,
+  semanticHydrationSource?: Viewer3DSemanticHydrationSource,
+): {
+  draft: HumanoidDraftSidecarReadRequest
+  promotion: HumanoidPromotionSidecarReadRequest
+  displayedMeshWorkspacePath: string
+  sourceKind: Viewer3DSemanticHydrationSource['sourceKind']
+} | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  const semanticSourceWorkspacePath = semanticHydrationSource?.semanticSourceWorkspacePath ?? summary.sourceWorkspacePath
+  return {
+    draft: { meshWorkspacePath: semanticSourceWorkspacePath },
+    promotion: { meshWorkspacePath: semanticSourceWorkspacePath },
+    displayedMeshWorkspacePath: summary.sourceWorkspacePath,
+    sourceKind: semanticHydrationSource?.sourceKind ?? 'displayed-mesh',
+  }
+}
+
+function applyViewer3DHumanoidHydration({
+  state,
+  meshWorkspacePath,
+  trustedContractPresent,
+  draftResult,
+  promotionResult,
+}: {
+  state: Viewer3DHumanoidReviewState
+  meshWorkspacePath: string
+  trustedContractPresent: boolean
+  draftResult: HumanoidDraftSidecarReadResult
+  promotionResult: HumanoidPromotionSidecarReadResult
+}): Viewer3DHumanoidReviewState {
+  const currentDraftSha256 = isHumanoidDraftFound(draftResult) ? draftResult.sidecar.draftSha256 : undefined
+  const shouldResetProposal = state.meshWorkspacePath !== meshWorkspacePath || (!state.isProposalDirty && isHumanoidDraftFound(draftResult))
+
+  return {
+    ...state,
+    meshWorkspacePath,
+    trustedContractPresent,
+    draftResult,
+    promotionResult: isHumanoidDraftReadable(draftResult) ? promotionResult : undefined,
+    proposedAssignments: shouldResetProposal && isHumanoidDraftFound(draftResult)
+      ? createViewer3DHumanoidProposedAssignments(draftResult.sidecar)
+      : shouldResetProposal
+        ? structuredClone(EMPTY_HUMANOID_ASSIGNMENTS)
+        : state.proposedAssignments,
+    proposalSourceDraftSha256: shouldResetProposal ? currentDraftSha256 : state.proposalSourceDraftSha256,
+    isProposalDirty: shouldResetProposal ? false : state.isProposalDirty,
+    rationale: shouldResetProposal ? DEFAULT_VIEWER3D_HUMANOID_PROMOTION_RATIONALE : state.rationale,
+    confirmationChecked: shouldResetProposal ? true : state.confirmationChecked,
+    loadState: 'loaded',
+    saveState: { status: 'idle' },
+  }
+}
+
+export function hasTrustedHumanoidContract(rigMeta: unknown, summary: RigSkeletonSummary | undefined): boolean {
+  if (!summary?.hasRig) return false
+  if (!rigMeta || typeof rigMeta !== 'object') return false
+  const metadata = rigMeta as Record<string, unknown>
+  const contract = metadata.humanoid_contract as Record<string, unknown> | undefined
+  if (!contract || typeof contract !== 'object' || !contract.required_roles || typeof contract.required_roles !== 'object') return false
+  const validation = contract.validation as { status?: unknown } | undefined
+  const provenance = contract.provenance as { trust_scope?: { trusted?: unknown } } | undefined
+  const translation = translateHumanoidAssignmentsToRigMetaNaming({ summary,
+    sources: [{ source: 'humanoid_contract', roleMap: { roles: contract.required_roles } }] })
+  if (translation.diagnostics.length > 0 || Object.keys(translation.namingByBoneId).length === 0) return false
+  return contract.schema === 'modly.humanoid.v1' && (contract.humanoid_contract_status ?? metadata.humanoid_contract_status) === 'trusted'
+    && validation?.status === 'validated' && Array.isArray(provenance?.trust_scope?.trusted)
+    && provenance.trust_scope.trusted.includes('required_roles')
+}
+
+function resolveViewer3DHumanoidPromotionMethod(args: {
+  currentJobId?: string
+  workflowArtifactPresent: boolean
+}): HumanoidPromotionMethod {
+  if (args.currentJobId?.startsWith('import-')) return 'import'
+  if (args.workflowArtifactPresent) return 'add-to-scene'
+  return 'viewer3d'
 }
 
 const MOTION_RETARGET_SAVE_UNAVAILABLE = 'Save is unavailable until Modly validates a trusted Kimodo motion payload with complete translated source bone metadata.'
@@ -3216,8 +3641,9 @@ export function applyViewer3DRigMetaHydrationResult({
   }
 
   const normalized = normalizeRigMetaNaming(result.rigMeta, {
-    expectedSourceWorkspacePath: token.sourceWorkspacePath,
-    expectedSkeletonContextId: token.skeletonContextId,
+    expectedSourceWorkspacePath: token.semanticSourceWorkspacePath,
+    expectedSkeletonContextId: token.semanticSourceWorkspacePath === token.sourceWorkspacePath ? token.skeletonContextId
+      : token.skeletonContextId.replace(`rig:${token.sourceWorkspacePath}|`, `rig:${token.semanticSourceWorkspacePath}|`),
     summary: state.summary,
   })
   const warnings = [...new Set([...result.warnings, ...normalized.warnings])]
@@ -4146,6 +4572,147 @@ export default function Viewer3D({
     setSelected(false); setViewMode('solid'); setPlayingUrl(null); setStoreMeshStats(null)
   }, [modelUrl, setSelected, setStoreMeshStats])
 
+  // Descriptor identity follows the selected per-node checkpoint, never the old global artifact.
+  const kimodoMetadataDescriptor = useMemo(() => resolveViewer3DKimodoMetadataDescriptor({
+    apiUrl, modelUrl: viewerPresentation.modelUrl, workspaceDir,
+    artifact: checkpoint?.substitutionPoint?.inputArtifact,
+  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, checkpoint?.substitutionPoint?.inputArtifact])
+  const descriptorRef = useRef(kimodoMetadataDescriptor)
+  descriptorRef.current = kimodoMetadataDescriptor
+  const [semanticMetadata, setSemanticMetadata] = useState<{ source: LoadedScene; context: string; descriptor: Viewer3DKimodoMetadataDescriptor; metadata: Record<string, unknown> } | null>(null)
+  const semanticHydrationSource = useMemo(() => resolveViewer3DSemanticHydrationSource({
+    displayedMeshWorkspacePath: liveSource?.binding.summary.sourceWorkspacePath,
+    descriptor: kimodoMetadataDescriptor, workspaceDir,
+    metadata: semanticMetadata?.source === liveSource && semanticMetadata.context === motionContext && semanticMetadata.descriptor === kimodoMetadataDescriptor ? semanticMetadata.metadata : null,
+  }), [liveSource, kimodoMetadataDescriptor, workspaceDir, semanticMetadata, motionContext])
+  useEffect(() => {
+    const reader = window.electron?.settings?.get
+    if (!reader || !rigEditorVisibility.isOpen || motionRetargetVisibility.isOpen) return
+    const paths = [checkpoint?.substitutionPoint?.inputArtifact.uri, checkpoint?.substitutionPoint?.inputArtifact.legacy?.filePath]
+    const needsRoot = viewerPresentation.modelUrl?.includes('/optimize/serve-file?') || paths.some(path => path && !path.startsWith('/workspace/') && (path.startsWith('/') || /^[A-Za-z]:/.test(path)))
+    if (!needsRoot) return
+    let cancelled = false
+    Promise.resolve().then(() => reader()).then(settings => {
+      if (!cancelled && motionContextRef.current === motionContext && window.electron?.settings?.get === reader) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
+    }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [motionContext, rigEditorVisibility.isOpen, motionRetargetVisibility.isOpen])
+  const semanticKey = JSON.stringify(semanticHydrationSource)
+  const semanticPorts = window.electron?.workspace?.artifacts
+  const semanticOwner = useMemo(() => ({ source: liveSource, context: motionContext, key: semanticKey,
+    metaReader: semanticPorts?.readRigMetaSidecar, draftReader: semanticPorts?.readHumanoidDraftSidecar,
+    promotionReader: semanticPorts?.readHumanoidPromotionSidecar, writer: semanticPorts?.writeHumanoidPromotionSidecar }),
+  [liveSource, motionContext, semanticKey, semanticPorts?.readRigMetaSidecar, semanticPorts?.readHumanoidDraftSidecar, semanticPorts?.readHumanoidPromotionSidecar, semanticPorts?.writeHumanoidPromotionSidecar])
+  const semanticOwnerRef = useRef(semanticOwner); semanticOwnerRef.current = semanticOwner
+  const [humanoidReviewState, humanoidStateRef, setHumanoidReviewState] = useCurrentState(createViewer3DHumanoidReviewState)
+  const humanoidLoadedOwner = useRef<typeof semanticOwner | null>(null)
+  const humanoidOperation = useRef<object | null>(null)
+  const rigPanelEpoch = useRef(0)
+  const renderedRigPanelEpoch = rigPanelEpoch.current
+  const semanticCurrent = () => {
+    const store = useWorkflowRunStore.getState()
+    const job = useAppStore.getState().currentJob
+    const ports = window.electron?.workspace?.artifacts
+    return isLive(semanticOwner.source) && semanticOwnerRef.current === semanticOwner && motionContextRef.current === motionContext
+      && store.executionId === executionId && store.activeCheckpointNodeId === checkpointNodeId
+      && (!checkpointNodeId || sameCheckpointOwner(checkpoint?.owner, store.getCheckpointOwner(checkpointNodeId)))
+      && job?.id === currentJob?.id && job?.outputUrl === currentJob?.outputUrl
+      && ports?.readRigMetaSidecar === semanticOwner.metaReader && ports?.readHumanoidDraftSidecar === semanticOwner.draftReader
+      && ports?.readHumanoidPromotionSidecar === semanticOwner.promotionReader && ports?.writeHumanoidPromotionSidecar === semanticOwner.writer
+  }
+  const humanoidCurrent = humanoidLoadedOwner.current === semanticOwner && humanoidReviewState.loadState === 'loaded'
+  const humanoidReviewPresentation = resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+    presentation: resolveViewer3DHumanoidReviewPresentation({ trustedContractPresent: humanoidCurrent && humanoidReviewState.trustedContractPresent,
+      draftResult: humanoidCurrent ? humanoidReviewState.draftResult : undefined, promotionResult: humanoidCurrent ? humanoidReviewState.promotionResult : undefined }),
+    semanticHydrationSource,
+  })
+  const rigDisplayNamingByBoneId = resolveViewer3DEffectiveRigMetaNaming({ summary: liveSource?.binding.summary,
+    rigMetaNamingByBoneId: rigEditorState.rigMetaNamingByBoneId,
+    draftResult: humanoidCurrent ? humanoidReviewState.draftResult : undefined,
+    promotionResult: humanoidCurrent ? humanoidReviewState.promotionResult : undefined })
+  useEffect(() => {
+    const source = semanticOwner.source
+    const summary = source?.binding.summary
+    const token = createViewer3DRigMetaHydrationToken({ modelUrl, summary, semanticSourceWorkspacePath: semanticHydrationSource?.semanticSourceWorkspacePath })
+    const metaRequest = resolveViewer3DRigMetaHydrationRequest(summary, semanticHydrationSource)
+    const request = resolveViewer3DHumanoidHydrationRequest(summary, semanticHydrationSource)
+    const previousOwner = humanoidLoadedOwner.current
+    humanoidOperation.current = null
+    humanoidLoadedOwner.current = semanticOwner
+    let cancelled = false
+    const current = () => !cancelled && semanticCurrent()
+    setHumanoidReviewState(state => ({ ...(previousOwner?.source === source && previousOwner.context === motionContext && previousOwner.key === semanticKey
+      ? state : createViewer3DHumanoidReviewState(summary?.sourceWorkspacePath)),
+      draftResult: undefined, promotionResult: undefined, trustedContractPresent: false, loadState: 'loading', saveState: { status: 'idle' } }))
+    setRigEditorState(state => ({ ...state, rigMetaNamingByBoneId: EMPTY_RIG_META_NAMING }))
+    if (!source || !request || !token || !metaRequest) return () => { cancelled = true }
+    const metaPromise: Promise<RigMetaSidecarReadResult> = Promise.resolve().then(() => semanticOwner.metaReader
+      ? semanticOwner.metaReader(metaRequest) : { success: true as const, status: 'not-found' as const, rigMetaWorkspacePath: metaRequest.sourceWorkspacePath.replace(/\.(glb|gltf)$/i, '.rigmeta.json') })
+    metaPromise.then(result => {
+      if (!current()) return
+      const hydration = applyViewer3DRigMetaHydrationResult({ state: rigStateRef.current, result, token, currentToken: token })
+      setRigEditorState(hydration.state); setRigMetaHydrationWarning(hydration.warning)
+      setHumanoidReviewState(state => ({ ...state, trustedContractPresent: result.success && result.status === 'found' && !hydration.warning && hasTrustedHumanoidContract(result.rigMeta, summary) }))
+    }).catch(error => {
+      if (!current()) return
+      setRigMetaHydrationWarning({ status: 'warning', messages: [ioError(error, 'Failed to read rig metadata.')] })
+    })
+    Promise.all([
+      Promise.resolve().then(() => semanticOwner.draftReader ? semanticOwner.draftReader(request.draft) : { success: false as const, status: 'error' as const, error: 'Workspace humanoid draft reader is unavailable.' }),
+      Promise.resolve().then(() => semanticOwner.promotionReader ? semanticOwner.promotionReader(request.promotion) : { success: false as const, status: 'error' as const, error: 'Workspace humanoid promotion reader is unavailable.' }),
+    ]).then(([draftResult, promotionResult]) => {
+      if (!current()) return
+      const expected = request.draft.meshWorkspacePath
+      if (isHumanoidDraftFound(draftResult) && draftResult.sidecar.output.workspacePath !== expected) throw new Error('Humanoid draft output mismatch.')
+      if (isHumanoidPromotionFound(promotionResult) && promotionResult.sidecar.output.workspacePath !== expected) throw new Error('Humanoid promotion output mismatch.')
+      setHumanoidReviewState(state => applyViewer3DHumanoidHydration({ state, meshWorkspacePath: request.displayedMeshWorkspacePath,
+        trustedContractPresent: state.trustedContractPresent, draftResult, promotionResult }))
+    }).catch(error => {
+      if (!current()) return
+      const message = ioError(error, 'Failed to read humanoid sidecars.')
+      setHumanoidReviewState(state => ({ ...state, loadState: 'error', draftResult: { success: false, status: 'error', error: message },
+        promotionResult: undefined, saveState: { status: 'idle' } }))
+    })
+    return () => { cancelled = true }
+  }, [semanticOwner, setHumanoidReviewState, setRigEditorState])
+  const handleSaveHumanoidPromotion = async () => {
+    // Check the retained callback's owner BEFORE acquiring or clearing an operation.
+    if (!semanticCurrent() || renderedRigPanelEpoch !== rigPanelEpoch.current || !rigEditorVisibility.isOpen
+      || humanoidLoadedOwner.current !== semanticOwner || humanoidOperation.current) return
+    const state = humanoidStateRef.current
+    const writer = semanticOwner.writer
+    const audit = resolveViewer3DHumanoidPromotionButtonAudit({ rationale: state.rationale })
+    const presentation = resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+      presentation: resolveViewer3DHumanoidReviewPresentation(state), semanticHydrationSource })
+    const gate = resolveViewer3DHumanoidPromotionGate({ presentation, ...audit, writerAvailable: !!writer })
+    if (!gate.allowed || state.loadState !== 'loaded' || !writer || !state.meshWorkspacePath || !isHumanoidDraftFound(state.draftResult) || state.draftResult.status !== 'found') {
+      setHumanoidReviewState(current => ({ ...current, saveState: { status: 'error', message: !gate.allowed ? gate.reason : 'No valid humanoid draft is available for promotion.' } })); return
+    }
+    const revision = JSON.stringify([state.proposedAssignments, state.rationale, state.draftResult])
+    const operation = {}; humanoidOperation.current = operation
+    const current = () => semanticCurrent() && renderedRigPanelEpoch === rigPanelEpoch.current && humanoidOperation.current === operation
+    const request = buildViewer3DHumanoidPromotionWriteRequest({ meshWorkspacePath: state.meshWorkspacePath, draft: state.draftResult.sidecar, sourceSha256: state.draftResult.sourceSha256,
+      existingPromotion: isHumanoidPromotionFound(state.promotionResult) ? state.promotionResult.sidecar : undefined,
+      proposedAssignments: state.proposedAssignments, rationale: audit.rationale, createdAt: new Date().toISOString(),
+      confirmedBy: DEFAULT_VIEWER3D_HUMANOID_CONFIRMED_BY, confirmedByLabel: DEFAULT_VIEWER3D_HUMANOID_CONFIRMED_BY_LABEL,
+      method: resolveViewer3DHumanoidPromotionMethod({ currentJobId: currentJob?.id, workflowArtifactPresent: !!checkpoint?.substitutionPoint?.inputArtifact }), promotionId: crypto.randomUUID() })
+    setHumanoidReviewState(current => ({ ...current, saveState: { status: 'saving' } }))
+    try {
+      const result = await writer(request)
+      if (!current()) return
+      const latest = humanoidStateRef.current
+      if (JSON.stringify([latest.proposedAssignments, latest.rationale, latest.draftResult]) !== revision) {
+        setHumanoidReviewState(state => ({ ...state, saveState: { status: 'idle' } })); return
+      }
+      setHumanoidReviewState(state => result.success ? { ...state,
+        promotionResult: { success: true, status: 'found', sidecarWorkspacePath: result.sidecarWorkspacePath, sidecar: result.sidecar },
+        saveState: { status: 'saved', sidecarWorkspacePath: result.sidecarWorkspacePath } }
+        : { ...state, promotionResult: undefined, saveState: { status: 'error', message: result.error } })
+    } catch (error) {
+      if (current()) setHumanoidReviewState(state => ({ ...state, promotionResult: undefined, saveState: { status: 'error', message: ioError(error, 'Promotion could not be saved.') } }))
+    } finally { if (humanoidOperation.current === operation) humanoidOperation.current = null }
+  }
+
   const sourceToken = (source: LoadedScene) => createViewer3DRigHydrationToken({ modelUrl: source.url, summary: source.binding.summary })
   useEffect(() => {
     const source = liveSource
@@ -4154,22 +4721,11 @@ export default function Viewer3D({
     const token = sourceToken(source)
     const ports = window.electron?.workspace?.artifacts
     const aliasReader = ports?.readRigRenameSidecar
-    const metaReader = ports?.readRigMetaSidecar
     const poseReader = ports?.readPoseClipSidecar
     const aliasRequest = resolveViewer3DRigHydrationRequest(summary)
-    const metaRequest = resolveViewer3DRigMetaHydrationRequest(summary)
     const poseRequest = resolveViewer3DPoseClipHydrationRequest(summary)
     let cancelled = false
     const current = () => !cancelled && isLive(source)
-    if (metaReader && metaRequest && token) {
-      Promise.resolve().then(() => metaReader(metaRequest)).then(result => {
-        if (!current()) return
-        const hydration = applyViewer3DRigMetaHydrationResult({ state: rigStateRef.current, result, token, currentToken: token })
-        setRigEditorState(hydration.state); setRigMetaHydrationWarning(hydration.warning)
-      }).catch((error: unknown) => {
-        if (current()) setRigMetaHydrationWarning({ status: 'warning', messages: [ioError(error, 'Failed to read rig metadata.')] })
-      })
-    }
     if (aliasReader && aliasRequest && token) {
       const operation = {}; aliasIO.current = operation
       const revision = aliasRevision(rigStateRef.current.renamePlan)
@@ -4269,7 +4825,7 @@ export default function Viewer3D({
   const rigTargetState = resolveViewer3DActiveRigTargetState({ rigEditorState, rigEditorVisibility, poseClipState, poseClipVisibility, selectedTarget: selectedRigTarget })
   const rigEditorPanelRenderState = { shouldRenderPanel: !!liveSource && rigEditorVisibility.isOpen }
   const poseClipPanelRenderState = { shouldRenderPanel: !!liveSource && poseClipVisibility.isOpen }
-  const rigEffectiveNaming = liveSource?.binding.summary.hasRig ? resolveRigEffectiveNaming(liveSource.binding.summary, rigEditorState.renamePlan, rigEditorState.rigMetaNamingByBoneId) : undefined
+  const rigEffectiveNaming = liveSource?.binding.summary.hasRig ? resolveRigEffectiveNaming(liveSource.binding.summary, rigEditorState.renamePlan, rigDisplayNamingByBoneId) : undefined
   const selectBone = (boneId: RigBoneId) => {
     const source = liveSource
     if (!isLive(source) || !source.binding.bonesById.has(boneId)) return
@@ -4335,13 +4891,6 @@ export default function Viewer3D({
     return () => window.clearInterval(interval)
   }, [liveSource, poseClipState.previewState, poseClipState.plan.clip.fps, isLive, poseStateRef, setPoseClipState])
 
-  // Descriptor identity follows the selected per-node checkpoint, never the old global artifact.
-  const kimodoMetadataDescriptor = useMemo(() => resolveViewer3DKimodoMetadataDescriptor({
-    apiUrl, modelUrl: viewerPresentation.modelUrl, workspaceDir,
-    artifact: checkpoint?.substitutionPoint?.inputArtifact,
-  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, checkpoint?.substitutionPoint?.inputArtifact])
-  const descriptorRef = useRef(kimodoMetadataDescriptor)
-  descriptorRef.current = kimodoMetadataDescriptor
   // Event callbacks belong to this render's epoch; retired callbacks cannot mint a new one.
   const renderedMotionEpoch = motionEpoch.current
   const motionCurrent = (source: LoadedScene | null, epoch = renderedMotionEpoch, descriptor = kimodoMetadataDescriptor, context = motionContext) => {
@@ -4387,6 +4936,7 @@ export default function Viewer3D({
       return response.json() as Promise<Record<string, unknown>>
     }).then(metadata => {
       if (cancelled || !current()) return
+      setSemanticMetadata({ source, context: motionContext, descriptor, metadata })
       const state = motionStateRef.current
       if (motionRevision(state) !== revision && state.session) return
       const rig = rigStateRef.current
@@ -4399,6 +4949,7 @@ export default function Viewer3D({
       setMotionRetargetState({ ...next, diagnosticsMessages: hydrated.diagnosticsMessages })
     }).catch((error: unknown) => {
       if (cancelled || !current()) return
+      setSemanticMetadata(null)
       // Missing sibling metadata is a nonblocking plain/third-party GLB fallback.
       if (descriptor.detectionMode === 'provenance') setMotionRetargetState(state => ({ ...state,
         diagnosticsMessages: [...state.diagnosticsMessages, ioError(error, 'Kimodo metadata could not be loaded.')] }))
@@ -4969,7 +5520,7 @@ export default function Viewer3D({
               rigEditorControls={hasRigEditorRail && rigEditorState.summary ? {
                 active: Boolean(rigEditorState.summary.hasRig && rigEditorVisibility.isOpen),
                 summary: rigEditorState.summary,
-                onOpenRigEditor: () => setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })),
+                onOpenRigEditor: () => { if (!isLive(liveSource)) return; rigPanelEpoch.current++; humanoidOperation.current = null; setHumanoidReviewState(state => ({ ...state, saveState: { status: 'idle' } })); setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })) },
               } : undefined}
               motionRetargetControls={resolveViewer3DMotionRetargetToolbarControls({ modelUrl, summary: motionRetargetState.summary,
                 visibility: motionRetargetVisibility, onOpenMotionRetarget: toggleMotion })}
@@ -4991,7 +5542,7 @@ export default function Viewer3D({
                 onCancelAlias: boneId => editAliases({ type: 'cancel-alias', boneId }),
                 onRevertAliases: () => editAliases({ type: 'revert-aliases' }),
                 onSaveAliases: handleSaveRigAliases,
-              }, rigHydrationWarning)}
+              }, rigHydrationWarning, { rigMetaNamingByBoneId: rigDisplayNamingByBoneId, humanoidReview: { presentation: humanoidReviewPresentation, saveState: humanoidReviewState.saveState, onPromote: handleSaveHumanoidPromotion } })}
               canSaveAliases={canSaveAliases}
               aliasesDirty={aliasesDirty}
               saveState={rigRenameSaveState.status}

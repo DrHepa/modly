@@ -848,3 +848,78 @@ test('renderer motion sidecar round-trips through preload, registered IPC and re
     mesh.geometry.dispose(); (mesh.material as InstanceType<typeof MeshBasicMaterial>).dispose()
   } finally { await rm(workspaceDir, { recursive: true, force: true }) }
 })
+
+test('preload workspace artifact registry exposes humanoid draft discovery and promotion persistence IPC channels', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      if (channel === 'workspace:artifact:readHumanoidDraftSidecar') {
+        return {
+          success: true,
+          status: 'found',
+          sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json',
+          sidecar: { schema: 'modly.humanoid-draft.v1', version: 1 },
+        }
+      }
+      if (channel === 'workspace:artifact:writeHumanoidPromotionSidecar') {
+        return {
+          success: true,
+          sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json',
+          sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1 },
+        }
+      }
+      return {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json',
+        sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1 },
+      }
+    },
+  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+
+  const draftRequest = { meshWorkspacePath: 'Workflows/outputs/hero_unirig.glb' }
+  const promotionWriteRequest: import('../../src/shared/types/electron.d').HumanoidPromotionSidecarWriteRequest = {
+    meshWorkspacePath: 'Workflows/outputs/hero_unirig.glb',
+    sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1, promotionId: 'promotion-port',
+      source: { workspacePath: 'Workflows/source.glb' }, output: { workspacePath: 'Workflows/outputs/hero_unirig.glb' },
+      meshOutputSha256: 'mesh-token', rigmetaSha256: 'rigmeta-token', draftSha256: 'draft-token', draftSchema: 'modly.humanoid-draft.v1',
+      promotedAssignments: { roles: {}, chains: {} }, provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+      audit: { confirmedBy: 'modly:user:local:manual', createdAt: '2026-10-07T00:00:00Z', method: 'viewer3d', rationale: 'Explicit confirmation' } },
+  }
+  const promotionReadRequest = { meshWorkspacePath: 'Workflows/outputs/hero_unirig.glb' }
+
+  assert.equal(typeof api.workspace.artifacts.readHumanoidDraftSidecar, 'function')
+  assert.equal(typeof api.workspace.artifacts.writeHumanoidPromotionSidecar, 'function')
+  assert.equal(typeof api.workspace.artifacts.readHumanoidPromotionSidecar, 'function')
+
+  const draftResult = await api.workspace.artifacts.readHumanoidDraftSidecar(draftRequest)
+  const promotionWriteResult = await api.workspace.artifacts.writeHumanoidPromotionSidecar(promotionWriteRequest)
+  const promotionReadResult = await api.workspace.artifacts.readHumanoidPromotionSidecar(promotionReadRequest)
+
+  assert.deepEqual(draftResult, {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json',
+    sidecar: { schema: 'modly.humanoid-draft.v1', version: 1 },
+  })
+  assert.deepEqual(promotionWriteResult, {
+    success: true,
+    sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json',
+    sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1 },
+  })
+  assert.deepEqual(promotionReadResult, {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json',
+    sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1 },
+  })
+  assert.deepEqual(invocations, [
+    { channel: 'workspace:artifact:readHumanoidDraftSidecar', args: [draftRequest] },
+    { channel: 'workspace:artifact:writeHumanoidPromotionSidecar', args: [promotionWriteRequest] },
+    { channel: 'workspace:artifact:readHumanoidPromotionSidecar', args: [promotionReadRequest] },
+  ])
+})

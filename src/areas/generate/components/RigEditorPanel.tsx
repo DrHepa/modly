@@ -3,11 +3,33 @@ import type { RigBoneId, RigSkeletonSummary } from '../rigSkeleton.ts'
 import type { RigRenamePlan, RigRenameValidationResult } from '../rigRenamePlan.ts'
 import type { RigEffectiveNamingResult } from '../rigEffectiveNaming.ts'
 
+type RigEditorHumanoidReviewStateKind = 'trusted' | 'draft' | 'promoted' | 'stale' | 'diagnostics-only'
+
+type RigEditorHumanoidPromotionSaveState =
+  | { status: 'idle' }
+  | { status: 'saving' }
+  | { status: 'saved'; sidecarWorkspacePath: string }
+  | { status: 'error'; message: string }
+
+type RigEditorHumanoidReviewPresentation = {
+  state: RigEditorHumanoidReviewStateKind
+  headline: string
+  canPromote: boolean
+  diagnostics: string[]
+}
+
+export interface RigEditorHumanoidReviewProps {
+  presentation: RigEditorHumanoidReviewPresentation
+  saveState: RigEditorHumanoidPromotionSaveState
+  onPromote: () => void
+}
+
 export interface RigEditorPanelProps {
   summary?: RigSkeletonSummary
   selectedBoneId?: RigBoneId
   renamePlan: RigRenamePlan
   effectiveNaming?: RigEffectiveNamingResult
+  humanoidReview?: RigEditorHumanoidReviewProps
   validation: RigRenameValidationResult
   /** The caller must authorise source-backed writes, including persisted removals. */
   canSaveAliases?: boolean
@@ -32,6 +54,7 @@ export function RigEditorPanel({
   selectedBoneId,
   renamePlan,
   effectiveNaming,
+  humanoidReview,
   validation,
   hydrationWarning,
   canSaveAliases = false,
@@ -96,6 +119,7 @@ export function RigEditorPanel({
             pendingAliasCount={pendingAliasCount}
             busy={busy}
             canSave={canSave}
+            humanoidReview={humanoidReview}
             onAliasChange={onAliasChange}
             onCancelAlias={onCancelAlias}
             onRevertAliases={onRevertAliases}
@@ -114,6 +138,7 @@ function RigAliasActions({
   pendingAliasCount,
   busy,
   canSave,
+  humanoidReview,
   onAliasChange,
   onCancelAlias,
   onRevertAliases,
@@ -125,6 +150,7 @@ function RigAliasActions({
   pendingAliasCount: number
   busy: boolean
   canSave: boolean
+  humanoidReview?: RigEditorHumanoidReviewProps
   onAliasChange: (boneId: RigBoneId, alias: string) => void
   onCancelAlias: (boneId: RigBoneId) => void
   onRevertAliases: () => void
@@ -178,7 +204,20 @@ function RigAliasActions({
         >
           Save rig aliases
         </button>
+        {humanoidReview?.presentation.canPromote ? (
+          <button
+            type="button"
+            title="Promote humanoid draft"
+            onClick={humanoidReview.onPromote}
+            disabled={humanoidReview.saveState.status === 'saving'}
+          >
+            {humanoidReview.saveState.status === 'saving' ? 'Promoting humanoid draft…' : 'Promote humanoid draft'}
+          </button>
+        ) : null}
       </div>
+
+      {humanoidReview?.saveState.status === 'saved' ? <p className="text-xs text-emerald-300">Promotion saved: {humanoidReview.saveState.sidecarWorkspacePath}</p> : null}
+      {humanoidReview?.saveState.status === 'error' ? <p className="text-xs text-red-300">{humanoidReview.saveState.message}</p> : null}
     </>
   )
 }

@@ -1,9 +1,12 @@
-import type { RigBoneId, RigBoneNode, RigSkeletonSummary } from './rigSkeleton.ts'
+import { translateKimodoTargetTracks, type RigBoneId, type RigBoneNode, type RigSkeletonSummary, type TranslatedKimodoTargetTrack } from './rigSkeleton.ts'
+import type { KimodoMotionArtifact, KimodoMotionRetargetTargetTrack } from './kimodoMotionAdapter.ts'
+import { normalizeSemanticRoleId } from './semanticRoles.ts'
 
 export const POSE_CLIP_SCHEMA = 'modly.pose-clip'
 export const POSE_CLIP_VERSION = 1
 export const POSE_CLIP_WORKSPACE_PREFIX = 'Workflows/pose-clips/'
 export const POSE_CLIP_WORKSPACE_SUFFIX = '.pose-clip.v1.json'
+export const POSE_CLIP_COMPANION_WORKSPACE_SUFFIX = '.kimodo-companion.pose-clip.v1.json'
 export const MIN_POSE_CLIP_DURATION_SECONDS = 0.001
 export const MIN_POSE_CLIP_FPS = 1
 
@@ -114,6 +117,31 @@ export interface ValidatePoseClipSidecarWorkspacePathInput {
 export interface PoseClipValidationResult {
   valid: boolean
   warnings: string[]
+}
+
+export interface DeriveKimodoPoseClipCompanionInput {
+  summary: RigSkeletonSummary
+  artifact: KimodoMotionArtifact
+  createdAt?: string
+  sourceBones?: readonly KimodoManualMappingSourceBone[]
+  mappings?: Readonly<Record<string, KimodoManualMappingEntry>>
+}
+
+export interface KimodoManualMappingSourceBone {
+  sourceBoneId: string
+  role?: string
+}
+
+export interface KimodoManualMappingEntry {
+  targetBoneId?: RigBoneId
+}
+
+export interface DeriveKimodoPoseClipCompanionResult {
+  /** Data availability only; callers retain responsibility for playback and export eligibility. */
+  available: boolean
+  warnings: string[]
+  sidecarWorkspacePath?: string
+  sidecar?: PoseClipSidecarV1
 }
 
 export function createPoseClipPlan(
@@ -349,6 +377,195 @@ export function createLegacyPoseClipSidecarWorkspacePath(sourceWorkspacePath: st
   return `${POSE_CLIP_WORKSPACE_PREFIX}${createPoseClipSidecarStem(normalizedSourceWorkspacePath)}${POSE_CLIP_WORKSPACE_SUFFIX}`
 }
 
+export function deriveKimodoPoseClipCompanionV1(input: DeriveKimodoPoseClipCompanionInput): DeriveKimodoPoseClipCompanionResult {
+  const sourceDeclarations = [input.summary.sourceWorkspacePath, input.artifact.sourceMeshWorkspacePath,
+    input.artifact.motionRetarget?.sourceContract?.sourceMeshWorkspacePath].filter((path) => path !== undefined)
+  const normalizedSources = sourceDeclarations.map(normalizeSafePoseClipSourceWorkspacePath)
+  if (normalizedSources.some((path) => !path) || new Set(normalizedSources).size > 1) {
+    return { available: false, warnings: ['Kimodo Pose/Clip companion source ownership evidence disagrees or contains an unsafe source path.'] }
+  }
+  const sourceWorkspacePath = normalizedSources[0]
+  if (!sourceWorkspacePath) {
+    return {
+      available: false,
+      warnings: ['Kimodo Pose/Clip companion export requires a translated quaternion payload and a source workspace path.'],
+    }
+  }
+
+  const payload = readTranslatedKimodoPoseClipPayload(input.summary, input.artifact, {
+    sourceBones: input.sourceBones,
+    mappings: input.mappings,
+  })
+  if (!payload.available) {
+    return {
+      available: false,
+      warnings: payload.warnings,
+    }
+  }
+
+  const sidecarWorkspacePath = createPoseClipCompanionWorkspacePath(sourceWorkspacePath, payload.plan.clip.id || payload.plan.clip.name)
+  const sidecar = buildPoseClipSidecarV1({
+    // Ownership declarations already agree after safe normalization. Persist the
+    // same canonical path used by main without mutating the caller's summary.
+    summary: { ...input.summary, sourceWorkspacePath },
+    plan: payload.plan,
+    createdAt: input.createdAt,
+    source: { workspacePath: sourceWorkspacePath },
+  })
+
+  return {
+    available: true,
+    warnings: payload.warnings,
+    sidecarWorkspacePath,
+    sidecar,
+  }
+}
+
+function readTranslatedKimodoPoseClipPayload(
+  summary: RigSkeletonSummary,
+  artifact: KimodoMotionArtifact,
+  manualMapping?: {
+    sourceBones?: readonly KimodoManualMappingSourceBone[]
+    mappings?: Readonly<Record<string, KimodoManualMappingEntry>>
+  },
+): { available: true, plan: PoseClipPlan, warnings: string[] } | { available: false, warnings: string[] } {
+  const motionRetarget = artifact.motionRetarget
+  if (!motionRetarget) {
+    return {
+      available: false,
+      warnings: ['Kimodo Pose/Clip companion export remains unavailable until metadata includes a translated quaternion payload.'],
+    }
+  }
+  if (motionRetarget.status === 'invalid') {
+    return {
+      available: false,
+      warnings: motionRetarget.diagnostics.length > 0
+        ? [...motionRetarget.diagnostics]
+        : ['Kimodo Pose/Clip companion export remains unavailable until metadata includes a translated quaternion payload.'],
+    }
+  }
+
+  const name = motionRetarget.clipName ?? 'Kimodo Motion'
+  const clip = { id: typeof name === 'string' ? deriveKimodoClipId(name) : '', name,
+    durationSeconds: motionRetarget.durationSeconds ?? 1, fps: motionRetarget.fps ?? 24 }
+  if (!isClipMetadata(clip)) {
+    return { available: false, warnings: ['Kimodo Pose/Clip companion clip metadata is invalid.'] }
+  }
+
+  const warnings = [...motionRetarget.diagnostics]
+  if (!Array.isArray(motionRetarget.targetTracks)) {
+    return { available: false, warnings: [...warnings, 'Kimodo Pose/Clip companion has no quaternion target tracks.'] }
+  }
+  const targetTracks = resolveKimodoTargetTracksForManualMappings({
+    summary,
+    targetTracks: motionRetarget.targetTracks,
+    sourceBones: manualMapping?.sourceBones,
+    mappings: manualMapping?.mappings,
+    diagnostics: warnings,
+  })
+  const translated: TranslatedKimodoTargetTrack[] = []
+  for (const track of targetTracks) {
+    // A user-selected stable ID scopes validation to that exact local bone. Do not
+    // discard it back into ambiguous original names or producer array indices.
+    const mappedBone = track.targetBoneId === undefined ? undefined : findBone(summary, track.targetBoneId)
+    const scopedSummary = mappedBone ? { ...summary, bones: [{ ...mappedBone, originalName: track.targetNodeName }] } : summary
+    const result = translateKimodoTargetTracks(scopedSummary, [track])
+    warnings.push(...result.diagnostics)
+    if (!result.ok) continue
+    for (const resolved of result.tracks) {
+      if (resolved.rotations.some((rotation) => rotation.timeSeconds > clip.durationSeconds + 1e-6)) {
+        warnings.push(`Kimodo target track "${resolved.targetNodeName}" extends beyond clip duration and was omitted.`)
+      } else translated.push(resolved)
+    }
+  }
+  // Manual and automatic tracks share one collision domain, even though explicit
+  // selections are validated against a one-bone scope.
+  const counts = new Map<RigBoneId, number>()
+  for (const track of translated) counts.set(track.boneId, (counts.get(track.boneId) ?? 0) + 1)
+  for (const [boneId, count] of counts) {
+    if (count > 1) warnings.push(`Multiple Kimodo tracks resolve to local target "${boneId}"; all colliding tracks were omitted.`)
+  }
+  const tracks = translated.filter((track) => counts.get(track.boneId) === 1)
+  if (tracks.length === 0) {
+    return { available: false, warnings: [...warnings, 'Kimodo Pose/Clip companion has no usable quaternion target tracks.'] }
+  }
+  const usedKeyframeIds = new Set<string>()
+  return {
+    available: true,
+    warnings,
+    plan: {
+      skeletonContextId: summary.skeletonContextId,
+      clip,
+      keyframes: tracks.flatMap((track) => track.rotations.map((rotation) => ({
+        id: createKimodoTrackKeyframeId(track.boneId, rotation.timeSeconds, clip.fps, usedKeyframeIds),
+        timeSeconds: rotation.timeSeconds,
+        boneId: track.boneId,
+        rotation: { x: rotation.x, y: rotation.y, z: rotation.z, w: rotation.w },
+      }))),
+    },
+  }
+}
+
+interface KimodoManuallyMappedTargetTrack extends KimodoMotionRetargetTargetTrack {
+  /** Local authority from this helper's explicit mapping, never producer metadata. */
+  targetBoneId?: RigBoneId
+}
+
+export function resolveKimodoTargetTracksForManualMappings(args: {
+  summary: RigSkeletonSummary
+  targetTracks: readonly KimodoMotionRetargetTargetTrack[]
+  sourceBones?: readonly KimodoManualMappingSourceBone[]
+  mappings?: Readonly<Record<string, KimodoManualMappingEntry>>
+  diagnostics?: string[]
+}): KimodoManuallyMappedTargetTrack[] {
+  const mappings = args.mappings
+  if (!args.sourceBones?.length || !mappings) return args.targetTracks.map(cloneKimodoTargetTrack)
+
+  const sourceByRole = new Map<string, KimodoManualMappingSourceBone[]>()
+  for (const sourceBone of args.sourceBones) {
+    const role = normalizeSemanticRoleId(sourceBone.role) ?? sourceBone.role
+    if (!role) continue
+    sourceByRole.set(role, [...(sourceByRole.get(role) ?? []), sourceBone])
+  }
+
+  return args.targetTracks.flatMap((track): KimodoManuallyMappedTargetTrack[] => {
+    const role = normalizeSemanticRoleId(track.targetRole) ?? track.targetRole
+    const sources = role ? sourceByRole.get(role) ?? [] : []
+    if (!sources.some((source) => Object.hasOwn(mappings, source.sourceBoneId))) return [cloneKimodoTargetTrack(track)]
+    if (sources.length !== 1) {
+      args.diagnostics?.push(`Kimodo manual mapping for role "${role}" has ambiguous source bones; track was omitted.`)
+      return []
+    }
+    const sourceBone = sources[0]
+    const mappedTargetBoneId = mappings[sourceBone.sourceBoneId]?.targetBoneId
+    if (mappedTargetBoneId === undefined) {
+      args.diagnostics?.push(`Kimodo manual mapping for "${sourceBone.sourceBoneId}" is explicitly unset; track was omitted.`)
+      return []
+    }
+    const candidates = args.summary.bones.filter((bone) => bone.boneId === mappedTargetBoneId)
+    if (candidates.length !== 1) {
+      args.diagnostics?.push(`Kimodo manual mapping for "${sourceBone.sourceBoneId}" has a missing or ambiguous local target; track was omitted.`)
+      return []
+    }
+    const mappedTargetBone = candidates[0]
+    return [{
+      ...cloneKimodoTargetTrack(track),
+      targetBoneId: mappedTargetBone.boneId,
+      targetNodeName: mappedTargetBone.originalName || mappedTargetBone.boneId,
+      ...(mappedTargetBone.role ? { targetRole: mappedTargetBone.role } : {}),
+    }]
+  })
+}
+
+function cloneKimodoTargetTrack(track: KimodoMotionRetargetTargetTrack): KimodoMotionRetargetTargetTrack {
+  return {
+    targetNodeName: track.targetNodeName,
+    targetNodeIndex: track.targetNodeIndex,
+    ...(track.targetRole ? { targetRole: track.targetRole } : {}),
+    rotations: Array.isArray(track.rotations) ? track.rotations.map((rotation) => ({ ...rotation })) : [],
+  }
+}
+
 export function validatePoseClipSidecarWorkspacePath(input: ValidatePoseClipSidecarWorkspacePathInput): PoseClipValidationResult {
   const warnings: string[] = []
   const normalizedSidecarPath = normalizeWorkspacePath(input.sidecarWorkspacePath)
@@ -441,6 +658,15 @@ function cloneKeyframe(keyframe: PoseClipKeyframe): PoseClipKeyframe {
   }
 }
 
+function toRotationOnlyKeyframe(keyframe: PoseClipKeyframe): PoseClipKeyframe {
+  return {
+    id: keyframe.id,
+    timeSeconds: keyframe.timeSeconds,
+    boneId: keyframe.boneId,
+    rotation: { ...keyframe.rotation },
+  }
+}
+
 function findBone(summary: RigSkeletonSummary, boneId: RigBoneId): RigBoneNode | undefined {
   return summary.bones.find((bone) => bone.boneId === boneId)
 }
@@ -510,6 +736,18 @@ function validatePoseClipSidecarShape(sidecar: unknown): string[] {
   }
 
   return warnings
+}
+
+function readKimodoPoseClipCompanionPayload(raw: Record<string, unknown>): { clip: PoseClipMetadata; keyframes: PoseClipKeyframe[] } | undefined {
+  const payload = raw.pose_clip_companion
+  if (!isRecord(payload)) return undefined
+  if (payload.schema !== 'modly.pose-clip-companion' || payload.version !== 1) return undefined
+  if (!isClipMetadata(payload.clip)) return undefined
+  if (!Array.isArray(payload.keyframes) || payload.keyframes.length === 0 || !payload.keyframes.every(isPoseClipKeyframe)) return undefined
+  return {
+    clip: cloneClipMetadata(payload.clip),
+    keyframes: payload.keyframes.map(cloneKeyframe),
+  }
 }
 
 function isClipMetadata(value: unknown): value is PoseClipMetadata {
@@ -582,6 +820,29 @@ function hashPoseClipSourceWorkspacePath(normalizedSourceWorkspacePath: string):
     hash = (hash * POSE_CLIP_SOURCE_HASH_PRIME) & POSE_CLIP_SOURCE_HASH_MASK
   }
   return hash.toString(16).padStart(16, '0')
+}
+
+function createPoseClipCompanionWorkspacePath(sourceWorkspacePath: string, clipIdOrName: string): string {
+  const normalizedSource = normalizeSafePoseClipSourceWorkspacePath(sourceWorkspacePath)!
+  const sourceStem = `${createPoseClipSidecarStem(normalizedSource)}${POSE_CLIP_SOURCE_HASH_SEPARATOR}${hashPoseClipSourceWorkspacePath(normalizedSource)}`
+  const clipStem = slugStem(clipIdOrName)
+  return `${POSE_CLIP_WORKSPACE_PREFIX}${sourceStem}.${clipStem}${POSE_CLIP_COMPANION_WORKSPACE_SUFFIX}`
+}
+
+function slugStem(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'pose-clip'
+}
+
+function deriveKimodoClipId(clipName: string): string {
+  return clipName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'kimodo-motion'
+}
+
+function createKimodoTrackKeyframeId(boneId: RigBoneId, timeSeconds: number, fps: number, usedIds: Set<string>): string {
+  const base = `kimodo-${slugId(boneId)}-f${Math.round(timeSeconds * fps)}`
+  let id = base
+  for (let suffix = 2; usedIds.has(id); suffix += 1) id = `${base}-${suffix}`
+  usedIds.add(id)
+  return id
 }
 
 function normalizeWorkspacePath(path: string): string {

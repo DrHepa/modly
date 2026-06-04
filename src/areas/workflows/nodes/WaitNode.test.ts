@@ -206,3 +206,79 @@ test('replacement rejection reasons render clear bounded copy without leaking ra
     await cleanup()
   }
 })
+
+test('humanoid Wait review state surfaces manual_confirmed continue copy without implying UniRig trust parity', async () => {
+  const { module, cleanup } = await loadWaitNodeModule()
+
+  try {
+    const state = module.resolveWaitCheckpointUiState({
+      nodeId: 'wait-1',
+      activeNodeId: 'wait-1',
+      runState: {
+        status: 'paused',
+        blockIndex: 0,
+        blockTotal: 1,
+        blockProgress: 100,
+        blockStep: 'Paused — review humanoid handoff before Kimodo',
+        artifact: originalMesh,
+        substitutionPoint,
+      },
+      waitCheckpointReview: {
+        status: 'manual_confirmed',
+        headline: 'Manual humanoid promotion is ready for downstream Kimodo.',
+        diagnostics: ['Promotion remains manual_confirmed only — it does NOT upgrade the mesh to UniRig semantic trust.'],
+        meshWorkspacePath: 'models/original.glb',
+        canPromote: true,
+        canReview: true,
+        continueLabel: 'Continue manual-confirmed',
+        reviewHint: 'Promotion remains manual_confirmed only — it does NOT upgrade the mesh to UniRig semantic trust.',
+        downstreamHumanoidStatus: 'manual_confirmed',
+        promotionSidecarWorkspacePath: 'models/original.humanoid-promotion.v1.json',
+      },
+    })
+
+    assert.equal(state.normalContinueLabel, 'Continue manual-confirmed')
+    assert.equal(state.humanoidHeadline, 'Manual humanoid promotion is ready for downstream Kimodo.')
+    assert.match(state.humanoidReviewHint ?? '', /manual_confirmed only/i)
+    assert.match(state.humanoidDiagnostics.join('\n'), /does NOT upgrade the mesh to UniRig semantic trust/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('humanoid Wait review state keeps stale draft and promotion paths degraded', async () => {
+  const { module, cleanup } = await loadWaitNodeModule()
+
+  try {
+    const state = module.resolveWaitCheckpointUiState({
+      nodeId: 'wait-1',
+      activeNodeId: 'wait-1',
+      runState: {
+        status: 'paused',
+        blockIndex: 0,
+        blockTotal: 1,
+        blockProgress: 100,
+        blockStep: 'Paused — review humanoid handoff before Kimodo',
+        artifact: originalMesh,
+        substitutionPoint,
+      },
+      waitCheckpointReview: {
+        status: 'stale',
+        headline: 'Humanoid draft or promotion is stale; downstream Kimodo will stay degraded.',
+        diagnostics: ['mesh_output_sha256_mismatch', 'draft_sha256_mismatch'],
+        meshWorkspacePath: 'models/original.glb',
+        canPromote: false,
+        canReview: true,
+        continueLabel: 'Continue degraded',
+        reviewHint: 'Regenerate the draft or write a fresh promotion before expecting manual_confirmed downstream use.',
+      },
+    })
+
+    assert.equal(state.normalContinueLabel, 'Continue degraded')
+    assert.equal(state.humanoidHeadline, 'Humanoid draft or promotion is stale; downstream Kimodo will stay degraded.')
+    assert.match(state.humanoidDiagnostics.join('\n'), /mesh_output_sha256_mismatch/)
+    assert.match(state.humanoidReviewHint ?? '', /fresh promotion/i)
+  } finally {
+    await cleanup()
+  }
+})

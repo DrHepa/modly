@@ -2,7 +2,7 @@ import { useCallback } from 'react'
 import { Handle, Position } from '@xyflow/react'
 import type { ArtifactRef, WFNodeData } from '@shared/types/electron.d'
 import type { ArtifactReplacementReason } from '@shared/types/artifacts'
-import { useWorkflowRunStore, type WorkflowRunState } from '../workflowRunStore'
+import { useWorkflowRunStore, type WaitCheckpointReviewState, type WorkflowRunState } from '../workflowRunStore'
 import { resolveArtifactReplacement } from '../workflowArtifacts'
 import BaseNode from './BaseNode'
 
@@ -13,6 +13,7 @@ type WaitCheckpointUiStateInput = {
   activeNodeId: string | null
   runState: WorkflowRunState
   pendingReplacement?: ArtifactRef
+  waitCheckpointReview?: WaitCheckpointReviewState
 }
 
 type WaitCheckpointUiState = {
@@ -24,6 +25,9 @@ type WaitCheckpointUiState = {
   showSubstitutedContinue: boolean
   substitutedContinueLabel?: string
   rejectionCopy?: string
+  humanoidHeadline?: string
+  humanoidDiagnostics: string[]
+  humanoidReviewHint?: string
 }
 
 const REPLACEMENT_REASON_COPY: Record<ArtifactReplacementReason, string> = {
@@ -66,6 +70,7 @@ export function resolveWaitCheckpointUiState(input: WaitCheckpointUiStateInput):
       normalContinueLabel: 'Continue',
       showSubstitutedContinue: false,
       rejectionCopy: replacementReasonCopy(input.runState),
+      humanoidDiagnostics: [],
     }
   }
 
@@ -78,18 +83,24 @@ export function resolveWaitCheckpointUiState(input: WaitCheckpointUiStateInput):
       normalContinueLabel: 'Continue',
       showSubstitutedContinue: false,
       rejectionCopy: replacementReasonCopy(input.runState),
+      humanoidDiagnostics: [],
     }
   }
+
+  const humanoidReview = input.waitCheckpointReview
 
   return {
     isPaused,
     isCheckpoint: true,
     statusLabel: 'Temporary checkpoint',
     description: `Temporary checkpoint${artifactLabel ? `: ${artifactLabel}` : ''}. This preview is not the final output.`,
-    normalContinueLabel: 'Continue',
+    normalContinueLabel: humanoidReview?.continueLabel ?? 'Continue',
     showSubstitutedContinue,
     ...(showSubstitutedContinue ? { substitutedContinueLabel: 'Continue with replacement' } : {}),
     rejectionCopy: replacementReasonCopy(input.runState),
+    humanoidHeadline: humanoidReview?.headline,
+    humanoidDiagnostics: humanoidReview?.diagnostics ?? [],
+    humanoidReviewHint: humanoidReview?.reviewHint,
   }
 }
 
@@ -98,8 +109,9 @@ export default function WaitNode({ id, data, selected }: { id: string; data: WFN
   const activeNodeId          = useWorkflowRunStore((s) => s.activeNodeId)
   const continueRun           = useWorkflowRunStore((s) => s.continueRun)
   const getPendingReplacement = useWorkflowRunStore((s) => s.getPendingReplacement)
+  const waitCheckpointReview  = useWorkflowRunStore((s) => s.waitCheckpointReview)
   const pendingReplacement    = getPendingReplacement()
-  const checkpointUi          = resolveWaitCheckpointUiState({ nodeId: id, activeNodeId, runState, pendingReplacement })
+  const checkpointUi          = resolveWaitCheckpointUiState({ nodeId: id, activeNodeId, runState, pendingReplacement, waitCheckpointReview })
 
   const handleContinue = useCallback(() => {
     continueRun()
@@ -160,6 +172,21 @@ export default function WaitNode({ id, data, selected }: { id: string; data: WFN
         <p className="text-[10px] text-zinc-500 italic">
           {checkpointUi.description}
         </p>
+        {checkpointUi.humanoidHeadline && (
+          <p className="mt-1.5 text-[10px] font-medium text-cyan-200">
+            {checkpointUi.humanoidHeadline}
+          </p>
+        )}
+        {checkpointUi.humanoidReviewHint && (
+          <p className="mt-1 text-[10px] text-zinc-400">
+            {checkpointUi.humanoidReviewHint}
+          </p>
+        )}
+        {checkpointUi.humanoidDiagnostics.map((diagnostic) => (
+          <p key={diagnostic} className="mt-1 text-[10px] text-zinc-400">
+            {diagnostic}
+          </p>
+        ))}
         {checkpointUi.rejectionCopy && (
           <p className="mt-1.5 text-[10px] text-zinc-400">
             {checkpointUi.rejectionCopy}

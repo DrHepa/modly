@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict'
 import test, { afterEach, beforeEach } from 'node:test'
 import axios from 'axios'
-import type { ArtifactRef, Workflow, WFEdge, WFNode } from '../../shared/types/electron.d'
+import type {
+  ArtifactRef,
+  HumanoidDraftSidecarReadResult,
+  HumanoidDraftSidecarV1,
+  HumanoidPromotionSidecarReadResult,
+  HumanoidPromotionSidecarV1,
+  RigMetaSidecarReadResult,
+  Workflow,
+  WFEdge,
+  WFNode,
 import { REQUIRED_LANDMARK_IDS, type LandmarkCaptureState, type LandmarkId, type LandmarkPoint, type LandmarkSidecarV1 } from './landmarks.ts'
 import { createLandmarkPointIntent, deriveLandmarkMarkers } from '../generate/components/viewerLandmarkPicking.ts'
 import type { WorkflowExtension } from './mockExtensions'
@@ -48,6 +57,18 @@ type LandmarkSidecarWriteCall = {
   sidecar: LandmarkSidecarV1
 }
 
+type HumanoidDraftReadCall = {
+  meshWorkspacePath: string
+}
+
+type HumanoidPromotionReadCall = {
+  meshWorkspacePath: string
+}
+
+type RigMetaReadCall = {
+  sourceWorkspacePath: string
+}
+
 const originalAxiosCreate = axios.create
 const originalSetTimeout = globalThis.setTimeout
 
@@ -55,6 +76,52 @@ let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
 let fsReadCalls: string[]
 let landmarkSidecarWriteCalls: LandmarkSidecarWriteCall[]
+let humanoidDraftReadCalls: HumanoidDraftReadCall[]
+let humanoidPromotionReadCalls: HumanoidPromotionReadCall[]
+let rigMetaReadCalls: RigMetaReadCall[]
+let humanoidDraftReadResult: HumanoidDraftSidecarReadResult
+let humanoidPromotionReadResult: HumanoidPromotionSidecarReadResult
+let rigMetaReadResult: RigMetaSidecarReadResult
+
+const humanoidDraftSidecar = Object.freeze({
+  schema: 'modly.humanoid-draft.v1',
+  version: 1,
+  source: { workspacePath: 'Workflows/generated/avatar-source.glb' },
+  output: { workspacePath: 'Workflows/generated/avatar.glb' },
+  meshOutputSha256: 'mesh-sha-1',
+  rigmetaSha256: 'rigmeta-sha-1',
+  draftSha256: 'draft-sha-1',
+  trust: { status: 'draft', reasons: ['semantic_trust_failed'], trusted: false },
+  provenance: { producer: 'unirig', runId: 'run-1', extensionId: 'unirig', createdAt: '2026-05-22T20:00:00.000Z' },
+  assignments: {
+    roles: { hips: { boneId: 'bone:hips', label: 'Hips', confidence: 0.88 } },
+    chains: { spine: ['bone:hips', 'bone:spine'] },
+  },
+  confidence: { overall: 0.74 },
+  completeness: { requiredRolesMissing: ['head'], score: 0.81 },
+  diagnostics: ['Manual review required before Kimodo handoff.'],
+} satisfies HumanoidDraftSidecarV1)
+
+const humanoidPromotionSidecar = Object.freeze({
+  schema: 'modly.humanoid-promotion.v1',
+  version: 1,
+  promotionId: 'promotion-1',
+  source: { workspacePath: 'Workflows/generated/avatar-source.glb' },
+  output: { workspacePath: 'Workflows/generated/avatar.glb' },
+  meshOutputSha256: 'mesh-sha-1',
+  rigmetaSha256: 'rigmeta-sha-1',
+  draftSha256: 'draft-sha-1',
+  draftSchema: 'modly.humanoid-draft.v1',
+  promotedAssignments: structuredClone(humanoidDraftSidecar.assignments),
+  provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+  audit: {
+    confirmedBy: 'modly:user:local:tester',
+    confirmedByLabel: 'Local Tester',
+    createdAt: '2026-05-22T20:10:00.000Z',
+    method: 'viewer3d',
+    rationale: 'Reviewed the draft manually for downstream manual_confirmed eligibility.',
+  },
+} satisfies HumanoidPromotionSidecarV1)
 
 beforeEach(() => {
   axiosClientMock = {
@@ -68,7 +135,24 @@ beforeEach(() => {
   runProcessCalls = []
   fsReadCalls = []
   landmarkSidecarWriteCalls = []
-
+  humanoidDraftReadCalls = []
+  humanoidPromotionReadCalls = []
+  rigMetaReadCalls = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'not-found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+  }
+  humanoidPromotionReadResult = {
+    success: true,
+    status: 'not-found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+  }
+  rigMetaReadResult = {
+    success: true,
+    status: 'not-found',
+    rigMetaWorkspacePath: 'Workflows/generated/avatar.rigmeta.json',
+  }
   axios.create = (() => axiosClientMock) as typeof axios.create
 
   useWorkflowRunStore.getState().reset()
@@ -93,6 +177,18 @@ beforeEach(() => {
       },
       workspace: {
         artifacts: {
+          readRigMetaSidecar: async (request: RigMetaReadCall) => {
+            rigMetaReadCalls.push(request)
+            return rigMetaReadResult
+          },
+          readHumanoidDraftSidecar: async (request: HumanoidDraftReadCall) => {
+            humanoidDraftReadCalls.push(request)
+            return humanoidDraftReadResult
+          },
+          readHumanoidPromotionSidecar: async (request: HumanoidPromotionReadCall) => {
+            humanoidPromotionReadCalls.push(request)
+            return humanoidPromotionReadResult
+          },
           writeLandmarkSidecar: async (request: LandmarkSidecarWriteCall) => {
             landmarkSidecarWriteCalls.push(request)
             return {
@@ -311,6 +407,48 @@ function createWaitExtension(overrides: Partial<WorkflowExtension> = {}): Workfl
   })
 }
 
+function createKimodoAnimateExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  return createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    name: 'Animate Rigged Mesh',
+    type: 'model',
+    input: 'text',
+    output: 'mesh',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: 'Walk forward' }],
+    ...overrides,
+  })
+}
+
+function createKimodoWaitWorkflow(args: { id: string; meshFilePath?: string } ): Workflow {
+  const kimodoExt = createKimodoAnimateExtension()
+  return {
+    id: args.id,
+    name: 'Wait Before Kimodo',
+    description: '',
+    nodes: [
+      createNode('text-source', 'textNode', { enabled: true, params: { text: 'Walk forward' } }),
+      createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/Workflows/generated/avatar.glb' } }),
+      createNode('wait-node', 'waitNode', { extensionId: 'workflow/wait', enabled: true, params: {} }),
+      createNode('kimodo-node', 'extensionNode', { extensionId: kimodoExt.id, enabled: true, params: {} }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-text-kimodo', source: 'text-source', target: 'kimodo-node', targetHandle: 'prompt' },
+      { id: 'edge-mesh-wait', source: 'mesh-source', target: 'wait-node' },
+      { id: 'edge-wait-kimodo', source: 'wait-node', target: 'kimodo-node', targetHandle: 'rigged_mesh' },
+      { id: 'edge-kimodo-output', source: 'kimodo-node', target: 'output-node' },
+    ],
+    createdAt: '2026-05-22T00:00:00.000Z',
+    updatedAt: '2026-05-22T00:00:00.000Z',
+  }
+}
+
 function createLandmarksWorkflow(args: {
   id?: string
   sourceFilePath?: string
@@ -439,12 +577,24 @@ type WorkflowRunCheckpointApi = {
   pendingReplacement?: ArtifactRef
 }
 
+type WaitCheckpointReviewSnapshot = {
+  status: 'manual_confirmed' | 'draft_only' | 'stale' | 'diagnostics_only'
+  headline: string
+  diagnostics: string[]
+  downstreamHumanoidStatus?: 'manual_confirmed'
+  promotionSidecarWorkspacePath?: string
+}
+
 function checkpointApi(): WorkflowRunCheckpointApi {
   const state = useWorkflowRunStore.getState() as unknown as Partial<WorkflowRunCheckpointApi>
   assert.equal(typeof state.continueRun, 'function')
   assert.equal(typeof state.setPendingReplacement, 'function', 'workflowRunStore must expose pending replacement helper')
   assert.equal(typeof state.getPendingReplacement, 'function', 'workflowRunStore must expose pending replacement inspection helper')
   return state as WorkflowRunCheckpointApi
+}
+
+function waitCheckpointReviewState(): WaitCheckpointReviewSnapshot | undefined {
+  return (useWorkflowRunStore.getState() as unknown as { waitCheckpointReview?: WaitCheckpointReviewSnapshot }).waitCheckpointReview
 }
 
 async function waitForPause(): Promise<void> {
@@ -1935,6 +2085,202 @@ test('workflowRunStore completes node to pick to write to continue and exposes s
     }).map((row) => row.kind),
     ['checkpoint-original', 'landmark-sidecar'],
   )
+})
+
+test('workflowRunStore surfaces draft-only humanoid wait review state before Kimodo without inventing trust', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-draft-only' })
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension(), kimodoExt])
+  await waitForPause()
+
+  try {
+    const review = waitCheckpointReviewState()
+    assert.deepEqual(rigMetaReadCalls, [{ sourceWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.deepEqual(humanoidDraftReadCalls, [{ meshWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.deepEqual(humanoidPromotionReadCalls, [{ meshWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.equal(review?.status, 'draft_only')
+    assert.match(review?.headline ?? '', /manual review/i)
+    assert.match((review?.diagnostics ?? []).join('\n'), /manual review required/i)
+    assert.equal(review?.downstreamHumanoidStatus, undefined)
+  } finally {
+    useWorkflowRunStore.getState().cancel()
+    await runPromise
+  }
+})
+test('workflowRunStore continues Wait before Kimodo fail-closed when only a humanoid draft exists', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-fail-closed' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-kimodo-draft-only' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-draft-only.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension(), kimodoExt])
+  await waitForPause()
+
+  useWorkflowRunStore.getState().continueRun()
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: kimodoExt.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      rigged_mesh_path: 'Workflows/generated/avatar.glb',
+      mesh_path: 'Workflows/generated/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: kimodoExt.id,
+    },
+  })
+})
+test('workflowRunStore forwards only manual_confirmed humanoid promotion references downstream after Wait', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-promoted' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+  humanoidPromotionReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    sidecar: structuredClone(humanoidPromotionSidecar),
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-kimodo-promoted' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-promoted.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension(), kimodoExt])
+  await waitForPause()
+
+  assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed')
+
+  useWorkflowRunStore.getState().continueRun()
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: kimodoExt.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      rigged_mesh_path: 'Workflows/generated/avatar.glb',
+      mesh_path: 'Workflows/generated/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: kimodoExt.id,
+      humanoid_input_status: 'manual_confirmed',
+      humanoid_promotion_sidecar_path: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    },
+  })
+})
+test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo and does not forward it', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-stale' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'stale',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+    staleReasons: ['mesh_output_sha256_mismatch'],
+  }
+  humanoidPromotionReadResult = {
+    success: true,
+    status: 'stale',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    sidecar: structuredClone(humanoidPromotionSidecar),
+    staleReasons: ['draft_sha256_mismatch'],
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: data as Record<string, unknown> })
+        return { data: { job_id: 'job-kimodo-stale' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-stale.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension(), kimodoExt])
+  await waitForPause()
+
+  const review = waitCheckpointReviewState()
+  assert.equal(review?.status, 'stale')
+  assert.match(review?.headline ?? '', /stale/i)
+  assert.match((review?.diagnostics ?? []).join('\n'), /mesh_output_sha256_mismatch|draft_sha256_mismatch/)
+
+  useWorkflowRunStore.getState().continueRun()
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data.params, {
+    rigged_mesh_path: 'Workflows/generated/avatar.glb',
+    mesh_path: 'Workflows/generated/avatar.glb',
+    node_id: 'animate-rigged-mesh',
+    model_id: kimodoExt.id,
+  })
 })
 
 test('workflowRunStore injects landmarks_sidecar_path into Rig Mesh params with the original mesh path', async () => {

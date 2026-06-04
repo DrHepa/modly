@@ -2,7 +2,16 @@ import { create } from 'zustand'
 import axios from 'axios'
 import { useAppStore } from '../../shared/stores/appStore.ts'
 import type { WorkflowExtension } from './mockExtensions.ts'
-import type { ArtifactLineage, ArtifactRef, ArtifactSubstitutionPoint, Workflow, WFNode, WFEdge } from '../../shared/types/electron.d'
+import type {
+  ArtifactLineage,
+  ArtifactRef,
+  ArtifactSubstitutionPoint,
+  HumanoidDraftSidecarReadResult,
+  HumanoidPromotionSidecarReadResult,
+  RigMetaSidecarReadResult,
+  Workflow,
+  WFNode,
+  WFEdge,
 import type { ArtifactReplacementResult, WorkflowContinueOptions } from '../../shared/types/artifacts.ts'
 import { buildProcessExecutionInput } from './processExecution.ts'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
@@ -66,6 +75,26 @@ type WorkflowLandmarkSession = LandmarkCaptureState & {
   captureId: string
   captureRevision: number
   sidecarStatus: LandmarkSidecarStatus
+}
+
+export type WaitCheckpointHumanoidStatus = 'manual_confirmed' | 'draft_only' | 'stale' | 'diagnostics_only'
+
+export interface WaitCheckpointReviewState {
+  status: WaitCheckpointHumanoidStatus
+  headline: string
+  diagnostics: string[]
+  meshWorkspacePath: string
+  canPromote: boolean
+  canReview: boolean
+  continueLabel: string
+  reviewHint?: string
+  downstreamHumanoidStatus?: 'manual_confirmed'
+  promotionSidecarWorkspacePath?: string
+}
+
+type WaitCheckpointHumanoidTarget = {
+  consumerNodeId: string
+  consumerExtensionId: string
 }
 
 function flushResume(): boolean {
@@ -180,6 +209,177 @@ function normalizeWorkspaceRelativeMeshPath(filePath: string, workspaceDir: stri
   const segments = relativePath.split('/')
   if (segments.length === 0 || segments.some((segment) => segment === '' || segment === '..')) return undefined
   return segments.join('/')
+}
+
+function isHumanoidDraftStale(result: HumanoidDraftSidecarReadResult | undefined): result is Extract<HumanoidDraftSidecarReadResult, { status: 'stale' }> {
+  return result?.success === true && result.status === 'stale'
+}
+
+function isHumanoidDraftFound(result: HumanoidDraftSidecarReadResult | undefined): result is Extract<HumanoidDraftSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function isHumanoidPromotionStale(result: HumanoidPromotionSidecarReadResult | undefined): result is Extract<HumanoidPromotionSidecarReadResult, { status: 'stale' }> {
+  return result?.success === true && result.status === 'stale'
+}
+
+function isHumanoidPromotionFound(result: HumanoidPromotionSidecarReadResult | undefined): result is Extract<HumanoidPromotionSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function isRigMetaFound(result: RigMetaSidecarReadResult | undefined): result is Extract<RigMetaSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function collectWaitCheckpointHumanoidDiagnostics(args: {
+  rigMetaResult?: RigMetaSidecarReadResult
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): string[] {
+  const diagnostics: string[] = []
+
+  if (isRigMetaFound(args.rigMetaResult)) diagnostics.push(...args.rigMetaResult.warnings)
+  if (args.rigMetaResult?.success === false && args.rigMetaResult.status === 'invalid') diagnostics.push(args.rigMetaResult.message)
+
+  if (isHumanoidDraftFound(args.draftResult)) diagnostics.push(...args.draftResult.sidecar.diagnostics)
+  if (isHumanoidDraftStale(args.draftResult)) diagnostics.push(...args.draftResult.staleReasons)
+  if (args.draftResult?.success === false) diagnostics.push(args.draftResult.error)
+
+  if (isHumanoidPromotionStale(args.promotionResult)) diagnostics.push(...args.promotionResult.staleReasons)
+  if (args.promotionResult?.success === false) diagnostics.push(args.promotionResult.error)
+
+  return [...new Set(diagnostics.filter((value) => value.trim().length > 0))]
+}
+
+function resolveWaitCheckpointHumanoidReview(args: {
+  meshWorkspacePath: string
+  rigMetaResult?: RigMetaSidecarReadResult
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): WaitCheckpointReviewState {
+  const diagnostics = collectWaitCheckpointHumanoidDiagnostics(args)
+
+  if (isHumanoidPromotionFound(args.promotionResult)) {
+    return {
+      status: 'manual_confirmed',
+      headline: 'Manual humanoid promotion is ready for downstream Kimodo.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: Boolean(isHumanoidDraftFound(args.draftResult)),
+      canReview: true,
+      continueLabel: 'Continue manual-confirmed',
+      reviewHint: 'Promotion remains manual_confirmed only — it does NOT upgrade the mesh to UniRig semantic trust.',
+      downstreamHumanoidStatus: 'manual_confirmed',
+      promotionSidecarWorkspacePath: args.promotionResult.sidecarWorkspacePath,
+    }
+  }
+
+  if (isHumanoidDraftStale(args.draftResult) || isHumanoidPromotionStale(args.promotionResult)) {
+    return {
+      status: 'stale',
+      headline: 'Humanoid draft or promotion is stale; downstream Kimodo will stay degraded.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: false,
+      canReview: true,
+      continueLabel: 'Continue degraded',
+      reviewHint: 'Regenerate the draft or write a fresh promotion before expecting manual_confirmed downstream use.',
+    }
+  }
+
+  if (isHumanoidDraftFound(args.draftResult)) {
+    return {
+      status: 'draft_only',
+      headline: 'Draft humanoid proposal requires manual review before manual-confirmed Kimodo handoff.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: true,
+      canReview: true,
+      continueLabel: 'Continue degraded',
+      reviewHint: 'Review the checkpoint preview in Viewer3D and write a manual promotion if the mapping is safe enough.',
+    }
+  }
+
+  return {
+    status: 'diagnostics_only',
+    headline: 'No promotable humanoid mapping is available for downstream Kimodo.',
+    diagnostics,
+    meshWorkspacePath: args.meshWorkspacePath,
+    canPromote: false,
+    canReview: false,
+    continueLabel: 'Continue degraded',
+    reviewHint: 'Continuing will not send a manual_confirmed humanoid input downstream.',
+  }
+}
+
+function isKimodoHumanoidConsumer(ext: WorkflowExtension, targetHandle?: string): boolean {
+  const identity = [ext.id, ext.extensionId, ext.nodeId, ext.name]
+    .map((value) => value.toLowerCase())
+  const hasKimodoMarker = identity.some((value) => value.includes('kimodo') || value.includes('animate-rigged-mesh'))
+  if (!hasKimodoMarker) return false
+
+  const meshInputs = ext.inputs?.filter((port) => port.type === 'mesh') ?? []
+  return meshInputs.some((port) => port.name === 'rigged_mesh' && (targetHandle === port.name || meshInputs.length === 1))
+}
+
+function resolveWaitCheckpointHumanoidTarget(args: {
+  nodeId: string
+  edges: WFEdge[]
+  nodes: WFNode[]
+  allExtensions: WorkflowExtension[]
+}): WaitCheckpointHumanoidTarget | undefined {
+  for (const edge of args.edges) {
+    if (edge.source !== args.nodeId) continue
+    const targetNode = args.nodes.find((candidate) => candidate.id === edge.target)
+    if (!targetNode || targetNode.type !== 'extensionNode') continue
+    const extensionId = typeof targetNode.data.extensionId === 'string' ? targetNode.data.extensionId : ''
+    const ext = args.allExtensions.find((candidate) => candidate.id === extensionId)
+    if (!ext || !isKimodoHumanoidConsumer(ext, edge.targetHandle ?? undefined)) continue
+    return { consumerNodeId: targetNode.id, consumerExtensionId: ext.id }
+  }
+  return undefined
+}
+
+async function readWaitCheckpointHumanoidReview(args: {
+  meshWorkspacePath: string
+}): Promise<WaitCheckpointReviewState> {
+  const rigMetaReader = window.electron.workspace.artifacts.readRigMetaSidecar
+  const draftReader = window.electron.workspace.artifacts.readHumanoidDraftSidecar
+  const promotionReader = window.electron.workspace.artifacts.readHumanoidPromotionSidecar
+
+  const [rigMetaResult, draftResult, promotionResult] = await Promise.all([
+    rigMetaReader({ sourceWorkspacePath: args.meshWorkspacePath }),
+    draftReader({ meshWorkspacePath: args.meshWorkspacePath }),
+    promotionReader({ meshWorkspacePath: args.meshWorkspacePath }),
+  ])
+
+  return resolveWaitCheckpointHumanoidReview({
+    meshWorkspacePath: args.meshWorkspacePath,
+    rigMetaResult,
+    draftResult,
+    promotionResult,
+  })
+}
+
+function resolveIncomingWaitHumanoidParams(args: {
+  ext: WorkflowExtension
+  incomingEdges: WFEdge[]
+  waitCheckpointReviews: Map<string, WaitCheckpointReviewState>
+}): Record<string, string> {
+  if (!isKimodoHumanoidConsumer(args.ext)) return {}
+
+  for (const edge of args.incomingEdges) {
+    const review = args.waitCheckpointReviews.get(edge.source)
+    if (!review?.downstreamHumanoidStatus) continue
+    return {
+      humanoid_input_status: review.downstreamHumanoidStatus,
+      ...(review.downstreamHumanoidStatus === 'manual_confirmed' && review.promotionSidecarWorkspacePath
+        ? { humanoid_promotion_sidecar_path: review.promotionSidecarWorkspacePath }
+        : {}),
+    }
+  }
+
+  return {}
 }
 
 function isLandmarkSidecarConsumer(ext: WorkflowExtension): boolean {
@@ -848,6 +1048,8 @@ export interface WorkflowRunStore {
   landmarkSidecars: Record<string, LandmarkSidecarLineageMetadata>
   /** Active guided landmarks capture session for a paused landmarksNode. */
   landmarkSession?: WorkflowLandmarkSession
+  /** Active Wait-before-Kimodo humanoid review state, when applicable. */
+  waitCheckpointReview?: WaitCheckpointReviewState
 
   run:         (workflow: Workflow, allExtensions: WorkflowExtension[], overrideImageData?: string) => Promise<void>
   cancel:      () => void
@@ -870,6 +1072,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
   artifactLineages: {},
   landmarkSidecars: {},
   landmarkSession: undefined,
+  waitCheckpointReview: undefined,
 
   async run(workflow, allExtensions, overrideImageData?) {
     _cancel.current = false
@@ -894,6 +1097,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       artifactLineages: {},
       landmarkSidecars: {},
       landmarkSession: undefined,
+      waitCheckpointReview: undefined,
       runState: { status: 'running', blockIndex: 0, blockTotal: execNodes.length, blockProgress: 0, blockStep: 'Starting…' },
     })
 
@@ -920,6 +1124,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       const artifactLineages = new Map<string, ArtifactLineage>()
       const nodeLandmarkSidecars = new Map<string, string>()
       const landmarkSidecarMetadata = new Map<string, LandmarkSidecarLineageMetadata>()
+      const waitCheckpointHumanoidReviews = new Map<string, WaitCheckpointReviewState>()
       const outputNodeIds = new Set(ordered.filter((n) => n.type === 'outputNode').map((n) => n.id))
 
       const rememberArtifactOutput = (nodeId: string, output: LegacyWorkflowOutput): ArtifactRef | undefined => {
@@ -1092,6 +1297,30 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           const landmarkSession = isLandmarksCheckpoint && inputArtifact?.kind === 'mesh'
             ? createLandmarkSession({ workflowId: workflow.id, nodeId: node.id, targetArtifact: inputArtifact })
             : undefined
+          const humanoidTarget = !isLandmarksCheckpoint && inputArtifact?.kind === 'mesh'
+            ? resolveWaitCheckpointHumanoidTarget({ nodeId: node.id, edges: workflow.edges, nodes: workflow.nodes, allExtensions })
+            : undefined
+
+          let waitCheckpointReview: WaitCheckpointReviewState | undefined
+          if (humanoidTarget && inputArtifact?.kind === 'mesh') {
+            const meshPath = resolveMeshPathForArtifact(inputArtifact)
+            const meshWorkspacePath = meshPath
+              ? normalizeWorkspaceRelativeMeshPath(meshPath, workspaceDir)
+              : undefined
+
+            waitCheckpointReview = meshWorkspacePath
+              ? await readWaitCheckpointHumanoidReview({ meshWorkspacePath })
+              : {
+                  status: 'diagnostics_only',
+                  headline: 'No promotable humanoid mapping is available for downstream Kimodo.',
+                  diagnostics: meshPath ? [`Wait checkpoint mesh is outside the workspace: ${meshPath}`] : ['Wait checkpoint mesh path is unavailable for humanoid review.'],
+                  meshWorkspacePath: '',
+                  canPromote: false,
+                  canReview: false,
+                  continueLabel: 'Continue degraded',
+                  reviewHint: 'Continuing will not send a manual_confirmed humanoid input downstream.',
+                }
+          }
 
           if (isLandmarksCheckpoint && !landmarkSession) {
             throw new Error('Landmarks node requires a mesh checkpoint input')
@@ -1101,19 +1330,24 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             runState: {
               ...s.runState,
               status: 'paused',
-              blockStep: isLandmarksCheckpoint ? 'Paused — mark required landmarks' : 'Paused — click Continue',
+              blockStep: isLandmarksCheckpoint
+                ? 'Paused — mark required landmarks'
+                : waitCheckpointReview
+                  ? 'Paused — review humanoid handoff before Kimodo'
+                  : 'Paused — click Continue',
               artifact: inputArtifact,
               substitutionPoint,
               replacementResult: undefined,
               error: undefined,
             },
             landmarkSession,
+            waitCheckpointReview,
           }))
           publishWaitCheckpointPreview({ artifact: inputArtifact, workspaceDir })
           let landmarkSidecarPath: string | undefined
           while (true) {
             await new Promise<void>((resolve) => { _resume.current = resolve })
-            if (_cancel.current) { set({ runState: IDLE, activeNodeId: null, landmarkSession: undefined, landmarkSidecars: {} }); return }
+            if (_cancel.current) { set({ runState: IDLE, activeNodeId: null, landmarkSession: undefined, landmarkSidecars: {}, waitCheckpointReview: undefined }); return }
 
             const activeLandmarkSession = useWorkflowRunStore.getState().landmarkSession
             if (!isLandmarksCheckpoint || !activeLandmarkSession) break
@@ -1143,6 +1377,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             text:       nodeInputText,
             outputType: incomingEdges[0] ? nodeOutputs.get(incomingEdges[0].source)?.outputType : undefined,
           }
+          const activeWaitCheckpointReview = useWorkflowRunStore.getState().waitCheckpointReview
           const replacement = _resumeOptions.current?.replacementArtifact ?? _pendingReplacement.current
           _resumeOptions.current = undefined
           _pendingReplacement.current = undefined
@@ -1174,6 +1409,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             nodeLandmarkSidecars.set(node.id, landmarkSidecarPath)
             set({ landmarkSidecars: Object.fromEntries(landmarkSidecarMetadata) })
           }
+          if (activeWaitCheckpointReview?.downstreamHumanoidStatus) {
+            waitCheckpointHumanoidReviews.set(node.id, activeWaitCheckpointReview)
+          } else {
+            waitCheckpointHumanoidReviews.delete(node.id)
+          }
           set((s) => ({
             runState: {
               ...s.runState,
@@ -1184,6 +1424,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             },
             pendingReplacement: undefined,
             landmarkSession: undefined,
+            waitCheckpointReview: undefined,
           }))
           continue
         }
@@ -1210,6 +1451,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const incomingLandmarkSidecarPath = resolveIncomingLandmarkSidecarPath({
           incomingEdges,
           landmarkSidecars: nodeLandmarkSidecars,
+        })
+        const incomingWaitHumanoidParams = resolveIncomingWaitHumanoidParams({
+          ext,
+          incomingEdges,
+          waitCheckpointReviews: waitCheckpointHumanoidReviews,
         })
 
         if (ext?.inputs && ext.inputs.length > 1) {
@@ -1269,6 +1515,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             routedMeshParams.landmarks_sidecar_path = incomingLandmarkSidecarPath
           }
         }
+        Object.assign(routedMeshParams, incomingWaitHumanoidParams)
 
         set((s) => ({
           activeNodeId: node.id,
@@ -1440,6 +1687,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         activeNodeId:     null,
         nodeImageOutputs: imageOutputs,
         landmarkSession:  undefined,
+        waitCheckpointReview: undefined,
         runState: {
           status:        'done',
           blockIndex:    execNodes.length > 0 ? execNodes.length - 1 : 0,
@@ -1458,7 +1706,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       if (!_cancel.current) {
         clearPendingCheckpointState()
         clearCurrentJobCheckpointMetadata()
-        set((s) => ({ runState: { ...s.runState, status: 'error', substitutionPoint: undefined, error: String(err) }, activeNodeId: null, pendingReplacement: undefined, landmarkSession: undefined, landmarkSidecars: {} }))
+        set((s) => ({ runState: { ...s.runState, status: 'error', substitutionPoint: undefined, error: String(err) }, activeNodeId: null, pendingReplacement: undefined, landmarkSession: undefined, landmarkSidecars: {}, waitCheckpointReview: undefined }))
         useAppStore.getState().updateCurrentJob({ status: 'error', error: String(err) })
       }
     },
@@ -1473,13 +1721,13 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       _activeJobId.current = null
     }
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
   },
 
   reset() {
     clearPendingCheckpointState()
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
   },
 
   continueRun(options) {

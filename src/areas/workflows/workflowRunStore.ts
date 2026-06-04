@@ -8,7 +8,7 @@ import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import type { WorkflowExtension } from './mockExtensions'
-import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import type { Workflow, WFNode, WFEdge, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadResult, RigMetaSidecarReadResult } from '@shared/types/electron.d'
 import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
 import { assignSlotFilePaths } from './slotInputs'
 import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
@@ -31,7 +31,23 @@ export interface WorkflowLandmarkSession extends Omit<LandmarkCaptureState, 'sid
   sidecarStatus: 'not_started' | 'pending-write' | 'ready' | 'error'
 }
 
+export type WaitCheckpointHumanoidStatus = 'manual_confirmed' | 'draft_only' | 'stale' | 'diagnostics_only'
+
+export interface WaitCheckpointReviewState {
+  status: WaitCheckpointHumanoidStatus
+  headline: string
+  diagnostics: string[]
+  meshWorkspacePath: string
+  canPromote: boolean
+  canReview: boolean
+  continueLabel: string
+  reviewHint?: string
+  downstreamHumanoidStatus?: 'manual_confirmed'
+  promotionSidecarWorkspacePath?: string
+}
+
 export interface WorkflowCheckpoint {
+  humanoidReview?: { owner: CheckpointOwner; state: WaitCheckpointReviewState }
   owner: CheckpointOwner
   input?: NodeOutput
   substitutionPoint?: ArtifactSubstitutionPoint
@@ -179,6 +195,7 @@ interface RunContext {
   nodeArtifacts: Map<string, ArtifactRef>
   outputRevisions: Map<string, number>
   checkpointRevision: number
+  reviewRequests: Map<string, symbol>
   workflow:           Workflow
   allExtensions:      WorkflowExtension[]
   client:             AxiosInstance
@@ -269,6 +286,207 @@ function runtimeCheckpointOutput(output: NodeOutput, workspaceDir: string): Node
     filePath = `${workspaceDir.replace(/\/+$/, '')}/${filePath}`
   }
   return { ...output, filePath }
+}
+
+function isHumanoidDraftStale(result: HumanoidDraftSidecarReadResult | undefined): result is Extract<HumanoidDraftSidecarReadResult, { status: 'stale' }> {
+  return result?.success === true && result.status === 'stale'
+}
+
+function isHumanoidDraftFound(result: HumanoidDraftSidecarReadResult | undefined): result is Extract<HumanoidDraftSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function isHumanoidPromotionStale(result: HumanoidPromotionSidecarReadResult | undefined): result is Extract<HumanoidPromotionSidecarReadResult, { status: 'stale' }> {
+  return result?.success === true && result.status === 'stale'
+}
+
+function isHumanoidPromotionFound(result: HumanoidPromotionSidecarReadResult | undefined): result is Extract<HumanoidPromotionSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function isRigMetaFound(result: RigMetaSidecarReadResult | undefined): result is Extract<RigMetaSidecarReadResult, { status: 'found' }> {
+  return result?.success === true && result.status === 'found'
+}
+
+function collectWaitCheckpointHumanoidDiagnostics(args: {
+  rigMetaResult?: RigMetaSidecarReadResult
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): string[] {
+  const diagnostics: string[] = []
+
+  if (isRigMetaFound(args.rigMetaResult)) diagnostics.push(...args.rigMetaResult.warnings)
+  if (args.rigMetaResult?.success === false && args.rigMetaResult.status === 'invalid') diagnostics.push(args.rigMetaResult.message)
+
+  if (isHumanoidDraftFound(args.draftResult)) diagnostics.push(...args.draftResult.sidecar.diagnostics)
+  if (isHumanoidDraftStale(args.draftResult)) diagnostics.push(...args.draftResult.staleReasons)
+  if (args.draftResult?.success === false) diagnostics.push(args.draftResult.error)
+
+  if (isHumanoidPromotionStale(args.promotionResult)) diagnostics.push(...args.promotionResult.staleReasons)
+  if (args.promotionResult?.success === false) diagnostics.push(args.promotionResult.error)
+
+  return [...new Set(diagnostics.filter((value) => value.trim().length > 0))]
+}
+
+function resolveWaitCheckpointHumanoidReview(args: {
+  meshWorkspacePath: string
+  rigMetaResult?: RigMetaSidecarReadResult
+  draftResult?: HumanoidDraftSidecarReadResult
+  promotionResult?: HumanoidPromotionSidecarReadResult
+}): WaitCheckpointReviewState {
+  const diagnostics = collectWaitCheckpointHumanoidDiagnostics(args)
+
+  if (isHumanoidPromotionFound(args.promotionResult)) {
+    return {
+      status: 'manual_confirmed',
+      headline: 'Manual humanoid promotion is ready for downstream Kimodo.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: Boolean(isHumanoidDraftFound(args.draftResult)),
+      canReview: true,
+      continueLabel: 'Continue manual-confirmed',
+      reviewHint: 'Promotion remains manual_confirmed only — it does NOT upgrade the mesh to UniRig semantic trust.',
+      downstreamHumanoidStatus: 'manual_confirmed',
+      promotionSidecarWorkspacePath: args.promotionResult.sidecarWorkspacePath,
+    }
+  }
+
+  if (isHumanoidDraftStale(args.draftResult) || isHumanoidPromotionStale(args.promotionResult)) {
+    return {
+      status: 'stale',
+      headline: 'Humanoid draft or promotion is stale; downstream Kimodo will stay degraded.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: false,
+      canReview: true,
+      continueLabel: 'Continue degraded',
+      reviewHint: 'Regenerate the draft or write a fresh promotion before expecting manual_confirmed downstream use.',
+    }
+  }
+
+  if (isHumanoidDraftFound(args.draftResult)) {
+    return {
+      status: 'draft_only',
+      headline: 'Draft humanoid proposal requires manual review before manual-confirmed Kimodo handoff.',
+      diagnostics,
+      meshWorkspacePath: args.meshWorkspacePath,
+      canPromote: true,
+      canReview: true,
+      continueLabel: 'Continue degraded',
+      reviewHint: 'Review the checkpoint preview in Viewer3D and write a manual promotion if the mapping is safe enough.',
+    }
+  }
+
+  return {
+    status: 'diagnostics_only',
+    headline: 'No promotable humanoid mapping is available for downstream Kimodo.',
+    diagnostics,
+    meshWorkspacePath: args.meshWorkspacePath,
+    canPromote: false,
+    canReview: false,
+    continueLabel: 'Continue degraded',
+    reviewHint: 'Continuing will not send a manual_confirmed humanoid input downstream.',
+  }
+}
+
+// Only the resolved capability and its declared consumed port own this adapter.
+// Display names and the legacy positional dialect are not semantic authority.
+function isHumanoidConsumer(ext: WorkflowExtension): boolean {
+  return ext.extensionId === 'kimodo-soma-rp' && ext.nodeId === 'animate-rigged-mesh'
+    && (ext.type === 'process' || ext.input === 'text') && hasNamedProcessInputs(ext.inputs)
+    && ext.inputs.some((port) => port.name === 'rigged_mesh' && port.type === 'mesh')
+}
+
+function checkpointFeedsHumanoid(ctx: RunContext, waitId: string): boolean {
+  return ctx.workflow.nodes.some((node) => {
+    if (node.type !== 'extensionNode' || !node.data.enabled) return false
+    const ext = ctx.allExtensions.find((candidate) => candidate.id === node.data.extensionId)
+    if (!ext || !isHumanoidConsumer(ext)) return false
+    if (ext.type === 'process') {
+      const input = buildProcessExecutionInput({ node, nodes: ctx.workflow.nodes, edges: ctx.workflow.edges,
+        allExtensions: ctx.allExtensions, nodeOutputs: ctx.nodeOutputs }).inputs?.rigged_mesh
+      return input?.type === 'mesh' && input.sourceNodeId === waitId && !!input.filePath
+    }
+    let source: string | undefined
+    for (const edge of ctx.workflow.edges) {
+      if (edge.target !== node.id || edge.targetHandle !== 'rigged_mesh') continue
+      const id = resolveDataSource(edge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
+      const output = id ? ctx.nodeOutputs.get(id) : undefined
+      if (output?.outputType === 'mesh' && output.filePath?.trim()) source = id
+    }
+    return source === waitId
+  })
+}
+
+function humanoidWorkspacePath(filePath: string | undefined, workspaceDir: string): string | undefined {
+  if (!filePath) return undefined
+  const relative = normalizeWorkflowPath(filePath, workspaceDir).replace(/^\/workspace\//, '')
+  if (!relative || relative.startsWith('/') || relative.includes(':')
+    || relative.split('/').some((part) => !part || part === '.' || part === '..')
+    || !/\.gl(?:b|tf)$/i.test(relative)) return undefined
+  return relative
+}
+
+function captureHumanoidReaders() {
+  const ports = window.electron?.workspace?.artifacts
+  return {
+    rig: typeof ports?.readRigMetaSidecar === 'function' ? ports.readRigMetaSidecar.bind(ports) : undefined,
+    draft: typeof ports?.readHumanoidDraftSidecar === 'function' ? ports.readHumanoidDraftSidecar.bind(ports) : undefined,
+    promotion: typeof ports?.readHumanoidPromotionSidecar === 'function' ? ports.readHumanoidPromotionSidecar.bind(ports) : undefined,
+  }
+}
+
+async function boundedReviewRead<T>(read: (() => Promise<T>) | undefined, name: string): Promise<{ result?: T; diagnostic?: string }> {
+  if (!read) return { diagnostic: `${name} reader is unavailable.` }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    // A missing response must not hold Continue indefinitely. Rejections are
+    // attached immediately, including if the timeout wins the race.
+    const result = await Promise.race([
+      Promise.resolve().then(read),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${name} reader timed out.`)), 5000) }),
+    ])
+    return { result }
+  } catch (error) {
+    return { diagnostic: `${name}: ${String(error)}` }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+async function readWaitCheckpointHumanoidReview(filePath: string | undefined, workspaceDir: string): Promise<WaitCheckpointReviewState> {
+  const meshWorkspacePath = humanoidWorkspacePath(filePath, workspaceDir)
+  const readers = captureHumanoidReaders()
+  if (!meshWorkspacePath) {
+    const review = resolveWaitCheckpointHumanoidReview({ meshWorkspacePath: '' })
+    return { ...review, diagnostics: ['Humanoid review requires a workspace GLB or GLTF mesh.'] }
+  }
+  const [rig, draft, promotion] = await Promise.all([
+    boundedReviewRead(readers.rig && (() => readers.rig!({ sourceWorkspacePath: meshWorkspacePath })), 'Rig metadata'),
+    boundedReviewRead(readers.draft && (() => readers.draft!({ meshWorkspacePath })), 'Humanoid draft'),
+    boundedReviewRead(readers.promotion && (() => readers.promotion!({ meshWorkspacePath })), 'Humanoid promotion'),
+  ])
+  const review = resolveWaitCheckpointHumanoidReview({ meshWorkspacePath,
+    rigMetaResult: rig.result, draftResult: draft.result, promotionResult: promotion.result })
+  return { ...review, diagnostics: [...review.diagnostics, ...[rig, draft, promotion].flatMap((read) => read.diagnostic ? [read.diagnostic] : [])] }
+}
+
+function clearHumanoidAuthority(params: Record<string, unknown>): void {
+  delete params.humanoid_input_status
+  delete params.humanoid_promotion_sidecar_path
+}
+
+async function readCurrentHumanoidParams(ctx: RunContext, filePath: string | undefined): Promise<Record<string, string>> {
+  const meshWorkspacePath = humanoidWorkspacePath(filePath, ctx.workspaceDir)
+  const { promotion } = captureHumanoidReaders()
+  if (!meshWorkspacePath) return {}
+  const { result } = await boundedReviewRead(promotion && (() => promotion({ meshWorkspacePath })), 'Humanoid promotion')
+  assertCurrentContext(ctx)
+  // Main validates physical source, output, draft and receipts. Do not add a
+  // competing renderer schema or infer solver trust from rig labels/booleans.
+  return isHumanoidPromotionFound(result) ? {
+    humanoid_input_status: 'manual_confirmed', humanoid_promotion_sidecar_path: result.sidecarWorkspacePath,
+  } : {}
 }
 
 function incomingLandmarkSidecar(ctx: RunContext, nodeId: string): string | undefined {
@@ -590,6 +808,7 @@ async function executeExtensionNode(
     }
 
     const effectiveParams = { ...liveParams }
+    if (isHumanoidConsumer(ext)) clearHumanoidAuthority(effectiveParams)
     if (namedModelImagePorts.size > 0) {
       // Only declared image side ports reserve these keys. Other models and
       // undeclared sides retain their ordinary user parameters.
@@ -625,6 +844,10 @@ async function executeExtensionNode(
         extraParams.mesh_path = normalized
         extraParams.node_id = ext.nodeId
         extraParams.model_id = ext.id
+      }
+      if (isHumanoidConsumer(ext)) {
+        Object.assign(extraParams, await readCurrentHumanoidParams(ctx, riggedMeshPath))
+        assertCurrentContext(ctx)
       }
       submission = await client.post('/generate/from-text', {
         prompt, model_id: ext.id, collection: 'Workflows',
@@ -717,6 +940,12 @@ async function executeExtensionNode(
       // Named values never leak into the legacy top-level fallback/output fields.
       nodeInputPath = undefined
       nodeInputText = undefined
+    }
+    if (isHumanoidConsumer(ext)) {
+      clearHumanoidAuthority(processParams)
+      const mesh = processInput.inputs?.rigged_mesh
+      Object.assign(processParams, await readCurrentHumanoidParams(ctx, mesh?.type === 'mesh' ? mesh.filePath : undefined))
+      assertCurrentContext(ctx)
     }
     const result = await window.electron.extensions.runProcess(ext.extensionId, processInput, processParams)
     assertCurrentContext(ctx)
@@ -830,6 +1059,32 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       artifactLineages: Object.fromEntries([...ctx.checkpoints].flatMap(([id, cp]) => cp.lineage ? [[id, cp.lineage]] : [])),
       landmarkSidecars: Object.fromEntries([...ctx.checkpoints].flatMap(([id, cp]) => cp.landmarkSidecar ? [[id, cp.landmarkSidecar]] : [])),
     })
+  }
+
+  const refreshCheckpointReview = async (ctx: RunContext, checkpoint: WorkflowCheckpoint, output = checkpoint.input): Promise<void> => {
+    if (!isCurrentContext(ctx) || ctx.nodeMap.get(checkpoint.owner.nodeId)?.type !== 'waitNode'
+      || !checkpointFeedsHumanoid(ctx, checkpoint.owner.nodeId)) return
+    const owner = { ...checkpoint.owner }, nodeId = owner.nodeId
+    const request = Symbol('checkpoint-review')
+    const filePath = output?.outputType === 'mesh' ? output.filePath : undefined
+    ctx.reviewRequests.set(nodeId, request)
+    const ownsRequest = (): boolean => isCurrentContext(ctx)
+      && sameCheckpointOwner(ctx.checkpoints.get(nodeId)?.owner, owner) && ctx.reviewRequests.get(nodeId) === request
+    const publish = (state: WaitCheckpointReviewState): void => {
+      if (!ownsRequest()) return
+      ctx.checkpoints.set(nodeId, { ...ctx.checkpoints.get(nodeId)!, humanoidReview: { owner, state } })
+      syncCheckpoints(ctx)
+    }
+    publish({ ...resolveWaitCheckpointHumanoidReview({ meshWorkspacePath: humanoidWorkspacePath(filePath, ctx.workspaceDir) ?? '' }),
+      headline: 'Reading humanoid review; Continue will recheck the selected mesh.' })
+    try {
+      publish(await readWaitCheckpointHumanoidReview(filePath, ctx.workspaceDir))
+    } catch (error) {
+      // Unexpected reader/result failures are still owner-bound and degraded.
+      publish({ ...resolveWaitCheckpointHumanoidReview({ meshWorkspacePath: '' }), diagnostics: [String(error)] })
+    } finally {
+      if (ownsRequest()) ctx.reviewRequests.delete(nodeId)
+    }
   }
 
   const ownedCheckpoint = (owner: CheckpointOwner, allowCaptureWrite = false): { ctx: RunContext; checkpoint: WorkflowCheckpoint } | undefined => {
@@ -1127,7 +1382,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         }
 
         const ctx: RunContext = {
-          runId, epoch, jobId, checkpoints: new Map(), nodeArtifacts: new Map(), outputRevisions: new Map(), checkpointRevision: 0,
+          runId, epoch, jobId, checkpoints: new Map(), nodeArtifacts: new Map(), outputRevisions: new Map(), checkpointRevision: 0, reviewRequests: new Map(),
           workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
           overrideImageData, nodeOutputs, nodeMap, ordered, branches, waitIds, parentWait, iteratorFiles,
         }
@@ -1265,6 +1520,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             set({ activeCheckpointNodeId: first.owner.nodeId })
             publishCheckpointPreview(ctx, first)
           }
+          // Reviews are checkpoint-local and never delay the manual handoff.
+          for (const checkpoint of ctx.checkpoints.values()) void refreshCheckpointReview(ctx, checkpoint)
           // Hand off to the user — branches run on demand via continueRun(id).
           set((s) => ({
             activeNodeId: null,
@@ -1349,11 +1606,25 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           return
         }
       }
+      if (checkpointFeedsHumanoid(ctx, waitId)) {
+        // An accepted Continue/Retry is busy before any reader can yield. Publish
+        // the reservation and visible controls together; background hydration
+        // does not enter this phase and leaves the paused checkpoint usable.
+        set((s) => ({
+          runningBranchId: waitId,
+          waitStates: { ...s.waitStates, [waitId]: 'running' },
+          runState: { ...s.runState, status: 'running', blockProgress: 0, blockStep: 'Checking humanoid review…' },
+        }))
+        const owner = checkpoint.owner
+        await refreshCheckpointReview(ctx, checkpoint, replacementOutput ?? checkpoint.input)
+        if (!isCurrentContext(ctx) || !sameCheckpointOwner(ctx.checkpoints.get(waitId)?.owner, owner)) return
+        checkpoint = ctx.checkpoints.get(waitId)!
+      }
       // Consuming a checkpoint invalidates every previously captured editor token.
       const original = checkpoint.substitutionPoint?.inputArtifact
       const edited = result?.status === 'accepted' && original ? buildWaitReplacementArtifactRef(original, result.artifact) : undefined
       checkpoint = { ...checkpoint, owner: { ...checkpoint.owner, revision: ++ctx.checkpointRevision },
-        pendingReplacement: undefined, replacementResult: result,
+        pendingReplacement: undefined, replacementResult: result, humanoidReview: undefined,
         lineage: edited && original ? buildWaitArtifactLineage(checkpoint.lineage, original, edited)
           : checkpoint.lineage && original ? { ...checkpoint.lineage, currentVersionId: original.versionId } : checkpoint.lineage }
       ctx.checkpoints.set(waitId, checkpoint)
@@ -1396,7 +1667,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         if (next === 'done') {
           for (const w of ctx.waitIds) {
             if (ctx.parentWait.get(w) === waitId && newWaitStates[w] === 'blocked') {
-              materializeCheckpoint(ctx, w)
+              const nextCheckpoint = materializeCheckpoint(ctx, w)
+              void refreshCheckpointReview(ctx, nextCheckpoint)
               newWaitStates[w] = 'pending'
             }
           }
@@ -1486,6 +1758,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       if (!match) return false
       set({ activeCheckpointNodeId: owner.nodeId })
       publishCheckpointPreview(match.ctx, match.checkpoint)
+      void refreshCheckpointReview(match.ctx, match.checkpoint)
       return true
     },
 
@@ -1499,8 +1772,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       }
       // Detach caller-owned values: an exporter must not mutate a pending artifact later.
       const pendingReplacement = artifact && { ...artifact, legacy: artifact.legacy && { ...artifact.legacy } }
-      match.ctx.checkpoints.set(owner.nodeId, { ...match.checkpoint, owner: { ...match.checkpoint.owner, revision: ++match.ctx.checkpointRevision }, pendingReplacement })
+      const next = { ...match.checkpoint, owner: { ...match.checkpoint.owner, revision: ++match.ctx.checkpointRevision }, pendingReplacement, humanoidReview: undefined }
+      match.ctx.checkpoints.set(owner.nodeId, next)
       syncCheckpoints(match.ctx)
+      // Normal Continue still chooses the original, even with a pending edit.
+      void refreshCheckpointReview(match.ctx, next)
       return true
     },
 

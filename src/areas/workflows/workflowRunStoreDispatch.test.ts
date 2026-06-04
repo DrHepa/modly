@@ -1,3 +1,4 @@
+import type { HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, RigMetaSidecarReadResult } from '../../shared/types/electron.d'
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
 import { build } from 'esbuild'
@@ -7,6 +8,8 @@ import vm from 'node:vm'
 import type { Workflow, WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
+import React from 'react'
+import { useStore } from 'zustand'
 
 type WorkflowRunStore = typeof import('./workflowRunStore').useWorkflowRunStore
 
@@ -55,6 +58,53 @@ let appState: {
   updateCurrentJob(value: Record<string, unknown>): void
 }
 
+let humanoidDraftReadCalls: Array<{ meshWorkspacePath: string }>
+let humanoidPromotionReadCalls: Array<{ meshWorkspacePath: string }>
+let rigMetaReadCalls: Array<{ sourceWorkspacePath: string }>
+let humanoidDraftReadResult: HumanoidDraftSidecarReadResult
+let humanoidPromotionReadResult: HumanoidPromotionSidecarReadResult
+let rigMetaReadResult: RigMetaSidecarReadResult
+let readerPorts: Partial<Window['electron']['workspace']['artifacts']>
+const humanoidDraftSidecar = Object.freeze({
+  schema: 'modly.humanoid-draft.v1',
+  version: 1,
+  source: { workspacePath: 'Workflows/generated/avatar-source.glb' },
+  output: { workspacePath: 'Workflows/generated/avatar.glb' },
+  meshOutputSha256: 'mesh-sha-1',
+  rigmetaSha256: 'rigmeta-sha-1',
+  draftSha256: 'draft-sha-1',
+  trust: { status: 'draft', reasons: ['semantic_trust_failed'], trusted: false },
+  provenance: { producer: 'unirig', runId: 'run-1', extensionId: 'unirig', createdAt: '2026-05-22T20:00:00.000Z' },
+  assignments: {
+    roles: { hips: { boneId: 'bone:hips', label: 'Hips', confidence: 0.88 } },
+    chains: { spine: ['bone:hips', 'bone:spine'] },
+  },
+  confidence: { overall: 0.74 },
+  completeness: { requiredRolesMissing: ['head'], score: 0.81 },
+  diagnostics: ['Manual review required before Kimodo handoff.'],
+} satisfies HumanoidDraftSidecarV1)
+
+const humanoidPromotionSidecar = Object.freeze({
+  schema: 'modly.humanoid-promotion.v1',
+  version: 1,
+  promotionId: 'promotion-1',
+  source: { workspacePath: 'Workflows/generated/avatar-source.glb' },
+  output: { workspacePath: 'Workflows/generated/avatar.glb' },
+  meshOutputSha256: 'mesh-sha-1',
+  rigmetaSha256: 'rigmeta-sha-1',
+  draftSha256: 'draft-sha-1',
+  draftSchema: 'modly.humanoid-draft.v1',
+  promotedAssignments: structuredClone(humanoidDraftSidecar.assignments),
+  provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+  audit: {
+    confirmedBy: 'modly:user:local:tester',
+    confirmedByLabel: 'Local Tester',
+    createdAt: '2026-05-22T20:10:00.000Z',
+    method: 'viewer3d',
+    rationale: 'Reviewed the draft manually for downstream manual_confirmed eligibility.',
+  },
+} satisfies HumanoidPromotionSidecarV1)
+
 beforeEach(() => {
   axiosClientMock = {
     async post() { throw new Error('Unexpected axios.post call') },
@@ -76,10 +126,20 @@ beforeEach(() => {
     setCurrentJob(value) { this.currentJob = value },
     updateCurrentJob(value) { this.currentJob = { ...this.currentJob, ...value } },
   }
+  humanoidDraftReadCalls = []; humanoidPromotionReadCalls = []; rigMetaReadCalls = []
+  humanoidDraftReadResult = { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json' }
+  humanoidPromotionReadResult = { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json' }
+  rigMetaReadResult = { success: true, status: 'not-found', rigMetaWorkspacePath: 'Workflows/generated/avatar.rigmeta.json' }
+  readerPorts = {
+    readHumanoidDraftSidecar: async (request) => { humanoidDraftReadCalls.push(request); return humanoidDraftReadResult },
+    readHumanoidPromotionSidecar: async (request) => { humanoidPromotionReadCalls.push(request); return humanoidPromotionReadResult },
+    readRigMetaSidecar: async (request) => { rigMetaReadCalls.push(request); return rigMetaReadResult },
+    writeLandmarkSidecar: (input) => writeSidecar(input),
+  }
   const fixture = { app: appState, get client() { return axiosClientMock } }
   const window = { electron: {
     settings: { get: async () => settingsGet ? settingsGet() : ({ workspaceDir }) },
-    workspace: { artifacts: { writeLandmarkSidecar: (input: unknown) => writeSidecar(input) } },
+    workspace: { artifacts: readerPorts },
     fs: {
       deleteDirectory: async () => ({ success: true }),
       listFiles: async () => iteratorFileNames,
@@ -99,7 +159,7 @@ beforeEach(() => {
     module, exports: module.exports, require: createRequire(import.meta.url), fixture, window,
     process, console, crypto, Blob, FormData, atob,
     // Polling delay is inert; each client is a bounded in-memory fixture.
-    setTimeout: (callback: () => void) => setTimeout(callback, 0), clearTimeout, TextDecoder,
+    setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay === 5000 ? delay : 0), clearTimeout, TextDecoder,
   })
   useWorkflowRunStore = module.exports.useWorkflowRunStore
 })
@@ -2008,4 +2068,584 @@ test('late MODEL cleanup preserves a non-blank opaque string id without trimming
   response.resolve({ data: { job_id: ' opaque-job:27 ' } })
   await run
   assert.deepEqual(paths, ['/generate/from-text', '/generate/cancel/ opaque-job:27 '])
+})
+
+function createKimodoAnimateExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  return createWorkflowExtension({
+    id: 'kimodo/animate-rigged-mesh',
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    name: 'Animate Rigged Mesh',
+    type: 'model',
+    input: 'text',
+    output: 'mesh',
+    inputs: [
+      { name: 'prompt', type: 'text', required: true },
+      { name: 'rigged_mesh', type: 'mesh', required: true },
+    ],
+    params: [{ id: 'prompt', label: 'Prompt', type: 'string', default: 'Walk forward' }],
+    ...overrides,
+  })
+}
+
+function createKimodoWaitWorkflow(args: { id: string; meshFilePath?: string } ): Workflow {
+  const kimodoExt = createKimodoAnimateExtension()
+  return {
+    id: args.id,
+    name: 'Wait Before Kimodo',
+    description: '',
+    nodes: [
+      createNode('text-source', 'textNode', { enabled: true, params: { text: 'Walk forward' } }),
+      createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: args.meshFilePath ?? '/workspace/Workflows/generated/avatar.glb' } }),
+      createNode('wait-node', 'waitNode', { extensionId: 'workflow/wait', enabled: true, params: {} }),
+      createNode('kimodo-node', 'extensionNode', { extensionId: kimodoExt.id, enabled: true, params: {} }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-text-kimodo', source: 'text-source', target: 'kimodo-node', targetHandle: 'prompt' },
+      { id: 'edge-mesh-wait', source: 'mesh-source', target: 'wait-node' },
+      { id: 'edge-wait-kimodo', source: 'wait-node', target: 'kimodo-node', targetHandle: 'rigged_mesh' },
+      { id: 'edge-kimodo-output', source: 'kimodo-node', target: 'output-node' },
+    ],
+    createdAt: '2026-05-22T00:00:00.000Z',
+    updatedAt: '2026-05-22T00:00:00.000Z',
+  }
+}
+
+function waitCheckpointReviewState(nodeId = 'wait-node') {
+  return useWorkflowRunStore.getState().checkpoints[nodeId]?.humanoidReview?.state
+}
+async function waitForHumanoidReview(nodeId = 'wait-node') {
+  for (let i = 0; i < 40; i++) {
+    if (waitCheckpointReviewState(nodeId)?.headline && !waitCheckpointReviewState(nodeId)!.headline.startsWith('Reading ')) return
+    await new Promise<void>(resolve => setImmediate(resolve))
+  }
+  assert.fail('Humanoid checkpoint review did not finish')
+}
+
+test('workflowRunStore surfaces draft-only humanoid wait review state before Kimodo without inventing trust', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-draft-only' })
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [kimodoExt])
+  await runPromise
+  await waitForHumanoidReview()
+
+  try {
+    const review = waitCheckpointReviewState()
+    assert.deepEqual(JSON.parse(JSON.stringify(rigMetaReadCalls)), [{ sourceWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.deepEqual(JSON.parse(JSON.stringify(humanoidDraftReadCalls)), [{ meshWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.deepEqual(JSON.parse(JSON.stringify(humanoidPromotionReadCalls)), [{ meshWorkspacePath: 'Workflows/generated/avatar.glb' }])
+    assert.equal(review?.status, 'draft_only')
+    assert.match(review?.headline ?? '', /manual review/i)
+    assert.match((review?.diagnostics ?? []).join('\n'), /manual review required/i)
+    assert.equal(review?.downstreamHumanoidStatus, undefined)
+  } finally {
+    useWorkflowRunStore.getState().cancel()
+    await runPromise
+  }
+})
+test('workflowRunStore continues Wait before Kimodo fail-closed when only a humanoid draft exists', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-fail-closed' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+        return { data: { job_id: 'job-kimodo-draft-only' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-draft-only.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [kimodoExt])
+  await runPromise
+  await waitForHumanoidReview()
+
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: kimodoExt.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      prompt: 'Walk forward', text: 'Walk forward',
+      rigged_mesh_path: 'Workflows/generated/avatar.glb',
+      mesh_path: 'Workflows/generated/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: kimodoExt.id,
+    },
+  })
+})
+test('workflowRunStore forwards only manual_confirmed humanoid promotion references downstream after Wait', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-promoted' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+  }
+  humanoidPromotionReadResult = {
+    success: true,
+    status: 'found',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    sidecar: structuredClone(humanoidPromotionSidecar),
+  }
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+        return { data: { job_id: 'job-kimodo-promoted' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-promoted.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [kimodoExt])
+  await runPromise
+  await waitForHumanoidReview()
+
+  assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed')
+
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: kimodoExt.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      prompt: 'Walk forward', text: 'Walk forward',
+      rigged_mesh_path: 'Workflows/generated/avatar.glb',
+      mesh_path: 'Workflows/generated/avatar.glb',
+      node_id: 'animate-rigged-mesh',
+      model_id: kimodoExt.id,
+      humanoid_input_status: 'manual_confirmed',
+      humanoid_promotion_sidecar_path: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    },
+  })
+})
+test('workflowRunStore diagnoses stale humanoid promotion state before Kimodo and does not forward it', async () => {
+  const kimodoExt = createKimodoAnimateExtension()
+  const workflow = createKimodoWaitWorkflow({ id: 'workflow-wait-kimodo-stale' })
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  humanoidDraftReadResult = {
+    success: true,
+    status: 'stale',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-draft.v1.json',
+    sidecar: structuredClone(humanoidDraftSidecar),
+    staleReasons: ['mesh_output_sha256_mismatch'],
+  }
+  humanoidPromotionReadResult = {
+    success: true,
+    status: 'stale',
+    sidecarWorkspacePath: 'Workflows/generated/avatar.humanoid-promotion.v1.json',
+    sidecar: structuredClone(humanoidPromotionSidecar),
+    staleReasons: ['draft_sha256_mismatch'],
+  }
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-text') {
+        postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+        return { data: { job_id: 'job-kimodo-stale' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/kimodo-stale.glb' } }
+    },
+  }
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [kimodoExt])
+  await runPromise
+  await waitForHumanoidReview()
+
+  const review = waitCheckpointReviewState()
+  assert.equal(review?.status, 'stale')
+  assert.match(review?.headline ?? '', /stale/i)
+  assert.match((review?.diagnostics ?? []).join('\n'), /mesh_output_sha256_mismatch|draft_sha256_mismatch/)
+
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  await runPromise
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(postCalls[0].data.params, {
+    prompt: 'Walk forward', text: 'Walk forward',
+    rigged_mesh_path: 'Workflows/generated/avatar.glb',
+    mesh_path: 'Workflows/generated/avatar.glb',
+    node_id: 'animate-rigged-mesh',
+    model_id: kimodoExt.id,
+  })
+})
+
+function foundPromotion(path = 'Workflows/generated/avatar.humanoid-promotion.v1.json'): HumanoidPromotionSidecarReadResult {
+  return { success: true, status: 'found', sidecarWorkspacePath: path, sidecar: structuredClone(humanoidPromotionSidecar) }
+}
+function noPromotion(): HumanoidPromotionSidecarReadResult {
+  return { success: true, status: 'not-found', sidecarWorkspacePath: 'missing.humanoid-promotion.v1.json' }
+}
+function humanoidOwner(id = 'wait-node') { return useWorkflowRunStore.getState().getCheckpointOwner(id)! }
+function editedHumanoidMesh(path = 'Workflows/edited/replacement.glb') {
+  return { id: 'edited-mesh', versionId: 'edited-v2', kind: 'mesh' as const, uri: path }
+}
+
+test('humanoid review remains checkpoint-local for two Waits, selection and out-of-order reads', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'two-reviews' })
+  workflow.nodes.push(createNode('source-b', 'meshNode', { enabled: true, params: { source: 'file', filePath: '/workspace/other.glb' } }),
+    createNode('wait-b', 'waitNode'), createNode('consumer-b', 'extensionNode', { enabled: true, extensionId: ext.id, params: {} }))
+  workflow.edges.push({ id: 'b-source', source: 'source-b', target: 'wait-b' },
+    { id: 'b-mesh', source: 'wait-b', target: 'consumer-b', targetHandle: 'rigged_mesh' })
+  const first = deferred<HumanoidPromotionSidecarReadResult>(), second = deferred<HumanoidPromotionSidecarReadResult>()
+  readerPorts.readHumanoidPromotionSidecar = ({ meshWorkspacePath }) => meshWorkspacePath === 'other.glb' ? second.promise : first.promise
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  useWorkflowRunStore.getState().selectCheckpoint(humanoidOwner())
+  second.resolve(noPromotion()); await waitForHumanoidReview('wait-b')
+  assert.equal(useWorkflowRunStore.getState().activeCheckpointNodeId, 'wait-node')
+  assert.equal(waitCheckpointReviewState('wait-b')?.status, 'diagnostics_only')
+  first.resolve(foundPromotion()); await waitForHumanoidReview()
+  assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed')
+  assert.equal(waitCheckpointReviewState('wait-b')?.downstreamHumanoidStatus, undefined)
+})
+
+for (const reset of ['cancel', 'reset', 'new-run'] as const) {
+  for (const rejects of [false, true]) {
+    test(`humanoid ${rejects ? 'failed' : 'successful'} old read cannot change ${reset} ownership`, async () => {
+      const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'old-review' })
+      const old = deferred<HumanoidPromotionSidecarReadResult>()
+      readerPorts.readHumanoidPromotionSidecar = () => old.promise
+      await useWorkflowRunStore.getState().run(workflow, [ext])
+      if (reset === 'new-run') {
+        readerPorts.readHumanoidPromotionSidecar = async () => noPromotion()
+        await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+      } else useWorkflowRunStore.getState()[reset]()
+      const snapshot = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+      if (rejects) old.reject(new Error('old read failed')); else old.resolve(foundPromotion())
+      await new Promise<void>(resolve => setImmediate(resolve))
+      assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), snapshot)
+    })
+  }
+}
+
+for (const explicit of [false, true]) {
+  test(`humanoid ${explicit ? 'replacement' : 'normal'} Continue refreshes its actual artifact after pending edit`, async () => {
+    const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'replacement-review' })
+    const reads: string[] = [], posts = captureTextRequests()
+    readerPorts.readHumanoidPromotionSidecar = async ({ meshWorkspacePath }) => {
+      reads.push(meshWorkspacePath)
+      return meshWorkspacePath.includes('replacement') ? noPromotion() : foundPromotion()
+    }
+    await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+    const oldOwner = humanoidOwner(), replacement = editedHumanoidMesh()
+    assert.equal(useWorkflowRunStore.getState().setPendingReplacement(oldOwner, replacement), true)
+    assert.notEqual(humanoidOwner().revision, oldOwner.revision)
+    await useWorkflowRunStore.getState().continueRun('wait-node', { owner: oldOwner, replacementArtifact: replacement })
+    assert.equal(posts.length, 0, 'stale replacement token cannot run')
+    const start = reads.length
+    await useWorkflowRunStore.getState().continueRun('wait-node', explicit ? { owner: humanoidOwner(), replacementArtifact: replacement } : undefined)
+    const params = posts[0].params as Record<string, unknown>
+    assert.equal(params.rigged_mesh_path, explicit ? 'Workflows/edited/replacement.glb' : 'Workflows/generated/avatar.glb')
+    assert.equal(params.humanoid_input_status, explicit ? undefined : 'manual_confirmed')
+    assert.ok(reads.slice(start).includes(String(params.rigged_mesh_path)))
+    assert.equal(useWorkflowRunStore.getState().waitStates['wait-node'], 'done')
+  })
+}
+
+test('old rejection after replacement clear cannot erase the current review', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'revision-review' })
+  const old = deferred<HumanoidPromotionSidecarReadResult>()
+  readerPorts.readHumanoidPromotionSidecar = () => old.promise
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  readerPorts.readHumanoidPromotionSidecar = async () => foundPromotion()
+  useWorkflowRunStore.getState().setPendingReplacement(humanoidOwner(), editedHumanoidMesh())
+  useWorkflowRunStore.getState().setPendingReplacement(humanoidOwner(), undefined)
+  await waitForHumanoidReview()
+  const snapshot = JSON.stringify(useWorkflowRunStore.getState().checkpoints)
+  old.reject(new Error('late old revision failure')); await new Promise<void>(resolve => setImmediate(resolve))
+  assert.equal(JSON.stringify(useWorkflowRunStore.getState().checkpoints), snapshot)
+})
+
+test('Continue reserves the branch before awaiting and cancellation cannot resume dispatch', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'continue-lock' }), posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+  const pending = deferred<HumanoidPromotionSidecarReadResult>()
+  readerPorts.readHumanoidPromotionSidecar = () => pending.promise
+  const first = useWorkflowRunStore.getState().continueRun('wait-node')
+  assert.equal(useWorkflowRunStore.getState().runningBranchId, 'wait-node')
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  useWorkflowRunStore.getState().cancel()
+  pending.resolve(foundPromotion()); await first
+  assert.equal(posts.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'idle')
+})
+
+test('Continue and actual dispatch each refresh promotion instead of trusting paused cache', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'double-refresh' }), posts = captureTextRequests()
+  let call = 0
+  readerPorts.readHumanoidPromotionSidecar = async () => ++call < 3 ? foundPromotion() : noPromotion()
+  workflow.nodes.find(n => n.id === 'kimodo-node')!.data.params = {
+    humanoid_input_status: 'trusted', humanoid_promotion_sidecar_path: 'forged.json', unknown: false, count: 0,
+  }
+  await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+  assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed')
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  const params = posts[0].params as any
+  assert.equal(call, 3); assert.equal(params.humanoid_input_status, undefined); assert.equal(params.humanoid_promotion_sidecar_path, undefined)
+  assert.equal(params.unknown, false); assert.equal(params.count, 0)
+})
+
+for (const failure of ['absent', 'throw', 'reject'] as const) {
+  test(`humanoid ${failure} readers degrade without blocking Continue or auto-promoting`, async () => {
+    const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: failure }), posts = captureTextRequests()
+    if (failure === 'absent') {
+      delete readerPorts.readRigMetaSidecar; delete readerPorts.readHumanoidDraftSidecar; delete readerPorts.readHumanoidPromotionSidecar
+    } else {
+      const fail = () => { if (failure === 'throw') throw new Error('sync failure'); return Promise.reject(new Error('async failure')) }
+      readerPorts.readRigMetaSidecar = fail; readerPorts.readHumanoidDraftSidecar = fail; readerPorts.readHumanoidPromotionSidecar = fail
+    }
+    readerPorts.writeHumanoidPromotionSidecar = async () => assert.fail('Wait must never promote')
+    await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+    assert.equal(waitCheckpointReviewState()?.status, 'diagnostics_only')
+    assert.equal(waitCheckpointReviewState()?.diagnostics.length, 3)
+    await useWorkflowRunStore.getState().continueRun('wait-node')
+    assert.equal((posts[0].params as any).humanoid_input_status, undefined)
+    assert.equal(useWorkflowRunStore.getState().waitStates['wait-node'], 'done')
+  })
+}
+
+test('reader functions are captured before await and refreshed on the next Continue', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'reader-capture' }), posts = captureTextRequests()
+  let oldCalls = 0, newCalls = 0
+  readerPorts.readRigMetaSidecar = async () => {
+    readerPorts.readHumanoidPromotionSidecar = async () => { newCalls++; return noPromotion() }
+    return rigMetaReadResult
+  }
+  readerPorts.readHumanoidPromotionSidecar = async () => { oldCalls++; return foundPromotion() }
+  await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+  assert.equal(oldCalls, 1); assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed')
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  assert.equal(newCalls, 2); assert.equal((posts[0].params as any).humanoid_input_status, undefined)
+})
+
+for (const route of ['preview', 'wrong-handle', 'competing-mesh', 'unrelated-text'] as const) {
+  test(`humanoid review follows the actual ${route} consumed route`, async () => {
+    const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: route }), posts = captureTextRequests()
+    const meshEdge = workflow.edges.find(e => e.id === 'edge-wait-kimodo')!
+    if (route === 'preview') {
+      workflow.nodes.push(createNode('preview', 'imagePreviewNode')); meshEdge.source = 'preview'
+      workflow.edges.push({ id: 'wait-preview', source: 'wait-node', target: 'preview' })
+    } else if (route === 'wrong-handle') meshEdge.targetHandle = 'wrong-rigged_mesh'
+    else {
+      workflow.nodes.push(createNode('unreviewed', 'meshNode', { enabled: true, params: { source: 'file', filePath: '/workspace/unreviewed.glb' } }))
+      workflow.edges.push({ id: 'other-mesh', source: 'unreviewed', target: 'kimodo-node', targetHandle: 'rigged_mesh' })
+      if (route === 'unrelated-text') meshEdge.targetHandle = 'prompt'
+    }
+    readerPorts.readHumanoidPromotionSidecar = async ({ meshWorkspacePath }) => meshWorkspacePath.includes('avatar') ? foundPromotion() : noPromotion()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    if (route === 'preview') { await waitForHumanoidReview(); assert.equal(waitCheckpointReviewState()?.status, 'manual_confirmed') }
+    else assert.equal(waitCheckpointReviewState(), undefined)
+    await useWorkflowRunStore.getState().continueRun('wait-node')
+    if (route === 'wrong-handle') {
+      assert.equal(posts.length, 0); assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh/)
+    } else {
+      const params = posts[0].params as any
+      assert.equal(params.humanoid_input_status, route === 'preview' ? 'manual_confirmed' : undefined)
+      assert.equal(params.rigged_mesh_path, route === 'preview' ? 'Workflows/generated/avatar.glb' : 'unreviewed.glb')
+    }
+  })
+}
+
+test('ordinary named providers retain reserved-looking user parameters and ignore Kimodo display labels', async () => {
+  const ext = createKimodoAnimateExtension({ extensionId: 'ordinary-owner', nodeId: 'ordinary-node', name: 'Kimodo Animate Rigged Mesh' })
+  const workflow = createKimodoWaitWorkflow({ id: 'ordinary' }), posts = captureTextRequests()
+  workflow.nodes.find(n => n.id === 'kimodo-node')!.data.params = { humanoid_input_status: false, humanoid_promotion_sidecar_path: '', unknown: 0 }
+  await useWorkflowRunStore.getState().run(workflow, [ext]); assert.equal(waitCheckpointReviewState(), undefined)
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  const params = posts[0].params as any
+  assert.equal(params.humanoid_input_status, false); assert.equal(params.humanoid_promotion_sidecar_path, ''); assert.equal(params.unknown, 0)
+  assert.equal(humanoidPromotionReadCalls.length, 0)
+})
+
+test('named PROCESS humanoid capability refreshes its own mesh without altering named transport', async () => {
+  const ext = createKimodoAnimateExtension({ type: 'process' }), workflow = createKimodoWaitWorkflow({ id: 'named-process' })
+  humanoidPromotionReadResult = foundPromotion()
+  await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+  await useWorkflowRunStore.getState().continueRun('wait-node')
+  assert.equal(runProcessCalls.length, 1)
+  const input = runProcessCalls[0].input as any
+  assert.equal(input.inputs.rigged_mesh.sourceNodeId, 'wait-node')
+  assert.equal(input.inputs.rigged_mesh.filePath, '/workspace/Workflows/generated/avatar.glb')
+  assert.equal(input.filePath, undefined)
+  assert.equal(runProcessCalls[0].params.humanoid_input_status, 'manual_confirmed')
+})
+
+// Mount the real Wait and shared button hook against this file's actual-store VM.
+// Only host elements/Flow are inert: subscriptions, actions and async ownership run.
+async function mountCurrentWait() {
+  const require = createRequire(import.meta.url)
+  // The store bundle owns a separate React copy; subscribe to its actual vanilla
+  // API with the renderer's React instance, as the application's bound hook does.
+  const hook = (selector: (state: ReturnType<WorkflowRunStore['getState']>) => unknown) => useStore(useWorkflowRunStore, selector)
+  const result = await build({
+    entryPoints: [fileURLToPath(new URL('./nodes/WaitNode.tsx', import.meta.url))],
+    tsconfig: fileURLToPath(new URL('../../../tsconfig.web.json', import.meta.url)),
+    bundle: true, platform: 'node', format: 'cjs', write: false,
+    external: ['react', 'react/*', '@xyflow/react', '../workflowRunStore', './workflowRunStore', './BaseNode'],
+  })
+  const module = { exports: {} as { default: React.ComponentType<any> } }
+  vm.runInNewContext(result.outputFiles[0].text, {
+    module, exports: module.exports, console,
+    require: (id: string) => id.endsWith('/workflowRunStore') ? { useWorkflowRunStore: hook }
+      : id === '@xyflow/react' ? { Handle: 'handle', Position: { Left: 'left', Right: 'right' } }
+      : id === './BaseNode' ? { __esModule: true, default: ({ subheader, children }: any) => React.createElement('section', null, subheader, children) }
+      : require(id),
+  })
+  const container: any = { children: [] }, context = {}
+  const append = (parent: any, child: any) => parent.children.push(child)
+  const remove = (parent: any, child: any) => parent.children.splice(parent.children.indexOf(child), 1)
+  const renderer = require('react-reconciler')({
+    now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
+    getRootHostContext: () => context, getChildHostContext: () => context,
+    getPublicInstance: (value: any) => value, prepareForCommit: () => null, resetAfterCommit: () => {},
+    createInstance: (type: string, props: any) => ({ type, props, children: [] }),
+    createTextInstance: (text: string) => ({ type: '#text', text, children: [] }),
+    appendInitialChild: append, appendChild: append, appendChildToContainer: append,
+    removeChild: remove, removeChildFromContainer: remove,
+    insertBefore: (parent: any, child: any, before: any) => parent.children.splice(parent.children.indexOf(before), 0, child),
+    shouldSetTextContent: () => false, finalizeInitialChildren: () => false, prepareUpdate: () => true,
+    commitUpdate: (instance: any, _payload: any, _type: any, _old: any, props: any) => { instance.props = props },
+    commitTextUpdate: (instance: any, _old: any, text: string) => { instance.text = text },
+    clearContainer: (target: any) => { target.children = [] },
+    scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
+    detachDeletedInstance: () => {}, getCurrentEventPriority: () => 1,
+  })
+  const tree = renderer.createContainer(container, 0, null, false, null, '', (error: Error) => { throw error }, null)
+  const act = (fn: () => void) => { renderer.flushSync(fn); renderer.flushPassiveEffects() }
+  const all = (node: any = container): any[] => [node, ...node.children.flatMap((child: any) => all(child))]
+  const text = (node: any = container): string => node.text ?? node.children.map(text).join('')
+  const button = (label: string) => all().find(node => node.type === 'button' && text(node).trim() === label)
+  act(() => renderer.updateContainer(React.createElement(module.exports.default, { id: 'wait-node', data: { enabled: true } }), tree, null))
+  return { act, button, text, unmount: () => act(() => renderer.updateContainer(null, tree, null)) }
+}
+
+for (const action of ['normal', 'replacement', 'retry-done', 'retry-error'] as const) {
+  for (const rejects of [false, true]) {
+    test(`mounted humanoid ${action} reserves visible controls before ${rejects ? 'failed' : 'successful'} review`, async () => {
+      const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'mounted-busy' })
+      const posts = captureTextRequests(), post = axiosClientMock.post
+      await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+      if (action.startsWith('retry')) {
+        if (action === 'retry-error') axiosClientMock.post = async () => { throw new Error('Prior branch failed') }
+        await useWorkflowRunStore.getState().continueRun('wait-node')
+        assert.equal(useWorkflowRunStore.getState().waitStates['wait-node'], action === 'retry-error' ? 'error' : 'done')
+        // The current run deliberately retains its captured client instance.
+        axiosClientMock.post = post
+        posts.length = 0
+      } else {
+        assert.equal(useWorkflowRunStore.getState().setPendingReplacement(humanoidOwner(), editedHumanoidMesh()), true)
+        await waitForHumanoidReview()
+      }
+      const h = await mountCurrentWait(), gate = deferred<HumanoidPromotionSidecarReadResult>()
+      const operations: Promise<void>[] = [], original = useWorkflowRunStore.getState().continueRun
+      useWorkflowRunStore.setState({ continueRun: (...args) => { const operation = original(...args); operations.push(operation); return operation } })
+      readerPorts.readHumanoidPromotionSidecar = () => gate.promise
+      const owner = humanoidOwner()
+      try {
+        h.act(() => h.button(action === 'replacement' ? 'Continue with replacement' : action.startsWith('retry') ? 'Retry' : 'Continue degraded').props.onClick())
+        const current = useWorkflowRunStore.getState()
+        assert.equal(current.runningBranchId, 'wait-node')
+        assert.equal(current.waitStates['wait-node'], 'running')
+        assert.equal(current.runState.status, 'running')
+        assert.equal(h.button('Running…')?.props.disabled, true)
+        assert.equal(h.button('Show checkpoint')?.props.disabled, true)
+        if (!action.startsWith('retry')) assert.equal(h.button('Continue with replacement')?.props.disabled, true)
+        assert.doesNotMatch(h.text(), /Continuing will not send a manual_confirmed/)
+        assert.equal(posts.length, 0)
+        await current.continueRun('wait-node', { owner, replacementArtifact: editedHumanoidMesh() })
+        assert.equal(current.selectCheckpoint(owner), false)
+        assert.equal(current.setPendingReplacement(owner, undefined), false)
+        if (rejects) gate.reject(new Error('Review read failed')); else gate.resolve(foundPromotion())
+        await Promise.all(operations); h.act(() => {})
+        assert.equal(posts.length, 1)
+        const params = posts[0].params as Record<string, unknown>
+        assert.equal(params.rigged_mesh_path, action === 'replacement' ? 'Workflows/edited/replacement.glb' : 'Workflows/generated/avatar.glb')
+        assert.equal(params.humanoid_input_status, rejects ? undefined : 'manual_confirmed')
+        assert.equal(useWorkflowRunStore.getState().waitStates['wait-node'], 'done')
+        assert.equal(h.button('Retry')?.props.disabled, false)
+        assert.equal(h.button('Show checkpoint')?.props.disabled, false)
+        assert.equal(h.button('Continue with replacement'), undefined)
+      } finally { gate.resolve(noPromotion()); await Promise.all(operations); h.unmount(); useWorkflowRunStore.getState().reset() }
+    })
+  }
+}
+
+test('mounted initial humanoid background hydration leaves Continue and Show usable', async () => {
+  const gate = deferred<HumanoidPromotionSidecarReadResult>()
+  readerPorts.readHumanoidPromotionSidecar = () => gate.promise
+  await useWorkflowRunStore.getState().run(createKimodoWaitWorkflow({ id: 'mounted-hydration' }), [createKimodoAnimateExtension()])
+  const h = await mountCurrentWait()
+  try {
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'paused')
+    assert.equal(useWorkflowRunStore.getState().runningBranchId, null)
+    assert.equal(h.button('Continue degraded')?.props.disabled, false)
+    assert.equal(h.button('Show checkpoint')?.props.disabled, false)
+    assert.equal(h.button('Running…'), undefined)
+    h.act(() => useWorkflowRunStore.getState().setPendingReplacement(humanoidOwner(), editedHumanoidMesh()))
+    assert.equal(h.button('Continue with replacement')?.props.disabled, false)
+  } finally { gate.resolve(noPromotion()); await waitForHumanoidReview(); h.unmount(); useWorkflowRunStore.getState().reset() }
+})
+
+test('mounted cancellation clears busy state and late rejection cannot clear a new current owner', async () => {
+  const ext = createKimodoAnimateExtension(), workflow = createKimodoWaitWorkflow({ id: 'mounted-cancel' }), posts = captureTextRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview()
+  const h = await mountCurrentWait(), old = deferred<HumanoidPromotionSidecarReadResult>()
+  let operation: Promise<void> | undefined
+  try {
+    readerPorts.readHumanoidPromotionSidecar = () => old.promise
+    h.act(() => { operation = useWorkflowRunStore.getState().continueRun('wait-node') })
+    assert.equal(h.button('Running…')?.props.disabled, true)
+    h.act(() => useWorkflowRunStore.getState().cancel())
+    assert.equal(h.button('Running…'), undefined)
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'idle')
+    readerPorts.readHumanoidPromotionSidecar = async () => foundPromotion()
+    await useWorkflowRunStore.getState().run(workflow, [ext]); await waitForHumanoidReview(); h.act(() => {})
+    const owner = humanoidOwner()
+    old.reject(new Error('Old reservation failed')); await operation; h.act(() => {})
+    assert.deepEqual(humanoidOwner(), owner)
+    assert.equal(h.button('Continue manual-confirmed')?.props.disabled, false)
+    assert.equal(useWorkflowRunStore.getState().runningBranchId, null)
+    assert.equal(posts.length, 0)
+  } finally { old.resolve(noPromotion()); await operation; h.unmount(); useWorkflowRunStore.getState().reset() }
 })

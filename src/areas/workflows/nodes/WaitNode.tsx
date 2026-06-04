@@ -3,7 +3,7 @@ import { Handle, Position } from '@xyflow/react'
 import type { ArtifactRef, WFNodeData } from '@shared/types/electron.d'
 import type { ArtifactReplacementReason } from '@shared/types/artifacts'
 import { useWorkflowRunStore, type WorkflowCheckpoint, type WaitState } from '../workflowRunStore'
-import { resolveArtifactReplacement } from '../workflowArtifacts'
+import { resolveArtifactReplacement, sameCheckpointOwner } from '../workflowArtifacts'
 import { useWaitButton } from '../useWaitButton'
 import BaseNode from './BaseNode'
 
@@ -24,6 +24,9 @@ type WaitCheckpointUiState = {
   showSubstitutedContinue: boolean
   substitutedContinueLabel?: string
   rejectionCopy?: string
+  humanoidHeadline?: string
+  humanoidDiagnostics: string[]
+  humanoidReviewHint?: string
 }
 
 const REPLACEMENT_REASON_COPY: Record<ArtifactReplacementReason, string> = {
@@ -66,6 +69,7 @@ export function resolveWaitCheckpointUiState(input: WaitCheckpointUiStateInput):
       showSubstitutedContinue,
       ...(showSubstitutedContinue ? { substitutedContinueLabel: 'Continue with replacement' } : {}),
       rejectionCopy: replacementReasonCopy(checkpoint),
+      humanoidDiagnostics: [],
     }
   }
 
@@ -78,18 +82,25 @@ export function resolveWaitCheckpointUiState(input: WaitCheckpointUiStateInput):
       normalContinueLabel: 'Continue',
       showSubstitutedContinue: false,
       rejectionCopy: replacementReasonCopy(checkpoint),
+      humanoidDiagnostics: [],
     }
   }
+
+  const review = checkpoint?.humanoidReview
+  const humanoidReview = review && sameCheckpointOwner(review.owner, checkpoint.owner) ? review.state : undefined
 
   return {
     isPaused,
     isCheckpoint: true,
     statusLabel: 'Temporary checkpoint',
     description: `Temporary checkpoint${artifactLabel ? `: ${artifactLabel}` : ''}. This preview is not the final output.`,
-    normalContinueLabel: 'Continue',
+    normalContinueLabel: humanoidReview?.continueLabel ?? 'Continue',
     showSubstitutedContinue,
     ...(showSubstitutedContinue ? { substitutedContinueLabel: 'Continue with replacement' } : {}),
     rejectionCopy: replacementReasonCopy(checkpoint),
+    humanoidHeadline: humanoidReview?.headline,
+    humanoidDiagnostics: humanoidReview?.diagnostics ?? [],
+    humanoidReviewHint: humanoidReview?.reviewHint,
   }
 }
 
@@ -136,7 +147,7 @@ export default function WaitNode({ id, data, selected }: { id: string; data: WFN
                 <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor">
                   <polygon points="5 3 19 12 5 21 5 3"/>
                 </svg>
-                {label}
+                {waitState === 'pending' ? checkpointUi.normalContinueLabel : label}
               </>
             )}
           </button>
@@ -172,6 +183,21 @@ export default function WaitNode({ id, data, selected }: { id: string; data: WFN
         <p className="text-[10px] text-zinc-500 italic">
           {checkpointUi.isCheckpoint && checkpointUi.isPaused ? checkpointUi.description : statusText}
         </p>
+        {checkpointUi.humanoidHeadline && (
+          <p className="mt-1.5 text-[10px] font-medium text-cyan-200">
+            {checkpointUi.humanoidHeadline}
+          </p>
+        )}
+        {checkpointUi.humanoidReviewHint && (
+          <p className="mt-1 text-[10px] text-zinc-400">
+            {checkpointUi.humanoidReviewHint}
+          </p>
+        )}
+        {checkpointUi.humanoidDiagnostics.map((diagnostic) => (
+          <p key={diagnostic} className="mt-1 text-[10px] text-zinc-400">
+            {diagnostic}
+          </p>
+        ))}
         {checkpointUi.rejectionCopy && (
           <p className="mt-1.5 text-[10px] text-zinc-400">
             {checkpointUi.rejectionCopy}

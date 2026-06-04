@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isolateAnimationForPoseClipPreview, resolveAnimationAvailability, resolveAnimationToggleState, syncAnimationActions } from './viewerAnimation.ts'
+import * as THREE from 'three'
+import { finishScopedAnimationPlayback, isolateAnimationForPoseClipPreview, resetAnimationPlayback, resolveAnimationAvailability, resolveAnimationToggleState, startGlobalAnimationPlayback, startScopedAnimationPlayback, syncAnimationActions } from './viewerAnimation.ts'
 
 test('resolveAnimationToggleState maps no clips to a disabled no-animation affordance', () => {
   assert.deepEqual(resolveAnimationToggleState({ hasAnimations: false, animationPlaying: false }), {
@@ -109,4 +110,120 @@ test('isolateAnimationForPoseClipPreview keeps a paused GLTF state paused withou
   assert.deepEqual(snapshot, { wasPlaying: false })
   assert.equal(action.enabled, true)
   assert.equal(action.paused, true)
+})
+
+test('resetAnimationPlayback stops, resets, unpauses, disables and rewinds every action before seeking the mixer to time zero', () => {
+  const calls: string[] = []
+  const firstAction = {
+    enabled: true,
+    paused: true,
+    time: 1.25,
+    play() { calls.push('first:play'); return this },
+    stop() { calls.push('first:stop'); return this },
+    reset() { calls.push('first:reset'); return this },
+  }
+  const secondAction = {
+    enabled: true,
+    paused: false,
+    time: 0.5,
+    play() { calls.push('second:play'); return this },
+    stop() { calls.push('second:stop'); return this },
+    reset() { calls.push('second:reset'); return this },
+  }
+  const mixer = {
+    time: 2.75,
+    setTime(timeSeconds: number) {
+      calls.push(`mixer:setTime:${timeSeconds}`)
+      this.time = timeSeconds
+    },
+  }
+
+  const result = resetAnimationPlayback({ actions: [firstAction, secondAction], mixer })
+
+  assert.deepEqual(calls, ['first:stop', 'first:reset', 'second:stop', 'second:reset', 'mixer:setTime:0'])
+  assert.equal(firstAction.enabled, false)
+  assert.equal(firstAction.paused, false)
+  assert.equal(firstAction.time, 0)
+  assert.equal(secondAction.enabled, false)
+  assert.equal(secondAction.paused, false)
+  assert.equal(secondAction.time, 0)
+  assert.equal(mixer.time, 0)
+  assert.deepEqual(result, { resetActionCount: 2, mixerTimeSeconds: 0 })
+})
+
+test('resetAnimationPlayback remains deterministic when actions or mixers only implement part of the Three.js control surface', () => {
+  const action = {
+    enabled: true,
+    paused: true,
+    play() { throw new Error('reset must not replay an action') },
+  }
+  const mixer = { time: 9 }
+
+  const result = resetAnimationPlayback({ actions: [action], mixer })
+
+  assert.equal(action.enabled, false)
+  assert.equal(action.paused, false)
+  assert.equal(mixer.time, 0)
+  assert.deepEqual(result, { resetActionCount: 1, mixerTimeSeconds: 0 })
+})
+
+test('global GLB playback owner can start independently of panel-scoped previews', () => {
+  assert.deepEqual(startGlobalAnimationPlayback({ hasAnimations: true, animationPlaying: false }), {
+    owner: 'global-glb',
+    animationPlaying: true,
+  })
+  assert.deepEqual(startGlobalAnimationPlayback({ hasAnimations: false, animationPlaying: false }), {
+    owner: 'global-glb',
+    animationPlaying: false,
+  })
+})
+
+test('scoped pose and Motion Retarget previews snapshot but do not erase the prior global GLB state', () => {
+  assert.deepEqual(startScopedAnimationPlayback({ owner: 'pose-clip-preview', globalAnimationPlaying: true }), {
+    owner: 'pose-clip-preview',
+    restoreGlobalAnimationPlaying: true,
+  })
+  assert.deepEqual(startScopedAnimationPlayback({ owner: 'motion-retarget-local-preview', globalAnimationPlaying: false }), {
+    owner: 'motion-retarget-local-preview',
+    restoreGlobalAnimationPlaying: false,
+  })
+})
+
+test('finishing a local Motion Retarget preview restores the prior global owner state without permanently disabling playback', () => {
+  assert.deepEqual(finishScopedAnimationPlayback({ owner: 'motion-retarget-local-preview', restoreGlobalAnimationPlaying: true }), {
+    owner: 'global-glb',
+    animationPlaying: true,
+  })
+  assert.deepEqual(finishScopedAnimationPlayback({ owner: 'pose-clip-preview', restoreGlobalAnimationPlaying: false }), {
+    owner: 'global-glb',
+    animationPlaying: false,
+  })
+})
+
+test('real Three actions rewind and release bindings while scoped owner helpers remain immutable snapshots', () => {
+  const root = new THREE.Object3D()
+  root.position.x = 3
+  const mixer = new THREE.AnimationMixer(root)
+  const clip = new THREE.AnimationClip('move', 1, [new THREE.NumberKeyframeTrack('.position[x]', [0, 1], [0, 10])])
+  const sourceValues = [...clip.tracks[0].values]
+  const action = mixer.clipAction(clip).play()
+  mixer.update(0.5)
+  assert.equal(root.position.x, 5)
+  const state = startScopedAnimationPlayback({ owner: 'motion-retarget-local-preview', globalAnimationPlaying: true })
+  assert.equal(action.isRunning(), true, 'Owner snapshots alone must not claim mixer acquisition')
+  isolateAnimationForPoseClipPreview([action], true)
+  assert.equal(action.paused, true)
+  resetAnimationPlayback({ actions: [action], mixer })
+  assert.equal(action.time, 0); assert.equal(action.enabled, false); assert.equal(action.paused, false)
+  assert.equal(action.isScheduled(), false); assert.equal(mixer.time, 0)
+  assert.equal(root.position.x, 3)
+  mixer.update(0.25)
+  assert.equal(root.position.x, 3)
+  assert.deepEqual(finishScopedAnimationPlayback(state), { owner: 'global-glb', animationPlaying: true })
+  assert.deepEqual(state, { owner: 'motion-retarget-local-preview', restoreGlobalAnimationPlaying: true })
+  syncAnimationActions([action], true)
+  mixer.update(0.5)
+  assert.equal(root.position.x, 5)
+  assert.deepEqual([...clip.tracks[0].values], sourceValues)
+  resetAnimationPlayback({ actions: [action], mixer })
 })

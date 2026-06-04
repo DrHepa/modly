@@ -16,7 +16,32 @@ export interface AnimationIsolationSnapshot {
 export interface AnimationActionLike {
   enabled: boolean
   paused: boolean
+  time?: number
   play: () => unknown
+  stop?: () => unknown
+  reset?: () => unknown
+}
+
+export interface AnimationMixerLike {
+  time?: number
+  setTime?: (timeSeconds: number) => unknown
+}
+
+export interface AnimationPlaybackResetResult {
+  resetActionCount: number
+  mixerTimeSeconds: 0
+}
+
+export type AnimationPlaybackOwner = 'global-glb' | 'pose-clip-preview' | 'motion-retarget-local-preview'
+
+export interface GlobalAnimationPlaybackState {
+  owner: 'global-glb'
+  animationPlaying: boolean
+}
+
+export interface ScopedAnimationPlaybackState {
+  owner: Exclude<AnimationPlaybackOwner, 'global-glb'>
+  restoreGlobalAnimationPlaying: boolean
 }
 
 export function resolveAnimationAvailability(animations: readonly unknown[]): boolean {
@@ -62,4 +87,58 @@ export function isolateAnimationForPoseClipPreview(
   }
 
   return { wasPlaying: animationPlaying }
+}
+
+export function resetAnimationPlayback({
+  actions,
+  mixer,
+}: {
+  actions: readonly AnimationActionLike[]
+  mixer?: AnimationMixerLike | null
+}): AnimationPlaybackResetResult {
+  for (const action of actions) {
+    action.stop?.()
+    action.reset?.()
+    action.time = 0
+    action.paused = false
+    action.enabled = false
+  }
+
+  mixer?.setTime?.(0)
+  if (mixer) mixer.time = 0
+
+  return { resetActionCount: actions.length, mixerTimeSeconds: 0 }
+}
+
+export function startGlobalAnimationPlayback({
+  hasAnimations,
+  animationPlaying,
+}: {
+  hasAnimations: boolean
+  animationPlaying: boolean
+}): GlobalAnimationPlaybackState {
+  return {
+    owner: 'global-glb',
+    animationPlaying: hasAnimations ? !animationPlaying : false,
+  }
+}
+
+export function startScopedAnimationPlayback({
+  owner,
+  globalAnimationPlaying,
+}: {
+  owner: ScopedAnimationPlaybackState['owner']
+  globalAnimationPlaying: boolean
+}): ScopedAnimationPlaybackState {
+  return {
+    owner,
+    restoreGlobalAnimationPlaying: globalAnimationPlaying,
+  }
+}
+
+export function finishScopedAnimationPlayback(state: ScopedAnimationPlaybackState): GlobalAnimationPlaybackState {
+  return {
+    owner: 'global-glb',
+    animationPlaying: state.restoreGlobalAnimationPlaying,
+  }
 }

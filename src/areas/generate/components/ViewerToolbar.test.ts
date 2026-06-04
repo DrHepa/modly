@@ -414,6 +414,44 @@ test('ViewerEditToolbar exposes Pose/Clip as a separate right-rail entry that ca
   assert.doesNotMatch(html, /title="Pause animation"/)
 })
 
+test('ViewerEditToolbar exposes Motion Retarget as a separate right-rail entry that can coexist with Rig Editor and Pose/Clip', async () => {
+  const html = await renderToolbarExport('ViewerEditToolbar', {
+    rigEditorControls: {
+      active: false,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenRigEditor: () => undefined,
+    },
+    motionRetargetControls: {
+      active: true,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenMotionRetarget: () => undefined,
+    },
+    poseClipControls: {
+      active: false,
+      summary: {
+        hasRig: true,
+        stats: { boneCount: 3, skinnedMeshCount: 1 },
+        warnings: [],
+      },
+      onOpenPoseClip: () => undefined,
+    },
+  })
+
+  assert.match(html, /aria-label="Viewer edit controls"/)
+  assert.match(html, /title="Open Rig Editor \(3 bones\)"/)
+  assert.match(html, /title="Close Motion Retarget \(3 bones\)"[^>]*aria-label="Close Motion Retarget \(3 bones\)"[^>]*aria-pressed="true"/)
+  assert.match(html, /title="Open Pose\/Clip \(3 bones\)"/)
+  assert.doesNotMatch(html, /title="Play animation"/)
+})
+
 test('ViewerEditToolbar keeps Pose/Clip available as a no-rig empty state without opening Rig Editor', async () => {
   const html = await renderToolbarExport('ViewerEditToolbar', {
     poseClipControls: {
@@ -507,5 +545,48 @@ test('mounted ViewerToolbar preserves view/edit callbacks and refuses disabled o
     assert.equal(mounted.nodes().some(node => node.props['aria-label'] === 'Viewer edit controls'), false)
     assert.equal(mounted.get('No animation clips').props.disabled, true)
     assert.ok(mounted.get('Auto-rotate')); assert.ok(mounted.get('Screenshot'))
+  } finally { mounted.unmount(); await cleanup() }
+})
+
+test('ViewerEditToolbar keeps Motion Retarget available as a no-rig empty state without opening other authoring rails', async () => {
+  const html = await renderToolbarExport('ViewerEditToolbar', {
+    motionRetargetControls: {
+      active: false,
+      summary: {
+        hasRig: false,
+        stats: { boneCount: 0, skinnedMeshCount: 0 },
+        warnings: ['No skeleton bones were found.'],
+      },
+      onOpenMotionRetarget: () => undefined,
+    },
+  })
+
+  assert.match(html, /No rig for Motion Retarget/)
+  assert.match(html, /Load a rigged character to inspect a Kimodo retarget session/)
+  assert.doesNotMatch(html, /Open Rig Editor/)
+  assert.doesNotMatch(html, /Open Pose\/Clip/)
+})
+
+test('mounted Motion Retarget rail preserves checkpoint save controls, separators, toggles and splat exclusion', async () => {
+  const { module, cleanup } = await loadViewerToolbarModule()
+  const calls: string[] = []
+  const summary = { hasRig: true, stats: { boneCount: 3, skinnedMeshCount: 1 }, warnings: [] }
+  const props = { ...baseViewToolbarProps,
+    sceneEditControls: { ...actionableSceneEditControls, onSave: () => calls.push('save') },
+    rigEditorControls: { active: false, summary, onOpenRigEditor: () => calls.push('rig') },
+    motionRetargetControls: { active: false, summary, onOpenMotionRetarget: () => calls.push('motion') },
+    poseClipControls: { active: false, summary, onOpenPoseClip: () => calls.push('pose') } }
+  const mounted = mountComponent(module.ViewerToolbar, props)
+  try {
+    const right = mounted.get('Viewer edit controls')
+    assert.equal(right.children.filter(node => node.props.role === 'separator').length, 4)
+    for (const label of ['Save edited copy', 'Open Rig Editor (3 bones)', 'Open Motion Retarget (3 bones)', 'Open Pose/Clip (3 bones)']) mounted.get(label).props.onClick()
+    assert.deepEqual(calls, ['save', 'rig', 'motion', 'pose'])
+    mounted.update({ ...props, motionRetargetControls: { ...props.motionRetargetControls, active: true }, sceneEditControls: { ...props.sceneEditControls, saving: true } })
+    assert.equal(mounted.get('Close Motion Retarget (3 bones)').props['aria-pressed'], true)
+    mounted.get('Saving edited copy').props.onClick()
+    assert.deepEqual(calls, ['save', 'rig', 'motion', 'pose'])
+    mounted.update({ ...props, showViewModes: false })
+    assert.equal(mounted.nodes().some(node => node.props['aria-label'] === 'Viewer edit controls'), false)
   } finally { mounted.unmount(); await cleanup() }
 })

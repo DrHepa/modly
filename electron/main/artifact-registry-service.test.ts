@@ -242,8 +242,10 @@ test('registers workspace library IPC handlers with structured results', async (
 })
 
 import {
+  downloadWorkspaceArtifact,
   getArtifactSidecarWorkspacePath,
   normalizeWorkspaceArtifactPath,
+  previewWorkspaceArtifact,
   readPoseClipSidecar,
   readRigMetaSidecar,
   readRigRenameSidecar,
@@ -289,6 +291,19 @@ type PoseClipSidecarReader = (request: {
   workspaceDir: string
   sidecarWorkspacePath: string
   legacySidecarWorkspacePath?: string
+  sourceWorkspacePath: string
+}) => Promise<unknown>
+
+type MotionRetargetSidecarWriter = (request: {
+  workspaceDir: string
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  sidecar: unknown
+}) => Promise<unknown>
+
+type MotionRetargetSidecarReader = (request: {
+  workspaceDir: string
+  sidecarWorkspacePath: string
   sourceWorkspacePath: string
 }) => Promise<unknown>
 
@@ -463,6 +478,18 @@ function getPoseClipSidecarReader(): PoseClipSidecarReader {
   return readPoseClipSidecar as PoseClipSidecarReader
 }
 
+function getMotionRetargetSidecarWriter(): MotionRetargetSidecarWriter {
+  const writer = (artifactRegistryService as { writeMotionRetargetSidecar?: unknown }).writeMotionRetargetSidecar
+  assert.equal(typeof writer, 'function', 'artifact registry service must export writeMotionRetargetSidecar')
+  return writer as MotionRetargetSidecarWriter
+}
+
+function getMotionRetargetSidecarReader(): MotionRetargetSidecarReader {
+  const reader = (artifactRegistryService as { readMotionRetargetSidecar?: unknown }).readMotionRetargetSidecar
+  assert.equal(typeof reader, 'function', 'artifact registry service must export readMotionRetargetSidecar')
+  return reader as MotionRetargetSidecarReader
+}
+
 function rigMetaSidecar(overrides: Record<string, unknown> = {}) {
   return {
     schema: 'modly.unirig.rigmeta',
@@ -475,6 +502,80 @@ function rigMetaSidecar(overrides: Record<string, unknown> = {}) {
       bones: {
         'rig:Body|skeleton:0|bone:Hips#0/Head#0': { name: 'Head' },
       },
+    },
+    ...overrides,
+  }
+}
+
+function motionRetargetSidecar<T extends Record<string, unknown> = Record<never, never>>(overrides: T = {} as T) {
+  return {
+    schema: 'modly.motion-retarget',
+    version: 1,
+    createdAt: '2026-05-21T00:00:00.000Z',
+    source: {
+      workspacePath: 'Workflows/checkpoints/source.glb',
+      artifactId: 'mesh-artifact-1',
+      versionId: 'mesh-version-1',
+    },
+    artifact: {
+      extensionId: 'kimodo-soma-rp',
+      nodeId: 'animate-rigged-mesh',
+      workflowId: 'workflow-kimodo-1',
+      workflowNodeId: 'node-kimodo-1',
+      sourceMeshWorkspacePath: 'Workflows/checkpoints/source.glb',
+      previewGlbWorkspacePath: 'Workflows/generated/kimodo/source.preview.glb',
+      animatedGlbWorkspacePath: 'Workflows/generated/kimodo/source.animated.glb',
+      bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
+      metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
+      canonicalMotionArtifactWorkspacePath: 'Workflows/generated/kimodo/source-motion/motion.npz',
+      motionNpzWorkspacePath: 'Workflows/generated/kimodo/source-motion/motion.npz',
+      motionBvhWorkspacePath: 'Workflows/generated/kimodo/source-motion/motion.bvh',
+      diagnostics: {
+        runtimeStatus: 'ok',
+        retargetStatus: 'degraded',
+        animationMappingStatus: 'ok',
+        stabilizationStatus: 'ok',
+        visualQualityStatus: 'warning',
+        sourceKind: 'kimodo-motion-bundle',
+        mappingConfidence: 'medium',
+        retargetErrorCode: null,
+        retargetErrorAliases: [],
+        retargetErrorMessage: null,
+        warnings: ['Root translation is deferred in MVP.'],
+        raw: { warnings: ['Root translation is deferred in MVP.'] },
+      },
+    },
+    sourceBones: [
+      {
+        sourceBoneId: 'source:Hips',
+        label: 'Hips',
+        rawLabel: 'Hips',
+        path: ['Hips'],
+      },
+      {
+        sourceBoneId: 'source:Spine',
+        label: 'Spine',
+        rawLabel: 'Spine',
+        path: ['Hips', 'Spine'],
+        parentSourceBoneId: 'source:Hips',
+      },
+    ],
+    session: {
+      selectedPreview: 'animated-glb',
+      mappings: {
+        'source:Hips': { targetBoneId: 'rig:Body|skeleton:0|bone:Hips#0' },
+        'source:Spine': { targetBoneId: 'rig:Body|skeleton:0|bone:Hips#0/Spine#0' },
+      },
+    },
+    warnings: [
+      'Root translation is deferred in MVP.',
+      'Target bone "Spine" is assigned to multiple source bones.',
+    ],
+    poseClip: {
+      id: 'walk-cycle',
+      name: 'Walk Cycle',
+      durationSeconds: 1.5,
+      fps: 24,
     },
     ...overrides,
   }
@@ -560,12 +661,16 @@ test('registers minimal artifact registry IPC handlers for read and write sideca
     })
 
     assert.deepEqual([...handlers.keys()].sort(), [
+      'workspace:artifact:downloadWorkspaceArtifact',
+      'workspace:artifact:previewWorkspaceArtifact',
+      'workspace:artifact:readMotionRetargetSidecar',
       'workspace:artifact:readPoseClipSidecar',
       'workspace:artifact:readRigMetaSidecar',
       'workspace:artifact:readRigRenameSidecar',
       'workspace:artifact:readSidecar',
       'workspace:artifact:writeEditedSceneArtifact',
       'workspace:artifact:writeLandmarkSidecar',
+      'workspace:artifact:writeMotionRetargetSidecar',
       'workspace:artifact:writePoseClipSidecar',
       'workspace:artifact:writeRigRenameSidecar',
       'workspace:artifact:writeSidecar',
@@ -600,6 +705,102 @@ test('registers minimal artifact registry IPC handlers for read and write sideca
         metadata: { via: 'ipc' },
       },
     })
+  })
+})
+
+test('workspace artifact preview rejects absolute and traversal paths before reading', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    for (const workspacePath of ['/tmp/secret.json', '../secret.json', 'Workflows/../secret.json']) {
+      const result = await previewWorkspaceArtifact({ workspaceDir, workspacePath })
+      assert.equal(result.success, false)
+      assert.match(result.error ?? '', /workspace-relative|absolute|traversal/i)
+    }
+  })
+})
+
+test('workspace artifact preview caps and truncates text previews safely', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows/kimodo/run-1'), { recursive: true })
+    const workspacePath = 'Workflows/kimodo/run-1/metadata.json'
+    await writeFile(path.join(workspaceDir, workspacePath), 'a'.repeat(40), 'utf8')
+
+    const result = await previewWorkspaceArtifact({ workspaceDir, workspacePath, maxBytes: 12 })
+
+    assert.deepEqual(result, {
+      success: true,
+      status: 'text',
+      workspacePath,
+      displayName: 'metadata.json',
+      content: 'aaaaaaaaaaaa',
+      byteLength: 40,
+      truncated: true,
+    })
+  })
+})
+
+test('workspace artifact preview classifies NPZ as binary and GLB as Viewer3D-owned 3D content', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows/kimodo/run-1'), { recursive: true })
+    await writeFile(path.join(workspaceDir, 'Workflows/kimodo/run-1/motion.npz'), new Uint8Array([80, 75, 3, 4]))
+    await writeFile(path.join(workspaceDir, 'Workflows/kimodo/run-1/animated.glb'), new Uint8Array([103, 108, 84, 70]))
+
+    const binaryResult = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'Workflows/kimodo/run-1/motion.npz' })
+    const glbResult = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'Workflows/kimodo/run-1/animated.glb' })
+
+    assert.deepEqual(binaryResult, {
+      success: true,
+      status: 'binary',
+      workspacePath: 'Workflows/kimodo/run-1/motion.npz',
+      displayName: 'motion.npz',
+      byteLength: 4,
+      binaryKind: 'npz',
+      message: 'Binary preview is unavailable for NPZ artifacts. Download the file to inspect it locally.',
+    })
+    assert.deepEqual(glbResult, {
+      success: true,
+      status: '3d-model',
+      workspacePath: 'Workflows/kimodo/run-1/animated.glb',
+      displayName: 'animated.glb',
+      viewerKind: 'glb',
+    })
+  })
+})
+
+test('workspace artifact download copies only after the save target is approved', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows/kimodo/run-1'), { recursive: true })
+    const workspacePath = 'Workflows/kimodo/run-1/metadata.json'
+    const sourcePath = path.join(workspaceDir, workspacePath)
+    await writeFile(sourcePath, '{"ok":true}', 'utf8')
+
+    const canceled = await downloadWorkspaceArtifact({
+      workspaceDir,
+      workspacePath,
+      suggestedName: 'metadata.json',
+      showSaveDialog: async () => ({ canceled: true }),
+    })
+
+    assert.deepEqual(canceled, {
+      success: true,
+      status: 'cancelled',
+      workspacePath,
+    })
+
+    const targetPath = path.join(workspaceDir, 'downloads', 'metadata.json')
+    const saved = await downloadWorkspaceArtifact({
+      workspaceDir,
+      workspacePath,
+      suggestedName: 'metadata.json',
+      showSaveDialog: async () => ({ canceled: false, filePath: targetPath }),
+    })
+
+    assert.deepEqual(saved, {
+      success: true,
+      status: 'saved',
+      workspacePath,
+      targetPath,
+    })
+    assert.equal(await readFile(targetPath, 'utf8'), '{"ok":true}')
   })
 })
 
@@ -1503,6 +1704,242 @@ test('registers pose clip sidecar IPC handlers with recoverable result envelopes
   })
 })
 
+test('writes and reads motion retarget sidecar JSON under Workflows/motion-retarget without mutating source mesh', async () => {
+  const writeMotionRetargetSidecar = getMotionRetargetSidecarWriter()
+  const readMotionRetargetSidecar = getMotionRetargetSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'checkpoints'), { recursive: true })
+    const sourceMesh = path.join(workspaceDir, 'Workflows', 'checkpoints', 'source.glb')
+    await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
+    const sidecarWorkspacePath = 'Workflows/motion-retarget/source-walk.motion-retarget.v1.json'
+    const sidecar = motionRetargetSidecar()
+
+    const writeResult = await writeMotionRetargetSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: sidecar.source.workspacePath,
+      sidecar,
+    })
+    const readResult = await readMotionRetargetSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: sidecar.source.workspacePath,
+    })
+
+    assert.deepEqual(writeResult, { success: true, sidecarWorkspacePath, sidecar })
+    assert.deepEqual(readResult, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+    assert.deepEqual(await readFile(sourceMesh), Buffer.from([0x67, 0x6c, 0x62]))
+  })
+})
+
+test('motion retarget sidecars validate artifact identity and correction payloads', async () => {
+  const writeMotionRetargetSidecar = getMotionRetargetSidecarWriter()
+  const readMotionRetargetSidecar = getMotionRetargetSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/source.glb')
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/other.glb')
+    await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
+    const sidecarWorkspacePath = 'Workflows/motion-retarget/mrt_0123456789abcdef.motion-retarget.v1.json'
+    const sidecar = motionRetargetSidecar({
+      identity: {
+        key: 'mrt_0123456789abcdef',
+        sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+        skeletonContextId: 'rig:Body|skeleton:0',
+        workflowId: 'workflow-kimodo-1',
+        workflowNodeId: 'node-kimodo-1',
+        bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
+        metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
+        artifactWorkspacePath: 'Workflows/generated/kimodo/source.animated.glb',
+      },
+      corrections: {
+        rootTranslationPolicy: 'preserve_scaled_npz',
+        rootMotionScale: 1.5,
+        rootOffset: { x: 0.25, y: 0, z: -0.5 },
+        previewMode: 'after',
+      },
+    })
+
+    const writeResult = await writeMotionRetargetSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: sidecar.source.workspacePath,
+      sidecar,
+    })
+    const readResult = await readMotionRetargetSidecar({ workspaceDir, sidecarWorkspacePath, sourceWorkspacePath: sidecar.source.workspacePath })
+
+    assert.deepEqual(writeResult, { success: true, sidecarWorkspacePath, sidecar })
+    assert.deepEqual(readResult, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+
+    for (const invalidSidecar of [
+      motionRetargetSidecar({ identity: { ...sidecar.identity, key: 'hero' } }),
+      motionRetargetSidecar({ identity: { ...sidecar.identity, sourceWorkspacePath: 'Workflows/checkpoints/other.glb' } }),
+      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootTranslationPolicy: 'basis_override' } }),
+      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootMotionScale: 4 } }),
+      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootOffset: { x: 0, y: Number.POSITIVE_INFINITY, z: 0 } } }),
+    ]) {
+      const invalid = await writeMotionRetargetSidecar({
+        workspaceDir,
+        sidecarWorkspacePath: 'Workflows/motion-retarget/mrt_invalid.motion-retarget.v1.json',
+        sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+        sidecar: invalidSidecar,
+      })
+      assert.equal((invalid as { success?: unknown }).success, false)
+      assert.match(String((invalid as { error?: unknown }).error), /identity|correction|root|finite/i)
+    }
+  })
+})
+
+test('rejects unsafe motion retarget sidecar paths and invalid payloads before writing files', async () => {
+  const writeMotionRetargetSidecar = getMotionRetargetSidecarWriter()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    const unsafeRequests = [
+      { sidecarWorkspacePath: '/tmp/escape.motion-retarget.v1.json', message: /absolute|workspace-relative/i },
+      { sidecarWorkspacePath: 'Workflows/motion-retarget/../escape.motion-retarget.v1.json', message: /traversal/i },
+      { sidecarWorkspacePath: 'Workflows/motion-retarget/..\\escape.motion-retarget.v1.json', message: /traversal/i },
+      { sidecarWorkspacePath: 'Workflows/pose-clips/source.motion-retarget.v1.json', message: /Workflows\/motion-retarget/i },
+      { sidecarWorkspacePath: 'Workflows/motion-retarget/source.json', message: /motion-retarget\.v1\.json/i },
+      { sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json', sourceWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json', message: /source/i },
+    ]
+
+    for (const unsafeRequest of unsafeRequests) {
+      const sourceWorkspacePath = unsafeRequest.sourceWorkspacePath ?? 'Workflows/checkpoints/source.glb'
+      const result = await writeMotionRetargetSidecar({
+        workspaceDir,
+        sidecarWorkspacePath: unsafeRequest.sidecarWorkspacePath,
+        sourceWorkspacePath,
+        sidecar: motionRetargetSidecar({ source: { workspacePath: sourceWorkspacePath } }),
+      })
+
+      assert.equal((result as { success?: unknown }).success, false, unsafeRequest.sidecarWorkspacePath)
+      assert.match(String((result as { error?: unknown }).error), unsafeRequest.message)
+    }
+
+    const invalidSidecars = [
+      { sidecar: motionRetargetSidecar({ schema: 'modly.pose-clip' }), message: /schema/i },
+      { sidecar: motionRetargetSidecar({ source: { workspacePath: 'Workflows/checkpoints/other.glb' } }), message: /source|workspacePath/i },
+      { sidecar: motionRetargetSidecar({ artifact: { extensionId: 'other-extension' } }), message: /artifact|extension/i },
+      { sidecar: motionRetargetSidecar({ session: { selectedPreview: 'wireframe-only' } }), message: /preview|session/i },
+      {
+        sidecar: motionRetargetSidecar({ artifact: { ...motionRetargetSidecar().artifact, previewGlbWorkspacePath: 'Workflows/checkpoints/source.glb' } }),
+        message: /source|previewglbworkspacepath|artifact/i,
+      },
+      {
+        sidecar: motionRetargetSidecar({ artifact: { ...motionRetargetSidecar().artifact, animatedGlbWorkspacePath: 'Workflows/checkpoints/source.glb' } }),
+        message: /source|animatedglbworkspacepath|artifact/i,
+      },
+    ]
+
+    for (const invalid of invalidSidecars) {
+      const result = await writeMotionRetargetSidecar({
+        workspaceDir,
+        sidecarWorkspacePath: 'Workflows/motion-retarget/source-walk.motion-retarget.v1.json',
+        sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+        sidecar: invalid.sidecar,
+      })
+
+      assert.equal((result as { success?: unknown }).success, false)
+      assert.match(String((result as { error?: unknown }).error), invalid.message)
+    }
+  })
+})
+
+test('reads an existing Pose/Clip v1 sidecar unchanged after Motion Retarget additions', async () => {
+  const readPoseClipSidecar = getPoseClipSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'pose-clips'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'checkpoints'), { recursive: true })
+    const sourceMesh = path.join(workspaceDir, 'Workflows', 'checkpoints', 'source.glb')
+    await writeFile(sourceMesh, Buffer.from([0x67, 0x6c, 0x62]))
+
+    const sidecarWorkspacePath = 'Workflows/pose-clips/source-legacy.pose-clip.v1.json'
+    const sidecar = poseClipSidecar({
+      createdAt: '2025-12-01T00:00:00.000Z',
+      clip: { id: 'legacy', name: 'Legacy Clip', durationSeconds: 1, fps: 12 },
+    })
+    const absoluteSidecar = path.join(workspaceDir, ...sidecarWorkspacePath.split('/'))
+    await writeFile(absoluteSidecar, JSON.stringify(sidecar, null, 2), 'utf-8')
+
+    const result = await readPoseClipSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    })
+
+    assert.deepEqual(result, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+    assert.deepEqual(await readFile(sourceMesh), Buffer.from([0x67, 0x6c, 0x62]))
+    assert.equal(await readFile(absoluteSidecar, 'utf-8'), JSON.stringify(sidecar, null, 2))
+  })
+})
+
+test('reads found, not-found, and invalid motion retarget sidecars with source compatibility enforced', async () => {
+  const readMotionRetargetSidecar = getMotionRetargetSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/source.glb')
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/other.glb')
+    await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
+    const sidecarWorkspacePath = 'Workflows/motion-retarget/source-walk.motion-retarget.v1.json'
+    const absoluteSidecar = path.join(workspaceDir, ...sidecarWorkspacePath.split('/'))
+    const sidecar = motionRetargetSidecar()
+    await writeFile(absoluteSidecar, JSON.stringify(sidecar, null, 2), 'utf-8')
+
+    const found = await readMotionRetargetSidecar({ workspaceDir, sidecarWorkspacePath, sourceWorkspacePath: sidecar.source.workspacePath })
+    assert.deepEqual(found, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+
+    const notFoundPath = 'Workflows/motion-retarget/missing.motion-retarget.v1.json'
+    const notFound = await readMotionRetargetSidecar({ workspaceDir, sidecarWorkspacePath: notFoundPath, sourceWorkspacePath: sidecar.source.workspacePath })
+    assert.deepEqual(notFound, { success: true, status: 'not-found', sidecarWorkspacePath: notFoundPath })
+
+    const mismatch = await readMotionRetargetSidecar({ workspaceDir, sidecarWorkspacePath, sourceWorkspacePath: 'Workflows/checkpoints/other.glb' })
+    assert.equal((mismatch as { success?: unknown }).success, false)
+    assert.equal((mismatch as { status?: unknown }).status, 'invalid')
+    assert.match(String((mismatch as { error?: unknown }).error), /source|workspacePath/i)
+  })
+})
+
+test('registers motion retarget sidecar IPC handlers with recoverable result envelopes', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/source.glb')
+    await createRegularSource(workspaceDir, 'Workflows/checkpoints/other.glb')
+    const handlers = new Map<string, (_event: unknown, payload: unknown) => Promise<unknown>>()
+    registerArtifactRegistryIpcHandlers({
+      getWorkspaceDir: () => workspaceDir,
+      ipcMain: {
+        handle(channel, handler) {
+          handlers.set(channel, handler)
+        },
+      },
+    })
+
+    const writeHandler = handlers.get('workspace:artifact:writeMotionRetargetSidecar')
+    const readHandler = handlers.get('workspace:artifact:readMotionRetargetSidecar')
+    assert.ok(writeHandler)
+    assert.ok(readHandler)
+
+    const invalidWrite = await writeHandler(undefined, { sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json' })
+    assert.deepEqual(invalidWrite, { success: false, error: 'Motion retarget sidecar write requires sidecarWorkspacePath, sourceWorkspacePath, and sidecar' })
+
+    const sidecarWorkspacePath = 'Workflows/motion-retarget/source.motion-retarget.v1.json'
+    const sidecar = motionRetargetSidecar()
+    const validWrite = await writeHandler(undefined, {
+      sidecarWorkspacePath,
+      sourceWorkspacePath: sidecar.source.workspacePath,
+      sidecar,
+    })
+    assert.deepEqual(validWrite, { success: true, sidecarWorkspacePath, sidecar })
+
+    const invalidRead = await readHandler(undefined, { sidecarWorkspacePath })
+    assert.deepEqual(invalidRead, { success: false, status: 'invalid', error: 'Motion retarget sidecar read requires sidecarWorkspacePath and sourceWorkspacePath' })
+
+    const validRead = await readHandler(undefined, { sidecarWorkspacePath, sourceWorkspacePath: sidecar.source.workspacePath })
+    assert.deepEqual(validRead, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+  })
+})
+
 test('reads an adjacent UniRig rigmeta sidecar derived from a safe source mesh path', async () => {
   const readRigMetaSidecar = getRigMetaSidecarReader()
 
@@ -1882,7 +2319,7 @@ test('deterministic sidecar updates use collision-safe owned temporary files', (
   assert.deepEqual(await readdir(path.join(workspaceDir, 'collection')), ['mesh.glb.artifact.json'])
 }))
 
-test('all nine artifact IPC handlers reject unknown payloads and coexist with library channels', () => withTempWorkspace(async (workspaceDir) => {
+test('all artifact IPC handlers reject unknown payloads and coexist with library channels', () => withTempWorkspace(async (workspaceDir) => {
   const handlers = new Map<string, (event: unknown, payload?: unknown) => Promise<unknown>>()
   const ipcMain = { handle: (channel: string, handler: (event: unknown, payload?: unknown) => Promise<unknown>) => {
     assert.equal(handlers.has(channel), false, channel)
@@ -1890,7 +2327,7 @@ test('all nine artifact IPC handlers reject unknown payloads and coexist with li
   } }
   registerWorkspaceAssetLibraryIpcHandlers({ ipcMain, getWorkspaceDir: () => workspaceDir })
   registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir: () => workspaceDir })
-  assert.equal(handlers.size, 12)
+  assert.equal(handlers.size, 16)
   for (const [channel, handler] of handlers) {
     if (!channel.startsWith('workspace:artifact:')) continue
     for (const invalid of [null, [], false, 'path', {}]) {
@@ -2268,3 +2705,209 @@ test('rigmeta read keeps supported draft objects and rejects same-target role co
     assert.deepEqual(await readFile(path.join(workspaceDir, sourceWorkspacePath)), sourceBefore)
   })
 })
+
+test('motion persistence confines source and sidecar physical paths including trusted-root aliases', () => withTempWorkspace(async (workspaceDir) => {
+  const request = { workspaceDir, sourceWorkspacePath: 'Workflows/checkpoints/source.glb', sidecarWorkspacePath: 'Workflows/motion-retarget/physical.motion-retarget.v1.json', sidecar: motionRetargetSidecar() }
+  await createRegularSource(workspaceDir, request.sourceWorkspacePath)
+  const output = path.join(workspaceDir, 'Workflows/motion-retarget')
+  const actual = path.join(workspaceDir, 'actual'); await mkdir(actual)
+  await symlink(actual, output)
+  assert.equal((await artifactRegistryService.writeMotionRetargetSidecar(request)).success, false)
+  await rm(output); await mkdir(output)
+  const leaf = path.join(workspaceDir, request.sidecarWorkspacePath)
+  for (const kind of ['link', 'directory']) {
+    if (kind === 'link') await symlink(path.join(actual, 'missing.json'), leaf)
+    else await mkdir(leaf)
+    assert.equal((await artifactRegistryService.writeMotionRetargetSidecar(request)).success, false)
+    assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).success, false)
+    await rm(leaf, { recursive: true })
+  }
+  const source = path.join(workspaceDir, request.sourceWorkspacePath)
+  await rm(source)
+  for (const kind of ['missing', 'link', 'directory']) {
+    if (kind === 'link') await symlink(path.join(actual, 'missing.glb'), source)
+    if (kind === 'directory') await mkdir(source)
+    assert.equal((await artifactRegistryService.writeMotionRetargetSidecar(request)).success, false, kind)
+    assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).success, false, kind)
+    if (kind !== 'missing') await rm(source, { recursive: true })
+  }
+  await createRegularSource(workspaceDir, request.sourceWorkspacePath)
+  const alias = path.join(workspaceDir, 'configured'); await symlink(workspaceDir, alias)
+  const saved = await artifactRegistryService.writeMotionRetargetSidecar({ ...request, workspaceDir: alias })
+  assert.equal(saved.success, true, JSON.stringify(saved))
+  assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).status, 'found')
+}))
+
+test('motion persistence rejects non-finite JSON and serialized owner substitution before creating directories', () => withTempWorkspace(async (workspaceDir) => {
+  const request = { workspaceDir, sourceWorkspacePath: 'Workflows/checkpoints/source.glb', sidecarWorkspacePath: 'Workflows/motion-retarget/finite.motion-retarget.v1.json' }
+  await createRegularSource(workspaceDir, request.sourceWorkspacePath)
+  for (const sidecar of [
+    motionRetargetSidecar({ extra: { metric: Infinity } }),
+    { ...motionRetargetSidecar(), toJSON: () => motionRetargetSidecar({ source: { workspacePath: 'other.glb' } }) },
+  ]) {
+    assert.equal((await artifactRegistryService.writeMotionRetargetSidecar({ ...request, sidecar })).success, false)
+    await assert.rejects(stat(path.join(workspaceDir, 'Workflows/motion-retarget')), { code: 'ENOENT' })
+  }
+}))
+
+test('motion persistence preserves unknown data but rejects contradictory identity paths and context', () => withTempWorkspace(async (workspaceDir) => {
+  const sidecar = motionRetargetSidecar({
+    identity: { key: 'mrt_0123456789abcdef', sourceWorkspacePath: 'Workflows/checkpoints/source.glb', skeletonContextId: 'rig:Body|skeleton:0' },
+    futureExtension: { schema: 'future.motion.v9', statuses: ['vendor-specific'], score: 1.25 },
+  })
+  const request = { workspaceDir, sourceWorkspacePath: sidecar.source.workspacePath, sidecarWorkspacePath: 'Workflows/motion-retarget/context.motion-retarget.v1.json' }
+  await createRegularSource(workspaceDir, request.sourceWorkspacePath)
+  const valid = await artifactRegistryService.writeMotionRetargetSidecar({ ...request, sidecar })
+  assert.equal(valid.success, true, JSON.stringify(valid))
+  assert.deepEqual(valid.sidecar, sidecar)
+  for (const identity of [
+    { ...sidecar.identity, bundleWorkspacePath: '../escape' },
+    { ...sidecar.identity, metadataWorkspacePath: 'different/metadata.json' },
+    { ...sidecar.identity, artifactWorkspacePath: 'different/animated.glb' },
+    { ...sidecar.identity, workflowId: 'different-workflow' },
+  ]) assert.equal((await artifactRegistryService.writeMotionRetargetSidecar({ ...request, sidecar: { ...sidecar, identity } })).success, false)
+  assert.equal((await artifactRegistryService.writeMotionRetargetSidecar({ ...request, sidecar: { ...sidecar, skeletonContextId: 'different-context' } })).success, false)
+  assert.deepEqual(JSON.parse(await readFile(path.join(workspaceDir, request.sidecarWorkspacePath), 'utf8')), sidecar)
+}))
+
+test('motion ownership queue covers physical aliases and preserves foreign or malformed owners', () => withTempWorkspace(async (workspaceDir) => {
+  const sourceA = 'Workflows/checkpoints/source.glb', sourceB = 'Workflows/checkpoints/other.glb'
+  await createRegularSource(workspaceDir, sourceA); await createRegularSource(workspaceDir, sourceB)
+  const alias = path.join(workspaceDir, 'configured'); await symlink(workspaceDir, alias)
+  const sidecarWorkspacePath = 'Workflows/motion-retarget/shared.motion-retarget.v1.json'
+  const make = (sourceWorkspacePath: string, root = workspaceDir) => ({ workspaceDir: root, sidecarWorkspacePath, sourceWorkspacePath, sidecar: motionRetargetSidecar({ source: { workspacePath: sourceWorkspacePath }, artifact: { ...motionRetargetSidecar().artifact, sourceMeshWorkspacePath: sourceWorkspacePath } }) })
+  const concurrent = await Promise.all([artifactRegistryService.writeMotionRetargetSidecar(make(sourceA)), artifactRegistryService.writeMotionRetargetSidecar(make(sourceB, alias))])
+  assert.equal(concurrent.filter((result: { success: boolean }) => result.success).length, 1)
+  const target = path.join(workspaceDir, sidecarWorkspacePath)
+  const owner = JSON.parse(await readFile(target, 'utf8')).source.workspacePath
+  assert.equal((await artifactRegistryService.writeMotionRetargetSidecar(make(owner, alias))).success, true)
+  for (const content of ['{broken', '{}', JSON.stringify(motionRetargetSidecar({ source: { workspacePath: owner }, schema: 'foreign' }))]) {
+    await writeFile(target, content)
+    const rejected = await artifactRegistryService.writeMotionRetargetSidecar(make(owner))
+    assert.equal(rejected.success, false)
+    assert.match(rejected.error, /ownership/i)
+    assert.equal(await readFile(target, 'utf8'), content)
+  }
+  await rm(target)
+  assert.equal((await artifactRegistryService.writeMotionRetargetSidecar(make(owner))).success, true)
+  const { readdir } = await import('node:fs/promises')
+  assert.deepEqual(await readdir(path.dirname(target)), [path.basename(target)])
+}))
+
+test('motion reads distinguish absent sidecars from malformed, non-finite, or physically invalid data', () => withTempWorkspace(async (workspaceDir) => {
+  const request = { workspaceDir, sourceWorkspacePath: 'Workflows/checkpoints/source.glb', sidecarWorkspacePath: 'Workflows/motion-retarget/read.motion-retarget.v1.json' }
+  await createRegularSource(workspaceDir, request.sourceWorkspacePath)
+  assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).status, 'not-found')
+  const target = path.join(workspaceDir, request.sidecarWorkspacePath); await mkdir(path.dirname(target), { recursive: true })
+  for (const content of ['{invalid', JSON.stringify({ ...motionRetargetSidecar(), extra: 'PLACEHOLDER' }).replace('"PLACEHOLDER"', '1e999')]) {
+    await writeFile(target, content)
+    assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).status, 'invalid')
+  }
+  await rm(target); await symlink(path.join(workspaceDir, 'missing'), target)
+  assert.equal((await artifactRegistryService.readMotionRetargetSidecar(request)).status, 'invalid')
+}))
+
+test('workspace preview and download reject symlinks and non-regular sources before a dialog', () => withTempWorkspace(async (workspaceDir) => {
+  await writeFile(path.join(workspaceDir, 'real.json'), '{"private":true}')
+  await symlink(path.join(workspaceDir, 'real.json'), path.join(workspaceDir, 'linked.json'))
+  await mkdir(path.join(workspaceDir, 'directory.glb'))
+  const { execFileSync } = await import('node:child_process')
+  execFileSync('mkfifo', [path.join(workspaceDir, 'pipe.txt')])
+  await symlink(workspaceDir, path.join(workspaceDir, 'inner'))
+  let dialogs = 0
+  for (const workspacePath of ['linked.json', 'directory.glb', 'pipe.txt', 'inner/real.json']) {
+    assert.equal((await previewWorkspaceArtifact({ workspaceDir, workspacePath })).success, false, workspacePath)
+    assert.equal((await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => { dialogs += 1; return { canceled: true } } })).success, false, workspacePath)
+  }
+  assert.equal(dialogs, 0)
+}))
+
+test('workspace preview bounds UTF-8 text bytes and handles empty and binary payloads', () => withTempWorkspace(async (workspaceDir) => {
+  await writeFile(path.join(workspaceDir, 'unicode.txt'), 'é🙂tail')
+  const capped = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'unicode.txt', maxBytes: 3 })
+  assert.equal(capped.success && capped.status, 'text')
+  if (!capped.success || capped.status !== 'text') return
+  assert.equal(capped.content, 'é'); assert.equal(capped.byteLength, 10); assert.equal(capped.truncated, true)
+  await writeFile(path.join(workspaceDir, 'empty.json'), '')
+  const empty = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'empty.json' })
+  assert.equal(empty.success && empty.status === 'text' && empty.content, '')
+  assert.equal(empty.success && empty.status === 'text' && empty.truncated, false)
+  await writeFile(path.join(workspaceDir, 'large.log'), 'x'.repeat(70 * 1024))
+  const bounded = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'large.log', maxBytes: 1e12 })
+  assert.equal(bounded.success && bounded.status === 'text' && Buffer.byteLength(bounded.content), 64 * 1024)
+  await writeFile(path.join(workspaceDir, 'binary.npz'), Buffer.from([80, 75, 0, 255]))
+  const binary = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'binary.npz' })
+  assert.equal(binary.success && binary.status === 'binary' && binary.byteLength, 4)
+}))
+
+test('download revalidates the source after the dialog without mutating approved destinations', () => withTempWorkspace(async (workspaceDir) => {
+  const workspacePath = 'source.json', source = path.join(workspaceDir, workspacePath)
+  const target = path.join(workspaceDir, 'downloads', 'copy.json')
+  await writeFile(source, 'original')
+  const result = await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => {
+    await rm(source); await symlink(path.join(workspaceDir, 'other.json'), source)
+    await writeFile(path.join(workspaceDir, 'other.json'), 'replacement')
+    return { canceled: false, filePath: target }
+  } })
+  assert.equal(result.success, false)
+  await assert.rejects(stat(path.dirname(target)), { code: 'ENOENT' })
+  assert.equal(await readFile(path.join(workspaceDir, 'other.json'), 'utf8'), 'replacement')
+}))
+
+test('download supports approved external copies, side-effect-free cancel, and same-file protections', () => withTempWorkspace(async (workspaceDir) => withTempWorkspace(async (outside) => {
+  const workspacePath = 'source.json', source = path.join(workspaceDir, workspacePath)
+  const bytes = Buffer.from([0, 1, 2, 255, 33]); await writeFile(source, bytes)
+  const target = path.join(outside, 'downloads', 'copy.json')
+  const canceled = await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => ({ canceled: true, filePath: target }) })
+  assert.equal(canceled.success && canceled.status, 'cancelled')
+  await assert.rejects(stat(path.dirname(target)), { code: 'ENOENT' })
+  const saved = await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => ({ canceled: false, filePath: target }) })
+  assert.equal(saved.success, true, JSON.stringify(saved)); assert.deepEqual(await readFile(target), bytes)
+  const { link } = await import('node:fs/promises'); const hardlink = path.join(outside, 'hardlink.json'); await link(source, hardlink)
+  for (const filePath of [source, hardlink]) {
+    assert.equal((await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => ({ canceled: false, filePath }) })).success, false)
+    assert.deepEqual(await readFile(source), bytes)
+  }
+  const linked = path.join(outside, 'linked.json'); await symlink(target, linked)
+  assert.equal((await downloadWorkspaceArtifact({ workspaceDir, workspacePath, showSaveDialog: async () => ({ canceled: false, filePath: linked }) })).success, false)
+  assert.deepEqual(await readFile(source), bytes); assert.deepEqual(await readFile(target), bytes)
+})))
+
+test('download checks the exact native POSIX destination spelling before any directory creation', () => withTempWorkspace(async (workspaceDir) => withTempWorkspace(async (outside) => {
+  if (path.sep !== '/') return
+  const sourceBytes = Buffer.from('source bytes'), victimBytes = Buffer.from('victim bytes')
+  await writeFile(path.join(workspaceDir, 'source.json'), sourceBytes)
+  const victim = path.join(outside, 'victim'); await mkdir(victim)
+  await writeFile(path.join(victim, 'copy.json'), victimBytes)
+  const linked = path.join(outside, 'chosen\\directory'); await symlink(victim, linked)
+  const destination = path.join(linked, 'copy.json')
+  const result = await downloadWorkspaceArtifact({ workspaceDir, workspacePath: 'source.json', showSaveDialog: async () => ({ canceled: false, filePath: destination }) })
+  assert.equal(result.success, false, 'The native destination symlink ancestor must not be rewritten before validation')
+  assert.deepEqual(await readFile(path.join(victim, 'copy.json')), victimBytes)
+  assert.deepEqual(await readFile(path.join(workspaceDir, 'source.json')), sourceBytes)
+  await assert.rejects(stat(path.join(outside, 'chosen')), { code: 'ENOENT' })
+  const { readdir } = await import('node:fs/promises')
+  assert.deepEqual((await readdir(outside)).sort(), ['chosen\\directory', 'victim'])
+})))
+
+test('download preserves legal native POSIX backslashes, percent text and whitespace without an alternate tree', () => withTempWorkspace(async (workspaceDir) => withTempWorkspace(async (outside) => {
+  if (path.sep !== '/') return
+  const { readdir } = await import('node:fs/promises')
+  const sourceBytes = Buffer.alloc(150000, 117); await writeFile(path.join(workspaceDir, 'source.json'), sourceBytes)
+  const directoryNames = ['chosen\\directory', '%2f literal directory', ' spaced directory ']
+  const leaf = ' copy\\%2f.json '
+  for (const name of directoryNames) {
+    const destination = path.join(outside, name, leaf)
+    const result = await downloadWorkspaceArtifact({ workspaceDir, workspacePath: 'source.json', showSaveDialog: async () => ({ canceled: false, filePath: destination }) })
+    assert.deepEqual(result, { success: true, status: 'saved', workspacePath: 'source.json', targetPath: destination })
+    assert.deepEqual(await readFile(destination), sourceBytes)
+    assert.deepEqual(await readdir(path.join(outside, name)), [leaf])
+    // Same spelling also supports an approved atomic replacement.
+    await writeFile(destination, 'old bytes')
+    assert.equal((await downloadWorkspaceArtifact({ workspaceDir, workspacePath: 'source.json', showSaveDialog: async () => ({ canceled: false, filePath: destination }) })).success, true)
+    assert.deepEqual(await readFile(destination), sourceBytes)
+    assert.deepEqual(await readdir(path.join(outside, name)), [leaf])
+  }
+  assert.deepEqual((await readdir(outside)).sort(), directoryNames.sort())
+  assert.deepEqual(await readFile(path.join(workspaceDir, 'source.json')), sourceBytes)
+})))

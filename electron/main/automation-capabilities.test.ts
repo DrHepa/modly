@@ -32,6 +32,58 @@ test('parseExtensionManifest preserves legacy process nodes with default non-int
   })
 })
 
+test('parseExtensionManifest uses input_contract metadata for legacy string inputs', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'kimodo-soma-rp',
+      type: 'model',
+      nodes: [{
+        id: 'animate-rigged-mesh',
+        name: 'Animate Rigged Mesh',
+        input: 'text',
+        output: 'mesh',
+        inputs: ['text', 'mesh'],
+        input_contract: [
+          { name: 'prompt', label: 'Prompt', type: 'text', required: true },
+          { name: 'rigged_mesh', label: 'Rigged Mesh', type: 'mesh', required: true },
+        ],
+      }],
+    },
+    'kimodo-soma-rp',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'prompt', label: 'Prompt', type: 'text', required: true },
+    { name: 'rigged_mesh', label: 'Rigged Mesh', type: 'mesh', required: true },
+  ])
+})
+
+test('parseExtensionManifest falls back to stable typed ports for legacy string inputs without input_contract', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'legacy-multi-inputs',
+      type: 'model',
+      nodes: [{
+        id: 'compose',
+        name: 'Compose',
+        input: 'text',
+        output: 'mesh',
+        inputs: ['text', 'mesh'],
+      }],
+    },
+    'legacy-multi-inputs',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'text', type: 'text', required: true },
+    { name: 'mesh', type: 'mesh', required: true },
+  ])
+})
+
 test('parseExtensionManifest accepts declarative interactive checkpoint and substitution metadata without making it headless', () => {
   const extension = parseExtensionManifest(
     {

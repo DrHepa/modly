@@ -75,6 +75,15 @@ export type ProcessPort = {
   required?: boolean
 }
 
+type ProcessPortType = ProcessPort['type']
+
+type LegacyProcessPortContract = {
+  name?: string
+  label?: string
+  type?: ProcessPortType
+  required?: boolean
+}
+
 type AutomationUiOnlyCapability = {
   kind: 'ui_only'
   source: 'ui-only'
@@ -189,14 +198,15 @@ export type ParsedManifest = {
     name?: string
     input?: 'mesh' | 'image' | 'text'
     output?: 'mesh' | 'image' | 'text'
-    inputs?: ProcessPort[]
-      params_schema?: unknown[]
-      hf_repo?: string
-      download_check?: string
-      hf_skip_prefixes?: string[]
-      weight_owner_id?: string
-      automation?: PartialCapabilityAutomationMetadata
-    }[]
+    inputs?: Array<ProcessPort | ProcessPortType>
+    input_contract?: LegacyProcessPortContract[]
+    params_schema?: unknown[]
+    hf_repo?: string
+    download_check?: string
+    hf_skip_prefixes?: string[]
+    weight_owner_id?: string
+    automation?: PartialCapabilityAutomationMetadata
+  }[]
 }
 
 export type ListedExtensionNode = {
@@ -259,15 +269,48 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
   }
 }
 
-function normalizeProcessPorts(inputs: ProcessPort[] | undefined): ProcessPort[] | undefined {
+function isProcessPortType(value: unknown): value is ProcessPortType {
+  return value === 'image' || value === 'text' || value === 'mesh'
+}
+
+function normalizeLegacyProcessPort(
+  inputType: ProcessPortType,
+  contract: LegacyProcessPortContract | undefined,
+): ProcessPort {
+  const contractType = isProcessPortType(contract?.type) ? contract.type : undefined
+  const type = contractType === inputType ? contractType : inputType
+  const fallbackName = contract?.name?.trim() || type
+  const fallbackLabel = contract?.label?.trim()
+
+  return {
+    name: fallbackName,
+    ...(fallbackLabel ? { label: fallbackLabel } : {}),
+    type,
+    required: contract?.required ?? true,
+  }
+}
+
+function normalizeProcessPorts(
+  inputs: Array<ProcessPort | ProcessPortType> | undefined,
+  inputContract: LegacyProcessPortContract[] | undefined,
+): ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return undefined
 
-  return inputs.map((input) => ({
-    name: input.name,
-    ...(input.label ? { label: input.label } : {}),
-    type: input.type,
-    required: input.required ?? true,
-  }))
+  return inputs
+    .map((input, index) => {
+      if (typeof input === 'string') {
+        if (!isProcessPortType(input)) return undefined
+        return normalizeLegacyProcessPort(input, inputContract?.[index])
+      }
+
+      return {
+        name: input.name,
+        ...(input.label ? { label: input.label } : {}),
+        type: input.type,
+        required: input.required ?? true,
+      }
+    })
+    .filter((input): input is ProcessPort => Boolean(input))
 }
 
 type ListedExtensionCommon = {
@@ -364,7 +407,7 @@ export function parseExtensionManifest(
   }
 
   const nodes = (parsed.nodes ?? []).map((node) => {
-    const normalizedInputs = normalizeProcessPorts(node.inputs)
+    const normalizedInputs = normalizeProcessPorts(node.inputs, node.input_contract)
     const capabilityId = `${extensionId}/${node.id}`
     const ownerId = node.weight_owner_id ?? node.id
     const weightOwnerId = `${extensionId}/${ownerId}`

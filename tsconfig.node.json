@@ -20,6 +20,7 @@
     "src/areas/workflows/nodes/mesh-exporter/output-path.ts",
     "src/areas/generate/kimodoMotionAdapter.ts",
     "src/areas/generate/motionRetargetPlan.ts",
+    "src/areas/generate/poseClipPlan.ts",
     "src/areas/generate/rigSkeleton.ts"
   ]
 }

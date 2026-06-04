@@ -5,8 +5,9 @@ import {
   buildPoseClipSidecarV1,
   clampPoseClipTime,
   createPoseClipCaptureKeyframeId,
-  createLegacyPoseClipSidecarWorkspacePath,
+  deriveKimodoPoseClipCompanionV1,
   createPoseClipDuplicateKeyframeId,
+  createLegacyPoseClipSidecarWorkspacePath,
   createPoseClipPlan,
   createPoseClipSidecarWorkspacePath,
   hydratePoseClipPlanFromSidecar,
@@ -16,6 +17,7 @@ import {
   type PoseClipPlanAction,
   type PoseClipSidecarV1,
 } from './poseClipPlan.ts'
+import type { KimodoMotionArtifact } from './kimodoMotionAdapter.ts'
 import type { RigSkeletonSummary } from './rigSkeleton.ts'
 
 const rigSummary: RigSkeletonSummary = {
@@ -562,4 +564,232 @@ test('createPoseClipCaptureKeyframeId is deterministic from bone, time and frame
   assert.equal(createPoseClipCaptureKeyframeId(plan, 'bone:left-arm', 0.5), 'kf-bone-left-arm-t0p500-f12-2')
   assert.equal(createPoseClipCaptureKeyframeId(plan, 'bone:right-arm', 0.5), 'kf-bone-right-arm-t0p500-f12-1')
   assert.deepEqual(plan, before)
+})
+
+function createKimodoArtifactForCompanion(raw: Record<string, unknown>): KimodoMotionArtifact {
+  return {
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    sourceMeshWorkspacePath: rigSummary.sourceWorkspacePath,
+    previewGlbWorkspacePath: 'Workflows/kimodo/run-1/preview.glb',
+    animatedGlbWorkspacePath: 'Workflows/kimodo/run-1/animated.glb',
+    bundleWorkspacePath: 'Workflows/kimodo/run-1',
+    metadataWorkspacePath: 'Workflows/kimodo/run-1/metadata.json',
+    diagnostics: {
+      runtimeStatus: 'success',
+      retargetStatus: 'success',
+      animationMappingStatus: 'trusted_contract',
+      stabilizationStatus: 'not_evaluated',
+      visualQualityStatus: 'warning',
+      sourceKind: 'load_mesh_existing',
+      mappingConfidence: 'compatible',
+      retargetErrorCode: null,
+      retargetErrorAliases: [],
+      retargetErrorMessage: null,
+      warnings: [],
+      raw,
+    },
+  }
+}
+
+test('deriveKimodoPoseClipCompanionV1 builds an additive v1 sidecar only from compatible RigBoneId quaternion payloads', () => {
+  const result = deriveKimodoPoseClipCompanionV1({
+    summary: rigSummary,
+    artifact: {
+      ...createKimodoArtifactForCompanion({ clip_name: 'Kimodo Walk Forward' }),
+      motionRetarget: {
+        status: 'parsed',
+        diagnostics: [],
+        clipName: 'Kimodo Walk Forward',
+        sourceContract: { schema: 'modly.humanoid.v1', trusted: true },
+        mappingStatus: 'trusted_manual',
+        mappingConfidence: 'compatible',
+        fps: 30,
+        durationSeconds: 1.5,
+        timeSemantics: 'seconds',
+        sourceBones: [{ sourceBoneId: 'src:hips', label: 'Source Hips', rawLabel: 'Hips' }],
+        targetTracks: [
+          {
+            targetNodeName: 'Hips',
+            targetNodeIndex: 0,
+            rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }],
+          },
+          {
+            targetNodeName: 'Arm',
+            targetNodeIndex: 1,
+            rotations: [{ timeSeconds: 0.5, x: 0, y: 0.3826834, z: 0, w: 0.9238795 }],
+          },
+        ],
+      },
+    },
+    createdAt: '2026-05-21T18:00:00.000Z',
+  })
+
+  assert.equal(result.available, true)
+  assert.deepEqual(result.warnings, [])
+  assert.equal(result.sidecarWorkspacePath, 'Workflows/pose-clips/hero-character.kimodo-walk-forward.kimodo-companion.pose-clip.v1.json')
+  assert.notEqual(result.sidecarWorkspacePath, createPoseClipSidecarWorkspacePath(rigSummary.sourceWorkspacePath!))
+  assert.deepEqual(result.sidecar, {
+    schema: 'modly.pose-clip',
+    version: 1,
+    createdAt: '2026-05-21T18:00:00.000Z',
+    source: { workspacePath: 'Workflows/generated/hero character.glb', artifactId: undefined, versionId: undefined },
+    skeletonContextId: 'rig:Hero_Mesh|skeleton:0',
+    clip: { id: 'kimodo-walk-forward', name: 'Kimodo Walk Forward', durationSeconds: 1.5, fps: 30 },
+    skeleton: {
+      rootBoneIds: ['bone:hips'],
+      boneCount: 3,
+      bones: [
+        { boneId: 'bone:hips', label: 'Hips', originalName: 'Hips', path: ['Hips'] },
+        { boneId: 'bone:left-arm', label: 'Arm', originalName: 'Arm', path: ['Hips', 'Arm'] },
+        { boneId: 'bone:right-arm', label: 'Arm', originalName: 'Arm', path: ['Hips', 'Arm'] },
+      ],
+    },
+    keyframes: [
+      {
+        id: 'kimodo-bone-hips-f0',
+        timeSeconds: 0,
+        boneId: 'bone:hips',
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      {
+        id: 'kimodo-bone-left-arm-f15',
+        timeSeconds: 0.5,
+        boneId: 'bone:left-arm',
+        rotation: { x: 0, y: 0.3826834, z: 0, w: 0.9238795 },
+      },
+    ],
+  })
+})
+
+test('deriveKimodoPoseClipCompanionV1 keeps existing Pose/Clip v1 readability by exporting rotation-only keyframes and ignoring source-mutation metadata', () => {
+  const artifact: KimodoMotionArtifact = {
+    ...createKimodoArtifactForCompanion({
+      clip_name: 'Kimodo Safe',
+      pose_clip_companion: { bind_pose: { should_not: 'persist' }, weights: { should_not: 'persist' } },
+    }),
+    motionRetarget: {
+      status: 'parsed',
+      diagnostics: [],
+      clipName: 'Kimodo Safe',
+      sourceContract: { schema: 'modly.humanoid.v1', trusted: true },
+      mappingStatus: 'trusted_manual',
+      mappingConfidence: 'compatible',
+      fps: 24,
+      durationSeconds: 1,
+      timeSemantics: 'seconds',
+      sourceBones: [],
+      targetTracks: [
+        {
+          targetNodeName: 'Hips',
+          targetNodeIndex: 0,
+          rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }],
+        },
+      ],
+    },
+  }
+  const artifactBefore = structuredClone(artifact)
+
+  const result = deriveKimodoPoseClipCompanionV1({
+    summary: rigSummary,
+    artifact,
+    createdAt: '2026-05-21T18:30:00.000Z',
+  })
+
+  assert.equal(result.available, true)
+  assert.deepEqual(result.sidecar?.keyframes, [
+    {
+      id: 'kimodo-bone-hips-f0',
+      timeSeconds: 0,
+      boneId: 'bone:hips',
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+    },
+  ])
+  assert.equal(JSON.stringify(result.sidecar).includes('translation'), false)
+  assert.equal(JSON.stringify(result.sidecar).includes('scale'), false)
+  assert.equal(JSON.stringify(result.sidecar).includes('bind_pose'), false)
+  assert.equal(JSON.stringify(result.sidecar).includes('weights'), false)
+  assert.equal(JSON.stringify(result.sidecar).includes('materials'), false)
+  assert.equal(JSON.stringify(result.sidecar).includes('source_transform'), false)
+  assert.deepEqual(artifact, artifactBefore)
+})
+
+test('deriveKimodoPoseClipCompanionV1 fails closed with a clear warning when compatible RigBoneId quaternion data is missing or malformed', () => {
+  const missingQuaternion = deriveKimodoPoseClipCompanionV1({
+    summary: rigSummary,
+    artifact: createKimodoArtifactForCompanion({}),
+  })
+
+  assert.equal(missingQuaternion.available, false)
+  assert.equal(missingQuaternion.sidecar, undefined)
+  assert.equal(missingQuaternion.sidecarWorkspacePath, undefined)
+  assert.match(missingQuaternion.warnings.join('\n'), /translated quaternion payload/i)
+
+  const unknownBone = deriveKimodoPoseClipCompanionV1({
+    summary: rigSummary,
+    artifact: {
+      ...createKimodoArtifactForCompanion({ clip_name: 'Kimodo Invalid Bone' }),
+      motionRetarget: {
+        status: 'parsed',
+        diagnostics: [],
+        clipName: 'Kimodo Invalid Bone',
+        sourceContract: { schema: 'modly.humanoid.v1', trusted: true },
+        mappingStatus: 'trusted_manual',
+        mappingConfidence: 'compatible',
+        fps: 24,
+        durationSeconds: 1,
+        timeSemantics: 'seconds',
+        sourceBones: [],
+        targetTracks: [
+          {
+            targetNodeName: 'Arm',
+            targetNodeIndex: 99,
+            targetRole: 'right_arm',
+            rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }],
+          },
+        ],
+      },
+    },
+  })
+
+  assert.equal(unknownBone.available, false)
+  assert.match(unknownBone.warnings.join('\n'), /role mismatch/i)
+})
+
+test('deriveKimodoPoseClipCompanionV1 exports partial rotation-only tracks with explicit unresolved-track warnings', () => {
+  const result = deriveKimodoPoseClipCompanionV1({
+    summary: {
+      ...rigSummary,
+      bones: rigSummary.bones.map((bone, index) => ({
+        ...bone,
+        nodeIndex: 50 + index,
+        role: bone.boneId === 'bone:hips' ? 'hips' : bone.boneId === 'bone:left-arm' ? 'left_arm' : 'right_arm',
+      })),
+    },
+    artifact: {
+      ...createKimodoArtifactForCompanion({ clip_name: 'Kimodo Partial Walk' }),
+      motionRetarget: {
+        status: 'parsed',
+        diagnostics: [],
+        clipName: 'Kimodo Partial Walk',
+        sourceContract: { schema: 'modly.humanoid-promotion.v1', trusted: false, status: 'manual_confirmed', sidecarPayloadSha256: 'hash', sidecarWorkspacePath: 'Workflows/kimodo/run-1/manual.json' },
+        mappingStatus: 'manual_confirmed',
+        mappingConfidence: 'compatible',
+        fps: 24,
+        durationSeconds: 1,
+        timeSemantics: 'seconds',
+        sourceBones: [],
+        targetTracks: [
+          { targetNodeName: 'Hips', targetNodeIndex: 0, targetRole: 'hips', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+          { targetNodeName: 'missing_finger', targetNodeIndex: 999, targetRole: 'left_index_1', rotations: [{ timeSeconds: 0, x: 0, y: 0.1, z: 0, w: 0.99 }] },
+        ],
+      },
+    },
+    createdAt: '2026-05-24T10:00:00.000Z',
+  })
+
+  assert.equal(result.available, true)
+  assert.deepEqual(result.sidecar?.keyframes.map((keyframe) => keyframe.boneId), ['bone:hips'])
+  assert.match(result.warnings.join('\n'), /missing local target/i)
+  assert.equal(JSON.stringify(result.sidecar).includes('translation'), false)
 })

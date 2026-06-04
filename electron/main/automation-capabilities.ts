@@ -88,6 +88,13 @@ export type ProcessPort = {
   required?: boolean
 }
 
+type LegacyProcessPortContract = {
+  name?: string
+  label?: string
+  type?: string
+  required?: boolean
+}
+
 type AutomationUiOnlyCapability = {
   kind: 'ui_only'
   source: 'ui-only'
@@ -203,6 +210,7 @@ export type ParsedManifest = {
     name?:             string
     input?:            string
     inputs?:           string[] | ProcessPort[]
+    input_contract?:   LegacyProcessPortContract[]
     input_labels?:     string[]
     output?:           string
     params_schema?:    unknown[]
@@ -221,9 +229,29 @@ export type ParsedManifest = {
 
 export type ListedExtensionNode = ReturnType<typeof parseExtensionManifest>['nodes'][number]
 
-function normalizeProcessPorts(inputs: string[] | ProcessPort[] | undefined): string[] | ProcessPort[] | undefined {
+function normalizeProcessPorts(
+  inputs: string[] | ProcessPort[] | undefined,
+  inputContract: LegacyProcessPortContract[] | undefined,
+): string[] | ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return inputs
-  if (inputs.every((input): input is string => typeof input === 'string')) return [...inputs]
+  if (inputs.every((input): input is string => typeof input === 'string')) {
+    // Naming changes routing authority: opt in only when every slot is unambiguous.
+    if (!Array.isArray(inputContract) || inputContract.length !== inputs.length) return [...inputs]
+    const names = new Set<string>()
+    const ports: ProcessPort[] = []
+    for (const [index, type] of inputs.entries()) {
+      const contract = inputContract[index]
+      if (!contract || typeof contract !== 'object' || Array.isArray(contract)
+        || typeof contract.name !== 'string'
+        || (contract.required != null && typeof contract.required !== 'boolean')) return [...inputs]
+      const name = contract.name.trim()
+      if (!name || names.has(name)) return [...inputs]
+      names.add(name)
+      const label = typeof contract.label === 'string' ? contract.label.trim() : ''
+      ports.push({ name, ...(label ? { label } : {}), type, required: contract.required ?? true })
+    }
+    return ports
+  }
   return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
 }
 
@@ -381,7 +409,7 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
       id:             nodeId,
       name:           n.name ?? n.id,
       input:          n.input  ?? 'image' as const,
-      inputs:         normalizeProcessPorts(n.inputs),
+      inputs:         normalizeProcessPorts(n.inputs, n.input_contract),
       inputLabels:    n.input_labels,
       output:         n.output ?? 'mesh'  as const,
       paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],

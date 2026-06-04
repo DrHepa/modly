@@ -1,7 +1,7 @@
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve as resolvePath } from 'node:path'
 
-import type { ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../src/shared/types/electron.d'
+import type { ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
 
 const SIDECAR_SUFFIX = '.artifact.json'
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
@@ -9,6 +9,8 @@ const LANDMARK_SIDECAR_PREFIX = 'Workflows/landmarks/'
 const LANDMARK_SIDECAR_SUFFIX = '.landmarks.v1.json'
 const RIG_RENAME_SIDECAR_PREFIX = 'Workflows/rig-edits/'
 const RIG_RENAME_SIDECAR_SUFFIX = '.rig.v1.json'
+const MOTION_RETARGET_SIDECAR_PREFIX = 'Workflows/motion-retarget/'
+const MOTION_RETARGET_SIDECAR_SUFFIX = '.motion-retarget.v1.json'
 const POSE_CLIP_SIDECAR_PREFIX = 'Workflows/pose-clips/'
 const POSE_CLIP_SIDECAR_SUFFIX = '.pose-clip.v1.json'
 const RIGMETA_MESH_EXTENSION_PATTERN = /\.(glb|gltf)$/i
@@ -69,6 +71,17 @@ export interface PoseClipSidecarReadServiceRequest {
   sourceWorkspacePath: string
 }
 
+export interface MotionRetargetSidecarWriteServiceRequest extends Omit<MotionRetargetSidecarWriteRequest, 'sidecar'> {
+  workspaceDir: string
+  sidecar: unknown
+}
+
+export interface MotionRetargetSidecarReadServiceRequest {
+  workspaceDir: string
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+}
+
 export interface RigMetaSidecarReadServiceRequest {
   workspaceDir: string
   sourceWorkspacePath: string
@@ -121,6 +134,10 @@ export type PoseClipSidecarWriteResult =
       error: string
     }
 
+export type LocalMotionRetargetSidecarReadResult = MotionRetargetSidecarReadResult
+
+export type LocalMotionRetargetSidecarWriteResult = MotionRetargetSidecarWriteResult
+
 export interface ArtifactRegistryIpcMainLike {
   handle(channel: string, handler: (event: unknown, payload: unknown) => Promise<unknown>): void
 }
@@ -128,6 +145,19 @@ export interface ArtifactRegistryIpcMainLike {
 export interface ArtifactRegistryIpcRegistrationDeps {
   ipcMain: ArtifactRegistryIpcMainLike
   getWorkspaceDir: () => string
+  showSaveDialog?: (options: { defaultPath?: string, title?: string }) => Promise<{ canceled: boolean, filePath?: string }>
+}
+
+export interface WorkspaceArtifactPreviewServiceRequest extends WorkspaceArtifactPreviewRequest {
+  workspaceDir: string
+  maxBytes?: number
+}
+
+export interface WorkspaceArtifactDownloadServiceRequest {
+  workspaceDir: string
+  workspacePath: string
+  suggestedName?: string
+  showSaveDialog: (options: { defaultPath?: string, title?: string }) => Promise<{ canceled: boolean, filePath?: string }>
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -314,6 +344,40 @@ function parsePoseClipSidecarReadPayload(payload: unknown, workspaceDir: string)
   }
 }
 
+function parseMotionRetargetSidecarPayload(payload: unknown, workspaceDir: string): MotionRetargetSidecarWriteServiceRequest {
+  if (
+    !isRecord(payload)
+    || typeof payload.sidecarWorkspacePath !== 'string'
+    || typeof payload.sourceWorkspacePath !== 'string'
+    || !isRecord(payload.sidecar)
+  ) {
+    throw new Error('Motion retarget sidecar write requires sidecarWorkspacePath, sourceWorkspacePath, and sidecar')
+  }
+
+  return {
+    workspaceDir,
+    sidecarWorkspacePath: payload.sidecarWorkspacePath,
+    sourceWorkspacePath: payload.sourceWorkspacePath,
+    sidecar: payload.sidecar,
+  }
+}
+
+function parseMotionRetargetSidecarReadPayload(payload: unknown, workspaceDir: string): MotionRetargetSidecarReadServiceRequest {
+  if (
+    !isRecord(payload)
+    || typeof payload.sidecarWorkspacePath !== 'string'
+    || typeof payload.sourceWorkspacePath !== 'string'
+  ) {
+    throw new Error('Motion retarget sidecar read requires sidecarWorkspacePath and sourceWorkspacePath')
+  }
+
+  return {
+    workspaceDir,
+    sidecarWorkspacePath: payload.sidecarWorkspacePath,
+    sourceWorkspacePath: payload.sourceWorkspacePath,
+  }
+}
+
 function parseRigMetaSidecarReadPayload(payload: unknown, workspaceDir: string): RigMetaSidecarReadServiceRequest {
   if (!isRecord(payload) || typeof payload.sourceWorkspacePath !== 'string') {
     throw new Error('Rigmeta sidecar read requires sourceWorkspacePath')
@@ -322,6 +386,34 @@ function parseRigMetaSidecarReadPayload(payload: unknown, workspaceDir: string):
   return {
     workspaceDir,
     sourceWorkspacePath: payload.sourceWorkspacePath,
+  }
+}
+
+function parseWorkspaceArtifactPreviewPayload(payload: unknown, workspaceDir: string): WorkspaceArtifactPreviewServiceRequest {
+  if (!isRecord(payload) || typeof payload.workspacePath !== 'string') {
+    throw new Error('Workspace artifact preview requires workspacePath')
+  }
+
+  return {
+    workspaceDir,
+    workspacePath: payload.workspacePath,
+  }
+}
+
+function parseWorkspaceArtifactDownloadPayload(
+  payload: unknown,
+  workspaceDir: string,
+  showSaveDialog: WorkspaceArtifactDownloadServiceRequest['showSaveDialog'],
+): WorkspaceArtifactDownloadServiceRequest {
+  if (!isRecord(payload) || typeof payload.workspacePath !== 'string') {
+    throw new Error('Workspace artifact download requires workspacePath')
+  }
+
+  return {
+    workspaceDir,
+    workspacePath: payload.workspacePath,
+    suggestedName: typeof payload.suggestedName === 'string' ? payload.suggestedName : undefined,
+    showSaveDialog,
   }
 }
 
@@ -338,6 +430,21 @@ function assertEditedArtifactPathExtensions(glbWorkspacePath: string, sidecarWor
   if (!sidecarWorkspacePath.endsWith('.json')) {
     throw new Error('Edited scene artifact sidecar path must end with .json')
   }
+}
+
+function resolveWorkspaceArtifactExtension(workspacePath: string): string {
+  const filename = basename(workspacePath).toLowerCase()
+  const match = filename.match(/\.([a-z0-9]+)$/i)
+  return match?.[1] ?? ''
+}
+
+function isWorkspaceArtifactTextPreviewExtension(extension: string): boolean {
+  return new Set(['json', 'bvh', 'txt', 'log', 'md', 'csv', 'yaml', 'yml']).has(extension)
+}
+
+function resolveWorkspaceArtifactBinaryKind(extension: string): string {
+  if (extension === 'npz') return 'npz'
+  return extension || 'binary'
 }
 
 function assertEditedArtifactPrefix(glbWorkspacePath: string, sidecarWorkspacePath: string): void {
@@ -379,6 +486,15 @@ function isLegacyBasenamePoseClipSidecarPath(sidecarWorkspacePath: string, sourc
   const sidecarStem = sidecarName.slice(0, -POSE_CLIP_SIDECAR_SUFFIX.length)
   const sourceName = basename(sourceWorkspacePath).replace(/\.[^.]+$/, '')
   return sidecarStem === sourceName
+}
+
+function assertMotionRetargetSidecarPath(sidecarWorkspacePath: string): void {
+  if (!sidecarWorkspacePath.startsWith(MOTION_RETARGET_SIDECAR_PREFIX)) {
+    throw new Error('Motion retarget sidecar path must stay under Workflows/motion-retarget/')
+  }
+  if (!sidecarWorkspacePath.endsWith(MOTION_RETARGET_SIDECAR_SUFFIX)) {
+    throw new Error('Motion retarget sidecar path must end with .motion-retarget.v1.json')
+  }
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -569,6 +685,146 @@ function validatePoseClipSidecarV1Payload(value: unknown, sourceWorkspacePath: s
   }
 
   return errors
+}
+
+function validateMotionRetargetSidecarV1Payload(value: unknown, sourceWorkspacePath: string): string[] {
+  if (!isRecord(value)) return ['invalid_sidecar']
+
+  const errors: string[] = []
+  if (value.schema !== 'modly.motion-retarget') errors.push('invalid_schema')
+  if (value.version !== 1) errors.push('invalid_version')
+  if (typeof value.createdAt !== 'string' || value.createdAt.length === 0) errors.push('invalid_created_at')
+
+  if (!isRecord(value.source)) {
+    errors.push('invalid_source')
+  } else {
+    if (value.source.workspacePath !== sourceWorkspacePath) errors.push('invalid_source_workspacePath')
+    if (value.source.artifactId !== undefined && typeof value.source.artifactId !== 'string') errors.push('invalid_source_artifact_id')
+    if (value.source.versionId !== undefined && typeof value.source.versionId !== 'string') errors.push('invalid_source_version_id')
+  }
+
+  if (value.identity !== undefined) {
+    if (!isRecord(value.identity)) {
+      errors.push('invalid_identity')
+    } else {
+      if (typeof value.identity.key !== 'string' || !/^mrt_[a-f0-9]{16}$/.test(value.identity.key)) errors.push('invalid_identity_key')
+      if (value.identity.sourceWorkspacePath !== sourceWorkspacePath) errors.push('invalid_identity_source_workspacePath')
+      if (typeof value.identity.skeletonContextId !== 'string' || value.identity.skeletonContextId.length === 0) errors.push('invalid_identity_skeleton')
+      for (const key of ['workflowId', 'workflowNodeId', 'bundleWorkspacePath', 'metadataWorkspacePath', 'artifactWorkspacePath'] as const) {
+        const identityValue = value.identity[key]
+        if (identityValue !== undefined && typeof identityValue !== 'string') errors.push(`invalid_identity_${key}`)
+      }
+    }
+  }
+
+  if (!isRecord(value.artifact)) {
+    errors.push('invalid_artifact')
+  } else {
+    if (value.artifact.extensionId !== 'kimodo-soma-rp') errors.push('invalid_artifact_extension')
+    if (value.artifact.nodeId !== 'text-to-motion-preview' && value.artifact.nodeId !== 'animate-rigged-mesh') errors.push('invalid_artifact_node')
+    if (!isWorkspaceRelativeString(value.artifact.bundleWorkspacePath)) errors.push('invalid_artifact_bundle_path')
+    if (!isWorkspaceRelativeString(value.artifact.metadataWorkspacePath)) errors.push('invalid_artifact_metadata_path')
+    if (
+      isWorkspaceRelativeString(value.artifact.bundleWorkspacePath)
+      && isWorkspaceRelativeString(value.artifact.metadataWorkspacePath)
+      && value.artifact.metadataWorkspacePath !== value.artifact.bundleWorkspacePath
+      && !value.artifact.metadataWorkspacePath.startsWith(`${value.artifact.bundleWorkspacePath}/`)
+    ) {
+      errors.push('invalid_artifact_metadata_scope')
+    }
+    if (value.artifact.sourceMeshWorkspacePath !== undefined && value.artifact.sourceMeshWorkspacePath !== sourceWorkspacePath) errors.push('invalid_artifact_source_mesh_path')
+    for (const key of ['bundleWorkspacePath', 'metadataWorkspacePath', 'previewGlbWorkspacePath', 'animatedGlbWorkspacePath', 'canonicalMotionArtifactWorkspacePath', 'motionNpzWorkspacePath', 'motionBvhWorkspacePath'] as const) {
+      const pathValue = value.artifact[key]
+      if (pathValue === sourceWorkspacePath) errors.push(`invalid_artifact_source_alias:${key}`)
+    }
+    for (const key of ['previewGlbWorkspacePath', 'animatedGlbWorkspacePath', 'canonicalMotionArtifactWorkspacePath', 'motionNpzWorkspacePath', 'motionBvhWorkspacePath'] as const) {
+      const pathValue = value.artifact[key]
+      if (pathValue !== undefined && !isWorkspaceRelativeString(pathValue)) errors.push(`invalid_artifact_${key}`)
+    }
+
+    const diagnostics = value.artifact.diagnostics
+    if (!isRecord(diagnostics)) {
+      errors.push('invalid_artifact_diagnostics')
+    } else {
+      for (const key of ['runtimeStatus', 'retargetStatus', 'animationMappingStatus', 'stabilizationStatus', 'visualQualityStatus', 'sourceKind', 'mappingConfidence', 'retargetErrorCode', 'retargetErrorMessage'] as const) {
+        const field = diagnostics[key]
+        if (field !== null && field !== undefined && typeof field !== 'string') errors.push(`invalid_artifact_diagnostics_${key}`)
+      }
+      if (!Array.isArray(diagnostics.retargetErrorAliases) || diagnostics.retargetErrorAliases.some((entry) => typeof entry !== 'string')) errors.push('invalid_artifact_diagnostics_retarget_error_aliases')
+      if (!Array.isArray(diagnostics.warnings) || diagnostics.warnings.some((entry) => typeof entry !== 'string')) errors.push('invalid_artifact_diagnostics_warnings')
+      if (!isRecord(diagnostics.raw)) errors.push('invalid_artifact_diagnostics_raw')
+    }
+  }
+
+  if (!Array.isArray(value.sourceBones) || value.sourceBones.length === 0) {
+    errors.push('invalid_source_bones')
+  } else {
+    for (const bone of value.sourceBones) {
+      if (!isRecord(bone) || typeof bone.sourceBoneId !== 'string' || bone.sourceBoneId.length === 0) errors.push('invalid_source_bone_id')
+      if (!isRecord(bone) || typeof bone.label !== 'string' || bone.label.length === 0) errors.push('invalid_source_bone_label')
+      if (!isRecord(bone) || typeof bone.rawLabel !== 'string' || bone.rawLabel.length === 0) errors.push('invalid_source_bone_raw_label')
+      if (!isRecord(bone) || !Array.isArray(bone.path) || bone.path.some((segment) => typeof segment !== 'string' || segment.length === 0)) errors.push('invalid_source_bone_path')
+      if (isRecord(bone) && bone.parentSourceBoneId !== undefined && typeof bone.parentSourceBoneId !== 'string') errors.push('invalid_source_bone_parent')
+    }
+  }
+
+  if (!isRecord(value.session)) {
+    errors.push('invalid_session')
+  } else {
+    if (value.session.selectedPreview !== undefined && value.session.selectedPreview !== 'preview-glb' && value.session.selectedPreview !== 'animated-glb') {
+      errors.push('invalid_session_selected_preview')
+    }
+    if (value.session.mappings !== undefined) {
+      if (!isRecord(value.session.mappings)) {
+        errors.push('invalid_session_mappings')
+      } else {
+        for (const mapping of Object.values(value.session.mappings)) {
+          if (!isRecord(mapping)) {
+            errors.push('invalid_session_mapping_entry')
+            continue
+          }
+          if (mapping.targetBoneId !== undefined && (typeof mapping.targetBoneId !== 'string' || mapping.targetBoneId.length === 0)) errors.push('invalid_session_mapping_target')
+        }
+      }
+    }
+  }
+
+  if (!Array.isArray(value.warnings) || value.warnings.some((entry) => typeof entry !== 'string')) errors.push('invalid_warnings')
+
+  if (value.corrections !== undefined) {
+    if (!isRecord(value.corrections)) {
+      errors.push('invalid_corrections')
+    } else {
+      if (!new Set(['solver', 'in_place', 'preserve_scaled_npz']).has(String(value.corrections.rootTranslationPolicy))) errors.push('invalid_corrections_root_policy')
+      if (!isFiniteNumber(value.corrections.rootMotionScale) || value.corrections.rootMotionScale < 0 || value.corrections.rootMotionScale > 3) errors.push('invalid_corrections_root_scale')
+      const rootOffset = value.corrections.rootOffset
+      if (!isRecord(rootOffset) || !isFiniteNumber(rootOffset.x) || !isFiniteNumber(rootOffset.y) || !isFiniteNumber(rootOffset.z)) errors.push('invalid_corrections_root_offset')
+      if (value.corrections.previewMode !== undefined && value.corrections.previewMode !== 'before' && value.corrections.previewMode !== 'after') errors.push('invalid_corrections_preview_mode')
+    }
+  }
+
+  if (value.poseClip !== undefined) {
+    if (!isRecord(value.poseClip)) {
+      errors.push('invalid_pose_clip')
+    } else {
+      if (typeof value.poseClip.id !== 'string' || value.poseClip.id.length === 0) errors.push('invalid_pose_clip_id')
+      if (typeof value.poseClip.name !== 'string' || value.poseClip.name.length === 0) errors.push('invalid_pose_clip_name')
+      if (!isFiniteNumber(value.poseClip.durationSeconds) || value.poseClip.durationSeconds <= 0) errors.push('invalid_pose_clip_duration_seconds')
+      if (!isFiniteNumber(value.poseClip.fps) || value.poseClip.fps <= 0) errors.push('invalid_pose_clip_fps')
+    }
+  }
+
+  return errors
+}
+
+function isWorkspaceRelativeString(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0) return false
+  try {
+    assertSafeWorkspacePathInput(value)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function isVector3Record(value: unknown): boolean {
@@ -968,6 +1224,35 @@ export async function writePoseClipSidecar(request: PoseClipSidecarWriteServiceR
   }
 }
 
+export async function writeMotionRetargetSidecar(request: MotionRetargetSidecarWriteServiceRequest): Promise<LocalMotionRetargetSidecarWriteResult> {
+  try {
+    const sidecarPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sidecarWorkspacePath)
+    const sourcePath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sourceWorkspacePath)
+
+    assertMotionRetargetSidecarPath(sidecarPath.workspacePath)
+
+    if (sidecarPath.workspacePath === sourcePath.workspacePath || sidecarPath.absolutePath === sourcePath.absolutePath) {
+      throw new Error('Motion retarget sidecar path must not overwrite the source artifact')
+    }
+
+    const validationErrors = validateMotionRetargetSidecarV1Payload(request.sidecar, sourcePath.workspacePath)
+    if (validationErrors.length > 0) {
+      throw new Error(`Invalid motion retarget sidecar v1: ${validationErrors.join(', ')}`)
+    }
+
+    await mkdir(dirname(sidecarPath.absolutePath), { recursive: true })
+    await writeJsonAtomically(sidecarPath.absolutePath, request.sidecar)
+
+    return {
+      success: true,
+      sidecarWorkspacePath: sidecarPath.workspacePath,
+      sidecar: request.sidecar as MotionRetargetSidecarV1,
+    }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export async function readPoseClipSidecar(request: PoseClipSidecarReadServiceRequest): Promise<PoseClipSidecarReadResult> {
   try {
     const sidecarPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sidecarWorkspacePath)
@@ -1034,6 +1319,46 @@ async function readPoseClipSidecarAtPath(
       status: 'found',
       sidecarWorkspacePath: sidecarPath.workspacePath,
       sidecar: parsedSidecar,
+    }
+  } catch (error) {
+    return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export async function readMotionRetargetSidecar(request: MotionRetargetSidecarReadServiceRequest): Promise<LocalMotionRetargetSidecarReadResult> {
+  try {
+    const sidecarPath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sidecarWorkspacePath)
+    const sourcePath = normalizeWorkspaceArtifactPath(request.workspaceDir, request.sourceWorkspacePath)
+
+    assertMotionRetargetSidecarPath(sidecarPath.workspacePath)
+
+    if (sidecarPath.workspacePath === sourcePath.workspacePath || sidecarPath.absolutePath === sourcePath.absolutePath) {
+      throw new Error('Motion retarget sidecar path must not overwrite the source artifact')
+    }
+
+    let parsedSidecar: unknown
+    try {
+      parsedSidecar = JSON.parse(await readFile(sidecarPath.absolutePath, 'utf-8'))
+    } catch (error) {
+      if (isRecord(error) && error.code === 'ENOENT') {
+        return { success: true, status: 'not-found', sidecarWorkspacePath: sidecarPath.workspacePath }
+      }
+      if (error instanceof SyntaxError) {
+        return { success: false, status: 'invalid', error: `Invalid motion retarget sidecar JSON: ${error.message}` }
+      }
+      throw error
+    }
+
+    const validationErrors = validateMotionRetargetSidecarV1Payload(parsedSidecar, sourcePath.workspacePath)
+    if (validationErrors.length > 0) {
+      throw new Error(`Invalid motion retarget sidecar v1: ${validationErrors.join(', ')}`)
+    }
+
+    return {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: sidecarPath.workspacePath,
+      sidecar: parsedSidecar as MotionRetargetSidecarV1,
     }
   } catch (error) {
     return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
@@ -1107,7 +1432,87 @@ export async function readArtifactSidecar(request: ArtifactRegistryReadRequest):
   }
 }
 
-export function registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir }: ArtifactRegistryIpcRegistrationDeps): void {
+export async function previewWorkspaceArtifact(request: WorkspaceArtifactPreviewServiceRequest): Promise<WorkspaceArtifactPreviewResult> {
+  try {
+    const normalized = normalizeWorkspaceArtifactPath(request.workspaceDir, request.workspacePath)
+    const fileStats = await stat(normalized.absolutePath)
+    const displayName = basename(normalized.workspacePath)
+    const extension = resolveWorkspaceArtifactExtension(normalized.workspacePath)
+
+    if (extension === 'glb' || extension === 'gltf') {
+      return {
+        success: true,
+        status: '3d-model',
+        workspacePath: normalized.workspacePath,
+        displayName,
+        viewerKind: extension as 'glb' | 'gltf',
+      }
+    }
+
+    if (!isWorkspaceArtifactTextPreviewExtension(extension)) {
+      return {
+        success: true,
+        status: 'binary',
+        workspacePath: normalized.workspacePath,
+        displayName,
+        byteLength: fileStats.size,
+        binaryKind: resolveWorkspaceArtifactBinaryKind(extension),
+        message: extension === 'npz'
+          ? 'Binary preview is unavailable for NPZ artifacts. Download the file to inspect it locally.'
+          : 'Binary preview is unavailable for this artifact. Download the file to inspect it locally.',
+      }
+    }
+
+    const maxBytes = Math.max(1, request.maxBytes ?? 64 * 1024)
+    const handle = await open(normalized.absolutePath, 'r')
+
+    try {
+      const buffer = Buffer.alloc(Math.min(fileStats.size, maxBytes + 1))
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+      return {
+        success: true,
+        status: 'text',
+        workspacePath: normalized.workspacePath,
+        displayName,
+        content: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString('utf8'),
+        byteLength: fileStats.size,
+        truncated: fileStats.size > maxBytes || bytesRead > maxBytes,
+      }
+    } finally {
+      await handle.close()
+    }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export async function downloadWorkspaceArtifact(request: WorkspaceArtifactDownloadServiceRequest): Promise<WorkspaceArtifactDownloadResult> {
+  try {
+    const normalized = normalizeWorkspaceArtifactPath(request.workspaceDir, request.workspacePath)
+    await stat(normalized.absolutePath)
+    const dialogResult = await request.showSaveDialog({
+      title: 'Download artifact',
+      defaultPath: request.suggestedName || basename(normalized.workspacePath),
+    })
+    if (dialogResult.canceled || !dialogResult.filePath) {
+      return { success: true, status: 'cancelled', workspacePath: normalized.workspacePath }
+    }
+
+    await mkdir(dirname(dialogResult.filePath), { recursive: true })
+    await copyFile(normalized.absolutePath, dialogResult.filePath)
+    return {
+      success: true,
+      status: 'saved',
+      workspacePath: normalized.workspacePath,
+      targetPath: dialogResult.filePath,
+    }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export function registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir, showSaveDialog }: ArtifactRegistryIpcRegistrationDeps): void {
+  const saveDialog = showSaveDialog ?? (async () => ({ canceled: true as const }))
   ipcMain.handle('workspace:artifact:writeSidecar', async (_event, payload) => {
     try {
       return writeArtifactSidecar(parseWritePayload(payload, getWorkspaceDir()))
@@ -1135,6 +1540,38 @@ export function registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir }
   ipcMain.handle('workspace:artifact:writeLandmarkSidecar', async (_event, payload) => {
     try {
       return writeLandmarkSidecar(parseLandmarkSidecarPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:writeMotionRetargetSidecar', async (_event, payload) => {
+    try {
+      return writeMotionRetargetSidecar(parseMotionRetargetSidecarPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:readMotionRetargetSidecar', async (_event, payload) => {
+    try {
+      return readMotionRetargetSidecar(parseMotionRetargetSidecarReadPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, status: 'invalid', error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:previewWorkspaceArtifact', async (_event, payload) => {
+    try {
+      return previewWorkspaceArtifact(parseWorkspaceArtifactPreviewPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:artifact:downloadWorkspaceArtifact', async (_event, payload) => {
+    try {
+      return downloadWorkspaceArtifact(parseWorkspaceArtifactDownloadPayload(payload, getWorkspaceDir(), saveDialog))
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) }
     }

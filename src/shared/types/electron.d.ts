@@ -1,6 +1,8 @@
 // Type declarations for the Electron API exposed via preload
 import type { ArtifactRef, ArtifactSidecar } from './artifacts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
+import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
+import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, MotionRetargetSourceBone, MotionRetargetSessionSnapshot } from '../../areas/generate/motionRetargetPlan.ts'
 
 export type {
   ArtifactKind,
@@ -410,6 +412,92 @@ export interface PoseClipSidecarReadRequest {
   sourceWorkspacePath: string
 }
 
+export interface MotionRetargetSidecarV1 {
+  schema: 'modly.motion-retarget'
+  version: 1
+  createdAt: string
+  source: {
+    workspacePath: string
+    artifactId?: string
+    versionId?: string
+  }
+  identity?: MotionRetargetCorrectionIdentityV1
+  artifact: KimodoMotionArtifact
+  sourceBones: MotionRetargetSourceBone[]
+  session: MotionRetargetSessionSnapshot
+  corrections?: MotionRetargetCorrectionsV1
+  warnings: string[]
+  poseClip?: PoseClipMetadata
+}
+
+export interface MotionRetargetSidecarWriteRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+  sidecar: MotionRetargetSidecarV1
+}
+
+export interface MotionRetargetSidecarReadRequest {
+  sidecarWorkspacePath: string
+  sourceWorkspacePath: string
+}
+
+export interface WorkspaceArtifactPreviewRequest {
+  workspacePath: string
+}
+
+export type WorkspaceArtifactPreviewResult =
+  | {
+      success: true
+      status: 'text'
+      workspacePath: string
+      displayName: string
+      content: string
+      byteLength: number
+      truncated: boolean
+    }
+  | {
+      success: true
+      status: 'binary'
+      workspacePath: string
+      displayName: string
+      byteLength: number
+      binaryKind: string
+      message: string
+    }
+  | {
+      success: true
+      status: '3d-model'
+      workspacePath: string
+      displayName: string
+      viewerKind: 'glb' | 'gltf'
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export interface WorkspaceArtifactDownloadRequest {
+  workspacePath: string
+  suggestedName?: string
+}
+
+export type WorkspaceArtifactDownloadResult =
+  | {
+      success: true
+      status: 'saved'
+      workspacePath: string
+      targetPath: string
+    }
+  | {
+      success: true
+      status: 'cancelled'
+      workspacePath: string
+    }
+  | {
+      success: false
+      error: string
+    }
+
 export interface RigRenameSidecarV1 {
   schema: 'modly.rig.rename-plan'
   version: 1
@@ -485,6 +573,36 @@ export type PoseClipSidecarReadResult =
       status: 'found'
       sidecarWorkspacePath: string
       sidecar: PoseClipSidecarV1
+    }
+  | {
+      success: true
+      status: 'not-found'
+      sidecarWorkspacePath: string
+    }
+  | {
+      success: false
+      status: 'invalid' | 'error'
+      sidecarWorkspacePath?: string
+      error: string
+    }
+
+export type MotionRetargetSidecarWriteResult =
+  | {
+      success: true
+      sidecarWorkspacePath: string
+      sidecar: MotionRetargetSidecarV1
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type MotionRetargetSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      sidecarWorkspacePath: string
+      sidecar: MotionRetargetSidecarV1
     }
   | {
       success: true
@@ -793,6 +911,10 @@ declare global {
           readSidecar: (request: ArtifactRegistryReadRequest) => Promise<ArtifactRegistryReadResult>
           writeEditedSceneArtifact: (request: EditedSceneArtifactWriteRequest) => Promise<EditedSceneArtifactWriteResult>
           writeLandmarkSidecar: (request: LandmarkSidecarWriteRequest) => Promise<LandmarkSidecarWriteResult>
+          writeMotionRetargetSidecar: (request: MotionRetargetSidecarWriteRequest) => Promise<MotionRetargetSidecarWriteResult>
+          readMotionRetargetSidecar: (request: MotionRetargetSidecarReadRequest) => Promise<MotionRetargetSidecarReadResult>
+          previewWorkspaceArtifact: (request: WorkspaceArtifactPreviewRequest) => Promise<WorkspaceArtifactPreviewResult>
+          downloadWorkspaceArtifact: (request: WorkspaceArtifactDownloadRequest) => Promise<WorkspaceArtifactDownloadResult>
           writePoseClipSidecar: (request: PoseClipSidecarWriteRequest) => Promise<PoseClipSidecarWriteResult>
           readPoseClipSidecar: (request: PoseClipSidecarReadRequest) => Promise<PoseClipSidecarReadResult>
           writeRigRenameSidecar: (request: RigRenameSidecarWriteRequest) => Promise<RigRenameSidecarWriteResult>

@@ -724,6 +724,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   registerArtifactRegistryIpcHandlers({
     ipcMain,
     getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
+    showSaveDialog: async ({ defaultPath, title }) => {
+      const win = getWindow()
+      const result = await dialog.showSaveDialog(win!, {
+        title,
+        defaultPath,
+      })
+      return { canceled: result.canceled, filePath: result.filePath }
+    },
   })
 
   ipcMain.handle('workspace:listCollections', async () => {

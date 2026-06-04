@@ -283,6 +283,213 @@ test('preload workspace artifact registry exposes pose clip sidecar reader IPC c
   ])
 })
 
+test('preload workspace artifact registry exposes motion retarget sidecar writer IPC channel', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      return {
+        success: true,
+        sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json',
+        sidecar: args[0] && typeof args[0] === 'object' && 'sidecar' in args[0]
+          ? (args[0] as { sidecar: unknown }).sidecar
+          : undefined,
+      }
+    },
+  })
+
+  const sidecar = {
+    schema: 'modly.motion-retarget',
+    version: 1,
+    createdAt: '2026-05-21T00:00:00.000Z',
+    source: { workspacePath: 'Workflows/checkpoints/source.glb' },
+    artifact: {
+      extensionId: 'kimodo-soma-rp',
+      nodeId: 'animate-rigged-mesh',
+      bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
+      metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
+      diagnostics: {
+        runtimeStatus: 'ok',
+        retargetStatus: 'degraded',
+        animationMappingStatus: 'ok',
+        stabilizationStatus: 'ok',
+        visualQualityStatus: 'warning',
+        sourceKind: 'kimodo-motion-bundle',
+        mappingConfidence: 'medium',
+        retargetErrorCode: null,
+        retargetErrorAliases: [],
+        retargetErrorMessage: null,
+        warnings: ['Root translation is deferred in MVP.'],
+        raw: {},
+      },
+    },
+    sourceBones: [{ sourceBoneId: 'source:Hips', label: 'Hips', rawLabel: 'Hips', path: ['Hips'] }],
+    session: { selectedPreview: 'preview-glb', mappings: { 'source:Hips': { targetBoneId: 'bone-1' } } },
+    warnings: ['Root translation is deferred in MVP.'],
+    poseClip: { id: 'walk-cycle', name: 'Walk Cycle', durationSeconds: 1.5, fps: 24 },
+  } as const
+  const request = {
+    sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json',
+    sourceWorkspacePath: sidecar.source.workspacePath,
+    sidecar,
+  }
+
+  assert.equal(typeof api.workspace.artifacts.writeMotionRetargetSidecar, 'function')
+  const result = await api.workspace.artifacts.writeMotionRetargetSidecar(request)
+
+  assert.deepEqual(result, { success: true, sidecarWorkspacePath: request.sidecarWorkspacePath, sidecar })
+  assert.deepEqual(invocations, [{ channel: 'workspace:artifact:writeMotionRetargetSidecar', args: [request] }])
+})
+
+test('preload workspace artifact registry exposes motion retarget sidecar reader IPC channel and preserves result envelopes', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const foundSidecar = {
+    schema: 'modly.motion-retarget',
+    version: 1,
+    createdAt: '2026-05-21T00:00:00.000Z',
+    source: { workspacePath: 'Workflows/checkpoints/source.glb' },
+    artifact: {
+      extensionId: 'kimodo-soma-rp',
+      nodeId: 'animate-rigged-mesh',
+      bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
+      metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
+      diagnostics: {
+        runtimeStatus: 'ok',
+        retargetStatus: 'degraded',
+        animationMappingStatus: 'ok',
+        stabilizationStatus: 'ok',
+        visualQualityStatus: 'warning',
+        sourceKind: 'kimodo-motion-bundle',
+        mappingConfidence: 'medium',
+        retargetErrorCode: null,
+        retargetErrorAliases: [],
+        retargetErrorMessage: null,
+        warnings: ['Root translation is deferred in MVP.'],
+        raw: {},
+      },
+    },
+    sourceBones: [{ sourceBoneId: 'source:Hips', label: 'Hips', rawLabel: 'Hips', path: ['Hips'] }],
+    session: { selectedPreview: 'preview-glb', mappings: { 'source:Hips': { targetBoneId: 'bone-1' } } },
+    warnings: ['Root translation is deferred in MVP.'],
+  } as const
+  const results = [
+    {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json',
+      sidecar: foundSidecar,
+    },
+    {
+      success: true,
+      status: 'not-found',
+      sidecarWorkspacePath: 'Workflows/motion-retarget/missing.motion-retarget.v1.json',
+    },
+    {
+      success: false,
+      status: 'invalid',
+      sidecarWorkspacePath: 'Workflows/motion-retarget/invalid.motion-retarget.v1.json',
+      error: 'Invalid motion retarget sidecar: invalid_schema',
+    },
+  ] as const
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      return results[invocations.length - 1]
+    },
+  })
+
+  const foundRequest = {
+    sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json',
+    sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+  }
+  const notFoundRequest = {
+    sidecarWorkspacePath: 'Workflows/motion-retarget/missing.motion-retarget.v1.json',
+    sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+  }
+  const invalidRequest = {
+    sidecarWorkspacePath: 'Workflows/motion-retarget/invalid.motion-retarget.v1.json',
+    sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+  }
+
+  assert.equal(typeof api.workspace.artifacts.readMotionRetargetSidecar, 'function')
+  const foundResult = await api.workspace.artifacts.readMotionRetargetSidecar(foundRequest)
+  const notFoundResult = await api.workspace.artifacts.readMotionRetargetSidecar(notFoundRequest)
+  const invalidResult = await api.workspace.artifacts.readMotionRetargetSidecar(invalidRequest)
+
+  assert.deepEqual(foundResult, results[0])
+  assert.deepEqual(notFoundResult, results[1])
+  assert.deepEqual(invalidResult, results[2])
+  assert.deepEqual(invocations, [
+    { channel: 'workspace:artifact:readMotionRetargetSidecar', args: [foundRequest] },
+    { channel: 'workspace:artifact:readMotionRetargetSidecar', args: [notFoundRequest] },
+    { channel: 'workspace:artifact:readMotionRetargetSidecar', args: [invalidRequest] },
+  ])
+})
+
+test('preload workspace artifact registry exposes workspace artifact preview and download IPC channels', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      if (channel === 'workspace:artifact:previewWorkspaceArtifact') {
+        return {
+          success: true,
+          status: 'text',
+          workspacePath: 'Workflows/kimodo/run-1/metadata.json',
+          displayName: 'metadata.json',
+          content: '{"ok":true}',
+          byteLength: 11,
+          truncated: false,
+        }
+      }
+      return {
+        success: true,
+        status: 'saved',
+        workspacePath: 'Workflows/kimodo/run-1/metadata.json',
+        targetPath: '/tmp/metadata.json',
+      }
+    },
+  })
+
+  const previewRequest = { workspacePath: 'Workflows/kimodo/run-1/metadata.json' }
+  const downloadRequest = { workspacePath: 'Workflows/kimodo/run-1/metadata.json', suggestedName: 'metadata.json' }
+
+  assert.equal(typeof api.workspace.artifacts.previewWorkspaceArtifact, 'function')
+  assert.equal(typeof api.workspace.artifacts.downloadWorkspaceArtifact, 'function')
+
+  const previewResult = await api.workspace.artifacts.previewWorkspaceArtifact(previewRequest)
+  const downloadResult = await api.workspace.artifacts.downloadWorkspaceArtifact(downloadRequest)
+
+  assert.deepEqual(previewResult, {
+    success: true,
+    status: 'text',
+    workspacePath: 'Workflows/kimodo/run-1/metadata.json',
+    displayName: 'metadata.json',
+    content: '{"ok":true}',
+    byteLength: 11,
+    truncated: false,
+  })
+  assert.deepEqual(downloadResult, {
+    success: true,
+    status: 'saved',
+    workspacePath: 'Workflows/kimodo/run-1/metadata.json',
+    targetPath: '/tmp/metadata.json',
+  })
+  assert.deepEqual(invocations, [
+    { channel: 'workspace:artifact:previewWorkspaceArtifact', args: [previewRequest] },
+    { channel: 'workspace:artifact:downloadWorkspaceArtifact', args: [downloadRequest] },
+  ])
+})
+
 test('preload workspace artifact registry exposes dedicated rig rename sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
   const api = createElectronApi({

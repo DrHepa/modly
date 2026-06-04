@@ -247,6 +247,8 @@ test('resolveViewer3DOverlayLayout offsets right-side overlays when the edit rai
       editRailClassName: 'right-4 top-1/2 -translate-y-1/2 z-20',
       editPanelClassName: 'right-16',
       rigEditorPanelSlot: 'top-right',
+      motionRetargetPanelSlot: 'top-right-stack',
+      motionRetargetPanelClassName: 'right-16 top-4',
       poseClipPanelSlot: 'bottom-drawer',
       poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
       commonViewportUsability: 'capped-internal-scroll',
@@ -259,6 +261,8 @@ test('resolveViewer3DOverlayLayout offsets right-side overlays when the edit rai
       editRailClassName: null,
       editPanelClassName: 'right-4',
       rigEditorPanelSlot: 'top-right',
+      motionRetargetPanelSlot: 'top-right-stack',
+      motionRetargetPanelClassName: 'right-4 top-4',
       poseClipPanelSlot: 'bottom-drawer',
       poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
       commonViewportUsability: 'capped-internal-scroll',
@@ -395,6 +399,217 @@ const secondRigSummary = Object.freeze({
       warnings: [],
     },
   ],
+})
+
+const kimodoDisplayedWorkspacePath = 'Workflows/kimodo-20260523-140139-ca71024b/animated.glb'
+const kimodoSemanticSourceWorkspacePath = 'Workflows/1779535081_02857c58_unirig.glb'
+
+const kimodoDisplayedRigBoneIds = Object.freeze({
+  hips: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0',
+  spine: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0/bone_1#0',
+  unmapped: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0',
+  chest: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0',
+  neck: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0',
+  head: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0/bone_5#0',
+})
+
+const kimodoDisplayedRigSummary = Object.freeze({
+  hasRig: true,
+  sourceWorkspacePath: kimodoDisplayedWorkspacePath,
+  skeletonContextId: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0',
+  skinnedMeshContexts: ['rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0'],
+  bones: [
+    {
+      boneId: kimodoDisplayedRigBoneIds.hips,
+      label: 'bone_0',
+      originalName: 'bone_0',
+      path: ['bone_0'],
+      siblingIndex: 0,
+      childIds: [kimodoDisplayedRigBoneIds.spine],
+      warnings: [],
+    },
+    {
+      boneId: kimodoDisplayedRigBoneIds.spine,
+      label: 'bone_1',
+      originalName: 'bone_1',
+      path: ['bone_0', 'bone_1'],
+      siblingIndex: 0,
+      parentId: kimodoDisplayedRigBoneIds.hips,
+      childIds: [kimodoDisplayedRigBoneIds.unmapped],
+      warnings: [],
+    },
+    {
+      boneId: kimodoDisplayedRigBoneIds.unmapped,
+      label: 'bone_2',
+      originalName: 'bone_2',
+      path: ['bone_0', 'bone_1', 'bone_2'],
+      siblingIndex: 0,
+      parentId: kimodoDisplayedRigBoneIds.spine,
+      childIds: [kimodoDisplayedRigBoneIds.chest],
+      warnings: [],
+    },
+    {
+      boneId: kimodoDisplayedRigBoneIds.chest,
+      label: 'bone_3',
+      originalName: 'bone_3',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3'],
+      siblingIndex: 0,
+      parentId: kimodoDisplayedRigBoneIds.unmapped,
+      childIds: [kimodoDisplayedRigBoneIds.neck],
+      warnings: [],
+    },
+    {
+      boneId: kimodoDisplayedRigBoneIds.neck,
+      label: 'bone_4',
+      originalName: 'bone_4',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4'],
+      siblingIndex: 0,
+      parentId: kimodoDisplayedRigBoneIds.chest,
+      childIds: [kimodoDisplayedRigBoneIds.head],
+      warnings: [],
+    },
+    {
+      boneId: kimodoDisplayedRigBoneIds.head,
+      label: 'bone_5',
+      originalName: 'bone_5',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4', 'bone_5'],
+      siblingIndex: 0,
+      parentId: kimodoDisplayedRigBoneIds.neck,
+      childIds: [],
+      warnings: [],
+    },
+  ],
+  rootBoneIds: [kimodoDisplayedRigBoneIds.hips],
+  stats: { skinnedMeshCount: 1, boneCount: 6 },
+  warnings: [],
+})
+
+const motionRetargetSession = Object.freeze({
+  artifact: {
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    workflowId: 'workflow-hero',
+    workflowNodeId: 'node-animate',
+    sourceMeshWorkspacePath: 'Workflows/outputs/hero.glb',
+    previewGlbWorkspacePath: 'Workflows/kimodo/run-1/preview.glb',
+    animatedGlbWorkspacePath: 'Workflows/kimodo/run-1/animated.glb',
+    bundleWorkspacePath: 'Workflows/kimodo/run-1',
+    metadataWorkspacePath: 'Workflows/kimodo/run-1/metadata.json',
+    canonicalMotionArtifactWorkspacePath: 'Workflows/kimodo/run-1/motion.npz',
+    motionNpzWorkspacePath: 'Workflows/kimodo/run-1/motion.npz',
+    motionBvhWorkspacePath: 'Workflows/kimodo/run-1/motion.bvh',
+    diagnostics: {
+      runtimeStatus: 'completed',
+      retargetStatus: 'completed',
+      animationMappingStatus: 'completed',
+      stabilizationStatus: 'completed',
+      visualQualityStatus: 'preview-only',
+      sourceKind: 'kimodo-motion-json',
+      mappingConfidence: 'manual',
+      retargetErrorCode: null,
+      retargetErrorAliases: [],
+      retargetErrorMessage: null,
+      warnings: ['Root-motion correctness is deferred.'],
+      raw: {},
+    },
+    motionRetarget: {
+      status: 'parsed',
+      diagnostics: [],
+      clipName: 'Kimodo Walk Forward',
+      sourceContract: { schema: 'modly.humanoid.v1', trusted: true },
+      mappingStatus: 'trusted_manual',
+      mappingConfidence: 'compatible',
+      fps: 30,
+      durationSeconds: 1.5,
+      timeSemantics: 'seconds',
+      sourceBones: [
+        { sourceBoneId: 'source:hips', label: 'Hips', rawLabel: 'Hips' },
+        { sourceBoneId: 'source:spine', label: 'Spine', rawLabel: 'Spine', parentSourceBoneId: 'source:hips' },
+      ],
+      targetTracks: [
+        {
+          targetNodeName: 'Hips',
+          targetNodeIndex: 0,
+          targetRole: 'hips',
+          rotations: [
+            { timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 },
+            { timeSeconds: 1, ...quaternionValue(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI)) },
+          ],
+        },
+        {
+          targetNodeName: 'Spine',
+          targetNodeIndex: 1,
+          targetRole: 'spine',
+          rotations: [
+            { timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 },
+            { timeSeconds: 1, ...quaternionValue(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI)) },
+          ],
+        },
+      ],
+    },
+  },
+  sourceBones: [
+    { sourceBoneId: 'source:hips', label: 'Hips', rawLabel: 'Hips', role: 'hips', path: ['Hips'] },
+    { sourceBoneId: 'source:spine', label: 'Spine', rawLabel: 'Spine', role: 'spine', path: ['Hips', 'Spine'], parentSourceBoneId: 'source:hips' },
+  ],
+  targetBones: [
+    {
+      boneId: 'rig:hero|skeleton:0|bone:hips#0',
+      label: 'UniRig Pelvis',
+      rawLabel: 'Hips',
+      labelProvenance: 'unirig',
+      role: 'hips',
+      childIds: ['rig:hero|skeleton:0|bone:hips#0/spine#0'],
+    },
+    {
+      boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
+      label: 'Manual Chest',
+      rawLabel: 'Spine',
+      labelProvenance: 'manual',
+      role: 'spine',
+      parentId: 'rig:hero|skeleton:0|bone:hips#0',
+      childIds: [],
+    },
+  ],
+  selectedPreview: 'animated-glb',
+  mappings: {
+    'source:hips': {
+      sourceBoneId: 'source:hips',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0',
+      targetLabel: 'UniRig Pelvis',
+      targetLabelProvenance: 'unirig',
+    },
+    'source:spine': {
+      sourceBoneId: 'source:spine',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
+      targetLabel: 'Manual Chest',
+      targetLabelProvenance: 'manual',
+    },
+  },
+  warnings: ['Root-motion correctness is deferred.'],
+  diagnostics: {
+    artifactWarnings: ['Root-motion correctness is deferred.'],
+    mappingWarnings: [],
+    sourceWarnings: {
+      'source:hips': [],
+      'source:spine': [],
+    },
+  },
+  exportReadiness: {
+    canSaveSidecar: true,
+    canExportPoseClip: true,
+    blockingWarnings: [],
+  },
+  unlockReadiness: {
+    trustedPayloadReady: true,
+    translationReady: true,
+    showSourceBones: true,
+    showMappingDisplay: true,
+    canPreview: true,
+    canSaveSidecar: true,
+    canExportPoseClip: true,
+    blockingWarnings: [],
+  },
 })
 
 const noRigSummary = Object.freeze({
@@ -2579,6 +2794,1640 @@ test('Viewer3D moves, shifts, and duplicates the selected keyframe through pure 
     assert.deepEqual(poseState.plan.keyframes.map((keyframe: { id: string }) => keyframe.id), ['kf-spine', 'kf-spine__copy-1'])
     assert.equal(poseState.selectedKeyframeId, 'kf-spine__copy-1')
     assert.equal(poseState.currentTimeSeconds, 0.85)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('resolveViewer3DOverlayLayout gives Motion Retarget its own non-overlapping right-panel slot', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const stackedLayout = module.resolveViewer3DOverlayLayout({
+      modelUrl: 'model.glb',
+      hasEditRail: true,
+      rigEditorVisibility: { isOpen: true },
+      motionRetargetVisibility: { isOpen: true },
+    })
+
+    assert.equal(stackedLayout.rigEditorPanelSlot, 'top-right')
+    assert.equal(stackedLayout.motionRetargetPanelSlot, 'top-right-stack')
+    assert.equal(stackedLayout.poseClipPanelSlot, 'bottom-drawer')
+    assert.notEqual(stackedLayout.motionRetargetPanelSlot, stackedLayout.poseClipPanelSlot)
+    assert.match(stackedLayout.motionRetargetPanelClassName, /right-16/)
+    assert.match(stackedLayout.motionRetargetPanelClassName, /top-\[/)
+
+    const soloLayout = module.resolveViewer3DOverlayLayout({
+      modelUrl: 'model.glb',
+      hasEditRail: true,
+      rigEditorVisibility: { isOpen: false },
+      motionRetargetVisibility: { isOpen: true },
+    })
+
+    assert.equal(soloLayout.motionRetargetPanelSlot, 'top-right-stack')
+    assert.match(soloLayout.motionRetargetPanelClassName, /top-4/)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps visibility renderer-local', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const hiddenControls = module.resolveViewer3DMotionRetargetToolbarControls({
+      modelUrl: null,
+      summary: rigSummary,
+      visibility: module.createViewer3DMotionRetargetVisibilityState(rigSummary),
+      onOpenMotionRetarget: () => undefined,
+    })
+
+    assert.equal(hiddenControls, undefined)
+
+    let visibility = module.createViewer3DMotionRetargetVisibilityState(rigSummary)
+    const toggles: string[] = []
+    const visibleControls = module.resolveViewer3DMotionRetargetToolbarControls({
+      modelUrl: 'hero.glb',
+      summary: rigSummary,
+      visibility,
+      onOpenMotionRetarget: () => toggles.push('toggle'),
+    })
+
+    assert.equal(visibleControls.summary, rigSummary)
+    assert.equal(visibleControls.active, false)
+    visibleControls.onOpenMotionRetarget()
+    assert.deepEqual(toggles, ['toggle'])
+
+    visibility = module.reduceViewer3DMotionRetargetVisibilityState(visibility, { type: 'toggle', summary: rigSummary })
+    assert.equal(visibility.isOpen, true)
+
+    const openControls = module.resolveViewer3DMotionRetargetToolbarControls({
+      modelUrl: 'hero.glb',
+      summary: rigSummary,
+      visibility,
+      onOpenMotionRetarget: () => undefined,
+    })
+
+    assert.equal(openControls.active, true)
+    assert.equal(module.createViewer3DRigEditorVisibilityState(rigSummary).isOpen, false)
+    assert.equal(module.createViewer3DPoseClipVisibilityState(rigSummary).isOpen, false)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D owns Motion Retarget session props separately from Rig Editor and Pose/Clip composition', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    let visibility = module.createViewer3DMotionRetargetVisibilityState(rigSummary)
+
+    assert.equal(motionState.selectedSourceBoneId, 'source:hips')
+    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, false)
+
+    visibility = module.reduceViewer3DMotionRetargetVisibilityState(visibility, { type: 'toggle', summary: rigSummary })
+    motionState = module.reduceViewer3DMotionRetargetState(motionState, { type: 'select-source-bone', sourceBoneId: 'source:spine' })
+    motionState = module.reduceViewer3DMotionRetargetState(motionState, { type: 'set-preview', selectedPreview: 'preview-glb' })
+
+    const selections: string[] = []
+    const previews: string[] = []
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps(motionState, {
+      onSelectSourceBone: (sourceBoneId: string) => selections.push(sourceBoneId),
+      onSelectPreview: (selectedPreview: string) => previews.push(selectedPreview),
+    })
+
+    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, true)
+    assert.equal(panelProps.summary, rigSummary)
+    assert.equal(panelProps.selectedSourceBoneId, 'source:spine')
+    assert.equal(panelProps.session.selectedPreview, 'preview-glb')
+    assert.equal(panelProps.selectedMapping.targetLabel, 'Manual Chest')
+    assert.equal(panelProps.selectedMapping.targetLabelProvenance, 'manual')
+    assert.deepEqual(panelProps.warnings, ['Root-motion correctness is deferred.'])
+    assert.equal(panelProps.saveDisabledReason, undefined)
+
+    panelProps.onSelectSourceBone('source:hips')
+    panelProps.onSelectPreview('animated-glb')
+
+    assert.deepEqual(selections, ['source:hips'])
+    assert.deepEqual(previews, ['animated-glb'])
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D saves Motion Retarget sidecars through preload with workspace-safe source and session provenance', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const requests: unknown[] = []
+
+    const result = await module.writeViewer3DMotionRetargetSidecar({
+      state: motionState,
+      createdAt: '2026-05-21T18:30:00.000Z',
+      writer: async (request: unknown) => {
+        requests.push(request)
+        return {
+          success: true,
+          sidecarWorkspacePath: (request as { sidecarWorkspacePath: string }).sidecarWorkspacePath,
+          sidecar: (request as { sidecar: unknown }).sidecar,
+        }
+      },
+    })
+
+    assert.equal(requests.length, 1)
+    assert.match((requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath, /^Workflows\/motion-retarget\/mrt_[a-f0-9]{16}\.motion-retarget\.v1\.json$/)
+    assert.equal((requests[0] as { sourceWorkspacePath: string }).sourceWorkspacePath, 'Workflows/outputs/hero.glb')
+    assert.equal((requests[0] as { sidecar: { schema: string } }).sidecar.schema, 'modly.motion-retarget')
+    assert.match((requests[0] as { sidecar: { identity: { key: string } } }).sidecar.identity.key, /^mrt_[a-f0-9]{16}$/)
+    assert.equal((requests[0] as { sidecar: { identity: { sourceWorkspacePath: string; skeletonContextId: string; workflowId: string; artifactWorkspacePath: string } } }).sidecar.identity.sourceWorkspacePath, 'Workflows/outputs/hero.glb')
+    assert.equal((requests[0] as { sidecar: { identity: { skeletonContextId: string } } }).sidecar.identity.skeletonContextId, 'rig:hero|skeleton:0')
+    assert.equal((requests[0] as { sidecar: { identity: { workflowId: string } } }).sidecar.identity.workflowId, 'workflow-hero')
+    assert.equal((requests[0] as { sidecar: { identity: { artifactWorkspacePath: string } } }).sidecar.identity.artifactWorkspacePath, 'Workflows/kimodo/run-1/animated.glb')
+    assert.equal((requests[0] as { sidecar: { source: { workspacePath: string } } }).sidecar.source.workspacePath, 'Workflows/outputs/hero.glb')
+    assert.equal((requests[0] as { sidecar: { artifact: { workflowId?: string; workflowNodeId?: string } } }).sidecar.artifact.workflowId, 'workflow-hero')
+    assert.equal((requests[0] as { sidecar: { artifact: { workflowId?: string; workflowNodeId?: string } } }).sidecar.artifact.workflowNodeId, 'node-animate')
+    assert.deepEqual((requests[0] as { sidecar: { session: { selectedPreview: string; mappings: Record<string, { targetBoneId?: string }> } } }).sidecar.session, {
+      selectedPreview: 'animated-glb',
+      mappings: {
+        'source:hips': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+        'source:spine': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0' },
+      },
+    })
+    assert.deepEqual((requests[0] as { sidecar: { corrections: unknown } }).sidecar.corrections, {
+      rootTranslationPolicy: 'solver',
+      rootMotionScale: 1,
+      rootOffset: { x: 0, y: 0, z: 0 },
+      previewMode: 'after',
+    })
+    assert.deepEqual(result, {
+      success: true,
+      sidecarWorkspacePath: (requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath,
+      sidecar: (requests[0] as { sidecar: unknown }).sidecar,
+    })
+    assert.deepEqual(module.resolveViewer3DMotionRetargetHydrationRequest(rigSummary, motionRetargetSession), {
+      sidecarWorkspacePath: (requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath,
+      sourceWorkspacePath: 'Workflows/outputs/hero.glb',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D loads Motion Retarget sidecars into renderer-owned session state while preserving mapping, readiness, and warnings', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary)
+    const token = module.createViewer3DMotionRetargetHydrationToken({ modelUrl: 'hero.glb', summary: rigSummary })
+    const sidecar = {
+      schema: 'modly.motion-retarget',
+      version: 1,
+      createdAt: '2026-05-21T18:30:00.000Z',
+      source: { workspacePath: 'Workflows/outputs/hero.glb' },
+      identity: module.createViewer3DMotionRetargetCorrectionIdentity({ summary: rigSummary, session: motionRetargetSession }),
+      artifact: structuredClone(motionRetargetSession.artifact),
+      sourceBones: structuredClone(motionRetargetSession.sourceBones),
+      session: {
+        selectedPreview: 'preview-glb',
+        mappings: {
+          'source:hips': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+          'source:spine': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0' },
+        },
+      },
+      warnings: ['Root-motion correctness is deferred.', 'Loaded from sidecar.'],
+      corrections: {
+        rootTranslationPolicy: 'preserve_scaled_npz',
+        rootMotionScale: 1.4,
+        rootOffset: { x: 0.2, y: 0, z: -0.2 },
+        previewMode: 'after',
+      },
+    }
+
+    const hydrated = module.applyViewer3DMotionRetargetHydrationResult({
+      state,
+      result: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/motion-retarget/hero.motion-retarget.v1.json', sidecar },
+      token,
+      currentToken: token,
+    })
+
+    assert.equal(hydrated.state.session?.selectedPreview, 'preview-glb')
+    assert.equal(hydrated.state.session?.mappings['source:hips']?.targetBoneId, 'rig:hero|skeleton:0|bone:hips#0')
+    assert.equal(hydrated.state.session?.mappings['source:spine']?.targetBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
+    assert.equal(hydrated.state.session?.exportReadiness.canSaveSidecar, true)
+    assert.equal(hydrated.state.session?.exportReadiness.canExportPoseClip, true)
+    assert.deepEqual(hydrated.state.diagnosticsMessages, ['Loaded from sidecar.'])
+    assert.equal(hydrated.state.loadState, 'loaded')
+    assert.equal(hydrated.state.correctionState.status, 'loaded')
+    assert.equal(hydrated.state.corrections.rootMotionScale, 1.4)
+    assert.equal(hydrated.state.selectedSourceBoneId, 'source:hips')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D Motion Retarget correction hydration is identity-bound and does not overwrite dirty local edits', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const cleanState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const dirtyState = module.reduceViewer3DMotionRetargetState(cleanState, {
+      type: 'set-mapping',
+      sourceBoneId: 'source:spine',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0',
+    })
+    const token = module.createViewer3DMotionRetargetHydrationToken({ modelUrl: 'hero.glb', summary: rigSummary })
+    const matchingIdentity = module.createViewer3DMotionRetargetCorrectionIdentity({ summary: rigSummary, session: motionRetargetSession })
+    const otherSession = {
+      ...motionRetargetSession,
+      artifact: {
+        ...motionRetargetSession.artifact,
+        workflowId: 'workflow-other',
+        bundleWorkspacePath: 'Workflows/kimodo/other',
+        metadataWorkspacePath: 'Workflows/kimodo/other/metadata.json',
+      },
+    }
+    const mismatchedIdentity = module.createViewer3DMotionRetargetCorrectionIdentity({ summary: rigSummary, session: otherSession })
+    const sidecar = {
+      schema: 'modly.motion-retarget',
+      version: 1,
+      createdAt: '2026-05-24T20:20:00.000Z',
+      source: { workspacePath: 'Workflows/outputs/hero.glb' },
+      identity: matchingIdentity,
+      artifact: structuredClone(motionRetargetSession.artifact),
+      sourceBones: structuredClone(motionRetargetSession.sourceBones),
+      session: {
+        selectedPreview: 'preview-glb',
+        mappings: {
+          'source:hips': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+        },
+      },
+      corrections: {
+        rootTranslationPolicy: 'solver',
+        rootMotionScale: 1,
+        rootOffset: { x: 0, y: 0, z: 0 },
+        previewMode: 'after',
+      },
+      warnings: [],
+    }
+
+    const dirtySkipped = module.applyViewer3DMotionRetargetHydrationResult({
+      state: dirtyState,
+      result: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/motion-retarget/mrt_dirty.motion-retarget.v1.json', sidecar },
+      token,
+      currentToken: token,
+    })
+    const identityRejected = module.applyViewer3DMotionRetargetHydrationResult({
+      state: cleanState,
+      result: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/motion-retarget/mrt_other.motion-retarget.v1.json', sidecar: { ...sidecar, identity: mismatchedIdentity } },
+      token,
+      currentToken: token,
+    })
+    const reopened = module.applyViewer3DMotionRetargetHydrationResult({
+      state: module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession),
+      result: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/motion-retarget/mrt_match.motion-retarget.v1.json', sidecar },
+      token,
+      currentToken: token,
+    })
+
+    assert.equal(dirtyState.correctionState.status, 'dirty')
+    assert.equal(dirtySkipped.dirtySkipped, true)
+    assert.equal(dirtySkipped.state.session.mappings['source:spine']?.targetBoneId, 'rig:hero|skeleton:0|bone:hips#0')
+    assert.equal(identityRejected.state.loadState, 'error')
+    assert.match(identityRejected.state.loadMessage, /different workflow\/artifact identity/i)
+    assert.equal(reopened.state.loadState, 'loaded')
+    assert.equal(reopened.state.session.selectedPreview, 'preview-glb')
+    assert.equal(reopened.state.session.mappings['source:hips']?.targetBoneId, 'rig:hero|skeleton:0|bone:hips#0')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D motion retarget hydration surfaces non-blocking warnings for invalid, not-found, and diagnostics-only states without fabricating mappings', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const emptyState = module.createViewer3DMotionRetargetState(rigSummary)
+    const token = module.createViewer3DMotionRetargetHydrationToken({ modelUrl: 'hero.glb', summary: rigSummary })
+
+    const notFound = module.applyViewer3DMotionRetargetHydrationResult({
+      state: emptyState,
+      result: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/motion-retarget/hero.motion-retarget.v1.json' },
+      token,
+      currentToken: token,
+    })
+    assert.equal(notFound.state.session, undefined)
+    assert.match(notFound.state.diagnosticsMessages.join('\n'), /not found/i)
+
+    const invalid = module.applyViewer3DMotionRetargetHydrationResult({
+      state: emptyState,
+      result: { success: false, status: 'invalid', sidecarWorkspacePath: 'Workflows/motion-retarget/hero.motion-retarget.v1.json', error: 'Motion retarget sidecar JSON is invalid.' },
+      token,
+      currentToken: token,
+    })
+    assert.equal(invalid.state.session, undefined)
+    assert.deepEqual(invalid.state.diagnosticsMessages, ['Motion retarget sidecar JSON is invalid.'])
+
+    const diagnosticsOnly = module.createViewer3DMotionRetargetState(rigSummary, {
+      ...motionRetargetSession,
+      sourceBones: [],
+      mappings: {},
+      exportReadiness: {
+        ...motionRetargetSession.exportReadiness,
+        canSaveSidecar: false,
+      },
+    })
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps(diagnosticsOnly, {})
+    assert.equal(panelProps.session?.exportReadiness.canSaveSidecar, false)
+    assert.match(panelProps.saveDisabledReason ?? '', /trusted Kimodo motion payload/i)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D exposes trusted Motion Retarget unlock readiness only when translated Kimodo metadata is present', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const readyPanelProps = module.resolveViewer3DMotionRetargetPanelProps(
+      module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession),
+      {},
+    )
+    const blockedPanelProps = module.resolveViewer3DMotionRetargetPanelProps(
+      module.createViewer3DMotionRetargetState(rigSummary, {
+        ...motionRetargetSession,
+        artifact: {
+          ...motionRetargetSession.artifact,
+          motionRetarget: undefined,
+        },
+        exportReadiness: {
+          canSaveSidecar: false,
+          canExportPoseClip: false,
+          blockingWarnings: ['Trusted Kimodo motion payload is unavailable.'],
+        },
+        unlockReadiness: {
+          trustedPayloadReady: false,
+          translationReady: false,
+          showSourceBones: false,
+          showMappingDisplay: false,
+          canPreview: false,
+          canSaveSidecar: false,
+          canExportPoseClip: false,
+          blockingWarnings: ['Trusted Kimodo motion payload is unavailable.'],
+        },
+      }),
+      {},
+    )
+
+    assert.equal(readyPanelProps.exportDisabledReason, undefined)
+    assert.equal(blockedPanelProps.exportDisabledReason, 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.')
+    assert.equal(readyPanelProps.previewDisabledReason, undefined)
+    assert.equal(readyPanelProps.previewDurationSeconds, 1.5)
+    assert.equal(blockedPanelProps.previewDisabledReason, 'Local preview is unavailable until Modly validates a trusted Kimodo motion payload with complete translated quaternion tracks.')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D local Motion Retarget preview scrubs rotation-only quaternions, resets from the pre-preview snapshot, and leaves Pose/Clip state untouched', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const poseState = module.reduceViewer3DPoseClipState(module.createViewer3DPoseClipState(rigSummary), {
+      type: 'set-preview',
+      previewState: 'playing',
+      currentTimeSeconds: 0.25,
+    })
+    const poseStateBefore = structuredClone(poseState)
+    const motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const hips = new THREE.Bone()
+    const spine = new THREE.Bone()
+    hips.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 7)
+    spine.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 9)
+    const originalHips = hips.quaternion.clone()
+    const originalSpine = spine.quaternion.clone()
+    const hipsPositionBefore = hips.position.clone()
+    const spineScaleBefore = spine.scale.clone()
+    const bonesById = new Map([
+      ['rig:hero|skeleton:0|bone:hips#0', hips],
+      ['rig:hero|skeleton:0|bone:hips#0/spine#0', spine],
+    ])
+    const gltfAction = { enabled: true, paused: false, play: () => { throw new Error('motion retarget scrub must not resume GLTF animation') } }
+
+    const started = module.startViewer3DMotionRetargetPreview({
+      state: motionState,
+      bonesById,
+      poseSnapshot: null,
+      gltfActions: [gltfAction],
+      gltfAnimationPlaying: true,
+      timeSeconds: 0.5,
+    })
+
+    assert.equal(started.state.previewState, 'playing')
+    assert.equal(started.state.previewCurrentTimeSeconds, 0.5)
+    assert.equal(gltfAction.paused, true)
+    assertQuaternionClose(hips.quaternion, new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2))
+    assertQuaternionClose(spine.quaternion, new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2))
+    assert.deepEqual(hips.position.toArray(), hipsPositionBefore.toArray())
+    assert.deepEqual(spine.scale.toArray(), spineScaleBefore.toArray())
+
+    hips.quaternion.setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 4)
+    const scrubbed = module.scrubViewer3DMotionRetargetPreviewTime({
+      state: started.state,
+      bonesById,
+      poseSnapshot: started.poseSnapshot,
+      gltfActions: [gltfAction],
+      gltfAnimationPlaying: true,
+      timeSeconds: 1,
+    })
+
+    assert.equal(scrubbed.state.previewState, 'paused')
+    assert.equal(scrubbed.state.previewCurrentTimeSeconds, 1)
+    assertQuaternionClose(hips.quaternion, new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI))
+    assertQuaternionClose(spine.quaternion, new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI))
+
+    const reset = module.resetViewer3DMotionRetargetPreview({
+      state: scrubbed.state,
+      bonesById,
+      snapshot: scrubbed.poseSnapshot,
+    })
+
+    assert.equal(reset.state.previewState, 'idle')
+    assert.equal(reset.state.previewCurrentTimeSeconds, 0)
+    assertQuaternionClose(hips.quaternion, originalHips)
+    assertQuaternionClose(spine.quaternion, originalSpine)
+    assert.deepEqual(poseState, poseStateBefore)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D disables unsafe local Motion Retarget preview copy without blocking sidecar save or PoseClip export', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const disabledCopy = 'Local rotation preview disabled because Kimodo omitted basis/rest-pose evidence; use animated GLB playback or export sidecar for rerun.'
+    const state = module.createViewer3DMotionRetargetState(rigSummary, {
+      ...motionRetargetSession,
+      warnings: [disabledCopy],
+      exportReadiness: {
+        canSaveSidecar: true,
+        canExportPoseClip: true,
+        blockingWarnings: [disabledCopy],
+      },
+      unlockReadiness: {
+        ...motionRetargetSession.unlockReadiness,
+        localRetargetReady: false,
+        canPreview: false,
+        canSaveSidecar: true,
+        canExportPoseClip: true,
+        blockingWarnings: [disabledCopy],
+      },
+    })
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps(state, {})
+    const hips = new THREE.Bone()
+    const beforeQuaternion = hips.quaternion.clone()
+    const started = module.startViewer3DMotionRetargetPreview({
+      state,
+      bonesById: new Map([['rig:hero|skeleton:0|bone:hips#0', hips]]),
+      poseSnapshot: null,
+      gltfActions: [],
+      gltfAnimationPlaying: false,
+      timeSeconds: 0.5,
+    })
+
+    assert.equal(panelProps.previewDisabledReason, disabledCopy)
+    assert.equal(panelProps.saveDisabledReason, undefined)
+    assert.equal(panelProps.exportDisabledReason, undefined)
+    assert.equal(started.state.previewState, 'idle')
+    assert.equal(started.preview, null)
+    assertQuaternionClose(hips.quaternion, beforeQuaternion)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D active Motion Retarget reset stops animated GLB playback, clears playing state, and seeks time zero', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const calls: string[] = []
+    const action = {
+      enabled: true,
+      paused: false,
+      time: 1.5,
+      play() { calls.push('play'); return this },
+      stop() { calls.push('stop'); return this },
+      reset() { calls.push('reset'); return this },
+    }
+    const mixer = {
+      time: 1.5,
+      setTime(timeSeconds: number) {
+        calls.push(`setTime:${timeSeconds}`)
+        this.time = timeSeconds
+      },
+    }
+    const state = module.reduceViewer3DMotionRetargetState(
+      module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession),
+      { type: 'set-preview-state', previewState: 'playing', timeSeconds: 0.75 },
+    )
+
+    const reset = module.resetViewer3DActiveMotionPlayback({
+      state,
+      activeBackend: 'animated-glb',
+      bonesById: new Map(),
+      localSnapshot: null,
+      animation: { actions: [action], mixer, playing: true },
+    })
+
+    assert.deepEqual(calls, ['stop', 'reset', 'setTime:0'])
+    assert.equal(action.enabled, false)
+    assert.equal(action.paused, false)
+    assert.equal(action.time, 0)
+    assert.equal(mixer.time, 0)
+    assert.equal(reset.animationPlaying, false)
+    assert.equal(reset.state.previewState, 'idle')
+    assert.equal(reset.state.previewCurrentTimeSeconds, 0)
+    assert.equal(reset.localSnapshot, null)
+    assert.deepEqual(reset.reset, { resetActionCount: 1, mixerTimeSeconds: 0 })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D active Motion Retarget reset restores only local preview snapshot when local retarget preview owns playback', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const hips = new THREE.Bone()
+    hips.position.set(1, 2, 3)
+    hips.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 4)
+    hips.scale.set(2, 2, 2)
+    const bonesById = new Map([['rig:hero|skeleton:0|bone:hips#0', hips]])
+    const snapshot = module.takeMotionRetargetPreviewSnapshot(bonesById)
+    const action = {
+      enabled: true,
+      paused: false,
+      time: 3,
+      play() { throw new Error('local reset must not replay GLB') },
+      stop() { throw new Error('local reset must not stop animated GLB actions') },
+      reset() { throw new Error('local reset must not seek animated GLB actions') },
+    }
+    hips.position.set(9, 8, 7)
+    hips.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2)
+    hips.scale.set(4, 5, 6)
+
+    const reset = module.resetViewer3DActiveMotionPlayback({
+      state: module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession),
+      activeBackend: 'local-retarget-preview',
+      bonesById,
+      localSnapshot: snapshot,
+      animation: { actions: [action], mixer: { time: 3 }, playing: true },
+    })
+
+    assert.deepEqual(hips.position.toArray(), [1, 2, 3])
+    assertQuaternionClose(hips.quaternion, snapshot.get('rig:hero|skeleton:0|bone:hips#0').quaternion)
+    assert.deepEqual(hips.scale.toArray(), [2, 2, 2])
+    assert.equal(action.enabled, true)
+    assert.equal(action.time, 3)
+    assert.equal(reset.animationPlaying, false)
+    assert.equal(reset.state.previewState, 'idle')
+    assert.equal(reset.state.previewCurrentTimeSeconds, 0)
+    assert.equal(reset.localSnapshot, null)
+    assert.deepEqual(reset.restoredBoneIds, ['rig:hero|skeleton:0|bone:hips#0'])
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D only resets Motion Retarget local preview on an open-to-closed visibility transition', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.equal(module.shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({ wasOpen: false, isOpen: false }), false)
+    assert.equal(module.shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({ wasOpen: false, isOpen: true }), false)
+    assert.equal(module.shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({ wasOpen: true, isOpen: true }), false)
+    assert.equal(module.shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({ wasOpen: true, isOpen: false }), true)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D closing Motion Retarget restores only scoped local preview and preserves global animated GLB playback', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const hips = new THREE.Bone()
+    hips.position.set(1, 2, 3)
+    const bonesById = new Map([['rig:hero|skeleton:0|bone:hips#0', hips]])
+    const snapshot = module.takeMotionRetargetPreviewSnapshot(bonesById)
+    hips.position.set(7, 8, 9)
+    const state = module.reduceViewer3DMotionRetargetState(
+      module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession),
+      { type: 'set-preview-state', previewState: 'playing', timeSeconds: 0.5 },
+    )
+
+    const reset = module.resetViewer3DScopedMotionRetargetPreviewOnClose({
+      state,
+      bonesById,
+      localSnapshot: snapshot,
+      globalAnimationPlaying: true,
+    })
+
+    assert.deepEqual(hips.position.toArray(), [1, 2, 3])
+    assert.equal(reset.globalAnimationPlaying, true)
+    assert.equal(reset.state.previewState, 'idle')
+    assert.equal(reset.state.previewCurrentTimeSeconds, 0)
+    assert.equal(reset.localSnapshot, null)
+    assert.deepEqual(reset.restoredBoneIds, ['rig:hero|skeleton:0|bone:hips#0'])
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D exports Kimodo Pose/Clip companions through the existing Pose/Clip sidecar writer with manual mapping applied', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    motionState = module.reduceViewer3DMotionRetargetState(motionState, {
+      type: 'set-mapping',
+      sourceBoneId: 'source:hips',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
+    })
+    motionState = module.reduceViewer3DMotionRetargetState(motionState, {
+      type: 'set-mapping',
+      sourceBoneId: 'source:spine',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0',
+    })
+    const requests: unknown[] = []
+
+    const result = await module.writeViewer3DMotionRetargetPoseClipCompanion({
+      state: motionState,
+      createdAt: '2026-05-21T18:45:00.000Z',
+      writer: async (request: unknown) => {
+        requests.push(request)
+        return {
+          success: true,
+          sidecarWorkspacePath: (request as { sidecarWorkspacePath: string }).sidecarWorkspacePath,
+          sidecar: (request as { sidecar: unknown }).sidecar,
+        }
+      },
+    })
+
+    assert.equal(requests.length, 1)
+    assert.equal((requests[0] as { sourceWorkspacePath: string }).sourceWorkspacePath, 'Workflows/outputs/hero.glb')
+    assert.equal((requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath, 'Workflows/pose-clips/hero.kimodo-walk-forward.kimodo-companion.pose-clip.v1.json')
+    assert.notEqual(
+      (requests[0] as { sidecarWorkspacePath: string }).sidecarWorkspacePath,
+      'Workflows/pose-clips/hero.pose-clip.v1.json',
+    )
+    assert.equal((requests[0] as { sidecar: { schema: string } }).sidecar.schema, 'modly.pose-clip')
+    assert.deepEqual((requests[0] as { sidecar: { keyframes: unknown[] } }).sidecar.keyframes, [
+      {
+        id: 'kimodo-rig-hero-skeleton-0-bone-hips-0-f0',
+        timeSeconds: 0,
+        boneId: 'rig:hero|skeleton:0|bone:hips#0',
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      {
+        id: 'kimodo-rig-hero-skeleton-0-bone-hips-0-spine-0-f0',
+        timeSeconds: 0,
+        boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      {
+        id: 'kimodo-rig-hero-skeleton-0-bone-hips-0-f30',
+        timeSeconds: 1,
+        boneId: 'rig:hero|skeleton:0|bone:hips#0',
+        rotation: quaternionValue(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI)),
+      },
+      {
+        id: 'kimodo-rig-hero-skeleton-0-bone-hips-0-spine-0-f30',
+        timeSeconds: 1,
+        boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
+        rotation: quaternionValue(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI)),
+      },
+    ])
+    assert.deepEqual(result, {
+      success: true,
+      sidecarWorkspacePath: 'Workflows/pose-clips/hero.kimodo-walk-forward.kimodo-companion.pose-clip.v1.json',
+      sidecar: (requests[0] as { sidecar: unknown }).sidecar,
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D fails companion export closed with a clear message when compatible Kimodo metadata is absent', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const motionState = module.createViewer3DMotionRetargetState(rigSummary, {
+      ...motionRetargetSession,
+      artifact: {
+        ...motionRetargetSession.artifact,
+        motionRetarget: undefined,
+      },
+      exportReadiness: {
+        canSaveSidecar: false,
+        canExportPoseClip: false,
+        blockingWarnings: ['Trusted Kimodo motion payload is unavailable.'],
+      },
+      unlockReadiness: {
+        trustedPayloadReady: false,
+        translationReady: false,
+        showSourceBones: false,
+        showMappingDisplay: false,
+        canPreview: false,
+        canSaveSidecar: false,
+        canExportPoseClip: false,
+        blockingWarnings: ['Trusted Kimodo motion payload is unavailable.'],
+      },
+    })
+    const requests: unknown[] = []
+
+    const result = await module.writeViewer3DMotionRetargetPoseClipCompanion({
+      state: motionState,
+      writer: async (request: unknown) => {
+        requests.push(request)
+        return { success: true, sidecarWorkspacePath: (request as { sidecarWorkspacePath: string }).sidecarWorkspacePath, sidecar: (request as { sidecar: unknown }).sidecar }
+      },
+    })
+
+    assert.equal(requests.length, 0)
+    assert.deepEqual(result, {
+      success: false,
+      error: 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D wires manual mapping callbacks through renderer-local Motion Retarget state while keeping trusted preview/export readiness unlocked', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const mappedTargets: Array<{ sourceBoneId: string, targetBoneId?: string }> = []
+
+    let panelProps = module.resolveViewer3DMotionRetargetPanelProps(motionState, {
+      onChangeMapping: (sourceBoneId: string, targetBoneId?: string) => {
+        mappedTargets.push({ sourceBoneId, targetBoneId })
+        motionState = module.reduceViewer3DMotionRetargetState(motionState, { type: 'set-mapping', sourceBoneId, targetBoneId })
+      },
+    })
+
+    panelProps.onChangeMapping('source:spine', 'rig:hero|skeleton:0|bone:hips#0')
+    panelProps = module.resolveViewer3DMotionRetargetPanelProps(motionState, {})
+
+    assert.deepEqual(mappedTargets, [
+      { sourceBoneId: 'source:spine', targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+    ])
+    assert.equal(panelProps.session.mappings['source:spine']?.targetBoneId, 'rig:hero|skeleton:0|bone:hips#0')
+    assert.equal(panelProps.session.exportReadiness.canExportPoseClip, true)
+    assert.match(panelProps.warnings.join('\n'), /assigned to multiple source bones/)
+
+    const requests: unknown[] = []
+    await module.writeViewer3DMotionRetargetSidecar({
+      state: motionState,
+      createdAt: '2026-05-24T09:40:00.000Z',
+      writer: async (request: unknown) => {
+        requests.push(request)
+        return { success: true, sidecarWorkspacePath: (request as { sidecarWorkspacePath: string }).sidecarWorkspacePath, sidecar: (request as { sidecar: unknown }).sidecar }
+      },
+    })
+
+    assert.deepEqual((requests[0] as { sidecar: { session: { mappings: Record<string, { targetBoneId: string }> } } }).sidecar.session.mappings, {
+      'source:hips': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+      'source:spine': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D duplicate target assignments surface diagnostics without downgrading companion export readiness', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let motionState = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+
+    motionState = module.reduceViewer3DMotionRetargetState(motionState, {
+      type: 'set-mapping',
+      sourceBoneId: 'source:spine',
+      targetBoneId: 'rig:hero|skeleton:0|bone:hips#0',
+    })
+
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps(motionState, {})
+
+    assert.equal(panelProps.session.exportReadiness.canExportPoseClip, true)
+    assert.equal(panelProps.session.exportReadiness.coherentExportReady, false)
+    assert.match(panelProps.session.exportReadiness.blockingWarnings.join('\n'), /not coherent\/export-ready/i)
+    assert.match(panelProps.warnings.join('\n'), /Target bone "UniRig Pelvis" is assigned to multiple source bones/)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D open for GLB artifacts routes to the internal Viewer3D preview target instead of an external browser', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const artifacts = module.resolveViewer3DMotionRetargetArtifactEntries(state.session)
+    const animatedGlb = artifacts.find((artifact: { key: string }) => artifact.key === 'animated-glb')
+
+    assert.ok(animatedGlb)
+
+    const opened = await module.openViewer3DMotionRetargetArtifact({
+      state,
+      artifact: animatedGlb,
+      previewReader: async () => {
+        throw new Error('GLB open must not request a text preview reader')
+      },
+    })
+
+    assert.equal(opened.motionRetargetState.session?.selectedPreview, 'animated-glb')
+    assert.deepEqual(opened.previewState, { status: 'closed' })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D open for text Motion Retarget artifacts displays an internal preview state', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const artifacts = module.resolveViewer3DMotionRetargetArtifactEntries(state.session)
+    const metadataJson = artifacts.find((artifact: { key: string }) => artifact.key === 'metadata')
+
+    assert.ok(metadataJson)
+
+    const opened = await module.openViewer3DMotionRetargetArtifact({
+      state,
+      artifact: metadataJson,
+      previewReader: async (request: { workspacePath: string }) => {
+        assert.equal(request.workspacePath, 'Workflows/kimodo/run-1/metadata.json')
+        return {
+          success: true,
+          status: 'text',
+          workspacePath: request.workspacePath,
+          displayName: 'metadata.json',
+          content: '{"clip":"Walk"}',
+          byteLength: 15,
+          truncated: false,
+        }
+      },
+    })
+
+    assert.deepEqual(opened.previewState, {
+      status: 'text',
+      title: 'Metadata JSON',
+      workspacePath: 'Workflows/kimodo/run-1/metadata.json',
+      displayName: 'metadata.json',
+      content: '{"clip":"Walk"}',
+      byteLength: 15,
+      truncated: false,
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D open for Motion NPZ shows binary preview unavailable info instead of raw text', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const artifacts = module.resolveViewer3DMotionRetargetArtifactEntries(state.session)
+    const motionNpz = artifacts.find((artifact: { key: string }) => artifact.key === 'motion-npz')
+
+    assert.ok(motionNpz)
+
+    const opened = await module.openViewer3DMotionRetargetArtifact({
+      state,
+      artifact: motionNpz,
+      previewReader: async (request: { workspacePath: string }) => ({
+        success: true,
+        status: 'binary',
+        workspacePath: request.workspacePath,
+        displayName: 'motion.npz',
+        byteLength: 2048,
+        binaryKind: 'npz',
+        message: 'Binary preview is unavailable for NPZ artifacts. Download the file to inspect it locally.',
+      }),
+    })
+
+    assert.deepEqual(opened.previewState, {
+      status: 'binary',
+      title: 'Motion NPZ',
+      workspacePath: 'Workflows/kimodo/run-1/motion.npz',
+      displayName: 'motion.npz',
+      byteLength: 2048,
+      binaryKind: 'npz',
+      message: 'Binary preview is unavailable for NPZ artifacts. Download the file to inspect it locally.',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D Motion Retarget download triggers the Electron artifact download IPC instead of browser anchors', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary, motionRetargetSession)
+    const artifacts = module.resolveViewer3DMotionRetargetArtifactEntries(state.session)
+    const motionBvh = artifacts.find((artifact: { key: string }) => artifact.key === 'motion-bvh')
+    const requests: Array<{ workspacePath: string, suggestedName?: string }> = []
+
+    assert.ok(motionBvh)
+
+    const result = await module.downloadViewer3DMotionRetargetArtifact({
+      artifact: motionBvh,
+      downloader: async (request: { workspacePath: string, suggestedName?: string }) => {
+        requests.push(request)
+        return {
+          success: true,
+          status: 'saved',
+          workspacePath: request.workspacePath,
+          targetPath: '/tmp/motion.bvh',
+        }
+      },
+    })
+
+    assert.deepEqual(requests, [{ workspacePath: 'Workflows/kimodo/run-1/motion.bvh', suggestedName: 'motion.bvh' }])
+    assert.deepEqual(result, {
+      success: true,
+      status: 'saved',
+      workspacePath: 'Workflows/kimodo/run-1/motion.bvh',
+      targetPath: '/tmp/motion.bvh',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D clones Motion Retarget session input so renderer-local state cannot mutate source Kimodo artifacts', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const sourceSession = structuredClone(motionRetargetSession) as {
+      selectedPreview: 'preview-glb' | 'animated-glb'
+      warnings: string[]
+      artifact: { previewGlbWorkspacePath?: string }
+      mappings: Record<string, { targetLabel?: string }>
+    }
+    const state = module.createViewer3DMotionRetargetState(rigSummary, sourceSession)
+
+    sourceSession.selectedPreview = 'preview-glb'
+    sourceSession.warnings.push('mutated outside renderer state')
+    sourceSession.artifact.previewGlbWorkspacePath = 'Workflows/kimodo/run-1/mutated-preview.glb'
+    sourceSession.mappings['source:hips'] = {
+      ...sourceSession.mappings['source:hips'],
+      targetLabel: 'Mutated outside renderer state',
+    }
+
+    assert.equal(state.session?.selectedPreview, 'animated-glb')
+    assert.deepEqual(state.session?.warnings, ['Root-motion correctness is deferred.'])
+    assert.equal(state.session?.artifact.previewGlbWorkspacePath, 'Workflows/kimodo/run-1/preview.glb')
+    assert.equal(state.session?.mappings['source:hips']?.targetLabel, 'UniRig Pelvis')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D resolves safe Kimodo metadata descriptors only for workspace-backed animate outputs', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        artifact: {
+          id: 'workflow-workflow-hero-node-node-animate',
+          kind: 'mesh',
+          uri: '/workspace/Workflows/kimodo/run-1/preview.glb',
+          versionId: 'v1',
+          legacy: { filePath: '/workspace/Workflows/kimodo/run-1/preview.glb', outputType: 'mesh' },
+          provenance: {
+            workflowId: 'workflow-hero',
+            workflowNodeId: 'node-animate',
+            extensionId: 'kimodo-soma-rp',
+            extensionNodeId: 'animate-rigged-mesh',
+          },
+        },
+      }),
+      {
+        artifact: {
+          id: 'workflow-workflow-hero-node-node-animate',
+          kind: 'mesh',
+          uri: '/workspace/Workflows/kimodo/run-1/preview.glb',
+          versionId: 'v1',
+          legacy: { filePath: '/workspace/Workflows/kimodo/run-1/preview.glb', outputType: 'mesh' },
+          provenance: {
+            workflowId: 'workflow-hero',
+            workflowNodeId: 'node-animate',
+            extensionId: 'kimodo-soma-rp',
+            extensionNodeId: 'animate-rigged-mesh',
+          },
+        },
+        artifactWorkspacePath: 'Workflows/kimodo/run-1/preview.glb',
+        bundleWorkspacePath: 'Workflows/kimodo/run-1',
+        metadataWorkspacePath: 'Workflows/kimodo/run-1/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-1/metadata.json',
+        detectionMode: 'provenance',
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+      }),
+      {
+        artifact: {
+          id: 'viewer3d:model-url:Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          kind: 'mesh',
+          uri: '/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          versionId: 'viewer3d:model-url:Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          legacy: {
+            filePath: '/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+            outputType: 'mesh',
+          },
+        },
+        artifactWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+        bundleWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59',
+        metadataWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260521-230257-c858ac59/metadata.json',
+        detectionMode: 'sibling-metadata',
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8765',
+        modelUrl: 'http://127.0.0.1:8765/optimize/serve-file?path=%2Fhome%2Fdrhepa%2FDocumentos%2FModly%2Fworkspace%2FWorkflows%2Fkimodo-20260521-230257-c858ac59%2Fanimated.glb',
+      }),
+      {
+        artifact: {
+          id: 'viewer3d:model-url:Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          kind: 'mesh',
+          uri: '/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          versionId: 'viewer3d:model-url:Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+          legacy: {
+            filePath: '/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+            outputType: 'mesh',
+          },
+        },
+        artifactWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+        bundleWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59',
+        metadataWorkspacePath: 'Workflows/kimodo-20260521-230257-c858ac59/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8765/workspace/Workflows/kimodo-20260521-230257-c858ac59/metadata.json',
+        detectionMode: 'sibling-metadata',
+      },
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'blob:http://127.0.0.1:8000/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/models/kimodo-20260521-230257-c858ac59/animated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/../escape/animated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/optimize/serve-file?path=%2Fhome%2Fdrhepa%2Foutside%2Fanimated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/optimize/serve-file?path=%2Fhome%2Fdrhepa%2FDocumentos%2FModly%2Fworkspace%2FWorkflows%2F..%252Fescape%2Fanimated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'C:/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+      }),
+      undefined,
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.fbx',
+      }),
+      undefined,
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        artifact: {
+          id: 'direct-import-kimodo',
+          kind: 'mesh',
+          uri: '/workspace/Imports/kimodo/run-1/animated.glb',
+          versionId: 'v1',
+          legacy: { filePath: '/workspace/Imports/kimodo/run-1/animated.glb', outputType: 'mesh' },
+        },
+      }),
+      {
+        artifact: {
+          id: 'direct-import-kimodo',
+          kind: 'mesh',
+          uri: '/workspace/Imports/kimodo/run-1/animated.glb',
+          versionId: 'v1',
+          legacy: { filePath: '/workspace/Imports/kimodo/run-1/animated.glb', outputType: 'mesh' },
+        },
+        artifactWorkspacePath: 'Imports/kimodo/run-1/animated.glb',
+        bundleWorkspacePath: 'Imports/kimodo/run-1',
+        metadataWorkspacePath: 'Imports/kimodo/run-1/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8000/workspace/Imports/kimodo/run-1/metadata.json',
+        detectionMode: 'sibling-metadata',
+      },
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        artifact: {
+          id: 'unsafe',
+          kind: 'mesh',
+          uri: '/workspace/../escape/animated.glb',
+          versionId: 'v1',
+          legacy: { filePath: '/workspace/../escape/animated.glb', outputType: 'mesh' },
+          provenance: {
+            workflowId: 'workflow-hero',
+            workflowNodeId: 'node-animate',
+            extensionId: 'kimodo-soma-rp',
+            extensionNodeId: 'animate-rigged-mesh',
+          },
+        },
+      }),
+      undefined,
+    )
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D hydrates a diagnostics-only Motion Retarget session from sibling Kimodo metadata when animated.glb was imported directly without provenance', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      artifact: {
+        id: 'direct-import-kimodo',
+        kind: 'mesh',
+        uri: '/workspace/Imports/kimodo/run-1/animated.glb',
+        versionId: 'v1',
+        legacy: { filePath: '/workspace/Imports/kimodo/run-1/animated.glb', outputType: 'mesh' },
+      },
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp',
+        node_id: 'animate-rigged-mesh',
+        contract_version: '2.0.0',
+        animated_artifact: 'animated.glb',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        bundle_artifacts: ['animated.glb', 'preview.glb', 'motion.npz', 'metadata.json'],
+        warnings: ['Root-motion correctness is deferred.'],
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps({
+      ...module.createViewer3DMotionRetargetState(rigSummary, hydrated.session),
+      diagnosticsMessages: hydrated.diagnosticsMessages,
+    }, {})
+
+    assert.equal(hydrated.session?.artifact.workflowId, undefined)
+    assert.equal(hydrated.session?.artifact.animatedGlbWorkspacePath, 'Imports/kimodo/run-1/animated.glb')
+    assert.equal(hydrated.session?.sourceBones.length, 0)
+    assert.deepEqual(panelProps.warnings, [
+      'Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.',
+      'Diagnostics-only inspection is available until Kimodo exports source bone metadata.',
+      'Root-motion correctness is deferred.',
+      'Animated GLB playback is available, but local retarget correctness is not proven.',
+      'Trusted Kimodo motion payload is unavailable.',
+    ])
+    assert.equal(panelProps.saveDisabledReason, 'Save is unavailable until Modly validates a trusted Kimodo motion payload with complete translated source bone metadata.')
+    assert.equal(panelProps.previewDisabledReason, 'Local preview is unavailable until Modly validates a trusted Kimodo motion payload with complete translated quaternion tracks.')
+    assert.equal(panelProps.exportDisabledReason, 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D hydrates a diagnostics-only Motion Retarget session from workspace modelUrl fallback when no artifact provenance is available', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260521-230257-c858ac59/animated.glb',
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp',
+        contract_version: 'kimodo-runtime-core/v1',
+        node_id: 'animate-rigged-mesh',
+        animated_artifact: 'animated.glb',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['animated.glb', 'metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        warnings: ['Root-motion correctness is deferred.'],
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps({
+      ...module.createViewer3DMotionRetargetState(rigSummary, hydrated.session),
+      diagnosticsMessages: hydrated.diagnosticsMessages,
+    }, {})
+
+    assert.equal(descriptor?.detectionMode, 'sibling-metadata')
+    assert.equal(hydrated.session?.artifact.workflowId, undefined)
+    assert.equal(hydrated.session?.artifact.bundleWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59')
+    assert.equal(hydrated.session?.artifact.animatedGlbWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/animated.glb')
+    assert.equal(hydrated.session?.artifact.previewGlbWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/preview.glb')
+    assert.equal(hydrated.session?.artifact.motionNpzWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/motion.npz')
+    assert.equal(hydrated.session?.artifact.motionBvhWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/motion.bvh')
+    assert.equal(hydrated.session?.sourceBones.length, 0)
+    assert.deepEqual(panelProps.warnings, [
+      'Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.',
+      'Diagnostics-only inspection is available until Kimodo exports source bone metadata.',
+      'Root-motion correctness is deferred.',
+      'Animated GLB playback is available, but local retarget correctness is not proven.',
+      'Trusted Kimodo motion payload is unavailable.',
+    ])
+    assert.equal(panelProps.saveDisabledReason, 'Save is unavailable until Modly validates a trusted Kimodo motion payload with complete translated source bone metadata.')
+    assert.equal(panelProps.previewDisabledReason, 'Local preview is unavailable until Modly validates a trusted Kimodo motion payload with complete translated quaternion tracks.')
+    assert.equal(panelProps.exportDisabledReason, 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D hydrates a diagnostics-only Motion Retarget session from serve-file modelUrl fallback when no artifact provenance is available', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8765',
+      modelUrl: 'http://127.0.0.1:8765/optimize/serve-file?path=%2Fhome%2Fdrhepa%2FDocumentos%2FModly%2Fworkspace%2FWorkflows%2Fkimodo-20260521-230257-c858ac59%2Fanimated.glb',
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp',
+        contract_version: 'kimodo-runtime-core/v1',
+        node_id: 'animate-rigged-mesh',
+        animated_artifact: 'animated.glb',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['animated.glb', 'metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        warnings: ['Root-motion correctness is deferred.'],
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps({
+      ...module.createViewer3DMotionRetargetState(rigSummary, hydrated.session),
+      diagnosticsMessages: hydrated.diagnosticsMessages,
+    }, {})
+
+    assert.equal(descriptor?.detectionMode, 'sibling-metadata')
+    assert.equal(descriptor?.artifactWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/animated.glb')
+    assert.equal(hydrated.session?.artifact.workflowId, undefined)
+    assert.equal(hydrated.session?.artifact.bundleWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59')
+    assert.equal(hydrated.session?.artifact.animatedGlbWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/animated.glb')
+    assert.equal(hydrated.session?.artifact.previewGlbWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/preview.glb')
+    assert.equal(hydrated.session?.artifact.motionNpzWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/motion.npz')
+    assert.equal(hydrated.session?.artifact.motionBvhWorkspacePath, 'Workflows/kimodo-20260521-230257-c858ac59/motion.bvh')
+    assert.equal(hydrated.session?.sourceBones.length, 0)
+    assert.deepEqual(panelProps.warnings, [
+      'Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.',
+      'Diagnostics-only inspection is available until Kimodo exports source bone metadata.',
+      'Root-motion correctness is deferred.',
+      'Animated GLB playback is available, but local retarget correctness is not proven.',
+      'Trusted Kimodo motion payload is unavailable.',
+    ])
+    assert.equal(panelProps.saveDisabledReason, 'Save is unavailable until Modly validates a trusted Kimodo motion payload with complete translated source bone metadata.')
+    assert.equal(panelProps.previewDisabledReason, 'Local preview is unavailable until Modly validates a trusted Kimodo motion payload with complete translated quaternion tracks.')
+    assert.equal(panelProps.exportDisabledReason, 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D ignores random sibling metadata during direct-import fallback so non-Kimodo GLBs do not hydrate a session', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      artifact: {
+        id: 'direct-import-random',
+        kind: 'mesh',
+        uri: '/workspace/Imports/random/run-1/animated.glb',
+        versionId: 'v1',
+        legacy: { filePath: '/workspace/Imports/random/run-1/animated.glb', outputType: 'mesh' },
+      },
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        extension_id: 'not-kimodo',
+        node_id: 'random-glb',
+        contract_version: '1.0.0',
+        animated_artifact: 'animated.glb',
+        bundle_artifacts: ['animated.glb', 'metadata.json'],
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    assert.equal(hydrated.session, undefined)
+    assert.deepEqual(hydrated.diagnosticsMessages, [])
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D preserves provenance-first Kimodo hydration for workflow-selected artifacts even without fallback-only contract fields', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      artifact: {
+        id: 'workflow-workflow-hero-node-node-animate',
+        kind: 'mesh',
+        uri: '/workspace/Workflows/kimodo/run-1/preview.glb',
+        versionId: 'v1',
+        legacy: { filePath: '/workspace/Workflows/kimodo/run-1/preview.glb', outputType: 'mesh' },
+        provenance: {
+          workflowId: 'workflow-hero',
+          workflowNodeId: 'node-animate',
+          extensionId: 'kimodo-soma-rp',
+          extensionNodeId: 'animate-rigged-mesh',
+        },
+      },
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        runtime_status: 'success',
+        retarget_status: 'success',
+        animation_mapping_status: 'trusted_contract',
+        canonical_motion_artifact: 'motion.npz',
+        artifacts: ['animated.glb', 'metadata.json', 'motion.npz', 'preview.glb'],
+        warnings: ['Root-motion correctness is deferred.'],
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    assert.equal(hydrated.session?.artifact.workflowId, 'workflow-hero')
+    assert.equal(hydrated.session?.artifact.workflowNodeId, 'node-animate')
+    assert.equal(hydrated.session?.artifact.animatedGlbWorkspacePath, 'Workflows/kimodo/run-1/animated.glb')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D resolves Kimodo metadata for Add to Scene workflow artifacts even when provenance-backed artifact paths are absolute workspace files', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-absolute/animated.glb',
+      artifact: {
+        id: 'workflow-workflow-hero-node-node-animate-absolute',
+        kind: 'mesh',
+        uri: '/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo/run-absolute/animated.glb',
+        versionId: 'v1',
+        legacy: {
+          filePath: '/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo/run-absolute/animated.glb',
+          outputType: 'mesh',
+        },
+        provenance: {
+          workflowId: 'workflow-hero',
+          workflowNodeId: 'node-animate',
+          extensionId: 'kimodo-soma-rp',
+          extensionNodeId: 'animate-rigged-mesh',
+        },
+      },
+    })
+
+    assert.deepEqual(descriptor, {
+      artifact: {
+        id: 'workflow-workflow-hero-node-node-animate-absolute',
+        kind: 'mesh',
+        uri: '/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo/run-absolute/animated.glb',
+        versionId: 'v1',
+        legacy: {
+          filePath: '/home/drhepa/Documentos/Modly/workspace/Workflows/kimodo/run-absolute/animated.glb',
+          outputType: 'mesh',
+        },
+        provenance: {
+          workflowId: 'workflow-hero',
+          workflowNodeId: 'node-animate',
+          extensionId: 'kimodo-soma-rp',
+          extensionNodeId: 'animate-rigged-mesh',
+        },
+      },
+      artifactWorkspacePath: 'Workflows/kimodo/run-absolute/animated.glb',
+      bundleWorkspacePath: 'Workflows/kimodo/run-absolute',
+      metadataWorkspacePath: 'Workflows/kimodo/run-absolute/metadata.json',
+      metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-absolute/metadata.json',
+      detectionMode: 'provenance',
+    })
+
+    const hydrated = module.hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+      descriptor,
+      metadata: {
+        runtime_status: 'success',
+        retarget_status: 'success',
+        animation_mapping_status: 'trusted_contract',
+        source_kind: 'load_mesh_existing',
+        mapping_confidence: 'compatible',
+        artifacts: ['animated.glb', 'metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        kimodo_motion_retarget: {
+          schema: 'kimodo.motion-retarget.v1',
+          contract_version: 1,
+          source_contract: { schema: 'modly.humanoid.v1', trusted: true, sidecar_payload_sha256: 'abc123' },
+          mapping_status: 'trusted_manual',
+          mapping_confidence: 'compatible',
+          fps: 30,
+          duration_seconds: 1.5,
+          time_semantics: 'seconds',
+          source_bones: [
+            { source_bone_id: 'src:hips', label: 'Source Hips', raw_label: 'Hips' },
+            { source_bone_id: 'src:spine', label: 'Source Spine', raw_label: 'Spine', parent_source_bone_id: 'src:hips' },
+          ],
+          target_tracks: [
+            {
+              target_node_name: 'Hips',
+              target_node_index: 0,
+              rotations: [
+                { time_seconds: 0, x: 0, y: 0, z: 0, w: 1 },
+                { time_seconds: 0.5, x: 0, y: 0.3826834, z: 0, w: 0.9238795 },
+              ],
+            },
+            {
+              target_node_name: 'Spine',
+              target_node_index: 1,
+              rotations: [
+                { time_seconds: 0, x: 0, y: 0, z: 0, w: 1 },
+                { time_seconds: 0.5, x: 0, y: 0, z: 0.3826834, w: 0.9238795 },
+              ],
+            },
+          ],
+        },
+      },
+      summary: rigSummary,
+      renamePlan: { skeletonContextId: rigSummary.skeletonContextId, aliases: {} },
+      rigMetaNamingByBoneId: {},
+    })
+
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps({
+      ...module.createViewer3DMotionRetargetState(rigSummary, hydrated.session),
+      diagnosticsMessages: hydrated.diagnosticsMessages,
+    }, {})
+
+    assert.equal(hydrated.session?.artifact.workflowId, 'workflow-hero')
+    assert.equal(hydrated.session?.artifact.animatedGlbWorkspacePath, 'Workflows/kimodo/run-absolute/animated.glb')
+    assert.equal(hydrated.session?.sourceBones.length, 2)
+    assert.equal(panelProps.saveDisabledReason, undefined)
+    assert.equal(panelProps.previewDisabledReason, undefined)
+    assert.equal(panelProps.exportDisabledReason, undefined)
+    assert.equal(panelProps.warnings.includes('Trusted Kimodo motion payload is unavailable.'), false)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D auto-prefers only safe animated GLBs and falls back to preview.glb with diagnostics when retargeting is degraded', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DMotionRetargetModelPresentation({
+        defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-1/preview.glb',
+        apiUrl: 'http://127.0.0.1:8000',
+        session: motionRetargetSession,
+        diagnosticsMessages: [],
+      }),
+      {
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-1/animated.glb',
+        warnings: ['Root-motion correctness is deferred.'],
+      },
+    )
+
+    const degradedSession = {
+      ...motionRetargetSession,
+      artifact: {
+        ...motionRetargetSession.artifact,
+        diagnostics: {
+          ...motionRetargetSession.artifact.diagnostics,
+          retargetStatus: 'failed',
+          retargetErrorMessage: 'Kimodo could not guarantee the exported animated GLB.',
+        },
+      },
+      warnings: ['Kimodo could not guarantee the exported animated GLB.'],
+      exportReadiness: {
+        ...motionRetargetSession.exportReadiness,
+        canExportPoseClip: false,
+        blockingWarnings: ['Kimodo retarget status is failed.'],
+      },
+    }
+
+    assert.deepEqual(
+      module.resolveViewer3DMotionRetargetModelPresentation({
+        defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-1/preview.glb',
+        apiUrl: 'http://127.0.0.1:8000',
+        session: degradedSession,
+        diagnosticsMessages: ['Animated GLB fallback engaged because Kimodo reported degraded retarget diagnostics.'],
+      }),
+      {
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo/run-1/preview.glb',
+        warnings: [
+          'Animated GLB fallback engaged because Kimodo reported degraded retarget diagnostics.',
+          'Kimodo could not guarantee the exported animated GLB.',
+        ],
+      },
+    )
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D keeps Motion Retarget diagnostics visible even when no Kimodo session could be hydrated', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DMotionRetargetState(rigSummary)
+    const panelProps = module.resolveViewer3DMotionRetargetPanelProps({
+      ...state,
+      diagnosticsMessages: [
+        'Kimodo metadata could not be loaded.',
+        'Diagnostics-only inspection is available until a safe retarget artifact is found.',
+      ],
+    }, {})
+
+    assert.equal(panelProps.session, undefined)
+    assert.deepEqual(panelProps.warnings, [
+      'Kimodo metadata could not be loaded.',
+      'Diagnostics-only inspection is available until a safe retarget artifact is found.',
+    ])
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D Motion Retarget seams stay renderer-local, Electron-guarded, and avoid interactive FastAPI orchestration', async () => {
+  const { cleanup } = await loadViewer3DModule()
+
+  try {
+    const source = readFileSync(viewer3DEntry, 'utf8')
+    const motionRetargetSlice = source.slice(
+      source.indexOf('export function createViewer3DMotionRetargetState'),
+      source.indexOf('export function resolveViewer3DPoseClipPanelProps'),
+    )
+    const motionRetargetRuntimeSlice = source.slice(
+      source.indexOf('const kimodoMetadataDescriptor = useMemo('),
+      source.indexOf('  const handlePoseClipCurrentTimeChange'),
+    )
+
+    assert.match(motionRetargetRuntimeSlice, /fetch\(kimodoMetadataDescriptor\.metadataUrl\)/)
+    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.writeMotionRetargetSidecar/)
+    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.readMotionRetargetSidecar/)
+    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.previewWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.downloadWorkspaceArtifact/)
+    assert.doesNotMatch(motionRetargetSlice, /writeFile|rename\(|rm\(|mkdir\(|GLTFExporter|exportGLB|saveEditedScenePendingReplacement/i)
+    assert.doesNotMatch(motionRetargetRuntimeSlice, /processRun|createFromImage|\/generate|FastAPI|interactive mapping|pose editing|target="_blank"|download=/i)
+    assert.doesNotMatch(motionRetargetRuntimeSlice, /ipcRenderer\.invoke\(/)
   } finally {
     await cleanup()
   }

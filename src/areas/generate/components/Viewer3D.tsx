@@ -15,18 +15,23 @@ import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
+import { MotionRetargetPanel } from './MotionRetargetPanel'
+import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
 import { RigEditorPanel } from './RigEditorPanel'
 import { RigOverlay } from './RigOverlay'
 import { createLandmarkPointIntent, deriveLandmarkMarkers, resolveLandmarkMarkerRenderModels, type LandmarkMarkerViewModel } from './viewerLandmarkPicking'
-import { isolateAnimationForPoseClipPreview, resolveAnimationAvailability, syncAnimationActions, type AnimationActionLike, type AnimationIsolationSnapshot } from './viewerAnimation'
+import { isolateAnimationForPoseClipPreview, resetAnimationPlayback, resolveAnimationAvailability, syncAnimationActions, type AnimationActionLike, type AnimationIsolationSnapshot, type AnimationMixerLike, type AnimationPlaybackResetResult } from './viewerAnimation'
 import { PoseClipPanel, type PoseClipDrawerMode, type PoseClipLoadState, type PoseClipPanelWarning, type PoseClipPreviewState, type PoseClipSaveState } from './PoseClipPanel'
 import { resolveViewerModelSource, type ViewerModelSource } from '../viewerModelSource'
 import { collectSceneParts, createEditPlan, editPlanReducer } from '../sceneEdit'
 import type { EditPlan, ScenePart } from '../sceneEdit.types'
 import { buildRigSelectionOverlay, collectRigSkeletonSummary, type RigBoneId, type RigSelectionOverlayViewModel, type RigSkeletonSummary, type RigSkinnedMeshContext } from '../rigSkeleton.ts'
 import { buildRigRenameSidecarV1, createRigRenamePlan, createRigRenameSidecarWorkspacePath, hydrateRigRenamePlanFromSidecar, reduceRigRenamePlan, validateRigRenamePlan, type RigRenamePlan, type RigRenameValidationResult } from '../rigRenamePlan.ts'
-import { buildPoseClipSidecarV1, clampPoseClipTime, createLegacyPoseClipSidecarWorkspacePath, createPoseClipCaptureKeyframeId, createPoseClipPlan, createPoseClipSidecarWorkspacePath, hydratePoseClipPlanFromSidecar, reducePoseClipPlan, type PoseClipPlan, type PoseClipQuaternion, type PoseClipSidecarV1 } from '../poseClipPlan.ts'
+import { buildPoseClipSidecarV1, clampPoseClipTime, createLegacyPoseClipSidecarWorkspacePath, createPoseClipCaptureKeyframeId, createPoseClipPlan, createPoseClipSidecarWorkspacePath, deriveKimodoPoseClipCompanionV1, hydratePoseClipPlanFromSidecar, reducePoseClipPlan, validatePoseClipSidecarWorkspacePath, type PoseClipPlan, type PoseClipQuaternion, type PoseClipSidecarV1 } from '../poseClipPlan.ts'
 import { applyLocalPoseClipRotation, evaluatePoseClipPreview, resetPoseClipPreview, resetPoseClipSelectedBone, restoreThenEvaluatePoseClipPreview, takePoseClipQuaternionSnapshot, type ApplyLocalPoseClipRotationResult, type EvaluatePoseClipPreviewResult, type PoseClipQuaternionSnapshot, type PoseClipRotationAxis } from '../poseClipPreview.ts'
+import { DEFAULT_MOTION_RETARGET_CORRECTIONS, createMotionRetargetCorrectionIdentity, createMotionRetargetSession, createMotionRetargetSidecarV1, hydrateMotionRetargetSessionSnapshotFromSidecar, normalizeMotionRetargetCorrections, reduceMotionRetargetSession, resolveMotionRetargetCorrectionState, type MotionRetargetCorrectionIdentityV1, type MotionRetargetCorrectionsV1, type MotionRetargetMappingEntry, type MotionRetargetPreviewKind, type MotionRetargetSession, type MotionRetargetSourceBone } from '../motionRetargetPlan.ts'
+import { normalizeKimodoMotionArtifact, type KimodoMotionArtifact } from '../kimodoMotionAdapter.ts'
+import { resolveMotionRetargetPreviewClip, resetMotionRetargetPreview, restoreThenEvaluateMotionRetargetPreview, takeMotionRetargetPreviewSnapshot, type MotionRetargetTransformSnapshot } from '../motionRetargetPreview.ts'
 import { resolveRigDisplayNames, type RigDisplayNamingResult } from '../rigDisplayNames.ts'
 import { normalizeRigMetaNaming, type RigMetaNamingMap } from '../rigMetaNaming.ts'
 import { resolveRigEffectiveNaming, type RigEffectiveNamingResult } from '../rigEffectiveNaming.ts'
@@ -40,7 +45,8 @@ import { useWorkflowRunStore } from '../../workflows/workflowRunStore'
 import type { LandmarkId, LandmarkPoint } from '../../workflows/landmarks'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
-import type { PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../../shared/types/electron.d'
+import type { MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult } from '../../../shared/types/electron.d'
+import type { ArtifactRef } from '../../../shared/types/artifacts.ts'
 
 type RigStats = {
   hasRig: boolean
@@ -71,6 +77,13 @@ type MeshModelClickEvent = ThreeEvent<MouseEvent> & {
   object: THREE.Object3D
   point: THREE.Vector3
   intersections: Array<{ object: THREE.Object3D; point: THREE.Vector3 }>
+}
+
+type MotionPlaybackBackend = 'local-retarget-preview' | 'animated-glb'
+
+type Viewer3DAnimationControls = {
+  actions: readonly AnimationActionLike[]
+  mixer?: AnimationMixerLike | null
 }
 
 const RIG_VIEW_MODES: ViewMode[] = ['bones', 'joints', 'influence']
@@ -405,6 +418,7 @@ interface MeshModelProps {
   sceneParts: readonly ScenePart[]
   onSelect: (partId: string | null) => void
   onAnimationAvailability: (hasAnimations: boolean) => void
+  onAnimationControlsReady?: (controls: Viewer3DAnimationControls | null) => void
   onRigStats: (stats: RigStats) => void
   onRigSkeletonSummary: (summary: RigSkeletonSummary) => void
   onPoseClipBonesReady?: (bonesById: Map<RigBoneId, THREE.Bone>) => void
@@ -418,7 +432,7 @@ interface MeshModelProps {
   }
 }
 
-function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, editMode, sceneParts, onStats, onSelect, onAnimationAvailability, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady, rigSkeletonSummary, selectedBoneId, onSceneReady, landmarkPicking }: MeshModelProps): JSX.Element {
+function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, editMode, sceneParts, onStats, onSelect, onAnimationAvailability, onAnimationControlsReady, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady, rigSkeletonSummary, selectedBoneId, onSceneReady, landmarkPicking }: MeshModelProps): JSX.Element {
   const { scene, animations } = useGLTF(url)
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
@@ -454,15 +468,17 @@ function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, ed
     const actions = animations.map((clip) => mixer.clipAction(clip))
     mixerRef.current = mixer
     actionsRef.current = actions
+    onAnimationControlsReady?.({ actions, mixer })
 
     return () => {
-      actions.forEach((action) => action.stop())
+      resetAnimationPlayback({ actions, mixer })
       mixer.stopAllAction()
       mixer.uncacheRoot(scene)
       actionsRef.current = []
       mixerRef.current = null
+      onAnimationControlsReady?.(null)
     }
-  }, [scene, animations])
+  }, [scene, animations, onAnimationControlsReady])
 
   useEffect(() => {
     syncAnimationActions(actionsRef.current, animationPlaying && resolveAnimationAvailability(animations))
@@ -1303,6 +1319,8 @@ type Viewer3DOverlayLayout = {
   editRailClassName: string | null
   editPanelClassName: string
   rigEditorPanelSlot: 'top-right'
+  motionRetargetPanelSlot: 'top-right-stack'
+  motionRetargetPanelClassName: string
   poseClipPanelSlot: 'bottom-drawer'
   poseClipPanelClassName: string
   commonViewportUsability: 'capped-internal-scroll'
@@ -1331,7 +1349,16 @@ export type Viewer3DRigHydrationWarning = {
 export type Viewer3DRigHydrationToken = {
   modelUrl: string | null
   sourceWorkspacePath: string
+  semanticSourceWorkspacePath: string
   skeletonContextId: string
+}
+
+export interface Viewer3DSemanticHydrationSource {
+  displayedMeshWorkspacePath: string
+  semanticSourceWorkspacePath: string
+  sourceKind: 'displayed-mesh' | 'kimodo-source'
+  warnings: string[]
+  failedClosed: boolean
 }
 
 export interface Viewer3DRigEditorState {
@@ -1340,6 +1367,10 @@ export interface Viewer3DRigEditorState {
   renamePlan: RigRenamePlan
   rigMetaNamingByBoneId: RigMetaNamingMap
   isRenamePlanDirty?: boolean
+}
+
+type Viewer3DRigEditorPanelOptions = {
+  rigMetaNamingByBoneId?: RigMetaNamingMap
 }
 
 export interface Viewer3DRigEditorVisibilityState {
@@ -1366,6 +1397,58 @@ export interface Viewer3DPoseClipVisibilityState {
   skeletonContextId?: string
   drawerMode: PoseClipDrawerMode
 }
+
+export interface Viewer3DMotionRetargetState {
+  summary?: RigSkeletonSummary
+  session?: MotionRetargetSession
+  identity?: MotionRetargetCorrectionIdentityV1
+  corrections: MotionRetargetCorrectionsV1
+  correctionState: ReturnType<typeof resolveMotionRetargetCorrectionState>
+  selectedSourceBoneId?: string
+  diagnosticsMessages: string[]
+  saveState: 'idle' | 'saving' | 'saved' | 'error'
+  loadState: 'idle' | 'loading' | 'loaded' | 'error'
+  exportState: 'idle' | 'exporting' | 'exported' | 'error'
+  previewState: 'idle' | 'playing' | 'paused'
+  previewCurrentTimeSeconds: number
+  saveMessage?: string
+  loadMessage?: string
+  exportMessage?: string
+}
+
+export interface Viewer3DMotionRetargetVisibilityState {
+  isOpen: boolean
+  skeletonContextId?: string
+}
+
+export type Viewer3DMotionRetargetArtifactEntry = {
+  key: MotionRetargetArtifactLink['key']
+  label: MotionRetargetArtifactLink['label']
+  workspacePath: MotionRetargetArtifactLink['workspacePath']
+  downloadName?: MotionRetargetArtifactLink['downloadName']
+  openMode: 'viewer3d-preview' | 'workspace-preview'
+}
+
+export type Viewer3DArtifactPreviewState =
+  | { status: 'closed' }
+  | {
+      status: 'text'
+      title: string
+      workspacePath: string
+      displayName: string
+      content: string
+      byteLength: number
+      truncated: boolean
+    }
+  | {
+      status: 'binary'
+      title: string
+      workspacePath: string
+      displayName: string
+      byteLength: number
+      binaryKind: string
+      message: string
+    }
 
 export interface Viewer3DSelectedRigTargetState {
   skeletonContextId?: string
@@ -1402,6 +1485,21 @@ export type Viewer3DPoseClipVisibilityAction =
   | { type: 'set-summary'; summary?: RigSkeletonSummary }
   | { type: 'toggle'; summary?: RigSkeletonSummary }
   | { type: 'set-drawer-mode'; drawerMode: PoseClipDrawerMode }
+  | { type: 'close' }
+
+export type Viewer3DMotionRetargetAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'set-session'; session?: MotionRetargetSession }
+  | { type: 'select-source-bone'; sourceBoneId?: string }
+  | { type: 'set-mapping'; sourceBoneId: string; targetBoneId?: RigBoneId }
+  | { type: 'set-preview'; selectedPreview: MotionRetargetPreviewKind }
+  | { type: 'set-corrections'; corrections: Partial<MotionRetargetCorrectionsV1> }
+  | { type: 'set-preview-time'; timeSeconds: number }
+  | { type: 'set-preview-state'; previewState: 'idle' | 'playing' | 'paused'; timeSeconds?: number }
+
+export type Viewer3DMotionRetargetVisibilityAction =
+  | { type: 'set-summary'; summary?: RigSkeletonSummary }
+  | { type: 'toggle'; summary?: RigSkeletonSummary }
   | { type: 'close' }
 
 export type Viewer3DRigEditorAction =
@@ -1470,6 +1568,29 @@ export function createViewer3DPoseClipState(summary?: RigSkeletonSummary): Viewe
 
 export function createViewer3DPoseClipVisibilityState(summary?: RigSkeletonSummary): Viewer3DPoseClipVisibilityState {
   return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'expanded' }
+}
+
+export function createViewer3DMotionRetargetState(summary?: RigSkeletonSummary, session?: MotionRetargetSession): Viewer3DMotionRetargetState {
+  const localSession = cloneViewer3DMotionRetargetSession(session)
+  const identity = createViewer3DMotionRetargetCorrectionIdentity({ summary, session: localSession })
+  return {
+    summary,
+    session: localSession,
+    identity,
+    corrections: structuredClone(DEFAULT_MOTION_RETARGET_CORRECTIONS),
+    correctionState: resolveMotionRetargetCorrectionState({ status: 'idle' }),
+    selectedSourceBoneId: localSession?.sourceBones[0]?.sourceBoneId,
+    diagnosticsMessages: [],
+    saveState: 'idle',
+    loadState: 'idle',
+    exportState: 'idle',
+    previewState: 'idle',
+    previewCurrentTimeSeconds: 0,
+  }
+}
+
+export function createViewer3DMotionRetargetVisibilityState(summary?: RigSkeletonSummary): Viewer3DMotionRetargetVisibilityState {
+  return { isOpen: false, skeletonContextId: summary?.skeletonContextId }
 }
 
 export function createViewer3DSelectedRigTargetState(summary?: RigSkeletonSummary): Viewer3DSelectedRigTargetState {
@@ -1710,6 +1831,111 @@ export function reduceViewer3DPoseClipState(
   }
 }
 
+export function reduceViewer3DMotionRetargetVisibilityState(
+  state: Viewer3DMotionRetargetVisibilityState,
+  action: Viewer3DMotionRetargetVisibilityAction,
+): Viewer3DMotionRetargetVisibilityState {
+  if (action.type === 'close') return { ...state, isOpen: false }
+
+  const skeletonContextId = action.summary?.skeletonContextId
+  if (action.type === 'set-summary') {
+    if (state.skeletonContextId !== skeletonContextId) return createViewer3DMotionRetargetVisibilityState(action.summary)
+    if (!action.summary?.hasRig) return { skeletonContextId, isOpen: false }
+    return { ...state, skeletonContextId }
+  }
+
+  if (!action.summary?.hasRig) return { skeletonContextId, isOpen: false }
+  return { skeletonContextId, isOpen: !state.isOpen }
+}
+
+export function reduceViewer3DMotionRetargetState(
+  state: Viewer3DMotionRetargetState,
+  action: Viewer3DMotionRetargetAction,
+): Viewer3DMotionRetargetState {
+  if (action.type === 'set-summary') {
+    if (state.summary?.skeletonContextId === action.summary?.skeletonContextId) return { ...state, summary: action.summary }
+    return createViewer3DMotionRetargetState(action.summary)
+  }
+
+  if (action.type === 'set-session') {
+      const session = cloneViewer3DMotionRetargetSession(action.session)
+      const identity = createViewer3DMotionRetargetCorrectionIdentity({ summary: state.summary, session })
+      return {
+        ...state,
+        session,
+        identity,
+        corrections: state.corrections,
+        correctionState: state.correctionState.status === 'loaded' ? state.correctionState : resolveMotionRetargetCorrectionState({ status: 'idle' }),
+        selectedSourceBoneId: session?.sourceBones.some((bone) => bone.sourceBoneId === state.selectedSourceBoneId)
+          ? state.selectedSourceBoneId
+          : session?.sourceBones[0]?.sourceBoneId,
+        diagnosticsMessages: state.diagnosticsMessages,
+        saveState: state.saveState,
+        loadState: state.loadState,
+        exportState: state.exportState,
+        previewState: state.previewState,
+        previewCurrentTimeSeconds: state.previewCurrentTimeSeconds,
+        saveMessage: state.saveMessage,
+        loadMessage: state.loadMessage,
+        exportMessage: state.exportMessage,
+      }
+    }
+
+  if (!state.session) return state
+
+  if (action.type === 'select-source-bone') {
+    const selectedSourceBoneId = action.sourceBoneId && state.session.sourceBones.some((bone) => bone.sourceBoneId === action.sourceBoneId)
+      ? action.sourceBoneId
+      : state.selectedSourceBoneId
+    return { ...state, selectedSourceBoneId }
+  }
+
+  if (action.type === 'set-mapping') {
+    const session = action.targetBoneId === undefined
+      ? reduceMotionRetargetSession(state.session, { type: 'clear-mapping', sourceBoneId: action.sourceBoneId })
+      : reduceMotionRetargetSession(state.session, { type: 'set-mapping', sourceBoneId: action.sourceBoneId, targetBoneId: action.targetBoneId })
+    const selectedSourceBoneId = session.sourceBones.some((bone) => bone.sourceBoneId === action.sourceBoneId)
+      ? action.sourceBoneId
+      : state.selectedSourceBoneId
+    return {
+      ...state,
+      session,
+      selectedSourceBoneId,
+      correctionState: resolveMotionRetargetCorrectionState({ status: 'dirty', lastLoadedIdentityKey: state.identity?.key, currentIdentityKey: state.identity?.key }),
+    }
+  }
+
+  if (action.type === 'set-preview-time') {
+    const preview = resolveViewer3DMotionRetargetPreviewClip(state)
+    return {
+      ...state,
+      previewCurrentTimeSeconds: clampPoseClipTime(action.timeSeconds, preview.plan?.clip.durationSeconds ?? 0),
+    }
+  }
+
+  if (action.type === 'set-preview-state') {
+    return {
+      ...state,
+      previewState: action.previewState,
+      previewCurrentTimeSeconds: action.timeSeconds ?? state.previewCurrentTimeSeconds,
+    }
+  }
+
+  if (action.type === 'set-corrections') {
+    return {
+      ...state,
+      corrections: normalizeMotionRetargetCorrections(action.corrections),
+      correctionState: resolveMotionRetargetCorrectionState({ status: 'dirty', lastLoadedIdentityKey: state.identity?.key, currentIdentityKey: state.identity?.key }),
+    }
+  }
+
+  return {
+    ...state,
+    session: reduceMotionRetargetSession(state.session, { type: 'set-preview', selectedPreview: action.selectedPreview }),
+    correctionState: resolveMotionRetargetCorrectionState({ status: 'dirty', lastLoadedIdentityKey: state.identity?.key, currentIdentityKey: state.identity?.key }),
+  }
+}
+
 export function reduceViewer3DRigEditorVisibilityState(
   state: Viewer3DRigEditorVisibilityState,
   action: Viewer3DRigEditorVisibilityAction,
@@ -1767,6 +1993,7 @@ export function resolveViewer3DRigEditorPanelProps(
   state: Viewer3DRigEditorState,
   callbacks: Viewer3DRigEditorCallbacks,
   hydrationWarning?: Viewer3DRigHydrationWarning | null,
+  options?: Viewer3DRigEditorPanelOptions,
 ): {
   summary?: RigSkeletonSummary
   selectedBoneId?: RigBoneId
@@ -1781,12 +2008,13 @@ export function resolveViewer3DRigEditorPanelProps(
   onRevertAliases: () => void
   onSaveAliases: () => void
 } {
+  const rigMetaNamingByBoneId = options?.rigMetaNamingByBoneId ?? state.rigMetaNamingByBoneId
   return {
     summary: state.summary,
     selectedBoneId: state.selectedBoneId,
     renamePlan: state.renamePlan,
-    rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
-    effectiveNaming: state.summary?.hasRig ? resolveRigEffectiveNaming(state.summary, state.renamePlan, state.rigMetaNamingByBoneId) : undefined,
+    rigMetaNamingByBoneId,
+    effectiveNaming: state.summary?.hasRig ? resolveRigEffectiveNaming(state.summary, state.renamePlan, rigMetaNamingByBoneId) : undefined,
     validation: state.summary?.hasRig ? validateRigRenamePlan(state.summary, state.renamePlan) : { valid: true, errors: [] },
     hydrationWarning,
     onSelectBone: callbacks.onSelectBone ?? (() => undefined),
@@ -1819,6 +2047,651 @@ export function resolveViewer3DPoseClipPanelRenderState({
   visibility: Viewer3DPoseClipVisibilityState
 }): { shouldRenderPanel: boolean } {
   return { shouldRenderPanel: Boolean(modelUrl && poseState.summary && visibility.isOpen) }
+}
+
+export function resolveViewer3DMotionRetargetPanelRenderState({
+  modelUrl,
+  motionRetargetState,
+  visibility,
+}: {
+  modelUrl: string | null
+  motionRetargetState: Viewer3DMotionRetargetState
+  visibility: Viewer3DMotionRetargetVisibilityState
+}): { shouldRenderPanel: boolean } {
+  return { shouldRenderPanel: Boolean(modelUrl && motionRetargetState.summary && visibility.isOpen) }
+}
+
+type Viewer3DMotionRetargetCallbacks = {
+  onSelectSourceBone?: (sourceBoneId: string) => void
+  onChangeMapping?: (sourceBoneId: string, targetBoneId?: RigBoneId) => void
+  onSelectPreview?: (selectedPreview: MotionRetargetPreviewKind) => void
+  onSaveSidecar?: () => void
+  onLoadSidecar?: () => void
+  onExportPoseClipCompanion?: () => void
+  onOpenArtifact?: (artifact: MotionRetargetArtifactLink) => void
+  onDownloadArtifact?: (artifact: MotionRetargetArtifactLink) => void
+  onPlayPreview?: () => void
+  onPausePreview?: () => void
+  onResetPreview?: () => void
+  onScrubPreview?: (timeSeconds: number) => void
+  onChangeCorrections?: (corrections: MotionRetargetCorrectionsV1) => void
+  onToggleAnimationPlayback?: () => void
+}
+
+type Viewer3DMotionRetargetPanelOptions = {
+  animationPlaybackAvailable?: boolean
+  animationPlaybackActive?: boolean
+}
+
+export function resolveViewer3DMotionRetargetPanelProps(
+  state: Viewer3DMotionRetargetState,
+  callbacks: Viewer3DMotionRetargetCallbacks,
+  options: Viewer3DMotionRetargetPanelOptions = {},
+): {
+  summary?: RigSkeletonSummary
+  session?: MotionRetargetSession
+  selectedSourceBoneId?: string
+  selectedMapping?: MotionRetargetMappingEntry
+  warnings: string[]
+  saveDisabledReason?: string
+  exportDisabledReason?: string
+  saveState: 'idle' | 'saving' | 'saved' | 'error'
+  loadState: 'idle' | 'loading' | 'loaded' | 'error'
+  exportState: 'idle' | 'exporting' | 'exported' | 'error'
+  previewState: 'idle' | 'playing' | 'paused'
+  previewDisabledReason?: string
+  previewCurrentTimeSeconds: number
+  previewDurationSeconds: number
+  corrections: MotionRetargetCorrectionsV1
+  correctionMessage?: string
+  correctionDirty: boolean
+  animationPlaybackAvailable: boolean
+  animationPlaybackActive: boolean
+  artifactLinks: Viewer3DMotionRetargetArtifactEntry[]
+  saveMessage?: string
+  loadMessage?: string
+  exportMessage?: string
+  onSelectSourceBone: (sourceBoneId: string) => void
+  onChangeMapping: (sourceBoneId: string, targetBoneId?: RigBoneId) => void
+  onSelectPreview: (selectedPreview: MotionRetargetPreviewKind) => void
+    onSaveSidecar: () => void
+    onLoadSidecar: () => void
+    onExportPoseClipCompanion: () => void
+    onOpenArtifact: (artifact: MotionRetargetArtifactLink) => void
+    onDownloadArtifact: (artifact: MotionRetargetArtifactLink) => void
+    onPlayPreview: () => void
+  onPausePreview: () => void
+  onResetPreview: () => void
+  onScrubPreview: (timeSeconds: number) => void
+  onChangeCorrections: (corrections: MotionRetargetCorrectionsV1) => void
+  onToggleAnimationPlayback: () => void
+} {
+  const selectedSourceBoneId = state.selectedSourceBoneId ?? state.session?.sourceBones[0]?.sourceBoneId
+  const preview = resolveViewer3DMotionRetargetPreviewClip(state)
+  return {
+    summary: state.summary,
+    session: state.session,
+    selectedSourceBoneId,
+    selectedMapping: selectedSourceBoneId ? state.session?.mappings[selectedSourceBoneId] : undefined,
+    warnings: dedupeViewer3DWarnings([...state.diagnosticsMessages, ...(state.session?.warnings ?? [])]),
+    saveDisabledReason: resolveViewer3DMotionRetargetSaveDisabledReason(state),
+    exportDisabledReason: resolveViewer3DMotionRetargetPoseClipCompanionDisabledReason(state),
+    saveState: state.saveState,
+    loadState: state.loadState,
+    exportState: state.exportState,
+    previewState: state.previewState,
+    previewDisabledReason: resolveViewer3DMotionRetargetPreviewDisabledReason(state),
+    previewCurrentTimeSeconds: state.previewCurrentTimeSeconds,
+    previewDurationSeconds: preview.plan?.clip.durationSeconds ?? 0,
+    corrections: state.corrections,
+    correctionMessage: state.correctionState.message,
+    correctionDirty: state.correctionState.dirty,
+    animationPlaybackAvailable: Boolean(options.animationPlaybackAvailable),
+    animationPlaybackActive: Boolean(options.animationPlaybackActive),
+    artifactLinks: resolveViewer3DMotionRetargetArtifactEntries(state.session),
+    saveMessage: state.saveMessage,
+    loadMessage: state.loadMessage,
+    exportMessage: state.exportMessage,
+    onSelectSourceBone: callbacks.onSelectSourceBone ?? (() => undefined),
+    onChangeMapping: callbacks.onChangeMapping ?? (() => undefined),
+    onSelectPreview: callbacks.onSelectPreview ?? (() => undefined),
+    onSaveSidecar: callbacks.onSaveSidecar ?? (() => undefined),
+    onLoadSidecar: callbacks.onLoadSidecar ?? (() => undefined),
+    onExportPoseClipCompanion: callbacks.onExportPoseClipCompanion ?? (() => undefined),
+    onOpenArtifact: callbacks.onOpenArtifact ?? (() => undefined),
+    onDownloadArtifact: callbacks.onDownloadArtifact ?? (() => undefined),
+    onPlayPreview: callbacks.onPlayPreview ?? (() => undefined),
+    onPausePreview: callbacks.onPausePreview ?? (() => undefined),
+    onResetPreview: callbacks.onResetPreview ?? (() => undefined),
+    onScrubPreview: callbacks.onScrubPreview ?? (() => undefined),
+    onChangeCorrections: callbacks.onChangeCorrections ?? (() => undefined),
+    onToggleAnimationPlayback: callbacks.onToggleAnimationPlayback ?? (() => undefined),
+  }
+}
+
+type Viewer3DKimodoMetadataDescriptor = {
+  artifact: ArtifactRef
+  artifactWorkspacePath: string
+  bundleWorkspacePath: string
+  metadataWorkspacePath: string
+  metadataUrl: string
+  detectionMode: 'provenance' | 'sibling-metadata'
+}
+
+export function resolveViewer3DKimodoMetadataDescriptor(args: {
+  apiUrl: string
+  artifact?: ArtifactRef
+  modelUrl?: string | null
+}): Viewer3DKimodoMetadataDescriptor | undefined {
+  const artifact = args.artifact ?? createViewer3DKimodoFallbackArtifactFromModelUrl(args.modelUrl)
+  if (!artifact) return undefined
+
+  const detectionMode = artifact.provenance?.extensionId === 'kimodo-soma-rp' && artifact.provenance.extensionNodeId === 'animate-rigged-mesh'
+    ? 'provenance'
+    : !artifact.provenance && resolveViewer3DArtifactWorkspacePath(artifact, args.modelUrl)?.endsWith('.glb')
+      ? 'sibling-metadata'
+      : undefined
+  if (!detectionMode) return undefined
+
+  const artifactWorkspacePath = resolveViewer3DArtifactWorkspacePath(artifact, args.modelUrl)
+  if (!artifactWorkspacePath) return undefined
+
+  const bundleSegments = artifactWorkspacePath.split('/')
+  if (bundleSegments.length < 2) return undefined
+  const bundleWorkspacePath = bundleSegments.slice(0, -1).join('/')
+  const metadataWorkspacePath = `${bundleWorkspacePath}/metadata.json`
+  const metadataUrl = resolveViewer3DWorkspaceUrl(args.apiUrl, metadataWorkspacePath)
+  if (!metadataUrl) return undefined
+
+  return {
+    artifact,
+    artifactWorkspacePath,
+    bundleWorkspacePath,
+    metadataWorkspacePath,
+    metadataUrl,
+    detectionMode,
+  }
+}
+
+function resolveViewer3DArtifactWorkspacePath(artifact: ArtifactRef, modelUrl: string | null | undefined): string | undefined {
+  return normalizeViewer3DWorkspacePath(artifact.legacy?.filePath)
+    ?? normalizeViewer3DWorkspacePath(artifact.uri)
+    ?? resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl)
+}
+
+function createViewer3DKimodoFallbackArtifactFromModelUrl(modelUrl: string | null | undefined): ArtifactRef | undefined {
+  const artifactWorkspacePath = resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl)
+  if (!artifactWorkspacePath) return undefined
+
+  const artifactUri = `/workspace/${artifactWorkspacePath}`
+  const artifactId = `viewer3d:model-url:${artifactWorkspacePath}`
+
+  return {
+    id: artifactId,
+    kind: 'mesh',
+    uri: artifactUri,
+    versionId: artifactId,
+    legacy: {
+      filePath: artifactUri,
+      outputType: 'mesh',
+    },
+  }
+}
+
+export function hydrateViewer3DMotionRetargetSessionFromKimodoMetadata(args: {
+  descriptor?: Viewer3DKimodoMetadataDescriptor
+  metadata: Record<string, unknown>
+  summary?: RigSkeletonSummary
+  previousSession?: MotionRetargetSession
+  renamePlan?: RigRenamePlan
+  rigMetaNamingByBoneId?: RigMetaNamingMap
+}): {
+  session?: MotionRetargetSession
+  diagnosticsMessages: string[]
+} {
+  if (!args.descriptor) return { session: undefined, diagnosticsMessages: [] }
+
+  const sourceMeshWorkspacePath = normalizeViewer3DWorkspacePath(
+    typeof args.metadata.source_workspace_path === 'string'
+      ? args.metadata.source_workspace_path
+      : typeof args.metadata.source_rigged_mesh === 'string'
+        ? args.metadata.source_rigged_mesh
+        : undefined,
+  )
+  const normalized = normalizeKimodoMotionArtifact({
+    artifact: args.descriptor.artifact,
+    bundleWorkspacePath: args.descriptor.bundleWorkspacePath,
+    metadataWorkspacePath: args.descriptor.metadataWorkspacePath,
+    metadata: args.metadata,
+    sourceMeshWorkspacePath,
+  })
+
+  if (!normalized.ok) {
+    return {
+      session: undefined,
+      diagnosticsMessages: args.descriptor.detectionMode === 'sibling-metadata' ? [] : [...normalized.errors],
+    }
+  }
+
+  const sourceBones = args.summary?.hasRig
+    ? (normalized.artifact.motionRetarget?.status === 'parsed'
+        ? normalized.artifact.motionRetarget.sourceBones.map((sourceBone) => ({
+            sourceBoneId: sourceBone.sourceBoneId,
+            label: sourceBone.label,
+            rawLabel: sourceBone.rawLabel,
+            path: sourceBone.parentSourceBoneId ? [sourceBone.parentSourceBoneId, sourceBone.label] : [sourceBone.label],
+            ...(sourceBone.parentSourceBoneId ? { parentSourceBoneId: sourceBone.parentSourceBoneId } : {}),
+          }))
+        : deriveKimodoSourceBones(args.metadata))
+    : []
+  const diagnosticsMessages = dedupeViewer3DWarnings([
+    ...(normalized.artifact.motionRetarget ? [] : ['Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.']),
+    ...(sourceBones.length === 0 ? ['Diagnostics-only inspection is available until Kimodo exports source bone metadata.'] : []),
+    ...(!isKimodoAnimatedGlbSafeForPreview(normalized.artifact) && normalized.artifact.previewGlbWorkspacePath && normalized.artifact.animatedGlbWorkspacePath
+      ? ['Animated GLB fallback engaged because Kimodo reported degraded retarget diagnostics.']
+      : []),
+  ])
+
+  if (!args.summary?.hasRig) {
+    return { session: undefined, diagnosticsMessages }
+  }
+
+  return {
+    session: createMotionRetargetSession({
+      artifact: normalized.artifact,
+      targetSummary: args.summary,
+      sourceBones,
+      snapshot: {
+        selectedPreview: args.previousSession?.selectedPreview
+          ?? (isKimodoAnimatedGlbSafeForPreview(normalized.artifact) ? 'animated-glb' : 'preview-glb'),
+      },
+      renamePlan: args.renamePlan,
+      rigMetaNamingByBoneId: args.rigMetaNamingByBoneId,
+    }),
+    diagnosticsMessages,
+  }
+}
+
+export function resolveViewer3DMotionRetargetModelPresentation(args: {
+  defaultModelUrl: string | null
+  apiUrl: string
+  session?: MotionRetargetSession
+  diagnosticsMessages?: readonly string[]
+}): {
+  modelUrl: string | null
+  warnings: string[]
+} {
+  const warnings = dedupeViewer3DWarnings([...(args.diagnosticsMessages ?? []), ...(args.session?.warnings ?? [])])
+  if (!args.session) {
+    return { modelUrl: args.defaultModelUrl, warnings }
+  }
+
+  const previewUrl = resolveViewer3DWorkspaceUrl(args.apiUrl, args.session.artifact.previewGlbWorkspacePath)
+  const animatedUrl = isKimodoAnimatedGlbSafeForPreview(args.session.artifact)
+    ? resolveViewer3DWorkspaceUrl(args.apiUrl, args.session.artifact.animatedGlbWorkspacePath)
+    : undefined
+
+  if (args.session.selectedPreview === 'animated-glb' && animatedUrl) {
+    return { modelUrl: animatedUrl, warnings }
+  }
+  if (previewUrl) {
+    return { modelUrl: previewUrl, warnings }
+  }
+  if (animatedUrl) {
+    return { modelUrl: animatedUrl, warnings }
+  }
+  return { modelUrl: args.defaultModelUrl, warnings }
+}
+
+function isKimodoAnimatedGlbSafeForPreview(artifact: KimodoMotionArtifact): boolean {
+  if (!artifact.animatedGlbWorkspacePath) return false
+  const failedStatuses = new Set(['failed', 'error'])
+  return !failedStatuses.has((artifact.diagnostics.runtimeStatus ?? '').toLowerCase())
+    && !failedStatuses.has((artifact.diagnostics.retargetStatus ?? '').toLowerCase())
+    && !failedStatuses.has((artifact.diagnostics.animationMappingStatus ?? '').toLowerCase())
+}
+
+function resolveViewer3DWorkspaceUrl(apiUrl: string, workspacePath: string | undefined): string | undefined {
+  const normalized = normalizeViewer3DWorkspacePath(workspacePath)
+  return normalized ? `${apiUrl}/workspace/${normalized}` : undefined
+}
+
+export function createViewer3DArtifactPreviewState(): Viewer3DArtifactPreviewState {
+  return { status: 'closed' }
+}
+
+function applyViewer3DMotionRetargetArtifactPreviewResult(
+  artifact: Viewer3DMotionRetargetArtifactEntry,
+  result: WorkspaceArtifactPreviewResult,
+): Viewer3DArtifactPreviewState {
+  if (!result.success) {
+    return {
+      status: 'binary',
+      title: artifact.label,
+      workspacePath: artifact.workspacePath,
+      displayName: artifact.downloadName ?? artifact.label,
+      byteLength: 0,
+      binaryKind: 'error',
+      message: result.error,
+    }
+  }
+
+  if (result.status === 'text') {
+    return {
+      status: 'text',
+      title: artifact.label,
+      workspacePath: result.workspacePath,
+      displayName: result.displayName,
+      content: result.content,
+      byteLength: result.byteLength,
+      truncated: result.truncated,
+    }
+  }
+
+  if (result.status === 'binary') {
+    return {
+      status: 'binary',
+      title: artifact.label,
+      workspacePath: result.workspacePath,
+      displayName: result.displayName,
+      byteLength: result.byteLength,
+      binaryKind: result.binaryKind,
+      message: result.message,
+    }
+  }
+
+  return createViewer3DArtifactPreviewState()
+}
+
+export async function openViewer3DMotionRetargetArtifact({
+  state,
+  artifact,
+  previewReader,
+}: {
+  state: Viewer3DMotionRetargetState
+  artifact: Viewer3DMotionRetargetArtifactEntry
+  previewReader: (request: WorkspaceArtifactPreviewRequest) => Promise<WorkspaceArtifactPreviewResult>
+}): Promise<{ motionRetargetState: Viewer3DMotionRetargetState, previewState: Viewer3DArtifactPreviewState }> {
+  if (artifact.openMode === 'viewer3d-preview') {
+    const selectedPreview = artifact.key === 'animated-glb' ? 'animated-glb' : 'preview-glb'
+    return {
+      motionRetargetState: reduceViewer3DMotionRetargetState(state, { type: 'set-preview', selectedPreview }),
+      previewState: createViewer3DArtifactPreviewState(),
+    }
+  }
+
+  const result = await previewReader({ workspacePath: artifact.workspacePath })
+  return {
+    motionRetargetState: state,
+    previewState: applyViewer3DMotionRetargetArtifactPreviewResult(artifact, result),
+  }
+}
+
+export async function downloadViewer3DMotionRetargetArtifact({
+  artifact,
+  downloader,
+}: {
+  artifact: Viewer3DMotionRetargetArtifactEntry
+  downloader: (request: WorkspaceArtifactDownloadRequest) => Promise<WorkspaceArtifactDownloadResult>
+}): Promise<WorkspaceArtifactDownloadResult> {
+  return downloader({
+    workspacePath: artifact.workspacePath,
+    suggestedName: artifact.downloadName,
+  })
+}
+
+export function resolveViewer3DMotionRetargetArtifactEntries(session?: MotionRetargetSession): Viewer3DMotionRetargetArtifactEntry[] {
+  if (!session) return []
+
+  const artifacts = [
+    { key: 'metadata', label: 'Metadata JSON', workspacePath: session.artifact.metadataWorkspacePath, openMode: 'workspace-preview' as const },
+    { key: 'animated-glb', label: 'Animated GLB', workspacePath: session.artifact.animatedGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
+    { key: 'preview-glb', label: 'Preview GLB', workspacePath: session.artifact.previewGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
+    { key: 'motion-npz', label: 'Motion NPZ', workspacePath: session.artifact.motionNpzWorkspacePath, openMode: 'workspace-preview' as const },
+    { key: 'motion-bvh', label: 'Motion BVH', workspacePath: session.artifact.motionBvhWorkspacePath, openMode: 'workspace-preview' as const },
+  ]
+
+  return artifacts.flatMap((artifact) => {
+    if (!artifact.workspacePath || !normalizeViewer3DWorkspacePath(artifact.workspacePath)) return []
+    return [{
+      key: artifact.key,
+      label: artifact.label,
+      workspacePath: artifact.workspacePath,
+      downloadName: artifact.workspacePath.split('/').filter(Boolean).at(-1) ?? `${artifact.key}.artifact`,
+      openMode: artifact.openMode,
+    } satisfies Viewer3DMotionRetargetArtifactEntry]
+  })
+}
+
+function normalizeViewer3DWorkspacePath(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.replace(/\\/g, '/').trim().replace(/^\/workspace\//, '')
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)) return undefined
+  const segments = normalized.split('/')
+  if (segments.some((segment) => segment === '' || segment === '..')) return undefined
+  return segments.join('/')
+}
+
+function createViewer3DDisplayedSemanticHydrationSource(
+  displayedMeshWorkspacePath: string | undefined,
+  warnings: string[] = [],
+  failedClosed = false,
+): Viewer3DSemanticHydrationSource | undefined {
+  if (!displayedMeshWorkspacePath) return undefined
+  return {
+    displayedMeshWorkspacePath,
+    semanticSourceWorkspacePath: displayedMeshWorkspacePath,
+    sourceKind: 'displayed-mesh',
+    warnings,
+    failedClosed,
+  }
+}
+
+function normalizeViewer3DSemanticWorkspaceSourcePath(value: unknown): string | undefined {
+  const normalized = normalizeViewer3DWorkspacePath(typeof value === 'string' ? value : undefined)
+  return normalized && isSafeRigSourceWorkspacePath(normalized) ? normalized : undefined
+}
+
+function normalizeViewer3DSemanticSourceFromAbsolutePath(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  return normalizeServeFileWorkspaceMeshPathFromAbsolutePath(value)
+}
+
+export function resolveViewer3DSemanticHydrationSource(args: {
+  displayedMeshWorkspacePath?: string
+  descriptor?: Viewer3DKimodoMetadataDescriptor
+  metadata?: Record<string, unknown> | null
+}): Viewer3DSemanticHydrationSource | undefined {
+  const fallback = createViewer3DDisplayedSemanticHydrationSource(args.displayedMeshWorkspacePath)
+  if (!fallback) return undefined
+  if (!args.descriptor || !args.metadata) return fallback
+
+  const displayedFilename = fallback.displayedMeshWorkspacePath.split('/').filter(Boolean).at(-1)?.toLowerCase()
+  if (displayedFilename !== 'animated.glb') return fallback
+
+  const semanticSourceWorkspacePath = normalizeViewer3DSemanticWorkspaceSourcePath(args.metadata.source_workspace_path)
+    ?? normalizeViewer3DSemanticSourceFromAbsolutePath(args.metadata.source_rigged_mesh)
+
+  if (!semanticSourceWorkspacePath) {
+    return createViewer3DDisplayedSemanticHydrationSource(
+      fallback.displayedMeshWorkspacePath,
+      ['Kimodo semantic source metadata was missing or unsafe, so display-only inheritance stayed on the displayed mesh.'],
+      true,
+    )
+  }
+
+  if (semanticSourceWorkspacePath === fallback.displayedMeshWorkspacePath) return fallback
+
+  return {
+    displayedMeshWorkspacePath: fallback.displayedMeshWorkspacePath,
+    semanticSourceWorkspacePath,
+    sourceKind: 'kimodo-source',
+    warnings: [],
+    failedClosed: false,
+  }
+}
+
+function dedupeViewer3DWarnings(warnings: readonly string[]): string[] {
+  return Array.from(new Set(warnings.filter((warning) => typeof warning === 'string' && warning.trim().length > 0)))
+}
+
+const MOTION_RETARGET_SAVE_UNAVAILABLE = 'Save is unavailable until Modly validates a trusted Kimodo motion payload with complete translated source bone metadata.'
+const MOTION_RETARGET_COMPANION_METADATA_UNAVAILABLE = 'Companion export is unavailable until Modly validates a trusted Kimodo motion payload with a safe Pose/Clip companion output path.'
+const MOTION_RETARGET_PREVIEW_UNAVAILABLE = 'Local preview is unavailable until Modly validates a trusted Kimodo motion payload with complete translated quaternion tracks.'
+
+function resolveViewer3DMotionRetargetSaveDisabledReason(state: Viewer3DMotionRetargetState): string | undefined {
+  if (!state.summary?.hasRig || !state.summary.sourceWorkspacePath) return 'Save requires a source-backed rig.'
+  if (!state.session) return 'Save requires a loaded Kimodo motion session.'
+  if (!state.session.unlockReadiness.canSaveSidecar || !state.session.exportReadiness.canSaveSidecar) return MOTION_RETARGET_SAVE_UNAVAILABLE
+  const workspaceValidation = validateViewer3DMotionRetargetSidecarWorkspacePath(state.summary.sourceWorkspacePath, state.session, state.summary.skeletonContextId)
+  if (workspaceValidation) return workspaceValidation
+  return undefined
+}
+
+function resolveViewer3DMotionRetargetPoseClipCompanionDerivation(state: Viewer3DMotionRetargetState) {
+  if (!state.summary?.hasRig || !state.summary.sourceWorkspacePath || !state.session) return null
+  const derivation = deriveKimodoPoseClipCompanionV1({
+    summary: state.summary,
+    artifact: state.session.artifact,
+    sourceBones: state.session.sourceBones,
+    mappings: state.session.mappings,
+  })
+  if (!derivation.available || !derivation.sidecarWorkspacePath) return derivation
+  const validation = validatePoseClipSidecarWorkspacePath({
+    sidecarWorkspacePath: derivation.sidecarWorkspacePath,
+    sourceWorkspacePath: state.summary.sourceWorkspacePath,
+  })
+  if (validation.valid) return derivation
+  return {
+    ...derivation,
+    available: false,
+    warnings: validation.warnings,
+  }
+}
+
+function resolveViewer3DMotionRetargetPreviewClip(state: Viewer3DMotionRetargetState) {
+  if (!state.summary?.hasRig || !state.session) return { available: false, warnings: [MOTION_RETARGET_PREVIEW_UNAVAILABLE] }
+  if (!state.session.unlockReadiness.canPreview) return { available: false, warnings: [...state.session.unlockReadiness.blockingWarnings] }
+  return resolveMotionRetargetPreviewClip({
+    summary: state.summary,
+    artifact: state.session.artifact,
+    sourceBones: state.session.sourceBones,
+    mappings: state.session.mappings,
+  })
+}
+
+function resolveViewer3DMotionRetargetPoseClipCompanionDisabledReason(state: Viewer3DMotionRetargetState): string | undefined {
+  if (!state.summary?.hasRig || !state.summary.sourceWorkspacePath) return 'Companion export requires a source-backed rig.'
+  if (!state.session) return 'Companion export requires a loaded Kimodo motion session.'
+  if (!state.session.unlockReadiness.canExportPoseClip || !state.session.exportReadiness.canExportPoseClip) return MOTION_RETARGET_COMPANION_METADATA_UNAVAILABLE
+  const derivation = resolveViewer3DMotionRetargetPoseClipCompanionDerivation(state)
+  if (!derivation?.available) {
+    return derivation?.warnings[0] ?? MOTION_RETARGET_COMPANION_METADATA_UNAVAILABLE
+  }
+  return undefined
+}
+
+function resolveViewer3DMotionRetargetPreviewDisabledReason(state: Viewer3DMotionRetargetState): string | undefined {
+  if (!state.summary?.hasRig || !state.summary.sourceWorkspacePath) return 'Local preview requires a source-backed rig.'
+  if (!state.session) return 'Local preview requires a loaded Kimodo motion session.'
+  const preview = resolveViewer3DMotionRetargetPreviewClip(state)
+  if (preview.available) return undefined
+  return preview.warnings.find((warning) => /^Local rotation preview disabled because Kimodo (?:omitted basis\/rest-pose evidence|marked the retarget basis invalid)/i.test(warning))
+    ?? MOTION_RETARGET_PREVIEW_UNAVAILABLE
+}
+
+function createViewer3DMotionRetargetSidecarWorkspacePath(sourceWorkspacePath: string, session?: MotionRetargetSession, skeletonContextId?: string): string {
+  const identity = session
+    ? createMotionRetargetCorrectionIdentity({ sourceWorkspacePath, skeletonContextId, artifact: session.artifact })
+    : undefined
+  const stem = identity?.key ?? createViewer3DLegacyMotionRetargetSidecarStem(sourceWorkspacePath)
+  return `Workflows/motion-retarget/${stem}.motion-retarget.v1.json`
+}
+
+function createViewer3DLegacyMotionRetargetSidecarStem(sourceWorkspacePath: string): string {
+  const normalized = sourceWorkspacePath.replace(/\\/g, '/')
+  const filename = normalized.split('/').filter(Boolean).at(-1) ?? 'motion-retarget'
+  const withoutExtension = filename.replace(/\.[^.]+$/, '') || 'motion-retarget'
+  return withoutExtension.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'motion-retarget'
+}
+
+function validateViewer3DMotionRetargetSidecarWorkspacePath(sourceWorkspacePath: string, session?: MotionRetargetSession, skeletonContextId?: string): string | undefined {
+  const sidecarWorkspacePath = createViewer3DMotionRetargetSidecarWorkspacePath(sourceWorkspacePath, session, skeletonContextId)
+  if (sidecarWorkspacePath.startsWith('/') || /^[A-Za-z]:\//.test(sidecarWorkspacePath)) {
+    return 'Motion retarget sidecar path must be workspace-relative.'
+  }
+  if (sidecarWorkspacePath.split('/').includes('..')) {
+    return 'Motion retarget sidecar path cannot contain traversal segments.'
+  }
+  if (!sidecarWorkspacePath.startsWith('Workflows/motion-retarget/')) {
+    return 'Motion retarget sidecar path must stay under Workflows/motion-retarget/.'
+  }
+  if (!sidecarWorkspacePath.endsWith('.motion-retarget.v1.json')) {
+    return 'Motion retarget sidecar path must end with .motion-retarget.v1.json.'
+  }
+  if (sidecarWorkspacePath === sourceWorkspacePath) {
+    return 'Motion retarget sidecar path cannot overwrite the source asset.'
+  }
+  return undefined
+}
+
+function cloneViewer3DMotionRetargetSession(session?: MotionRetargetSession): MotionRetargetSession | undefined {
+  return session ? structuredClone(session) : undefined
+}
+
+function deriveKimodoSourceBones(metadata: Record<string, unknown>): MotionRetargetSourceBone[] {
+  const candidates = Array.isArray(metadata.source_bones) ? metadata.source_bones : []
+  return candidates.flatMap((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return []
+    const sourceBone = candidate as Record<string, unknown>
+    const sourceBoneId = typeof sourceBone.source_bone_id === 'string'
+      ? sourceBone.source_bone_id
+      : typeof sourceBone.id === 'string'
+        ? sourceBone.id
+        : undefined
+    const label = typeof sourceBone.label === 'string'
+      ? sourceBone.label
+      : typeof sourceBone.name === 'string'
+        ? sourceBone.name
+        : sourceBoneId
+    const rawLabel = typeof sourceBone.raw_label === 'string'
+      ? sourceBone.raw_label
+      : label
+    const path = Array.isArray(sourceBone.path)
+      ? sourceBone.path.flatMap((segment) => typeof segment === 'string' ? [segment] : [])
+      : []
+    if (!sourceBoneId || !label || !rawLabel) return []
+    return [{
+      sourceBoneId,
+      label,
+      rawLabel,
+      path: path.length > 0 ? path : [label],
+      ...(typeof sourceBone.parent_source_bone_id === 'string' ? { parentSourceBoneId: sourceBone.parent_source_bone_id } : {}),
+    } satisfies MotionRetargetSourceBone]
+  })
+}
+
+export function resolveViewer3DMotionRetargetToolbarControls({
+  modelUrl,
+  summary,
+  visibility,
+  onOpenMotionRetarget,
+}: {
+  modelUrl: string | null
+  summary?: RigSkeletonSummary
+  visibility: Viewer3DMotionRetargetVisibilityState
+  onOpenMotionRetarget: () => void
+}): {
+  active: boolean
+  summary: RigSkeletonSummary
+  onOpenMotionRetarget: () => void
+} | undefined {
+  if (!modelUrl || !summary) return undefined
+  return {
+    active: Boolean(summary.hasRig && visibility.isOpen),
+    summary,
+    onOpenMotionRetarget,
+  }
 }
 
 type Viewer3DPoseClipCallbacks = {
@@ -1998,8 +2871,12 @@ export async function writeViewer3DRigRenameSidecar({
   return writer(request)
 }
 
-export function resolveViewer3DRigHydrationRequest(summary?: RigSkeletonSummary): RigRenameSidecarReadRequest | null {
+export function resolveViewer3DRigHydrationRequest(
+  summary?: RigSkeletonSummary,
+  semanticHydrationSource?: Viewer3DSemanticHydrationSource,
+): RigRenameSidecarReadRequest | null {
   if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  if (semanticHydrationSource?.sourceKind === 'kimodo-source') return null
   return {
     sidecarWorkspacePath: createRigRenameSidecarWorkspacePath(summary.sourceWorkspacePath),
     sourceWorkspacePath: summary.sourceWorkspacePath,
@@ -2018,28 +2895,58 @@ export function resolveViewer3DPoseClipHydrationRequest(summary?: RigSkeletonSum
   }
 }
 
-export function resolveViewer3DRigMetaHydrationRequest(summary?: RigSkeletonSummary): RigMetaSidecarReadRequest | null {
+export function resolveViewer3DMotionRetargetHydrationRequest(summary?: RigSkeletonSummary, session?: MotionRetargetSession): MotionRetargetSidecarReadRequest | null {
   if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
-  return { sourceWorkspacePath: summary.sourceWorkspacePath }
+  return {
+    sidecarWorkspacePath: createViewer3DMotionRetargetSidecarWorkspacePath(summary.sourceWorkspacePath, session),
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+  }
+}
+
+export function createViewer3DMotionRetargetCorrectionIdentity({
+  summary,
+  session,
+}: {
+  summary?: RigSkeletonSummary
+  session?: MotionRetargetSession
+}): MotionRetargetCorrectionIdentityV1 | undefined {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath || !session) return undefined
+  return createMotionRetargetCorrectionIdentity({
+    sourceWorkspacePath: summary.sourceWorkspacePath,
+    skeletonContextId: summary.skeletonContextId,
+    artifact: session.artifact,
+  })
+}
+
+export function resolveViewer3DRigMetaHydrationRequest(
+  summary?: RigSkeletonSummary,
+  semanticHydrationSource?: Viewer3DSemanticHydrationSource,
+): RigMetaSidecarReadRequest | null {
+  if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
+  return { sourceWorkspacePath: semanticHydrationSource?.semanticSourceWorkspacePath ?? summary.sourceWorkspacePath }
 }
 
 export function createViewer3DRigHydrationToken({
   modelUrl,
   summary,
+  semanticSourceWorkspacePath,
 }: {
   modelUrl: string | null
   summary?: RigSkeletonSummary
+  semanticSourceWorkspacePath?: string
 }): Viewer3DRigHydrationToken | null {
   if (!summary?.hasRig || !summary.sourceWorkspacePath) return null
   return {
     modelUrl,
     sourceWorkspacePath: summary.sourceWorkspacePath,
+    semanticSourceWorkspacePath: semanticSourceWorkspacePath ?? summary.sourceWorkspacePath,
     skeletonContextId: summary.skeletonContextId,
   }
 }
 
 export const createViewer3DRigMetaHydrationToken = createViewer3DRigHydrationToken
 export const createViewer3DPoseClipHydrationToken = createViewer3DRigHydrationToken
+export const createViewer3DMotionRetargetHydrationToken = createViewer3DRigHydrationToken
 
 export function areViewer3DRigHydrationTokensEqual(
   left: Viewer3DRigHydrationToken | null,
@@ -2048,9 +2955,10 @@ export function areViewer3DRigHydrationTokensEqual(
   return Boolean(
     left &&
     right &&
-    left.modelUrl === right.modelUrl &&
-    left.sourceWorkspacePath === right.sourceWorkspacePath &&
-    left.skeletonContextId === right.skeletonContextId,
+      left.modelUrl === right.modelUrl &&
+      left.sourceWorkspacePath === right.sourceWorkspacePath &&
+      left.semanticSourceWorkspacePath === right.semanticSourceWorkspacePath &&
+      left.skeletonContextId === right.skeletonContextId,
   )
 }
 
@@ -2139,7 +3047,7 @@ export function applyViewer3DRigMetaHydrationResult({
   }
 
   const normalized = normalizeRigMetaNaming(result.rigMeta, {
-    expectedSourceWorkspacePath: token.sourceWorkspacePath,
+    expectedSourceWorkspacePath: token.semanticSourceWorkspacePath,
     summary: state.summary,
   })
   const warning = normalized.warnings.length > 0 ? { status: 'warning' as const, messages: normalized.warnings } : null
@@ -2174,6 +3082,69 @@ export async function writeViewer3DPoseClipSidecar({
     sidecarWorkspacePath,
     sourceWorkspacePath: summary.sourceWorkspacePath,
     sidecar: sidecar as unknown as PoseClipSidecarWriteRequest['sidecar'],
+  })
+}
+
+export async function writeViewer3DMotionRetargetPoseClipCompanion({
+  state,
+  createdAt = new Date().toISOString(),
+  writer,
+}: {
+  state: Viewer3DMotionRetargetState
+  createdAt?: string
+  writer: (request: PoseClipSidecarWriteRequest) => Promise<PoseClipSidecarWriteResult>
+}): Promise<PoseClipSidecarWriteResult> {
+  const disabledReason = resolveViewer3DMotionRetargetPoseClipCompanionDisabledReason(state)
+  if (disabledReason) return { success: false, error: disabledReason }
+
+  const derivation = state.summary?.hasRig && state.session
+      ? deriveKimodoPoseClipCompanionV1({
+          summary: state.summary,
+          artifact: state.session.artifact,
+          createdAt,
+          sourceBones: state.session.sourceBones,
+          mappings: state.session.mappings,
+        })
+    : null
+
+  if (!state.summary?.sourceWorkspacePath || !derivation?.available || !derivation.sidecar || !derivation.sidecarWorkspacePath) {
+    return { success: false, error: MOTION_RETARGET_COMPANION_METADATA_UNAVAILABLE }
+  }
+
+  return writer({
+    sidecarWorkspacePath: derivation.sidecarWorkspacePath,
+    sourceWorkspacePath: state.summary.sourceWorkspacePath,
+    sidecar: derivation.sidecar as PoseClipSidecarWriteRequest['sidecar'],
+  })
+}
+
+export async function writeViewer3DMotionRetargetSidecar({
+  state,
+  createdAt = new Date().toISOString(),
+  writer,
+}: {
+  state: Viewer3DMotionRetargetState
+  createdAt?: string
+  writer: (request: MotionRetargetSidecarWriteRequest) => Promise<MotionRetargetSidecarWriteResult>
+}): Promise<MotionRetargetSidecarWriteResult> {
+  const disabledReason = resolveViewer3DMotionRetargetSaveDisabledReason(state)
+  if (disabledReason) return { success: false, error: disabledReason }
+
+  const summary = state.summary!
+  const session = state.session!
+  const sourceWorkspacePath = summary.sourceWorkspacePath!
+
+  return writer({
+    sidecarWorkspacePath: createViewer3DMotionRetargetSidecarWorkspacePath(sourceWorkspacePath, session),
+    sourceWorkspacePath,
+    sidecar: createMotionRetargetSidecarV1({
+      identity: createMotionRetargetCorrectionIdentity({ sourceWorkspacePath, skeletonContextId: summary.skeletonContextId, artifact: session.artifact }),
+      session,
+      sourceWorkspacePath,
+      createdAt,
+      corrections: state.corrections,
+      warnings: dedupeViewer3DWarnings([...state.diagnosticsMessages, ...session.warnings]),
+    }) as MotionRetargetSidecarWriteRequest['sidecar'],
   })
 }
 
@@ -2213,6 +3184,96 @@ export function applyViewer3DPoseClipHydrationResult({
   return {
     state: { ...state, plan: hydrated.plan, selectedKeyframeId: undefined, currentTimeSeconds: 0, previewState: 'idle', loadState: 'loaded', warning, loadError: undefined },
     warning,
+    stale: false,
+  }
+}
+
+export function applyViewer3DMotionRetargetHydrationResult({
+  state,
+  result,
+  token,
+  currentToken,
+  showNotFoundMessage = true,
+}: {
+  state: Viewer3DMotionRetargetState
+  result: MotionRetargetSidecarReadResult
+  token: Viewer3DRigHydrationToken | null
+  currentToken: Viewer3DRigHydrationToken | null
+  showNotFoundMessage?: boolean
+}): {
+  state: Viewer3DMotionRetargetState
+  stale: boolean
+  dirtySkipped?: boolean
+} {
+  if (!areViewer3DRigHydrationTokensEqual(token, currentToken)) {
+    return { state, stale: true }
+  }
+  if (!state.summary?.hasRig || !token) return { state, stale: false }
+
+  if (!result.success) {
+    return {
+      state: {
+        ...state,
+        diagnosticsMessages: [result.error],
+        loadState: 'error',
+        loadMessage: result.error,
+      },
+      stale: false,
+    }
+  }
+
+  if (result.status === 'not-found') {
+    const message = `Motion retarget sidecar not found at ${result.sidecarWorkspacePath}.`
+    return {
+      state: {
+        ...state,
+        diagnosticsMessages: showNotFoundMessage ? [message] : state.diagnosticsMessages,
+        loadState: 'idle',
+        loadMessage: showNotFoundMessage ? message : state.loadMessage,
+      },
+      stale: false,
+    }
+  }
+
+  const expectedIdentity = createViewer3DMotionRetargetCorrectionIdentity({ summary: state.summary, session: state.session ?? createMotionRetargetSession({
+    artifact: result.sidecar.artifact,
+    targetSummary: state.summary,
+    sourceBones: result.sidecar.sourceBones,
+    snapshot: result.sidecar.session,
+  }) })
+  const hydrated = result.sidecar.identity && expectedIdentity
+    ? hydrateMotionRetargetSessionSnapshotFromSidecar({ sidecar: result.sidecar as Parameters<typeof hydrateMotionRetargetSessionSnapshotFromSidecar>[0]['sidecar'], identity: expectedIdentity })
+    : null
+  if (hydrated?.status === 'identity-mismatch') {
+    const message = hydrated.warnings.join(' ')
+    return {
+      state: { ...state, diagnosticsMessages: hydrated.warnings, loadState: 'error', loadMessage: message, correctionState: resolveMotionRetargetCorrectionState({ status: 'error', message }) },
+      stale: false,
+    }
+  }
+  if (state.correctionState.dirty) return { state, stale: false, dirtySkipped: true }
+
+  const session = createMotionRetargetSession({
+    artifact: result.sidecar.artifact,
+    targetSummary: state.summary,
+    sourceBones: hydrated?.status === 'loaded' ? hydrated.sourceBones : result.sidecar.sourceBones,
+    snapshot: hydrated?.status === 'loaded' ? hydrated.snapshot : result.sidecar.session,
+  })
+  const diagnosticsMessages = result.sidecar.warnings.filter((warning) => !session.warnings.includes(warning))
+  const identity = createViewer3DMotionRetargetCorrectionIdentity({ summary: state.summary, session })
+
+  return {
+    state: {
+      ...state,
+      session,
+      identity,
+      corrections: hydrated?.status === 'loaded' ? hydrated.corrections : structuredClone(DEFAULT_MOTION_RETARGET_CORRECTIONS),
+      correctionState: resolveMotionRetargetCorrectionState({ status: 'loaded', sidecarWorkspacePath: result.sidecarWorkspacePath }),
+      selectedSourceBoneId: session.sourceBones[0]?.sourceBoneId,
+      diagnosticsMessages,
+      loadState: 'loaded',
+      loadMessage: `Loaded motion retarget sidecar: ${result.sidecarWorkspacePath}`,
+    },
     stale: false,
   }
 }
@@ -2259,6 +3320,184 @@ export function resetViewer3DPoseClipPreview({
 }
 
 export const takeViewer3DPoseClipSnapshot = takePoseClipQuaternionSnapshot
+
+export function startViewer3DMotionRetargetPreview({
+  state,
+  bonesById,
+  poseSnapshot,
+  gltfActions,
+  gltfAnimationPlaying,
+  timeSeconds,
+}: {
+  state: Viewer3DMotionRetargetState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: MotionRetargetTransformSnapshot | null
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  timeSeconds?: number
+}): {
+  state: Viewer3DMotionRetargetState
+  poseSnapshot: MotionRetargetTransformSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+  preview: EvaluatePoseClipPreviewResult | null
+} {
+  const previewClip = resolveViewer3DMotionRetargetPreviewClip(state)
+  const snapshot = poseSnapshot ?? takeMotionRetargetPreviewSnapshot(bonesById)
+  const gltfAnimationSnapshot = isolateAnimationForPoseClipPreview(gltfActions, gltfAnimationPlaying)
+  if (!previewClip.available || !previewClip.plan) {
+    return { state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 }, poseSnapshot: snapshot, gltfAnimationSnapshot, preview: null }
+  }
+  const nextTime = clampPoseClipTime(timeSeconds ?? state.previewCurrentTimeSeconds, previewClip.plan.clip.durationSeconds)
+  const preview = restoreThenEvaluateMotionRetargetPreview({
+    plan: previewClip.plan,
+    bonesById,
+    snapshot,
+    timeSeconds: nextTime,
+    summary: state.summary,
+    corrections: state.corrections,
+  }).preview
+  return {
+    state: { ...state, previewState: 'playing', previewCurrentTimeSeconds: nextTime },
+    poseSnapshot: snapshot,
+    gltfAnimationSnapshot,
+    preview,
+  }
+}
+
+export function scrubViewer3DMotionRetargetPreviewTime({
+  state,
+  bonesById,
+  poseSnapshot,
+  gltfActions,
+  gltfAnimationPlaying,
+  timeSeconds,
+}: {
+  state: Viewer3DMotionRetargetState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  poseSnapshot: MotionRetargetTransformSnapshot | null
+  gltfActions: readonly AnimationActionLike[]
+  gltfAnimationPlaying: boolean
+  timeSeconds: number
+}): {
+  state: Viewer3DMotionRetargetState
+  poseSnapshot: MotionRetargetTransformSnapshot
+  gltfAnimationSnapshot: AnimationIsolationSnapshot
+  preview: EvaluatePoseClipPreviewResult | null
+} {
+  const previewClip = resolveViewer3DMotionRetargetPreviewClip(state)
+  const snapshot = poseSnapshot ?? takeMotionRetargetPreviewSnapshot(bonesById)
+  const gltfAnimationSnapshot = isolateAnimationForPoseClipPreview(gltfActions, gltfAnimationPlaying)
+  if (!previewClip.available || !previewClip.plan) {
+    return { state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 }, poseSnapshot: snapshot, gltfAnimationSnapshot, preview: null }
+  }
+  const nextTime = clampPoseClipTime(timeSeconds, previewClip.plan.clip.durationSeconds)
+  const preview = restoreThenEvaluateMotionRetargetPreview({
+    plan: previewClip.plan,
+    bonesById,
+    snapshot,
+    timeSeconds: nextTime,
+    summary: state.summary,
+    corrections: state.corrections,
+  }).preview
+  return {
+    state: { ...state, previewState: 'paused', previewCurrentTimeSeconds: nextTime },
+    poseSnapshot: snapshot,
+    gltfAnimationSnapshot,
+    preview,
+  }
+}
+
+export function resetViewer3DMotionRetargetPreview({
+  state,
+  bonesById,
+  snapshot,
+}: {
+  state: Viewer3DMotionRetargetState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  snapshot: MotionRetargetTransformSnapshot
+}): { state: Viewer3DMotionRetargetState; restoredBoneIds: RigBoneId[] } {
+  const reset = resetMotionRetargetPreview({ bonesById, snapshot })
+  return { state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 }, restoredBoneIds: reset.restoredBoneIds }
+}
+
+export function resetViewer3DActiveMotionPlayback({
+  state,
+  activeBackend,
+  bonesById,
+  localSnapshot,
+  animation,
+}: {
+  state: Viewer3DMotionRetargetState
+  activeBackend: MotionPlaybackBackend
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  localSnapshot: Parameters<typeof resetMotionRetargetPreview>[0]['snapshot'] | null
+  animation: Viewer3DAnimationControls & { playing: boolean }
+}): {
+  state: Viewer3DMotionRetargetState
+  animationPlaying: false
+  localSnapshot: null
+  reset?: AnimationPlaybackResetResult
+  restoredBoneIds?: RigBoneId[]
+} {
+  if (activeBackend === 'animated-glb') {
+    const reset = resetAnimationPlayback({ actions: animation.actions, mixer: animation.mixer })
+    return {
+      state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 },
+      animationPlaying: false,
+      localSnapshot: null,
+      reset,
+    }
+  }
+
+  const reset = localSnapshot
+    ? resetMotionRetargetPreview({ bonesById, snapshot: localSnapshot })
+    : { restoredBoneIds: [] as RigBoneId[] }
+  return {
+    state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 },
+    animationPlaying: false,
+    localSnapshot: null,
+    restoredBoneIds: reset.restoredBoneIds,
+  }
+}
+
+export function shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({
+  wasOpen,
+  isOpen,
+}: {
+  wasOpen: boolean
+  isOpen: boolean
+}): boolean {
+  return wasOpen && !isOpen
+}
+
+export function resetViewer3DScopedMotionRetargetPreviewOnClose({
+  state,
+  bonesById,
+  localSnapshot,
+  globalAnimationPlaying,
+}: {
+  state: Viewer3DMotionRetargetState
+  bonesById: ReadonlyMap<RigBoneId, THREE.Bone>
+  localSnapshot: Parameters<typeof resetMotionRetargetPreview>[0]['snapshot'] | null
+  globalAnimationPlaying: boolean
+}): {
+  state: Viewer3DMotionRetargetState
+  localSnapshot: null
+  globalAnimationPlaying: boolean
+  restoredBoneIds: RigBoneId[]
+} {
+  const reset = localSnapshot
+    ? resetMotionRetargetPreview({ bonesById, snapshot: localSnapshot })
+    : { restoredBoneIds: [] as RigBoneId[] }
+  return {
+    state: { ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 },
+    localSnapshot: null,
+    globalAnimationPlaying,
+    restoredBoneIds: reset.restoredBoneIds,
+  }
+}
+
+export { takeMotionRetargetPreviewSnapshot }
 
 export function scrubViewer3DPoseClipPreviewTime({
   state,
@@ -2436,19 +3675,7 @@ export function resolveViewer3DPresentation(modelSource: ViewerModelSource): Vie
 }
 
 export function resolveViewer3DRigSourceWorkspacePath(modelSource: ViewerModelSource): string | undefined {
-  if (!modelSource.modelUrl) return undefined
-
-  const marker = '/workspace/'
-  const markerIndex = modelSource.modelUrl.indexOf(marker)
-  if (markerIndex < 0) return undefined
-
-  const workspacePath = decodeURIComponent(modelSource.modelUrl.slice(markerIndex + marker.length))
-    .replace(/\?.*$/, '')
-    .replace(/#.*$/, '')
-    .replace(/\\/g, '/')
-
-  if (!isSafeRigSourceWorkspacePath(workspacePath)) return undefined
-  return workspacePath
+  return resolveViewer3DWorkspaceMeshPathFromUrl(modelSource.modelUrl)
 }
 
 function isSafeRigSourceWorkspacePath(workspacePath: string): boolean {
@@ -2462,16 +3689,90 @@ function isSafeRigSourceWorkspacePath(workspacePath: string): boolean {
   )
 }
 
-export function resolveViewer3DOverlayLayout({ modelUrl, hasEditRail, poseClipVisibility }: { modelUrl: string | null; hasEditRail: boolean; poseClipVisibility?: Viewer3DPoseClipVisibilityState }): Viewer3DOverlayLayout {
+function normalizeServeFileWorkspaceMeshPathFromAbsolutePath(absolutePath: string): string | undefined {
+  const normalizedAbsolutePath = absolutePath.replace(/\\/g, '/').trim()
+  if (!normalizedAbsolutePath || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(normalizedAbsolutePath) || /%2e%2e/i.test(normalizedAbsolutePath)) {
+    return undefined
+  }
+
+  const workspaceMarker = '/workspace/'
+  const workspaceIndex = normalizedAbsolutePath.toLowerCase().indexOf(workspaceMarker)
+  if (workspaceIndex < 0) return undefined
+
+  const workspaceSuffix = normalizedAbsolutePath.slice(workspaceIndex + workspaceMarker.length)
+  if (!workspaceSuffix || /%2f|%5c|%2e/i.test(workspaceSuffix)) return undefined
+
+  let decodedWorkspaceSuffix = workspaceSuffix
+  try {
+    decodedWorkspaceSuffix = decodeURIComponent(workspaceSuffix)
+  } catch {
+    return undefined
+  }
+
+  const normalizedWorkspacePath = decodedWorkspaceSuffix.replace(/\\/g, '/')
+  if (!isSafeRigSourceWorkspacePath(normalizedWorkspacePath)) return undefined
+  return normalizedWorkspacePath
+}
+
+function resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl: string | null | undefined): string | undefined {
+  if (typeof modelUrl !== 'string') return undefined
+
+  const trimmed = modelUrl.trim()
+  if (!trimmed || /^blob:/i.test(trimmed) || /^[A-Za-z]:[\\/]/.test(trimmed)) return undefined
+  if (/[\\/]\.\.(?:[\\/]|$)/.test(trimmed) || /%2e%2e/i.test(trimmed)) return undefined
+
+  let pathname = trimmed
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(trimmed)) {
+    let parsed: URL
+    try {
+      parsed = new URL(trimmed)
+    } catch {
+      return undefined
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+
+    if (parsed.pathname === '/optimize/serve-file') {
+      const absolutePath = parsed.searchParams.get('path')
+      return absolutePath ? normalizeServeFileWorkspaceMeshPathFromAbsolutePath(absolutePath) : undefined
+    }
+
+    pathname = parsed.pathname
+  }
+
+  if (!pathname.startsWith('/workspace/')) return undefined
+
+  const workspacePath = decodeURIComponent(pathname.slice('/workspace/'.length)).replace(/\\/g, '/')
+  if (!isSafeRigSourceWorkspacePath(workspacePath)) return undefined
+  return workspacePath
+}
+
+export function resolveViewer3DOverlayLayout({
+  modelUrl,
+  hasEditRail,
+  poseClipVisibility,
+  rigEditorVisibility,
+  motionRetargetVisibility,
+}: {
+  modelUrl: string | null
+  hasEditRail: boolean
+  poseClipVisibility?: Viewer3DPoseClipVisibilityState
+  rigEditorVisibility?: Viewer3DRigEditorVisibilityState
+  motionRetargetVisibility?: Viewer3DMotionRetargetVisibilityState
+}): Viewer3DOverlayLayout {
   const editRailClassName = modelUrl && hasEditRail ? 'right-4 top-1/2 -translate-y-1/2 z-20' : null
   const rightOverlayClassName = editRailClassName ? 'right-16' : 'right-4'
   const isPoseClipMinimized = Boolean(poseClipVisibility?.isOpen && poseClipVisibility.drawerMode === 'minimized')
+  const motionRetargetPanelClassName = motionRetargetVisibility?.isOpen && rigEditorVisibility?.isOpen
+    ? `${rightOverlayClassName} top-[22rem]`
+    : `${rightOverlayClassName} top-4`
 
   return {
     viewRailClassName: 'left-4 top-1/2 -translate-y-1/2 z-20',
     editRailClassName,
     editPanelClassName: rightOverlayClassName,
     rigEditorPanelSlot: 'top-right',
+    motionRetargetPanelSlot: 'top-right-stack',
+    motionRetargetPanelClassName,
     poseClipPanelSlot: 'bottom-drawer',
     poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
     commonViewportUsability: 'capped-internal-scroll',
@@ -2505,6 +3806,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const [rigEditorVisibility, setRigEditorVisibility] = useState<Viewer3DRigEditorVisibilityState>(() => createViewer3DRigEditorVisibilityState())
   const [poseClipState, setPoseClipState] = useState<Viewer3DPoseClipState>(() => createViewer3DPoseClipState())
   const [poseClipVisibility, setPoseClipVisibility] = useState<Viewer3DPoseClipVisibilityState>(() => createViewer3DPoseClipVisibilityState())
+  const [motionRetargetState, setMotionRetargetState] = useState<Viewer3DMotionRetargetState>(() => createViewer3DMotionRetargetState())
+  const [motionRetargetVisibility, setMotionRetargetVisibility] = useState<Viewer3DMotionRetargetVisibilityState>(() => createViewer3DMotionRetargetVisibilityState())
   const [selectedRigTarget, setSelectedRigTarget] = useState<Viewer3DSelectedRigTargetState>(() => createViewer3DSelectedRigTargetState())
   const [selected, setSelected] = useState(false)
   const [sceneEditMode, setSceneEditMode] = useState<'idle' | 'editing'>('idle')
@@ -2514,31 +3817,67 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const [rigRenameSaveState, setRigRenameSaveState] = useState<RigRenameSaveState>({ status: 'idle' })
   const [rigRenameHydrationWarning, setRigRenameHydrationWarning] = useState<Viewer3DRigHydrationWarning | null>(null)
   const [rigMetaHydrationWarning, setRigMetaHydrationWarning] = useState<Viewer3DRigHydrationWarning | null>(null)
+  const [kimodoMetadata, setKimodoMetadata] = useState<Record<string, unknown> | null>(null)
+  const [artifactPreviewState, setArtifactPreviewState] = useState<Viewer3DArtifactPreviewState>(() => createViewer3DArtifactPreviewState())
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const sceneRef = useRef<THREE.Object3D | null>(null)
   const poseClipBonesRef = useRef<Map<RigBoneId, THREE.Bone>>(new Map())
   const poseClipSnapshotRef = useRef<PoseClipQuaternionSnapshot | null>(null)
+  const motionRetargetSnapshotRef = useRef<MotionRetargetTransformSnapshot | null>(null)
+  const motionRetargetWasOpenRef = useRef(motionRetargetVisibility.isOpen)
+  const animationControlsRef = useRef<Viewer3DAnimationControls | null>(null)
 
   const modelSource = resolveViewerModelSource(currentJob, apiUrl)
   const viewerPresentation = resolveViewer3DPresentation(modelSource)
-  const { modelUrl } = viewerPresentation
+  const baseModelUrl = viewerPresentation.modelUrl
   const rigSourceWorkspacePath = resolveViewer3DRigSourceWorkspacePath(modelSource)
+  const kimodoMetadataDescriptor = useMemo(
+    () => resolveViewer3DKimodoMetadataDescriptor({ apiUrl, artifact: workflowRunState.artifact, modelUrl: baseModelUrl }),
+    [apiUrl, baseModelUrl, workflowRunState.artifact],
+  )
+  const semanticHydrationSource = useMemo(
+    () => resolveViewer3DSemanticHydrationSource({
+      displayedMeshWorkspacePath: rigSourceWorkspacePath,
+      descriptor: kimodoMetadataDescriptor,
+      metadata: kimodoMetadata,
+    }),
+    [kimodoMetadata, kimodoMetadataDescriptor, rigSourceWorkspacePath],
+  )
+  const motionRetargetPresentation = useMemo(
+    () => resolveViewer3DMotionRetargetModelPresentation({
+      defaultModelUrl: baseModelUrl,
+      apiUrl,
+      session: motionRetargetState.session,
+      diagnosticsMessages: motionRetargetState.diagnosticsMessages,
+    }),
+    [apiUrl, baseModelUrl, motionRetargetState.diagnosticsMessages, motionRetargetState.session],
+  )
+  const modelUrl = motionRetargetPresentation.modelUrl
   const sceneEditSource = resolveSceneEditSourceDescriptor({ currentJobId: currentJob?.id, modelSource })
   const sceneEditVisibility = resolveSceneEditControlsVisibility({ modelSource, source: sceneEditSource?.artifact ?? null })
   const canShowSceneEditControls = sceneEditVisibility.visible
   const hasRigEditorRail = Boolean(modelUrl && rigEditorState.summary)
+  const hasMotionRetargetRail = Boolean(modelUrl && motionRetargetState.summary)
   const hasPoseClipRail = Boolean(modelUrl && poseClipState.summary)
-  const overlayLayout = resolveViewer3DOverlayLayout({ modelUrl, hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasPoseClipRail, poseClipVisibility })
+  const overlayLayout = resolveViewer3DOverlayLayout({
+    modelUrl,
+    hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasMotionRetargetRail || hasPoseClipRail,
+    poseClipVisibility,
+    rigEditorVisibility,
+    motionRetargetVisibility,
+  })
   const activeCheckpointArtifact = workflowRunState.status === 'paused' ? workflowRunState.substitutionPoint?.inputArtifact : undefined
   const selectedPart = editPlan?.selectedPartId ? sceneParts.find((part) => part.id === editPlan.selectedPartId) : undefined
   const canSaveEditedCopy = Boolean(editPlan && editPlan.excludedPartIds.length > 0 && saveState.status !== 'saving')
   const landmarkMarkers = useMemo(() => resolveViewer3DLandmarkMarkers(landmarkSession?.completed), [landmarkSession?.completed])
   const rigTargetState = resolveViewer3DActiveRigTargetState({ rigEditorState, rigEditorVisibility, poseClipState, poseClipVisibility, selectedTarget: selectedRigTarget })
   const rigEditorPanelRenderState = resolveViewer3DRigEditorPanelRenderState({ modelUrl, rigState: rigEditorState, visibility: rigEditorVisibility })
+  const motionRetargetPanelRenderState = resolveViewer3DMotionRetargetPanelRenderState({ modelUrl, motionRetargetState, visibility: motionRetargetVisibility })
   const poseClipPanelRenderState = resolveViewer3DPoseClipPanelRenderState({ modelUrl, poseState: poseClipState, visibility: poseClipVisibility })
   const rigHydrationWarning = rigRenameHydrationWarning && rigMetaHydrationWarning
     ? { status: 'warning' as const, messages: [...rigRenameHydrationWarning.messages, ...rigMetaHydrationWarning.messages] }
     : rigRenameHydrationWarning ?? rigMetaHydrationWarning
+  const rigDisplayNamingByBoneId = rigEditorState.rigMetaNamingByBoneId
 
   const handleSelectRigEditorBone = useCallback((boneId: RigBoneId) => {
     setSelectedRigTarget((current) => {
@@ -2568,28 +3907,76 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   }, [handleSelectPoseClipBone, handleSelectRigEditorBone, rigTargetState.activeMode])
 
   const rigEffectiveNaming = rigEditorPanelRenderState.shouldRenderPanel || poseClipPanelRenderState.shouldRenderPanel
-    ? resolveRigEffectiveNaming(rigEditorState.summary ?? poseClipState.summary!, rigEditorState.renamePlan, rigEditorState.rigMetaNamingByBoneId)
+    ? resolveRigEffectiveNaming(rigEditorState.summary ?? poseClipState.summary!, rigEditorState.renamePlan, rigDisplayNamingByBoneId)
     : undefined
 
   const rigOverlayProps = resolveViewer3DRigOverlayProps(rigTargetState, {
     onSelectBone: handleSelectActiveRigTarget,
   }, undefined, rigEffectiveNaming)
 
-  // A .ply/.splat reaching the viewer is always a Gaussian splat here: mesh
-  // plys are converted to GLB on import and workflow mesh outputs are .glb.
-  const isSplat = /\.(ply|splat)$/i.test(outputUrl)
+  useEffect(() => {
+    if (!kimodoMetadataDescriptor) {
+      setKimodoMetadata(null)
+      setMotionRetargetState((current) => ({ ...current, session: undefined, diagnosticsMessages: [] }))
+      return
+    }
 
-  // The splat viewer needs binary .splat — route raw workspace .ply through the
-  // conversion endpoint; import URLs already point at a .splat via serve-file.
-  const splatUrl = outputUrl.startsWith('/workspace/')
-    ? `${apiUrl}/optimize/ply-to-splat?path=${encodeURIComponent(outputUrl.slice('/workspace/'.length))}`
-    : modelUrl
+    let cancelled = false
+    fetch(kimodoMetadataDescriptor.metadataUrl)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Failed to load Kimodo metadata (${response.status}).`)
+        return response.json() as Promise<Record<string, unknown>>
+      })
+      .then((metadata) => {
+        if (cancelled) return
+        setKimodoMetadata(metadata)
+        const hydrated = hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({
+          descriptor: kimodoMetadataDescriptor,
+          metadata,
+          summary: motionRetargetState.summary,
+          previousSession: motionRetargetState.session,
+          renamePlan: rigEditorState.renamePlan,
+          rigMetaNamingByBoneId: rigDisplayNamingByBoneId,
+        })
+
+        setMotionRetargetState((current) => {
+          return {
+            ...current,
+            session: hydrated.session,
+            selectedSourceBoneId: hydrated.session?.sourceBones.some((bone) => bone.sourceBoneId === current.selectedSourceBoneId)
+              ? current.selectedSourceBoneId
+              : hydrated.session?.sourceBones[0]?.sourceBoneId,
+            diagnosticsMessages: hydrated.diagnosticsMessages,
+          }
+        })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        if (kimodoMetadataDescriptor.detectionMode === 'sibling-metadata') {
+          setKimodoMetadata(null)
+          setMotionRetargetState((current) => ({ ...current, session: undefined, diagnosticsMessages: [] }))
+          return
+        }
+        const message = error instanceof Error ? error.message : 'Kimodo metadata could not be loaded.'
+        setKimodoMetadata(null)
+        setMotionRetargetState((current) => ({
+          ...current,
+          session: undefined,
+          diagnosticsMessages: [message, 'Diagnostics-only inspection is available until a safe retarget artifact is found.'],
+        }))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [kimodoMetadataDescriptor, motionRetargetState.summary?.skeletonContextId, rigDisplayNamingByBoneId, rigEditorState.renamePlan])
 
   // Reset view state when model changes
   useEffect(() => {
     setSelected(false)
     setViewMode('solid')
     setAnimationPlaying(false)
+    if (animationControlsRef.current) resetAnimationPlayback(animationControlsRef.current)
     setHasAnimations(false)
     setRigStats({ hasRig: false, skinnedMeshCount: 0, boneCount: 0, jointCount: 0 })
     setRigEditorState(createViewer3DRigEditorState())
@@ -2599,8 +3986,14 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
       resetPoseClipPreview({ bonesById: poseClipBonesRef.current, snapshot: poseClipSnapshotRef.current })
       poseClipSnapshotRef.current = null
     }
+    if (motionRetargetSnapshotRef.current) {
+      resetMotionRetargetPreview({ bonesById: poseClipBonesRef.current, snapshot: motionRetargetSnapshotRef.current })
+      motionRetargetSnapshotRef.current = null
+    }
     setPoseClipState(createViewer3DPoseClipState())
     setPoseClipVisibility(createViewer3DPoseClipVisibilityState())
+    setMotionRetargetState(createViewer3DMotionRetargetState())
+    setMotionRetargetVisibility(createViewer3DMotionRetargetVisibilityState())
     setSceneEditMode('idle')
     setSceneParts([])
     setEditPlan(null)
@@ -2608,15 +4001,18 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     setRigRenameSaveState({ status: 'idle' })
     setRigRenameHydrationWarning(null)
     setRigMetaHydrationWarning(null)
+    setKimodoMetadata(null)
     sceneRef.current = null
     poseClipBonesRef.current = new Map()
     setStoreMeshStats(null)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the model changes; setters are stable
-  }, [modelUrl])
+  }, [currentJob?.id, baseModelUrl])
 
   useEffect(() => {
     const request = resolveViewer3DRigMetaHydrationRequest(rigEditorState.summary)
-    const token = createViewer3DRigMetaHydrationToken({ modelUrl, summary: rigEditorState.summary })
+    const token = createViewer3DRigMetaHydrationToken({
+      modelUrl,
+      summary: rigEditorState.summary,
+    })
     const reader = window.electron?.workspace?.artifacts?.readRigMetaSidecar
     if (!request || !token || !reader) {
       setRigMetaHydrationWarning(null)
@@ -2628,7 +4024,10 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     reader(request).then((result) => {
       if (cancelled) return
       setRigEditorState((current) => {
-        const currentToken = createViewer3DRigMetaHydrationToken({ modelUrl, summary: current.summary })
+        const currentToken = createViewer3DRigMetaHydrationToken({
+          modelUrl,
+          summary: current.summary,
+            })
         const hydration = applyViewer3DRigMetaHydrationResult({ state: current, result, token, currentToken })
         setRigMetaHydrationWarning(hydration.warning)
         return hydration.state
@@ -2674,6 +4073,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     }
   }, [modelUrl, rigEditorState.summary?.hasRig, rigEditorState.summary?.sourceWorkspacePath, rigEditorState.summary?.skeletonContextId])
 
+
   useEffect(() => {
     const request = resolveViewer3DPoseClipHydrationRequest(poseClipState.summary)
     const token = createViewer3DPoseClipHydrationToken({ modelUrl, summary: poseClipState.summary })
@@ -2697,6 +4097,38 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
       cancelled = true
     }
   }, [modelUrl, poseClipState.summary?.hasRig, poseClipState.summary?.sourceWorkspacePath, poseClipState.summary?.skeletonContextId])
+
+  useEffect(() => {
+    const request = resolveViewer3DMotionRetargetHydrationRequest(motionRetargetState.summary, motionRetargetState.session)
+    const token = createViewer3DMotionRetargetHydrationToken({ modelUrl, summary: motionRetargetState.summary })
+    const reader = window.electron?.workspace?.artifacts?.readMotionRetargetSidecar
+    if (!reader || !request || !token) return
+
+    let cancelled = false
+    reader(request).then((result) => {
+      if (cancelled) return
+      setMotionRetargetState((current) => applyViewer3DMotionRetargetHydrationResult({
+        state: current,
+        result,
+        token,
+        currentToken: createViewer3DMotionRetargetHydrationToken({ modelUrl, summary: current.summary }),
+        showNotFoundMessage: false,
+      }).state)
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      const message = error instanceof Error ? error.message : 'Failed to read motion retarget sidecar.'
+      setMotionRetargetState((current) => ({
+        ...current,
+        diagnosticsMessages: [message],
+        loadState: 'error',
+        loadMessage: message,
+      }))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [modelUrl, motionRetargetState.summary?.hasRig, motionRetargetState.summary?.sourceWorkspacePath, motionRetargetState.summary?.skeletonContextId])
 
   useEffect(() => {
     if (!canShowSceneEditControls || !sceneEditSource) {
@@ -2753,6 +4185,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'set-summary', summary }))
     setPoseClipState((current) => reduceViewer3DPoseClipState(current, { type: 'set-summary', summary }))
     setPoseClipVisibility((current) => reduceViewer3DPoseClipVisibilityState(current, { type: 'set-summary', summary }))
+    setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-summary', summary }))
+    setMotionRetargetVisibility((current) => reduceViewer3DMotionRetargetVisibilityState(current, { type: 'set-summary', summary }))
     setSelectedRigTarget((current) => reduceViewer3DSelectedRigTargetState(current, { type: 'set-summary', summary }))
   }, [])
 
@@ -2855,6 +4289,149 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
       rotation: { x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w },
     }))
   }
+
+  const handleSaveMotionRetargetSidecar = async () => {
+    const writer = window.electron?.workspace?.artifacts?.writeMotionRetargetSidecar
+    if (!writer) {
+      setMotionRetargetState((current) => ({ ...current, saveState: 'error', saveMessage: 'Workspace motion retarget writer is unavailable.' }))
+      return
+    }
+    setMotionRetargetState((current) => ({ ...current, saveState: 'saving', saveMessage: undefined }))
+    const result = await writeViewer3DMotionRetargetSidecar({ state: motionRetargetState, writer })
+    setMotionRetargetState((current) => result.success
+      ? { ...current, saveState: 'saved', saveMessage: `Saved motion retarget sidecar: ${result.sidecarWorkspacePath}` }
+      : { ...current, saveState: 'error', saveMessage: result.error })
+  }
+
+  const handleLoadMotionRetargetSidecar = async () => {
+    const reader = window.electron?.workspace?.artifacts?.readMotionRetargetSidecar
+    const request = resolveViewer3DMotionRetargetHydrationRequest(motionRetargetState.summary, motionRetargetState.session)
+    const token = createViewer3DMotionRetargetHydrationToken({ modelUrl, summary: motionRetargetState.summary })
+    if (!reader || !request || !token) {
+      setMotionRetargetState((current) => ({ ...current, loadState: 'error', loadMessage: 'Workspace motion retarget reader is unavailable for this rig.' }))
+      return
+    }
+    setMotionRetargetState((current) => ({ ...current, loadState: 'loading', loadMessage: undefined }))
+    const result = await reader(request)
+    setMotionRetargetState((current) => applyViewer3DMotionRetargetHydrationResult({
+      state: current,
+      result,
+      token,
+      currentToken: createViewer3DMotionRetargetHydrationToken({ modelUrl, summary: current.summary }),
+    }).state)
+  }
+
+  const handleExportMotionRetargetPoseClipCompanion = async () => {
+    const writer = window.electron?.workspace?.artifacts?.writePoseClipSidecar
+    if (!writer) {
+      setMotionRetargetState((current) => ({ ...current, exportState: 'error', exportMessage: 'Workspace Pose/Clip writer is unavailable.' }))
+      return
+    }
+    setMotionRetargetState((current) => ({ ...current, exportState: 'exporting', exportMessage: undefined }))
+    const result = await writeViewer3DMotionRetargetPoseClipCompanion({ state: motionRetargetState, writer })
+    setMotionRetargetState((current) => result.success
+      ? { ...current, exportState: 'exported', exportMessage: `Exported Pose/Clip companion: ${result.sidecarWorkspacePath}` }
+      : { ...current, exportState: 'error', exportMessage: result.error })
+  }
+
+  const handleOpenMotionRetargetArtifact = useCallback(async (artifact: MotionRetargetArtifactLink) => {
+    const viewerArtifact = artifact as Viewer3DMotionRetargetArtifactEntry
+    const previewReader = window.electron?.workspace?.artifacts?.previewWorkspaceArtifact
+    if (viewerArtifact.openMode === 'workspace-preview' && !previewReader) {
+      setArtifactPreviewState({
+        status: 'binary',
+        title: artifact.label,
+        workspacePath: artifact.workspacePath,
+        displayName: artifact.downloadName ?? artifact.label,
+        byteLength: 0,
+        binaryKind: 'error',
+        message: 'Workspace artifact preview is unavailable.',
+      })
+      return
+    }
+
+    const opened = await openViewer3DMotionRetargetArtifact({
+      state: motionRetargetState,
+      artifact: viewerArtifact,
+      previewReader: previewReader ?? (async () => ({ success: false, error: 'Workspace artifact preview is unavailable.' })),
+    })
+    setMotionRetargetState(opened.motionRetargetState)
+    setArtifactPreviewState(opened.previewState)
+  }, [motionRetargetState])
+
+  const handleDownloadMotionRetargetArtifact = useCallback(async (artifact: MotionRetargetArtifactLink) => {
+    const downloader = window.electron?.workspace?.artifacts?.downloadWorkspaceArtifact
+    if (!downloader) {
+      setMotionRetargetState((current) => ({ ...current, exportState: 'error', exportMessage: 'Workspace artifact download is unavailable.' }))
+      return
+    }
+
+    const result = await downloadViewer3DMotionRetargetArtifact({ artifact: artifact as Viewer3DMotionRetargetArtifactEntry, downloader })
+    if (!result.success) {
+      setMotionRetargetState((current) => ({ ...current, exportState: 'error', exportMessage: result.error }))
+    }
+  }, [])
+
+  const handlePlayMotionRetargetPreview = useCallback(() => {
+    const bonesById = poseClipBonesRef.current
+    if (bonesById.size === 0) return
+    setAnimationPlaying(false)
+    setMotionRetargetState((current) => {
+      const started = startViewer3DMotionRetargetPreview({
+        state: current,
+        bonesById,
+        poseSnapshot: motionRetargetSnapshotRef.current,
+        gltfActions: animationControlsRef.current?.actions ?? [],
+        gltfAnimationPlaying: animationPlaying,
+      })
+      motionRetargetSnapshotRef.current = started.poseSnapshot
+      return started.state
+    })
+  }, [animationPlaying])
+
+  const handlePauseMotionRetargetPreview = useCallback(() => {
+    setMotionRetargetState((current) => ({ ...current, previewState: 'paused' }))
+  }, [])
+
+  const handleResetMotionRetargetPreview = useCallback(() => {
+    setAnimationPlaying(false)
+    setMotionRetargetState((current) => {
+      const activeBackend: MotionPlaybackBackend = current.session?.selectedPreview === 'animated-glb' && hasAnimations
+        ? 'animated-glb'
+        : 'local-retarget-preview'
+      const reset = resetViewer3DActiveMotionPlayback({
+        state: current,
+        activeBackend,
+        bonesById: poseClipBonesRef.current,
+        localSnapshot: motionRetargetSnapshotRef.current,
+        animation: {
+          actions: animationControlsRef.current?.actions ?? [],
+          mixer: animationControlsRef.current?.mixer,
+          playing: animationPlaying,
+        },
+      })
+      motionRetargetSnapshotRef.current = reset.localSnapshot
+      return reset.state
+    })
+  }, [animationPlaying, hasAnimations])
+
+  const handleScrubMotionRetargetPreview = useCallback((timeSeconds: number) => {
+    const bonesById = poseClipBonesRef.current
+    if (bonesById.size === 0) return
+    setAnimationPlaying(false)
+    setMotionRetargetState((current) => {
+      const scrubbed = scrubViewer3DMotionRetargetPreviewTime({
+        state: current,
+        bonesById,
+        poseSnapshot: motionRetargetSnapshotRef.current,
+        gltfActions: animationControlsRef.current?.actions ?? [],
+        gltfAnimationPlaying: animationPlaying,
+        timeSeconds,
+      })
+      motionRetargetSnapshotRef.current = scrubbed.poseSnapshot
+      return scrubbed.state
+    })
+  }, [animationPlaying])
 
   const handlePoseClipCurrentTimeChange = useCallback((timeSeconds: number) => {
     const bonesById = poseClipBonesRef.current
@@ -3043,6 +4620,48 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     handlePoseClipPreviewReset()
   }, [poseClipVisibility.isOpen, handlePoseClipPreviewReset])
 
+  useEffect(() => {
+    const wasOpen = motionRetargetWasOpenRef.current
+    const isOpen = motionRetargetVisibility.isOpen
+    motionRetargetWasOpenRef.current = isOpen
+    if (!shouldResetViewer3DMotionRetargetPreviewForVisibilityChange({ wasOpen, isOpen })) return
+    setMotionRetargetState((current) => {
+      const reset = resetViewer3DScopedMotionRetargetPreviewOnClose({
+        state: current,
+        bonesById: poseClipBonesRef.current,
+        localSnapshot: motionRetargetSnapshotRef.current,
+        globalAnimationPlaying: animationPlaying,
+      })
+      motionRetargetSnapshotRef.current = reset.localSnapshot
+      return reset.state
+    })
+  }, [animationPlaying, motionRetargetVisibility.isOpen])
+
+  useEffect(() => {
+    if (motionRetargetState.previewState !== 'playing') return
+    const preview = resolveViewer3DMotionRetargetPreviewClip(motionRetargetState)
+    if (!preview.available || !preview.plan) return
+    const interval = window.setInterval(() => {
+      setMotionRetargetState((current) => {
+        if (current.previewState !== 'playing') return current
+        const nextTime = current.previewCurrentTimeSeconds >= preview.plan!.clip.durationSeconds
+          ? 0
+          : Math.min(preview.plan!.clip.durationSeconds, current.previewCurrentTimeSeconds + 1 / preview.plan!.clip.fps)
+        if (!motionRetargetSnapshotRef.current) {
+          motionRetargetSnapshotRef.current = takeMotionRetargetPreviewSnapshot(poseClipBonesRef.current)
+        }
+        restoreThenEvaluateMotionRetargetPreview({
+          plan: preview.plan!,
+          bonesById: poseClipBonesRef.current,
+          snapshot: motionRetargetSnapshotRef.current,
+          timeSeconds: nextTime,
+        })
+        return { ...current, previewCurrentTimeSeconds: nextTime }
+      })
+    }, 1000 / Math.max(1, preview.plan.clip.fps))
+    return () => window.clearInterval(interval)
+  }, [motionRetargetState])
+
 
   return (
     <ModelErrorBoundary resetKey={modelUrl} fallback={<ModelLoadError />}>
@@ -3091,6 +4710,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 onStats={setStoreMeshStats}
                 onSelect={handleSceneSelect}
                 onAnimationAvailability={handleAnimationAvailability}
+                onAnimationControlsReady={(controls) => { animationControlsRef.current = controls }}
                 onRigStats={setRigStats}
                 onRigSkeletonSummary={handleRigSkeletonSummary}
                 onPoseClipBonesReady={handlePoseClipBonesReady}
@@ -3176,6 +4796,12 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 summary: rigEditorState.summary,
                 onOpenRigEditor: () => setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })),
               } : undefined}
+              motionRetargetControls={resolveViewer3DMotionRetargetToolbarControls({
+                modelUrl,
+                summary: motionRetargetState.summary,
+                visibility: motionRetargetVisibility,
+                onOpenMotionRetarget: () => setMotionRetargetVisibility((current) => reduceViewer3DMotionRetargetVisibilityState(current, { type: 'toggle', summary: motionRetargetState.summary })),
+              })}
               poseClipControls={poseClipState.summary ? {
                 active: Boolean(poseClipState.summary.hasRig && poseClipVisibility.isOpen),
                 summary: poseClipState.summary,
@@ -3198,6 +4824,63 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
             />
             {rigRenameSaveState.status === 'saved' && <p className="mt-2 rounded-lg bg-emerald-500/10 p-2 text-xs text-emerald-200">Saved sidecar: {rigRenameSaveState.sidecarWorkspacePath}</p>}
             {rigRenameSaveState.status === 'error' && <p className="mt-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-200">{rigRenameSaveState.message}</p>}
+          </div>
+        )}
+
+        {motionRetargetPanelRenderState.shouldRenderPanel && (
+          <div className={`absolute ${overlayLayout.motionRetargetPanelClassName} bottom-4 z-20 w-80 max-w-[calc(100%-5rem)]`}>
+            <MotionRetargetPanel
+              {...{
+                ...resolveViewer3DMotionRetargetPanelProps(motionRetargetState, {
+                  onSelectSourceBone: (sourceBoneId) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'select-source-bone', sourceBoneId })),
+                  onChangeMapping: (sourceBoneId, targetBoneId) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-mapping', sourceBoneId, targetBoneId })),
+                  onSelectPreview: (selectedPreview) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-preview', selectedPreview })),
+                  onSaveSidecar: handleSaveMotionRetargetSidecar,
+                  onLoadSidecar: handleLoadMotionRetargetSidecar,
+                  onExportPoseClipCompanion: handleExportMotionRetargetPoseClipCompanion,
+                  onOpenArtifact: handleOpenMotionRetargetArtifact,
+                  onDownloadArtifact: handleDownloadMotionRetargetArtifact,
+                  onPlayPreview: handlePlayMotionRetargetPreview,
+                  onPausePreview: handlePauseMotionRetargetPreview,
+                  onResetPreview: handleResetMotionRetargetPreview,
+                  onScrubPreview: handleScrubMotionRetargetPreview,
+                  onChangeCorrections: (corrections) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-corrections', corrections })),
+                  onToggleAnimationPlayback: () => setAnimationPlaying((current) => hasAnimations ? !current : false),
+                }, {
+                  animationPlaybackAvailable: hasAnimations,
+                  animationPlaybackActive: animationPlaying,
+                }),
+              }}
+            />
+          </div>
+        )}
+
+        {artifactPreviewState.status !== 'closed' && (
+          <div className="absolute inset-x-4 bottom-4 z-20 mx-auto max-w-3xl rounded-2xl border border-zinc-700/70 bg-zinc-950/95 p-4 text-sm text-zinc-200 shadow-2xl shadow-black/50">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-white">{artifactPreviewState.title}</p>
+                <p className="text-xs text-zinc-400">{artifactPreviewState.displayName}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setArtifactPreviewState(createViewer3DArtifactPreviewState())}
+                className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200"
+              >
+                Close preview
+              </button>
+            </div>
+            {artifactPreviewState.status === 'text' ? (
+              <>
+                <p className="mb-2 text-xs text-zinc-400">{artifactPreviewState.byteLength} bytes{artifactPreviewState.truncated ? ' · preview truncated' : ''}</p>
+                <pre className="max-h-[40vh] overflow-auto rounded-xl bg-black/40 p-3 text-xs text-zinc-100">{artifactPreviewState.content}</pre>
+              </>
+            ) : (
+              <div className="space-y-2 rounded-xl bg-black/30 p-3 text-xs text-zinc-200">
+                <p>{artifactPreviewState.message}</p>
+                <p className="text-zinc-400">{artifactPreviewState.binaryKind.toUpperCase()} · {artifactPreviewState.byteLength} bytes</p>
+              </div>
+            )}
           </div>
         )}
 

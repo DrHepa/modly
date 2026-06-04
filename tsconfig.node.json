@@ -17,6 +17,9 @@
   "include": [
     "electron.vite.config.*",
     "electron/**/*",
-    "src/areas/workflows/nodes/mesh-exporter/output-path.ts"
+    "src/areas/workflows/nodes/mesh-exporter/output-path.ts",
+    "src/areas/generate/kimodoMotionAdapter.ts",
+    "src/areas/generate/rigSkeleton.ts",
+    "src/areas/generate/semanticRoles.ts"
   ]
 }

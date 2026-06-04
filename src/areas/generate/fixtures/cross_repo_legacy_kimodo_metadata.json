@@ -1,0 +1,15 @@
+{
+  "runtime_status": "success_with_fallback",
+  "retarget_status": "failed",
+  "animation_mapping_status": "failed",
+  "retarget_error_code": "MAPPING_INCOMPATIBLE",
+  "retarget_error_aliases": ["BVH_UNAVAILABLE"],
+  "retarget_error_message": "Legacy preview fallback preserved for inspection only.",
+  "fallback_output": "preview.glb",
+  "canonical_motion_artifact": "motion.npz",
+  "artifacts": ["metadata.json", "motion.bvh", "motion.npz", "preview.glb"],
+  "warnings": ["legacy_bundle_diagnostics_only"],
+  "diagnostics": {
+    "bvh_path": "motion.bvh"
+  }
+}

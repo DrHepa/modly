@@ -1,3 +1,5 @@
+import { normalizeSemanticRoleId } from './semanticRoles.ts'
+
 export type RigBoneWarning = 'empty-name' | 'duplicate-name'
 export type RigBoneId = string
 
@@ -36,6 +38,30 @@ export interface RigBoneNode {
   childIds: RigBoneId[]
   warnings: RigBoneWarning[]
 }
+
+export interface KimodoTargetTrackRotation {
+  timeSeconds: number
+  x: number
+  y: number
+  z: number
+  w: number
+}
+
+export interface KimodoTargetTrackLike {
+  targetNodeName: string
+  /** Producer index retained as evidence; not the local skeleton.bones index. */
+  targetNodeIndex: number
+  targetRole?: string
+  rotations: KimodoTargetTrackRotation[]
+}
+
+export interface TranslatedKimodoTargetTrack extends KimodoTargetTrackLike {
+  boneId: RigBoneId
+}
+
+export type TranslateKimodoTargetTracksResult =
+  | { ok: true, tracks: TranslatedKimodoTargetTrack[], diagnostics: string[] }
+  | { ok: false, diagnostics: string[] }
 
 export interface RigSkeletonSummary {
   hasRig: boolean
@@ -183,6 +209,147 @@ export function buildRigSelectionOverlay(
     highlightedBoneIds,
     connections,
   }
+}
+
+export function translateKimodoTargetTracks(
+  summary: RigSkeletonSummary,
+  tracks: readonly KimodoTargetTrackLike[],
+): TranslateKimodoTargetTracksResult {
+  const translated: TranslatedKimodoTargetTrack[] = []
+  const diagnostics: string[] = []
+
+  for (const track of tracks) {
+    if (!Array.isArray(track.rotations) || track.rotations.length === 0) {
+      diagnostics.push(`Kimodo target track "${track.targetNodeName}" is partial or missing quaternion rotations.`)
+      continue
+    }
+
+    if (typeof track.targetNodeName !== 'string' || !track.targetNodeName.trim()
+      || !Number.isSafeInteger(track.targetNodeIndex) || track.targetNodeIndex < 0
+      || !validKimodoRotations(track.rotations)) {
+      diagnostics.push(`Kimodo target track "${track.targetNodeName}" has invalid identity or quaternion timing data.`)
+      continue
+    }
+
+    const resolution = resolveKimodoTargetTrackCandidates(summary, track)
+    const baseCandidates = resolution.candidates
+
+    if (baseCandidates.length === 0) {
+      diagnostics.push(resolution.diagnostic ?? `Kimodo target track "${track.targetNodeName}" is missing local target for node index ${track.targetNodeIndex}.`)
+      continue
+    }
+
+    if (resolution.identityMatch) {
+      if (baseCandidates.length !== 1) {
+        diagnostics.push(`Kimodo target track "${track.targetNodeName}" resolved to an ambiguous local target.`)
+        continue
+      }
+
+      diagnostics.push(...resolveExactIdentityRoleDiagnostics(baseCandidates[0], track))
+      translated.push(cloneTranslatedKimodoTargetTrack(track, baseCandidates[0].boneId))
+      continue
+    }
+
+    const normalizedTargetRole = normalizeSemanticRoleId(track.targetRole)
+    const roleCandidates = normalizedTargetRole
+      ? baseCandidates.filter((bone) => normalizeSemanticRoleId(bone.role) === normalizedTargetRole)
+      : baseCandidates
+
+    if (normalizedTargetRole && roleCandidates.length === 0) {
+      diagnostics.push(`Kimodo target track "${track.targetNodeName}" failed role mismatch for "${track.targetRole}".`)
+      continue
+    }
+
+    if (roleCandidates.length !== 1) {
+      diagnostics.push(`Kimodo target track "${track.targetNodeName}" resolved to an ambiguous local target.`)
+      continue
+    }
+
+    translated.push(cloneTranslatedKimodoTargetTrack(track, roleCandidates[0].boneId, normalizedTargetRole))
+  }
+
+  const counts = new Map<RigBoneId, number>()
+  for (const track of translated) counts.set(track.boneId, (counts.get(track.boneId) ?? 0) + 1)
+  for (const [boneId, count] of counts) {
+    if (count > 1) diagnostics.push(`Multiple Kimodo tracks resolve to local target "${boneId}"; all colliding tracks were omitted.`)
+  }
+  const tracksWithoutCollisions = translated.filter(track => counts.get(track.boneId) === 1)
+  if (tracksWithoutCollisions.length === 0 && diagnostics.length > 0) return { ok: false, diagnostics }
+  return { ok: true, tracks: tracksWithoutCollisions, diagnostics }
+}
+
+function resolveExactIdentityRoleDiagnostics(bone: RigBoneNode, track: KimodoTargetTrackLike): string[] {
+  const normalizedTargetRole = normalizeSemanticRoleId(track.targetRole)
+  if (!normalizedTargetRole) return []
+  if (!bone.role) {
+    return [`Kimodo target track "${track.targetNodeName}" accepted exact local identity for role "${normalizedTargetRole}"; local role metadata is missing.`]
+  }
+  const normalizedBoneRole = normalizeSemanticRoleId(bone.role)
+  if (normalizedBoneRole === normalizedTargetRole) return []
+  return [`Kimodo target track "${track.targetNodeName}" accepted exact local identity; local role metadata "${bone.role}" differs from Kimodo role "${normalizedTargetRole}".`]
+}
+
+function cloneTranslatedKimodoTargetTrack(track: KimodoTargetTrackLike, boneId: RigBoneId, normalizedTargetRole = normalizeSemanticRoleId(track.targetRole)): TranslatedKimodoTargetTrack {
+  return {
+    boneId,
+    targetNodeName: track.targetNodeName,
+    targetNodeIndex: track.targetNodeIndex,
+    ...(normalizedTargetRole ? { targetRole: normalizedTargetRole } : {}),
+    rotations: track.rotations.map((rotation) => ({ ...rotation })),
+  }
+}
+
+function resolveKimodoTargetTrackCandidates(
+  summary: RigSkeletonSummary,
+  track: KimodoTargetTrackLike,
+): { candidates: RigBoneNode[], diagnostic?: string, identityMatch: boolean } {
+  // External node indices have no demonstrated relationship to skeleton.bones.
+  // Prefer literal names, then an unambiguous case-insensitive legacy match.
+  const exactCandidates = summary.bones.filter(bone => bone.originalName === track.targetNodeName)
+  const sameNameCandidates = exactCandidates.length > 0
+    ? exactCandidates
+    : summary.bones.filter(bone => normalizeComparableBoneName(bone.originalName) === normalizeComparableBoneName(track.targetNodeName))
+  if (sameNameCandidates.length === 1) return { candidates: sameNameCandidates, identityMatch: true }
+
+  const normalizedTargetRole = normalizeSemanticRoleId(track.targetRole)
+  if (normalizedTargetRole) {
+    const sameNameAndRoleCandidates = sameNameCandidates.filter((bone) => normalizeSemanticRoleId(bone.role) === normalizedTargetRole)
+    if (sameNameAndRoleCandidates.length > 0) return { candidates: sameNameAndRoleCandidates, identityMatch: false }
+
+    if (sameNameCandidates.length === 0) {
+      const sameRoleCandidates = summary.bones.filter((bone) => normalizeSemanticRoleId(bone.role) === normalizedTargetRole)
+      if (sameRoleCandidates.length > 0) return { candidates: sameRoleCandidates, identityMatch: false }
+    }
+
+    if (sameNameCandidates.length > 0) {
+      return {
+        candidates: [],
+        diagnostic: `Kimodo target track "${track.targetNodeName}" failed role mismatch for "${track.targetRole}".`,
+        identityMatch: false,
+      }
+    }
+  }
+
+  if (sameNameCandidates.length > 0) return { candidates: sameNameCandidates, identityMatch: false }
+
+  return {
+    candidates: [],
+    diagnostic: `Kimodo target track "${track.targetNodeName}" is missing local target for node index ${track.targetNodeIndex}.`,
+    identityMatch: false,
+  }
+}
+
+function validKimodoRotations(rotations: readonly KimodoTargetTrackRotation[]): boolean {
+  return rotations.every((rotation, index) => rotation
+    && [rotation.timeSeconds, rotation.x, rotation.y, rotation.z, rotation.w].every(Number.isFinite)
+    && rotation.timeSeconds >= 0
+    && (index === 0 || rotation.timeSeconds > rotations[index - 1].timeSeconds)
+    && Math.hypot(rotation.x, rotation.y, rotation.z, rotation.w) > 0
+    && Number.isFinite(Math.hypot(rotation.x, rotation.y, rotation.z, rotation.w)))
+}
+
+function normalizeComparableBoneName(value: string): string {
+  return value.trim().toLowerCase()
 }
 
 function orderSkeletonBones<Bone extends RigBoneLike>(input: readonly Bone[]): Bone[] {

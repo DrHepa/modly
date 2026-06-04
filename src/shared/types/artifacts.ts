@@ -3,6 +3,8 @@ export interface ArtifactProvenance {
   workflowId?: string
   workflowNodeId?: string
   source?: string
+  extensionId?: string
+  extensionNodeId?: string
   [key: string]: unknown
 }
 
@@ -36,6 +38,7 @@ export interface ArtifactRef {
   text?: string
   versionId: string
   legacy?: LegacyArtifactPayload
+  provenance?: ArtifactProvenance
 }
 
 export interface ArtifactVersion {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Bone } from 'three'
 
-import { buildRigSelectionOverlay, collectRigSkeletonBinding, collectRigSkeletonSummary, type RigBoneNode } from './rigSkeleton.ts'
+import { buildRigSelectionOverlay, collectRigSkeletonBinding, collectRigSkeletonSummary, translateKimodoTargetTracks, type RigSkeletonSummary, type RigBoneNode } from './rigSkeleton.ts'
 import { CANONICAL_SEMANTIC_ROLE_IDS, normalizeSemanticRoleId, type SemanticRoleId } from './semanticRoles.ts'
 
 function namedBone(name: string): Bone {
@@ -308,4 +308,301 @@ test('semantic role contract uses canonical ids and aliases only at ingestion bo
   for (const unknown of [undefined, '', '   ', 'bone_4', 'unknown_role', 'constructor', ' CONSTRUCTOR ', 'c_o_n_s_t_r_u_c_t_o_r', '__proto__', 'toString']) {
     assert.equal(normalizeSemanticRoleId(unknown), undefined, String(unknown))
   }
+})
+
+test('translateKimodoTargetTracks resolves unique original names and uses roles to disambiguate duplicates', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:Hero|skeleton:0',
+    skinnedMeshContexts: ['rig:Hero|skeleton:0'],
+    rootBoneIds: ['bone:hips'],
+    stats: { skinnedMeshCount: 1, boneCount: 3 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:hips', label: 'Hips', originalName: 'Hips', path: ['Hips'], siblingIndex: 0, childIds: ['bone:left-arm', 'bone:right-arm'], warnings: [], nodeIndex: 0 },
+      { boneId: 'bone:left-arm', label: 'Arm', originalName: 'Arm', path: ['Hips', 'Arm'], siblingIndex: 0, parentId: 'bone:hips', childIds: [], warnings: ['duplicate-name'], nodeIndex: 1, role: 'left_arm' },
+      { boneId: 'bone:right-arm', label: 'Arm', originalName: 'Arm', path: ['Hips', 'Arm'], siblingIndex: 1, parentId: 'bone:hips', childIds: [], warnings: ['duplicate-name'], nodeIndex: 2, role: 'right_arm' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const translated = translateKimodoTargetTracks(summary, [
+    {
+      targetNodeName: 'Hips',
+      targetNodeIndex: 0,
+      rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }],
+    },
+    {
+      targetNodeName: 'Arm',
+      targetNodeIndex: 1,
+      targetRole: 'left_upper_arm',
+      rotations: [{ timeSeconds: 0.5, x: 0, y: 0.3826834, z: 0, w: 0.9238795 }],
+    },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks, [
+    {
+      boneId: 'bone:hips',
+      targetNodeName: 'Hips',
+      targetNodeIndex: 0,
+      rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }],
+    },
+    {
+      boneId: 'bone:left-arm',
+      targetNodeName: 'Arm',
+      targetNodeIndex: 1,
+      targetRole: 'left_upper_arm',
+      rotations: [{ timeSeconds: 0.5, x: 0, y: 0.3826834, z: 0, w: 0.9238795 }],
+    },
+  ])
+})
+
+test('translateKimodoTargetTracks fails closed for missing targets, ambiguous duplicates, and role mismatches', () => {
+  const ambiguousSummary = {
+    hasRig: true,
+    skeletonContextId: 'rig:Ambiguous|skeleton:0',
+    skinnedMeshContexts: ['rig:Ambiguous|skeleton:0'],
+    rootBoneIds: ['bone:root'],
+    stats: { skinnedMeshCount: 1, boneCount: 3 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:root', label: 'Root', originalName: 'Root', path: ['Root'], siblingIndex: 0, childIds: ['bone:arm-a', 'bone:arm-b'], warnings: [], nodeIndex: 0 },
+      { boneId: 'bone:arm-a', label: 'Arm', originalName: 'Arm', path: ['Root', 'Arm'], siblingIndex: 0, parentId: 'bone:root', childIds: [], warnings: ['duplicate-name'], nodeIndex: 1, role: 'left_arm' },
+      { boneId: 'bone:arm-b', label: 'Arm', originalName: 'Arm', path: ['Root', 'Arm'], siblingIndex: 1, parentId: 'bone:root', childIds: [], warnings: ['duplicate-name'], nodeIndex: 1, role: 'left_arm' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const missing = translateKimodoTargetTracks(ambiguousSummary, [
+    { targetNodeName: 'Leg', targetNodeIndex: 99, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+  assert.equal(missing.ok, false)
+  assert.match(missing.diagnostics.join('\n'), /missing local target/i)
+
+  const ambiguous = translateKimodoTargetTracks(ambiguousSummary, [
+    { targetNodeName: 'Arm', targetNodeIndex: 1, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+  assert.equal(ambiguous.ok, false)
+  assert.match(ambiguous.diagnostics.join('\n'), /ambiguous local target/i)
+
+  const roleMismatch = translateKimodoTargetTracks(ambiguousSummary, [
+    { targetNodeName: 'Arm', targetNodeIndex: 99, targetRole: 'right_arm', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+  assert.equal(roleMismatch.ok, false)
+  assert.match(roleMismatch.diagnostics.join('\n'), /role mismatch/i)
+})
+
+test('translateKimodoTargetTracks falls back to stable role and original name when exported node indices diverge', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:LocalViewer|skeleton:0',
+    skinnedMeshContexts: ['rig:LocalViewer|skeleton:0'],
+    rootBoneIds: ['bone:hips'],
+    stats: { skinnedMeshCount: 1, boneCount: 3 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:hips', label: 'Hips', originalName: 'Hips', path: ['Hips'], siblingIndex: 0, childIds: ['bone:left-leg'], warnings: [], nodeIndex: 42, role: 'hips' },
+      { boneId: 'bone:left-leg', label: 'Left Upper Leg', originalName: 'bone_5', path: ['Hips', 'Left Upper Leg'], siblingIndex: 0, parentId: 'bone:hips', childIds: ['bone:right-leg'], warnings: [], nodeIndex: 77, role: 'left_upper_leg' },
+      { boneId: 'bone:right-leg', label: 'Right Upper Leg', originalName: 'bone_6', path: ['Hips', 'Right Upper Leg'], siblingIndex: 1, parentId: 'bone:hips', childIds: [], warnings: [], nodeIndex: 78, role: 'right_upper_leg' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const translated = translateKimodoTargetTracks(summary, [
+    {
+      targetNodeName: 'bone_5',
+      targetNodeIndex: 0,
+      targetRole: 'left_upper_leg',
+      rotations: [{ timeSeconds: 0.25, x: 0.1, y: 0.2, z: 0.3, w: 0.9 }],
+    },
+    {
+      targetNodeName: 'bone_6',
+      targetNodeIndex: 1,
+      targetRole: 'right_upper_leg',
+      rotations: [{ timeSeconds: 0.25, x: -0.1, y: -0.2, z: -0.3, w: 0.9 }],
+    },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks.map((track) => track.boneId), ['bone:left-leg', 'bone:right-leg'])
+})
+
+test('translateKimodoTargetTracks resolves UniRig bone_* targets by canonical semantic role without mutating names or indices', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:UniRig|skeleton:0',
+    skinnedMeshContexts: ['rig:UniRig|skeleton:0'],
+    rootBoneIds: ['bone:5'],
+    stats: { skinnedMeshCount: 1, boneCount: 3 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:5', label: 'bone_5', originalName: 'bone_5', path: ['bone_5'], siblingIndex: 0, childIds: ['bone:4'], warnings: [], nodeIndex: 5, role: 'hips' },
+      { boneId: 'bone:4', label: 'bone_4', originalName: 'bone_4', path: ['bone_5', 'bone_4'], siblingIndex: 0, parentId: 'bone:5', childIds: ['bone:3'], warnings: [], nodeIndex: 4, role: 'spine' },
+      { boneId: 'bone:3', label: 'bone_3', originalName: 'bone_3', path: ['bone_5', 'bone_4', 'bone_3'], siblingIndex: 0, parentId: 'bone:4', childIds: [], warnings: [], nodeIndex: 3, role: 'left_lower_arm' },
+    ],
+  } satisfies RigSkeletonSummary
+  const originalNames = summary.bones.map((bone) => bone.originalName)
+  const originalIndices = summary.bones.map((bone) => bone.nodeIndex)
+
+  const translated = translateKimodoTargetTracks(summary, [
+    { targetNodeName: 'LeftForeArm', targetNodeIndex: 41, targetRole: 'left_forearm', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks, [
+    { boneId: 'bone:3', targetNodeName: 'LeftForeArm', targetNodeIndex: 41, targetRole: 'left_lower_arm', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+  assert.deepEqual(summary.bones.map((bone) => bone.originalName), originalNames)
+  assert.deepEqual(summary.bones.map((bone) => bone.nodeIndex), originalIndices)
+})
+
+test('translateKimodoTargetTracks accepts exact identity matches when local role metadata is absent or stale', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:ExactIdentity|skeleton:0',
+    skinnedMeshContexts: ['rig:ExactIdentity|skeleton:0'],
+    rootBoneIds: ['bone:hips'],
+    stats: { skinnedMeshCount: 1, boneCount: 2 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:hips', label: 'Bone 5', originalName: 'bone_5', path: ['Bone 5'], siblingIndex: 0, childIds: ['bone:spine'], warnings: [], nodeIndex: 0 },
+      { boneId: 'bone:spine', label: 'Bone 4', originalName: 'bone_4', path: ['Bone 5', 'Bone 4'], siblingIndex: 0, parentId: 'bone:hips', childIds: [], warnings: [], nodeIndex: 1, role: 'neck' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const translated = translateKimodoTargetTracks(summary, [
+    { targetNodeName: 'bone_5', targetNodeIndex: 0, targetRole: 'hips', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+    { targetNodeName: 'bone_4', targetNodeIndex: 1, targetRole: 'spine', rotations: [{ timeSeconds: 0, x: 0, y: 0.2, z: 0, w: 0.98 }] },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks.map((track) => track.boneId), ['bone:hips', 'bone:spine'])
+  assert.match(translated.diagnostics.join('\n'), /role metadata is missing/i)
+  assert.match(translated.diagnostics.join('\n'), /role metadata "neck" differs from Kimodo role "spine"/i)
+  assert.doesNotMatch(translated.diagnostics.join('\n'), /failed role mismatch/i)
+})
+
+test('translateKimodoTargetTracks accepts unique originalName matches when exported node indices diverge and role metadata is stale', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:UniqueOriginalName|skeleton:0',
+    skinnedMeshContexts: ['rig:UniqueOriginalName|skeleton:0'],
+    rootBoneIds: ['bone:hips'],
+    stats: { skinnedMeshCount: 1, boneCount: 3 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:hips', label: 'Bone 5', originalName: 'bone_5', path: ['Bone 5'], siblingIndex: 0, childIds: ['bone:spine'], warnings: [], nodeIndex: 42 },
+      { boneId: 'bone:spine', label: 'Bone 4', originalName: 'bone_4', path: ['Bone 5', 'Bone 4'], siblingIndex: 0, parentId: 'bone:hips', childIds: ['bone:foot'], warnings: [], nodeIndex: 43, role: 'neck' },
+      { boneId: 'bone:foot', label: 'Bone 9', originalName: 'bone_9', path: ['Bone 5', 'Bone 4', 'Bone 9'], siblingIndex: 0, parentId: 'bone:spine', childIds: [], warnings: [], nodeIndex: 44, role: 'left_hand' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const translated = translateKimodoTargetTracks(summary, [
+    { targetNodeName: 'bone_5', targetNodeIndex: 0, targetRole: 'hips', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+    { targetNodeName: 'bone_4', targetNodeIndex: 1, targetRole: 'spine', rotations: [{ timeSeconds: 0, x: 0, y: 0.2, z: 0, w: 0.98 }] },
+    { targetNodeName: 'bone_9', targetNodeIndex: 2, targetRole: 'right_foot', rotations: [{ timeSeconds: 0, x: 0.1, y: 0, z: 0, w: 0.99 }] },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks.map((track) => track.boneId), ['bone:hips', 'bone:spine', 'bone:foot'])
+  assert.match(translated.diagnostics.join('\n'), /role metadata is missing/i)
+  assert.match(translated.diagnostics.join('\n'), /role metadata "neck" differs from Kimodo role "spine"/i)
+  assert.match(translated.diagnostics.join('\n'), /role metadata "left_hand" differs from Kimodo role "right_foot"/i)
+  assert.doesNotMatch(translated.diagnostics.join('\n'), /failed role mismatch/i)
+})
+
+test('translateKimodoTargetTracks returns partial safe translations with diagnostics instead of hard failing every valid track', () => {
+  const summary = {
+    hasRig: true,
+    skeletonContextId: 'rig:Partial|skeleton:0',
+    skinnedMeshContexts: ['rig:Partial|skeleton:0'],
+    rootBoneIds: ['bone:hips'],
+    stats: { skinnedMeshCount: 1, boneCount: 2 },
+    warnings: [],
+    bones: [
+      { boneId: 'bone:hips', label: 'Hips', originalName: 'Hips', path: ['Hips'], siblingIndex: 0, childIds: ['bone:spine'], warnings: [], nodeIndex: 0, role: 'hips' },
+      { boneId: 'bone:spine', label: 'Spine', originalName: 'Spine', path: ['Hips', 'Spine'], siblingIndex: 0, parentId: 'bone:hips', childIds: [], warnings: [], nodeIndex: 1, role: 'spine' },
+    ],
+  } satisfies RigSkeletonSummary
+
+  const translated = translateKimodoTargetTracks(summary, [
+    { targetNodeName: 'Hips', targetNodeIndex: 0, targetRole: 'hips', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+    { targetNodeName: 'missing_finger', targetNodeIndex: 99, targetRole: 'left_index_1', rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] },
+  ])
+
+  assert.equal(translated.ok, true)
+  assert.deepEqual(translated.tracks.map((track) => track.boneId), ['bone:hips'])
+  assert.match(translated.diagnostics.join('\n'), /missing local target/i)
+})
+
+test('Kimodo translation does not confuse exported indices with local skeleton array positions', () => {
+  const root = namedBone('Root'); const a = namedBone('Arm'); const b = namedBone('Arm')
+  root.add(a, b)
+  for (const bones of [[root, a, b], [b, root, a]]) {
+    const binding = collectRigSkeletonBinding({ skinnedMeshes: [{ name: 'Body', skeleton: { bones } }] })
+    const track = { targetNodeName: 'Arm', targetNodeIndex: bones.indexOf(a), rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] }
+    const ambiguous = translateKimodoTargetTracks(binding.summary, [track])
+    assert.equal(ambiguous.ok, false)
+    assert.match(ambiguous.diagnostics.join('\n'), /ambiguous|index domain/i)
+    binding.summary.bones.find(node => binding.bonesById.get(node.boneId) === b)!.role = 'left_arm'
+    const resolved = translateKimodoTargetTracks(binding.summary, [{ ...track, targetRole: 'left_upper_arm' }])
+    assert.equal(resolved.ok, true)
+    assert.equal(binding.bonesById.get(resolved.tracks[0].boneId), b)
+  }
+})
+
+test('Kimodo translation preserves exact raw names before case folding and never uses display aliases', () => {
+  const a = namedBone('Arm'); const b = namedBone('arm'); const c = namedBone(' Arm ')
+  const binding = collectRigSkeletonBinding({ skinnedMeshes: [{ skeleton: { bones: [a, b, c] } }] })
+  binding.summary.bones.forEach(node => { node.label = 'Hand' })
+  const make = (targetNodeName: string) => ({ targetNodeName, targetNodeIndex: 2, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] })
+  for (const bone of [a, b, c]) {
+    const result = translateKimodoTargetTracks(binding.summary, [make(bone.name)])
+    assert.equal(result.ok, true)
+    assert.equal(binding.bonesById.get(result.tracks[0].boneId), bone)
+  }
+  assert.equal(translateKimodoTargetTracks(binding.summary, [make('ARM')]).ok, false)
+  assert.equal(translateKimodoTargetTracks(binding.summary, [make('Hand')]).ok, false)
+})
+
+test('Kimodo translation removes all tracks colliding on a target but preserves unrelated valid tracks', () => {
+  const hips = namedBone('Hips'); const foot = namedBone('Foot')
+  const binding = collectRigSkeletonBinding({ skinnedMeshes: [{ skeleton: { bones: [hips, foot] } }] })
+  binding.summary.bones[0].role = 'hips'
+  const make = (targetNodeName: string, targetRole?: string) => ({ targetNodeName, targetNodeIndex: 99, targetRole, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] })
+  const result = translateKimodoTargetTracks(binding.summary, [make('Hips'), make('Pelvis', 'hips'), make('Foot')])
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.tracks.map(track => binding.bonesById.get(track.boneId)), [foot])
+  assert.match(result.diagnostics.join('\n'), /duplicate|multiple|collision/i)
+})
+
+test('Kimodo translation validates direct-call rotations without sacrificing other valid targets', () => {
+  const binding = collectRigSkeletonBinding({ skinnedMeshes: [{ skeleton: { bones: [namedBone('Hips')] } }] })
+  const valid = { targetNodeName: 'Hips', targetNodeIndex: 0, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }] }
+  for (const rotation of [{ timeSeconds: -1, x: 0, y: 0, z: 0, w: 1 }, { timeSeconds: NaN, x: 0, y: 0, z: 0, w: 1 }, { timeSeconds: 0, x: 0, y: 0, z: 0, w: 0 }, { timeSeconds: 0, x: Infinity, y: 0, z: 0, w: 1 }]) {
+    assert.equal(translateKimodoTargetTracks(binding.summary, [{ ...valid, rotations: [rotation] }]).ok, false)
+  }
+  assert.equal(translateKimodoTargetTracks(binding.summary, [{ ...valid, rotations: [{ ...valid.rotations[0], timeSeconds: 1 }, valid.rotations[0]] }]).ok, false)
+  assert.equal(translateKimodoTargetTracks(binding.summary, [{ ...valid, targetNodeIndex: -1 }]).ok, false)
+})
+
+test('Kimodo translated IDs bind real reversed and shared Three bones without modifying names or arrays', async () => {
+  const { Scene, Skeleton, SkinnedMesh, AnimationMixer, AnimationClip, QuaternionKeyframeTrack } = await import('three')
+  const scene = new Scene(); const hips = namedBone('Hips'); const foot = namedBone('Foot'); hips.add(foot)
+  const mesh = new SkinnedMesh(); mesh.add(hips); mesh.bind(new Skeleton([foot, hips])); scene.add(mesh)
+  const shared = new SkinnedMesh(); shared.bind(new Skeleton([hips, foot])); scene.add(shared)
+  const binding = collectRigSkeletonBinding({ skinnedMeshes: [{ name: 'Body', skeleton: mesh.skeleton }, { name: 'Clothes', skeleton: shared.skeleton }] })
+  const input = [{ targetNodeName: 'Foot', targetNodeIndex: 42, rotations: [{ timeSeconds: 0, x: 0, y: 0, z: 0, w: 1 }, { timeSeconds: 1, x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 }] }]
+  const before = structuredClone(input)
+  const result = translateKimodoTargetTracks(binding.summary, input)
+  assert.equal(result.ok, true)
+  assert.equal(binding.bonesById.get(result.tracks[0].boneId), foot)
+  const track = result.tracks[0]
+  const target = binding.bonesById.get(track.boneId)!
+  const clip = new AnimationClip('Translated', 1, [new QuaternionKeyframeTrack(`${target.uuid}.quaternion`, track.rotations.map(r => r.timeSeconds), track.rotations.flatMap(r => [r.x, r.y, r.z, r.w]))])
+  const mixer = new AnimationMixer(scene); mixer.clipAction(clip).play(); mixer.setTime(0.5)
+  assert.ok(Math.abs(foot.quaternion.y - Math.sin(Math.PI / 8)) < 1e-6)
+  assert.equal(hips.quaternion.y, 0)
+  assert.deepEqual(mesh.skeleton.bones, [foot, hips]); assert.deepEqual(shared.skeleton.bones, [hips, foot])
+  assert.deepEqual([hips.name, foot.name], ['Hips', 'Foot']); assert.deepEqual(input, before)
+  track.rotations[0].x = 0.5; assert.deepEqual(input, before)
+  mixer.stopAllAction(); mixer.uncacheRoot(scene)
 })

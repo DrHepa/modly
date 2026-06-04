@@ -21,6 +21,10 @@
     "src/areas/generate/kimodoMotionAdapter.ts",
     "src/areas/generate/motionRetargetPlan.ts",
     "src/areas/generate/poseClipPlan.ts",
+    "src/areas/generate/rigDisplayNames.ts",
+    "src/areas/generate/rigEffectiveNaming.ts",
+    "src/areas/generate/rigMetaNaming.ts",
+    "src/areas/generate/rigRenamePlan.ts",
     "src/areas/generate/rigSkeleton.ts"
   ]
 }

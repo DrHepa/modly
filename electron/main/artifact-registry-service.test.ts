@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -6,15 +7,20 @@ import test from 'node:test'
 
 import {
   downloadWorkspaceArtifact,
+  getHumanoidDraftWorkspacePath,
+  getHumanoidPromotionWorkspacePath,
   getArtifactSidecarWorkspacePath,
   normalizeWorkspaceArtifactPath,
   previewWorkspaceArtifact,
+  readHumanoidDraftSidecar,
+  readHumanoidPromotionSidecar,
   readPoseClipSidecar,
   readRigMetaSidecar,
   readRigRenameSidecar,
   registerArtifactRegistryIpcHandlers,
   writeLandmarkSidecar,
   readArtifactSidecar,
+  writeHumanoidPromotionSidecar,
   writeEditedSceneArtifact,
   writePoseClipSidecar,
   writeArtifactSidecar,
@@ -336,6 +342,104 @@ function motionRetargetSidecar(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function sha256(value: string | Uint8Array): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function humanoidDraftSidecar(overrides: Record<string, unknown> = {}) {
+  return {
+    schema: 'modly.humanoid-draft.v1',
+    version: 1,
+    source: { workspacePath: 'Workflows/sources/source.glb' },
+    output: { workspacePath: 'Workflows/outputs/hero_unirig.glb' },
+    meshOutputSha256: sha256('mesh-bytes-v1'),
+    rigmetaSha256: sha256(JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb' }), null, 2)),
+    draftSha256: 'draft-sha-1',
+    trust: { status: 'draft', reasons: ['semantic_trust_failed'], trusted: false },
+    provenance: {
+      producer: 'unirig',
+      runId: 'run-1',
+      extensionId: 'unirig-ext',
+      createdAt: '2026-05-22T00:00:00.000Z',
+    },
+    assignments: {
+      roles: {
+        hips: 'rig:Body|skeleton:0|bone:Hips#0',
+      },
+      chains: {
+        spine: ['rig:Body|skeleton:0|bone:Hips#0', 'rig:Body|skeleton:0|bone:Hips#0/Spine#0'],
+      },
+    },
+    confidence: { byRole: { hips: 0.92 }, overall: 0.91 },
+    completeness: { requiredRolesMissing: [], score: 1 },
+    diagnostics: [],
+    ...overrides,
+  }
+}
+
+function humanoidPromotionSidecar(overrides: Record<string, unknown> = {}) {
+  return {
+    schema: 'modly.humanoid-promotion.v1',
+    version: 1,
+    promotionId: 'promotion-1',
+    source: { workspacePath: 'Workflows/sources/source.glb' },
+    output: { workspacePath: 'Workflows/outputs/hero_unirig.glb' },
+    meshOutputSha256: sha256('mesh-bytes-v1'),
+    rigmetaSha256: sha256(JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb' }), null, 2)),
+    draftSha256: 'draft-sha-1',
+    draftSchema: 'modly.humanoid-draft.v1',
+    promotedAssignments: {
+      roles: {
+        hips: 'rig:Body|skeleton:0|bone:Hips#0',
+      },
+      chains: {
+        spine: ['rig:Body|skeleton:0|bone:Hips#0', 'rig:Body|skeleton:0|bone:Hips#0/Spine#0'],
+      },
+    },
+    provenance: {
+      basis: 'modly.humanoid-draft.v1',
+      trustStatus: 'manual_confirmed',
+    },
+    audit: {
+      confirmedBy: 'modly:user:local:drhepa',
+      confirmedByLabel: 'drhepa',
+      createdAt: '2026-05-22T00:05:00.000Z',
+      method: 'viewer3d',
+      rationale: 'Reviewed manually.',
+    },
+    ...overrides,
+  }
+}
+
+function humanoidEmbeddedRigMetaDraftSidecar(options: {
+  meshWorkspacePath?: string
+  sourceWorkspacePath?: string
+  rigMetaWorkspacePath?: string
+  embeddedOutputWorkspacePath?: string
+  embeddedSourceWorkspacePath?: string
+  draftOverrides?: Record<string, unknown>
+  rigMetaOverrides?: Record<string, unknown>
+} = {}) {
+  const meshWorkspacePath = options.meshWorkspacePath ?? 'Workflows/outputs/hero_unirig.glb'
+  const sourceWorkspacePath = options.sourceWorkspacePath ?? 'Workflows/outputs/source.glb'
+  const rigMetaWorkspacePath = options.rigMetaWorkspacePath ?? 'Workflows/outputs/hero_unirig.rigmeta.json'
+  const draft = humanoidDraftSidecar({
+    source: { workspacePath: options.embeddedSourceWorkspacePath ?? path.basename(sourceWorkspacePath) },
+    output: { workspacePath: options.embeddedOutputWorkspacePath ?? path.basename(meshWorkspacePath) },
+    rigmetaSha256: 'will-be-rewritten-by-modly-fallback',
+    draftSha256: 'will-be-rewritten-by-modly-fallback',
+    ...(options.draftOverrides ?? {}),
+  })
+  return rigMetaSidecar({
+    output_mesh: path.basename(meshWorkspacePath),
+    humanoid_contract_status: 'draft',
+    humanoid_draft: draft,
+    source: { workspacePath: sourceWorkspacePath },
+    sidecar_path: rigMetaWorkspacePath,
+    ...(options.rigMetaOverrides ?? {}),
+  })
+}
+
 test('normalizes workspace-relative artifact paths and rejects absolute or traversal input', async () => {
   await withTempWorkspace(async (workspaceDir) => {
     assert.deepEqual(normalizeWorkspaceArtifactPath(workspaceDir, 'renders\\mesh.glb'), {
@@ -418,12 +522,15 @@ test('registers minimal artifact registry IPC handlers for read and write sideca
     assert.deepEqual([...handlers.keys()].sort(), [
       'workspace:artifact:downloadWorkspaceArtifact',
       'workspace:artifact:previewWorkspaceArtifact',
+      'workspace:artifact:readHumanoidDraftSidecar',
+      'workspace:artifact:readHumanoidPromotionSidecar',
       'workspace:artifact:readMotionRetargetSidecar',
       'workspace:artifact:readPoseClipSidecar',
       'workspace:artifact:readRigMetaSidecar',
       'workspace:artifact:readRigRenameSidecar',
       'workspace:artifact:readSidecar',
       'workspace:artifact:writeEditedSceneArtifact',
+      'workspace:artifact:writeHumanoidPromotionSidecar',
       'workspace:artifact:writeLandmarkSidecar',
       'workspace:artifact:writeMotionRetargetSidecar',
       'workspace:artifact:writePoseClipSidecar',
@@ -961,6 +1068,44 @@ test('validates rig rename sidecar v1 schema and source metadata before writing 
   })
 })
 
+test('accepts rig rename sidecars that bind to the current mesh lineage source via adjacent rigmeta', async () => {
+  const writeRigRenameSidecar = getRigRenameSidecarWriter()
+  const readRigRenameSidecar = getRigRenameSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    const outputWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const sidecarWorkspacePath = 'Workflows/rig-edits/hero_unirig-rig-aliases.rig.v1.json'
+    const lineageSourceWorkspacePath = 'Workflows/inputs/hero.glb'
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+    const sidecar = rigRenameSidecar({ source: { workspacePath: lineageSourceWorkspacePath } })
+
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+    await writeFile(path.join(workspaceDir, ...outputWorkspacePath.split('/')), Buffer.from([0x67, 0x6c, 0x62]))
+    await writeFile(
+      path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')),
+      JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb', source: { workspacePath: lineageSourceWorkspacePath } }), null, 2),
+      'utf-8',
+    )
+
+    const writeResult = await writeRigRenameSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: outputWorkspacePath,
+      sidecar,
+    })
+
+    assert.deepEqual(writeResult, { success: true, sidecarWorkspacePath, sidecar })
+
+    const readResult = await readRigRenameSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: outputWorkspacePath,
+    })
+
+    assert.deepEqual(readResult, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
+  })
+})
+
 test('registers rig rename sidecar IPC handler with recoverable result errors', async () => {
   await withTempWorkspace(async (workspaceDir) => {
     const handlers = new Map<string, (_event: unknown, payload: unknown) => Promise<unknown>>()
@@ -1061,6 +1206,41 @@ test('returns invalid for malformed rig rename sidecar JSON, schema, or source m
       assert.equal((result as { status?: unknown }).status, 'invalid', invalidCase.filename)
       assert.match(String((result as { error?: unknown }).error), invalidCase.message)
     }
+  })
+})
+
+test('rejects rig rename sidecars whose source path does not match the current mesh lineage', async () => {
+  const readRigRenameSidecar = getRigRenameSidecarReader()
+
+  await withTempWorkspace(async (workspaceDir) => {
+    const outputWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const sidecarWorkspacePath = 'Workflows/rig-edits/hero_unirig-rig-aliases.rig.v1.json'
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+    const mismatchedSourceWorkspacePath = 'Workflows/inputs/other.glb'
+
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'rig-edits'), { recursive: true })
+    await writeFile(path.join(workspaceDir, ...outputWorkspacePath.split('/')), Buffer.from([0x67, 0x6c, 0x62]))
+    await writeFile(
+      path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')),
+      JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb', source: { workspacePath: 'Workflows/inputs/hero.glb' } }), null, 2),
+      'utf-8',
+    )
+    await writeFile(
+      path.join(workspaceDir, ...sidecarWorkspacePath.split('/')),
+      JSON.stringify(rigRenameSidecar({ source: { workspacePath: mismatchedSourceWorkspacePath } }), null, 2),
+      'utf-8',
+    )
+
+    const result = await readRigRenameSidecar({
+      workspaceDir,
+      sidecarWorkspacePath,
+      sourceWorkspacePath: outputWorkspacePath,
+    })
+
+    assert.equal((result as { success?: unknown }).success, false)
+    assert.equal((result as { status?: unknown }).status, 'invalid')
+    assert.match(String((result as { error?: unknown }).error), /invalid_source_workspacePath/i)
   })
 })
 
@@ -1939,5 +2119,239 @@ test('registers rigmeta sidecar read IPC handler with recoverable result errors'
       },
       warnings: [],
     })
+  })
+})
+
+test('derives canonical humanoid draft and promotion sibling sidecar paths from a mesh workspace path', () => {
+  assert.equal(getHumanoidDraftWorkspacePath('Workflows/outputs/hero_unirig.glb'), 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json')
+  assert.equal(getHumanoidPromotionWorkspacePath('Workflows/outputs/hero_unirig.glb'), 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json')
+  assert.equal(getHumanoidDraftWorkspacePath('Workflows/outputs/hero_unirig.gltf'), 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json')
+  assert.equal(getHumanoidPromotionWorkspacePath('Workflows/outputs/hero_unirig.gltf'), 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json')
+})
+
+test('writes and reads a manual-confirmed humanoid promotion sidecar beside the mesh without mutating source files', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'sources'), { recursive: true })
+
+    const meshWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const meshAbsolutePath = path.join(workspaceDir, ...meshWorkspacePath.split('/'))
+    const draftWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json'
+    const promotionWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json'
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+    const sourceWorkspacePath = 'Workflows/sources/source.glb'
+
+    await writeFile(meshAbsolutePath, 'mesh-bytes-v1', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...sourceWorkspacePath.split('/')), 'source-mesh', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb' }), null, 2), 'utf-8')
+    await writeFile(path.join(workspaceDir, ...draftWorkspacePath.split('/')), JSON.stringify(humanoidDraftSidecar(), null, 2), 'utf-8')
+
+    const promotion = humanoidPromotionSidecar()
+    const writeResult = await writeHumanoidPromotionSidecar({
+      workspaceDir,
+      meshWorkspacePath,
+      sidecar: promotion,
+    })
+
+    assert.deepEqual(writeResult, {
+      success: true,
+      sidecarWorkspacePath: promotionWorkspacePath,
+      sidecar: promotion,
+    })
+
+    const readDraftResult = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.deepEqual(readDraftResult, {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: draftWorkspacePath,
+      sidecar: humanoidDraftSidecar(),
+    })
+
+    const readPromotionResult = await readHumanoidPromotionSidecar({ workspaceDir, meshWorkspacePath })
+    assert.deepEqual(readPromotionResult, {
+      success: true,
+      status: 'found',
+      sidecarWorkspacePath: promotionWorkspacePath,
+      sidecar: promotion,
+    })
+
+    assert.equal(await readFile(meshAbsolutePath, 'utf-8'), 'mesh-bytes-v1')
+    assert.equal(await readFile(path.join(workspaceDir, ...sourceWorkspacePath.split('/')), 'utf-8'), 'source-mesh')
+  })
+})
+
+test('detects stale humanoid draft and promotion sidecars when mesh or bound hashes drift', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+
+    const meshWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const meshAbsolutePath = path.join(workspaceDir, ...meshWorkspacePath.split('/'))
+    const draftWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json'
+    const promotionWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json'
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+
+    await writeFile(meshAbsolutePath, 'mesh-bytes-v1', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb' }), null, 2), 'utf-8')
+    await writeFile(path.join(workspaceDir, ...draftWorkspacePath.split('/')), JSON.stringify(humanoidDraftSidecar(), null, 2), 'utf-8')
+    await writeFile(path.join(workspaceDir, ...promotionWorkspacePath.split('/')), JSON.stringify(humanoidPromotionSidecar(), null, 2), 'utf-8')
+
+    await writeFile(meshAbsolutePath, 'mesh-bytes-v2', 'utf-8')
+
+    const staleDraft = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal((staleDraft as { success?: unknown }).success, true)
+    assert.equal((staleDraft as { status?: unknown }).status, 'stale')
+    assert.match(JSON.stringify(staleDraft), /mesh_output_sha256/i)
+
+    const stalePromotion = await readHumanoidPromotionSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal((stalePromotion as { success?: unknown }).success, true)
+    assert.equal((stalePromotion as { status?: unknown }).status, 'stale')
+    assert.match(JSON.stringify(stalePromotion), /mesh_output_sha256/i)
+  })
+})
+
+test('rejects malformed humanoid draft and promotion payloads plus unsafe mesh paths', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+    const meshWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const promotionWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json'
+    const draftWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json'
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+
+    await writeFile(path.join(workspaceDir, ...meshWorkspacePath.split('/')), 'mesh-bytes-v1', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMetaSidecar({ output_mesh: 'hero_unirig.glb' }), null, 2), 'utf-8')
+    await writeFile(path.join(workspaceDir, ...draftWorkspacePath.split('/')), JSON.stringify(humanoidDraftSidecar({ schema: 'unsupported.schema' }), null, 2), 'utf-8')
+
+    const invalidDraft = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal((invalidDraft as { success?: unknown }).success, false)
+    assert.equal((invalidDraft as { status?: unknown }).status, 'invalid')
+    assert.match(String((invalidDraft as { error?: unknown }).error), /schema|version/i)
+
+    const invalidWrite = await writeHumanoidPromotionSidecar({
+      workspaceDir,
+      meshWorkspacePath,
+      sidecar: humanoidPromotionSidecar({
+        audit: {
+          confirmedBy: 'bad-user-id',
+          createdAt: '2026-05-22T00:05:00.000Z',
+          method: 'viewer3d',
+          rationale: 'Reviewed manually.',
+        },
+      }),
+    })
+    assert.deepEqual(invalidWrite, {
+      success: false,
+      error: 'Invalid humanoid promotion sidecar v1: invalid_audit_confirmed_by',
+    })
+
+    const unsafeWrite = await writeHumanoidPromotionSidecar({
+      workspaceDir,
+      meshWorkspacePath: '../escape.glb',
+      sidecar: humanoidPromotionSidecar(),
+    })
+    assert.equal(unsafeWrite.success, false)
+    assert.match(String(unsafeWrite.error), /traversal|workspace-relative/i)
+    await assert.rejects(stat(path.join(workspaceDir, ...promotionWorkspacePath.split('/'))), /ENOENT/)
+  })
+})
+
+test('falls back to embedded rigmeta humanoid drafts when the adjacent draft sidecar is missing', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+
+    const meshWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const meshAbsolutePath = path.join(workspaceDir, ...meshWorkspacePath.split('/'))
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+    const rigMeta = humanoidEmbeddedRigMetaDraftSidecar({ meshWorkspacePath })
+
+    await writeFile(meshAbsolutePath, 'mesh-bytes-v1', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(rigMeta, null, 2), 'utf-8')
+
+    const result = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal(result.success, true)
+    assert.equal(result.status, 'found')
+    assert.equal(result.sidecarWorkspacePath, 'Workflows/outputs/hero_unirig.humanoid-draft.v1.json')
+    assert.equal(result.sidecar.output.workspacePath, meshWorkspacePath)
+    assert.equal(result.sidecar.source.workspacePath, 'Workflows/outputs/source.glb')
+    assert.equal(result.sidecar.rigmetaSha256, sha256(JSON.stringify(rigMeta, null, 2)))
+    const embeddedDraft = (rigMeta as unknown as { humanoid_draft: { draftSha256: string } }).humanoid_draft
+    assert.notEqual(result.sidecar.draftSha256, embeddedDraft.draftSha256)
+  })
+})
+
+test('writes humanoid promotions from embedded rigmeta fallback drafts and rejects unrelated embedded paths', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'outputs'), { recursive: true })
+
+    const meshWorkspacePath = 'Workflows/outputs/hero_unirig.glb'
+    const meshAbsolutePath = path.join(workspaceDir, ...meshWorkspacePath.split('/'))
+    const rigMetaWorkspacePath = 'Workflows/outputs/hero_unirig.rigmeta.json'
+    const promotionWorkspacePath = 'Workflows/outputs/hero_unirig.humanoid-promotion.v1.json'
+    const validRigMeta = humanoidEmbeddedRigMetaDraftSidecar({ meshWorkspacePath })
+
+    await writeFile(meshAbsolutePath, 'mesh-bytes-v1', 'utf-8')
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(validRigMeta, null, 2), 'utf-8')
+
+    const draftResult = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal(draftResult.success, true)
+    assert.equal(draftResult.status, 'found')
+
+    const promotion = humanoidPromotionSidecar({
+      source: draftResult.sidecar.source,
+      output: draftResult.sidecar.output,
+      meshOutputSha256: draftResult.sidecar.meshOutputSha256,
+      rigmetaSha256: draftResult.sidecar.rigmetaSha256,
+      draftSha256: draftResult.sidecar.draftSha256,
+    })
+    const writeResult = await writeHumanoidPromotionSidecar({
+      workspaceDir,
+      meshWorkspacePath,
+      sidecar: promotion,
+    })
+    assert.deepEqual(writeResult, {
+      success: true,
+      sidecarWorkspacePath: promotionWorkspacePath,
+      sidecar: promotion,
+    })
+
+    const invalidRigMeta = humanoidEmbeddedRigMetaDraftSidecar({
+      meshWorkspacePath,
+      embeddedSourceWorkspacePath: 'Workflows/unrelated/source.glb',
+    })
+    await writeFile(path.join(workspaceDir, ...rigMetaWorkspacePath.split('/')), JSON.stringify(invalidRigMeta, null, 2), 'utf-8')
+
+    const invalidDraft = await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath })
+    assert.equal(invalidDraft.success, false)
+    assert.equal(invalidDraft.status, 'invalid')
+    assert.match(String(invalidDraft.error), /source|lineage|related|directory/i)
+  })
+})
+
+test('registers humanoid draft and promotion IPC handlers with recoverable result envelopes', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    const handlers = new Map<string, (_event: unknown, payload: unknown) => Promise<unknown>>()
+    registerArtifactRegistryIpcHandlers({
+      getWorkspaceDir: () => workspaceDir,
+      ipcMain: {
+        handle(channel, handler) {
+          handlers.set(channel, handler)
+        },
+      },
+    })
+
+    const writeHandler = handlers.get('workspace:artifact:writeHumanoidPromotionSidecar')
+    const readDraftHandler = handlers.get('workspace:artifact:readHumanoidDraftSidecar')
+    const readPromotionHandler = handlers.get('workspace:artifact:readHumanoidPromotionSidecar')
+    assert.ok(writeHandler)
+    assert.ok(readDraftHandler)
+    assert.ok(readPromotionHandler)
+
+    const invalidWrite = await writeHandler(undefined, { meshWorkspacePath: 'Workflows/outputs/hero_unirig.glb' })
+    assert.deepEqual(invalidWrite, { success: false, error: 'Humanoid promotion sidecar write requires meshWorkspacePath and sidecar' })
+
+    const invalidReadDraft = await readDraftHandler(undefined, { meshWorkspacePath: 123 })
+    assert.deepEqual(invalidReadDraft, { success: false, status: 'invalid', error: 'Humanoid draft sidecar read requires meshWorkspacePath' })
+
+    const invalidReadPromotion = await readPromotionHandler(undefined, { meshWorkspacePath: 123 })
+    assert.deepEqual(invalidReadPromotion, { success: false, status: 'invalid', error: 'Humanoid promotion sidecar read requires meshWorkspacePath' })
   })
 })

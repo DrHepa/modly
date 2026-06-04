@@ -441,6 +441,150 @@ export interface MotionRetargetSidecarReadRequest {
   sourceWorkspacePath: string
 }
 
+export interface HumanoidSidecarArtifactRef {
+  workspacePath: string
+}
+
+export interface HumanoidDraftSidecarV1 {
+  schema: 'modly.humanoid-draft.v1'
+  version: 1
+  source: HumanoidSidecarArtifactRef
+  output: HumanoidSidecarArtifactRef
+  meshOutputSha256: string
+  rigmetaSha256: string
+  draftSha256: string
+  trust: {
+    status: 'draft'
+    reasons: string[]
+    trusted?: false
+  }
+  provenance: {
+    producer: string
+    runId?: string
+    extensionId?: string
+    createdAt: string
+  }
+  assignments: {
+    roles: Record<string, unknown>
+    chains: Record<string, unknown>
+  }
+  confidence: {
+    byRole?: Record<string, unknown>
+    overall: number
+  }
+  completeness: {
+    requiredRolesMissing: string[]
+    score: number
+  }
+  diagnostics: string[]
+}
+
+export type HumanoidPromotionMethod = 'viewer3d' | 'workflow-wait' | 'add-to-scene' | 'import'
+
+export interface HumanoidPromotionSidecarV1 {
+  schema: 'modly.humanoid-promotion.v1'
+  version: 1
+  promotionId: string
+  supersedesPromotionId?: string
+  source: HumanoidSidecarArtifactRef
+  output: HumanoidSidecarArtifactRef
+  meshOutputSha256: string
+  rigmetaSha256: string
+  draftSha256: string
+  draftSchema: 'modly.humanoid-draft.v1'
+  promotedAssignments: {
+    roles: Record<string, unknown>
+    chains: Record<string, unknown>
+  }
+  provenance: {
+    basis: 'modly.humanoid-draft.v1'
+    trustStatus: 'manual_confirmed'
+  }
+  audit: {
+    confirmedBy: string
+    confirmedByLabel?: string
+    createdAt: string
+    method: HumanoidPromotionMethod
+    rationale: string
+  }
+}
+
+export interface HumanoidDraftSidecarReadRequest {
+  meshWorkspacePath: string
+}
+
+export interface HumanoidPromotionSidecarWriteRequest {
+  meshWorkspacePath: string
+  sidecar: HumanoidPromotionSidecarV1
+}
+
+export interface HumanoidPromotionSidecarReadRequest {
+  meshWorkspacePath: string
+}
+
+export type HumanoidDraftSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      sidecarWorkspacePath: string
+      sidecar: HumanoidDraftSidecarV1
+    }
+  | {
+      success: true
+      status: 'not-found'
+      sidecarWorkspacePath: string
+    }
+  | {
+      success: true
+      status: 'stale'
+      sidecarWorkspacePath: string
+      sidecar: HumanoidDraftSidecarV1
+      staleReasons: string[]
+    }
+  | {
+      success: false
+      status: 'invalid' | 'error'
+      sidecarWorkspacePath?: string
+      error: string
+    }
+
+export type HumanoidPromotionSidecarWriteResult =
+  | {
+      success: true
+      sidecarWorkspacePath: string
+      sidecar: HumanoidPromotionSidecarV1
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type HumanoidPromotionSidecarReadResult =
+  | {
+      success: true
+      status: 'found'
+      sidecarWorkspacePath: string
+      sidecar: HumanoidPromotionSidecarV1
+    }
+  | {
+      success: true
+      status: 'not-found'
+      sidecarWorkspacePath: string
+    }
+  | {
+      success: true
+      status: 'stale'
+      sidecarWorkspacePath: string
+      sidecar: HumanoidPromotionSidecarV1
+      staleReasons: string[]
+    }
+  | {
+      success: false
+      status: 'invalid' | 'error'
+      sidecarWorkspacePath?: string
+      error: string
+    }
+
 export interface WorkspaceArtifactPreviewRequest {
   workspacePath: string
 }
@@ -911,6 +1055,9 @@ declare global {
           readSidecar: (request: ArtifactRegistryReadRequest) => Promise<ArtifactRegistryReadResult>
           writeEditedSceneArtifact: (request: EditedSceneArtifactWriteRequest) => Promise<EditedSceneArtifactWriteResult>
           writeLandmarkSidecar: (request: LandmarkSidecarWriteRequest) => Promise<LandmarkSidecarWriteResult>
+          readHumanoidDraftSidecar: (request: HumanoidDraftSidecarReadRequest) => Promise<HumanoidDraftSidecarReadResult>
+          writeHumanoidPromotionSidecar: (request: HumanoidPromotionSidecarWriteRequest) => Promise<HumanoidPromotionSidecarWriteResult>
+          readHumanoidPromotionSidecar: (request: HumanoidPromotionSidecarReadRequest) => Promise<HumanoidPromotionSidecarReadResult>
           writeMotionRetargetSidecar: (request: MotionRetargetSidecarWriteRequest) => Promise<MotionRetargetSidecarWriteResult>
           readMotionRetargetSidecar: (request: MotionRetargetSidecarReadRequest) => Promise<MotionRetargetSidecarReadResult>
           previewWorkspaceArtifact: (request: WorkspaceArtifactPreviewRequest) => Promise<WorkspaceArtifactPreviewResult>

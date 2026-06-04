@@ -380,6 +380,51 @@ const rigSummary = Object.freeze({
   ],
 })
 
+const humanoidDraftSidecar = Object.freeze({
+  schema: 'modly.humanoid-draft.v1',
+  version: 1,
+  source: { workspacePath: 'Characters/hero-source.glb' },
+  output: { workspacePath: 'Workflows/generated/hero.glb' },
+  meshOutputSha256: 'mesh-sha-123',
+  rigmetaSha256: 'rigmeta-sha-123',
+  draftSha256: 'draft-sha-123',
+  trust: { status: 'draft', reasons: ['confidence_below_threshold'], trusted: false },
+  provenance: { producer: 'unirig', runId: 'run-123', extensionId: 'unirig-ext', createdAt: '2026-05-22T19:00:00.000Z' },
+  assignments: {
+    roles: {
+      hips: { boneId: 'rig:hero|skeleton:0|bone:hips#0', label: 'Hips', confidence: 0.98 },
+      spine: { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Spine', confidence: 0.84 },
+    },
+    chains: {
+      spine: ['rig:hero|skeleton:0|bone:hips#0', 'rig:hero|skeleton:0|bone:hips#0/spine#0'],
+    },
+  },
+  confidence: { overall: 0.76, byRole: { hips: 0.98, spine: 0.84 } },
+  completeness: { requiredRolesMissing: ['head'], score: 0.67 },
+  diagnostics: ['Head role is still unresolved.'],
+})
+
+const humanoidPromotionSidecar = Object.freeze({
+  schema: 'modly.humanoid-promotion.v1',
+  version: 1,
+  promotionId: 'promotion-123',
+  source: { workspacePath: 'Characters/hero-source.glb' },
+  output: { workspacePath: 'Workflows/generated/hero.glb' },
+  meshOutputSha256: 'mesh-sha-123',
+  rigmetaSha256: 'rigmeta-sha-123',
+  draftSha256: 'draft-sha-123',
+  draftSchema: 'modly.humanoid-draft.v1',
+  promotedAssignments: structuredClone(humanoidDraftSidecar.assignments),
+  provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+  audit: {
+    confirmedBy: 'modly:user:local:drhepa',
+    confirmedByLabel: 'drhepa',
+    createdAt: '2026-05-22T20:00:00.000Z',
+    method: 'import',
+    rationale: 'Reviewed hips and spine against the rig overlay.',
+  },
+})
+
 const secondRigSummary = Object.freeze({
   hasRig: true,
   sourceWorkspacePath: 'Workflows/outputs/creature.glb',
@@ -399,6 +444,134 @@ const secondRigSummary = Object.freeze({
       warnings: [],
     },
   ],
+})
+
+const contextualRigBoneIds = Object.freeze({
+  hips: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0',
+  spine: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0',
+  unmapped: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0',
+  chest: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0',
+  neck: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0',
+  head: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0|bone:bone_0#0/bone_1#0/bone_2#0/bone_3#0/bone_4#0/bone_5#0',
+})
+
+const rawBoneRigSummary = Object.freeze({
+  hasRig: true,
+  sourceWorkspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb',
+  skeletonContextId: 'rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0',
+  skinnedMeshContexts: ['rig:Workflows/1779522315_382fd9a5_unirig.glb|skeleton:0'],
+  rootBoneIds: [contextualRigBoneIds.hips],
+  stats: { skinnedMeshCount: 1, boneCount: 6 },
+  warnings: [],
+  bones: [
+    {
+      boneId: contextualRigBoneIds.hips,
+      label: 'bone_0',
+      originalName: 'bone_0',
+      path: ['bone_0'],
+      siblingIndex: 0,
+      childIds: [contextualRigBoneIds.spine],
+      warnings: [],
+    },
+    {
+      boneId: contextualRigBoneIds.spine,
+      label: 'bone_1',
+      originalName: 'bone_1',
+      path: ['bone_0', 'bone_1'],
+      siblingIndex: 0,
+      parentId: contextualRigBoneIds.hips,
+      childIds: [contextualRigBoneIds.unmapped],
+      warnings: [],
+    },
+    {
+      boneId: contextualRigBoneIds.unmapped,
+      label: 'bone_2',
+      originalName: 'bone_2',
+      path: ['bone_0', 'bone_1', 'bone_2'],
+      siblingIndex: 0,
+      parentId: contextualRigBoneIds.spine,
+      childIds: [contextualRigBoneIds.chest],
+      warnings: [],
+    },
+    {
+      boneId: contextualRigBoneIds.chest,
+      label: 'bone_3',
+      originalName: 'bone_3',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3'],
+      siblingIndex: 0,
+      parentId: contextualRigBoneIds.unmapped,
+      childIds: [contextualRigBoneIds.neck],
+      warnings: [],
+    },
+    {
+      boneId: contextualRigBoneIds.neck,
+      label: 'bone_4',
+      originalName: 'bone_4',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4'],
+      siblingIndex: 0,
+      parentId: contextualRigBoneIds.chest,
+      childIds: [contextualRigBoneIds.head],
+      warnings: [],
+    },
+    {
+      boneId: contextualRigBoneIds.head,
+      label: 'bone_5',
+      originalName: 'bone_5',
+      path: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4', 'bone_5'],
+      siblingIndex: 0,
+      parentId: contextualRigBoneIds.neck,
+      childIds: [],
+      warnings: [],
+    },
+  ],
+})
+
+const rawBoneHumanoidDraftSidecar = Object.freeze({
+  schema: 'modly.humanoid-draft.v1',
+  version: 1,
+  source: { workspacePath: 'Characters/raw-source.glb' },
+  output: { workspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb' },
+  meshOutputSha256: 'mesh-raw-123',
+  rigmetaSha256: 'rigmeta-raw-123',
+  draftSha256: 'draft-raw-123',
+  trust: { status: 'draft', reasons: ['manual_review_required'], trusted: false },
+  provenance: { producer: 'unirig', runId: 'run-raw', extensionId: 'unirig-ext', createdAt: '2026-05-23T10:00:00.000Z' },
+  assignments: {
+    roles: {
+      hips: 'bone_0',
+      spine: 'bone_1',
+      chest: 'bone_3',
+      neck: 'bone_4',
+      head: 'bone_5',
+    },
+    chains: {
+      spine: ['bone_0', 'bone_1', 'bone_2', 'bone_3', 'bone_4', 'bone_5'],
+    },
+  },
+  confidence: { overall: 0.79, byRole: { hips: 0.97, spine: 0.91, chest: 0.88, neck: 0.86, head: 0.86 } },
+  completeness: { requiredRolesMissing: [], score: 1 },
+  diagnostics: [],
+})
+
+const rawBoneHumanoidPromotionSidecar = Object.freeze({
+  schema: 'modly.humanoid-promotion.v1',
+  version: 1,
+  promotionId: 'promotion-raw-123',
+  source: { workspacePath: 'Characters/raw-source.glb' },
+  output: { workspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb' },
+  meshOutputSha256: 'mesh-raw-123',
+  rigmetaSha256: 'rigmeta-raw-123',
+  draftSha256: 'draft-raw-123',
+  draftSchema: 'modly.humanoid-draft.v1',
+  promotedAssignments: structuredClone(rawBoneHumanoidDraftSidecar.assignments),
+  provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+  audit: {
+    confirmedBy: 'modly:user:local:drhepa',
+    confirmedByLabel: 'drhepa',
+    createdAt: '2026-05-23T10:30:00.000Z',
+    method: 'viewer3d',
+    rationale: 'Reviewed raw bone naming inside Rig Editor.',
+  },
 })
 
 const kimodoDisplayedWorkspacePath = 'Workflows/kimodo-20260523-140139-ca71024b/animated.glb'
@@ -482,6 +655,18 @@ const kimodoDisplayedRigSummary = Object.freeze({
   rootBoneIds: [kimodoDisplayedRigBoneIds.hips],
   stats: { skinnedMeshCount: 1, boneCount: 6 },
   warnings: [],
+})
+
+const kimodoSourceHumanoidDraftSidecar = Object.freeze({
+  ...structuredClone(rawBoneHumanoidDraftSidecar),
+  source: { workspacePath: 'Characters/kimodo-source.glb' },
+  output: { workspacePath: kimodoSemanticSourceWorkspacePath },
+})
+
+const kimodoSourceHumanoidPromotionSidecar = Object.freeze({
+  ...structuredClone(rawBoneHumanoidPromotionSidecar),
+  source: { workspacePath: 'Characters/kimodo-source.glb' },
+  output: { workspacePath: kimodoSemanticSourceWorkspacePath },
 })
 
 const motionRetargetSession = Object.freeze({
@@ -4428,6 +4613,779 @@ test('Viewer3D Motion Retarget seams stay renderer-local, Electron-guarded, and 
     assert.doesNotMatch(motionRetargetSlice, /writeFile|rename\(|rm\(|mkdir\(|GLTFExporter|exportGLB|saveEditedScenePendingReplacement/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /processRun|createFromImage|\/generate|FastAPI|interactive mapping|pose editing|target="_blank"|download=/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /ipcRenderer\.invoke\(/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D resolves Kimodo semantic hydration source safely and fails closed for unsafe metadata', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DSemanticHydrationSource({
+        displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+        descriptor: {
+          artifact: { id: 'kimodo-display', kind: 'mesh', uri: `/workspace/${kimodoDisplayedWorkspacePath}`, versionId: 'v1' },
+          artifactWorkspacePath: kimodoDisplayedWorkspacePath,
+          bundleWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b',
+          metadataWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+          metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+          detectionMode: 'sibling-metadata',
+        },
+        metadata: {
+          source_workspace_path: kimodoSemanticSourceWorkspacePath,
+          source_rigged_mesh: '/home/drhepa/Documentos/Modly/workspace/Workflows/1779535081_02857c58_unirig.glb',
+        },
+      }),
+      {
+        displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+        semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+        sourceKind: 'kimodo-source',
+        warnings: [],
+        failedClosed: false,
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DSemanticHydrationSource({
+        displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+        descriptor: {
+          artifact: { id: 'kimodo-display', kind: 'mesh', uri: `/workspace/${kimodoDisplayedWorkspacePath}`, versionId: 'v1' },
+          artifactWorkspacePath: kimodoDisplayedWorkspacePath,
+          bundleWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b',
+          metadataWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+          metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+          detectionMode: 'sibling-metadata',
+        },
+        metadata: {
+          source_rigged_mesh: '/home/drhepa/Documentos/Modly/workspace/Workflows/1779535081_02857c58_unirig.glb',
+        },
+      }),
+      {
+        displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+        semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+        sourceKind: 'kimodo-source',
+        warnings: [],
+        failedClosed: false,
+      },
+    )
+
+    const unsafe = module.resolveViewer3DSemanticHydrationSource({
+      displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+      descriptor: {
+        artifact: { id: 'kimodo-display', kind: 'mesh', uri: `/workspace/${kimodoDisplayedWorkspacePath}`, versionId: 'v1' },
+        artifactWorkspacePath: kimodoDisplayedWorkspacePath,
+        bundleWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b',
+        metadataWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+        detectionMode: 'sibling-metadata',
+      },
+      metadata: {
+        source_workspace_path: '../outside.glb',
+        source_rigged_mesh: '/home/drhepa/outside/animated.glb',
+      },
+    })
+
+    assert.equal(unsafe.displayedMeshWorkspacePath, kimodoDisplayedWorkspacePath)
+    assert.equal(unsafe.semanticSourceWorkspacePath, kimodoDisplayedWorkspacePath)
+    assert.equal(unsafe.sourceKind, 'displayed-mesh')
+    assert.equal(unsafe.failedClosed, true)
+    assert.match(unsafe.warnings[0], /semantic source/i)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D routes Kimodo semantic naming hydration to the source mesh while alias and runtime sidecars stay anchored to the displayed mesh', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const semanticSource = module.resolveViewer3DSemanticHydrationSource({
+      displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+      descriptor: {
+        artifact: { id: 'kimodo-display', kind: 'mesh', uri: `/workspace/${kimodoDisplayedWorkspacePath}`, versionId: 'v1' },
+        artifactWorkspacePath: kimodoDisplayedWorkspacePath,
+        bundleWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b',
+        metadataWorkspacePath: 'Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+        metadataUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/metadata.json',
+        detectionMode: 'sibling-metadata',
+      },
+      metadata: { source_workspace_path: kimodoSemanticSourceWorkspacePath },
+    })
+
+    assert.deepEqual(module.resolveViewer3DRigMetaHydrationRequest(kimodoDisplayedRigSummary, semanticSource), {
+      sourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+    })
+    assert.deepEqual(module.resolveViewer3DHumanoidHydrationRequest(kimodoDisplayedRigSummary, semanticSource), {
+      displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+      sourceKind: 'kimodo-source',
+      draft: { meshWorkspacePath: kimodoSemanticSourceWorkspacePath },
+      promotion: { meshWorkspacePath: kimodoSemanticSourceWorkspacePath },
+    })
+    assert.equal(module.resolveViewer3DRigHydrationRequest(kimodoDisplayedRigSummary, semanticSource), null)
+    assert.deepEqual(module.resolveViewer3DPoseClipHydrationRequest(kimodoDisplayedRigSummary), {
+      sidecarWorkspacePath: 'Workflows/pose-clips/animated--src-d517426fb6123459.pose-clip.v1.json',
+      legacySidecarWorkspacePath: 'Workflows/pose-clips/animated.pose-clip.v1.json',
+      sourceWorkspacePath: kimodoDisplayedWorkspacePath,
+    })
+    assert.deepEqual(module.resolveViewer3DMotionRetargetHydrationRequest(kimodoDisplayedRigSummary), {
+      sidecarWorkspacePath: 'Workflows/motion-retarget/animated.motion-retarget.v1.json',
+      sourceWorkspacePath: kimodoDisplayedWorkspacePath,
+    })
+    assert.deepEqual(module.createViewer3DRigMetaHydrationToken({
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/animated.glb',
+      summary: kimodoDisplayedRigSummary,
+      semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+    }), {
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/animated.glb',
+      sourceWorkspacePath: kimodoDisplayedWorkspacePath,
+      semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+      skeletonContextId: 'rig:Workflows/kimodo-20260523-140139-ca71024b/animated.glb|skeleton:0',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D inherits Kimodo semantic source labels onto displayed runtime bones without enabling Kimodo promotion writes', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DRigEditorState(kimodoDisplayedRigSummary)
+    const token = module.createViewer3DRigMetaHydrationToken({
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-20260523-140139-ca71024b/animated.glb',
+      summary: kimodoDisplayedRigSummary,
+      semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+    })
+
+    const hydrated = module.applyViewer3DRigMetaHydrationResult({
+      state,
+      result: {
+        success: true,
+        status: 'found',
+        rigMetaWorkspacePath: 'Workflows/1779535081_02857c58_unirig.rigmeta.json',
+        warnings: [],
+        namingByBoneId: {},
+        rigMeta: {
+          schema: 'modly.unirig.rigmeta',
+          source: { workspacePath: kimodoSemanticSourceWorkspacePath },
+          humanoid_draft: {
+            schema: 'modly.humanoid-draft.v1',
+            assignments: {
+              roles: {
+                hips: 'bone_0',
+                spine: 'bone_1',
+              },
+            },
+          },
+        },
+      },
+      token,
+      currentToken: token,
+    })
+
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: kimodoDisplayedRigSummary,
+      rigMetaNamingByBoneId: hydrated.state.rigMetaNamingByBoneId,
+      draftResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/1779535081_02857c58_unirig.humanoid-draft.v1.json',
+        sidecar: kimodoSourceHumanoidDraftSidecar,
+      },
+      promotionResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/1779535081_02857c58_unirig.humanoid-promotion.v1.json',
+        sidecar: kimodoSourceHumanoidPromotionSidecar,
+      },
+    })
+
+    const panelProps = module.resolveViewer3DRigEditorPanelProps(state, {}, undefined, { rigMetaNamingByBoneId: displayNaming })
+    const poseProps = module.resolveViewer3DPoseClipPanelProps(module.createViewer3DPoseClipState(kimodoDisplayedRigSummary), {}, panelProps.effectiveNaming)
+    const overlayProps = module.resolveViewer3DRigOverlayProps({
+      ...state,
+      selectedBoneId: kimodoDisplayedRigBoneIds.spine,
+      rigMetaNamingByBoneId: displayNaming,
+    }, {}, module.reduceViewer3DRigEditorVisibilityState(module.createViewer3DRigEditorVisibilityState(kimodoDisplayedRigSummary), { type: 'toggle', summary: kimodoDisplayedRigSummary }), panelProps.effectiveNaming)
+    const inheritedPresentation = module.resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+      presentation: module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: {
+          success: true,
+          status: 'found',
+          sidecarWorkspacePath: 'Workflows/1779535081_02857c58_unirig.humanoid-draft.v1.json',
+          sidecar: kimodoSourceHumanoidDraftSidecar,
+        },
+        promotionResult: {
+          success: true,
+          status: 'found',
+          sidecarWorkspacePath: 'Workflows/1779535081_02857c58_unirig.humanoid-promotion.v1.json',
+          sidecar: kimodoSourceHumanoidPromotionSidecar,
+        },
+      }),
+      semanticHydrationSource: {
+        displayedMeshWorkspacePath: kimodoDisplayedWorkspacePath,
+        semanticSourceWorkspacePath: kimodoSemanticSourceWorkspacePath,
+        sourceKind: 'kimodo-source',
+        warnings: [],
+        failedClosed: false,
+      },
+    })
+
+    assert.equal(hydrated.warning, null)
+    assert.equal(panelProps.effectiveNaming.byBoneId[kimodoDisplayedRigBoneIds.hips].label, 'Hips')
+    assert.equal(panelProps.effectiveNaming.byBoneId[kimodoDisplayedRigBoneIds.spine].label, 'Spine')
+    assert.equal(panelProps.effectiveNaming.byBoneId[kimodoDisplayedRigBoneIds.chest].label, 'Chest')
+    assert.equal(panelProps.effectiveNaming.byBoneId[kimodoDisplayedRigBoneIds.unmapped].label, 'bone_2')
+    assert.equal(poseProps.rigDisplayNames.byBoneId[kimodoDisplayedRigBoneIds.spine].label, 'Spine')
+    assert.equal(overlayProps.overlay?.selectedLabel, 'Spine')
+    assert.equal(inheritedPresentation.canPromote, false)
+    assert.equal(inheritedPresentation.state, 'promoted')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D rigmeta hydration surfaces humanoid draft naming as UniRig display labels without trusting the contract', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    const token = module.createViewer3DRigMetaHydrationToken({ modelUrl: '1779522315_382fd9a5_unirig.glb', summary: rawBoneRigSummary })
+
+    const hydrated = module.applyViewer3DRigMetaHydrationResult({
+      state,
+      result: {
+        success: true,
+        status: 'found',
+        rigMetaWorkspacePath: 'Workflows/1779522315_382fd9a5_unirig.rigmeta.json',
+        warnings: [],
+        namingByBoneId: {},
+        rigMeta: {
+          schema: 'modly.unirig.rigmeta',
+          source: { workspacePath: 'Workflows/1779522315_382fd9a5_unirig.glb' },
+          humanoid_contract_status: 'draft',
+          humanoid_draft: {
+            schema: 'modly.humanoid-draft.v1',
+            assignments: {
+              roles: {
+                hips: 'bone_0',
+                spine: 'bone_1',
+              },
+            },
+          },
+        },
+      },
+      token,
+      currentToken: token,
+    })
+
+    assert.deepEqual(hydrated.state.rigMetaNamingByBoneId, {
+      [contextualRigBoneIds.hips]: { label: 'Hips', source: 'humanoid_draft' },
+      [contextualRigBoneIds.spine]: { label: 'Spine', source: 'humanoid_draft' },
+    })
+    assert.deepEqual(module.resolveViewer3DRigEditorPanelProps(hydrated.state, {}).effectiveNaming.ordered, [
+      { boneId: contextualRigBoneIds.hips, label: 'Hips', rawLabel: 'bone_0', provenance: 'unirig' },
+      { boneId: contextualRigBoneIds.spine, label: 'Spine', rawLabel: 'bone_1', provenance: 'unirig' },
+      { boneId: contextualRigBoneIds.unmapped, label: 'bone_2', rawLabel: 'bone_2', provenance: 'raw' },
+      { boneId: contextualRigBoneIds.chest, label: 'bone_3', rawLabel: 'bone_3', provenance: 'raw' },
+      { boneId: contextualRigBoneIds.neck, label: 'bone_4', rawLabel: 'bone_4', provenance: 'raw' },
+      { boneId: contextualRigBoneIds.head, label: 'bone_5', rawLabel: 'bone_5', provenance: 'raw' },
+    ])
+    assert.equal(module.resolveViewer3DHumanoidReviewPresentation({
+      rigMetaNamingByBoneId: hydrated.state.rigMetaNamingByBoneId,
+      draftResult: undefined,
+      promotionResult: undefined,
+    }).status === 'trusted', false)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D derives Rig Editor effective naming from humanoid draft assignments even when runtime RigBoneId values are contextual', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: rawBoneRigSummary,
+      rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
+      draftResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+        sidecar: rawBoneHumanoidDraftSidecar,
+      },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json' },
+    })
+
+    const panelProps = module.resolveViewer3DRigEditorPanelProps(state, {}, undefined, { rigMetaNamingByBoneId: displayNaming })
+
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.hips].label, 'Hips')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.hips].provenance, 'unirig')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.spine].label, 'Spine')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.chest].label, 'Chest')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.neck].label, 'Neck')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.head].label, 'Head')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.unmapped].label, 'bone_2')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D prefers promotion role mappings for all mapped contextual runtime bones even when draft data is absent', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: rawBoneRigSummary,
+      rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
+      draftResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json' },
+      promotionResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json', sidecar: rawBoneHumanoidPromotionSidecar },
+    })
+
+    const panelProps = module.resolveViewer3DRigEditorPanelProps(state, {}, undefined, { rigMetaNamingByBoneId: displayNaming })
+
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.hips].label, 'Hips')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.spine].label, 'Spine')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.chest].label, 'Chest')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.neck].label, 'Neck')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.head].label, 'Head')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D keeps manual aliases above humanoid draft display naming', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let state = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    state = module.reduceViewer3DRigEditorState(state, { type: 'set-alias', boneId: contextualRigBoneIds.spine, alias: 'Manual Spine Control' })
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: rawBoneRigSummary,
+      rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
+      draftResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+        sidecar: rawBoneHumanoidDraftSidecar,
+      },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json' },
+    })
+
+    const panelProps = module.resolveViewer3DRigEditorPanelProps(state, {}, undefined, { rigMetaNamingByBoneId: displayNaming })
+
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.spine].label, 'Manual Spine Control')
+    assert.equal(panelProps.effectiveNaming.byBoneId[contextualRigBoneIds.spine].provenance, 'manual')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D Pose/Clip props receive the same semantic draft labels as Rig Editor effective naming', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const rigState = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: rawBoneRigSummary,
+      rigMetaNamingByBoneId: rigState.rigMetaNamingByBoneId,
+      draftResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+        sidecar: rawBoneHumanoidDraftSidecar,
+      },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json' },
+    })
+    let poseState = module.createViewer3DPoseClipState(rawBoneRigSummary)
+    poseState = module.reduceViewer3DPoseClipState(poseState, { type: 'select-bone', summary: rawBoneRigSummary, boneId: contextualRigBoneIds.spine })
+
+    const effectiveNaming = module.resolveViewer3DRigEditorPanelProps(rigState, {}, undefined, { rigMetaNamingByBoneId: displayNaming }).effectiveNaming
+    const panelProps = module.resolveViewer3DPoseClipPanelProps(poseState, {}, effectiveNaming)
+
+    assert.equal(panelProps.rigDisplayNames.byBoneId[contextualRigBoneIds.hips].label, 'Hips')
+    assert.equal(panelProps.rigDisplayNames.byBoneId[contextualRigBoneIds.spine].label, 'Spine')
+    assert.equal(panelProps.rigDisplayNames.byBoneId[contextualRigBoneIds.spine].provenance, 'unirig')
+    assert.equal(panelProps.rigDisplayNames.byBoneId[contextualRigBoneIds.chest].label, 'Chest')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D selected-target overlay uses the same raw-bone semantic draft labels as Rig Editor and Pose/Clip', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    let rigState = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    rigState = module.reduceViewer3DRigEditorState(rigState, { type: 'select-bone', boneId: contextualRigBoneIds.hips })
+    const displayNaming = module.resolveViewer3DEffectiveRigMetaNaming({
+      summary: rawBoneRigSummary,
+      rigMetaNamingByBoneId: rigState.rigMetaNamingByBoneId,
+      draftResult: {
+        success: true,
+        status: 'found',
+        sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+        sidecar: rawBoneHumanoidDraftSidecar,
+      },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json' },
+    })
+    const effectiveNaming = module.resolveViewer3DRigEditorPanelProps(rigState, {}, undefined, { rigMetaNamingByBoneId: displayNaming }).effectiveNaming
+    const visibility = module.reduceViewer3DRigEditorVisibilityState(
+      module.createViewer3DRigEditorVisibilityState(rawBoneRigSummary),
+      { type: 'toggle', summary: rawBoneRigSummary },
+    )
+
+    const overlayProps = module.resolveViewer3DRigOverlayProps(rigState, {}, visibility, effectiveNaming)
+
+    assert.equal(overlayProps.overlay.selectedBoneId, contextualRigBoneIds.hips)
+    assert.equal(overlayProps.overlay.selectedLabel, 'Hips')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D resolves humanoid review presentation for draft, promoted, stale, trusted, and diagnostics-only states', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json', sidecar: humanoidDraftSidecar },
+        promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json' },
+      }),
+      {
+        state: 'draft',
+        headline: 'Draft humanoid proposal available for manual review.',
+        canPromote: true,
+        diagnostics: ['Head role is still unresolved.'],
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json', sidecar: humanoidDraftSidecar },
+        promotionResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json', sidecar: humanoidPromotionSidecar },
+      }),
+      {
+        state: 'promoted',
+        headline: 'Manual promotion is active for this mesh.',
+        canPromote: true,
+        diagnostics: ['Head role is still unresolved.'],
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: {
+          success: true,
+          status: 'stale',
+          sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json',
+          sidecar: humanoidDraftSidecar,
+          staleReasons: ['mesh_output_sha256_mismatch'],
+        },
+        promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json' },
+      }),
+      {
+        state: 'stale',
+        headline: 'Humanoid draft or promotion is stale and blocked.',
+        canPromote: false,
+        diagnostics: ['Head role is still unresolved.', 'mesh_output_sha256_mismatch'],
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: true,
+        draftResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json' },
+        promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json' },
+      }),
+      {
+        state: 'trusted',
+        headline: 'Trusted UniRig humanoid contract is already present.',
+        canPromote: false,
+        diagnostics: [],
+      },
+    )
+
+    assert.deepEqual(
+      module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json' },
+        promotionResult: { success: false, status: 'invalid', error: 'Invalid humanoid promotion sidecar v1: invalid_output_workspace_path' },
+      }),
+      {
+        state: 'diagnostics-only',
+        headline: 'No promotable humanoid draft is available for this mesh.',
+        canPromote: false,
+        diagnostics: ['Invalid humanoid promotion sidecar v1: invalid_output_workspace_path'],
+      },
+    )
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D promotion gating requires a valid draft, explicit confirmation, rationale, and an available writer', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const draftPresentation = module.resolveViewer3DHumanoidReviewPresentation({
+      trustedContractPresent: false,
+      draftResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json', sidecar: humanoidDraftSidecar },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json' },
+    })
+
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionGate({
+      presentation: draftPresentation,
+      rationale: '',
+      confirmationChecked: false,
+      writerAvailable: true,
+    }), {
+      allowed: false,
+      reason: 'Explicit confirmation is required before manual promotion.',
+    })
+
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionGate({
+      presentation: draftPresentation,
+      rationale: '',
+      confirmationChecked: true,
+      writerAvailable: true,
+    }), {
+      allowed: false,
+      reason: 'Promotion rationale is required for auditability.',
+    })
+
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionGate({
+      presentation: draftPresentation,
+      rationale: 'Reviewed in Viewer3D.',
+      confirmationChecked: true,
+      writerAvailable: false,
+    }), {
+      allowed: false,
+      reason: 'Workspace humanoid promotion writer is unavailable.',
+    })
+
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionGate({
+      presentation: draftPresentation,
+      rationale: 'Reviewed in Viewer3D.',
+      confirmationChecked: true,
+      writerAvailable: true,
+    }), {
+      allowed: true,
+    })
+
+    const stalePresentation = module.resolveViewer3DHumanoidReviewPresentation({
+      trustedContractPresent: false,
+      draftResult: {
+        success: true,
+        status: 'stale',
+        sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-draft.v1.json',
+        sidecar: humanoidDraftSidecar,
+        staleReasons: ['draft_sha256_mismatch'],
+      },
+      promotionResult: { success: true, status: 'not-found', sidecarWorkspacePath: 'Workflows/generated/hero.humanoid-promotion.v1.json' },
+    })
+
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionGate({
+      presentation: stalePresentation,
+      rationale: 'Reviewed in Viewer3D.',
+      confirmationChecked: true,
+      writerAvailable: true,
+    }), {
+      allowed: false,
+      reason: 'Promotion is blocked until the stale humanoid artifacts are regenerated.',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D humanoid proposal helpers only edit proposed assignments and never mutate the source draft or rig summary', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const sourceDraft = structuredClone(humanoidDraftSidecar)
+    const sourceSummary = structuredClone(rigSummary)
+    const initialAssignments = module.createViewer3DHumanoidProposedAssignments(sourceDraft)
+    const nextRoles = module.applyViewer3DHumanoidRoleProposalChange(initialAssignments, 'spine', { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Chest', confidence: 0.91 })
+    const nextChains = module.applyViewer3DHumanoidChainProposalChange(nextRoles, 'left_arm', [
+      'rig:hero|skeleton:0|bone:hips#0',
+      'rig:hero|skeleton:0|bone:hips#0/spine#0',
+    ])
+
+    assert.notEqual(nextRoles, initialAssignments)
+    assert.notEqual(nextChains, nextRoles)
+    assert.equal(nextChains.roles.spine.label, 'Chest')
+    assert.deepEqual(nextChains.chains.left_arm, [
+      'rig:hero|skeleton:0|bone:hips#0',
+      'rig:hero|skeleton:0|bone:hips#0/spine#0',
+    ])
+
+    assert.equal(sourceDraft.assignments.roles.spine.label, 'Spine')
+    assert.equal((sourceDraft.assignments.chains as Record<string, unknown>)['left_arm'], undefined)
+    assert.deepEqual(sourceSummary, rigSummary)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D keeps humanoid promotion inside Rig Editor props without a separate HumanoidReviewPanel sibling surface', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const state = module.createViewer3DRigEditorState(rawBoneRigSummary)
+    const rigEditorProps = module.resolveViewer3DRigEditorPanelProps(state, {}, undefined, {
+      rigMetaNamingByBoneId: module.resolveViewer3DEffectiveRigMetaNaming({
+        summary: rawBoneRigSummary,
+        rigMetaNamingByBoneId: state.rigMetaNamingByBoneId,
+        draftResult: {
+          success: true,
+          status: 'found',
+          sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+          sidecar: rawBoneHumanoidDraftSidecar,
+        },
+        promotionResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json', sidecar: rawBoneHumanoidPromotionSidecar },
+      }),
+      humanoidReview: module.resolveViewer3DRigHumanoidReviewProps({
+        presentation: module.resolveViewer3DHumanoidReviewPresentation({
+          trustedContractPresent: false,
+          draftResult: {
+            success: true,
+            status: 'found',
+            sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-draft.v1.json',
+            sidecar: rawBoneHumanoidDraftSidecar,
+          },
+          promotionResult: { success: true, status: 'found', sidecarWorkspacePath: 'Workflows/outputs/raw-bones.humanoid-promotion.v1.json', sidecar: rawBoneHumanoidPromotionSidecar },
+        }),
+        draft: rawBoneHumanoidDraftSidecar,
+        promotion: rawBoneHumanoidPromotionSidecar,
+        proposedAssignments: module.createViewer3DHumanoidProposedAssignments(rawBoneHumanoidDraftSidecar),
+        rationale: 'Reviewed against Rig Editor semantic names.',
+        confirmationChecked: true,
+        saveState: { status: 'idle' },
+        onRationaleChange: () => {},
+        onConfirmationChange: () => {},
+        onPromote: () => {},
+      }),
+    })
+
+    assert.equal('HumanoidReviewPanel' in module, false)
+    assert.ok(rigEditorProps.humanoidReview)
+    assert.equal(rigEditorProps.humanoidReview.presentation.state, 'promoted')
+    assert.equal(rigEditorProps.humanoidReview.presentation.headline.includes('Humanoid review'), false)
+    assert.equal('draft' in rigEditorProps.humanoidReview, false)
+    assert.equal('proposedAssignments' in rigEditorProps.humanoidReview, false)
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D resolves default manual-confirmation audit input for the minimal Rig Editor promote button', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(module.resolveViewer3DHumanoidPromotionButtonAudit(), {
+      rationale: 'Manual confirmation from Rig Editor',
+      confirmationChecked: true,
+    })
+
+    const request = module.buildViewer3DHumanoidPromotionWriteRequest({
+      meshWorkspacePath: 'Workflows/generated/raw-bones.glb',
+      draft: rawBoneHumanoidDraftSidecar,
+      proposedAssignments: module.createViewer3DHumanoidProposedAssignments(rawBoneHumanoidDraftSidecar),
+      ...module.resolveViewer3DHumanoidPromotionButtonAudit(),
+      createdAt: '2026-05-23T11:30:00.000Z',
+      confirmedBy: 'modly:user:local:drhepa',
+      confirmedByLabel: 'drhepa',
+      method: 'viewer3d',
+      promotionId: 'promotion-raw-bones',
+    })
+
+    assert.deepEqual(request.sidecar.promotedAssignments, rawBoneHumanoidDraftSidecar.assignments)
+    assert.equal(request.sidecar.audit.rationale, 'Manual confirmation from Rig Editor')
+    assert.equal(request.sidecar.provenance.trustStatus, 'manual_confirmed')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D builds auditable humanoid promotion sidecars from proposed assignments without altering draft trust semantics', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const proposedAssignments = module.applyViewer3DHumanoidRoleProposalChange(
+      module.createViewer3DHumanoidProposedAssignments(humanoidDraftSidecar),
+      'spine',
+      { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Chest', confidence: 0.91 },
+    )
+
+    const request = module.buildViewer3DHumanoidPromotionWriteRequest({
+      meshWorkspacePath: 'Workflows/generated/hero.glb',
+      draft: humanoidDraftSidecar,
+      existingPromotion: humanoidPromotionSidecar,
+      proposedAssignments,
+      rationale: 'Reviewed spine mapping against the overlay and keeping this as manual_confirmed only.',
+      createdAt: '2026-05-22T21:05:00.000Z',
+      confirmedBy: 'modly:user:local:drhepa',
+      confirmedByLabel: 'drhepa',
+      method: 'add-to-scene',
+      promotionId: 'promotion-456',
+    })
+
+    assert.deepEqual(request, {
+      meshWorkspacePath: 'Workflows/generated/hero.glb',
+      sidecar: {
+        schema: 'modly.humanoid-promotion.v1',
+        version: 1,
+        promotionId: 'promotion-456',
+        supersedesPromotionId: 'promotion-123',
+        source: { workspacePath: 'Characters/hero-source.glb' },
+        output: { workspacePath: 'Workflows/generated/hero.glb' },
+        meshOutputSha256: 'mesh-sha-123',
+        rigmetaSha256: 'rigmeta-sha-123',
+        draftSha256: 'draft-sha-123',
+        draftSchema: 'modly.humanoid-draft.v1',
+        promotedAssignments: {
+          roles: {
+            hips: { boneId: 'rig:hero|skeleton:0|bone:hips#0', label: 'Hips', confidence: 0.98 },
+            spine: { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Chest', confidence: 0.91 },
+          },
+          chains: {
+            spine: ['rig:hero|skeleton:0|bone:hips#0', 'rig:hero|skeleton:0|bone:hips#0/spine#0'],
+          },
+        },
+        provenance: { basis: 'modly.humanoid-draft.v1', trustStatus: 'manual_confirmed' },
+        audit: {
+          confirmedBy: 'modly:user:local:drhepa',
+          confirmedByLabel: 'drhepa',
+          createdAt: '2026-05-22T21:05:00.000Z',
+          method: 'add-to-scene',
+          rationale: 'Reviewed spine mapping against the overlay and keeping this as manual_confirmed only.',
+        },
+      },
+    })
+
+    assert.equal(humanoidDraftSidecar.trust.status, 'draft')
+    assert.equal(humanoidDraftSidecar.assignments.roles.spine.label, 'Spine')
+  } finally {
+    await cleanup()
+  }
+})
+test('Viewer3D promotion write requests preserve draft proposedAssignments unchanged when the reviewer does not edit them', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const proposedAssignments = module.createViewer3DHumanoidProposedAssignments(humanoidDraftSidecar)
+
+    const request = module.buildViewer3DHumanoidPromotionWriteRequest({
+      meshWorkspacePath: 'Workflows/generated/hero.glb',
+      draft: humanoidDraftSidecar,
+      proposedAssignments,
+      rationale: 'Confirmed draft matches the Rig Editor naming and hierarchy.',
+      createdAt: '2026-05-23T08:00:00.000Z',
+      confirmedBy: 'modly:user:local:drhepa',
+      confirmedByLabel: 'drhepa',
+      method: 'import',
+      promotionId: 'promotion-789',
+    })
+
+    assert.deepEqual(request.sidecar.promotedAssignments, humanoidDraftSidecar.assignments)
+    assert.notEqual(request.sidecar.promotedAssignments, humanoidDraftSidecar.assignments)
+    assert.equal(request.sidecar.provenance.trustStatus, 'manual_confirmed')
   } finally {
     await cleanup()
   }

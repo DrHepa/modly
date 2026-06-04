@@ -848,3 +848,63 @@ test('RigEditorPanel keeps invalid rigmeta warnings non-blocking while effective
     await cleanup()
   }
 })
+
+test('RigEditorPanel keeps selected details and hierarchy while exposing only a minimal promote action for humanoid drafts', async () => {
+  const { module, cleanup } = await loadRigEditorPanelModule()
+  const summary = createRigSummary()
+
+  try {
+    const html = renderPanel(module.RigEditorPanel, {
+      ...defaultPanelProps(summary),
+      selectedBoneId: summary.bones[0].boneId,
+      effectiveNaming: createEffectiveNaming(summary, {
+        [summary.bones[0].boneId]: { label: 'Hips', provenance: 'unirig' },
+      }),
+        humanoidReview: {
+          presentation: {
+            state: 'draft',
+            headline: 'Draft humanoid proposal available for manual review.',
+            canPromote: true,
+            diagnostics: ['diagnostic that must stay hidden'],
+          },
+          draft: {
+            schema: 'modly.humanoid-draft.v1',
+          version: 1,
+          source: { workspacePath: 'Characters/hero.glb' },
+          output: { workspacePath: 'Models/hero.glb' },
+          meshOutputSha256: 'mesh-sha',
+          rigmetaSha256: 'rigmeta-sha',
+          draftSha256: 'draft-sha',
+          trust: { status: 'draft', reasons: ['manual_review_required'], trusted: false },
+          provenance: { producer: 'unirig', runId: 'run-1', extensionId: 'unirig-ext', createdAt: '2026-05-23T10:00:00.000Z' },
+          assignments: { roles: { hips: { boneId: summary.bones[0].boneId, label: 'Hips' } }, chains: {} },
+          confidence: { overall: 0.9, byRole: { hips: 0.9 } },
+          completeness: { requiredRolesMissing: [], score: 1 },
+          diagnostics: [],
+        },
+        proposedAssignments: { roles: { hips: { boneId: summary.bones[0].boneId, label: 'Hips' } }, chains: {} },
+        rationale: 'Reviewed in Rig Editor.',
+        confirmationChecked: true,
+        saveState: { status: 'idle' },
+        onRationaleChange: () => undefined,
+        onConfirmationChange: () => undefined,
+        onPromote: () => undefined,
+      },
+    })
+
+    assert.match(html, /aria-label="Rig Editor panel"/)
+    assert.match(html, /Selected bone/)
+    assert.match(html, /Bone hierarchy/)
+    assert.match(html, /Safe alias/)
+    assert.match(html, /Save rig aliases/)
+    assert.match(html, />Promote humanoid draft</)
+    assert.equal((html.match(/>Promote humanoid draft</g) ?? []).length, 1)
+    assert.doesNotMatch(html, /Humanoid review/i)
+    assert.doesNotMatch(html, /Confidence \/ completeness/)
+    assert.doesNotMatch(html, /Promotion payload source/)
+    assert.doesNotMatch(html, /diagnostic that must stay hidden/)
+    assert.doesNotMatch(html, /aria-label="Humanoid review panel"/)
+  } finally {
+    await cleanup()
+  }
+})

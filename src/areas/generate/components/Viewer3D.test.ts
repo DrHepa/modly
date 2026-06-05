@@ -4569,6 +4569,244 @@ test('Viewer3D auto-prefers only safe animated GLBs and falls back to preview.gl
     await cleanup()
   }
 })
+
+test('Viewer3D Kimodo source-rig fallback selects safe workspace-relative GLB/GLTF only for degraded preview-only output', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+    })
+    const result = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+      descriptor,
+      metadata: {
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        animation_mapping_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        source_workspace_path: 'Workflows/sources/rigged-hero.glb',
+      },
+      previewHasUsableRig: false,
+    })
+
+    assert.deepEqual(result, {
+      active: true,
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/sources/rigged-hero.glb',
+      sourceWorkspacePath: 'Workflows/sources/rigged-hero.glb',
+      warnings: ['Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.'],
+      artifact: result.artifact,
+    })
+    assert.equal(result.artifact.previewGlbWorkspacePath, 'Workflows/kimodo-preview/run-1/preview.glb')
+
+    const gltfResult = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-2/preview.glb',
+      descriptor: module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-2/preview.glb',
+      }),
+      metadata: {
+        runtime_status: 'completed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        source_workspace_path: 'Workflows/sources/rigged-creature.gltf',
+      },
+      previewHasUsableRig: false,
+    })
+
+    assert.equal(gltfResult.active, true)
+    assert.equal(gltfResult.sourceWorkspacePath, 'Workflows/sources/rigged-creature.gltf')
+    assert.equal(gltfResult.modelUrl, 'http://127.0.0.1:8000/workspace/Workflows/sources/rigged-creature.gltf')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D Kimodo source-rig fallback fails closed for unsafe, missing, non-mesh, and non-preview-only source metadata', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb',
+    })
+    const unsafeCases = [
+      { name: 'missing source', metadata: {} },
+      { name: 'absolute source_workspace_path', metadata: { source_workspace_path: '/home/drhepa/Documentos/Modly/workspace/Workflows/source.glb' } },
+      { name: 'traversal', metadata: { source_workspace_path: 'Workflows/../source.glb' } },
+      { name: 'encoded traversal', metadata: { source_workspace_path: 'Workflows/%2e%2e/source.glb' } },
+      { name: 'drive prefix', metadata: { source_workspace_path: 'C:/workspace/Workflows/source.glb' } },
+      { name: 'empty segment', metadata: { source_workspace_path: 'Workflows//source.glb' } },
+      { name: 'non glb/gltf', metadata: { source_workspace_path: 'Workflows/source.fbx' } },
+      { name: 'outside absolute source_rigged_mesh', metadata: { source_rigged_mesh: '/home/drhepa/outside/source.glb' } },
+      { name: 'safe source but preview already has rig', metadata: { source_workspace_path: 'Workflows/source.glb' }, previewHasUsableRig: true },
+      { name: 'safe source but safe animated output exists', metadata: { source_workspace_path: 'Workflows/source.glb', animated_artifact: 'animated.glb', runtime_status: 'completed', retarget_status: 'completed', animation_mapping_status: 'completed' } },
+    ]
+
+    for (const current of unsafeCases) {
+      const result = module.resolveViewer3DKimodoSourceRigFallback({
+        apiUrl: 'http://127.0.0.1:8000',
+        defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb',
+        descriptor,
+        metadata: {
+          runtime_status: 'failed',
+          retarget_status: 'failed',
+          visual_quality_status: 'preview-only',
+          preview_artifact: 'preview.glb',
+          bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+          ...current.metadata,
+        },
+        previewHasUsableRig: Boolean(current.previewHasUsableRig),
+      })
+
+      assert.equal(result.active, false, current.name)
+      assert.equal(result.modelUrl, 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb', current.name)
+      assert.equal(result.sourceWorkspacePath, undefined, current.name)
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D authoring presentation switches only modelUrl and rigSourceWorkspacePath without changing reset keys', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const authoring = module.resolveViewer3DAuthoringPresentation({
+      baseModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+      currentJobId: 'job-preview-only',
+      rigSourceWorkspacePath: 'Workflows/kimodo-preview/run-1/preview.glb',
+      motionRetargetPresentation: {
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+        warnings: ['Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.'],
+      },
+      sourceRigFallback: {
+        active: true,
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/source-rigs/hero.glb',
+        sourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        warnings: ['Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.'],
+      },
+    })
+
+    assert.deepEqual(authoring, {
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/source-rigs/hero.glb',
+      rigSourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+      resetKey: { currentJobId: 'job-preview-only', baseModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb' },
+      warnings: [
+        'Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.',
+        'Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.',
+      ],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D source-rig fallback keeps preview bundle artifacts visible and appends explicit diagnostics', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-artifacts/preview.glb',
+    })
+    const fallback = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-artifacts/preview.glb',
+      descriptor,
+      metadata: {
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        source_workspace_path: 'Workflows/source-rigs/hero.glb',
+        warnings: ['Kimodo produced preview-only output.'],
+      },
+      previewHasUsableRig: false,
+    })
+    const artifactEntries = module.resolveViewer3DMotionRetargetArtifactEntries(undefined, fallback.artifact)
+
+    assert.deepEqual(artifactEntries.map((entry: { key: string, workspacePath: string, openMode: string }) => [entry.key, entry.workspacePath, entry.openMode]), [
+      ['metadata', 'Workflows/kimodo-preview/run-artifacts/metadata.json', 'workspace-preview'],
+      ['preview-glb', 'Workflows/kimodo-preview/run-artifacts/preview.glb', 'viewer3d-preview'],
+      ['motion-npz', 'Workflows/kimodo-preview/run-artifacts/motion.npz', 'workspace-preview'],
+      ['motion-bvh', 'Workflows/kimodo-preview/run-artifacts/motion.bvh', 'workspace-preview'],
+    ])
+    assert.match(fallback.warnings.join('\n'), /source-rig authoring fallback active/i)
+    assert.match(fallback.warnings.join('\n'), /preview-only output/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D source-rig fallback preserves trust boundaries and ignores PoseClip hashed sidecar paths', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-trust/preview.glb',
+    })
+    const baseArgs = {
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-trust/preview.glb',
+      descriptor,
+      metadata: {
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        source_workspace_path: 'Workflows/source-rigs/hero.glb',
+        pose_clip_sidecar_workspace_path: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json',
+        manual_confirmed: true,
+        trusted_contract: true,
+        basis: { trusted: true },
+        axis: { trusted: true },
+        plane: { trusted: true },
+      },
+      previewHasUsableRig: false,
+    }
+    const withHashedSidecar = module.resolveViewer3DKimodoSourceRigFallback(baseArgs)
+    const withoutHashedSidecar = module.resolveViewer3DKimodoSourceRigFallback({
+      ...baseArgs,
+      metadata: { ...baseArgs.metadata, pose_clip_sidecar_workspace_path: 'Workflows/pose-clips/other--src-ffffffffffffffff.pose-clip.v1.json' },
+    })
+    const manualPromotionPresentation = module.resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+      presentation: module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: { success: true, status: 'found', sidecar: humanoidDraftSidecar },
+        promotionResult: { success: true, status: 'found', sidecar: humanoidPromotionSidecar },
+      }),
+      semanticHydrationSource: {
+        displayedMeshWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        semanticSourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        sourceKind: 'kimodo-source',
+        warnings: withHashedSidecar.warnings,
+        failedClosed: false,
+      },
+    })
+
+    assert.deepEqual(withHashedSidecar, withoutHashedSidecar)
+    assert.equal(withHashedSidecar.active, true)
+    assert.equal(withHashedSidecar.trust?.trustedContractPresent, false)
+    assert.deepEqual(withHashedSidecar.trust?.trustedEvidence, { sourceContract: false, basis: false, axis: false, plane: false, motion: false })
+    assert.equal(manualPromotionPresentation.state, 'promoted')
+    assert.equal(manualPromotionPresentation.canPromote, false)
+  } finally {
+    await cleanup()
+  }
+})
 test('Viewer3D keeps Motion Retarget diagnostics visible even when no Kimodo session could be hydrated', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 

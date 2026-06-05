@@ -4597,6 +4597,249 @@ test('Viewer3D auto-prefers only safe animated GLBs and falls back to preview.gl
     await cleanup()
   }
 })
+
+test('Viewer3D Kimodo source-rig fallback selects safe workspace-relative GLB/GLTF only for degraded preview-only output', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+    })
+    const result = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        animation_mapping_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        source_workspace_path: 'Workflows/sources/rigged-hero.glb',
+      },
+      previewHasUsableRig: false,
+    })
+
+    assert.deepEqual(result, {
+      active: true,
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/sources/rigged-hero.glb',
+      sourceWorkspacePath: 'Workflows/sources/rigged-hero.glb',
+      warnings: ['Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.'],
+      artifact: result.artifact,
+    })
+    assert.equal(result.artifact.previewGlbWorkspacePath, 'Workflows/kimodo-preview/run-1/preview.glb')
+
+    const gltfResult = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-2/preview.glb',
+      descriptor: module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-2/preview.glb',
+      }),
+      metadata: {
+        extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+        runtime_status: 'completed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        source_workspace_path: 'Workflows/sources/rigged-creature.gltf',
+      },
+      previewHasUsableRig: false,
+    })
+
+    assert.equal(gltfResult.active, true)
+    assert.equal(gltfResult.sourceWorkspacePath, 'Workflows/sources/rigged-creature.gltf')
+    assert.equal(gltfResult.modelUrl, 'http://127.0.0.1:8000/workspace/Workflows/sources/rigged-creature.gltf')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D Kimodo source-rig fallback fails closed for unsafe, missing, non-mesh, and non-preview-only source metadata', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb',
+    })
+    const unsafeCases = [
+      { name: 'missing source', metadata: {} },
+      { name: 'absolute source_workspace_path', metadata: { source_workspace_path: '/home/drhepa/Documentos/Modly/workspace/Workflows/source.glb' } },
+      { name: 'traversal', metadata: { source_workspace_path: 'Workflows/../source.glb' } },
+      { name: 'encoded traversal', metadata: { source_workspace_path: 'Workflows/%2e%2e/source.glb' } },
+      { name: 'drive prefix', metadata: { source_workspace_path: 'C:/workspace/Workflows/source.glb' } },
+      { name: 'empty segment', metadata: { source_workspace_path: 'Workflows//source.glb' } },
+      { name: 'non glb/gltf', metadata: { source_workspace_path: 'Workflows/source.fbx' } },
+      { name: 'outside absolute source_rigged_mesh', metadata: { source_rigged_mesh: '/home/drhepa/outside/source.glb' } },
+      { name: 'safe source but preview already has rig', metadata: { source_workspace_path: 'Workflows/source.glb' }, previewHasUsableRig: true },
+      { name: 'safe source but safe animated output exists', metadata: { source_workspace_path: 'Workflows/source.glb', animated_artifact: 'animated.glb', runtime_status: 'completed', retarget_status: 'completed', animation_mapping_status: 'completed' } },
+    ]
+
+    for (const current of unsafeCases) {
+      const result = module.resolveViewer3DKimodoSourceRigFallback({
+        apiUrl: 'http://127.0.0.1:8000',
+        defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb',
+        descriptor,
+        metadata: {
+          extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+          runtime_status: 'failed',
+          retarget_status: 'failed',
+          visual_quality_status: 'preview-only',
+          preview_artifact: 'preview.glb',
+          bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+          ...current.metadata,
+        },
+        previewHasUsableRig: Boolean(current.previewHasUsableRig),
+      })
+
+      assert.equal(result.active, false, current.name)
+      assert.equal(result.modelUrl, 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-unsafe/preview.glb', current.name)
+      assert.equal(result.sourceWorkspacePath, undefined, current.name)
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D authoring presentation switches only modelUrl and rigSourceWorkspacePath without changing reset keys', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const authoring = module.resolveViewer3DAuthoringPresentation({
+      baseModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+      currentJobId: 'job-preview-only',
+      rigSourceWorkspacePath: 'Workflows/kimodo-preview/run-1/preview.glb',
+      motionRetargetPresentation: {
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb',
+        warnings: ['Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.'],
+      },
+      sourceRigFallback: {
+        active: true,
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/source-rigs/hero.glb',
+        sourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        warnings: ['Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.'],
+      },
+    })
+
+    assert.deepEqual(authoring, {
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/source-rigs/hero.glb',
+      rigSourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+      resetKey: { currentJobId: 'job-preview-only', baseModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-1/preview.glb' },
+      warnings: [
+        'Diagnostics-only inspection is available until Kimodo exports a trusted motion payload.',
+        'Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.',
+      ],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D source-rig fallback keeps preview bundle artifacts visible and appends explicit diagnostics', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-artifacts/preview.glb',
+    })
+    const fallback = module.resolveViewer3DKimodoSourceRigFallback({
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-artifacts/preview.glb',
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        canonical_motion_artifact: 'motion.npz',
+        motion_bvh_artifact: 'motion.bvh',
+        bundle_artifacts: ['metadata.json', 'motion.bvh', 'motion.npz', 'preview.glb'],
+        source_workspace_path: 'Workflows/source-rigs/hero.glb',
+        warnings: ['Kimodo produced preview-only output.'],
+      },
+      previewHasUsableRig: false,
+    })
+    const artifactEntries = module.resolveViewer3DMotionRetargetArtifactEntries(undefined, fallback.artifact)
+
+    assert.deepEqual(artifactEntries.map((entry: { key: string, workspacePath: string, openMode: string }) => [entry.key, entry.workspacePath, entry.openMode]), [
+      ['metadata', 'Workflows/kimodo-preview/run-artifacts/metadata.json', 'workspace-preview'],
+      ['preview-glb', 'Workflows/kimodo-preview/run-artifacts/preview.glb', 'viewer3d-preview'],
+      ['motion-npz', 'Workflows/kimodo-preview/run-artifacts/motion.npz', 'workspace-preview'],
+      ['motion-bvh', 'Workflows/kimodo-preview/run-artifacts/motion.bvh', 'workspace-preview'],
+    ])
+    assert.match(fallback.warnings.join('\n'), /source-rig authoring fallback active/i)
+    assert.match(fallback.warnings.join('\n'), /preview-only output/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D source-rig fallback preserves trust boundaries and ignores PoseClip hashed sidecar paths', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({
+      apiUrl: 'http://127.0.0.1:8000',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-trust/preview.glb',
+    })
+    const baseArgs = {
+      apiUrl: 'http://127.0.0.1:8000',
+      defaultModelUrl: 'http://127.0.0.1:8000/workspace/Workflows/kimodo-preview/run-trust/preview.glb',
+      descriptor,
+      metadata: {
+        extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+        runtime_status: 'failed',
+        retarget_status: 'failed',
+        visual_quality_status: 'preview-only',
+        preview_artifact: 'preview.glb',
+        source_workspace_path: 'Workflows/source-rigs/hero.glb',
+        pose_clip_sidecar_workspace_path: 'Workflows/pose-clips/hero--src-1d73d9779190b874.pose-clip.v1.json',
+        manual_confirmed: true,
+        trusted_contract: true,
+        basis: { trusted: true },
+        axis: { trusted: true },
+        plane: { trusted: true },
+      },
+      previewHasUsableRig: false,
+    }
+    const withHashedSidecar = module.resolveViewer3DKimodoSourceRigFallback(baseArgs)
+    const withoutHashedSidecar = module.resolveViewer3DKimodoSourceRigFallback({
+      ...baseArgs,
+      metadata: { ...baseArgs.metadata, pose_clip_sidecar_workspace_path: 'Workflows/pose-clips/other--src-ffffffffffffffff.pose-clip.v1.json' },
+    })
+    const manualPromotionPresentation = module.resolveViewer3DHumanoidReviewPresentationForHydrationSource({
+      presentation: module.resolveViewer3DHumanoidReviewPresentation({
+        trustedContractPresent: false,
+        draftResult: { success: true, status: 'found', sidecar: humanoidDraftSidecar },
+        promotionResult: { success: true, status: 'found', sidecar: humanoidPromotionSidecar },
+      }),
+      semanticHydrationSource: {
+        displayedMeshWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        semanticSourceWorkspacePath: 'Workflows/source-rigs/hero.glb',
+        sourceKind: 'kimodo-source',
+        warnings: withHashedSidecar.warnings,
+        failedClosed: false,
+      },
+    })
+
+    assert.deepEqual(withHashedSidecar, withoutHashedSidecar)
+    assert.equal(withHashedSidecar.active, true)
+    assert.equal(withHashedSidecar.trust?.trustedContractPresent, false)
+    assert.deepEqual(withHashedSidecar.trust?.trustedEvidence, { sourceContract: false, basis: false, axis: false, plane: false, motion: false })
+    assert.equal(manualPromotionPresentation.state, 'promoted')
+    assert.equal(manualPromotionPresentation.canPromote, false)
+  } finally {
+    await cleanup()
+  }
+})
 test('Viewer3D keeps Motion Retarget diagnostics visible even when no Kimodo session could be hydrated', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
@@ -5616,5 +5859,447 @@ test('Viewer3D trusted required roles need positive unambiguous current rig bind
     assert.equal(module.hasTrustedHumanoidContract(metadata({ hips: id }), undefined), false)
     const ambiguous = { ...rigSummary, bones: rigSummary.bones.map((bone: any) => ({ ...bone, originalName: 'duplicate' })) }
     assert.equal(module.hasTrustedHumanoidContract(metadata({ hips: 'duplicate' }), ambiguous), false)
+  } finally { await cleanup() }
+})
+
+test('Viewer3D degraded source fallback requires positive bundle identity and exact preview ownership', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const apiUrl = 'http://127.0.0.1:8000'
+    const defaultModelUrl = `${apiUrl}/workspace/Workflows/kimodo/run/preview.glb`
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl: defaultModelUrl })
+    const metadata = { extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh', runtime_status: 'failed',
+      preview_artifact: 'preview.glb', source_workspace_path: 'Workflows/rig.glb' }
+    const args = { apiUrl, defaultModelUrl, descriptor, metadata, previewHasUsableRig: false }
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback(args).active, true)
+    for (const value of [
+      { ...metadata, extension_id: undefined }, { ...metadata, node_id: 'unrelated' },
+      { ...metadata, preview_artifact: 'Workflows/other/preview.glb' },
+      { ...metadata, preview_artifact: undefined }, { ...metadata, source_workspace_path: 'Workflows/kimodo/run/preview.glb' },
+      { ...metadata, source_workspace_path: 'Workflows/kimodo/run/animated.glb', animated_artifact: 'animated.glb' },
+      { ...metadata, source_workspace_path: 'Workflows/rig.glb', source_rigged_mesh: '/outside/rig.glb' },
+      { ...metadata, source_workspace_path: 'Workflows/%252e%252e/rig.glb' },
+      { ...metadata, source_workspace_path: 'Workflows/./rig.glb' },
+      { ...metadata, kimodo_motion_retarget: { source_contract: { source_mesh_workspace_path: 'Workflows/unrelated.glb' } } },
+    ]) assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: value }).active, false, JSON.stringify(value))
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, defaultModelUrl: 'https://foreign.invalid/workspace/Workflows/kimodo/run/preview.glb' }).active, false)
+    const absolute = { ...metadata, source_rigged_mesh: '/configured/workspace/Workflows/rig.glb' }
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: absolute }).active, false)
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: absolute, workspaceDir: '/configured/workspace' }).active, true)
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: { ...absolute, source_workspace_path: 'Workflows/other.glb' }, workspaceDir: '/configured/workspace' }).active, false)
+  } finally { await cleanup() }
+})
+
+// CPU lifecycle coverage: real React effects, stores, Scene/Bone identities and
+// sidecar services. Only rendering/loaders are adapters; no GLB/GPU/UI claim.
+test('Viewer3D mounted degraded-bundle ownership', async suite => {
+  const THREE: typeof import('three') = require('three')
+  const { createElement } = require('react')
+  const axios = require('axios') // Resolve Node transport before browser doubles.
+  type Host = { type: string; props: any; children: Host[] }
+  const context = {}
+  const remove = (parent: Host, child: Host) => {
+    const index = parent.children.indexOf(child)
+    if (index >= 0) parent.children.splice(index, 1)
+  }
+  const append = (parent: Host, child: Host) => { remove(parent, child); parent.children.push(child) }
+  const insert = (parent: Host, child: Host, before: Host) => { remove(parent, child); parent.children.splice(parent.children.indexOf(before), 0, child) }
+  const renderer = require('react-reconciler')({
+    now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
+    getRootHostContext: () => context, getChildHostContext: () => context,
+    getPublicInstance: (instance: Host) => instance, prepareForCommit: () => null, resetAfterCommit: () => undefined,
+    createInstance: (type: string, props: any) => ({ type, props, children: [] }),
+    createTextInstance: (text: string) => ({ type: '#text', props: { text }, children: [] }),
+    appendInitialChild: append, appendChild: append, appendChildToContainer: append,
+    removeChild: remove, removeChildFromContainer: remove, insertBefore: insert, insertInContainerBefore: insert,
+    finalizeInitialChildren: () => false, shouldSetTextContent: () => false, prepareUpdate: () => true,
+    commitUpdate: (instance: Host, _payload: unknown, _type: string, _old: unknown, props: any) => { instance.props = props },
+    commitTextUpdate: (instance: Host, _old: string, text: string) => { instance.props.text = text },
+    clearContainer: (host: Host) => { host.children = [] }, detachDeletedInstance: () => undefined,
+    scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
+  })
+  function flush(callback = () => undefined as void) {
+    renderer.flushSync(callback)
+    for (let i = 0; i < 10; i++) {
+      if (!renderer.flushPassiveEffects()) return
+      renderer.flushSync(() => undefined)
+    }
+    assert.fail('Viewer effects did not settle')
+  }
+  async function settle() { for (let i = 0; i < 8; i++) { await Promise.resolve(); flush() } }
+  function find(host: Host, predicate: (node: Host) => boolean): Host | undefined {
+    if (predicate(host)) return host
+    for (const child of host.children) { const found = find(child, predicate); if (found) return found }
+  }
+  function deferred() {
+    let resolve!: (value: any) => void
+    const promise = new Promise<any>(yes => { resolve = yes })
+    return { promise, resolve }
+  }
+  const previewUrl = '/workspace/Workflows/kimodo/run/preview.glb'
+  const sourceUrl = '/workspace/Workflows/rig.glb'
+  const animatedUrl = '/workspace/Workflows/kimodo/run/animated.glb'
+  const degraded = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh',
+    runtime_status: 'failed', retarget_status: 'failed', animation_mapping_status: 'failed', visual_quality_status: 'preview-only',
+    preview_artifact: 'preview.glb', canonical_motion_artifact: 'motion.npz', motion_bvh_artifact: 'motion.bvh',
+    source_workspace_path: 'Workflows/rig.glb', warnings: ['degraded fixture'], ...extra,
+  })
+  const response = (metadata = degraded()) => ({ ok: true, json: async () => metadata })
+  function asset(harness: any, url: string, rigged = true) {
+    const scene = new THREE.Group()
+    const root = new THREE.Bone(); root.name = 'root'
+    const child = new THREE.Bone(); child.name = 'child'; child.position.y = 1; root.add(child)
+    const geometry = new THREE.BoxGeometry()
+    const count = geometry.getAttribute('position').count
+    geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(new Uint16Array(count * 4), 4))
+    const weights = new Float32Array(count * 4)
+    for (let i = 0; i < count; i++) weights[i * 4] = 1
+    geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(weights, 4))
+    const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshStandardMaterial())
+    if (rigged) { scene.add(root, mesh); mesh.bind(new THREE.Skeleton([child, root])) }
+    else scene.add(new THREE.Mesh(geometry, new THREE.MeshStandardMaterial()))
+    harness.gltf.set(url, { scene, animations: [] })
+    return { scene, root, child, mesh }
+  }
+  const draftFor = (output = 'Workflows/rig.glb') => ({
+    schema: 'modly.humanoid-draft.v1', version: 1, source: { workspacePath: 'Workflows/source.glb' }, output: { workspacePath: output },
+    meshOutputSha256: 'fixture-mesh', rigmetaSha256: 'fixture-meta', draftSha256: 'opaque-v1', draftContentSha256: 'host-receipt',
+    trust: { status: 'draft', reasons: ['manual review'], trusted: false }, provenance: { producer: 'unirig', createdAt: '2026-10-07' },
+    assignments: { roles: { hips: { boneId: 'root', label: 'Pelvis' } }, chains: {} }, confidence: { overall: 0.9 },
+    completeness: { requiredRolesMissing: [], score: 1 }, diagnostics: [],
+  })
+  async function mount(t: any, options: {
+    metadata?: Record<string, unknown>; ports?: Record<string, unknown>; rig?: boolean; settings?: any; fetch?: () => any
+  } = {}) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'viewer-fallback-mount-'))
+    const saved = new Map<string, PropertyDescriptor | undefined>()
+    const requests: unknown[] = [], fetches: unknown[] = []
+    const originalAdapter = axios.defaults.adapter
+    axios.defaults.adapter = async (request: unknown) => { requests.push(request); throw new Error('Unexpected transport request') }
+    t.mock.method(globalThis, 'fetch', (...args: unknown[]) => {
+      fetches.push(args); return options.fetch ? options.fetch() : Promise.resolve(response(options.metadata))
+    })
+    let unmount = () => undefined as void
+    t.after(async () => {
+      try { unmount() } finally {
+        for (const [name, descriptor] of saved) {
+          if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+          else Reflect.deleteProperty(globalThis, name)
+        }
+        axios.defaults.adapter = originalAdapter
+        await rm(directory, { recursive: true, force: true })
+        assert.deepEqual(requests, [], 'No network request may leave the CPU harness')
+      }
+    })
+    const events = new EventTarget(), storage = new Map<string, string>()
+    const localStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) }
+    for (const [name, value] of Object.entries({
+      window: { addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events), setInterval, clearInterval, localStorage },
+      document: { activeElement: null, hasFocus: () => true }, HTMLInputElement: class {}, localStorage,
+    })) {
+      saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value })
+    }
+    const outfile = path.join(directory, 'viewer.mjs')
+    await build({
+      stdin: { contents: `export { default as Viewer3D } from './src/areas/generate/components/Viewer3D'; export { useAppStore } from './src/shared/stores/appStore'; export { useWorkflowRunStore } from './src/areas/workflows/workflowRunStore'; export { harness } from '@react-three/fiber'`, resolveDir: projectRoot, loader: 'tsx' },
+      outfile, bundle: true, format: 'esm', platform: 'node', tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [{ name: 'mounted-cpu-adapters', setup(builder) {
+        builder.onResolve({ filter: /^(@react-three\/(fiber|drei|postprocessing)|\.\/SplatViewer)$/ }, () => ({ path: 'adapters', namespace: 'fixture' }))
+        builder.onLoad({ filter: /^adapters$/, namespace: 'fixture' }, () => ({ loader: 'js', resolveDir: projectRoot, contents: `
+          import { createElement, forwardRef } from 'react'
+          export const harness = { gltf: new Map() }
+          export const Canvas = props => createElement('test-canvas', null, props.children)
+          export const useFrame = () => undefined
+          export function useGLTF(url) { const asset = harness.gltf.get(url); if (!asset) throw new Error('Missing fixture ' + url); return asset }
+          useGLTF.clear = () => undefined
+          export const useLoader = () => { throw new Error('Unexpected non-GLTF load') }
+          useLoader.clear = () => undefined
+          export const useThree = () => ({ gl: { domElement: { toDataURL: () => '', getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) } } })
+          export const useGizmoContext = () => ({})
+          export const Environment = () => null, GizmoHelper = () => null, Lightformer = () => null
+          const host = props => createElement('test-adapter', props, props.children)
+          export const Html = host, OrbitControls = host, EffectComposer = host, Outline = host, Selection = host, Select = host
+          export default forwardRef(function SplatViewer(props, ref) { return createElement('test-splat', props) })
+        ` }))
+        builder.onResolve({ filter: /^@shared\/hooks\/useGeneration$/ }, () => ({ path: 'generation', namespace: 'fixture' }))
+        builder.onLoad({ filter: /^generation$/, namespace: 'fixture' }, () => ({
+          contents: `import { useAppStore } from ${JSON.stringify(path.join(projectRoot, 'src/shared/stores/appStore.ts'))}; export const useGeneration = () => ({ currentJob: useAppStore(s => s.currentJob) })`, loader: 'js', resolveDir: projectRoot,
+        }))
+        // Use the installed import entry, not its self-requiring UMD; share
+        // the actual Three constructors with fixtures and the real BVH code.
+        builder.onResolve({ filter: /^three-mesh-bvh$/ }, () => ({ path: path.join(projectRoot, 'node_modules/three-mesh-bvh/src/index.js') }))
+        builder.onResolve({ filter: /^(react(?:\/.*)?|three(?:\/.*)?|axios|zustand(?:\/.*)?)$/ }, args => ({ path: require.resolve(args.path), external: true }))
+      } }],
+    })
+    const { Viewer3D, useAppStore, useWorkflowRunStore, harness } = await import(pathToFileURL(outfile).href)
+    const preview = asset(harness, previewUrl, false), source = asset(harness, sourceUrl, options.rig !== false)
+    asset(harness, animatedUrl)
+    Object.assign(window, { electron: { settings: options.settings, workspace: { artifacts: {
+      readRigMetaSidecar: async () => ({ success: true, status: 'not-found', rigMetaWorkspacePath: 'absent.rigmeta.json' }),
+      readHumanoidDraftSidecar: async (request: any) => ({ success: true, status: 'found', sidecarWorkspacePath: 'fixture.json', sidecar: draftFor(request.meshWorkspacePath) }),
+      readHumanoidPromotionSidecar: async () => ({ success: true, status: 'not-found', sidecarWorkspacePath: 'absent.json' }),
+      ...options.ports,
+    } } } })
+    const host: Host = { type: 'root', props: {}, children: [] }
+    const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
+    const job = (url: string) => useAppStore.getState().setCurrentJob({ id: url, status: 'done', outputUrl: url, imageFile: '', progress: 100, createdAt: 0 })
+    useAppStore.setState({ apiUrl: '' }); job(previewUrl)
+    const render = () => flush(() => renderer.updateContainer(createElement(Viewer3D), root, null))
+    unmount = () => flush(() => renderer.updateContainer(null, root, null))
+    const component = (name: string): any => {
+      const walk = (fiber: any): any => !fiber ? undefined : fiber.type?.name === name ? fiber.memoizedProps : walk(fiber.child) ?? walk(fiber.sibling)
+      const props = walk(root.current); assert.ok(props, `Missing mounted component ${name}`); return props
+    }
+    const click = (title: string) => flush(() => {
+      const button = find(host, node => node.type === 'button' && node.props.title === title)
+      assert.ok(button, `Missing button ${title}`); button.props.onClick()
+    })
+    render(); await settle()
+    return { host, harness, source, preview, component, click, render, useWorkflowRunStore, fetches,
+      switchTo: (url: string) => flush(() => job(url)), panel: () => component('MotionRetargetPanel') }
+  }
+
+  // A typed output with an invalid suffix is still an output declaration,
+  // never evidence that the same path is an independent authoring input.
+  for (const field of ['canonical_motion_artifact', 'motion_npz_artifact', 'motion_bvh_artifact', 'artifacts', 'bundle_artifacts']) {
+    await suite.test(`reject generated-source collision in ${field}`, async t => {
+      const pending = deferred()
+      const view = await mount(t, { fetch: () => pending.promise })
+      const generated = asset(view.harness, '/workspace/Workflows/kimodo/run/generated.glb')
+      pending.resolve(response(degraded({ source_workspace_path: 'Workflows/kimodo/run/generated.glb',
+        [field]: field.endsWith('artifacts') ? [{ path: 'generated.glb', role: 'animated-output' }] : 'generated.glb' })))
+      await settle()
+      assert.equal(view.component('GltfMeshModel').url, previewUrl)
+      assert.equal(view.component('SceneMeshModel').scene, view.preview.scene)
+      assert.notEqual(view.component('SceneMeshModel').scene, generated.scene)
+      assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+    })
+  }
+
+  await suite.test('distinct co-located source keeps actual Bones, dirty aliases and non-promotion across close/reopen', async t => {
+    const pending = deferred(), colocated = '/workspace/Workflows/kimodo/run/source.glb'
+    const view = await mount(t, { fetch: () => pending.promise })
+    const source = asset(view.harness, colocated)
+    pending.resolve(response(degraded({ source_workspace_path: colocated.slice('/workspace/'.length),
+      artifacts: [{ path: 'animated.glb', role: 'animated-output' }, { path: 'source.glb', role: 'source' }] })))
+    await settle()
+    assert.equal(view.component('GltfMeshModel').url, colocated)
+    assert.equal(view.component('SceneMeshModel').scene, source.scene)
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    assert.equal(view.panel().session, undefined)
+    assert.deepEqual(view.panel().artifactLinks.map((entry: any) => entry.key), ['metadata', 'preview-glb', 'motion-npz', 'motion-bvh'])
+    assert.match(view.panel().warnings.join(' '), /source-rig authoring fallback/)
+    assert.ok(view.panel().saveDisabledReason)
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    const rig = () => view.component('RigEditorPanel')
+    const id = rig().summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+    flush(() => rig().onSelectBone(id)); flush(() => rig().onAliasChange(id, 'Authored Alias'))
+    const bones = [...source.mesh.skeleton.bones], names = bones.map(bone => bone.name)
+    view.click('Close Motion Retarget (2 bones)'); await settle()
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    assert.equal(view.component('SceneMeshModel').scene, source.scene)
+    assert.equal(rig().aliasesDirty, true); assert.equal(rig().effectiveNaming.byBoneId[id].label, 'Authored Alias')
+    assert.equal(rig().humanoidReview.presentation.canPromote, false)
+    assert.deepEqual(source.mesh.skeleton.bones, bones); assert.deepEqual(bones.map(bone => bone.name), names)
+    assert.equal(view.fetches.length, 1, 'source hasRig and panel visibility do not revoke the preview decision')
+  })
+  await suite.test('no-session dispatch rejects forged/stale callbacks and explicit preview survives refreshed metadata', async t => {
+    const previews: any[] = [], downloads: any[] = [], refreshed = deferred(); let count = 0
+    const view = await mount(t, { fetch: () => ++count === 1 ? Promise.resolve(response()) : refreshed.promise, ports: {
+      previewWorkspaceArtifact: async (request: any) => { previews.push(request); return { success: false, error: 'Diagnostic fixture' } },
+      downloadWorkspaceArtifact: async (request: any) => { downloads.push(request); return { success: true } },
+    } })
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    const old = view.panel(), metadata = old.artifactLinks.find((entry: any) => entry.key === 'metadata')
+    const npz = old.artifactLinks.find((entry: any) => entry.key === 'motion-npz')
+    await old.onOpenArtifact(metadata); await settle(); await view.panel().onDownloadArtifact(npz); await settle()
+    assert.deepEqual(previews, [{ workspacePath: 'Workflows/kimodo/run/metadata.json' }])
+    assert.deepEqual(downloads, [{ workspacePath: 'Workflows/kimodo/run/motion.npz', suggestedName: 'motion.npz' }])
+    await view.panel().onOpenArtifact({ ...metadata, workspacePath: 'Workflows/unlisted.json' })
+    await view.panel().onDownloadArtifact({ ...npz, workspacePath: 'Workflows/unlisted.npz' }); await settle()
+    view.click('Close Motion Retarget (2 bones)'); await settle(); view.click('Open Motion Retarget (2 bones)'); await settle()
+    await old.onOpenArtifact(metadata); await old.onDownloadArtifact(npz); await settle()
+    assert.equal(previews.length, 1); assert.equal(downloads.length, 1)
+    flush(() => view.panel().onOpenArtifact(view.panel().artifactLinks.find((entry: any) => entry.key === 'preview-glb'))); await settle()
+    refreshed.resolve(response()); await settle()
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene)
+    assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+  })
+  await suite.test('explicit animated selection survives refreshed degraded metadata', async t => {
+    const refreshed = deferred(); let count = 0
+    const metadata = degraded({ animated_artifact: 'animated.glb' })
+    const view = await mount(t, { fetch: () => ++count === 1 ? Promise.resolve(response(metadata)) : refreshed.promise })
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    flush(() => view.panel().onOpenArtifact(view.panel().artifactLinks.find((entry: any) => entry.key === 'animated-glb'))); await settle()
+    refreshed.resolve(response(metadata)); await settle()
+    assert.equal(view.component('GltfMeshModel').url, animatedUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.harness.gltf.get(animatedUrl).scene)
+  })
+  await suite.test('same-URL preview Scene replacement retires old no-rig metadata capability', async t => {
+    const first = deferred(), second = deferred(); let count = 0
+    const view = await mount(t, { fetch: () => ++count === 1 ? first.promise : second.promise })
+    const replacement = asset(view.harness, previewUrl)
+    view.render(); await settle()
+    first.resolve(response()); await settle(); second.resolve(response()); await settle()
+    assert.ok(count >= 2)
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    assert.equal(view.component('SceneMeshModel').scene, replacement.scene)
+  })
+  await suite.test('delayed configured root cannot select source after execution replacement', async t => {
+    const rootResult = deferred(), nextMetadata = deferred(); let roots = 0, fetches = 0
+    const root = path.join(tmpdir(), 'configured-workspace')
+    const metadata = degraded({ source_rigged_mesh: path.join(root, 'Workflows/rig.glb') }); delete metadata.source_workspace_path
+    const view = await mount(t, { settings: { get: () => { roots++; return rootResult.promise } },
+      fetch: () => ++fetches === 1 ? Promise.resolve(response(metadata)) : nextMetadata.promise })
+    assert.equal(roots, 1)
+    flush(() => view.useWorkflowRunStore.setState({ executionId: 'replacement-owner' })); await settle()
+    rootResult.resolve({ workspaceDir: root }); await settle()
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    nextMetadata.resolve(response(degraded({ extension_id: 'unrelated' }))); await settle()
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+  })
+  await suite.test('current configured root allows the identified physical source', async t => {
+    const root = path.join(tmpdir(), 'configured-workspace')
+    const metadata = degraded({ source_rigged_mesh: path.join(root, 'Workflows/rig.glb') }); delete metadata.source_workspace_path
+    const view = await mount(t, { metadata, settings: { get: async () => ({ workspaceDir: root }) } })
+    // Root discovery triggers a second metadata pass before source loading.
+    await settle()
+    assert.equal(view.component('GltfMeshModel').url, sourceUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+  })
+  await suite.test('retired job metadata cannot select a source', async t => {
+    const retired = deferred()
+    const view = await mount(t, { fetch: () => retired.promise })
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    assert.equal(view.fetches.length, 1)
+    asset(view.harness, '/other.glb', false); view.switchTo('/other.glb'); await settle()
+    retired.resolve(response()); await settle()
+    assert.equal(view.component('GltfMeshModel').url, '/other.glb')
+  })
+  await suite.test('pending artifact result and callbacks retire with same-URL source Scene and execution', async t => {
+    const result = deferred(), previews: any[] = [], downloads: any[] = []
+    const view = await mount(t, { ports: {
+      previewWorkspaceArtifact: (request: any) => { previews.push(request); return result.promise },
+      downloadWorkspaceArtifact: async (request: any) => { downloads.push(request); return { success: true } },
+    } })
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    const old = view.panel(), link = old.artifactLinks.find((entry: any) => entry.key === 'metadata')
+    const operation = old.onOpenArtifact(link); await settle(); assert.equal(previews.length, 1)
+    const replacement = asset(view.harness, sourceUrl); view.render(); await settle()
+    result.resolve({ success: false, error: 'Retired preview operation' }); await operation; await settle()
+    assert.equal(find(view.host, node => node.type === '#text' && String(node.props.text).includes('Retired preview operation')), undefined)
+    await old.onDownloadArtifact(link); await settle(); assert.equal(downloads.length, 0)
+    view.click('Open Motion Retarget (2 bones)'); await settle()
+    const current = view.panel()
+    await current.onDownloadArtifact(link); await settle()
+    assert.deepEqual(downloads, [{ workspacePath: 'Workflows/kimodo/run/metadata.json', suggestedName: 'metadata.json' }])
+    assert.equal(view.component('SceneMeshModel').scene, replacement.scene)
+    flush(() => view.useWorkflowRunStore.setState({ executionId: 'replacement-execution' })); await settle()
+    await current.onDownloadArtifact(link); await settle(); assert.equal(downloads.length, 1)
+  })
+  for (const missing of [false, true]) {
+    await suite.test(missing ? 'source load failure leaves authoring closed' : 'source without rig leaves authoring closed without oscillation', async t => {
+      const pending = deferred()
+      const view = await mount(t, { rig: false, fetch: () => pending.promise })
+      if (missing) view.harness.gltf.delete(sourceUrl)
+      pending.resolve(response()); await settle()
+      assert.equal(find(view.host, node => node.type === 'button' && /Rig Editor|Motion Retarget/.test(String(node.props.title))), undefined)
+      if (missing) assert.ok(find(view.host, node => node.type === '#text' && node.props.text === 'Model file not found'))
+      else {
+        assert.equal(view.component('GltfMeshModel').url, sourceUrl)
+        assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+        assert.equal(view.component('ViewerEditToolbar').motionRetargetControls.summary.hasRig, false)
+      }
+      assert.equal(view.fetches.length, 1)
+    })
+  }
+  await suite.test('physical source alias Save/read preserves source/draft receipts and rejects stale Bone identities', async t => {
+    const { createHash } = await import('node:crypto')
+    const { mkdir, writeFile, readFile } = await import('node:fs/promises')
+    const workspaceDir = await mkdtemp(path.join(tmpdir(), 'fallback-source-service-'))
+    t.after(() => rm(workspaceDir, { recursive: true, force: true }))
+    // The host service belongs to tsconfig.node, not the composite web project.
+    // Execute its real Node bundle, leaving both projects' typecheck roots intact.
+    const serviceBundle = path.join(workspaceDir, 'service.mjs')
+    await build({ entryPoints: [path.join(projectRoot, 'electron/main/artifact-registry-service.ts')],
+      outfile: serviceBundle, bundle: true, format: 'esm', platform: 'node', packages: 'external',
+      tsconfig: path.join(projectRoot, 'tsconfig.node.json') })
+    const service = await import(pathToFileURL(serviceBundle).href)
+    const dir = path.join(workspaceDir, 'Workflows'); await mkdir(dir)
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex')
+    const input = 'physical original input', mesh = 'physical source rig'
+    const meta = JSON.stringify({ schema: 'modly.unirig.rigmeta', output_mesh: 'rig.glb', source: { workspacePath: 'Workflows/source.glb' } })
+    const draft: any = { ...draftFor(), meshOutputSha256: sha(mesh), rigmetaSha256: sha(meta) }; delete draft.draftContentSha256
+    const files = { 'source.glb': input, 'rig.glb': mesh, 'rig.rigmeta.json': meta, 'rig.humanoid-draft.v1.json': JSON.stringify(draft) }
+    for (const [name, text] of Object.entries(files)) await writeFile(path.join(dir, name), text)
+    const before = await service.readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath: 'Workflows/rig.glb' })
+    assert.equal(before.success, true); assert.equal(before.status, 'found'); assert.equal(before.sourceSha256, sha(input))
+    assert.ok(before.sidecar?.draftContentSha256)
+    const writes: any[] = []
+    const view = await mount(t, { ports: {
+      readRigMetaSidecar: (request: any) => service.readRigMetaSidecar({ ...request, workspaceDir }),
+      readHumanoidDraftSidecar: (request: any) => service.readHumanoidDraftSidecar({ ...request, workspaceDir }),
+      readHumanoidPromotionSidecar: (request: any) => service.readHumanoidPromotionSidecar({ ...request, workspaceDir }),
+      writeHumanoidPromotionSidecar: () => assert.fail('Diagnostic fallback must not promote'),
+      readRigRenameSidecar: (request: any) => service.readRigRenameSidecar({ ...request, workspaceDir }),
+      writeRigRenameSidecar: async (request: any) => { writes.push(request); return service.writeRigRenameSidecar({ ...request, workspaceDir }) },
+    } })
+    const rig = () => view.component('RigEditorPanel')
+    async function until(predicate: () => boolean) {
+      for (let i = 0; i < 100 && !predicate(); i++) { await new Promise(resolve => setTimeout(resolve, 5)); await settle() }
+      assert.ok(predicate(), 'Bounded CPU service operation completed')
+    }
+    view.click('Open Rig Editor (2 bones)'); await settle(); await until(() => rig().humanoidReview.presentation.state === 'draft')
+    const id = rig().summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+    flush(() => rig().onAliasChange(id, 'Saved Source Root')); await until(() => rig().loadState !== 'loading')
+    flush(() => rig().onSaveAliases()); await until(() => rig().saveState === 'saved')
+    assert.equal(writes.length, 1); assert.equal(writes[0].sourceWorkspacePath, 'Workflows/rig.glb')
+    assert.equal(writes[0].sidecar.source.workspacePath, 'Workflows/rig.glb')
+    const saved = await service.readRigRenameSidecar({ workspaceDir, sourceWorkspacePath: writes[0].sourceWorkspacePath, sidecarWorkspacePath: writes[0].sidecarWorkspacePath })
+    assert.equal(saved.success, true); assert.equal(saved.status, 'found'); assert.equal(saved.sidecar?.aliases[id].alias, 'Saved Source Root')
+    assert.deepEqual(await service.readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath: 'Workflows/rig.glb' }), before)
+    for (const [name, text] of Object.entries(files)) assert.equal(await readFile(path.join(dir, name), 'utf8'), text)
+    assert.equal(rig().humanoidReview.presentation.canPromote, false); assert.equal(view.source.root.name, 'root')
+    const replacement = asset(view.harness, sourceUrl); replacement.root.name = 'replacementRoot'; view.render(); await settle()
+    view.click('Open Rig Editor (2 bones)'); await until(() => rig().loadState !== 'loading')
+    assert.equal(rig().aliasesDirty, false); assert.deepEqual(rig().renamePlan.aliases, {})
+  })
+})
+
+test('Viewer3D source identity excludes every adapter-recognized animated list alias and typed motion declaration', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const apiUrl = 'http://127.0.0.1:8000', defaultModelUrl = `${apiUrl}/workspace/Workflows/kimodo/run/preview.glb`
+    const descriptor = module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl: defaultModelUrl })
+    const metadata = { extension_id: 'kimodo-soma-rp', node_id: 'animate-rigged-mesh', runtime_status: 'failed',
+      preview_artifact: 'preview.glb', source_workspace_path: 'Workflows/kimodo/run/generated.glb' }
+    const args = { apiUrl, defaultModelUrl, descriptor, previewHasUsableRig: false }
+    for (const list of ['artifacts', 'bundle_artifacts']) {
+      for (const pathKey of ['path', 'workspace_path', 'workspacePath', 'file_path', 'filePath', 'artifact']) {
+        for (const roleKey of ['role', 'kind', 'type', 'output']) {
+          const value = { ...metadata, [list]: [{ [pathKey]: 'generated.glb', [roleKey]: 'Animated-Output' }] }
+          assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: value }).active, false, `${list}/${pathKey}/${roleKey}`)
+        }
+      }
+      assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: {
+        ...metadata, source_workspace_path: 'Workflows/kimodo/run/animated.glb', [list]: ['animated.glb'],
+      } }).active, false)
+    }
+    for (const field of ['canonical_motion_artifact', 'motion_npz_artifact', 'motion_bvh_artifact']) {
+      assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: { ...metadata, [field]: 'generated.glb' } }).active, false, field)
+      // Reject an output/source identity even if its declaration is outside the bundle.
+      assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: {
+        ...metadata, source_workspace_path: 'Workflows/rig.glb', [field]: 'Workflows/rig.glb',
+      } }).active, false, field)
+    }
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: {
+      ...metadata, diagnostics: { bvh_path: 'generated.glb' },
+    } }).active, false)
+    assert.equal(module.resolveViewer3DKimodoSourceRigFallback({ ...args, metadata: {
+      ...metadata, artifacts: [{ path: 'generated.glb', role: 'source' }, { path: 'animated.glb', role: 'animated-output' }],
+    } }).active, true, 'distinct source and output can share a bundle directory')
   } finally { await cleanup() }
 })

@@ -1610,6 +1610,31 @@ export type Viewer3DMotionRetargetArtifactEntry = {
   openMode: 'viewer3d-preview' | 'workspace-preview'
 }
 
+export type Viewer3DKimodoSourceRigFallbackResult = {
+  active: boolean
+  modelUrl: string | null
+  sourceWorkspacePath?: string
+  warnings: string[]
+  artifact?: KimodoMotionArtifact
+  trust?: {
+    trustedContractPresent: false
+    trustedEvidence: {
+      sourceContract: false
+      basis: false
+      axis: false
+      plane: false
+      motion: false
+    }
+  }
+}
+
+export type Viewer3DAuthoringPresentation = {
+  modelUrl: string | null
+  rigSourceWorkspacePath?: string
+  resetKey: { currentJobId?: string, baseModelUrl: string | null }
+  warnings: string[]
+}
+
 export type Viewer3DArtifactPreviewState =
   | { status: 'closed' }
   | {
@@ -2353,6 +2378,8 @@ type Viewer3DMotionRetargetCallbacks = {
 type Viewer3DMotionRetargetPanelOptions = {
   animationPlaybackAvailable?: boolean
   animationPlaybackActive?: boolean
+  fallbackArtifact?: KimodoMotionArtifact
+  warnings?: readonly string[]
 }
 
 export function resolveViewer3DMotionRetargetPanelProps(
@@ -2406,7 +2433,7 @@ export function resolveViewer3DMotionRetargetPanelProps(
     session: state.session,
     selectedSourceBoneId,
     selectedMapping: selectedSourceBoneId && state.session && Object.hasOwn(state.session.mappings, selectedSourceBoneId) ? state.session.mappings[selectedSourceBoneId] : undefined,
-    warnings: dedupeViewer3DWarnings([...state.diagnosticsMessages, ...(state.session?.warnings ?? [])]),
+    warnings: dedupeViewer3DWarnings([...state.diagnosticsMessages, ...(state.session?.warnings ?? []), ...(options.warnings ?? [])]),
     saveDisabledReason: resolveViewer3DMotionRetargetSaveDisabledReason(state),
     exportDisabledReason: resolveViewer3DMotionRetargetPoseClipCompanionDisabledReason(state),
     saveState: state.saveState,
@@ -2421,7 +2448,7 @@ export function resolveViewer3DMotionRetargetPanelProps(
     correctionDirty: state.correctionState.dirty,
     animationPlaybackAvailable: Boolean(options.animationPlaybackAvailable),
     animationPlaybackActive: Boolean(options.animationPlaybackActive),
-    artifactLinks: resolveViewer3DMotionRetargetArtifactEntries(state.session),
+    artifactLinks: resolveViewer3DMotionRetargetArtifactEntries(state.session, options.fallbackArtifact),
     saveMessage: state.saveMessage,
     loadMessage: state.loadMessage,
     exportMessage: state.exportMessage,
@@ -2622,6 +2649,199 @@ export function resolveViewer3DMotionRetargetModelPresentation(args: {
   return { modelUrl: args.defaultModelUrl, warnings }
 }
 
+const VIEWER3D_KIMODO_SOURCE_RIG_FALLBACK_WARNING = 'Kimodo source-rig authoring fallback active because preview output is degraded and no safe animated rig output was available.'
+
+function readViewer3DMetadataString(metadata: Record<string, unknown> | null | undefined, key: string): string | undefined {
+  const value = metadata?.[key]
+  return typeof value === 'string' ? value : undefined
+}
+
+function resolveViewer3DBundleArtifactWorkspacePath(bundleWorkspacePath: string, value: unknown, fallbackName?: string): string | undefined {
+  const artifactName = typeof value === 'string' && value.trim() ? value.trim() : fallbackName
+  if (!artifactName) return undefined
+  const normalized = normalizeViewer3DWorkspacePath(artifactName)
+  if (!normalized || /[%?#]/.test(normalized)) return undefined
+  const workspacePath = normalized.includes('/') ? normalized : `${bundleWorkspacePath}/${normalized}`
+  const safePath = normalizeViewer3DWorkspacePath(workspacePath)
+  return safePath?.startsWith(`${bundleWorkspacePath}/`) ? safePath : undefined
+}
+
+function resolveViewer3DKimodoFallbackSourceWorkspacePath(metadata: Record<string, unknown>, workspaceDir?: string): string | undefined {
+  const paths: Array<string | undefined> = []
+  if (Object.hasOwn(metadata, 'source_workspace_path')) paths.push(normalizeViewer3DWorkspacePath(readViewer3DMetadataString(metadata, 'source_workspace_path')))
+  if (Object.hasOwn(metadata, 'source_rigged_mesh')) paths.push(normalizeServeFileWorkspaceMeshPathFromAbsolutePath(readViewer3DMetadataString(metadata, 'source_rigged_mesh') ?? '', workspaceDir))
+  const source = paths[0]
+  const motion = metadata.kimodo_motion_retarget
+  const contract = motion && typeof motion === 'object' && !Array.isArray(motion) ? (motion as Record<string, unknown>).source_contract : undefined
+  if (contract && typeof contract === 'object' && !Array.isArray(contract)) {
+    for (const key of ['source_mesh_workspace_path', 'sourceMeshWorkspacePath']) {
+      if (Object.hasOwn(contract, key)) paths.push(normalizeViewer3DWorkspacePath(readViewer3DMetadataString(contract as Record<string, unknown>, key)))
+    }
+  }
+  return source && !/[%?#]/.test(source) && isSafeRigSourceWorkspacePath(source) && paths.every(path => path === source) ? source : undefined
+}
+
+function isViewer3DKimodoPreviewOnlyDegradedArtifact(artifact: KimodoMotionArtifact, previewHasUsableRig: boolean): boolean {
+  if (previewHasUsableRig) return false
+  if (!artifact.previewGlbWorkspacePath) return false
+  if (isKimodoAnimatedGlbPreferred(artifact)) return false
+
+  const statuses = [
+    artifact.diagnostics.runtimeStatus,
+    artifact.diagnostics.retargetStatus,
+    artifact.diagnostics.animationMappingStatus,
+    artifact.diagnostics.visualQualityStatus,
+  ].map((status) => status?.toLowerCase()).filter(Boolean)
+
+  return statuses.some((status) => status === 'failed' || status === 'error' || status === 'preview-only' || status === 'degraded')
+}
+
+function createViewer3DKimodoFallbackArtifact(args: {
+  descriptor: Viewer3DKimodoMetadataDescriptor
+  metadata: Record<string, unknown>
+  sourceWorkspacePath?: string
+}): KimodoMotionArtifact {
+  const runtimeStatus = readViewer3DMetadataString(args.metadata, 'runtime_status') ?? readViewer3DMetadataString(args.metadata, 'runtimeStatus')
+  const retargetStatus = readViewer3DMetadataString(args.metadata, 'retarget_status') ?? readViewer3DMetadataString(args.metadata, 'retargetStatus')
+  const animationMappingStatus = readViewer3DMetadataString(args.metadata, 'animation_mapping_status') ?? readViewer3DMetadataString(args.metadata, 'animationMappingStatus')
+  const visualQualityStatus = readViewer3DMetadataString(args.metadata, 'visual_quality_status') ?? readViewer3DMetadataString(args.metadata, 'visualQualityStatus')
+  const warningsValue = args.metadata.warnings
+  const warnings = Array.isArray(warningsValue) ? warningsValue.filter((warning): warning is string => typeof warning === 'string') : []
+  const rawMetadata = structuredClone(args.metadata)
+  delete rawMetadata.pose_clip_sidecar_workspace_path
+  delete rawMetadata.poseClipSidecarWorkspacePath
+
+  return {
+    extensionId: 'kimodo-soma-rp',
+    nodeId: 'animate-rigged-mesh',
+    workflowId: args.descriptor.artifact.provenance?.workflowId,
+    workflowNodeId: args.descriptor.artifact.provenance?.workflowNodeId,
+    sourceMeshWorkspacePath: args.sourceWorkspacePath,
+    previewGlbWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.preview_artifact, 'preview.glb'),
+    animatedGlbWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.animated_artifact),
+    bundleWorkspacePath: args.descriptor.bundleWorkspacePath,
+    metadataWorkspacePath: args.descriptor.metadataWorkspacePath,
+    canonicalMotionArtifactWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.canonical_motion_artifact),
+    motionNpzWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.motion_npz_artifact ?? args.metadata.canonical_motion_artifact, 'motion.npz'),
+    motionBvhWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.motion_bvh_artifact, 'motion.bvh'),
+    diagnostics: {
+      runtimeStatus: runtimeStatus ?? null,
+      retargetStatus: retargetStatus ?? null,
+      solverStatus: readViewer3DMetadataString(args.metadata, 'solver_status') ?? null,
+      basisStatus: readViewer3DMetadataString(args.metadata, 'basis_status') ?? null,
+      rootMotionStatus: readViewer3DMetadataString(args.metadata, 'root_motion_status') ?? null,
+      animationMappingStatus: animationMappingStatus ?? null,
+      stabilizationStatus: readViewer3DMetadataString(args.metadata, 'stabilization_status') ?? null,
+      visualQualityStatus: visualQualityStatus ?? null,
+      sourceKind: readViewer3DMetadataString(args.metadata, 'source_kind') ?? null,
+      mappingConfidence: readViewer3DMetadataString(args.metadata, 'mapping_confidence') ?? null,
+      retargetErrorCode: readViewer3DMetadataString(args.metadata, 'retarget_error_code') ?? null,
+      retargetErrorAliases: [],
+      retargetErrorMessage: readViewer3DMetadataString(args.metadata, 'retarget_error_message') ?? null,
+      warnings,
+      raw: rawMetadata,
+    },
+  }
+}
+
+export function resolveViewer3DKimodoSourceRigFallback(args: {
+  apiUrl: string
+  defaultModelUrl: string | null
+  descriptor?: Viewer3DKimodoMetadataDescriptor
+  metadata?: Record<string, unknown> | null
+  previewHasUsableRig: boolean
+  workspaceDir?: string
+}): Viewer3DKimodoSourceRigFallbackResult {
+  const inactive = (artifact?: KimodoMotionArtifact, warnings: string[] = []): Viewer3DKimodoSourceRigFallbackResult => ({
+    active: false,
+    modelUrl: args.defaultModelUrl,
+    warnings,
+    ...(artifact ? { artifact } : {}),
+  })
+
+  if (!args.descriptor || !args.metadata) return inactive()
+  // Bundle identity permits diagnostic inspection, never solver/rig trust. A
+  // failed status in an arbitrary sibling JSON cannot choose another mesh.
+  if ((Object.hasOwn(args.metadata, 'extension_id') && args.metadata.extension_id !== 'kimodo-soma-rp')
+    || (Object.hasOwn(args.metadata, 'node_id') && args.metadata.node_id !== 'animate-rigged-mesh')) return inactive()
+  if (args.descriptor.detectionMode !== 'provenance'
+    && (args.metadata.extension_id !== 'kimodo-soma-rp' || args.metadata.node_id !== 'animate-rigged-mesh')) return inactive()
+  const displayed = resolveViewer3DWorkspaceMeshPathFromUrl(args.defaultModelUrl, args.apiUrl, args.workspaceDir)
+  const preview = resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.preview_artifact)
+  if (!preview || displayed !== preview || args.descriptor.artifactWorkspacePath !== preview) return inactive()
+
+  const sourceWorkspacePath = resolveViewer3DKimodoFallbackSourceWorkspacePath(args.metadata, args.workspaceDir)
+  const artifact = createViewer3DKimodoFallbackArtifact({ descriptor: args.descriptor, metadata: args.metadata, sourceWorkspacePath })
+  const fallbackWarnings = dedupeViewer3DWarnings([VIEWER3D_KIMODO_SOURCE_RIG_FALLBACK_WARNING, ...artifact.diagnostics.warnings])
+  // Match the adapter's bundle-list path aliases and animated-output roles.
+  // These are negative identity evidence, not a successful retarget contract:
+  // even an incorrectly typed motion output cannot become its own source rig.
+  const listedOutputs = [args.metadata.artifacts, args.metadata.bundle_artifacts]
+    .flatMap((value) => Array.isArray(value) ? value : [])
+    .flatMap((entry: unknown) => {
+      const record = entry && typeof entry === 'object' ? entry as Record<string, unknown> : undefined
+      const path = typeof entry === 'string' ? entry
+        : [record?.path, record?.workspace_path, record?.workspacePath, record?.file_path, record?.filePath, record?.artifact]
+          .find((value): value is string => typeof value === 'string')
+      if (!path) return []
+      const animated = [record?.role, record?.kind, record?.type, record?.output]
+        .some((value) => typeof value === 'string' && /animated/.test(value.toLowerCase()))
+        || path.replace(/\\/g, '/').split('/').at(-1) === 'animated.glb'
+      return animated ? [path] : []
+    })
+  const diagnostics = args.metadata.diagnostics
+  const generatedPaths = [
+    artifact.previewGlbWorkspacePath, artifact.animatedGlbWorkspacePath,
+    artifact.canonicalMotionArtifactWorkspacePath, artifact.motionNpzWorkspacePath, artifact.motionBvhWorkspacePath,
+    args.metadata.preview_artifact, args.metadata.animated_artifact, args.metadata.canonical_motion_artifact,
+    args.metadata.motion_npz_artifact, args.metadata.motion_bvh_artifact,
+    diagnostics && typeof diagnostics === 'object' ? (diagnostics as Record<string, unknown>).bvh_path : undefined,
+    ...listedOutputs,
+  ]
+  const bundleWorkspacePath = args.descriptor.bundleWorkspacePath
+  const sourceIsGenerated = sourceWorkspacePath && generatedPaths.some((value) => typeof value === 'string'
+    && (sourceWorkspacePath === resolveViewer3DBundleArtifactWorkspacePath(bundleWorkspacePath, value)
+      || sourceWorkspacePath === normalizeViewer3DWorkspacePath(value)))
+
+  if (!isViewer3DKimodoPreviewOnlyDegradedArtifact(artifact, args.previewHasUsableRig) || !sourceWorkspacePath
+    || sourceIsGenerated) {
+    return inactive(artifact)
+  }
+
+  const sourceUrl = resolveViewer3DWorkspaceUrl(args.apiUrl, sourceWorkspacePath)
+  if (!sourceUrl) return inactive(artifact)
+  const hasUntrustedTrustMetadata = ['manual_confirmed', 'trusted_contract', 'basis', 'axis', 'plane', 'kimodo_motion_retarget']
+    .some((key) => Object.prototype.hasOwnProperty.call(args.metadata ?? {}, key))
+
+  return {
+    active: true,
+    modelUrl: sourceUrl,
+    sourceWorkspacePath,
+    warnings: fallbackWarnings,
+    artifact,
+    ...(hasUntrustedTrustMetadata ? { trust: {
+      trustedContractPresent: false,
+      trustedEvidence: { sourceContract: false, basis: false, axis: false, plane: false, motion: false },
+    } } : {}),
+  }
+}
+
+export function resolveViewer3DAuthoringPresentation(args: {
+  baseModelUrl: string | null
+  currentJobId?: string
+  rigSourceWorkspacePath?: string
+  motionRetargetPresentation: { modelUrl: string | null, warnings: readonly string[] }
+  sourceRigFallback?: Pick<Viewer3DKimodoSourceRigFallbackResult, 'active' | 'modelUrl' | 'sourceWorkspacePath' | 'warnings'>
+}): Viewer3DAuthoringPresentation {
+  const fallbackActive = Boolean(args.sourceRigFallback?.active && args.sourceRigFallback.modelUrl && args.sourceRigFallback.sourceWorkspacePath)
+  return {
+    modelUrl: fallbackActive ? args.sourceRigFallback!.modelUrl : args.motionRetargetPresentation.modelUrl,
+    rigSourceWorkspacePath: fallbackActive ? args.sourceRigFallback!.sourceWorkspacePath : args.rigSourceWorkspacePath,
+    resetKey: { currentJobId: args.currentJobId, baseModelUrl: args.baseModelUrl },
+    warnings: dedupeViewer3DWarnings([...args.motionRetargetPresentation.warnings, ...(fallbackActive ? args.sourceRigFallback!.warnings : [])]),
+  }
+}
+
 function isKimodoAnimatedGlbPreferred(artifact: KimodoMotionArtifact): boolean {
   if (!artifact.animatedGlbWorkspacePath) return false
   const failedStatuses = new Set(['failed', 'error'])
@@ -2719,15 +2939,16 @@ export async function downloadViewer3DMotionRetargetArtifact({
   })
 }
 
-export function resolveViewer3DMotionRetargetArtifactEntries(session?: MotionRetargetSession): Viewer3DMotionRetargetArtifactEntry[] {
-  if (!session) return []
+export function resolveViewer3DMotionRetargetArtifactEntries(session?: MotionRetargetSession, fallbackArtifact?: KimodoMotionArtifact): Viewer3DMotionRetargetArtifactEntry[] {
+  const sourceArtifact = session?.artifact ?? fallbackArtifact
+  if (!sourceArtifact) return []
 
   const artifacts = [
-    { key: 'metadata', label: 'Metadata JSON', workspacePath: session.artifact.metadataWorkspacePath, openMode: 'workspace-preview' as const },
-    { key: 'animated-glb', label: 'Animated GLB', workspacePath: session.artifact.animatedGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
-    { key: 'preview-glb', label: 'Preview GLB', workspacePath: session.artifact.previewGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
-    { key: 'motion-npz', label: 'Motion NPZ', workspacePath: session.artifact.motionNpzWorkspacePath, openMode: 'workspace-preview' as const },
-    { key: 'motion-bvh', label: 'Motion BVH', workspacePath: session.artifact.motionBvhWorkspacePath, openMode: 'workspace-preview' as const },
+    { key: 'metadata', label: 'Metadata JSON', workspacePath: sourceArtifact.metadataWorkspacePath, openMode: 'workspace-preview' as const },
+    { key: 'animated-glb', label: 'Animated GLB', workspacePath: sourceArtifact.animatedGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
+    { key: 'preview-glb', label: 'Preview GLB', workspacePath: sourceArtifact.previewGlbWorkspacePath, openMode: 'viewer3d-preview' as const },
+    { key: 'motion-npz', label: 'Motion NPZ', workspacePath: sourceArtifact.motionNpzWorkspacePath, openMode: 'workspace-preview' as const },
+    { key: 'motion-bvh', label: 'Motion BVH', workspacePath: sourceArtifact.motionBvhWorkspacePath, openMode: 'workspace-preview' as const },
   ]
 
   return artifacts.flatMap((artifact) => {
@@ -4460,7 +4681,26 @@ export default function Viewer3D({
   motionModelRef.current = motionModel
   const [workspaceRoot, setWorkspaceRoot] = useState<{ context: string; path?: string } | null>(null)
   const workspaceDir = workspaceRoot?.context === motionContext ? workspaceRoot.path : undefined
-  const modelUrl = motionModel?.context === motionContext ? motionModel.url : viewerPresentation.modelUrl
+  // The selected checkpoint, not a previous scene's/global artifact, owns metadata.
+  const kimodoMetadataDescriptor = useMemo(() => resolveViewer3DKimodoMetadataDescriptor({
+    apiUrl, modelUrl: viewerPresentation.modelUrl, workspaceDir,
+    artifact: checkpoint?.substitutionPoint?.inputArtifact,
+  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, checkpoint?.substitutionPoint?.inputArtifact])
+  const descriptorRef = useRef(kimodoMetadataDescriptor)
+  descriptorRef.current = kimodoMetadataDescriptor
+  const [sourceRigDecision, setSourceRigDecision] = useState<{
+    context: string; descriptor: Viewer3DKimodoMetadataDescriptor; preview: LoadedScene
+    metadata: Record<string, unknown>; result: Viewer3DKimodoSourceRigFallbackResult
+  } | null>(null)
+  const sourceRigFallback = sourceRigDecision?.context === motionContext && sourceRigDecision.descriptor === kimodoMetadataDescriptor
+    ? sourceRigDecision : null
+  const selectedMotionModel = motionModel?.context === motionContext ? motionModel : null
+  const authoringPresentation = resolveViewer3DAuthoringPresentation({
+    baseModelUrl: viewerPresentation.modelUrl, currentJobId: currentJob?.id,
+    motionRetargetPresentation: { modelUrl: selectedMotionModel?.url ?? viewerPresentation.modelUrl, warnings: [] },
+    sourceRigFallback: selectedMotionModel?.explicit ? undefined : sourceRigFallback?.result,
+  })
+  const modelUrl = authoringPresentation.modelUrl
   const [motionRetargetState, motionStateRef, setMotionRetargetState] = useCurrentState(createViewer3DMotionRetargetState)
   const [motionRetargetVisibility, motionVisibilityRef, setMotionRetargetVisibility] = useCurrentState(createViewer3DMotionRetargetVisibilityState)
   const [artifactPreviewState, setArtifactPreviewState] = useState(createViewer3DArtifactPreviewState)
@@ -4572,19 +4812,21 @@ export default function Viewer3D({
     setSelected(false); setViewMode('solid'); setPlayingUrl(null); setStoreMeshStats(null)
   }, [modelUrl, setSelected, setStoreMeshStats])
 
-  // Descriptor identity follows the selected per-node checkpoint, never the old global artifact.
-  const kimodoMetadataDescriptor = useMemo(() => resolveViewer3DKimodoMetadataDescriptor({
-    apiUrl, modelUrl: viewerPresentation.modelUrl, workspaceDir,
-    artifact: checkpoint?.substitutionPoint?.inputArtifact,
-  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, checkpoint?.substitutionPoint?.inputArtifact])
-  const descriptorRef = useRef(kimodoMetadataDescriptor)
-  descriptorRef.current = kimodoMetadataDescriptor
   const [semanticMetadata, setSemanticMetadata] = useState<{ source: LoadedScene; context: string; descriptor: Viewer3DKimodoMetadataDescriptor; metadata: Record<string, unknown> } | null>(null)
-  const semanticHydrationSource = useMemo(() => resolveViewer3DSemanticHydrationSource({
-    displayedMeshWorkspacePath: liveSource?.binding.summary.sourceWorkspacePath,
-    descriptor: kimodoMetadataDescriptor, workspaceDir,
-    metadata: semanticMetadata?.source === liveSource && semanticMetadata.context === motionContext && semanticMetadata.descriptor === kimodoMetadataDescriptor ? semanticMetadata.metadata : null,
-  }), [liveSource, kimodoMetadataDescriptor, workspaceDir, semanticMetadata, motionContext])
+  const semanticHydrationSource = useMemo(() => {
+    const displayed = liveSource?.binding.summary.sourceWorkspacePath
+    // Diagnostic source display remains a manual, non-promoting route even
+    // when the source filename is not animated.glb. Physical readers still
+    // validate source/draft receipts and current Bone bindings independently.
+    if (sourceRigFallback && displayed && displayed === sourceRigFallback.result.sourceWorkspacePath) return {
+      displayedMeshWorkspacePath: displayed, semanticSourceWorkspacePath: displayed,
+      sourceKind: 'kimodo-source' as const, warnings: sourceRigFallback.result.warnings, failedClosed: false,
+    }
+    return resolveViewer3DSemanticHydrationSource({
+      displayedMeshWorkspacePath: displayed, descriptor: kimodoMetadataDescriptor, workspaceDir,
+      metadata: semanticMetadata?.source === liveSource && semanticMetadata.context === motionContext && semanticMetadata.descriptor === kimodoMetadataDescriptor ? semanticMetadata.metadata : null,
+    })
+  }, [liveSource, kimodoMetadataDescriptor, workspaceDir, semanticMetadata, motionContext, sourceRigFallback])
   useEffect(() => {
     const reader = window.electron?.settings?.get
     if (!reader || !rigEditorVisibility.isOpen || motionRetargetVisibility.isOpen) return
@@ -4907,6 +5149,7 @@ export default function Viewer3D({
   const motionPanelCurrent = () => motionEventCurrent() && motionVisibilityRef.current.isOpen
   const presentMotionSession = (session: MotionRetargetSession | undefined, explicitPreview?: MotionRetargetPreviewKind) => {
     if (!session) return session
+    if (sourceRigFallback && !selectedMotionModel?.explicit && explicitPreview === undefined) return session
     const presentation = resolveViewer3DMotionRetargetModelPresentation({ defaultModelUrl: modelUrl, apiUrl, session, explicitPreview })
     const path = resolveViewer3DWorkspaceMeshPathFromUrl(presentation.modelUrl, apiUrl, workspaceDir)
     if (!presentation.modelUrl || !path) return session
@@ -4931,16 +5174,40 @@ export default function Viewer3D({
     const reader = globalThis.fetch
     const revision = motionRevision(motionStateRef.current)
     let cancelled = false
-    Promise.resolve().then(() => reader(descriptor.metadataUrl)).then(async response => {
+    // The no-rig decision belongs to the preview's actual Scene, not the
+    // replacement source rig's capability report. Retain that immutable
+    // decision through the authorised switch; panel reopen must not oscillate.
+    const retained = sourceRigFallback && source.binding.summary.sourceWorkspacePath === sourceRigFallback.result.sourceWorkspacePath
+      && !selectedMotionModel?.explicit ? sourceRigFallback : null
+    Promise.resolve().then(async () => {
+      if (retained) return retained.metadata
+      const response = await reader(descriptor.metadataUrl)
       if (!response.ok) throw new Error(`Failed to load Kimodo metadata (${response.status}).`)
       return response.json() as Promise<Record<string, unknown>>
-    }).then(metadata => {
+    }).then(async metadata => {
       if (cancelled || !current()) return
       setSemanticMetadata({ source, context: motionContext, descriptor, metadata })
       const state = motionStateRef.current
       if (motionRevision(state) !== revision && state.session) return
       const rig = rigStateRef.current
       const selection = motionModelRef.current?.context === motionContext ? motionModelRef.current : null
+      if (!retained && !selection?.explicit) {
+        const settingsReader = window.electron?.settings?.get
+        if (!workspaceDir && typeof metadata.source_rigged_mesh === 'string' && settingsReader) {
+          const settings = await settingsReader()
+          if (cancelled || !current() || window.electron?.settings?.get !== settingsReader) return
+          if (settings.workspaceDir) {
+            setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
+            return
+          }
+        }
+        const result = resolveViewer3DKimodoSourceRigFallback({ apiUrl, defaultModelUrl: source.url,
+          descriptor, metadata, workspaceDir, previewHasUsableRig: source.binding.summary.hasRig })
+        if (result.active) {
+          setSourceRigDecision({ context: motionContext, descriptor, preview: source, metadata: structuredClone(metadata), result })
+          return
+        }
+      }
       const hydrated = hydrateViewer3DMotionRetargetSessionFromKimodoMetadata({ descriptor, metadata, summary: source.binding.summary,
         previousSession: state.session, selectedPreview: selection?.selectedPreview,
         renamePlan: rig.renamePlan, rigMetaNamingByBoneId: rig.rigMetaNamingByBoneId })
@@ -5057,13 +5324,27 @@ export default function Viewer3D({
       if (operation.current()) setMotionRetargetState(current => ({ ...current, exportState: operation.unchanged() ? 'error' : 'idle', exportMessage: operation.unchanged() ? ioError(error, 'Failed to export companion.') : undefined }))
     } finally { operation.finish() }
   }
-  const currentArtifact = (artifact: MotionRetargetArtifactLink) => resolveViewer3DMotionRetargetArtifactEntries(motionStateRef.current.session)
+  const fallbackArtifact = liveSource && sourceRigFallback
+    && (liveSource.binding.summary.sourceWorkspacePath === sourceRigFallback.result.sourceWorkspacePath
+      || selectedMotionModel?.explicit) ? sourceRigFallback.result.artifact : undefined
+  const currentArtifact = (artifact: MotionRetargetArtifactLink) => resolveViewer3DMotionRetargetArtifactEntries(motionStateRef.current.session, fallbackArtifact)
     .find(entry => entry.key === artifact.key && entry.workspacePath === artifact.workspacePath)
   const handleOpenMotionRetargetArtifact = async (artifact: MotionRetargetArtifactLink) => {
     if (!motionPanelCurrent()) return
     const entry = currentArtifact(artifact)
     if (!entry) return
-    if (entry.openMode === 'viewer3d-preview') { selectMotionPreview(entry.key === 'animated-glb' ? 'animated-glb' : 'preview-glb'); return }
+    if (entry.openMode === 'viewer3d-preview') {
+      const selectedPreview = entry.key === 'animated-glb' ? 'animated-glb' : 'preview-glb'
+      if (motionStateRef.current.session) selectMotionPreview(selectedPreview)
+      else {
+        const url = resolveViewer3DWorkspaceUrl(apiUrl, entry.workspacePath)
+        if (!url) return
+        motionEpoch.current++; motionIO.current = {}
+        resetMotionUI(); handlePoseClipPreviewReset(); setPlayingUrl(null)
+        setMotionModel({ context: motionContext, url, selectedPreview, explicit: true })
+      }
+      return
+    }
     const reader = window.electron?.workspace?.artifacts?.previewWorkspaceArtifact
     // Supersede only after proving that this callback still owns the panel.
     const operation = beginMotionIO('preview', true)
@@ -5577,6 +5858,8 @@ export default function Viewer3D({
                 }, {
                   animationPlaybackAvailable: hasAnimations,
                   animationPlaybackActive: animationPlaying,
+                  fallbackArtifact,
+                  warnings: authoringPresentation.warnings,
                 }),
               }}
             />

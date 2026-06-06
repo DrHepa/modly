@@ -304,7 +304,7 @@ test('resolveViewer3DOverlayLayout reserves the top-left toolbar area for Free m
   }
 })
 
-test('resolveViewer3DOverlayLayout places RigOverlay bottom-left above minimized Pose/Clip controls only while Pose/Clip is open and minimized', async () => {
+test('resolveViewer3DOverlayLayout treats Pose/Clip as one action rail regardless of legacy drawer mode', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -325,8 +325,7 @@ test('resolveViewer3DOverlayLayout places RigOverlay bottom-left above minimized
       poseClipVisibility: { isOpen: true, skeletonContextId: 'rig:hero|skeleton:0', drawerMode: 'expanded' },
     })
 
-    assert.equal(expandedPoseClipLayout.rigOverlaySafeArea, 'below-top-left-toolbar')
-    assert.equal(expandedPoseClipLayout.rigOverlayClassName, 'left-4 top-24 z-20')
+    assert.deepEqual(expandedPoseClipLayout, minimizedPoseClipLayout)
   } finally {
     await cleanup()
   }
@@ -1820,25 +1819,20 @@ test('Viewer3D owns Pose/Clip state separately from Rig Editor and passes stable
   }
 })
 
-test('Viewer3D routes Pose/Clip tree selection by stable non-root RigBoneId', async () => {
+test('Viewer3D keeps Pose/Clip panel free of duplicate tree selection while reducer remains stable-id safe', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
     let poseState = module.createViewer3DPoseClipState(rigSummary)
-    const selected: string[] = []
+    const panelProps = module.resolveViewer3DPoseClipPanelProps(poseState, {})
 
-    const panelProps = module.resolveViewer3DPoseClipPanelProps(poseState, {
-      onSelectBone: (boneId: string) => selected.push(boneId),
-    })
-
-    panelProps.onSelectBone('rig:hero|skeleton:0|bone:hips#0/spine#0')
+    assert.equal('onSelectBone' in panelProps, false)
     poseState = module.reduceViewer3DPoseClipState(poseState, {
       type: 'select-bone',
       summary: rigSummary,
-      boneId: selected[0],
+      boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
     })
 
-    assert.deepEqual(selected, ['rig:hero|skeleton:0|bone:hips#0/spine#0'])
     assert.equal(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.equal(poseState.plan.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.notEqual(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0')
@@ -1882,7 +1876,7 @@ test('Viewer3D resolves Pose/Clip panel props with manual aliases over UniRig la
       { boneId: 'rig:hero|skeleton:0|bone:hips#0', label: 'UniRig Pelvis', rawLabel: 'Hips', provenance: 'unirig' },
       { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Manual Chest', rawLabel: 'Spine', provenance: 'manual' },
     ])
-    panelProps.onSelectBone('rig:hero|skeleton:0|bone:hips#0')
+    assert.equal('onSelectBone' in panelProps, false)
     assert.equal(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
   } finally {
     await cleanup()
@@ -2169,7 +2163,7 @@ test('Viewer3D shared selected target preserves Pose/Clip selection across panel
   }
 })
 
-test('Viewer3D Pose/Clip drawer minimization preserves selected target and authored plan state', async () => {
+test('Viewer3D Pose/Clip legacy drawer mode changes do not create a distinct normal workflow', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -2211,6 +2205,8 @@ test('Viewer3D Pose/Clip drawer minimization preserves selected target and autho
     assert.equal(visibility.drawerMode, 'expanded')
     assert.equal(expandedProps.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.deepEqual(expandedProps.keyframes.map((keyframe: { id: string }) => keyframe.id), ['kf-spine'])
+    assert.equal(expandedProps.drawerMode, undefined)
+    assert.equal(expandedProps.onDrawerModeChange, undefined)
   } finally {
     await cleanup()
   }
@@ -2829,6 +2825,7 @@ test('Viewer3D minimized Pose/Clip panel props preserve stable capture IDs and d
       poseState,
       {
         drawerMode: 'minimized',
+        onDrawerModeChange: () => calls.push('drawer-mode-changed'),
         onCurrentTimeChange: (timeSeconds: number) => {
           calls.push(`time:${timeSeconds}`)
           poseState = module.reduceViewer3DPoseClipState(poseState, { type: 'set-current-time', timeSeconds })
@@ -2851,7 +2848,8 @@ test('Viewer3D minimized Pose/Clip panel props preserve stable capture IDs and d
       effectiveNaming,
     )
 
-    assert.equal(panelProps.drawerMode, 'minimized')
+    assert.equal(panelProps.drawerMode, undefined)
+    assert.equal(panelProps.onDrawerModeChange, undefined)
     assert.equal(panelProps.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.equal(panelProps.rigDisplayNames.byBoneId['rig:hero|skeleton:0|bone:hips#0/spine#0'].label, 'Manual Chest')
 
@@ -3015,7 +3013,7 @@ test('resolveViewer3DOverlayLayout gives Motion Retarget its own non-overlapping
     await cleanup()
   }
 })
-test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps visibility renderer-local', async () => {
+test('Viewer3D never exposes Motion Retarget toolbar controls in the normal authoring rail', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -3029,18 +3027,14 @@ test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps vis
     assert.equal(hiddenControls, undefined)
 
     let visibility = module.createViewer3DMotionRetargetVisibilityState(rigSummary)
-    const toggles: string[] = []
     const visibleControls = module.resolveViewer3DMotionRetargetToolbarControls({
       modelUrl: 'hero.glb',
       summary: rigSummary,
       visibility,
-      onOpenMotionRetarget: () => toggles.push('toggle'),
+      onOpenMotionRetarget: () => undefined,
     })
 
-    assert.equal(visibleControls.summary, rigSummary)
-    assert.equal(visibleControls.active, false)
-    visibleControls.onOpenMotionRetarget()
-    assert.deepEqual(toggles, ['toggle'])
+    assert.equal(visibleControls, undefined)
 
     visibility = module.reduceViewer3DMotionRetargetVisibilityState(visibility, { type: 'toggle', summary: rigSummary })
     assert.equal(visibility.isOpen, true)
@@ -3052,14 +3046,18 @@ test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps vis
       onOpenMotionRetarget: () => undefined,
     })
 
-    assert.equal(openControls.active, true)
+    assert.equal(openControls, undefined)
     assert.equal(module.createViewer3DRigEditorVisibilityState(rigSummary).isOpen, false)
-    assert.equal(module.createViewer3DPoseClipVisibilityState(rigSummary).isOpen, false)
+    assert.deepEqual(module.createViewer3DPoseClipVisibilityState(rigSummary), {
+      isOpen: false,
+      skeletonContextId: rigSummary.skeletonContextId,
+      drawerMode: 'minimized',
+    })
   } finally {
     await cleanup()
   }
 })
-test('Viewer3D owns Motion Retarget session props separately from Rig Editor and Pose/Clip composition', async () => {
+test('Viewer3D preserves Motion Retarget internals but normal panel render state stays hidden', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -3080,7 +3078,7 @@ test('Viewer3D owns Motion Retarget session props separately from Rig Editor and
       onSelectPreview: (selectedPreview: string) => previews.push(selectedPreview),
     })
 
-    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, true)
+    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, false)
     assert.equal(panelProps.summary, rigSummary)
     assert.equal(panelProps.selectedSourceBoneId, 'source:spine')
     assert.equal(panelProps.session.selectedPreview, 'preview-glb')

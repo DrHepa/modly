@@ -15,7 +15,6 @@ import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
-import { MotionRetargetPanel } from './MotionRetargetPanel'
 import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
 import { RigEditorPanel, type RigEditorHumanoidReviewProps } from './RigEditorPanel'
 import { RigOverlay } from './RigOverlay'
@@ -1632,7 +1631,7 @@ export function createViewer3DPoseClipState(summary?: RigSkeletonSummary): Viewe
 }
 
 export function createViewer3DPoseClipVisibilityState(summary?: RigSkeletonSummary): Viewer3DPoseClipVisibilityState {
-  return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'expanded' }
+  return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'minimized' }
 }
 
 export function createViewer3DMotionRetargetState(summary?: RigSkeletonSummary, session?: MotionRetargetSession): Viewer3DMotionRetargetState {
@@ -2213,7 +2212,10 @@ export function resolveViewer3DMotionRetargetPanelRenderState({
   motionRetargetState: Viewer3DMotionRetargetState
   visibility: Viewer3DMotionRetargetVisibilityState
 }): { shouldRenderPanel: boolean } {
-  return { shouldRenderPanel: Boolean(modelUrl && motionRetargetState.summary && visibility.isOpen) }
+  void modelUrl
+  void motionRetargetState
+  void visibility
+  return { shouldRenderPanel: false }
 }
 
 type Viewer3DMotionRetargetCallbacks = {
@@ -3265,16 +3267,14 @@ export function resolveViewer3DMotionRetargetToolbarControls({
   summary: RigSkeletonSummary
   onOpenMotionRetarget: () => void
 } | undefined {
-  if (!modelUrl || !summary) return undefined
-  return {
-    active: Boolean(summary.hasRig && visibility.isOpen),
-    summary,
-    onOpenMotionRetarget,
-  }
+  void modelUrl
+  void summary
+  void visibility
+  void onOpenMotionRetarget
+  return undefined
 }
 
 type Viewer3DPoseClipCallbacks = {
-  onSelectBone?: (boneId: RigBoneId) => void
   onCurrentTimeChange?: (timeSeconds: number) => void
   onClipMetadataChange?: (metadata: { durationSeconds?: number; fps?: number }) => void
   onCaptureKeyframe?: (boneId: RigBoneId, timeSeconds: number) => void
@@ -3336,7 +3336,6 @@ export function resolveViewer3DPoseClipPanelProps(
   onResetSelectedTarget: (boneId: RigBoneId) => void
   onSaveSidecar: () => void
   onLoadSidecar: () => void
-  onSelectBone: (boneId: RigBoneId) => void
 } {
   return {
     summary: state.summary,
@@ -3353,8 +3352,6 @@ export function resolveViewer3DPoseClipPanelProps(
     warnings: state.warning?.messages.map((message) => ({ kind: 'invalid-sidecar' as const, message })) ?? [],
     saveError: state.saveError,
     loadError: state.loadError,
-    drawerMode: callbacks.drawerMode,
-    onDrawerModeChange: callbacks.onDrawerModeChange,
     onCurrentTimeChange: callbacks.onCurrentTimeChange ?? (() => undefined),
     onClipMetadataChange: callbacks.onClipMetadataChange ?? (() => undefined),
     onCaptureKeyframe: callbacks.onCaptureKeyframe ?? (() => undefined),
@@ -3373,7 +3370,6 @@ export function resolveViewer3DPoseClipPanelProps(
     onResetSelectedTarget: callbacks.onResetSelectedTarget ?? (() => undefined),
     onSaveSidecar: callbacks.onSaveSidecar ?? (() => undefined),
     onLoadSidecar: callbacks.onLoadSidecar ?? (() => undefined),
-    onSelectBone: callbacks.onSelectBone ?? (() => undefined),
   }
 }
 
@@ -4340,7 +4336,7 @@ export function resolveViewer3DOverlayLayout({
 }): Viewer3DOverlayLayout {
   const editRailClassName = modelUrl && hasEditRail ? 'right-4 top-1/2 -translate-y-1/2 z-20' : null
   const rightOverlayClassName = editRailClassName ? 'right-16' : 'right-4'
-  const isPoseClipMinimized = Boolean(poseClipVisibility?.isOpen && poseClipVisibility.drawerMode === 'minimized')
+  const isPoseClipActionRailOpen = Boolean(poseClipVisibility?.isOpen)
   const motionRetargetPanelClassName = motionRetargetVisibility?.isOpen && rigEditorVisibility?.isOpen
     ? `${rightOverlayClassName} top-[22rem]`
     : `${rightOverlayClassName} top-4`
@@ -4356,8 +4352,8 @@ export function resolveViewer3DOverlayLayout({
     poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
     commonViewportUsability: 'capped-internal-scroll',
     hintClassName: rightOverlayClassName,
-    rigOverlayClassName: isPoseClipMinimized ? 'left-4 bottom-24 z-20' : 'left-4 top-24 z-20',
-    rigOverlaySafeArea: isPoseClipMinimized ? 'above-minimized-pose-clip-controls' : 'below-top-left-toolbar',
+    rigOverlayClassName: isPoseClipActionRailOpen ? 'left-4 bottom-24 z-20' : 'left-4 top-24 z-20',
+    rigOverlaySafeArea: isPoseClipActionRailOpen ? 'above-minimized-pose-clip-controls' : 'below-top-left-toolbar',
   }
 }
 
@@ -4458,11 +4454,10 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const sceneEditVisibility = resolveSceneEditControlsVisibility({ modelSource, source: sceneEditSource?.artifact ?? null })
   const canShowSceneEditControls = sceneEditVisibility.visible
   const hasRigEditorRail = Boolean(modelUrl && rigEditorState.summary)
-  const hasMotionRetargetRail = Boolean(modelUrl && motionRetargetState.summary)
   const hasPoseClipRail = Boolean(modelUrl && poseClipState.summary)
   const overlayLayout = resolveViewer3DOverlayLayout({
     modelUrl,
-    hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasMotionRetargetRail || hasPoseClipRail,
+    hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasPoseClipRail,
     poseClipVisibility,
     rigEditorVisibility,
     motionRetargetVisibility,
@@ -4473,7 +4468,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const landmarkMarkers = useMemo(() => resolveViewer3DLandmarkMarkers(landmarkSession?.completed), [landmarkSession?.completed])
   const rigTargetState = resolveViewer3DActiveRigTargetState({ rigEditorState, rigEditorVisibility, poseClipState, poseClipVisibility, selectedTarget: selectedRigTarget })
   const rigEditorPanelRenderState = resolveViewer3DRigEditorPanelRenderState({ modelUrl, rigState: rigEditorState, visibility: rigEditorVisibility })
-  const motionRetargetPanelRenderState = resolveViewer3DMotionRetargetPanelRenderState({ modelUrl, motionRetargetState, visibility: motionRetargetVisibility })
   const poseClipPanelRenderState = resolveViewer3DPoseClipPanelRenderState({ modelUrl, poseState: poseClipState, visibility: poseClipVisibility })
   const rigHydrationWarning = rigRenameHydrationWarning && rigMetaHydrationWarning
     ? { status: 'warning' as const, messages: [...rigRenameHydrationWarning.messages, ...rigMetaHydrationWarning.messages] }
@@ -5513,12 +5507,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 summary: rigEditorState.summary,
                 onOpenRigEditor: () => setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })),
               } : undefined}
-              motionRetargetControls={resolveViewer3DMotionRetargetToolbarControls({
-                modelUrl,
-                summary: motionRetargetState.summary,
-                visibility: motionRetargetVisibility,
-                onOpenMotionRetarget: () => setMotionRetargetVisibility((current) => reduceViewer3DMotionRetargetVisibilityState(current, { type: 'toggle', summary: motionRetargetState.summary })),
-              })}
               poseClipControls={poseClipState.summary ? {
                 active: Boolean(poseClipState.summary.hasRig && poseClipVisibility.isOpen),
                 summary: poseClipState.summary,
@@ -5548,36 +5536,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
             />
             {rigRenameSaveState.status === 'saved' && <p className="mt-2 rounded-lg bg-emerald-500/10 p-2 text-xs text-emerald-200">Saved sidecar: {rigRenameSaveState.sidecarWorkspacePath}</p>}
             {rigRenameSaveState.status === 'error' && <p className="mt-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-200">{rigRenameSaveState.message}</p>}
-          </div>
-        )}
-
-        {motionRetargetPanelRenderState.shouldRenderPanel && (
-          <div className={`absolute ${overlayLayout.motionRetargetPanelClassName} bottom-4 z-20 w-80 max-w-[calc(100%-5rem)]`}>
-            <MotionRetargetPanel
-              {...{
-                ...resolveViewer3DMotionRetargetPanelProps(motionRetargetState, {
-                  onSelectSourceBone: (sourceBoneId) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'select-source-bone', sourceBoneId })),
-                  onChangeMapping: (sourceBoneId, targetBoneId) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-mapping', sourceBoneId, targetBoneId })),
-                  onSelectPreview: (selectedPreview) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-preview', selectedPreview })),
-                  onSaveSidecar: handleSaveMotionRetargetSidecar,
-                  onLoadSidecar: handleLoadMotionRetargetSidecar,
-                  onExportPoseClipCompanion: handleExportMotionRetargetPoseClipCompanion,
-                  onOpenArtifact: handleOpenMotionRetargetArtifact,
-                  onDownloadArtifact: handleDownloadMotionRetargetArtifact,
-                  onPlayPreview: handlePlayMotionRetargetPreview,
-                  onPausePreview: handlePauseMotionRetargetPreview,
-                  onResetPreview: handleResetMotionRetargetPreview,
-                  onScrubPreview: handleScrubMotionRetargetPreview,
-                  onChangeCorrections: (corrections) => setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'set-corrections', corrections })),
-                  onToggleAnimationPlayback: () => setAnimationPlaying((current) => hasAnimations ? !current : false),
-                }, {
-                  animationPlaybackAvailable: hasAnimations,
-                  animationPlaybackActive: animationPlaying,
-                  fallbackArtifact: sourceRigFallback.active ? sourceRigFallback.artifact : undefined,
-                  warnings: authoringPresentation.warnings,
-                }),
-              }}
-            />
           </div>
         )}
 
@@ -5614,7 +5572,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
           <div className={`absolute ${overlayLayout.poseClipPanelClassName} z-20 max-w-[calc(100%-5rem)]`}>
             <PoseClipPanel
               {...resolveViewer3DPoseClipPanelProps({ ...poseClipState, selectedBoneId: rigTargetState.selectedBoneId }, {
-                onSelectBone: handleSelectPoseClipBone,
                 onCurrentTimeChange: handlePoseClipCurrentTimeChange,
                 onClipMetadataChange: handlePoseClipMetadataChange,
                 onCaptureKeyframe: handleCapturePoseClipKeyframe,
@@ -5651,8 +5608,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 onResetSelectedTarget: handleResetPoseClipSelectedTarget,
                 onSaveSidecar: handleSavePoseClipSidecar,
                 onLoadSidecar: handleLoadPoseClipSidecar,
-                drawerMode: poseClipVisibility.drawerMode,
-                onDrawerModeChange: (drawerMode) => setPoseClipVisibility((current) => reduceViewer3DPoseClipVisibilityState(current, { type: 'set-drawer-mode', drawerMode })),
               }, rigEffectiveNaming)}
             />
           </div>

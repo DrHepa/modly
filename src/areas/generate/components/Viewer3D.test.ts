@@ -321,7 +321,7 @@ test('resolveViewer3DOverlayLayout reserves the top-left toolbar area for Free m
   }
 })
 
-test('resolveViewer3DOverlayLayout places RigOverlay bottom-left above minimized Pose/Clip controls only while Pose/Clip is open and minimized', async () => {
+test('resolveViewer3DOverlayLayout treats Pose/Clip as one action rail regardless of legacy drawer mode', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -342,8 +342,7 @@ test('resolveViewer3DOverlayLayout places RigOverlay bottom-left above minimized
       poseClipVisibility: { isOpen: true, skeletonContextId: 'rig:hero|skeleton:0', drawerMode: 'expanded' },
     })
 
-    assert.equal(expandedPoseClipLayout.rigOverlaySafeArea, 'below-top-left-toolbar')
-    assert.equal(expandedPoseClipLayout.rigOverlayClassName, 'left-4 top-24 z-20')
+    assert.deepEqual(expandedPoseClipLayout, minimizedPoseClipLayout)
   } finally {
     await cleanup()
   }
@@ -1842,25 +1841,20 @@ test('Viewer3D owns Pose/Clip state separately from Rig Editor and passes stable
   }
 })
 
-test('Viewer3D routes Pose/Clip tree selection by stable non-root RigBoneId', async () => {
+test('Viewer3D keeps Pose/Clip panel free of duplicate tree selection while reducer remains stable-id safe', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
     let poseState = module.createViewer3DPoseClipState(rigSummary)
-    const selected: string[] = []
+    const panelProps = module.resolveViewer3DPoseClipPanelProps(poseState, {})
 
-    const panelProps = module.resolveViewer3DPoseClipPanelProps(poseState, {
-      onSelectBone: (boneId: string) => selected.push(boneId),
-    })
-
-    panelProps.onSelectBone('rig:hero|skeleton:0|bone:hips#0/spine#0')
+    assert.equal('onSelectBone' in panelProps, false)
     poseState = module.reduceViewer3DPoseClipState(poseState, {
       type: 'select-bone',
       summary: rigSummary,
-      boneId: selected[0],
+      boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0',
     })
 
-    assert.deepEqual(selected, ['rig:hero|skeleton:0|bone:hips#0/spine#0'])
     assert.equal(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.equal(poseState.plan.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.notEqual(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0')
@@ -1904,7 +1898,7 @@ test('Viewer3D resolves Pose/Clip panel props with manual aliases over UniRig la
       { boneId: 'rig:hero|skeleton:0|bone:hips#0', label: 'UniRig Pelvis', rawLabel: 'Hips', provenance: 'unirig' },
       { boneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0', label: 'Manual Chest', rawLabel: 'Spine', provenance: 'manual' },
     ])
-    panelProps.onSelectBone('rig:hero|skeleton:0|bone:hips#0')
+    assert.equal('onSelectBone' in panelProps, false)
     assert.equal(poseState.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
   } finally {
     await cleanup()
@@ -2191,7 +2185,7 @@ test('Viewer3D shared selected target preserves Pose/Clip selection across panel
   }
 })
 
-test('Viewer3D Pose/Clip drawer minimization preserves selected target and authored plan state', async () => {
+test('Viewer3D Pose/Clip legacy drawer mode changes do not create a distinct normal workflow', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -2233,6 +2227,8 @@ test('Viewer3D Pose/Clip drawer minimization preserves selected target and autho
     assert.equal(visibility.drawerMode, 'expanded')
     assert.equal(expandedProps.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.deepEqual(expandedProps.keyframes.map((keyframe: { id: string }) => keyframe.id), ['kf-spine'])
+    assert.equal(expandedProps.drawerMode, undefined)
+    assert.equal(expandedProps.onDrawerModeChange, undefined)
   } finally {
     await cleanup()
   }
@@ -2851,6 +2847,7 @@ test('Viewer3D minimized Pose/Clip panel props preserve stable capture IDs and d
       poseState,
       {
         drawerMode: 'minimized',
+        onDrawerModeChange: () => calls.push('drawer-mode-changed'),
         onCurrentTimeChange: (timeSeconds: number) => {
           calls.push(`time:${timeSeconds}`)
           poseState = module.reduceViewer3DPoseClipState(poseState, { type: 'set-current-time', timeSeconds })
@@ -2873,7 +2870,8 @@ test('Viewer3D minimized Pose/Clip panel props preserve stable capture IDs and d
       effectiveNaming,
     )
 
-    assert.equal(panelProps.drawerMode, 'minimized')
+    assert.equal(panelProps.drawerMode, undefined)
+    assert.equal(panelProps.onDrawerModeChange, undefined)
     assert.equal(panelProps.selectedBoneId, 'rig:hero|skeleton:0|bone:hips#0/spine#0')
     assert.equal(panelProps.rigDisplayNames.byBoneId['rig:hero|skeleton:0|bone:hips#0/spine#0'].label, 'Manual Chest')
 
@@ -3037,7 +3035,7 @@ test('resolveViewer3DOverlayLayout gives Motion Retarget its own non-overlapping
     await cleanup()
   }
 })
-test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps visibility renderer-local', async () => {
+test('Viewer3D never exposes Motion Retarget toolbar controls in the normal authoring rail', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -3051,18 +3049,14 @@ test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps vis
     assert.equal(hiddenControls, undefined)
 
     let visibility = module.createViewer3DMotionRetargetVisibilityState(rigSummary)
-    const toggles: string[] = []
     const visibleControls = module.resolveViewer3DMotionRetargetToolbarControls({
       modelUrl: 'hero.glb',
       summary: rigSummary,
       visibility,
-      onOpenMotionRetarget: () => toggles.push('toggle'),
+      onOpenMotionRetarget: () => undefined,
     })
 
-    assert.equal(visibleControls.summary, rigSummary)
-    assert.equal(visibleControls.active, false)
-    visibleControls.onOpenMotionRetarget()
-    assert.deepEqual(toggles, ['toggle'])
+    assert.equal(visibleControls, undefined)
 
     visibility = module.reduceViewer3DMotionRetargetVisibilityState(visibility, { type: 'toggle', summary: rigSummary })
     assert.equal(visibility.isOpen, true)
@@ -3074,14 +3068,18 @@ test('Viewer3D gates Motion Retarget toolbar entry by loaded model and keeps vis
       onOpenMotionRetarget: () => undefined,
     })
 
-    assert.equal(openControls.active, true)
+    assert.equal(openControls, undefined)
     assert.equal(module.createViewer3DRigEditorVisibilityState(rigSummary).isOpen, false)
-    assert.equal(module.createViewer3DPoseClipVisibilityState(rigSummary).isOpen, false)
+    assert.deepEqual(module.createViewer3DPoseClipVisibilityState(rigSummary), {
+      isOpen: false,
+      skeletonContextId: rigSummary.skeletonContextId,
+      drawerMode: 'minimized',
+    })
   } finally {
     await cleanup()
   }
 })
-test('Viewer3D owns Motion Retarget session props separately from Rig Editor and Pose/Clip composition', async () => {
+test('Viewer3D preserves Motion Retarget internals but normal panel render state stays hidden', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -3102,7 +3100,7 @@ test('Viewer3D owns Motion Retarget session props separately from Rig Editor and
       onSelectPreview: (selectedPreview: string) => previews.push(selectedPreview),
     })
 
-    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, true)
+    assert.equal(module.resolveViewer3DMotionRetargetPanelRenderState({ modelUrl: 'hero.glb', motionRetargetState: motionState, visibility }).shouldRenderPanel, false)
     assert.equal(panelProps.summary, rigSummary)
     assert.equal(panelProps.selectedSourceBoneId, 'source:spine')
     assert.equal(panelProps.session.selectedPreview, 'preview-glb')
@@ -5970,7 +5968,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     completeness: { requiredRolesMissing: [], score: 1 }, diagnostics: [],
   })
   async function mount(t: any, options: {
-    metadata?: Record<string, unknown>; ports?: Record<string, unknown>; rig?: boolean; settings?: any; fetch?: () => any
+    metadata?: Record<string, unknown>; ports?: Record<string, unknown>; rig?: boolean; settings?: any; fetch?: () => any; initialUrl?: string; previewRig?: boolean
   } = {}) {
     const directory = await mkdtemp(path.join(tmpdir(), 'viewer-fallback-mount-'))
     const saved = new Map<string, PropertyDescriptor | undefined>()
@@ -6034,7 +6032,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       } }],
     })
     const { Viewer3D, useAppStore, useWorkflowRunStore, harness } = await import(pathToFileURL(outfile).href)
-    const preview = asset(harness, previewUrl, false), source = asset(harness, sourceUrl, options.rig !== false)
+    const preview = asset(harness, options.initialUrl ?? previewUrl, options.previewRig ?? false), source = asset(harness, sourceUrl, options.rig !== false)
     asset(harness, animatedUrl)
     Object.assign(window, { electron: { settings: options.settings, workspace: { artifacts: {
       readRigMetaSidecar: async () => ({ success: true, status: 'not-found', rigMetaWorkspacePath: 'absent.rigmeta.json' }),
@@ -6045,7 +6043,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     const host: Host = { type: 'root', props: {}, children: [] }
     const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
     const job = (url: string) => useAppStore.getState().setCurrentJob({ id: url, status: 'done', outputUrl: url, imageFile: '', progress: 100, createdAt: 0 })
-    useAppStore.setState({ apiUrl: '' }); job(previewUrl)
+    useAppStore.setState({ apiUrl: '' }); job(options.initialUrl ?? previewUrl)
     const render = () => flush(() => renderer.updateContainer(createElement(Viewer3D), root, null))
     unmount = () => flush(() => renderer.updateContainer(null, root, null))
     const component = (name: string): any => {
@@ -6058,7 +6056,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     })
     render(); await settle()
     return { host, harness, source, preview, component, click, render, useWorkflowRunStore, fetches,
-      switchTo: (url: string) => flush(() => job(url)), panel: () => component('MotionRetargetPanel') }
+      switchTo: (url: string) => flush(() => job(url)), panel: () => component('PoseClipPanel') }
   }
 
   // A typed output with an invalid suffix is still an output declaration,
@@ -6087,57 +6085,46 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     await settle()
     assert.equal(view.component('GltfMeshModel').url, colocated)
     assert.equal(view.component('SceneMeshModel').scene, source.scene)
-    view.click('Open Motion Retarget (2 bones)'); await settle()
-    assert.equal(view.panel().session, undefined)
-    assert.deepEqual(view.panel().artifactLinks.map((entry: any) => entry.key), ['metadata', 'preview-glb', 'motion-npz', 'motion-bvh'])
-    assert.match(view.panel().warnings.join(' '), /source-rig authoring fallback/)
-    assert.ok(view.panel().saveDisabledReason)
     view.click('Open Rig Editor (2 bones)'); await settle()
     const rig = () => view.component('RigEditorPanel')
     const id = rig().summary.bones.find((bone: any) => bone.originalName === 'root').boneId
     flush(() => rig().onSelectBone(id)); flush(() => rig().onAliasChange(id, 'Authored Alias'))
     const bones = [...source.mesh.skeleton.bones], names = bones.map(bone => bone.name)
-    view.click('Close Motion Retarget (2 bones)'); await settle()
-    view.click('Open Motion Retarget (2 bones)'); await settle()
+    assert.ok(find(view.host, node => node.type === '#text' && /source-rig authoring fallback/.test(String(node.props.text))))
+    view.click('Close Rig Editor (2 bones)'); await settle()
+    view.click('Open Rig Editor (2 bones)'); await settle()
     assert.equal(view.component('SceneMeshModel').scene, source.scene)
     assert.equal(rig().aliasesDirty, true); assert.equal(rig().effectiveNaming.byBoneId[id].label, 'Authored Alias')
     assert.equal(rig().humanoidReview.presentation.canPromote, false)
     assert.deepEqual(source.mesh.skeleton.bones, bones); assert.deepEqual(bones.map(bone => bone.name), names)
     assert.equal(view.fetches.length, 1, 'source hasRig and panel visibility do not revoke the preview decision')
   })
-  await suite.test('no-session dispatch rejects forged/stale callbacks and explicit preview survives refreshed metadata', async t => {
-    const previews: any[] = [], downloads: any[] = [], refreshed = deferred(); let count = 0
-    const view = await mount(t, { fetch: () => ++count === 1 ? Promise.resolve(response()) : refreshed.promise, ports: {
-      previewWorkspaceArtifact: async (request: any) => { previews.push(request); return { success: false, error: 'Diagnostic fixture' } },
-      downloadWorkspaceArtifact: async (request: any) => { downloads.push(request); return { success: true } },
-    } })
-    view.click('Open Motion Retarget (2 bones)'); await settle()
-    const old = view.panel(), metadata = old.artifactLinks.find((entry: any) => entry.key === 'metadata')
-    const npz = old.artifactLinks.find((entry: any) => entry.key === 'motion-npz')
-    await old.onOpenArtifact(metadata); await settle(); await view.panel().onDownloadArtifact(npz); await settle()
-    assert.deepEqual(previews, [{ workspacePath: 'Workflows/kimodo/run/metadata.json' }])
-    assert.deepEqual(downloads, [{ workspacePath: 'Workflows/kimodo/run/motion.npz', suggestedName: 'motion.npz' }])
-    await view.panel().onOpenArtifact({ ...metadata, workspacePath: 'Workflows/unlisted.json' })
-    await view.panel().onDownloadArtifact({ ...npz, workspacePath: 'Workflows/unlisted.npz' }); await settle()
-    view.click('Close Motion Retarget (2 bones)'); await settle(); view.click('Open Motion Retarget (2 bones)'); await settle()
-    await old.onOpenArtifact(metadata); await old.onDownloadArtifact(npz); await settle()
-    assert.equal(previews.length, 1); assert.equal(downloads.length, 1)
-    flush(() => view.panel().onOpenArtifact(view.panel().artifactLinks.find((entry: any) => entry.key === 'preview-glb'))); await settle()
-    refreshed.resolve(response()); await settle()
-    assert.equal(view.component('GltfMeshModel').url, previewUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene)
-    assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+  await suite.test('compact Pose Clip rail shares Rig Editor targets and acts on actual source Bones without retired surfaces', async t => {
+    const view = await mount(t)
+    assert.equal(find(view.host, node => /Motion Retarget/.test(String(node.props.title))), undefined)
+    assert.equal(view.component('ViewerEditToolbar').motionRetargetControls, undefined)
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    const rig = view.component('RigEditorPanel')
+    const id = rig.summary.bones.find((bone: any) => bone.originalName === 'child').boneId
+    flush(() => rig.onSelectBone(id))
+    view.click('Open Pose/Clip (2 bones)'); await settle()
+    assert.equal(view.panel().selectedBoneId, id)
+    const original = view.source.child.quaternion.clone()
+    view.click('Rotate selected target +X')
+    assert.equal(view.source.child.quaternion.equals(original), false)
+    view.click('Capture pose keyframe')
+    assert.equal(view.panel().keyframes.length, 1)
+    assert.equal(view.panel().keyframes[0].boneId, id)
+    view.click('Play Pose/Clip preview'); assert.equal(view.panel().previewState, 'playing')
+    view.click('Pause Pose/Clip preview'); assert.equal(view.panel().previewState, 'paused')
+    view.click('Reset selected target pose'); assert.equal(view.source.child.quaternion.equals(original), true)
+    view.click('Reset Pose/Clip preview'); assert.equal(view.panel().currentTimeSeconds, 0)
+    assert.equal(view.panel().canSaveSidecar, false, 'No physical writer means no save capability')
+    assert.equal(find(view.host, node => node.props.title === 'Expand Pose/Clip drawer'), undefined)
+    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
   })
-  await suite.test('explicit animated selection survives refreshed degraded metadata', async t => {
-    const refreshed = deferred(); let count = 0
-    const metadata = degraded({ animated_artifact: 'animated.glb' })
-    const view = await mount(t, { fetch: () => ++count === 1 ? Promise.resolve(response(metadata)) : refreshed.promise })
-    view.click('Open Motion Retarget (2 bones)'); await settle()
-    flush(() => view.panel().onOpenArtifact(view.panel().artifactLinks.find((entry: any) => entry.key === 'animated-glb'))); await settle()
-    refreshed.resolve(response(metadata)); await settle()
-    assert.equal(view.component('GltfMeshModel').url, animatedUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.harness.gltf.get(animatedUrl).scene)
-  })
+  // Explicit Motion Retarget artifact-preview/animated-selection dispatch was
+  // removed in original57. Its helper tests above remain; no hidden UI is rebuilt.
   await suite.test('same-URL preview Scene replacement retires old no-rig metadata capability', async t => {
     const first = deferred(), second = deferred(); let count = 0
     const view = await mount(t, { fetch: () => ++count === 1 ? first.promise : second.promise })
@@ -6170,6 +6157,36 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     assert.equal(view.component('GltfMeshModel').url, sourceUrl)
     assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
   })
+  await suite.test('automatic no-rig serve-file fallback discovers the configured root without opening a panel', async t => {
+    const root = path.join(tmpdir(), 'configured-workspace'), reads: string[] = []
+    const initialUrl = `/optimize/serve-file?path=${encodeURIComponent(path.join(root, 'Workflows/kimodo/run/preview.glb'))}`
+    const view = await mount(t, { initialUrl, settings: { get: async () => { reads.push(root); return { workspaceDir: root } } } })
+    await settle()
+    assert.equal(reads.length, 1)
+    assert.equal(view.component('GltfMeshModel').url, sourceUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(find(view.host, node => node.props['aria-label'] === 'Pose/Clip action rail'), undefined)
+    assert.equal(view.component('ViewerEditToolbar').motionRetargetControls, undefined)
+  })
+  await suite.test('Rig Editor independently discovers a serve-file rig root and enables physical alias custody', async t => {
+    const root = path.join(tmpdir(), 'configured-workspace'), reads: string[] = [], writes: any[] = []
+    const initialUrl = `/optimize/serve-file?path=${encodeURIComponent(path.join(root, 'Workflows/rig.glb'))}`
+    const view = await mount(t, { initialUrl, previewRig: true, metadata: { extension_id: 'unrelated' },
+      settings: { get: async () => { reads.push(root); return { workspaceDir: root } } },
+      ports: { writeRigRenameSidecar: async (request: any) => { writes.push(request); return { success: true, sidecarWorkspacePath: request.sidecarWorkspacePath } } } })
+    assert.equal(reads.length, 0)
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    assert.equal(reads.length, 1)
+    // Resolving physical custody replaces the formerly pathless binding and
+    // retires its panel; reopen only the newly source-backed editor.
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    assert.equal(reads.length, 1)
+    const rig = () => view.component('RigEditorPanel'), id = rig().summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+    assert.equal(rig().summary.sourceWorkspacePath, 'Workflows/rig.glb')
+    flush(() => rig().onAliasChange(id, 'Configured Root')); await rig().onSaveAliases(); await settle()
+    assert.equal(writes.length, 1); assert.equal(writes[0].sourceWorkspacePath, 'Workflows/rig.glb')
+    assert.equal(view.component('GltfMeshModel').url, initialUrl)
+  })
   await suite.test('retired job metadata cannot select a source', async t => {
     const retired = deferred()
     const view = await mount(t, { fetch: () => retired.promise })
@@ -6179,26 +6196,131 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     retired.resolve(response()); await settle()
     assert.equal(view.component('GltfMeshModel').url, '/other.glb')
   })
-  await suite.test('pending artifact result and callbacks retire with same-URL source Scene and execution', async t => {
-    const result = deferred(), previews: any[] = [], downloads: any[] = []
+  for (const replacementKind of ['scene', 'execution', 'port'] as const) {
+    await suite.test(`Pose Clip read and retained callbacks retire on ${replacementKind} replacement`, async t => {
+      const result = deferred(), reads: any[] = []
+      const view = await mount(t, { ports: { readPoseClipSidecar: (request: any) => { reads.push(request); return reads.length === 1 ? Promise.resolve({ success: true, status: 'not-found', sidecarWorkspacePath: 'absent.json' }) : result.promise } } })
+      view.click('Open Rig Editor (2 bones)'); await settle()
+      const rig = view.component('RigEditorPanel'), id = rig.summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+      flush(() => rig.onSelectBone(id)); view.click('Open Pose/Clip (2 bones)'); await settle()
+      const old = view.panel(), count = reads.length
+      const pending = old.onLoadSidecar(); await settle()
+      assert.equal(reads.length, count + 1)
+      if (replacementKind === 'scene') { asset(view.harness, sourceUrl); view.render(); await settle() }
+      else if (replacementKind === 'execution') { flush(() => view.useWorkflowRunStore.setState({ executionId: 'new-execution' })); await settle() }
+      else { window.electron!.workspace.artifacts.readPoseClipSidecar = async () => ({ success: false, status: 'error', error: 'New reader' }); view.render(); await settle() }
+      const callsAfterReplacement = reads.length
+      result.resolve({ success: false, error: 'Retired pose operation' }); await pending; await settle()
+      assert.equal(find(view.host, node => node.type === '#text' && String(node.props.text).includes('Retired pose operation')), undefined)
+      await old.onLoadSidecar(); flush(() => old.onRotateSelectedTarget(id, 'x', 30)); await settle()
+      assert.equal(reads.length, callsAfterReplacement)
+      assert.equal(view.harness.gltf.get(sourceUrl).scene.children[0].quaternion.x, 0)
+      if (replacementKind === 'port') {
+        const state = view.panel()
+        flush(() => { old.onCurrentTimeChange(1); old.onPreviewPause(); old.onPreviewReset(); old.onResetSelectedTarget(id) })
+        assert.equal(view.panel().currentTimeSeconds, state.currentTimeSeconds)
+        assert.equal(view.panel().previewState, state.previewState)
+      }
+    })
+  }
+  await suite.test('Pose Clip writer replacement retires pending completion and allows a current retry', async t => {
+    const pending = deferred(), oldWrites: any[] = [], newWrites: any[] = []
+    const view = await mount(t, { ports: { writePoseClipSidecar: (request: any) => { oldWrites.push(request); return pending.promise } } })
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    const rig = view.component('RigEditorPanel'), id = rig.summary.bones.find((bone: any) => bone.originalName === 'root').boneId
+    flush(() => rig.onSelectBone(id)); view.click('Open Pose/Clip (2 bones)'); view.click('Capture pose keyframe')
+    const old = view.panel(), save = old.onSaveSidecar(); await settle()
+    assert.equal(oldWrites.length, 1); assert.equal(view.panel().saveState, 'saving')
+    window.electron!.workspace.artifacts.writePoseClipSidecar = async request => { newWrites.push(request); return { success: true, sidecarWorkspacePath: request.sidecarWorkspacePath, sidecar: request.sidecar } }
+    view.render(); await settle()
+    assert.equal(view.panel().saveState, 'idle'); assert.equal(view.panel().canSaveSidecar, true)
+    await old.onSaveSidecar(); assert.equal(newWrites.length, 0)
+    await view.panel().onSaveSidecar(); await settle()
+    assert.equal(newWrites.length, 1); assert.equal(view.panel().saveState, 'saved')
+    pending.resolve({ success: false, error: 'Retired writer failure' }); await save; await settle()
+    assert.equal(view.panel().saveState, 'saved'); assert.equal(view.panel().saveError, undefined)
+    assert.equal(view.panel().keyframes[0].boneId, id)
+  })
+  for (const persistedResult of ['not-found', 'found'] as const) {
+    for (const release of ['reset', 'close'] as const) {
+      for (const port of ['reader', 'writer'] as const) {
+        await suite.test(`Pose Clip dirty authoring survives ${port} replacement after ${release} with ${persistedResult} sidecar`, async t => {
+          let persisted: any, reads = 0, writes = 0
+          const reader = async () => {
+            reads++
+            return persisted
+              ? { success: true as const, status: 'found' as const, sidecarWorkspacePath: 'fixture.json', sidecar: persisted }
+              : { success: true as const, status: 'not-found' as const, sidecarWorkspacePath: 'absent.json' }
+          }
+          const writer = async (request: any) => {
+            writes++; persisted = request.sidecar
+            return { success: true as const, sidecarWorkspacePath: request.sidecarWorkspacePath, sidecar: request.sidecar }
+          }
+          const view = await mount(t, { ports: { readPoseClipSidecar: reader, writePoseClipSidecar: writer } })
+          view.click('Open Rig Editor (2 bones)'); await settle()
+          const rig = view.component('RigEditorPanel'), id = rig.summary.bones[0].boneId
+          flush(() => rig.onSelectBone(id)); view.click('Open Pose/Clip (2 bones)')
+          assert.equal(view.panel().canSaveSidecar, false, 'Initial empty plan is clean')
+          view.click('Rotate selected target +X'); view.click('Capture pose keyframe')
+          if (persistedResult === 'found') {
+            view.click('Save pose clip sidecar'); await settle()
+            assert.equal(writes, 1); assert.equal(view.panel().saveState, 'saved')
+            assert.equal(view.panel().canSaveSidecar, false)
+            const scrub = find(view.host, node => node.type === 'input' && node.props.title === 'Current time scrubber')!
+            flush(() => scrub.props.onChange({ currentTarget: { valueAsNumber: 1 } }))
+            view.click('Rotate selected target +Y'); view.click('Capture pose keyframe')
+          }
+          const authored = structuredClone(view.panel().keyframes)
+          assert.equal(authored.length, persistedResult === 'found' ? 2 : 1)
+          assert.equal(view.panel().canSaveSidecar, true, 'Positive dirty capability before releasing preview ownership')
+          view.click(release === 'reset' ? 'Reset Pose/Clip preview' : 'Close Pose/Clip (2 bones)'); await settle()
+          const readsBefore = reads
+          if (port === 'reader') window.electron!.workspace.artifacts.readPoseClipSidecar = () => reader()
+          else window.electron!.workspace.artifacts.writePoseClipSidecar = request => writer(request)
+          view.render(); await settle()
+          if (release === 'close') view.click('Open Pose/Clip (2 bones)')
+          assert.deepEqual(view.panel().keyframes, authored, 'Port replacement is not explicit Load')
+          assert.equal(view.panel().canSaveSidecar, true, 'Missing sidecars must not certify dirty authoring as saved')
+          assert.equal(reads, readsBefore + 1, 'A current automatic read completed without applying over dirty authoring')
+          assert.equal(view.panel().saveState, 'idle'); assert.equal(view.panel().loadState, 'idle')
+          assert.equal(view.panel().canLoadSidecar, true)
+          view.click('Load pose clip sidecar'); await settle()
+          assert.equal(reads, readsBefore + 2, 'Explicit Load remains available through the current reader')
+          assert.equal(view.panel().keyframes.length, 1)
+          assert.equal(view.panel().canSaveSidecar, persistedResult === 'not-found', 'Only a found explicit Load advances the baseline')
+          if (persistedResult === 'not-found') {
+            assert.deepEqual(view.panel().keyframes, authored)
+            view.click('Save pose clip sidecar'); await settle()
+            assert.equal(writes, 1); assert.equal(view.panel().saveState, 'saved')
+            assert.equal(view.panel().canSaveSidecar, false)
+          }
+        })
+      }
+    }
+  }
+  await suite.test('Pose Clip automatically hydrates a clean newly loaded Scene from the saved sidecar', async t => {
+    let persisted: any, reads = 0
     const view = await mount(t, { ports: {
-      previewWorkspaceArtifact: (request: any) => { previews.push(request); return result.promise },
-      downloadWorkspaceArtifact: async (request: any) => { downloads.push(request); return { success: true } },
+      readPoseClipSidecar: async () => { reads++; return persisted
+        ? { success: true, status: 'found', sidecarWorkspacePath: 'fixture.json', sidecar: persisted }
+        : { success: true, status: 'not-found', sidecarWorkspacePath: 'absent.json' } },
+      writePoseClipSidecar: async (request: any) => { persisted = request.sidecar; return { success: true, sidecarWorkspacePath: request.sidecarWorkspacePath, sidecar: request.sidecar } },
     } })
-    view.click('Open Motion Retarget (2 bones)'); await settle()
-    const old = view.panel(), link = old.artifactLinks.find((entry: any) => entry.key === 'metadata')
-    const operation = old.onOpenArtifact(link); await settle(); assert.equal(previews.length, 1)
-    const replacement = asset(view.harness, sourceUrl); view.render(); await settle()
-    result.resolve({ success: false, error: 'Retired preview operation' }); await operation; await settle()
-    assert.equal(find(view.host, node => node.type === '#text' && String(node.props.text).includes('Retired preview operation')), undefined)
-    await old.onDownloadArtifact(link); await settle(); assert.equal(downloads.length, 0)
-    view.click('Open Motion Retarget (2 bones)'); await settle()
-    const current = view.panel()
-    await current.onDownloadArtifact(link); await settle()
-    assert.deepEqual(downloads, [{ workspacePath: 'Workflows/kimodo/run/metadata.json', suggestedName: 'metadata.json' }])
-    assert.equal(view.component('SceneMeshModel').scene, replacement.scene)
-    flush(() => view.useWorkflowRunStore.setState({ executionId: 'replacement-execution' })); await settle()
-    await current.onDownloadArtifact(link); await settle(); assert.equal(downloads.length, 1)
+    view.click('Open Rig Editor (2 bones)'); await settle()
+    const rig = view.component('RigEditorPanel'), id = rig.summary.bones[0].boneId
+    flush(() => rig.onSelectBone(id)); view.click('Open Pose/Clip (2 bones)')
+    view.click('Rotate selected target +X'); view.click('Capture pose keyframe')
+    view.click('Save pose clip sidecar'); await settle()
+    assert.equal(view.panel().saveState, 'saved')
+    const saved = structuredClone(view.panel().keyframes), readsBefore = reads
+    const replacement = asset(view.harness, sourceUrl)
+    assert.notEqual(replacement.scene, view.source.scene)
+    view.render(); await settle(); view.click('Open Pose/Clip (2 bones)')
+    assert.ok(reads > readsBefore, 'A new clean Scene still auto-loads its persisted plan')
+    assert.equal(view.panel().loadState, 'loaded')
+    assert.deepEqual(view.panel().keyframes, saved)
+    assert.equal(view.panel().canSaveSidecar, false)
+    assert.equal(replacement.root.quaternion.x, 0, 'Hydration does not acquire live Bone ownership')
   })
   for (const missing of [false, true]) {
     await suite.test(missing ? 'source load failure leaves authoring closed' : 'source without rig leaves authoring closed without oscillation', async t => {
@@ -6211,7 +6333,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       else {
         assert.equal(view.component('GltfMeshModel').url, sourceUrl)
         assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
-        assert.equal(view.component('ViewerEditToolbar').motionRetargetControls.summary.hasRig, false)
+        assert.equal(view.component('ViewerEditToolbar').motionRetargetControls, undefined)
       }
       assert.equal(view.fetches.length, 1)
     })

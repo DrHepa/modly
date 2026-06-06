@@ -778,7 +778,8 @@ test('Viewer3D mounted stable selection rotates the real out-of-order Bone and e
   let panel = view.component('PoseClipPanel')
   assert.equal(panel.selectedBoneId, undefined, 'No implicit first target')
   const childId = panel.summary.bones.find((bone: any) => bone.originalName === 'child').boneId
-  flush(() => panel.onSelectBone(childId))
+  view.click('Open Rig Editor (2 bones)')
+  flush(() => view.component('RigEditorPanel').onSelectBone(childId))
   panel = view.component('PoseClipPanel')
   assert.equal(panel.selectedBoneId, childId)
   view.click('Play animation'); view.frame(0.2)
@@ -1072,7 +1073,8 @@ test('Viewer3D pose saves retain dirty revisions, recover rejection and ignore o
   } } } })
   view.click('Open Pose/Clip (2 bones)')
   let panel = view.component('PoseClipPanel'); const id = panel.summary.bones[0].boneId
-  flush(() => panel.onSelectBone(id)); flush(() => view.component('PoseClipPanel').onCaptureKeyframe(id, 0))
+  view.click('Open Rig Editor (2 bones)')
+  flush(() => view.component('RigEditorPanel').onSelectBone(id)); flush(() => view.component('PoseClipPanel').onCaptureKeyframe(id, 0))
   const first = view.component('PoseClipPanel').onSaveSidecar(); await settle()
   assert.equal(view.component('PoseClipPanel').saveState, 'saving')
   flush(() => view.component('PoseClipPanel').onClipMetadataChange({ name: 'New authored revision' }))
@@ -1092,18 +1094,19 @@ test('Viewer3D pose saves retain dirty revisions, recover rejection and ignore o
   assert.equal(panel.saveState, 'idle'); assert.equal(panel.keyframes.length, 0); assert.equal(panel.canSaveSidecar, false)
 })
 
-test('Viewer3D pose minimize, close and unmount restore captured Bone references and stop preview writers', async t => {
+test('Viewer3D pose reset, close and unmount restore captured Bone references and stop preview writers', async t => {
   let rig: ReturnType<typeof authoringAsset>
   const view = await mount(t, '/workspace/rig.glb', h => { rig = authoringAsset(h) })
   view.click('Open Pose/Clip (2 bones)')
   const id = view.component('PoseClipPanel').summary.bones[0].boneId
   const before = rig!.root.quaternion.clone()
-  flush(() => view.component('PoseClipPanel').onSelectBone(id))
+  view.click('Open Rig Editor (2 bones)')
+  flush(() => view.component('RigEditorPanel').onSelectBone(id))
   flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(id, 'z', 30))
   flush(() => view.component('PoseClipPanel').onCaptureKeyframe(id, 0))
   flush(() => view.component('PoseClipPanel').onPreviewPlay())
   assert.equal(view.component('PoseClipPanel').previewState, 'playing')
-  flush(() => view.component('PoseClipPanel').onDrawerModeChange('minimized'))
+  view.click('Reset Pose/Clip preview')
   assert.ok(rig!.root.quaternion.equals(before)); assert.equal(view.component('PoseClipPanel').previewState, 'idle')
   assert.equal(view.component('PoseClipPanel').keyframes.length, 1)
   flush(() => view.component('PoseClipPanel').onRotateSelectedTarget(id, 'x', 20))

@@ -18,7 +18,6 @@ import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
-import { MotionRetargetPanel } from './MotionRetargetPanel'
 import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
 import { RigEditorPanel, type RigEditorHumanoidReviewProps } from './RigEditorPanel'
 import { RigOverlay } from './RigOverlay'
@@ -1773,7 +1772,7 @@ export function createViewer3DPoseClipState(summary?: RigSkeletonSummary): Viewe
 }
 
 export function createViewer3DPoseClipVisibilityState(summary?: RigSkeletonSummary): Viewer3DPoseClipVisibilityState {
-  return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'expanded' }
+  return { isOpen: false, skeletonContextId: summary?.skeletonContextId, drawerMode: 'minimized' }
 }
 
 export function createViewer3DMotionRetargetState(summary?: RigSkeletonSummary, session?: MotionRetargetSession): Viewer3DMotionRetargetState {
@@ -2355,7 +2354,10 @@ export function resolveViewer3DMotionRetargetPanelRenderState({
   motionRetargetState: Viewer3DMotionRetargetState
   visibility: Viewer3DMotionRetargetVisibilityState
 }): { shouldRenderPanel: boolean } {
-  return { shouldRenderPanel: Boolean(modelUrl && motionRetargetState.summary && visibility.isOpen) }
+  void modelUrl
+  void motionRetargetState
+  void visibility
+  return { shouldRenderPanel: false }
 }
 
 type Viewer3DMotionRetargetCallbacks = {
@@ -3501,16 +3503,14 @@ export function resolveViewer3DMotionRetargetToolbarControls({
   summary: RigSkeletonSummary
   onOpenMotionRetarget: () => void
 } | undefined {
-  if (!modelUrl || !summary) return undefined
-  return {
-    active: Boolean(summary.hasRig && visibility.isOpen),
-    summary,
-    onOpenMotionRetarget,
-  }
+  void modelUrl
+  void summary
+  void visibility
+  void onOpenMotionRetarget
+  return undefined
 }
 
 type Viewer3DPoseClipCallbacks = {
-  onSelectBone?: (boneId: RigBoneId) => void
   onCurrentTimeChange?: (timeSeconds: number) => void
   onClipMetadataChange?: (metadata: { durationSeconds?: number; fps?: number }) => void
   onCaptureKeyframe?: (boneId: RigBoneId, timeSeconds: number) => void
@@ -3572,7 +3572,6 @@ export function resolveViewer3DPoseClipPanelProps(
   onResetSelectedTarget: (boneId: RigBoneId) => void
   onSaveSidecar: () => void
   onLoadSidecar: () => void
-  onSelectBone: (boneId: RigBoneId) => void
 } {
   return {
     summary: state.summary,
@@ -3589,8 +3588,6 @@ export function resolveViewer3DPoseClipPanelProps(
     warnings: state.warning?.messages.map((message) => ({ kind: 'invalid-sidecar' as const, message })) ?? [],
     saveError: state.saveError,
     loadError: state.loadError,
-    drawerMode: callbacks.drawerMode,
-    onDrawerModeChange: callbacks.onDrawerModeChange,
     onCurrentTimeChange: callbacks.onCurrentTimeChange ?? (() => undefined),
     onClipMetadataChange: callbacks.onClipMetadataChange ?? (() => undefined),
     onCaptureKeyframe: callbacks.onCaptureKeyframe ?? (() => undefined),
@@ -3609,7 +3606,6 @@ export function resolveViewer3DPoseClipPanelProps(
     onResetSelectedTarget: callbacks.onResetSelectedTarget ?? (() => undefined),
     onSaveSidecar: callbacks.onSaveSidecar ?? (() => undefined),
     onLoadSidecar: callbacks.onLoadSidecar ?? (() => undefined),
-    onSelectBone: callbacks.onSelectBone ?? (() => undefined),
   }
 }
 
@@ -4571,7 +4567,7 @@ export function resolveViewer3DOverlayLayout({
 }): Viewer3DOverlayLayout {
   const editRailClassName = modelUrl && hasEditRail ? 'right-4 top-1/2 -translate-y-1/2 z-20' : null
   const rightOverlayClassName = editRailClassName ? 'right-16' : 'right-4'
-  const isPoseClipMinimized = Boolean(poseClipVisibility?.isOpen && poseClipVisibility.drawerMode === 'minimized')
+  const isPoseClipActionRailOpen = Boolean(poseClipVisibility?.isOpen)
   const motionRetargetPanelClassName = motionRetargetVisibility?.isOpen && rigEditorVisibility?.isOpen
     ? `${rightOverlayClassName} top-[22rem]`
     : `${rightOverlayClassName} top-4`
@@ -4587,8 +4583,8 @@ export function resolveViewer3DOverlayLayout({
     poseClipPanelClassName: 'left-4 right-16 bottom-4 max-h-[34vh]',
     commonViewportUsability: 'capped-internal-scroll',
     hintClassName: rightOverlayClassName,
-    rigOverlayClassName: isPoseClipMinimized ? 'left-4 bottom-24 z-20' : 'left-4 top-24 z-20',
-    rigOverlaySafeArea: isPoseClipMinimized ? 'above-minimized-pose-clip-controls' : 'below-top-left-toolbar',
+    rigOverlayClassName: isPoseClipActionRailOpen ? 'left-4 bottom-24 z-20' : 'left-4 top-24 z-20',
+    rigOverlaySafeArea: isPoseClipActionRailOpen ? 'above-minimized-pose-clip-controls' : 'below-top-left-toolbar',
   }
 }
 
@@ -4712,17 +4708,6 @@ export default function Viewer3D({
     if (controls) animationControlsRef.current = { scene, controls }
     else if (animationControlsRef.current?.scene === scene) animationControlsRef.current = null
   }, [])
-  useEffect(() => {
-    const reader = window.electron?.settings?.get
-    const paths = [checkpoint?.substitutionPoint?.inputArtifact.uri, checkpoint?.substitutionPoint?.inputArtifact.legacy?.filePath]
-    const needsRoot = viewerPresentation.modelUrl?.includes('/optimize/serve-file?') || paths.some(path => path && !path.startsWith('/workspace/') && (path.startsWith('/') || /^[A-Za-z]:/.test(path)))
-    if (!reader || !motionRetargetVisibility.isOpen || !needsRoot) return
-    let cancelled = false
-    Promise.resolve().then(() => reader()).then(settings => {
-      if (!cancelled && motionContextRef.current === motionContext) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
-    }).catch(() => undefined)
-    return () => { cancelled = true }
-  }, [motionContext, motionRetargetVisibility.isOpen])
   const outputUrl = currentJob?.outputUrl ?? ''
   const isSplat = /\.(ply|splat)(?:[?#]|$)/i.test(outputUrl)
   const rigSourceWorkspacePath = resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl, apiUrl, workspaceDir)
@@ -4747,6 +4732,17 @@ export default function Viewer3D({
   const liveSource = loadedSource?.url === modelUrl && !isSplat ? loadedSource : null
   const isLive = useCallback((source: LoadedScene | null): source is LoadedScene =>
     !!source && sourceRef.current === source && modelRef.current === source.url, [sourceRef])
+  useEffect(() => {
+    const reader = window.electron?.settings?.get
+    const paths = [checkpoint?.substitutionPoint?.inputArtifact.uri, checkpoint?.substitutionPoint?.inputArtifact.legacy?.filePath]
+    const needsRoot = viewerPresentation.modelUrl?.includes('/optimize/serve-file?') || paths.some(path => path && !path.startsWith('/workspace/') && (path.startsWith('/') || /^[A-Za-z]:/.test(path)))
+    if (!reader || workspaceDir || !needsRoot || !liveSource || liveSource.binding.summary.hasRig) return
+    let cancelled = false
+    Promise.resolve().then(() => reader()).then(settings => {
+      if (!cancelled && motionContextRef.current === motionContext && window.electron?.settings?.get === reader) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
+    }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [motionContext, liveSource, workspaceDir])
   const poseSessionRef = useRef<PoseClipPreviewSession | null>(null)
   const poseOwnerRef = useRef<THREE.Object3D | null>(null)
   const [rigEditorState, rigStateRef, setRigEditorState] = useCurrentState(createViewer3DRigEditorState)
@@ -4829,16 +4825,16 @@ export default function Viewer3D({
   }, [liveSource, kimodoMetadataDescriptor, workspaceDir, semanticMetadata, motionContext, sourceRigFallback])
   useEffect(() => {
     const reader = window.electron?.settings?.get
-    if (!reader || !rigEditorVisibility.isOpen || motionRetargetVisibility.isOpen) return
+    if (!reader || workspaceDir || !rigEditorVisibility.isOpen) return
     const paths = [checkpoint?.substitutionPoint?.inputArtifact.uri, checkpoint?.substitutionPoint?.inputArtifact.legacy?.filePath]
     const needsRoot = viewerPresentation.modelUrl?.includes('/optimize/serve-file?') || paths.some(path => path && !path.startsWith('/workspace/') && (path.startsWith('/') || /^[A-Za-z]:/.test(path)))
     if (!needsRoot) return
     let cancelled = false
     Promise.resolve().then(() => reader()).then(settings => {
-      if (!cancelled && motionContextRef.current === motionContext && window.electron?.settings?.get === reader) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
+      if (!cancelled && isLive(liveSource) && motionContextRef.current === motionContext && window.electron?.settings?.get === reader) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
     }).catch(() => undefined)
     return () => { cancelled = true }
-  }, [motionContext, rigEditorVisibility.isOpen, motionRetargetVisibility.isOpen])
+  }, [motionContext, rigEditorVisibility.isOpen, workspaceDir, liveSource, isLive])
   const semanticKey = JSON.stringify(semanticHydrationSource)
   const semanticPorts = window.electron?.workspace?.artifacts
   const semanticOwner = useMemo(() => ({ source: liveSource, context: motionContext, key: semanticKey,
@@ -4955,10 +4951,20 @@ export default function Viewer3D({
     } finally { if (humanoidOperation.current === operation) humanoidOperation.current = null }
   }
 
+  // Pose callbacks retain the exact physical IO ports from their render. A
+  // replaced bridge cannot complete old work or grant authority to old controls.
+  const poseReader = window.electron?.workspace?.artifacts?.readPoseClipSidecar
+  const poseWriter = window.electron?.workspace?.artifacts?.writePoseClipSidecar
+  const posePortsCurrent = () => window.electron?.workspace?.artifacts?.readPoseClipSidecar === poseReader
+    && window.electron?.workspace?.artifacts?.writePoseClipSidecar === poseWriter
   const sourceToken = (source: LoadedScene) => createViewer3DRigHydrationToken({ modelUrl: source.url, summary: source.binding.summary })
   useEffect(() => {
     const source = liveSource
     if (!source) return
+    // Retire pending work when this source or its physical pose ports change;
+    // keep the authored plan available for a retry through the current bridge.
+    poseIO.current = null
+    setPoseClipState(state => ({ ...state, saveState: 'idle', loadState: 'idle', saveError: undefined, loadError: undefined }))
     const summary = source.binding.summary
     const token = sourceToken(source)
     const ports = window.electron?.workspace?.artifacts
@@ -4967,7 +4973,7 @@ export default function Viewer3D({
     const aliasRequest = resolveViewer3DRigHydrationRequest(summary)
     const poseRequest = resolveViewer3DPoseClipHydrationRequest(summary)
     let cancelled = false
-    const current = () => !cancelled && isLive(source)
+    const current = () => !cancelled && isLive(source) && posePortsCurrent()
     if (aliasReader && aliasRequest && token) {
       const operation = {}; aliasIO.current = operation
       const revision = aliasRevision(rigStateRef.current.renamePlan)
@@ -4989,21 +4995,24 @@ export default function Viewer3D({
     if (poseReader && poseRequest && token) {
       const operation = {}; poseIO.current = operation
       const revision = poseRevision(poseStateRef.current.plan)
+      // Reset/close releases preview ownership, not unsaved authoring. A current
+      // read may replace the plan/baseline only if authoring was clean at start.
+      const dirtyAtStart = revision !== poseBaseline.current
       setPoseClipState(state => ({ ...state, loadState: 'loading' }))
       Promise.resolve().then(() => poseReader(poseRequest)).then(result => {
         if (!current() || poseIO.current !== operation) return
-        if (poseRevision(poseStateRef.current.plan) !== revision || poseSessionRef.current) {
+        if (dirtyAtStart || poseRevision(poseStateRef.current.plan) !== revision || poseSessionRef.current) {
           setPoseClipState(state => ({ ...state, loadState: 'idle' })); return
         }
         const hydration = applyViewer3DPoseClipHydrationResult({ state: poseStateRef.current, result, token, currentToken: token })
         if (!hydration.warning) poseBaseline.current = poseRevision(hydration.state.plan)
         setPoseClipState(hydration.state)
       }).catch((error: unknown) => {
-        if (current() && poseIO.current === operation) setPoseClipState(state => poseRevision(state.plan) !== revision || poseSessionRef.current ? { ...state, loadState: 'idle' } : { ...state, loadState: 'error', loadError: ioError(error, 'Failed to read pose clip.') })
+        if (current() && poseIO.current === operation) setPoseClipState(state => dirtyAtStart || poseRevision(state.plan) !== revision || poseSessionRef.current ? { ...state, loadState: 'idle' } : { ...state, loadState: 'error', loadError: ioError(error, 'Failed to read pose clip.') })
       }).finally(() => { if (poseIO.current === operation) poseIO.current = null })
     }
     return () => { cancelled = true }
-  }, [liveSource, isLive, rigStateRef, poseStateRef, setRigEditorState, setPoseClipState])
+  }, [liveSource, poseReader, poseWriter, isLive, rigStateRef, poseStateRef, setRigEditorState, setPoseClipState])
 
   type CheckpointAuthority = {
     source: LoadedScene; owner: CheckpointOwner; artifact: ArtifactRef; workspaceDir?: string
@@ -5062,7 +5071,6 @@ export default function Viewer3D({
   const selectedPart = sceneParts.find(part => part.id === editPlan?.selectedPartId)
   const hasRigEditorRail = !!liveSource?.binding.summary.hasRig
   const hasPoseClipRail = hasRigEditorRail
-  const motionRetargetPanelRenderState = { shouldRenderPanel: !!liveSource && motionRetargetVisibility.isOpen }
   const overlayLayout = resolveViewer3DOverlayLayout({ modelUrl, hasEditRail: canShowSceneEditControls || hasRigEditorRail || hasPoseClipRail, poseClipVisibility, rigEditorVisibility, motionRetargetVisibility })
   const rigTargetState = resolveViewer3DActiveRigTargetState({ rigEditorState, rigEditorVisibility, poseClipState, poseClipVisibility, selectedTarget: selectedRigTarget })
   const rigEditorPanelRenderState = { shouldRenderPanel: !!liveSource && rigEditorVisibility.isOpen }
@@ -5083,7 +5091,7 @@ export default function Viewer3D({
   const acquirePose = () => {
     if (motionPreviewRef.current) { releaseMotion(); setMotionRetargetState(state => ({ ...state, previewState: 'idle', previewCurrentTimeSeconds: 0 })) }
     const source = liveSource
-    if (!isLive(source) || !source.binding.summary.hasRig) return null
+    if (!isLive(source) || !posePortsCurrent() || !motionEventCurrent() || !source.binding.summary.hasRig) return null
     if (!poseSessionRef.current) poseSessionRef.current = createPoseClipPreviewSession({ scene: source.scene,
       sourceWorkspacePath: source.binding.summary.sourceWorkspacePath ?? '', skeletonContextId: source.binding.summary.skeletonContextId }, source.binding.bonesById)
     poseOwnerRef.current = source.scene
@@ -5096,7 +5104,7 @@ export default function Viewer3D({
       skeletonContextId: liveSource.binding.summary.skeletonContextId }, state.plan, state.currentTimeSeconds)
   }
   const authorPose = (action: Viewer3DPoseClipAction, evaluate = true) => {
-    if (!isLive(liveSource)) return
+    if (!isLive(liveSource) || !posePortsCurrent() || !motionEventCurrent()) return
     const session = acquirePose()
     const next = { ...reduceViewer3DPoseClipState(poseStateRef.current, action), previewState: 'paused' as const, saveState: 'idle' as const }
     if (evaluate) evaluatePose(next, session)
@@ -5463,23 +5471,23 @@ export default function Viewer3D({
   }
   const handleSavePoseClipSidecar = async () => {
     const source = liveSource; const writer = window.electron?.workspace?.artifacts?.writePoseClipSidecar
-    if (!isLive(source) || !writer || !canSaveSidecar || poseIO.current) return
+    if (!isLive(source) || !posePortsCurrent() || !motionEventCurrent() || !writer || !canSaveSidecar || poseIO.current) return
     const state = poseStateRef.current; const revision = poseRevision(state.plan); const operation = {}
     poseIO.current = operation; setPoseClipState(current => ({ ...current, saveState: 'saving', saveError: undefined }))
     try {
       const result = await writeViewer3DPoseClipSidecar({ state, writer })
-      if (!isLive(source) || poseIO.current !== operation) return
+      if (!isLive(source) || !posePortsCurrent() || !motionEventCurrent() || poseIO.current !== operation) return
       if (result.success) poseBaseline.current = revision
       setPoseClipState(current => ({ ...current, saveState: poseRevision(current.plan) !== revision ? 'idle' : result.success ? 'saved' : 'error',
         saveError: !result.success && poseRevision(current.plan) === revision ? result.error : undefined }))
     } catch (error) {
-      if (isLive(source) && poseIO.current === operation) setPoseClipState(current => ({ ...current,
+      if (isLive(source) && posePortsCurrent() && motionEventCurrent() && poseIO.current === operation) setPoseClipState(current => ({ ...current,
         saveState: poseRevision(current.plan) === revision ? 'error' : 'idle', saveError: poseRevision(current.plan) === revision ? ioError(error, 'Failed to save pose clip.') : undefined }))
     } finally { if (poseIO.current === operation) poseIO.current = null }
   }
   const handleLoadPoseClipSidecar = async () => {
     const source = liveSource; const reader = window.electron?.workspace?.artifacts?.readPoseClipSidecar
-    if (!isLive(source) || !reader || !canLoadSidecar || poseIO.current) return
+    if (!isLive(source) || !posePortsCurrent() || !motionEventCurrent() || !reader || !canLoadSidecar || poseIO.current) return
     const token = sourceToken(source); const request = resolveViewer3DPoseClipHydrationRequest(source.binding.summary)
     if (!token || !request) return
     const operation = {}; poseIO.current = operation
@@ -5487,13 +5495,13 @@ export default function Viewer3D({
     setPoseClipState(state => ({ ...state, loadState: 'loading', loadError: undefined }))
     try {
       const result = await reader(request)
-      if (!isLive(source) || poseIO.current !== operation) return
+      if (!isLive(source) || !posePortsCurrent() || !motionEventCurrent() || poseIO.current !== operation) return
       // Explicit Load deliberately replaces the authored plan; automatic hydration does not.
       const hydration = applyViewer3DPoseClipHydrationResult({ state: poseStateRef.current, result, token, currentToken: token })
       if (!hydration.warning && result.success && result.status === 'found') poseBaseline.current = poseRevision(hydration.state.plan)
       setPoseClipState({ ...hydration.state, saveState: 'idle', saveError: undefined })
     } catch (error) {
-      if (isLive(source) && poseIO.current === operation) setPoseClipState(state => ({ ...state, loadState: 'error', loadError: ioError(error, 'Failed to load pose clip.') }))
+      if (isLive(source) && posePortsCurrent() && motionEventCurrent() && poseIO.current === operation) setPoseClipState(state => ({ ...state, loadState: 'error', loadError: ioError(error, 'Failed to load pose clip.') }))
     } finally { if (poseIO.current === operation) poseIO.current = null }
   }
 
@@ -5803,8 +5811,6 @@ export default function Viewer3D({
                 summary: rigEditorState.summary,
                 onOpenRigEditor: () => { if (!isLive(liveSource)) return; rigPanelEpoch.current++; humanoidOperation.current = null; setHumanoidReviewState(state => ({ ...state, saveState: { status: 'idle' } })); setRigEditorVisibility((current) => reduceViewer3DRigEditorVisibilityState(current, { type: 'toggle', summary: rigEditorState.summary })) },
               } : undefined}
-              motionRetargetControls={resolveViewer3DMotionRetargetToolbarControls({ modelUrl, summary: motionRetargetState.summary,
-                visibility: motionRetargetVisibility, onOpenMotionRetarget: toggleMotion })}
               poseClipControls={hasPoseClipRail && poseClipState.summary ? {
                 active: Boolean(poseClipState.summary.hasRig && poseClipVisibility.isOpen),
                 summary: poseClipState.summary,
@@ -5831,38 +5837,9 @@ export default function Viewer3D({
               loadState={rigRenameLoadState}
               loadError={rigRenameHydrationWarning?.messages.join(' ')}
             />
+            {[...authoringPresentation.warnings, ...motionRetargetState.diagnosticsMessages].length > 0 && <p role="status" aria-label="Rig source diagnostics" className="mt-2 text-xs text-amber-100">{[...authoringPresentation.warnings, ...motionRetargetState.diagnosticsMessages].join(' ')}</p>}
             {rigRenameSaveState.status === 'saved' && <p className="mt-2 rounded-lg bg-emerald-500/10 p-2 text-xs text-emerald-200">Saved sidecar: {rigRenameSaveState.sidecarWorkspacePath}</p>}
             {rigRenameSaveState.status === 'error' && <p className="mt-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-200">{rigRenameSaveState.message}</p>}
-          </div>
-        )}
-
-        {motionRetargetPanelRenderState.shouldRenderPanel && (
-          <div className={`absolute ${overlayLayout.motionRetargetPanelClassName} bottom-4 z-20 w-80 max-w-[calc(100%-5rem)]`}>
-            <MotionRetargetPanel
-              {...{
-                ...resolveViewer3DMotionRetargetPanelProps(motionRetargetState, {
-                  onSelectSourceBone: (sourceBoneId) => { if (motionPanelCurrent()) setMotionRetargetState((current) => reduceViewer3DMotionRetargetState(current, { type: 'select-source-bone', sourceBoneId })) },
-                  onChangeMapping: (sourceBoneId, targetBoneId) => authorMotion({ type: 'set-mapping', sourceBoneId, targetBoneId }),
-                  onSelectPreview: selectMotionPreview,
-                  onSaveSidecar: handleSaveMotionRetargetSidecar,
-                  onLoadSidecar: handleLoadMotionRetargetSidecar,
-                  onExportPoseClipCompanion: handleExportMotionRetargetPoseClipCompanion,
-                  onOpenArtifact: handleOpenMotionRetargetArtifact,
-                  onDownloadArtifact: handleDownloadMotionRetargetArtifact,
-                  onPlayPreview: handlePlayMotionRetargetPreview,
-                  onPausePreview: handlePauseMotionRetargetPreview,
-                  onResetPreview: handleResetMotionRetargetPreview,
-                  onScrubPreview: handleScrubMotionRetargetPreview,
-                  onChangeCorrections: corrections => authorMotion({ type: 'set-corrections', corrections }),
-                  onToggleAnimationPlayback: () => { if (motionPanelCurrent()) handleGlobalPlayback() },
-                }, {
-                  animationPlaybackAvailable: hasAnimations,
-                  animationPlaybackActive: animationPlaying,
-                  fallbackArtifact,
-                  warnings: authoringPresentation.warnings,
-                }),
-              }}
-            />
           </div>
         )}
 
@@ -5899,7 +5876,6 @@ export default function Viewer3D({
           <div className={`absolute ${overlayLayout.poseClipPanelClassName} z-20 max-w-[calc(100%-5rem)]`}>
             <PoseClipPanel
               {...resolveViewer3DPoseClipPanelProps({ ...poseClipState, selectedBoneId: rigTargetState.selectedBoneId }, {
-                onSelectBone: selectBone,
                 onCurrentTimeChange: timeSeconds => authorPose({ type: 'set-current-time', timeSeconds }),
                 onClipMetadataChange: metadata => liveSource && authorPose({ type: 'set-clip-metadata', summary: liveSource.binding.summary, ...metadata }),
                 onCaptureKeyframe: capturePose,
@@ -5920,8 +5896,8 @@ export default function Viewer3D({
                 onShiftSelectedKeyframe: (id, deltaSeconds) => liveSource && selectedKeyAction(id, { type: 'shift-selected-keyframe', summary: liveSource.binding.summary, deltaSeconds }),
                 onDuplicateSelectedKeyframe: id => liveSource && selectedKeyAction(id, { type: 'duplicate-selected-keyframe', summary: liveSource.binding.summary }),
                 onPreviewPlay: handlePoseClipPreviewPlay,
-                onPreviewPause: () => setPoseClipState(state => ({ ...state, previewState: 'paused' })),
-                onPreviewReset: handlePoseClipPreviewReset,
+                onPreviewPause: () => { if (posePortsCurrent() && motionEventCurrent()) setPoseClipState(state => ({ ...state, previewState: 'paused' })) },
+                onPreviewReset: () => { if (posePortsCurrent() && motionEventCurrent()) handlePoseClipPreviewReset() },
                 onRotateSelectedTarget: (boneId, axis, degreesDelta) => {
                   const session = acquirePose()
                   if (!session) return
@@ -5930,16 +5906,12 @@ export default function Viewer3D({
                 },
                 onResetSelectedTarget: boneId => {
                   const session = acquirePose()
-                  if (session) resetPoseClipSelectedBone({ bonesById: session.bonesById, snapshot: session.snapshot, boneId })
+                  if (!session) return
+                  resetPoseClipSelectedBone({ bonesById: session.bonesById, snapshot: session.snapshot, boneId })
                   setPoseClipState(state => ({ ...state, previewState: 'paused' }))
                 },
                 onSaveSidecar: handleSavePoseClipSidecar,
                 onLoadSidecar: handleLoadPoseClipSidecar,
-                drawerMode: poseClipVisibility.drawerMode,
-                onDrawerModeChange: drawerMode => {
-                  handlePoseClipPreviewReset()
-                  setPoseClipVisibility(current => ({ ...current, drawerMode }))
-                },
               }, rigEffectiveNaming)}
               canSaveSidecar={canSaveSidecar}
               canLoadSidecar={canLoadSidecar}

@@ -25,6 +25,9 @@ import { createLandmarkPointIntent, deriveLandmarkMarkers, resolveLandmarkMarker
 import { isolateAnimationForPoseClipPreview, resetAnimationPlayback, resolveAnimationAvailability, syncAnimationActions, type AnimationActionLike, type AnimationIsolationSnapshot, type AnimationMixerLike, type AnimationPlaybackResetResult } from './viewerAnimation'
 import { PoseClipPanel, type PoseClipDrawerMode, type PoseClipLoadState, type PoseClipPanelWarning, type PoseClipPreviewState, type PoseClipSaveState } from './PoseClipPanel'
 import { normalizeSceneWorkspacePath, resolveViewerModelSource, type ViewerModelSource } from '../viewerModelSource'
+import { resolveViewerAssetTarget, resolveViewerAssetWorkspacePathFromUrl, resolveViewerArtifactWorkspacePath, resolveViewerWorkspacePathFromAbsoluteValue, isSafeViewerWorkspaceRelativePath, type ViewerAssetTarget } from '../viewerAssetTarget.ts'
+import { resolveViewerRigSourceWorkspacePath, resolveViewerTargetPresentation } from '../viewerProvenance.ts'
+import { captureViewerWorkspaceArtifactService } from '../viewerWorkspaceArtifactService.ts'
 import { collectSceneParts, createEditPlan, editPlanReducer } from '../sceneEdit'
 import type { EditPlan, ScenePart } from '../sceneEdit.types'
 import { buildRigSelectionOverlay, collectRigSkeletonBinding, type RigBoneId, type RigSelectionOverlayViewModel, type RigSkeletonSummary, type RigSkinnedMeshContext } from '../rigSkeleton.ts'
@@ -1449,6 +1452,8 @@ function EmptyState(): JSX.Element {
 type Viewer3DPresentation = {
   modelUrl: string | null
   checkpointLabel: string | null
+  sourceLabel: string | null
+  provenance?: ArtifactRef['provenance']
   canDeleteSelectedModel: boolean
   selectedHint: string
   idleHint: string
@@ -2517,15 +2522,9 @@ export function resolveViewer3DKimodoMetadataDescriptor(args: {
 }
 
 function resolveViewer3DArtifactWorkspacePath(artifact: ArtifactRef, modelUrl?: string | null, apiUrl?: string, workspaceDir?: string): string | undefined {
-  if (artifact.kind !== 'mesh') return undefined
-  const values = [artifact.uri, artifact.legacy?.filePath].filter((value): value is string => value !== undefined)
-  const paths = values.map(value => value.startsWith('/workspace/')
-    ? normalizeViewer3DWorkspacePath(value) : artifactWorkspacePath(value, workspaceDir) ?? undefined)
-  const displayed = modelUrl ? resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl, apiUrl, workspaceDir) : undefined
-  if (modelUrl && !displayed) return undefined
-  if (displayed) paths.push(displayed)
-  const first = paths[0]
-  return first && isSafeRigSourceWorkspacePath(first) && paths.every(path => path === first) ? first : undefined
+  const path = resolveViewerArtifactWorkspacePath(artifact, { apiUrl, workspaceDir })
+  if (!path) return undefined
+  return !modelUrl || resolveViewerAssetWorkspacePathFromUrl(modelUrl, { apiUrl, workspaceDir }) === path ? path : undefined
 }
 
 function createViewer3DKimodoFallbackArtifactFromModelUrl(modelUrl: string | null | undefined, apiUrl?: string, workspaceDir?: string): ArtifactRef | undefined {
@@ -2989,7 +2988,7 @@ function createViewer3DDisplayedSemanticHydrationSource(
 
 function normalizeViewer3DSemanticWorkspaceSourcePath(value: unknown): string | undefined {
   const normalized = normalizeViewer3DWorkspacePath(typeof value === 'string' ? value : undefined)
-  return normalized && isSafeRigSourceWorkspacePath(normalized) ? normalized : undefined
+  return normalized && isSafeViewerWorkspaceRelativePath(normalized, { meshOnly: true }) ? normalized : undefined
 }
 
 function normalizeViewer3DSemanticSourceFromAbsolutePath(value: unknown, workspaceDir?: string): string | undefined {
@@ -4484,72 +4483,24 @@ function resolveValidRigSelectedBoneId(summary: RigSkeletonSummary | undefined, 
     : resolveDefaultRigSelectedBoneId(summary)
 }
 
-export function resolveViewer3DPresentation(modelSource: ViewerModelSource): Viewer3DPresentation {
-  const checkpointLabel = modelSource.kind === 'workflow-checkpoint' ? modelSource.label : null
-
-  return {
-    modelUrl: modelSource.modelUrl,
-    checkpointLabel,
-    canDeleteSelectedModel: modelSource.kind === 'final',
-    selectedHint: checkpointLabel ?? 'Click mesh to select • Delete to remove',
-    idleHint: 'Drag to rotate • Scroll to zoom',
-  }
+export function resolveViewer3DPresentation(target: ViewerAssetTarget | ViewerModelSource): Viewer3DPresentation {
+  return resolveViewerTargetPresentation(target)
 }
 
-export function resolveViewer3DRigSourceWorkspacePath(modelSource: ViewerModelSource, apiUrl?: string): string | undefined {
-  const url = modelSource.modelUrl
-  if (!url || url.includes('#')) return undefined
-  try {
-    // Validate percent encoding even in a cache query; never interpret query text as a path.
-    decodeURIComponent(url)
-    let route = url
-    if (/^https?:\/\//.test(url)) {
-      const parsed = new URL(url)
-      if (parsed.username || parsed.password || (apiUrl !== undefined && (!apiUrl || parsed.origin !== new URL(apiUrl).origin))) return undefined
-      // Keep the raw path until traversal checks; URL would normalise dot segments.
-      route = url.match(/^https?:\/\/[^/?#]+(\/[^?#]*)?(?:\?[^#]*)?$/)?.[1] ?? ''
-    } else if (!url.startsWith('/')) return undefined
-    const rawPath = route.split('?', 1)[0]
-    if (!rawPath.startsWith('/workspace/')) return undefined
-    const encoded = rawPath.slice('/workspace/'.length)
-    if (encoded.split('/').some(segment => segment === '.' || segment === '..' || !segment)) return undefined
-    if (/%(?:2e|2f|5c|00|25)/i.test(encoded)) return undefined
-    const decoded = decodeURIComponent(encoded)
-    if (/[?#]/.test(decoded)) return undefined
-    const path = normalizeSceneWorkspacePath(decoded)
-    return path && /\.(glb|gltf)$/i.test(path) ? path : undefined
-  } catch {
-    return undefined
-  }
+export function resolveViewer3DRigSourceWorkspacePath(target: { modelUrl: string | null; workspacePath?: string }, apiUrl?: string, workspaceDir?: string): string | undefined {
+  return resolveViewerRigSourceWorkspacePath(target, { apiUrl, workspaceDir })
 }
 
 function isSafeRigSourceWorkspacePath(path: string): boolean {
-  return normalizeSceneWorkspacePath(path) === path && /\.(glb|gltf)$/i.test(path)
+  return isSafeViewerWorkspaceRelativePath(path, { meshOnly: true })
 }
 
 function normalizeServeFileWorkspaceMeshPathFromAbsolutePath(absolutePath: string, workspaceDir?: string): string | undefined {
-  // Absolute physical paths need configured custody, never a substring named workspace.
-  if (!workspaceDir || /[%?#\x00]/.test(absolutePath)) return undefined
-  const path = artifactWorkspacePath(absolutePath, workspaceDir)
-  return path && isSafeRigSourceWorkspacePath(path) ? path : undefined
+  return resolveViewerWorkspacePathFromAbsoluteValue(absolutePath, { workspaceDir, meshOnly: true })
 }
 
 function resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl: string | null | undefined, apiUrl?: string, workspaceDir?: string): string | undefined {
-  if (!modelUrl) return undefined
-  const source = { kind: 'final', modelUrl, isCheckpointPreview: false, label: 'Final output' } as const
-  const workspacePath = resolveViewer3DRigSourceWorkspacePath(source, apiUrl)
-  if (workspacePath) return workspacePath
-  if (!workspaceDir || modelUrl.includes('#')) return undefined
-  try {
-    decodeURIComponent(modelUrl)
-    const parsed = new URL(modelUrl, apiUrl || 'http://localhost')
-    if (parsed.username || parsed.password || !/^https?:$/.test(parsed.protocol)) return undefined
-    if (/^https?:/.test(modelUrl) && (!apiUrl || parsed.origin !== new URL(apiUrl).origin)) return undefined
-    const rawRoute = modelUrl.replace(/^https?:\/\/[^/?#]+/, '').split('?', 1)[0]
-    if (rawRoute !== '/optimize/serve-file' || parsed.searchParams.getAll('path').length !== 1) return undefined
-    const absolute = parsed.searchParams.get('path')
-    return absolute ? normalizeServeFileWorkspaceMeshPathFromAbsolutePath(absolute, workspaceDir) : undefined
-  } catch { return undefined }
+  return resolveViewerAssetWorkspacePathFromUrl(modelUrl, { apiUrl, workspaceDir })
 }
 
 export function resolveViewer3DOverlayLayout({
@@ -4666,10 +4617,9 @@ export default function Viewer3D({
   const setSelected = useAppStore(s => s.setMeshSelected)
   const checkpointNodeId = useWorkflowRunStore(s => s.activeCheckpointNodeId)
   const checkpoint = useWorkflowRunStore(s => checkpointNodeId ? s.checkpoints[checkpointNodeId] : undefined)
-  const modelSource = resolveViewerModelSource(currentJob, apiUrl)
-  const viewerPresentation = resolveViewer3DPresentation(modelSource)
+  const baseViewerTarget = resolveViewerAssetTarget({ currentJob, apiUrl })
   const executionId = useWorkflowRunStore(s => s.executionId)
-  const motionContext = JSON.stringify([currentJob?.id, viewerPresentation.modelUrl, executionId, checkpointNodeId, checkpoint?.owner, checkpoint?.substitutionPoint?.inputArtifact])
+  const motionContext = JSON.stringify([currentJob?.id, baseViewerTarget.modelUrl, executionId, checkpointNodeId, checkpoint?.owner, checkpoint?.substitutionPoint?.inputArtifact])
   const motionContextRef = useRef(motionContext)
   motionContextRef.current = motionContext
   const [motionModel, setMotionModel] = useState<{ context: string; url: string; selectedPreview: MotionRetargetPreviewKind; explicit: boolean } | null>(null)
@@ -4677,11 +4627,21 @@ export default function Viewer3D({
   motionModelRef.current = motionModel
   const [workspaceRoot, setWorkspaceRoot] = useState<{ context: string; path?: string } | null>(null)
   const workspaceDir = workspaceRoot?.context === motionContext ? workspaceRoot.path : undefined
+  const workflowRunState = useWorkflowRunStore(s => s.runState)
+  const workflowJobCurrent = !!executionId && currentJob?.id === executionId
+  const checkpointArtifact = checkpoint?.substitutionPoint?.inputArtifact
+  const selectedArtifact = workflowJobCurrent && checkpoint?.owner.runId === executionId
+    && checkpoint.owner.nodeId === checkpointNodeId && checkpointArtifact?.id === checkpoint.owner.inputArtifactId
+    && checkpointArtifact?.versionId === checkpoint.owner.inputVersionId ? checkpointArtifact : undefined
+  const viewerTarget = resolveViewerAssetTarget({ currentJob, apiUrl, workspaceDir,
+    workflowArtifact: checkpoint ? selectedArtifact : workflowJobCurrent && workflowRunState.status === 'done' ? workflowRunState.artifact : undefined })
+  const modelSource = resolveViewerModelSource(viewerTarget)
+  const viewerPresentation = resolveViewer3DPresentation(viewerTarget)
   // The selected checkpoint, not a previous scene's/global artifact, owns metadata.
   const kimodoMetadataDescriptor = useMemo(() => resolveViewer3DKimodoMetadataDescriptor({
     apiUrl, modelUrl: viewerPresentation.modelUrl, workspaceDir,
-    artifact: checkpoint?.substitutionPoint?.inputArtifact,
-  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, checkpoint?.substitutionPoint?.inputArtifact])
+    artifact: selectedArtifact,
+  }), [apiUrl, viewerPresentation.modelUrl, workspaceDir, selectedArtifact])
   const descriptorRef = useRef(kimodoMetadataDescriptor)
   descriptorRef.current = kimodoMetadataDescriptor
   const [sourceRigDecision, setSourceRigDecision] = useState<{
@@ -5142,6 +5102,9 @@ export default function Viewer3D({
   }, [liveSource, poseClipState.previewState, poseClipState.plan.clip.fps, isLive, poseStateRef, setPoseClipState])
 
   // Event callbacks belong to this render's epoch; retired callbacks cannot mint a new one.
+  const artifactPorts = window.electron?.workspace?.artifacts
+  const workspaceArtifactService = useMemo(() => captureViewerWorkspaceArtifactService(),
+    [artifactPorts, artifactPorts?.previewWorkspaceArtifact, artifactPorts?.downloadWorkspaceArtifact, artifactPorts?.readSidecar])
   const renderedMotionEpoch = motionEpoch.current
   const motionCurrent = (source: LoadedScene | null, epoch = renderedMotionEpoch, descriptor = kimodoMetadataDescriptor, context = motionContext) => {
     return () => {
@@ -5353,30 +5316,29 @@ export default function Viewer3D({
       }
       return
     }
-    const reader = window.electron?.workspace?.artifacts?.previewWorkspaceArtifact
+    const reader = workspaceArtifactService.previewWorkspaceArtifact
+    if (!workspaceArtifactService.isCurrent()) return
     // Supersede only after proving that this callback still owns the panel.
     const operation = beginMotionIO('preview', true)
     if (!operation) return
     try {
-      if (!reader) throw new Error('Workspace artifact preview is unavailable.')
       const result = await reader({ workspacePath: entry.workspacePath })
-      if (operation.current()) setArtifactPreviewState(applyViewer3DMotionRetargetArtifactPreviewResult(entry, result))
+      if (operation.current() && workspaceArtifactService.isCurrent()) setArtifactPreviewState(applyViewer3DMotionRetargetArtifactPreviewResult(entry, result))
     } catch (error) {
-      if (operation.current()) setArtifactPreviewState(applyViewer3DMotionRetargetArtifactPreviewResult(entry, { success: false, error: ioError(error, 'Artifact preview failed.') }))
+      if (operation.current() && workspaceArtifactService.isCurrent()) setArtifactPreviewState(applyViewer3DMotionRetargetArtifactPreviewResult(entry, { success: false, error: ioError(error, 'Artifact preview failed.') }))
     } finally { operation.finish() }
   }
   const handleDownloadMotionRetargetArtifact = async (artifact: MotionRetargetArtifactLink) => {
     const entry = currentArtifact(artifact)
-    const downloader = window.electron?.workspace?.artifacts?.downloadWorkspaceArtifact
-    if (!entry) return
+    const downloader = workspaceArtifactService.downloadWorkspaceArtifact
+    if (!entry || !workspaceArtifactService.isCurrent()) return
     const operation = beginMotionIO('download')
     if (!operation) return
     try {
-      if (!downloader) throw new Error('Workspace artifact download is unavailable.')
       const result = await downloadViewer3DMotionRetargetArtifact({ artifact: entry, downloader })
-      if (!result.success && operation.current() && operation.unchanged()) setMotionRetargetState(current => ({ ...current, exportState: 'error', exportMessage: result.error }))
+      if (!result.success && operation.current() && operation.unchanged() && workspaceArtifactService.isCurrent()) setMotionRetargetState(current => ({ ...current, exportState: 'error', exportMessage: result.error }))
     } catch (error) {
-      if (operation.current() && operation.unchanged()) setMotionRetargetState(current => ({ ...current, exportState: 'error', exportMessage: ioError(error, 'Artifact download failed.') }))
+      if (operation.current() && operation.unchanged() && workspaceArtifactService.isCurrent()) setMotionRetargetState(current => ({ ...current, exportState: 'error', exportMessage: ioError(error, 'Artifact download failed.') }))
     } finally { operation.finish() }
   }
   const evaluateMotion = (state: Viewer3DMotionRetargetState, time: number) => {

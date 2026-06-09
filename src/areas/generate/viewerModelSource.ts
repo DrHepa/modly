@@ -1,5 +1,6 @@
 import type { GenerationJob } from '../../shared/stores/appStore'
 import type { SceneEditArtifactDescriptor, SceneEditEligibilityResult } from './sceneEdit.types'
+import { resolveViewerAssetTarget, type ViewerAssetTarget } from './viewerAssetTarget.ts'
 
 export type ViewerModelSource =
   | { kind: 'none'; modelUrl: null; isCheckpointPreview: false }
@@ -11,16 +12,17 @@ export type ViewerModelSource =
       label: 'Temporary checkpoint — not final output'
     }
 
-function resolveModelUrl(outputUrl: string, apiUrl: string): string {
-  if (outputUrl.startsWith('http://') || outputUrl.startsWith('https://') || outputUrl.startsWith('blob:')) {
-    return outputUrl
-  }
+export function resolveViewerModelSource(target: ViewerAssetTarget): ViewerModelSource
+export function resolveViewerModelSource(currentJob: GenerationJob | null, apiUrl: string): ViewerModelSource
+export function resolveViewerModelSource(
+  currentJobOrTarget: GenerationJob | ViewerAssetTarget | null,
+  apiUrl?: string,
+): ViewerModelSource {
+  const target = isViewerAssetTarget(currentJobOrTarget)
+    ? currentJobOrTarget
+    : resolveViewerAssetTarget({ currentJob: currentJobOrTarget, apiUrl: apiUrl ?? '' })
 
-  return outputUrl.startsWith('/') ? `${apiUrl}${outputUrl}` : outputUrl
-}
-
-export function resolveViewerModelSource(currentJob: GenerationJob | null, apiUrl: string): ViewerModelSource {
-  if (!currentJob?.outputUrl) {
+  if (target.kind === 'none') {
     return {
       kind: 'none',
       modelUrl: null,
@@ -28,29 +30,13 @@ export function resolveViewerModelSource(currentJob: GenerationJob | null, apiUr
     }
   }
 
-  if (currentJob.status === 'done') {
-    return {
-      kind: 'final',
-      modelUrl: resolveModelUrl(currentJob.outputUrl, apiUrl),
-      isCheckpointPreview: false,
-      label: 'Final output',
-    }
-  }
+  return target.kind === 'final'
+    ? { kind: target.kind, modelUrl: target.modelUrl, isCheckpointPreview: target.isCheckpointPreview, label: target.label }
+    : { kind: target.kind, modelUrl: target.modelUrl, isCheckpointPreview: target.isCheckpointPreview, label: target.label }
+}
 
-  if (currentJob.status === 'generating' && currentJob.previewKind === 'workflow-checkpoint') {
-    return {
-      kind: 'workflow-checkpoint',
-      modelUrl: resolveModelUrl(currentJob.outputUrl, apiUrl),
-      isCheckpointPreview: true,
-      label: 'Temporary checkpoint — not final output',
-    }
-  }
-
-  return {
-    kind: 'none',
-    modelUrl: null,
-    isCheckpointPreview: false,
-  }
+function isViewerAssetTarget(value: GenerationJob | ViewerAssetTarget | null): value is ViewerAssetTarget {
+  return Boolean(value && typeof value === 'object' && 'kind' in value && 'isCheckpointPreview' in value && 'modelUrl' in value)
 }
 
 export interface CheckpointEditEligibilityInput {

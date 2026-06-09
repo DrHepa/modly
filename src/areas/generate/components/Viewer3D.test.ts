@@ -117,6 +117,7 @@ test('resolveViewer3DPresentation marks workflow checkpoints as temporary and no
       {
         modelUrl: 'http://127.0.0.1:8000/workspace/checkpoints/wait.glb',
         checkpointLabel: 'Temporary checkpoint — not final output',
+        sourceLabel: 'Temporary checkpoint — not final output',
         canDeleteSelectedModel: false,
         selectedHint: 'Temporary checkpoint — not final output',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -141,6 +142,36 @@ test('resolveViewer3DPresentation keeps final outputs deletable without checkpoi
       {
         modelUrl: 'http://127.0.0.1:8000/workspace/final/model.glb',
         checkpointLabel: null,
+        sourceLabel: 'Final output',
+        canDeleteSelectedModel: true,
+        selectedHint: 'Click mesh to select • Delete to remove',
+        idleHint: 'Drag to rotate • Scroll to zoom',
+      },
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
+test('resolveViewer3DPresentation forwards normalized source label and provenance without creating new UI states', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DPresentation({
+        kind: 'final',
+        modelUrl: 'http://127.0.0.1:8000/workspace/imports/hero.glb',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        provenance: { producer: 'scene-import', runId: 'import-1' },
+      }),
+      {
+        modelUrl: 'http://127.0.0.1:8000/workspace/imports/hero.glb',
+        checkpointLabel: null,
+        sourceLabel: 'Imported mesh',
+        provenance: { producer: 'scene-import', runId: 'import-1' },
         canDeleteSelectedModel: true,
         selectedHint: 'Click mesh to select • Delete to remove',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -172,6 +203,39 @@ test('resolveViewer3DRigSourceWorkspacePath keeps final generated workspace mesh
         label: 'Temporary checkpoint — not final output',
       }),
       'Workflows/checkpoints/wait rig.glb',
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
+test('resolveViewer3DRigSourceWorkspacePath requires target workspacePath to corroborate a safe visible URL', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.equal(
+      module.resolveViewer3DRigSourceWorkspacePath({
+        kind: 'final',
+        modelUrl: 'blob:http://127.0.0.1:8000/generated-preview',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        workspacePath: 'Imports/hero.glb',
+      }),
+      undefined,
+    )
+    assert.equal(
+      module.resolveViewer3DRigSourceWorkspacePath({
+        kind: 'final',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Imports/fallback.glb',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        workspacePath: '../unsafe.glb',
+      }),
+      undefined,
     )
   } finally {
     await cleanup()
@@ -213,6 +277,7 @@ test('resolveViewer3DPresentation keeps empty viewer state non-deletable and cop
       {
         modelUrl: null,
         checkpointLabel: null,
+        sourceLabel: null,
         canDeleteSelectedModel: false,
         selectedHint: 'Click mesh to select • Delete to remove',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -4878,8 +4943,13 @@ test('Viewer3D Motion Retarget seams stay renderer-local, Electron-guarded, and 
     assert.match(motionRetargetRuntimeSlice, /reader\(descriptor\.metadataUrl\)/)
     assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.writeMotionRetargetSidecar/)
     assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.readMotionRetargetSidecar/)
-    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.previewWorkspaceArtifact/)
-    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.downloadWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /workspaceArtifactService\.previewWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /workspaceArtifactService\.downloadWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /workspaceArtifactService\.isCurrent\(\)/)
+    const service = readFileSync(path.join(projectRoot, 'src/areas/generate/viewerWorkspaceArtifactService.ts'), 'utf8')
+    assert.match(service, /window\.electron\?\.workspace\?\.artifacts/)
+    assert.match(service, /typeof method !== 'function'/)
+    assert.match(service, /await method\.call\(ports, request\)/)
     assert.doesNotMatch(motionRetargetSlice, /writeFile|rename\(|rm\(|mkdir\(|GLTFExporter|exportGLB|saveEditedScenePendingReplacement/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /processRun|createFromImage|\/generate|FastAPI|interactive mapping|pose editing|target="_blank"|download=/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /ipcRenderer\.invoke\(/)
@@ -6055,7 +6125,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       assert.ok(button, `Missing button ${title}`); button.props.onClick()
     })
     render(); await settle()
-    return { host, harness, source, preview, component, click, render, useWorkflowRunStore, fetches,
+    return { host, harness, source, preview, component, click, render, useWorkflowRunStore, useAppStore, fetches,
       switchTo: (url: string) => flush(() => job(url)), panel: () => component('PoseClipPanel') }
   }
 
@@ -6125,6 +6195,36 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
   })
   // Explicit Motion Retarget artifact-preview/animated-selection dispatch was
   // removed in original57. Its helper tests above remain; no hidden UI is rebuilt.
+  await suite.test('stale selected checkpoint owner retires source authoring despite a matching artifact URL', async t => {
+    const second = deferred()
+    let fetchCount = 0, parsedSecondResponse = false
+    const view = await mount(t, { fetch: () => ++fetchCount === 1 ? Promise.resolve(response()) : second.promise })
+    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(view.component('GltfMeshModel').url, sourceUrl)
+    assert.deepEqual(view.fetches, [['/workspace/Workflows/kimodo/run/metadata.json']])
+    const artifact = { id: 'old-input', versionId: 'old-version', kind: 'mesh', uri: previewUrl,
+      provenance: { extensionId: 'unrelated', extensionNodeId: 'not-kimodo' } }
+    flush(() => view.useWorkflowRunStore.setState({ executionId: 'old-run', activeCheckpointNodeId: 'old-wait',
+      checkpoints: { 'old-wait': { owner: { runId: 'old-run', nodeId: 'old-wait', inputArtifactId: artifact.id, inputVersionId: artifact.versionId, revision: 1 },
+        substitutionPoint: { inputArtifact: artifact } } } }))
+    await settle()
+    assert.notEqual(view.useAppStore.getState().currentJob.id, 'old-run')
+    assert.equal(view.useWorkflowRunStore.getState().getCheckpointOwner('old-wait'), undefined, 'Public store fields do not create private execution authority')
+    assert.deepEqual(view.fetches, [
+      ['/workspace/Workflows/kimodo/run/metadata.json'],
+      ['/workspace/Workflows/kimodo/run/metadata.json'],
+    ])
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene, 'The retired checkpoint cannot retain source authoring authority')
+    assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+    second.resolve({ ok: true, json: async () => { parsedSecondResponse = true; return degraded() } })
+    await settle()
+    assert.equal(parsedSecondResponse, true, 'The second read completed rather than merely remaining pending')
+    assert.equal(view.component('GltfMeshModel').url, previewUrl)
+    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene, 'Late metadata cannot recover retired source authority')
+    assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
+    assert.equal(view.fetches.length, 2, 'The fenced completion must not cause a read loop')
+  })
   await suite.test('same-URL preview Scene replacement retires old no-rig metadata capability', async t => {
     const first = deferred(), second = deferred(); let count = 0
     const view = await mount(t, { fetch: () => ++count === 1 ? first.promise : second.promise })

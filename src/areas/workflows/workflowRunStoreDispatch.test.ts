@@ -1,6 +1,8 @@
 import type { HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, RigMetaSidecarReadResult } from '../../shared/types/electron.d'
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
+import type { GenerationJob } from '../../shared/stores/appStore.ts'
+import { resolveViewerAssetTarget } from '../generate/viewerAssetTarget.ts'
 import { build } from 'esbuild'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
@@ -3032,4 +3034,59 @@ test('inherited raw prompt is not an explicit motion parameter', async () => {
   assert.equal(posts[0].prompt, 'Connected motion')
   assert.equal((posts[0].params as Record<string, unknown>).motion_prompt, 'Connected motion')
   assert.equal((posts[0].params as Record<string, unknown>).character_prompt, undefined)
+})
+
+test('workflowRunStore resolves a paused checkpoint viewer target from the selected current owner', async () => {
+  await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+  const state = useWorkflowRunStore.getState()
+  const checkpoint = state.checkpoints.wait
+  const input = checkpoint.substitutionPoint?.inputArtifact
+  assert.ok(input)
+  assert.equal(state.activeCheckpointNodeId, 'wait')
+  assert.equal(input.id, owner().inputArtifactId)
+  assert.equal(input.versionId, owner().inputVersionId)
+  assert.equal(appState.currentJob?.status, 'generating')
+  const target = resolveViewerAssetTarget({ currentJob: appState.currentJob as unknown as GenerationJob,
+    apiUrl: appState.apiUrl, workflowArtifact: input })
+  assert.deepEqual(target, {
+    kind: 'workflow-checkpoint', modelUrl: 'http://inert.invalid/workspace/source.glb',
+    isCheckpointPreview: true, label: 'Temporary checkpoint — not final output',
+    sourceLabel: 'Temporary checkpoint — not final output', sourceKind: 'workflow',
+    workspacePath: 'source.glb', artifactId: input.id, versionId: input.versionId,
+  })
+  useWorkflowRunStore.getState().cancel()
+})
+
+test('workflowRunStore keeps final viewer identity and drops stale artifact metadata after actual mesh-history undo', async () => {
+  const workflow = checkpointWorkflow()
+  workflow.nodes.push(createNode('output', 'outputNode'))
+  workflow.edges.push({ id: 'output', source: 'wait', target: 'output' })
+  await useWorkflowRunStore.getState().run(workflow, [])
+  await useWorkflowRunStore.getState().continueRun('wait', { owner: owner() })
+  const { runState } = useWorkflowRunStore.getState()
+  const artifact = runState.artifact
+  assert.ok(artifact)
+  assert.equal(runState.status, 'done')
+  assert.equal(appState.currentJob?.status, 'done')
+  const currentJob = appState.currentJob as unknown as GenerationJob
+  assert.deepEqual(resolveViewerAssetTarget({ currentJob, apiUrl: appState.apiUrl, workflowArtifact: artifact }), {
+    kind: 'final', modelUrl: 'http://inert.invalid/workspace/source.glb', isCheckpointPreview: false,
+    label: 'Final output', sourceLabel: 'Final output', sourceKind: 'workflow', workspacePath: 'source.glb',
+    artifactId: artifact.id, versionId: artifact.versionId,
+  })
+  // Run the real app store history reducer; no native/storage/backend calls.
+  const { useAppStore } = await import('../../shared/stores/appStore.ts')
+  const before = useAppStore.getState()
+  try {
+    useAppStore.getState().setCurrentJob(currentJob)
+    useAppStore.getState().pushMeshUrl('/workspace/history/older.glb')
+    useAppStore.getState().pushMeshUrl(currentJob.outputUrl!)
+    useAppStore.getState().undoMesh()
+    assert.equal(useAppStore.getState().currentJob?.outputUrl, '/workspace/history/older.glb')
+    assert.deepEqual(resolveViewerAssetTarget({ currentJob: useAppStore.getState().currentJob,
+      apiUrl: appState.apiUrl, workflowArtifact: artifact, sourceKind: 'history' }), {
+      kind: 'final', modelUrl: 'http://inert.invalid/workspace/history/older.glb', isCheckpointPreview: false,
+      label: 'Final output', sourceLabel: 'Final output', sourceKind: 'history', workspacePath: 'history/older.glb',
+    })
+  } finally { useAppStore.setState(before, true) }
 })

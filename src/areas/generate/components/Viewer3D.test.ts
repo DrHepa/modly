@@ -100,6 +100,7 @@ test('resolveViewer3DPresentation marks workflow checkpoints as temporary and no
       {
         modelUrl: 'http://127.0.0.1:8000/workspace/checkpoints/wait.glb',
         checkpointLabel: 'Temporary checkpoint — not final output',
+        sourceLabel: undefined,
         canDeleteSelectedModel: false,
         selectedHint: 'Temporary checkpoint — not final output',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -124,6 +125,36 @@ test('resolveViewer3DPresentation keeps final outputs deletable without checkpoi
       {
         modelUrl: 'http://127.0.0.1:8000/workspace/final/model.glb',
         checkpointLabel: null,
+        sourceLabel: undefined,
+        canDeleteSelectedModel: true,
+        selectedHint: 'Click mesh to select • Delete to remove',
+        idleHint: 'Drag to rotate • Scroll to zoom',
+      },
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
+test('resolveViewer3DPresentation forwards normalized source label and provenance without creating new UI states', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.deepEqual(
+      module.resolveViewer3DPresentation({
+        kind: 'final',
+        modelUrl: 'http://127.0.0.1:8000/workspace/imports/hero.glb',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        provenance: { producer: 'scene-import', runId: 'import-1' },
+      }),
+      {
+        modelUrl: 'http://127.0.0.1:8000/workspace/imports/hero.glb',
+        checkpointLabel: null,
+        sourceLabel: 'Imported mesh',
+        provenance: { producer: 'scene-import', runId: 'import-1' },
         canDeleteSelectedModel: true,
         selectedHint: 'Click mesh to select • Delete to remove',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -155,6 +186,39 @@ test('resolveViewer3DRigSourceWorkspacePath keeps final generated workspace mesh
         label: 'Temporary checkpoint — not final output',
       }),
       'Workflows/checkpoints/wait rig.glb',
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
+test('resolveViewer3DRigSourceWorkspacePath prefers normalized target workspacePath before raw URL parsing', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.equal(
+      module.resolveViewer3DRigSourceWorkspacePath({
+        kind: 'final',
+        modelUrl: 'blob:http://127.0.0.1:8000/generated-preview',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        workspacePath: 'Imports/hero.glb',
+      }),
+      'Imports/hero.glb',
+    )
+    assert.equal(
+      module.resolveViewer3DRigSourceWorkspacePath({
+        kind: 'final',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Imports/fallback.glb',
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: 'Imported mesh',
+        sourceKind: 'import',
+        workspacePath: '../unsafe.glb',
+      }),
+      'Imports/fallback.glb',
     )
   } finally {
     await cleanup()
@@ -196,6 +260,7 @@ test('resolveViewer3DPresentation keeps empty viewer state non-deletable and cop
       {
         modelUrl: null,
         checkpointLabel: null,
+        sourceLabel: null,
         canDeleteSelectedModel: false,
         selectedHint: 'Click mesh to select • Delete to remove',
         idleHint: 'Drag to rotate • Scroll to zoom',
@@ -4844,8 +4909,8 @@ test('Viewer3D Motion Retarget seams stay renderer-local, Electron-guarded, and 
     assert.match(motionRetargetRuntimeSlice, /fetch\(kimodoMetadataDescriptor\.metadataUrl\)/)
     assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.writeMotionRetargetSidecar/)
     assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.readMotionRetargetSidecar/)
-    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.previewWorkspaceArtifact/)
-    assert.match(motionRetargetRuntimeSlice, /window\.electron\?\.workspace\?\.artifacts\?\.downloadWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /previewWorkspaceArtifact/)
+    assert.match(motionRetargetRuntimeSlice, /downloadWorkspaceArtifact/)
     assert.doesNotMatch(motionRetargetSlice, /writeFile|rename\(|rm\(|mkdir\(|GLTFExporter|exportGLB|saveEditedScenePendingReplacement/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /processRun|createFromImage|\/generate|FastAPI|interactive mapping|pose editing|target="_blank"|download=/i)
     assert.doesNotMatch(motionRetargetRuntimeSlice, /ipcRenderer\.invoke\(/)

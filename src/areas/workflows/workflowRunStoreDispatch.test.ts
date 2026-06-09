@@ -14,6 +14,7 @@ import type {
 } from '../../shared/types/electron.d'
 import { REQUIRED_LANDMARK_IDS, type LandmarkCaptureState, type LandmarkId, type LandmarkPoint, type LandmarkSidecarV1 } from './landmarks.ts'
 import { createLandmarkPointIntent, deriveLandmarkMarkers } from '../generate/components/viewerLandmarkPicking.ts'
+import { resolveViewerAssetTarget } from '../generate/viewerAssetTarget.ts'
 import type { WorkflowExtension } from './mockExtensions'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
 import { buildEditedCheckpointArtifactRef, deriveArtifactHistoryRows, type LandmarkSidecarLineageMetadata } from './workflowArtifacts.ts'
@@ -1927,6 +1928,90 @@ test('workflowRunStore clears checkpoint preview metadata when a wait checkpoint
   assert.equal(useAppStore.getState().currentJob?.status, 'done')
   assert.equal(useAppStore.getState().currentJob?.outputUrl, '/workspace/meshes/original.glb')
   assert.equal(useAppStore.getState().currentJob?.previewKind, undefined)
+})
+
+test('workflowRunStore resolves a paused checkpoint viewer target from artifact-backed workflow state', async () => {
+  const workflow = createWaitWorkflow({ id: 'workflow-wait-checkpoint-target' })
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension()])
+  await waitForPause()
+
+  try {
+    const { apiUrl, currentJob } = useAppStore.getState()
+    const { runState } = useWorkflowRunStore.getState()
+
+    assert.ok(currentJob)
+    assert.ok(runState.artifact)
+
+    assert.deepEqual(resolveViewerAssetTarget({
+      currentJob,
+      apiUrl,
+      workflowArtifact: runState.artifact,
+    }), {
+      kind: 'workflow-checkpoint',
+      modelUrl: 'http://127.0.0.1:8000/workspace/meshes/original.glb',
+      isCheckpointPreview: true,
+      label: 'Temporary checkpoint — not final output',
+      sourceLabel: 'Temporary checkpoint — not final output',
+      sourceKind: 'workflow',
+      workspacePath: 'meshes/original.glb',
+      artifactId: 'workflow-workflow-wait-checkpoint-target-node-mesh-source',
+      versionId: 'workflow-workflow-wait-checkpoint-target-node-mesh-source-original',
+    })
+  } finally {
+    useWorkflowRunStore.getState().continueRun()
+    await runPromise
+  }
+})
+
+test('workflowRunStore keeps workflow viewer identity on final output and drops stale artifact metadata for undo history targets', async () => {
+  const workflow = createWaitWorkflow({ id: 'workflow-wait-history-target' })
+
+  const runPromise = useWorkflowRunStore.getState().run(workflow, [createWaitExtension()])
+  await waitForPause()
+  useWorkflowRunStore.getState().continueRun()
+  await runPromise
+
+  const { apiUrl, currentJob, pushMeshUrl, undoMesh } = useAppStore.getState()
+  const { runState } = useWorkflowRunStore.getState()
+
+  assert.ok(currentJob)
+  assert.ok(runState.artifact)
+
+  assert.deepEqual(resolveViewerAssetTarget({
+    currentJob,
+    apiUrl,
+    workflowArtifact: runState.artifact,
+  }), {
+    kind: 'final',
+    modelUrl: 'http://127.0.0.1:8000/workspace/meshes/original.glb',
+    isCheckpointPreview: false,
+    label: 'Final output',
+    sourceLabel: 'Final output',
+    sourceKind: 'workflow',
+    workspacePath: 'meshes/original.glb',
+    artifactId: 'workflow-workflow-wait-history-target-node-wait-node',
+    versionId: 'workflow-workflow-wait-history-target-node-wait-node-original',
+  })
+
+  pushMeshUrl('/workspace/history/older.glb')
+  pushMeshUrl(currentJob.outputUrl!)
+  undoMesh()
+
+  assert.deepEqual(resolveViewerAssetTarget({
+    currentJob: useAppStore.getState().currentJob,
+    apiUrl,
+    workflowArtifact: runState.artifact,
+    sourceKind: 'history',
+  }), {
+    kind: 'final',
+    modelUrl: 'http://127.0.0.1:8000/workspace/history/older.glb',
+    isCheckpointPreview: false,
+    label: 'Final output',
+    sourceLabel: 'Final output',
+    sourceKind: 'history',
+    workspacePath: 'history/older.glb',
+  })
 })
 
 test('workflowRunStore clears checkpoint preview metadata after normal continue before downstream processing', async () => {

@@ -1,19 +1,21 @@
 import type { GenerationJob } from '../../shared/stores/appStore'
+import { buildSceneImportGenerationJob } from './sceneImportAutomation.ts'
+import { resolveViewerAssetTargetFromLibraryEntry, type ViewerAssetTarget } from './viewerAssetTarget.ts'
 import type { AssetLibraryOpenRequest } from '../../shared/types/assetLibrary'
-import { resolveAssetLibraryOpenTarget, type AssetLibraryOpenTarget, type ProjectedAssetLibraryEntry } from './assetLibraryProjection'
+import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 
 export type GenerateOpenPanel = 'export' | 'decimate' | 'smooth' | 'import' | 'library' | 'light' | null
 export type AssetLibrarySortMode = 'type' | 'name' | 'date'
 
 export interface AssetLibraryEntryGroup {
-  capability: NonNullable<ProjectedAssetLibraryEntry['capability']>
+  capability: RendererAssetLibraryEntry['capability']
   capabilityLabel: string
   sectionKey: string
-  entries: ProjectedAssetLibraryEntry[]
+  entries: RendererAssetLibraryEntry[]
 }
 
 export interface AssetLibrarySourceScopeGroup {
-  sourceScope: ProjectedAssetLibraryEntry['sourceScope']
+  sourceScope: RendererAssetLibraryEntry['sourceScope']
   sourceScopeLabel: string
   sectionKey: string
   entryGroups: AssetLibraryEntryGroup[]
@@ -21,6 +23,7 @@ export interface AssetLibrarySourceScopeGroup {
 
 export interface AssetLibraryOpenSelection {
   historyUrl: string
+  target: Extract<ViewerAssetTarget, { kind: 'final' }>
   job: GenerationJob
 }
 
@@ -31,14 +34,15 @@ const ASSET_LIBRARY_CAPABILITY_SECTIONS = [
   { capability: 'landmarks-sidecar', label: 'Landmarks sidecars' },
   { capability: 'generated-world', label: 'Generated worlds' },
   { capability: 'scene-manifest', label: 'Scene manifests' },
-] as const satisfies ReadonlyArray<{ capability: NonNullable<ProjectedAssetLibraryEntry['capability']>, label: string }>
+  { capability: undefined, label: 'Unknown metadata' },
+] as const satisfies ReadonlyArray<{ capability: RendererAssetLibraryEntry['capability'], label: string }>
 
 const ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS = [
   { sourceScope: 'workflows', label: 'Workflows' },
   { sourceScope: 'exports', label: 'Exports' },
-] as const satisfies ReadonlyArray<{ sourceScope: ProjectedAssetLibraryEntry['sourceScope'], label: string }>
+] as const satisfies ReadonlyArray<{ sourceScope: RendererAssetLibraryEntry['sourceScope'], label: string }>
 
-const ASSET_LIBRARY_CAPABILITY_ORDER = new Map(
+const ASSET_LIBRARY_CAPABILITY_ORDER = new Map<RendererAssetLibraryEntry['capability'], number>(
   ASSET_LIBRARY_CAPABILITY_SECTIONS.map((section, index) => [section.capability, index]),
 )
 
@@ -68,35 +72,53 @@ export function toggleAssetLibrarySectionKey(currentKeys: string[], sectionKey: 
     : [...currentKeys, sectionKey]
 }
 
-export function buildAssetLibraryOpenRequest(entry: ProjectedAssetLibraryEntry): AssetLibraryOpenRequest {
-  const target = resolveAssetLibraryOpenTarget(entry)
-  return target.kind === 'linked-source'
-    ? { workspacePath: target.workspacePath, sourceWorkspacePath: target.sourceWorkspacePath }
-    : { workspacePath: entry.workspacePath }
+export function buildAssetLibraryOpenRequest(entry: RendererAssetLibraryEntry): AssetLibraryOpenRequest {
+  return {
+    workspacePath: entry.workspacePath,
+    ...(entry.openTarget.kind === 'linked-source' ? { sourceWorkspacePath: entry.openTarget.workspacePath } : {}),
+  }
 }
 
-export function isAssetLibraryEntryOpenable(entry: ProjectedAssetLibraryEntry | null | undefined): entry is ProjectedAssetLibraryEntry {
-  return Boolean(entry && resolveAssetLibraryOpenTarget(entry).kind !== 'unavailable')
+export function isAssetLibraryEntryOpenable(entry: RendererAssetLibraryEntry | null | undefined): entry is RendererAssetLibraryEntry {
+  return Boolean(entry && entry.state === 'ready' && entry.openTarget.kind !== 'unavailable')
 }
 
-export function describeAssetLibraryOpenability(entry: ProjectedAssetLibraryEntry): string {
+export function describeAssetLibraryOpenability(entry: RendererAssetLibraryEntry): string {
   if (entry.state === 'unknown-metadata') return 'Missing metadata prevents a safe open in Generate.'
   if (entry.state === 'unsupported') return 'This asset is tracked in the library but is not supported in Generate.'
   if (entry.state === 'unsafe') return 'This asset was rejected because its workspace path is unsafe.'
-  const target = resolveAssetLibraryOpenTarget(entry)
-  if (target.kind === 'linked-source') return `Ready to open linked source ${entry.source?.displayName ?? target.sourceWorkspacePath} in Generate.`
-  if (target.kind === 'self') return 'Ready to open this asset directly in Generate.'
-  if (entry.nonOpenableReason) return entry.nonOpenableReason
-  if (!/\.(glb|gltf)$/i.test(entry.workspacePath)) return 'Only .glb/.gltf workspace assets are openable in this release.'
-  return target.reason
+
+  switch (entry.openTarget.kind) {
+    case 'self':
+      return 'Ready to open this asset directly in Generate.'
+    case 'linked-source':
+      return 'Generate opens the linked source mesh for this sidecar asset.'
+    case 'unavailable':
+      switch (entry.openTarget.reason) {
+        case 'capability-not-viewable':
+          if (entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
+            return 'This asset is tracked as a mesh in the library, but this format cannot open directly in Generate yet.'
+          }
+          return 'This capability is tracked in the library but cannot open in Generate yet.'
+        case 'missing-source-link':
+          return 'This asset needs a valid source mesh before it can open in Generate.'
+        case 'missing-capability':
+          return 'This asset is missing a supported capability classification.'
+        case 'unsafe-entry':
+          return 'This asset was rejected because its workspace path is unsafe.'
+        case 'state-not-openable':
+        default:
+          return 'This asset is not openable in Generate.'
+      }
+  }
 }
 
-export function filterVisibleAssetLibraryEntries(entries: ProjectedAssetLibraryEntry[]): ProjectedAssetLibraryEntry[] {
+export function filterVisibleAssetLibraryEntries(entries: RendererAssetLibraryEntry[]): RendererAssetLibraryEntry[] {
   return entries.filter((entry) => entry.state !== 'unsupported' && !hasInternalAssetLibraryDirectory(entry.workspacePath))
 }
 
 export function filterAssetLibraryScopeGroups(
-  entries: ProjectedAssetLibraryEntry[],
+  entries: RendererAssetLibraryEntry[],
   searchQuery: string,
   sortMode: AssetLibrarySortMode,
 ): AssetLibrarySourceScopeGroup[] {
@@ -104,12 +126,12 @@ export function filterAssetLibraryScopeGroups(
   const visibleEntries = filterVisibleAssetLibraryEntries(entries)
 
   return ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS
-    .map((scopeSection) => {
+    .map((scopeSection): AssetLibrarySourceScopeGroup | null => {
       const scopeEntries = visibleEntries.filter((entry) => entry.sourceScope === scopeSection.sourceScope)
       const scopeMatches = normalizedSearchQuery.length > 0 && matchesAssetLibrarySearch(scopeSection.label, normalizedSearchQuery)
 
       const entryGroups = ASSET_LIBRARY_CAPABILITY_SECTIONS
-        .map((capabilitySection) => {
+        .map((capabilitySection): AssetLibraryEntryGroup | null => {
           const capabilityEntries = scopeEntries.filter((entry) => entry.capability === capabilitySection.capability)
           if (capabilityEntries.length === 0) return null
 
@@ -144,23 +166,23 @@ export function filterAssetLibraryScopeGroups(
     .filter((group): group is AssetLibrarySourceScopeGroup => group !== null)
 }
 
-export function createAssetLibraryOpenJob(
-  entry: ProjectedAssetLibraryEntry,
-  target: AssetLibraryOpenTarget,
+export function resolveAssetLibraryOpenSelection(
+  entry: RendererAssetLibraryEntry,
+  apiUrl: string,
   now = Date.now(),
 ): AssetLibraryOpenSelection | null {
-  if (target.kind === 'unavailable') return null
+  const target = resolveViewerAssetTargetFromLibraryEntry(entry, apiUrl)
+  if (target.kind !== 'final') return null
+
+  const historyUrl = target.workspacePath ? `/workspace/${target.workspacePath.split('/').map(encodeURIComponent).join('/')}` : target.modelUrl
   return {
-    historyUrl: target.url,
-    job: {
-      id: `library-${now}`,
-      imageFile: '',
-      status: 'done',
-      progress: 100,
-      outputUrl: target.url,
-      originalOutputUrl: target.url,
-      createdAt: now,
-    },
+    historyUrl,
+    target,
+    job: buildSceneImportGenerationJob({
+      meshPath: target.workspacePath ?? entry.workspacePath,
+      url: historyUrl,
+      displayName: entry.displayName,
+    }, now),
   }
 }
 
@@ -169,9 +191,9 @@ export function resolveOpenPanelAfterLibrarySelection(currentPanel: GenerateOpen
 }
 
 function sortAssetLibraryEntries(
-  entries: ProjectedAssetLibraryEntry[],
+  entries: RendererAssetLibraryEntry[],
   sortMode: AssetLibrarySortMode,
-): ProjectedAssetLibraryEntry[] {
+): RendererAssetLibraryEntry[] {
   return [...entries].sort((left, right) => compareAssetLibraryEntries(left, right, sortMode))
 }
 
@@ -188,8 +210,8 @@ function compareAssetLibraryEntryGroups(
 }
 
 function compareAssetLibraryEntries(
-  left: ProjectedAssetLibraryEntry,
-  right: ProjectedAssetLibraryEntry,
+  left: RendererAssetLibraryEntry,
+  right: RendererAssetLibraryEntry,
   sortMode: AssetLibrarySortMode,
 ): number {
   if (sortMode === 'date') {
@@ -203,15 +225,16 @@ function compareAssetLibraryEntries(
   return compareAssetLibraryEntryNames(left, right)
 }
 
-function compareAssetLibraryEntryNames(left: ProjectedAssetLibraryEntry, right: ProjectedAssetLibraryEntry): number {
+function compareAssetLibraryEntryNames(left: RendererAssetLibraryEntry, right: RendererAssetLibraryEntry): number {
   const displayNameComparison = left.displayName.localeCompare(right.displayName, undefined, { sensitivity: 'base' })
   if (displayNameComparison !== 0) return displayNameComparison
   const workspacePathComparison = left.workspacePath.localeCompare(right.workspacePath, undefined, { sensitivity: 'base' })
   if (workspacePathComparison !== 0) return workspacePathComparison
   return left.id.localeCompare(right.id, undefined, { sensitivity: 'base' })
+    || left.workspacePath.localeCompare(right.workspacePath) || left.id.localeCompare(right.id)
 }
 
-function resolveAssetLibrarySortTimestamp(entry: ProjectedAssetLibraryEntry): number | null {
+function resolveAssetLibrarySortTimestamp(entry: RendererAssetLibraryEntry): number | null {
   return parseAssetLibrarySortTimestamp(entry.createdAt) ?? parseAssetLibrarySortTimestamp(entry.updatedAt)
 }
 
@@ -225,12 +248,11 @@ function normalizeAssetLibrarySearchQuery(searchQuery: string): string {
   return searchQuery.trim().toLocaleLowerCase()
 }
 
-function matchesAssetLibraryEntrySearch(entry: ProjectedAssetLibraryEntry, normalizedSearchQuery: string): boolean {
+function matchesAssetLibraryEntrySearch(entry: RendererAssetLibraryEntry, normalizedSearchQuery: string): boolean {
   return [
     entry.displayName,
     entry.workspacePath,
     entry.source?.workspacePath,
-    entry.source?.displayName,
     entry.manifest?.workspacePath,
     entry.capability,
     entry.sourceScope,

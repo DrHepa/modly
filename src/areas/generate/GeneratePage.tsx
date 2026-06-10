@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 import type { GenerationJob, LightSettings, PointLight } from '@shared/stores/appStore'
@@ -7,13 +7,13 @@ import { ColorPicker } from '@shared/components/ui'
 import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
-import { getDefaultAssetLibraryService } from './assetLibraryService'
+import { listAssetLibraryEntries, openAssetLibraryEntry } from './assetLibraryService.ts'
 import { buildOrcaSlicerDeepLink, canOpenInOrcaSlicer } from './orcaSlicerLink'
-import { resolveAssetLibraryOpenTarget, type ProjectedAssetLibraryEntry } from './assetLibraryProjection'
+import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 import {
   ASSET_LIBRARY_SORT_OPTIONS,
   buildAssetLibraryOpenRequest,
-  createAssetLibraryOpenJob,
+  resolveAssetLibraryOpenSelection,
   describeAssetLibraryOpenability,
   filterAssetLibraryScopeGroups,
   getDefaultAssetLibraryCollapsedSectionKeys,
@@ -24,6 +24,13 @@ import {
   type GenerateOpenPanel,
 } from './assetLibraryUi'
 import { buildSceneImportGenerationJob } from './sceneImportAutomation'
+
+export { getDefaultAssetLibraryCollapsedSectionKeys, resolveOpenPanelAfterLibrarySelection, resolveAssetLibraryOpenSelection } from './assetLibraryUi.ts'
+
+export type MeshImportOrigin = 'toolbar'
+export function resolveOpenPanelAfterMeshImport(_origin: MeshImportOrigin, panel: GenerateOpenPanel): GenerateOpenPanel {
+  return panel === 'import' ? null : panel
+}
 
 const MIN_WIDTH = 220
 const MAX_WIDTH = 520
@@ -428,7 +435,7 @@ function SmoothPopover({
 // Workspace library popover
 // ---------------------------------------------------------------------------
 
-function AssetLibraryToggleButton({
+export function AssetLibraryToggleButton({
   open,
   disabled,
   onToggle,
@@ -460,15 +467,15 @@ function AssetLibraryToggleButton({
   )
 }
 
-function AssetLibraryPopover({
+export function AssetLibraryPopover({
   entries,
   selectedEntryId,
   loading,
   opening,
   error,
-  searchQuery,
-  sortMode,
-  collapsedSectionKeys,
+  searchQuery = '',
+  sortMode = 'type',
+  collapsedSectionKeys = getDefaultAssetLibraryCollapsedSectionKeys(),
   onSelectEntry,
   onSearchQueryChange,
   onSortModeChange,
@@ -477,17 +484,17 @@ function AssetLibraryPopover({
   onRefresh,
   onClose,
 }: {
-  entries: ProjectedAssetLibraryEntry[]
+  entries: RendererAssetLibraryEntry[]
   selectedEntryId: string | null
   loading: boolean
   opening: boolean
   error: string | null
-  searchQuery: string
-  sortMode: AssetLibrarySortMode
-  collapsedSectionKeys: string[]
+  searchQuery?: string
+  sortMode?: AssetLibrarySortMode
+  collapsedSectionKeys?: string[]
   onSelectEntry: (entryId: string) => void
   onSearchQueryChange: (value: string) => void
-  onSortModeChange: (value: AssetLibrarySortMode) => void
+  onSortModeChange?: (value: AssetLibrarySortMode) => void
   onToggleSection: (sectionKey: string) => void
   onOpenSelected: () => void
   onRefresh: () => void
@@ -552,7 +559,7 @@ function AssetLibraryPopover({
           <select
             id="asset-library-sort"
             value={sortMode}
-            onChange={(event) => onSortModeChange(event.target.value as AssetLibrarySortMode)}
+            onChange={(event) => onSortModeChange?.(event.target.value as AssetLibrarySortMode)}
             className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
           >
             {ASSET_LIBRARY_SORT_OPTIONS.map((option) => (
@@ -577,6 +584,7 @@ function AssetLibraryPopover({
               <section key={scopeGroup.sectionKey} role="group" aria-label={`Source scope ${scopeGroup.sourceScopeLabel}`} className="border-b border-zinc-800 last:border-b-0">
                 <button
                   type="button"
+                  aria-label={`Toggle ${scopeGroup.sourceScopeLabel} assets`}
                   aria-expanded={scopeExpanded}
                   aria-controls={scopeRegionId}
                   onClick={() => onToggleSection(scopeGroup.sectionKey)}
@@ -594,6 +602,7 @@ function AssetLibraryPopover({
                         <section key={group.sectionKey} role="group" aria-label={`Capability category ${group.capabilityLabel}`} className="border-t border-zinc-800 first:border-t-0">
                           <button
                             type="button"
+                            aria-label={`Toggle ${group.capabilityLabel} assets in ${scopeGroup.sourceScopeLabel}`}
                             aria-expanded={capabilityExpanded}
                             aria-controls={capabilityRegionId}
                             onClick={() => onToggleSection(group.sectionKey)}
@@ -667,7 +676,7 @@ export default function GeneratePage(): JSX.Element {
   const [decimating, setDecimating] = useState(false)
   const [smoothing, setSmoothing] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [libraryEntries, setLibraryEntries] = useState<ProjectedAssetLibraryEntry[]>([])
+  const [libraryEntries, setLibraryEntries] = useState<RendererAssetLibraryEntry[]>([])
   const [librarySelectedEntryId, setLibrarySelectedEntryId] = useState<string | null>(null)
   const [libraryLoaded, setLibraryLoaded] = useState(false)
   const [libraryLoading, setLibraryLoading] = useState(false)
@@ -702,7 +711,27 @@ export default function GeneratePage(): JSX.Element {
   const canUndo = useAppStore((s) => s.historyIndex > 0)
   const canRedo = useAppStore((s) => s.historyIndex < s.meshHistory.length - 1)
   const { optimizeMesh, smoothMesh, importMesh } = useApi()
-  const assetLibraryService = useMemo(() => getDefaultAssetLibraryService(), [])
+  const libraryEpoch = useRef(0)
+  const libraryWorkspace = useRef<string | null>(null)
+  const librarySelection = useRef(librarySelectedEntryId)
+  librarySelection.current = librarySelectedEntryId
+  useEffect(() => () => { libraryEpoch.current += 1 }, [])
+  useEffect(() => {
+    libraryEpoch.current += 1
+    libraryWorkspace.current = null
+    setLibraryEntries([])
+    setLibrarySelectedEntryId(null)
+    setLibraryLoaded(false)
+    setLibraryLoading(false)
+    setLibraryOpening(false)
+  }, [apiUrl])
+  async function readLibraryWorkspace(): Promise<string> {
+    const reader = window.electron?.settings?.get
+    if (typeof reader !== 'function') throw new Error('Workspace settings API is unavailable.')
+    const settings = await reader()
+    if (typeof settings.workspaceDir !== 'string' || !settings.workspaceDir) throw new Error('Workspace is unavailable.')
+    return settings.workspaceDir
+  }
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -762,10 +791,10 @@ export default function GeneratePage(): JSX.Element {
   }, [hasModel, meshSelected, selectedPointLightId])
 
   useEffect(() => {
-    if (openPanel !== 'library' || libraryLoaded || libraryLoading) return
+    if (openPanel !== 'library' || libraryLoaded || libraryLoading || libraryError) return
     void loadLibraryEntries()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- lazy-load guarded by loaded/loading flags
-  }, [openPanel, libraryLoaded, libraryLoading])
+  }, [openPanel, libraryLoaded, libraryLoading, libraryError])
 
   async function handleUnloadAll() {
     await window.electron.model.unloadAll()
@@ -812,10 +841,10 @@ export default function GeneratePage(): JSX.Element {
     return url
   }
 
-  async function handleImportMesh() {
+  async function handleImportMesh(origin: MeshImportOrigin = 'toolbar') {
     const filePath = await window.electron.fs.selectMeshFile()
     if (!filePath) return
-    setOpenPanel(null)
+    setOpenPanel(panel => resolveOpenPanelAfterMeshImport(origin, panel))
     setImporting(true)
     try {
       const { url } = await importMesh(filePath)
@@ -828,66 +857,67 @@ export default function GeneratePage(): JSX.Element {
   }
 
   async function loadLibraryEntries() {
+    const epoch = ++libraryEpoch.current
+    setLibraryOpening(false)
     setLibraryLoading(true)
     setLibraryError(null)
     try {
-      const result = await assetLibraryService.list()
-      if (!result.success) {
-        setLibraryLoaded(false)
-        setLibraryEntries([])
-        setLibrarySelectedEntryId(null)
-        setLibraryError(result.error.message)
-        return
-      }
+      const workspace = await readLibraryWorkspace()
+      const result = await listAssetLibraryEntries()
+      const currentWorkspace = await readLibraryWorkspace()
+      if (epoch !== libraryEpoch.current) return
+      if (workspace !== currentWorkspace) throw new Error('Workspace changed; refresh the asset library.')
+      if (!result.success) throw new Error(result.error)
+      libraryWorkspace.current = workspace
       setLibraryEntries(result.entries)
-      setLibrarySelectedEntryId((current) => current && result.entries.some((entry) => entry.id === current)
-        ? current
-        : result.entries.find(isAssetLibraryEntryOpenable)?.id ?? result.entries[0]?.id ?? null)
+      setLibrarySelectedEntryId(current => current && result.entries.some(entry => entry.id === current)
+        ? current : result.entries.find(isAssetLibraryEntryOpenable)?.id ?? result.entries[0]?.id ?? null)
       setLibraryLoaded(true)
     } catch (err) {
+      if (epoch !== libraryEpoch.current) return
+      libraryWorkspace.current = null
       setLibraryLoaded(false)
       setLibraryEntries([])
       setLibrarySelectedEntryId(null)
       setLibraryError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLibraryLoading(false)
+      if (epoch === libraryEpoch.current) setLibraryLoading(false)
     }
   }
 
   async function handleOpenSelectedLibraryEntry() {
-    const selectedEntry = libraryEntries.find((entry) => entry.id === librarySelectedEntryId) ?? null
-    if (!selectedEntry) {
-      setLibraryError('Select an asset before opening it in Generate.')
+    const selectedEntry = libraryEntries.find(entry => entry.id === librarySelectedEntryId)
+    if (!selectedEntry || !isAssetLibraryEntryOpenable(selectedEntry)) {
+      setLibraryError(selectedEntry ? describeAssetLibraryOpenability(selectedEntry) : 'Select an asset before opening it in Generate.')
       return
     }
-    if (!isAssetLibraryEntryOpenable(selectedEntry)) {
-      setLibraryError(describeAssetLibraryOpenability(selectedEntry))
-      return
-    }
-
+    const epoch = ++libraryEpoch.current
+    const owner = useAppStore.getState().currentJob
+    const isCurrent = () => epoch === libraryEpoch.current && librarySelection.current === selectedEntry.id
+      && useAppStore.getState().currentJob === owner && useAppStore.getState().apiUrl === apiUrl
     setLibraryOpening(true)
     setLibraryError(null)
     try {
-      const result = await assetLibraryService.open(buildAssetLibraryOpenRequest(selectedEntry))
-      if (!result.success) {
-        setLibraryError(result.error.message)
-        return
-      }
-      const target = resolveAssetLibraryOpenTarget(result.entry)
-      const selection = createAssetLibraryOpenJob(result.entry, target)
-      if (!selection) {
-        setLibraryError(describeAssetLibraryOpenability(result.entry))
-        return
-      }
-      setLibraryEntries((currentEntries) => currentEntries.map((entry) => entry.id === result.entry.id ? result.entry : entry))
+      const workspace = await readLibraryWorkspace()
+      if (!isCurrent()) return
+      if (workspace !== libraryWorkspace.current) throw new Error('Workspace changed; refresh the asset library.')
+      const result = await openAssetLibraryEntry(buildAssetLibraryOpenRequest(selectedEntry))
+      const currentWorkspace = await readLibraryWorkspace()
+      if (!isCurrent()) return
+      if (workspace !== currentWorkspace) throw new Error('Workspace changed; refresh the asset library.')
+      if (!result.success) throw new Error(result.error)
+      if (result.entry.workspacePath !== selectedEntry.workspacePath || result.entry.id !== selectedEntry.id) throw new Error('Library selection changed; refresh the asset library.')
+      const selection = resolveAssetLibraryOpenSelection(result.entry, apiUrl)
+      if (!selection) throw new Error(describeAssetLibraryOpenability(result.entry))
+      setLibraryEntries(entries => entries.map(entry => entry.id === result.entry.id ? result.entry : entry))
       setLibrarySelectedEntryId(result.entry.id)
       setCurrentJob(selection.job)
       pushMeshUrl(selection.historyUrl)
-      setOpenPanel((currentPanel) => resolveOpenPanelAfterLibrarySelection(currentPanel))
+      setOpenPanel(resolveOpenPanelAfterLibrarySelection)
     } catch (err) {
-      setLibraryError(err instanceof Error ? err.message : String(err))
+      if (isCurrent()) setLibraryError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLibraryOpening(false)
+      if (epoch === libraryEpoch.current) setLibraryOpening(false)
     }
   }
 
@@ -1029,7 +1059,7 @@ export default function GeneratePage(): JSX.Element {
             {openPanel === 'import' && (
               <div className="absolute top-full left-0 mt-1 z-50 bg-zinc-900 border border-zinc-700/60 rounded-xl p-1 flex flex-col gap-0.5 min-w-[140px] shadow-xl">
                 <button
-                  onClick={handleImportMesh}
+                  onClick={() => { void handleImportMesh() }}
                   className="px-3 py-2 text-left hover:bg-zinc-800 rounded-lg transition-colors flex items-center gap-2.5"
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" className="text-zinc-400">
@@ -1064,6 +1094,11 @@ export default function GeneratePage(): JSX.Element {
                 sortMode={librarySortMode}
                 collapsedSectionKeys={libraryCollapsedSectionKeys}
                 onSelectEntry={(entryId) => {
+                  if (librarySelection.current !== entryId) {
+                    libraryEpoch.current += 1
+                    librarySelection.current = entryId
+                    setLibraryOpening(false)
+                  }
                   setLibraryError(null)
                   setLibrarySelectedEntryId(entryId)
                 }}

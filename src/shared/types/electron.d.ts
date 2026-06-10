@@ -1,5 +1,6 @@
 // Type declarations for the Electron API exposed via preload
 import type { ArtifactRef, ArtifactSidecar } from './artifacts'
+import type { AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult } from './assetLibrary.ts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
 import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, MotionRetargetSourceBone, MotionRetargetSessionSnapshot } from '../../areas/generate/motionRetargetPlan.ts'
@@ -17,15 +18,21 @@ export type {
   LegacyArtifactPayload,
 } from './artifacts'
 
-export {}
-
-import type {
+export type {
+  AssetCapability,
+  AssetEntryState,
+  AssetLibraryEntry,
+  AssetLibraryListRequest,
   AssetLibraryListResult,
   AssetLibraryOpenRequest,
   AssetLibraryOpenResult,
+  AssetLibraryPreviewKind,
   AssetLibraryReadRequest,
   AssetLibraryReadResult,
-} from './assetLibrary'
+} from './assetLibrary.ts'
+
+export {}
+
 
 // ─── Extension types ──────────────────────────────────────────────────────────
 

@@ -4,373 +4,10 @@ import { StringDecoder } from 'node:string_decoder'
 import { readdir, readFile, stat, mkdir, rename, rm, writeFile, lstat, realpath, mkdtemp, link, open } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, resolve as resolvePath, sep } from 'node:path'
 
-import type {
-  AssetCapability,
-  AssetEntryState,
-  AssetLibraryEntry,
-  AssetLibraryError,
-  AssetLibraryListResult,
-  AssetLibraryOpenResult,
-  AssetLibraryPreviewKind,
-  AssetLibraryPreviewPayload,
-  AssetLibraryReadResult,
-  AssetLibrarySourceScope,
-} from '../../src/shared/types/assetLibrary'
-import type { ArtifactProvenance } from '../../src/shared/types/artifacts'
-
-const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
-const ENCODED_ESCAPE_PATTERN = /%2e|%2f|%5c/i
-const ALLOWED_ROOTS = ['Workflows', 'Exports'] as const
-const SKIPPED_DIRS = new Set(['tmp', 'temp', 'cache'])
-const INTERNAL_SUFFIXES = ['.artifact.json', '.rigmeta.json'] as const
-const TEXT_EXTENSIONS = new Set(['json', 'txt', 'md'])
-const INTRINSIC_MOTION_EXTENSIONS = new Set(['bvh', 'npz'])
-const MESH_EXTENSIONS = new Set(['glb', 'gltf', 'obj', 'stl', 'ply', 'splat'])
-
-export interface AssetLibraryClassificationCandidate {
-  workspacePath: string
-  hasRigMetadata?: boolean
-}
-
-export interface AssetLibraryClassification {
-  capability?: AssetCapability
-  state: AssetEntryState
-  previewKind: AssetLibraryPreviewKind
-  openable: boolean
-  nonOpenableReason?: string
-}
-
-export interface NormalizedWorkspaceAssetPath {
-  workspacePath: string
-  absolutePath: string
-}
-
-export interface WorkspaceAssetLibraryRequest {
-  workspaceDir: string
-}
-
-export interface WorkspaceAssetLibraryReadRequest extends WorkspaceAssetLibraryRequest {
-  workspacePath: string
-  sourceWorkspacePath?: string
-}
-
-interface AssetLibraryMetadata {
-  sourceWorkspacePath?: string
-  manifestWorkspacePath?: string
-  artifactId?: string
-  versionId?: string
-  provenance?: ArtifactProvenance
-  warnings: string[]
-}
-
-export interface IpcMainLike {
-  handle(channel: string, handler: (event: unknown, payload?: unknown) => Promise<unknown>): void
-}
-
-export interface WorkspaceAssetLibraryIpcDeps {
-  ipcMain: IpcMainLike
-  getWorkspaceDir: () => string
-}
-
-function libraryError(code: AssetLibraryError['code'], message: string): AssetLibraryError {
-  return { code, message }
-}
-
-function normalizeSeparators(input: string): string {
-  return input.replace(/\\/g, '/')
-}
-
-function isWindowsAbsolutePath(input: string): boolean {
-  return WINDOWS_ABSOLUTE_PATH.test(input) || input.startsWith('\\\\')
-}
-
-function assertSafeWorkspaceRelativePath(workspacePath: string): string {
-  const normalized = normalizeSeparators(workspacePath.trim())
-  if (!normalized || normalized === '.') throw new Error('Workspace library path must be workspace-relative and non-empty')
-  if (ENCODED_ESCAPE_PATTERN.test(normalized)) throw new Error('Workspace library path must not contain encoded path escapes')
-  if (isAbsolute(normalized) || isWindowsAbsolutePath(workspacePath)) throw new Error('Workspace library path must not be absolute')
-  const segments = normalized.split('/').filter((segment) => segment && segment !== '.')
-  if (segments.some((segment) => segment === '..')) throw new Error('Workspace library path must not contain traversal segments')
-  if (!ALLOWED_ROOTS.includes(segments[0] as typeof ALLOWED_ROOTS[number])) {
-    throw new Error('Workspace library path must stay under allowed workspace library roots')
-  }
-  return segments.join('/')
-}
-
-export function normalizeWorkspaceAssetPath(workspaceDir: string, workspacePath: string): NormalizedWorkspaceAssetPath {
-  const safePath = assertSafeWorkspaceRelativePath(workspacePath)
-  const root = resolve(workspaceDir)
-  const absolutePath = resolve(root, ...safePath.split('/'))
-  const back = relative(root, absolutePath)
-  if (!back || back.startsWith('..') || isAbsolute(back)) throw new Error('Workspace library path escapes the workspace root')
-  return { workspacePath: safePath, absolutePath }
-}
-
-function extensionOf(workspacePath: string): string {
-  return extname(workspacePath).slice(1).toLowerCase()
-}
-
-function isGlbOrGltf(workspacePath: string): boolean {
-  return /\.(glb|gltf)$/i.test(workspacePath)
-}
-
-function sourceScopeFor(workspacePath: string): AssetLibrarySourceScope {
-  return workspacePath.startsWith('Exports/') ? 'exports' : 'workflows'
-}
-
-export function classifyAssetLibraryCandidate(candidate: AssetLibraryClassificationCandidate): AssetLibraryClassification {
-  const extension = extensionOf(candidate.workspacePath)
-
-  if (candidate.workspacePath.endsWith('.landmarks.v1.json')) {
-    return { capability: 'landmarks-sidecar', state: 'ready', previewKind: 'text', openable: false, nonOpenableReason: 'Landmark sidecars require opening their source mesh.' }
-  }
-  if (candidate.workspacePath.endsWith('.world.json')) {
-    return { capability: 'generated-world', state: 'ready', previewKind: 'text', openable: false, nonOpenableReason: 'Generated worlds are list-only in this release.' }
-  }
-  if (candidate.workspacePath.endsWith('.scene.json') || candidate.workspacePath.endsWith('/scene-manifest.json')) {
-    return { capability: 'scene-manifest', state: 'ready', previewKind: 'text', openable: false, nonOpenableReason: 'Scene manifests are list-only in this release.' }
-  }
-  if (INTRINSIC_MOTION_EXTENSIONS.has(extension)) {
-    return { capability: 'animation-motion', state: 'ready', previewKind: 'binary', openable: false, nonOpenableReason: 'Motion files are list-only in this release.' }
-  }
-  if (extension === 'glb' || extension === 'gltf') {
-    return { capability: candidate.hasRigMetadata ? 'rigged-mesh' : 'mesh', state: 'ready', previewKind: '3d-model', openable: true }
-  }
-  if (MESH_EXTENSIONS.has(extension)) {
-    return { capability: 'mesh', state: 'ready', previewKind: 'binary', openable: false, nonOpenableReason: `.${extension} workspace assets are list-only in this release.` }
-  }
-  if (TEXT_EXTENSIONS.has(extension)) {
-    return { state: 'unsupported', previewKind: 'text', openable: false, nonOpenableReason: 'Unsupported workspace asset.' }
-  }
-  return { state: 'unsupported', previewKind: 'binary', openable: false, nonOpenableReason: 'Unsupported workspace asset.' }
-}
-
-function stringField(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
-}
-
-function objectField(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
-}
-
-function manifestCapabilityFor(workspacePath: string): 'generated-world' | 'scene-manifest' | undefined {
-  if (workspacePath.endsWith('.world.json')) return 'generated-world'
-  if (workspacePath.endsWith('.scene.json')) return 'scene-manifest'
-  if (workspacePath.endsWith('/scene-manifest.json')) return 'scene-manifest'
-  return undefined
-}
-
-async function safeLinkedWorkspacePath(workspaceDir: string, ownerWorkspacePath: string, candidate: unknown, expected?: { mustBeMesh?: boolean, mustBeManifest?: boolean }): Promise<{ workspacePath?: string, warning?: string }> {
-  const raw = stringField(candidate)
-  if (!raw) return {}
-  let normalized: NormalizedWorkspaceAssetPath
-  try {
-    normalized = normalizeWorkspaceAssetPath(workspaceDir, raw)
-  } catch {
-    return { warning: 'Ignored unsafe linked workspace path.' }
-  }
-  if (normalized.workspacePath === ownerWorkspacePath) return { warning: 'Ignored self-linked workspace path.' }
-  if (expected?.mustBeMesh && !isGlbOrGltf(normalized.workspacePath)) return { warning: 'Ignored non-GLB/GLTF source workspace path.' }
-  if (expected?.mustBeManifest && !manifestCapabilityFor(normalized.workspacePath)) return { warning: 'Ignored non-manifest workspace path.' }
-  try {
-    await stat(normalized.absolutePath)
-  } catch {
-    return { warning: 'Ignored missing linked workspace path.' }
-  }
-  return { workspacePath: normalized.workspacePath }
-}
-
-async function readMetadata(workspaceDir: string, workspacePath: string, absolutePath: string): Promise<AssetLibraryMetadata> {
-  const metadata: AssetLibraryMetadata = { warnings: [] }
-  if (extensionOf(workspacePath) !== 'json') return metadata
-
-  let parsed: Record<string, unknown>
-  try {
-    parsed = JSON.parse(await readFile(absolutePath, 'utf8')) as Record<string, unknown>
-  } catch {
-    return metadata
-  }
-
-  const sourceRaw = parsed.sourceWorkspacePath ?? parsed.source_workspace_path ?? parsed.sourcePath ?? objectField(parsed.source)?.workspacePath
-  const source = await safeLinkedWorkspacePath(workspaceDir, workspacePath, sourceRaw, { mustBeMesh: true })
-  if (source.workspacePath) metadata.sourceWorkspacePath = source.workspacePath
-  if (source.warning) metadata.warnings.push(source.warning)
-
-  const manifestRaw = parsed.manifestWorkspacePath ?? parsed.manifest_workspace_path ?? objectField(parsed.manifest)?.workspacePath
-  const manifest = await safeLinkedWorkspacePath(workspaceDir, workspacePath, manifestRaw, { mustBeManifest: true })
-  if (manifest.workspacePath) metadata.manifestWorkspacePath = manifest.workspacePath
-  if (manifest.warning) metadata.warnings.push(manifest.warning)
-
-  metadata.artifactId = stringField(parsed.artifactId ?? parsed.artifact_id)
-  metadata.versionId = stringField(parsed.versionId ?? parsed.version_id)
-  metadata.provenance = objectField(parsed.provenance) as ArtifactProvenance | undefined
-  return metadata
-}
-
-function shouldSkipDirectory(name: string): boolean {
-  return name.startsWith('.') || SKIPPED_DIRS.has(name.toLowerCase())
-}
-
-function shouldSkipFile(name: string): boolean {
-  return name.startsWith('.') || INTERNAL_SUFFIXES.some((suffix) => name.endsWith(suffix))
-}
-
-async function hasRigMetadata(absolutePath: string): Promise<boolean> {
-  if (!/\.(glb|gltf)$/i.test(absolutePath)) return false
-  const stem = absolutePath.replace(/\.(glb|gltf)$/i, '')
-  try {
-    await stat(`${stem}.rigmeta.json`)
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function buildEntry(workspaceDir: string, workspacePath: string): Promise<AssetLibraryEntry> {
-  const { absolutePath } = normalizeWorkspaceAssetPath(workspaceDir, workspacePath)
-  const stats = await stat(absolutePath)
-  const classification = classifyAssetLibraryCandidate({ workspacePath, hasRigMetadata: await hasRigMetadata(absolutePath) })
-  const metadata = await readMetadata(workspaceDir, workspacePath, absolutePath)
-  const manifestCapability = metadata.manifestWorkspacePath ? manifestCapabilityFor(metadata.manifestWorkspacePath) : undefined
-  return {
-    id: `library:${workspacePath}`,
-    workspacePath,
-    displayName: basename(workspacePath),
-    sourceScope: sourceScopeFor(workspacePath),
-    capability: classification.capability,
-    state: classification.state,
-    previewKind: classification.previewKind,
-    source: metadata.sourceWorkspacePath ? { workspacePath: metadata.sourceWorkspacePath, displayName: basename(metadata.sourceWorkspacePath), role: 'source-mesh' } : undefined,
-    manifest: metadata.manifestWorkspacePath && manifestCapability ? { workspacePath: metadata.manifestWorkspacePath, capability: manifestCapability } : undefined,
-    artifactId: metadata.artifactId,
-    versionId: metadata.versionId,
-    provenance: metadata.provenance,
-    warnings: metadata.warnings,
-    openable: classification.openable,
-    nonOpenableReason: classification.nonOpenableReason,
-    createdAt: (stats.birthtime.getTime() > 0 ? stats.birthtime : stats.mtime).toISOString(),
-    updatedAt: stats.mtime.toISOString(),
-  }
-}
-
-async function collectFiles(workspaceDir: string, rootName: typeof ALLOWED_ROOTS[number]): Promise<string[]> {
-  const root = join(workspaceDir, rootName)
-  const files: string[] = []
-
-  async function walk(dir: string): Promise<void> {
-    let entries: Awaited<ReturnType<typeof readdir>>
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (!shouldSkipDirectory(entry.name)) await walk(join(dir, entry.name))
-        continue
-      }
-      if (!entry.isFile() || shouldSkipFile(entry.name)) continue
-      files.push(relative(workspaceDir, join(dir, entry.name)).split(sep).join('/'))
-    }
-  }
-
-  await walk(root)
-  return files
-}
-
-export async function listWorkspaceAssetLibrary(request: WorkspaceAssetLibraryRequest): Promise<AssetLibraryListResult> {
-  try {
-    const workspacePaths = (await Promise.all(ALLOWED_ROOTS.map((root) => collectFiles(request.workspaceDir, root)))).flat().sort()
-    const entries = await Promise.all(workspacePaths.map((workspacePath) => buildEntry(request.workspaceDir, workspacePath)))
-    return { success: true, entries: entries.filter((entry) => entry.state !== 'unsupported') }
-  } catch (error) {
-    return { success: false, error: libraryError('list-failed', error instanceof Error ? error.message : String(error)) }
-  }
-}
-
-async function previewEntry(absolutePath: string, entry: AssetLibraryEntry): Promise<AssetLibraryPreviewPayload> {
-  if (entry.previewKind === '3d-model') return { kind: '3d-model', viewerKind: extensionOf(entry.workspacePath) as 'glb' | 'gltf' }
-  const stats = await stat(absolutePath)
-  if (entry.previewKind === 'text') {
-    const maxBytes = 64 * 1024
-    const content = await readFile(absolutePath, 'utf8')
-    return { kind: 'text', content: content.slice(0, maxBytes), byteLength: stats.size, truncated: content.length > maxBytes }
-  }
-  if (entry.previewKind === 'binary') {
-    return { kind: 'binary', binaryKind: extensionOf(entry.workspacePath), byteLength: stats.size, message: 'Binary preview is unavailable.' }
-  }
-  return { kind: 'none' }
-}
-
-export async function readWorkspaceAssetLibraryEntry(request: WorkspaceAssetLibraryReadRequest): Promise<AssetLibraryReadResult> {
-  try {
-    const normalized = normalizeWorkspaceAssetPath(request.workspaceDir, request.workspacePath)
-    const sourceValidation = await validateRequestedSource(request.workspaceDir, normalized.workspacePath, request.sourceWorkspacePath)
-    if (!sourceValidation.success) return { success: false, error: sourceValidation.error }
-    const entry = await buildEntry(request.workspaceDir, normalized.workspacePath)
-    return { success: true, entry, preview: await previewEntry(normalized.absolutePath, entry) }
-  } catch (error) {
-    return { success: false, error: libraryError('unsafe-path', error instanceof Error ? error.message : String(error)) }
-  }
-}
-
-async function validateRequestedSource(workspaceDir: string, workspacePath: string, sourceWorkspacePath?: string): Promise<{ success: true } | { success: false, error: AssetLibraryError }> {
-  if (!sourceWorkspacePath) return { success: true }
-  let source: NormalizedWorkspaceAssetPath
-  try {
-    source = normalizeWorkspaceAssetPath(workspaceDir, sourceWorkspacePath)
-  } catch (error) {
-    return { success: false, error: libraryError('unsafe-path', error instanceof Error ? error.message : String(error)) }
-  }
-  if (source.workspacePath === workspacePath) return { success: false, error: libraryError('not-openable', 'Linked source must not point to the same workspace asset.') }
-  if (!isGlbOrGltf(source.workspacePath)) return { success: false, error: libraryError('not-openable', 'Linked source must be a safe .glb/.gltf workspace asset.') }
-  try {
-    await stat(source.absolutePath)
-  } catch {
-    return { success: false, error: libraryError('not-openable', 'Linked source workspace asset was not found.') }
-  }
-  const entry = await buildEntry(workspaceDir, workspacePath)
-  if (entry.source?.workspacePath !== source.workspacePath) {
-    return { success: false, error: libraryError('not-openable', 'Requested source does not match the indexed library source link.') }
-  }
-  return { success: true }
-}
-
-export async function openWorkspaceAssetLibraryEntry(request: WorkspaceAssetLibraryReadRequest): Promise<AssetLibraryOpenResult> {
-  const read = await readWorkspaceAssetLibraryEntry(request)
-  if (!read.success) return read
-  if (request.sourceWorkspacePath) return { success: true, entry: read.entry }
-  if (!read.entry.openable) {
-    return { success: false, error: libraryError('not-openable', read.entry.nonOpenableReason ?? 'Workspace asset is not openable.') }
-  }
-  return { success: true, entry: read.entry }
-}
-
-function readPayloadRequest(payload: unknown): { workspacePath?: string, sourceWorkspacePath?: string } {
-  if (typeof payload !== 'object' || payload === null) return {}
-  const values = payload as { workspacePath?: unknown, sourceWorkspacePath?: unknown }
-  return {
-    workspacePath: typeof values.workspacePath === 'string' ? values.workspacePath : undefined,
-    sourceWorkspacePath: typeof values.sourceWorkspacePath === 'string' ? values.sourceWorkspacePath : undefined,
-  }
-}
-
-export function registerWorkspaceAssetLibraryIpcHandlers(deps: WorkspaceAssetLibraryIpcDeps): void {
-  deps.ipcMain.handle('workspace:library:list', async () => listWorkspaceAssetLibrary({ workspaceDir: deps.getWorkspaceDir() }))
-  deps.ipcMain.handle('workspace:library:read', async (_event, payload) => {
-    const { workspacePath, sourceWorkspacePath } = readPayloadRequest(payload)
-    if (!workspacePath) return { success: false, error: libraryError('invalid-request', 'workspacePath is required.') }
-    return readWorkspaceAssetLibraryEntry({ workspaceDir: deps.getWorkspaceDir(), workspacePath, sourceWorkspacePath })
-  })
-  deps.ipcMain.handle('workspace:library:open', async (_event, payload) => {
-    const { workspacePath, sourceWorkspacePath } = readPayloadRequest(payload)
-    if (!workspacePath) return { success: false, error: libraryError('invalid-request', 'workspacePath is required.') }
-    return openWorkspaceAssetLibraryEntry({ workspaceDir: deps.getWorkspaceDir(), workspacePath, sourceWorkspacePath })
-  })
-}
-
 // Artifact sidecars are also available outside the asset-library roots.
 import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
+import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
+import type { AssetCapability, AssetEntryState, AssetLibraryEntry, AssetLibraryListResult, AssetLibraryManifestCapability, AssetLibraryManifestRef, AssetLibraryOpenResult, AssetLibraryPreviewKind, AssetLibraryPreviewPayload, AssetLibraryReadResult, AssetLibrarySourceLink, AssetLibrarySourceScope } from '../../src/shared/types/assetLibrary.ts'
 
 const SIDECAR_SUFFIX = '.artifact.json'
 const LANDMARK_SIDECAR_PREFIX = 'Workflows/landmarks/'
@@ -395,6 +32,47 @@ const SUPPORTED_RIGMETA_SCHEMA_VALUES = new Set([
 ])
 const REQUIRED_LANDMARK_IDS = ['left_shoulder', 'right_shoulder', 'hip', 'left_knee', 'right_knee'] as const
 const REQUIRED_LANDMARK_ID_SET = new Set<string>(REQUIRED_LANDMARK_IDS)
+const ENCODED_ESCAPE_PATTERN = /%2e|%2f|%5c/i
+const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:/
+function isWindowsAbsolutePath(input: string): boolean { return WINDOWS_ABSOLUTE_PATH.test(input) || input.startsWith('\\\\') }
+const ASSET_LIBRARY_INTERNAL_SUFFIXES = [SIDECAR_SUFFIX, '.rigmeta.json', HUMANOID_DRAFT_SIDECAR_SUFFIX, HUMANOID_PROMOTION_SIDECAR_SUFFIX] as const
+const ASSET_LIBRARY_SCOPED_ROOTS = ['Workflows', 'Exports'] as const
+const ASSET_LIBRARY_MESH_EXTENSIONS = new Set(['glb', 'gltf', 'obj', 'stl', 'ply'])
+const ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES = new Set(['tmp', 'temp', 'cache'])
+const ASSET_LIBRARY_MANIFEST_SCHEMA_CAPABILITIES: Record<string, AssetLibraryManifestCapability> = {
+  'modly.generated-world.v1': 'generated-world',
+  'modly.scene-manifest.v1': 'scene-manifest',
+}
+
+export interface AssetLibraryClassificationCandidate {
+  workspacePath: string
+  artifactKind?: ArtifactKind
+  previewKind?: AssetLibraryPreviewKind
+  evidence?: {
+    rigMeta?: boolean
+    humanoidDraft?: boolean
+    humanoidPromotion?: boolean
+    motionRetargetSidecar?: boolean
+    poseClipSidecar?: boolean
+    landmarkSidecar?: boolean
+    manifestCapability?: AssetLibraryManifestCapability
+    embeddedSkins?: boolean
+    embeddedAnimations?: boolean
+    intrinsicMotionFile?: boolean
+  }
+}
+
+export interface AssetLibraryClassification {
+  capability?: AssetCapability
+  state: AssetEntryState
+}
+
+export interface NormalizeAssetLibraryReadRequestInput {
+  workspaceDir: string
+  workspacePath: string
+  sourceWorkspacePath?: string
+  indexedSourceWorkspacePath?: string
+}
 
 export interface NormalizedWorkspaceArtifactPath {
   workspacePath: string
@@ -404,6 +82,16 @@ export interface NormalizedWorkspaceArtifactPath {
 export interface ArtifactRegistryReadRequest {
   workspaceDir: string
   workspacePath: string
+}
+
+export interface WorkspaceAssetLibraryListServiceRequest {
+  workspaceDir: string
+}
+
+export interface WorkspaceAssetLibraryReadServiceRequest {
+  workspaceDir: string
+  workspacePath: string
+  sourceWorkspacePath?: string
 }
 
 export interface ArtifactRegistryWriteRequest extends ArtifactRegistryReadRequest {
@@ -575,6 +263,698 @@ function assertSafeWorkspacePathInput(workspacePath: string): string {
   return segments.filter((segment) => segment !== '' && segment !== '.').join('/')
 }
 
+export function classifyAssetLibraryCandidate(candidate: AssetLibraryClassificationCandidate): AssetLibraryClassification {
+  const evidence = candidate.evidence ?? {}
+  const meshCandidate = isSupportedAssetLibraryMeshPath(candidate.workspacePath)
+
+  if (evidence.manifestCapability) {
+    return { capability: evidence.manifestCapability, state: 'ready' }
+  }
+
+  if (evidence.landmarkSidecar) {
+    return { capability: 'landmarks-sidecar', state: 'ready' }
+  }
+
+  if (evidence.motionRetargetSidecar || evidence.poseClipSidecar) {
+    return { capability: 'animation-motion', state: 'ready' }
+  }
+
+  if (evidence.intrinsicMotionFile) {
+    return { capability: 'animation-motion', state: 'ready' }
+  }
+
+  if (candidate.artifactKind === 'mesh' || meshCandidate) {
+    if (evidence.rigMeta || evidence.humanoidDraft || evidence.humanoidPromotion) {
+      return { capability: 'rigged-mesh', state: 'ready' }
+    }
+    if (evidence.embeddedAnimations) {
+      return { capability: 'animation-motion', state: 'ready' }
+    }
+    if (evidence.embeddedSkins) {
+      return { capability: 'rigged-mesh', state: 'ready' }
+    }
+    return { capability: 'mesh', state: 'ready' }
+  }
+
+  if (candidate.previewKind === '3d-model' || candidate.previewKind === 'none') {
+    return { capability: undefined, state: 'unknown-metadata' }
+  }
+
+  return { capability: undefined, state: 'unsupported' }
+}
+
+/** Library discovery is scoped; generic artifact sidecar reads are not. */
+export function normalizeWorkspaceAssetPath(workspaceDir: string, workspacePath: string): NormalizedWorkspaceArtifactPath {
+  if (typeof workspacePath !== 'string' || !workspacePath || workspacePath !== workspacePath.trim()
+    || /[\\%?#\x00-\x1f]/.test(workspacePath) || workspacePath.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('Library path must be safe workspace-relative without encoded escapes or traversal')
+  }
+  const normalized = normalizeWorkspaceArtifactPath(workspaceDir, workspacePath)
+  if (!ASSET_LIBRARY_SCOPED_ROOTS.some(root => normalized.workspacePath.startsWith(`${root}/`))) {
+    throw new Error('Library path must stay under allowed workspace library roots')
+  }
+  return normalized
+}
+
+export function normalizeAssetLibraryReadRequest(input: NormalizeAssetLibraryReadRequestInput): { workspacePath: string, sourceWorkspacePath?: string } {
+  const workspacePath = normalizeWorkspaceAssetPath(input.workspaceDir, input.workspacePath).workspacePath
+  const sourceWorkspacePath = input.sourceWorkspacePath !== undefined
+    ? normalizeWorkspaceAssetPath(input.workspaceDir, input.sourceWorkspacePath).workspacePath
+    : undefined
+  const indexedSourceWorkspacePath = input.indexedSourceWorkspacePath
+    ? normalizeWorkspaceAssetPath(input.workspaceDir, input.indexedSourceWorkspacePath).workspacePath
+    : undefined
+
+  if (sourceWorkspacePath && sourceWorkspacePath !== indexedSourceWorkspacePath) {
+    throw new Error('Asset library source link does not match the indexed source workspace path')
+  }
+
+  if (sourceWorkspacePath && sourceWorkspacePath === workspacePath) {
+    throw new Error('Asset library source link must not point at the entry workspace path')
+  }
+
+  return {
+    workspacePath,
+    ...(sourceWorkspacePath ? { sourceWorkspacePath } : {}),
+  }
+}
+
+function shouldSkipWorkspaceAssetLibraryPath(workspacePath: string): boolean {
+  return hasInternalWorkspaceAssetLibraryDirectory(workspacePath)
+    || ASSET_LIBRARY_INTERNAL_SUFFIXES.some((suffix) => workspacePath.endsWith(suffix))
+}
+
+function deriveAssetLibrarySourceScope(workspacePath: string): AssetLibrarySourceScope {
+  return normalizeWorkspaceSeparators(workspacePath).startsWith('Exports/') ? 'exports' : 'workflows'
+}
+
+function isInternalWorkspaceAssetLibraryDirectoryName(segment: string): boolean {
+  const normalizedSegment = segment.trim().toLocaleLowerCase()
+  return normalizedSegment.startsWith('.') || ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES.has(normalizedSegment)
+}
+
+function hasInternalWorkspaceAssetLibraryDirectory(workspacePath: string): boolean {
+  const segments = normalizeWorkspaceSeparators(workspacePath).split('/').filter(Boolean)
+  return segments.slice(1, -1).some(isInternalWorkspaceAssetLibraryDirectoryName)
+}
+
+function isSupportedAssetLibraryMeshPath(workspacePath: string): boolean {
+  return ASSET_LIBRARY_MESH_EXTENSIONS.has(resolveWorkspaceArtifactExtension(workspacePath))
+}
+
+function resolveAssetLibraryPreviewKind(workspacePath: string): AssetLibraryPreviewKind {
+  const extension = resolveWorkspaceArtifactExtension(workspacePath)
+  if (extension === 'glb' || extension === 'gltf') return '3d-model'
+  if (isWorkspaceArtifactTextPreviewExtension(extension)) return 'text'
+  return extension ? 'binary' : 'none'
+}
+
+function isArtifactKind(value: unknown): value is ArtifactKind {
+  return value === 'image' || value === 'text' || value === 'mesh'
+}
+
+function isAssetLibraryManifestCapability(value: unknown): value is AssetLibraryManifestCapability {
+  return value === 'generated-world' || value === 'scene-manifest'
+}
+
+async function listWorkspaceFilePaths(workspaceDir: string): Promise<string[]> {
+  const root = resolvePath(workspaceDir)
+  const results: string[] = []
+
+  for (const scopedRoot of ASSET_LIBRARY_SCOPED_ROOTS) {
+    const scopedRootPaths = await listWorkspaceFilePathsWithinRoot(root, scopedRoot)
+    results.push(...scopedRootPaths)
+  }
+
+  return results.sort((left, right) => left.localeCompare(right))
+}
+
+async function listWorkspaceFilePathsWithinRoot(workspaceRoot: string, scopedRoot: string): Promise<string[]> {
+  const results: string[] = []
+  const pending = [scopedRoot]
+
+  while (pending.length > 0) {
+    const relativeDir = pending.pop() ?? scopedRoot
+    let absoluteDir: string
+    try { absoluteDir = (await physicalArtifactPath(workspaceRoot, relativeDir, 'directory')).absolutePath }
+    catch (error) { if (isRecord(error) && error.code === 'ENOENT') continue; throw error }
+    const entries = await readWorkspaceDirectoryEntries(absoluteDir)
+    if (!entries) continue
+
+    for (const entry of entries) {
+      const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name
+      if (entry.isDirectory()) {
+        if (isInternalWorkspaceAssetLibraryDirectoryName(entry.name)) {
+          continue
+        }
+        pending.push(relativePath)
+        continue
+      }
+      if (entry.isFile() && !entry.name.startsWith('.')) {
+        await physicalArtifactPath(workspaceRoot, relativePath)
+        results.push(relativePath)
+      }
+    }
+  }
+
+  return results
+}
+
+async function readWorkspaceDirectoryEntries(absoluteDir: string) {
+  try {
+    return await readdir(absoluteDir, { withFileTypes: true })
+  } catch (error) {
+    if (isRecord(error) && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return null
+    throw error
+  }
+}
+
+async function readJsonRecordIfPresent(workspaceDir: string, workspacePath: string): Promise<{ status: 'found', value: unknown } | { status: 'not-found' } | { status: 'invalid', error: string }> {
+  try {
+    return { status: 'found', value: JSON.parse((await readLibraryBytes(workspaceDir, workspacePath)).toString('utf8')) }
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') return { status: 'not-found' }
+    if (error instanceof SyntaxError) return { status: 'invalid', error: error.message }
+    throw error
+  }
+}
+
+const LIBRARY_METADATA_MAX_BYTES = 8 * 1024 * 1024
+async function readLibraryBytes(workspaceDir: string, workspacePath: string, glb = false): Promise<Buffer> {
+  const target = await physicalArtifactPath(workspaceDir, workspacePath)
+  const file = await open(target.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const stats = await file.stat()
+    if (!stats.isFile()) throw new Error('Library evidence must be a regular file')
+    let size = stats.size
+    if (glb) {
+      const header = Buffer.alloc(20)
+      const { bytesRead } = await file.read(header, 0, 20, 0)
+      if (bytesRead !== 20 || header.readUInt32LE(0) !== 0x46546c67 || header.readUInt32LE(4) !== 2
+        || header.readUInt32LE(16) !== 0x4e4f534a) throw new Error('Invalid GLB JSON header')
+      size = 20 + header.readUInt32LE(12)
+      if (header.readUInt32LE(8) !== stats.size || size > stats.size) throw new Error('Invalid GLB declared length')
+    }
+    if (size > LIBRARY_METADATA_MAX_BYTES) throw new Error('Library metadata exceeds inspection limit')
+    const buffer = Buffer.alloc(size)
+    let offset = 0
+    while (offset < size) {
+      const { bytesRead } = await file.read(buffer, offset, size - offset, offset)
+      if (!bytesRead) throw new Error('Library evidence changed during read')
+      offset += bytesRead
+    }
+    // The parser only receives the bounded JSON portion; validate total size above.
+    if (glb) buffer.writeUInt32LE(size, 8)
+    return buffer
+  } finally { await file.close() }
+}
+
+interface IntrinsicAssetLibraryEvidence {
+  embeddedSkins: boolean
+  embeddedAnimations: boolean
+  intrinsicMotionFile: boolean
+  warnings: string[]
+}
+
+async function readIntrinsicAssetLibraryEvidence(workspaceDir: string, workspacePath: string, previewKind: AssetLibraryPreviewKind): Promise<IntrinsicAssetLibraryEvidence> {
+  const extension = resolveWorkspaceArtifactExtension(workspacePath)
+
+  if (extension === 'bvh' || extension === 'npz') {
+    return {
+      embeddedSkins: false,
+      embeddedAnimations: false,
+      intrinsicMotionFile: true,
+      warnings: [],
+    }
+  }
+
+  if (previewKind !== '3d-model') {
+    return {
+      embeddedSkins: false,
+      embeddedAnimations: false,
+      intrinsicMotionFile: false,
+      warnings: [],
+    }
+  }
+
+  try {
+    const parsed = extension === 'gltf'
+      ? JSON.parse((await readLibraryBytes(workspaceDir, workspacePath)).toString('utf8'))
+      : extension === 'glb'
+        ? parseGlbJsonChunk(await readLibraryBytes(workspaceDir, workspacePath, true))
+        : null
+
+    if (!isRecord(parsed)) {
+      return {
+        embeddedSkins: false,
+        embeddedAnimations: false,
+        intrinsicMotionFile: false,
+        warnings: [],
+      }
+    }
+
+    return {
+      embeddedSkins: Array.isArray(parsed.skins) && parsed.skins.length > 0,
+      embeddedAnimations: Array.isArray(parsed.animations) && parsed.animations.length > 0,
+      intrinsicMotionFile: false,
+      warnings: [],
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return {
+      embeddedSkins: false,
+      embeddedAnimations: false,
+      intrinsicMotionFile: false,
+      warnings: isSupportedAssetLibraryMeshPath(workspacePath)
+        ? [`Failed to inspect intrinsic GLB/GLTF evidence for ${workspacePath}: ${message}`]
+        : [],
+    }
+  }
+}
+
+function parseGlbJsonChunk(buffer: Buffer): unknown {
+  if (buffer.length < 20) {
+    throw new Error('GLB file is too small to contain a JSON chunk')
+  }
+
+  if (buffer.readUInt32LE(0) !== 0x46546c67) {
+    throw new Error('Invalid GLB magic header')
+  }
+
+  const version = buffer.readUInt32LE(4)
+  if (version !== 2) {
+    throw new Error(`Unsupported GLB version ${version}`)
+  }
+
+  const declaredLength = buffer.readUInt32LE(8)
+  if (declaredLength > buffer.length) {
+    throw new Error('GLB declared length exceeds file size')
+  }
+
+  const chunkLength = buffer.readUInt32LE(12)
+  const chunkType = buffer.readUInt32LE(16)
+  if (chunkType !== 0x4e4f534a) {
+    throw new Error('First GLB chunk is not JSON')
+  }
+
+  const chunkStart = 20
+  const chunkEnd = chunkStart + chunkLength
+  if (chunkEnd > buffer.length) {
+    throw new Error('GLB JSON chunk exceeds file size')
+  }
+
+  const jsonText = buffer.subarray(chunkStart, chunkEnd).toString('utf-8').replace(/\0+$/u, '').trimEnd()
+  if (!jsonText) {
+    throw new Error('GLB JSON chunk is empty')
+  }
+
+  return JSON.parse(jsonText)
+}
+
+function extractAssetLibraryMetadataRecord(sidecar: ArtifactSidecar | undefined): Record<string, unknown> | undefined {
+  return sidecar && isRecord(sidecar.metadata) ? sidecar.metadata : undefined
+}
+
+function extractAssetLibraryArtifactKind(metadata: Record<string, unknown> | undefined): ArtifactKind | undefined {
+  if (!metadata) return undefined
+  if (isArtifactKind(metadata.artifactKind)) return metadata.artifactKind
+  if (isArtifactKind(metadata.kind)) return metadata.kind
+  if (isRecord(metadata.artifact) && isArtifactKind(metadata.artifact.kind)) return metadata.artifact.kind
+  return undefined
+}
+
+function extractAssetLibraryVersionId(metadata: Record<string, unknown> | undefined): string | undefined {
+  if (!metadata) return undefined
+  if (isNonEmptyString(metadata.versionId)) return metadata.versionId
+  if (isRecord(metadata.artifact) && isNonEmptyString(metadata.artifact.versionId)) return metadata.artifact.versionId
+  return undefined
+}
+
+function extractAssetLibraryProvenance(metadata: Record<string, unknown> | undefined): AssetLibraryEntry['provenance'] | undefined {
+  if (!metadata) return undefined
+  const provenance = isRecord(metadata.provenance)
+    ? metadata.provenance
+    : isRecord(metadata.artifact) && isRecord(metadata.artifact.provenance)
+      ? metadata.artifact.provenance
+      : undefined
+  if (!provenance || !isNonEmptyString(provenance.workflowId) || !isNonEmptyString(provenance.workflowNodeId)) return undefined
+  return {
+    workflowId: provenance.workflowId,
+    workflowNodeId: provenance.workflowNodeId,
+    ...(isNonEmptyString(provenance.extensionId) ? { extensionId: provenance.extensionId } : {}),
+    ...(isNonEmptyString(provenance.extensionNodeId) ? { extensionNodeId: provenance.extensionNodeId } : {}),
+  }
+}
+
+function extractAssetLibraryDisplayName(metadata: Record<string, unknown> | undefined, workspacePath: string): string {
+  if (metadata) {
+    if (isNonEmptyString(metadata.displayName)) return metadata.displayName
+    if (isNonEmptyString(metadata.title)) return metadata.title
+    if (isNonEmptyString(metadata.label)) return metadata.label
+    if (isRecord(metadata.assetLibrary)) {
+      if (isNonEmptyString(metadata.assetLibrary.title)) return metadata.assetLibrary.title
+      if (isNonEmptyString(metadata.assetLibrary.displayName)) return metadata.assetLibrary.displayName
+    }
+  }
+  return basename(workspacePath)
+}
+
+function extractAssetLibraryWarnings(metadata: Record<string, unknown> | undefined): string[] {
+  if (!metadata) return []
+  const warnings = metadata.warnings
+  return isStringArray(warnings) ? warnings : []
+}
+
+function extractAssetLibraryMetadataSource(metadata: Record<string, unknown> | undefined): AssetLibrarySourceLink | undefined {
+  if (!metadata || !isRecord(metadata.source)) return undefined
+  const source = metadata.source
+  if (!isWorkspaceRelativeString(source.workspacePath) && !isNonEmptyString(source.assetId) && !isNonEmptyString(source.versionId)) return undefined
+  return {
+    relation: 'derived-from',
+    ...(isWorkspaceRelativeString(source.workspacePath) ? { workspacePath: source.workspacePath } : {}),
+    ...(isNonEmptyString(source.assetId) ? { assetId: source.assetId } : {}),
+    ...(isNonEmptyString(source.versionId) ? { versionId: source.versionId } : {}),
+    ...(!isWorkspaceRelativeString(source.workspacePath) ? { degraded: true } : {}),
+  }
+}
+
+function extractManifestRefFromMetadata(metadata: Record<string, unknown> | undefined, workspacePath: string): AssetLibraryManifestRef | undefined {
+  if (!metadata || !isRecord(metadata.assetLibrary) || !isAssetLibraryManifestCapability(metadata.assetLibrary.capability)) return undefined
+  return {
+    capability: metadata.assetLibrary.capability,
+    workspacePath,
+    ...(isNonEmptyString(metadata.assetLibrary.schema) ? { schema: metadata.assetLibrary.schema } : {}),
+    ...(isNonEmptyString(metadata.assetLibrary.title) ? { title: metadata.assetLibrary.title } : {}),
+  }
+}
+
+function extractManifestRefFromRecord(record: unknown, workspacePath: string): AssetLibraryManifestRef | undefined {
+  if (!isRecord(record)) return undefined
+  if (isRecord(record.assetLibrary) && isAssetLibraryManifestCapability(record.assetLibrary.capability)) {
+    return {
+      capability: record.assetLibrary.capability,
+      workspacePath,
+      ...(isNonEmptyString(record.assetLibrary.schema) ? { schema: record.assetLibrary.schema } : {}),
+      ...(isNonEmptyString(record.assetLibrary.title) ? { title: record.assetLibrary.title } : {}),
+    }
+  }
+  if (isAssetLibraryManifestCapability(record.capability)) {
+    return {
+      capability: record.capability,
+      workspacePath,
+      ...(isNonEmptyString(record.schema) ? { schema: record.schema } : {}),
+      ...(isNonEmptyString(record.title) ? { title: record.title } : {}),
+    }
+  }
+  if (isNonEmptyString(record.schema)) {
+    const capability = ASSET_LIBRARY_MANIFEST_SCHEMA_CAPABILITIES[record.schema]
+    if (capability) {
+      return {
+        capability,
+        workspacePath,
+        schema: record.schema,
+        ...(isNonEmptyString(record.title) ? { title: record.title } : {}),
+      }
+    }
+  }
+  return undefined
+}
+
+function mergeManifestRefs(primary: AssetLibraryManifestRef | undefined, secondary: AssetLibraryManifestRef | undefined): AssetLibraryManifestRef | undefined {
+  if (!primary) return secondary
+  if (!secondary) return primary
+  return {
+    capability: primary.capability,
+    workspacePath: primary.workspacePath,
+    ...(primary.schema ?? secondary.schema ? { schema: primary.schema ?? secondary.schema } : {}),
+    ...(primary.title ?? secondary.title ? { title: primary.title ?? secondary.title } : {}),
+  }
+}
+
+async function readArtifactRegistrySidecarForLibrary(workspaceDir: string, workspacePath: string): Promise<{ sidecar?: ArtifactSidecar, warnings: string[] }> {
+  const sidecarPath = normalizeWorkspaceArtifactPath(workspaceDir, getArtifactSidecarWorkspacePath(workspacePath))
+  const result = await readJsonRecordIfPresent(workspaceDir, sidecarPath.workspacePath)
+  if (result.status === 'not-found') return { warnings: [] }
+  if (result.status === 'invalid') return { warnings: [`Invalid artifact registry sidecar JSON for ${workspacePath}: ${result.error}`] }
+  if (!isRecord(result.value) || !isNonEmptyString(result.value.artifactId) || !isWorkspaceRelativeString(result.value.workspacePath) || !isRecord(result.value.metadata)) {
+    return { warnings: [`Invalid artifact registry sidecar payload for ${workspacePath}`] }
+  }
+  if (result.value.workspacePath !== workspacePath) {
+    return { warnings: [`Artifact registry sidecar workspacePath mismatch for ${workspacePath}`] }
+  }
+  return {
+    sidecar: {
+      artifactId: result.value.artifactId,
+      workspacePath: result.value.workspacePath,
+      metadata: result.value.metadata,
+    },
+    warnings: [],
+  }
+}
+
+async function readLandmarkLibraryState(workspaceDir: string, workspacePath: string): Promise<{ source?: AssetLibrarySourceLink, warnings: string[] }> {
+  const parsed = await readJsonRecordIfPresent(workspaceDir, workspacePath)
+  if (parsed.status !== 'found' || !isRecord(parsed.value) || !isRecord(parsed.value.target)) {
+    return { warnings: parsed.status === 'invalid' ? [`Invalid landmark sidecar JSON for ${workspacePath}: ${parsed.error}`] : [] }
+  }
+  const sourceWorkspacePath = typeof parsed.value.target.meshPath === 'string' ? parsed.value.target.meshPath : ''
+  const validationErrors = validateLandmarkSidecarV1Payload(parsed.value, workspacePath, sourceWorkspacePath)
+  if (validationErrors.length > 0) return { warnings: [`Invalid landmark sidecar payload for ${workspacePath}: ${validationErrors.join(', ')}`] }
+  return {
+    source: {
+      relation: 'sidecar-source',
+      ...(isWorkspaceRelativeString(parsed.value.target.meshPath) ? { workspacePath: parsed.value.target.meshPath } : { degraded: true }),
+      ...(isNonEmptyString(parsed.value.target.artifactId) ? { assetId: parsed.value.target.artifactId } : {}),
+      ...(isNonEmptyString(parsed.value.target.versionId) ? { versionId: parsed.value.target.versionId } : {}),
+      ...(!isWorkspaceRelativeString(parsed.value.target.meshPath) ? { degraded: true } : {}),
+    },
+    warnings: [],
+  }
+}
+
+async function readPoseClipLibraryState(workspaceDir: string, workspacePath: string): Promise<{ source?: AssetLibrarySourceLink, warnings: string[] }> {
+  const parsed = await readJsonRecordIfPresent(workspaceDir, workspacePath)
+  if (parsed.status !== 'found' || !isRecord(parsed.value) || !isRecord(parsed.value.source)) {
+    return { warnings: parsed.status === 'invalid' ? [`Invalid pose clip sidecar JSON for ${workspacePath}: ${parsed.error}`] : [] }
+  }
+  const sourceWorkspacePath = typeof parsed.value.source.workspacePath === 'string' ? parsed.value.source.workspacePath : ''
+  const validationErrors = validatePoseClipSidecarV1Payload(parsed.value, sourceWorkspacePath)
+  if (validationErrors.length > 0) return { warnings: [`Invalid pose clip sidecar payload for ${workspacePath}: ${validationErrors.join(', ')}`] }
+  return {
+    source: {
+      relation: 'sidecar-source',
+      ...(isWorkspaceRelativeString(parsed.value.source.workspacePath) ? { workspacePath: parsed.value.source.workspacePath } : { degraded: true }),
+      ...(isNonEmptyString(parsed.value.source.artifactId) ? { assetId: parsed.value.source.artifactId } : {}),
+      ...(isNonEmptyString(parsed.value.source.versionId) ? { versionId: parsed.value.source.versionId } : {}),
+      ...(!isWorkspaceRelativeString(parsed.value.source.workspacePath) ? { degraded: true } : {}),
+    },
+    warnings: [],
+  }
+}
+
+async function readMotionRetargetLibraryState(workspaceDir: string, workspacePath: string): Promise<{ source?: AssetLibrarySourceLink, warnings: string[] }> {
+  const parsed = await readJsonRecordIfPresent(workspaceDir, workspacePath)
+  if (parsed.status !== 'found' || !isRecord(parsed.value) || !isRecord(parsed.value.source)) {
+    return { warnings: parsed.status === 'invalid' ? [`Invalid motion retarget sidecar JSON for ${workspacePath}: ${parsed.error}`] : [] }
+  }
+  const sourceWorkspacePath = typeof parsed.value.source.workspacePath === 'string' ? parsed.value.source.workspacePath : ''
+  const validationErrors = validateMotionRetargetSidecarV1Payload(parsed.value, sourceWorkspacePath)
+  if (validationErrors.length > 0) return { warnings: [`Invalid motion retarget sidecar payload for ${workspacePath}: ${validationErrors.join(', ')}`] }
+  return {
+    source: {
+      relation: 'sidecar-source',
+      ...(isWorkspaceRelativeString(parsed.value.source.workspacePath) ? { workspacePath: parsed.value.source.workspacePath } : { degraded: true }),
+      ...(isNonEmptyString(parsed.value.source.artifactId) ? { assetId: parsed.value.source.artifactId } : {}),
+      ...(isNonEmptyString(parsed.value.source.versionId) ? { versionId: parsed.value.source.versionId } : {}),
+      ...(!isWorkspaceRelativeString(parsed.value.source.workspacePath) ? { degraded: true } : {}),
+    },
+    warnings: isRecord(parsed.value.artifact) && isRecord(parsed.value.artifact.diagnostics) && isStringArray(parsed.value.artifact.diagnostics.warnings)
+      ? parsed.value.artifact.diagnostics.warnings
+      : [],
+  }
+}
+
+async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePath: string): Promise<AssetLibraryEntry | null> {
+  normalizeWorkspaceAssetPath(workspaceDir, workspacePath)
+  const physical = await physicalArtifactPath(workspaceDir, workspacePath)
+  const stats = await lstat(physical.absolutePath)
+  if (shouldSkipWorkspaceAssetLibraryPath(workspacePath)) return null
+
+  const sourceScope = deriveAssetLibrarySourceScope(workspacePath)
+  const previewKind = resolveAssetLibraryPreviewKind(workspacePath)
+  const { sidecar, warnings: sidecarWarnings } = await readArtifactRegistrySidecarForLibrary(workspaceDir, workspacePath)
+  const metadata = extractAssetLibraryMetadataRecord(sidecar)
+  const manifestFromMetadata = extractManifestRefFromMetadata(metadata, workspacePath)
+  const manifestRecord = previewKind === 'text' && resolveWorkspaceArtifactExtension(workspacePath) === 'json'
+    ? await readJsonRecordIfPresent(workspaceDir, workspacePath)
+    : { status: 'not-found' as const }
+  const manifestFromRecord = manifestRecord.status === 'found' ? extractManifestRefFromRecord(manifestRecord.value, workspacePath) : undefined
+
+  const motionState = workspacePath.startsWith(MOTION_RETARGET_SIDECAR_PREFIX) && workspacePath.endsWith(MOTION_RETARGET_SIDECAR_SUFFIX)
+    ? await readMotionRetargetLibraryState(workspaceDir, workspacePath)
+    : { warnings: [] as string[] }
+  const poseClipState = workspacePath.startsWith(POSE_CLIP_SIDECAR_PREFIX) && workspacePath.endsWith(POSE_CLIP_SIDECAR_SUFFIX)
+    ? await readPoseClipLibraryState(workspaceDir, workspacePath)
+    : { warnings: [] as string[] }
+  const landmarkState = workspacePath.startsWith(LANDMARK_SIDECAR_PREFIX) && workspacePath.endsWith(LANDMARK_SIDECAR_SUFFIX)
+    ? await readLandmarkLibraryState(workspaceDir, workspacePath)
+    : { warnings: [] as string[] }
+
+  const rigMetaState = previewKind === '3d-model' ? await readRigMetaSidecar({ workspaceDir, sourceWorkspacePath: workspacePath }) : null
+  const humanoidDraftState = previewKind === '3d-model' ? await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath: workspacePath }) : null
+  const humanoidPromotionState = previewKind === '3d-model' ? await readHumanoidPromotionSidecar({ workspaceDir, meshWorkspacePath: workspacePath }) : null
+  const intrinsicEvidence = await readIntrinsicAssetLibraryEvidence(workspaceDir, workspacePath, previewKind)
+
+  const classification = classifyAssetLibraryCandidate({
+    workspacePath,
+    artifactKind: extractAssetLibraryArtifactKind(metadata),
+    previewKind,
+    evidence: {
+      rigMeta: rigMetaState?.success === true && rigMetaState.status === 'found',
+      humanoidDraft: humanoidDraftState?.success === true && humanoidDraftState.status !== 'not-found',
+      humanoidPromotion: humanoidPromotionState?.success === true && humanoidPromotionState.status !== 'not-found',
+      motionRetargetSidecar: motionState.source !== undefined,
+      poseClipSidecar: poseClipState.source !== undefined,
+      landmarkSidecar: landmarkState.source !== undefined,
+      manifestCapability: manifestFromMetadata?.capability ?? manifestFromRecord?.capability,
+      embeddedSkins: intrinsicEvidence.embeddedSkins,
+      embeddedAnimations: intrinsicEvidence.embeddedAnimations,
+      intrinsicMotionFile: intrinsicEvidence.intrinsicMotionFile,
+    },
+  })
+
+  const warnings = [
+    ...extractAssetLibraryWarnings(metadata),
+    ...sidecarWarnings,
+    ...(manifestRecord.status === 'invalid' ? [`Invalid manifest JSON for ${workspacePath}: ${manifestRecord.error}`] : []),
+    ...motionState.warnings,
+    ...poseClipState.warnings,
+    ...landmarkState.warnings,
+    ...(rigMetaState?.success === true && rigMetaState.status === 'found' ? rigMetaState.warnings : []),
+    ...intrinsicEvidence.warnings,
+  ]
+
+  let source: AssetLibrarySourceLink | undefined = motionState.source
+    ?? poseClipState.source
+    ?? landmarkState.source
+    ?? extractAssetLibraryMetadataSource(metadata)
+    ?? (rigMetaState?.success === true && rigMetaState.status === 'found' && isRecord(rigMetaState.rigMeta) && isRecord(rigMetaState.rigMeta.source) && isWorkspaceRelativeString(rigMetaState.rigMeta.source.workspacePath)
+      ? { relation: 'derived-from', workspacePath: rigMetaState.rigMeta.source.workspacePath }
+      : undefined)
+
+  if (source?.workspacePath) {
+    try {
+      if (source.workspacePath === workspacePath || !/\.(glb|gltf)$/i.test(source.workspacePath)) throw new Error('Source must be a different viewable mesh')
+      normalizeWorkspaceAssetPath(workspaceDir, source.workspacePath)
+      await physicalArtifactPath(workspaceDir, source.workspacePath)
+    } catch {
+      const { workspacePath: _path, ...identity } = source
+      source = { ...identity, degraded: true }
+      warnings.push('Ignored unsafe, missing, self-linked or non-viewable library source.')
+    }
+  }
+
+  const manifest = mergeManifestRefs(manifestFromMetadata, manifestFromRecord)
+
+  const displayName = manifest?.title
+    ?? extractAssetLibraryDisplayName(metadata, workspacePath)
+
+  return {
+    id: `library:${workspacePath}`,
+    workspacePath,
+    displayName,
+    sourceScope,
+    ...(Number.isFinite(stats.birthtimeMs) && stats.birthtimeMs > 0 ? { createdAt: new Date(stats.birthtimeMs).toISOString() }
+      : Number.isFinite(stats.mtimeMs) && stats.mtimeMs > 0 ? { createdAt: new Date(stats.mtimeMs).toISOString() } : {}),
+    ...(Number.isFinite(stats.mtimeMs) && stats.mtimeMs > 0 ? { updatedAt: new Date(stats.mtimeMs).toISOString() } : {}),
+    ...(classification.capability ? { capability: classification.capability } : {}),
+    state: classification.state,
+    ...(sidecar?.artifactId ? { artifactId: sidecar.artifactId } : {}),
+    ...(extractAssetLibraryVersionId(metadata) ? { versionId: extractAssetLibraryVersionId(metadata) } : {}),
+    ...(extractAssetLibraryProvenance(metadata) ? { provenance: extractAssetLibraryProvenance(metadata) } : {}),
+    ...(source ? { source } : {}),
+    ...(manifest ? { manifest } : {}),
+    previewKind,
+    warnings: [...new Set(warnings)],
+  }
+}
+
+function mapWorkspaceArtifactPreviewToLibraryPayload(result: Extract<WorkspaceArtifactPreviewResult, { success: true }>): AssetLibraryPreviewPayload {
+  if (result.status === '3d-model') return { kind: '3d-model', viewerKind: result.viewerKind }
+  if (result.status === 'text') {
+    return {
+      kind: 'text',
+      content: result.content,
+      byteLength: result.byteLength,
+      truncated: result.truncated,
+    }
+  }
+  if (result.status === 'binary') {
+    return {
+      kind: 'binary',
+      binaryKind: result.binaryKind,
+      byteLength: result.byteLength,
+      message: result.message,
+    }
+  }
+  return { kind: 'none' }
+}
+
+export async function listWorkspaceAssetLibrary(request: WorkspaceAssetLibraryListServiceRequest): Promise<AssetLibraryListResult> {
+  try {
+    const entries = await listWorkspaceFilePaths(request.workspaceDir)
+    const projected = await Promise.all(entries.map((workspacePath) => buildWorkspaceAssetLibraryEntry(request.workspaceDir, workspacePath)))
+    return {
+      success: true,
+      entries: projected.filter((entry): entry is AssetLibraryEntry => entry !== null && entry.state !== 'unsupported'),
+    }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export async function readWorkspaceAssetLibraryEntry(request: WorkspaceAssetLibraryReadServiceRequest): Promise<AssetLibraryReadResult> {
+  try {
+    const entry = await buildWorkspaceAssetLibraryEntry(request.workspaceDir, normalizeWorkspaceAssetPath(request.workspaceDir, request.workspacePath).workspacePath)
+    if (!entry) {
+      throw new Error('Asset library entry was not found')
+    }
+    const normalizedRequest = normalizeAssetLibraryReadRequest({
+      workspaceDir: request.workspaceDir,
+      workspacePath: entry.workspacePath,
+      sourceWorkspacePath: request.sourceWorkspacePath,
+      indexedSourceWorkspacePath: entry.source?.workspacePath,
+    })
+    if (normalizedRequest.sourceWorkspacePath) await physicalArtifactPath(request.workspaceDir, normalizedRequest.sourceWorkspacePath)
+    const previewResult = await previewWorkspaceArtifact({ workspaceDir: request.workspaceDir, workspacePath: normalizedRequest.workspacePath })
+    if (previewResult.success !== true) {
+      throw new Error(previewResult.error)
+    }
+    const preview = mapWorkspaceArtifactPreviewToLibraryPayload(previewResult)
+    return { success: true, entry, preview }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+export async function openWorkspaceAssetLibraryEntry(request: WorkspaceAssetLibraryReadServiceRequest): Promise<AssetLibraryOpenResult> {
+  try {
+    const readResult = await readWorkspaceAssetLibraryEntry(request)
+    if (readResult.success !== true) return readResult
+    if (readResult.entry.state !== 'ready' || !readResult.entry.capability) {
+      throw new Error('Asset library open requires a ready supported asset')
+    }
+    const entry = readResult.entry
+    const direct = entry.capability !== undefined && ['mesh', 'rigged-mesh', 'animation-motion'].includes(entry.capability) && /\.(glb|gltf)$/i.test(entry.workspacePath)
+    const linked = entry.capability !== undefined && ['landmarks-sidecar', 'animation-motion'].includes(entry.capability) && entry.source?.workspacePath
+      && !entry.source.degraded && request.sourceWorkspacePath === entry.source.workspacePath
+    if (!direct && !linked) throw new Error('Asset library entry is not openable: requires a safe GLB/GLTF mesh or indexed source')
+    return { success: true, entry }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export function normalizeWorkspaceArtifactPath(workspaceDir: string, workspacePath: string): NormalizedWorkspaceArtifactPath {
   const safeWorkspacePath = assertSafeWorkspacePathInput(workspacePath)
   const resolvedWorkspace = resolvePath(workspaceDir)
@@ -605,6 +985,25 @@ function parseReadPayload(payload: unknown, workspaceDir: string): ArtifactRegis
     throw new Error('Artifact registry read requires a workspacePath string')
   }
   return { workspaceDir, workspacePath: payload.workspacePath }
+}
+
+function parseWorkspaceAssetLibraryListPayload(payload: unknown, workspaceDir: string): WorkspaceAssetLibraryListServiceRequest {
+  if (payload !== undefined && payload !== null && (!isRecord(payload) || Object.keys(payload).length > 0)) {
+    throw new Error('Workspace asset library list does not accept a payload')
+  }
+  return { workspaceDir }
+}
+
+function parseWorkspaceAssetLibraryReadPayload(payload: unknown, workspaceDir: string): WorkspaceAssetLibraryReadServiceRequest {
+  if (!isRecord(payload) || typeof payload.workspacePath !== 'string') {
+    throw new Error('Workspace asset library read requires a workspacePath string')
+  }
+  if ('workspaceDir' in payload || (payload.sourceWorkspacePath !== undefined && typeof payload.sourceWorkspacePath !== 'string')) throw new Error('Invalid asset library request')
+  return {
+    workspaceDir,
+    workspacePath: payload.workspacePath,
+    ...(typeof payload.sourceWorkspacePath === 'string' ? { sourceWorkspacePath: payload.sourceWorkspacePath } : {}),
+  }
 }
 
 function parseWritePayload(payload: unknown, workspaceDir: string): ArtifactRegistryWriteRequest {
@@ -1883,7 +2282,7 @@ async function assertPathDoesNotExist(absolutePath: string, label: string): Prom
 async function physicalArtifactPath(
   workspaceDir: string,
   workspacePath: string,
-  mode: 'read' | 'write' | 'optional' = 'read',
+  mode: 'read' | 'write' | 'optional' | 'directory' = 'read',
 ): Promise<NormalizedWorkspaceArtifactPath> {
   const normalized = normalizeWorkspaceArtifactPath(workspaceDir, workspacePath)
   const root = await realpath(workspaceDir)
@@ -1898,7 +2297,7 @@ async function physicalArtifactPath(
       info = await lstat(current)
     } catch (error) {
       if (!isRecord(error) || error.code !== 'ENOENT') throw error
-      if (mode === 'read') throw error
+      if (mode === 'read' || mode === 'directory') throw error
       if (!leaf && mode === 'write') {
         try { await mkdir(current) } catch (creationError) {
           if (!isRecord(creationError) || creationError.code !== 'EEXIST') throw creationError
@@ -1910,7 +2309,7 @@ async function physicalArtifactPath(
       }
     }
     if (info.isSymbolicLink()) throw new Error('Artifact path must not contain inner symlinks')
-    if (leaf ? !info.isFile() : !info.isDirectory()) {
+    if (leaf && mode !== 'directory' ? !info.isFile() : !info.isDirectory()) {
       throw new Error(leaf ? 'Artifact path must be a regular file' : 'Artifact ancestor must be a directory')
     }
   }
@@ -2909,4 +3308,31 @@ export function registerArtifactRegistryIpcHandlers({ ipcMain, getWorkspaceDir, 
       return { success: false, status: 'invalid', message: error instanceof Error ? error.message : String(error) }
     }
   })
+}
+
+export function registerWorkspaceAssetLibraryIpcHandlers({ ipcMain, getWorkspaceDir }: ArtifactRegistryIpcRegistrationDeps): void {
+  ipcMain.handle('workspace:library:list', async (_event, payload) => {
+    try {
+      return listWorkspaceAssetLibrary(parseWorkspaceAssetLibraryListPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:library:read', async (_event, payload) => {
+    try {
+      return readWorkspaceAssetLibraryEntry(parseWorkspaceAssetLibraryReadPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('workspace:library:open', async (_event, payload) => {
+    try {
+      return openWorkspaceAssetLibraryEntry(parseWorkspaceAssetLibraryReadPayload(payload, getWorkspaceDir()))
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
 }

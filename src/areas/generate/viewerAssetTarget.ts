@@ -1,5 +1,6 @@
 import type { GenerationJob } from '../../shared/stores/appStore.ts'
 import type { ArtifactRef } from '../../shared/types/artifacts.ts'
+import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 
 const FINAL_LABEL = 'Final output' as const
 const CHECKPOINT_LABEL = 'Temporary checkpoint — not final output' as const
@@ -63,6 +64,50 @@ export function resolveViewerAssetTarget(input: ResolveViewerAssetTargetInput): 
 export function resolveViewerAssetTargetUrl(outputUrl: string, apiUrl: string): string {
   if (outputUrl.startsWith('http://') || outputUrl.startsWith('https://') || outputUrl.startsWith('blob:')) return outputUrl
   return outputUrl.startsWith('/') ? `${apiUrl}${outputUrl}` : outputUrl
+}
+
+export function resolveViewerAssetTargetFromLibraryEntry(entry: RendererAssetLibraryEntry, apiUrl: string): ViewerAssetTarget {
+  if (entry.state !== 'ready' || entry.openTarget.kind === 'unavailable'
+    || !isSafeViewerWorkspaceRelativePath(entry.workspacePath)
+    || (entry.openTarget.kind === 'self' && entry.openTarget.workspacePath !== entry.workspacePath)
+    || (entry.openTarget.kind === 'linked-source' && (entry.source?.degraded
+      || entry.source?.workspacePath !== entry.openTarget.workspacePath || entry.workspacePath === entry.openTarget.workspacePath))) {
+    return {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
+    }
+  }
+
+  const modelUrl = isSafeViewerWorkspaceRelativePath(entry.openTarget.workspacePath, { meshOnly: true })
+    ? `${apiUrl}${WORKSPACE_PREFIX}${entry.openTarget.workspacePath.split('/').map(encodeURIComponent).join('/')}` : undefined
+  if (!modelUrl) {
+    return {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
+    }
+  }
+
+  return {
+    kind: 'final',
+    modelUrl,
+    isCheckpointPreview: false,
+    label: FINAL_LABEL,
+    sourceLabel: entry.displayName,
+    sourceKind: 'import',
+    workspacePath: entry.openTarget.workspacePath,
+    ...(entry.openTarget.kind === 'self'
+      ? {
+          ...(entry.artifactId ? { artifactId: entry.artifactId } : {}),
+          ...(entry.versionId ? { versionId: entry.versionId } : {}),
+          ...(entry.provenance ? { provenance: entry.provenance } : {}),
+        }
+      : {
+          ...(entry.source?.assetId ? { artifactId: entry.source.assetId } : {}),
+          ...(entry.source?.versionId ? { versionId: entry.source.versionId } : {}),
+        }),
+  }
 }
 
 /** Renderer preflight only. Native IO still owns physical/symlink custody. */

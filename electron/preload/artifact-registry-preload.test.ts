@@ -789,3 +789,63 @@ test('preload workspace artifact registry exposes humanoid draft discovery and p
     { channel: 'workspace:artifact:readHumanoidPromotionSidecar', args: [promotionReadRequest] },
   ])
 })
+
+test('preload workspace asset library exposes list, read, and open IPC channels', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const listResult = {
+    success: true,
+    entries: [
+      {
+        id: 'artifact-hero',
+        workspacePath: 'Workflows/generated/hero.glb',
+        displayName: 'Hero Mesh',
+        capability: 'rigged-mesh',
+        state: 'ready',
+        previewKind: '3d-model',
+        warnings: [],
+      },
+    ],
+  } as const
+  const readResult = {
+    success: true,
+    entry: listResult.entries[0],
+    preview: { kind: '3d-model', viewerKind: 'glb' },
+  } as const
+  const openResult = {
+    success: true,
+    entry: listResult.entries[0],
+  } as const
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      if (channel === 'workspace:library:list') return listResult
+      if (channel === 'workspace:library:read') return readResult
+      if (channel === 'workspace:library:open') return openResult
+      throw new Error(`Unexpected channel: ${channel}`)
+    },
+  })
+
+  assert.equal(typeof api.workspace.library.list, 'function')
+  assert.equal(typeof api.workspace.library.read, 'function')
+  assert.equal(typeof api.workspace.library.open, 'function')
+
+  const readRequest = {
+    workspacePath: 'Workflows/generated/hero.glb',
+    sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+  }
+  const openRequest = {
+    workspacePath: 'Workflows/generated/hero.glb',
+  }
+
+  assert.deepEqual(await api.workspace.library.list(), listResult)
+  assert.deepEqual(await api.workspace.library.read(readRequest), readResult)
+  assert.deepEqual(await api.workspace.library.open(openRequest), openResult)
+  assert.deepEqual(invocations, [
+    { channel: 'workspace:library:list', args: [] },
+    { channel: 'workspace:library:read', args: [readRequest] },
+    { channel: 'workspace:library:open', args: [openRequest] },
+  ])
+})

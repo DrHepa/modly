@@ -1,5 +1,6 @@
 import type { GenerationJob } from '../../shared/stores/appStore.ts'
 import type { ArtifactRef } from '../../shared/types/artifacts.ts'
+import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 
 const FINAL_LABEL = 'Final output' as const
 const CHECKPOINT_LABEL = 'Temporary checkpoint — not final output' as const
@@ -14,7 +15,7 @@ export type ViewerAssetTarget =
       modelUrl: string
       isCheckpointPreview: false
       label: typeof FINAL_LABEL
-      sourceLabel: typeof FINAL_LABEL
+      sourceLabel: string
       sourceKind: ViewerAssetSourceKind
       workspacePath?: string
       artifactId?: string
@@ -26,7 +27,7 @@ export type ViewerAssetTarget =
       modelUrl: string
       isCheckpointPreview: true
       label: typeof CHECKPOINT_LABEL
-      sourceLabel: typeof CHECKPOINT_LABEL
+      sourceLabel: string
       sourceKind: ViewerAssetSourceKind
       workspacePath?: string
       artifactId?: string
@@ -94,6 +95,45 @@ export function resolveViewerAssetTargetUrl(outputUrl: string, apiUrl: string): 
   }
 
   return outputUrl.startsWith('/') ? `${apiUrl}${outputUrl}` : outputUrl
+}
+
+export function resolveViewerAssetTargetFromLibraryEntry(entry: RendererAssetLibraryEntry, apiUrl: string): ViewerAssetTarget {
+  if (entry.openTarget.kind === 'unavailable') {
+    return {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
+    }
+  }
+
+  const modelUrl = resolveViewerWorkspaceModelUrl(entry.openTarget.workspacePath, apiUrl)
+  if (!modelUrl) {
+    return {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
+    }
+  }
+
+  return {
+    kind: 'final',
+    modelUrl,
+    isCheckpointPreview: false,
+    label: FINAL_LABEL,
+    sourceLabel: entry.displayName,
+    sourceKind: 'import',
+    workspacePath: entry.openTarget.workspacePath,
+    ...(entry.openTarget.kind === 'self'
+      ? {
+          ...(entry.artifactId ? { artifactId: entry.artifactId } : {}),
+          ...(entry.versionId ? { versionId: entry.versionId } : {}),
+          ...(entry.provenance ? { provenance: entry.provenance } : {}),
+        }
+      : {
+          ...(entry.source?.assetId ? { artifactId: entry.source.assetId } : {}),
+          ...(entry.source?.versionId ? { versionId: entry.source.versionId } : {}),
+        }),
+  }
 }
 
 export function isSafeViewerWorkspaceRelativePath(workspacePath: string, options: { meshOnly?: boolean } = {}): boolean {
@@ -170,6 +210,11 @@ function resolveViewerArtifactModelUrl(
 ): string | undefined {
   const workspacePath = resolveViewerArtifactWorkspacePath(artifact)
   return workspacePath ? `${apiUrl}${WORKSPACE_PREFIX}${workspacePath}` : undefined
+}
+
+function resolveViewerWorkspaceModelUrl(workspacePath: string, apiUrl: string): string | undefined {
+  const normalizedWorkspacePath = normalizeViewerWorkspacePath(workspacePath, { meshOnly: true })
+  return normalizedWorkspacePath ? `${apiUrl}${WORKSPACE_PREFIX}${normalizedWorkspacePath}` : undefined
 }
 
 function resolveViewerArtifactMetadata(

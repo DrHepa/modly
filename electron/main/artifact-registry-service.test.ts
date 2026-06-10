@@ -6,17 +6,22 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  classifyAssetLibraryCandidate,
   downloadWorkspaceArtifact,
   getHumanoidDraftWorkspacePath,
   getHumanoidPromotionWorkspacePath,
   getArtifactSidecarWorkspacePath,
+  listWorkspaceAssetLibrary,
+  normalizeAssetLibraryReadRequest,
   normalizeWorkspaceArtifactPath,
+  openWorkspaceAssetLibraryEntry,
   previewWorkspaceArtifact,
   readHumanoidDraftSidecar,
   readHumanoidPromotionSidecar,
   readPoseClipSidecar,
   readRigMetaSidecar,
   readRigRenameSidecar,
+  readWorkspaceAssetLibraryEntry,
   registerArtifactRegistryIpcHandlers,
   writeLandmarkSidecar,
   readArtifactSidecar,
@@ -27,9 +32,22 @@ import {
 } from './artifact-registry-service.ts'
 
 import type { LandmarkSidecarV1 } from '../../src/areas/workflows/landmarks.ts'
+import type { AssetLibraryListResult, AssetLibraryReadResult } from '../../src/shared/types/assetLibrary.ts'
 import type { RigMetaSidecarReadResult } from '../../src/shared/types/electron.d.ts'
 
 const artifactRegistryService = await import(new URL('./artifact-registry-service.ts', import.meta.url).href)
+
+function assertSuccessfulAssetLibraryList(result: AssetLibraryListResult): asserts result is Extract<AssetLibraryListResult, { success: true }> {
+  if (result.success !== true) {
+    assert.fail(`expected successful library list, got ${result.error}`)
+  }
+}
+
+function assertSuccessfulAssetLibraryRead(result: AssetLibraryReadResult): asserts result is Extract<AssetLibraryReadResult, { success: true }> {
+  if (result.success !== true) {
+    assert.fail(`expected successful library read, got ${result.error}`)
+  }
+}
 
 type RigRenameSidecarWriter = (request: {
   workspaceDir: string
@@ -346,6 +364,24 @@ function sha256(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function buildMinimalGlb(document: Record<string, unknown>): Buffer {
+  const jsonBytes = Buffer.from(JSON.stringify(document), 'utf-8')
+  const paddedJsonLength = Math.ceil(jsonBytes.length / 4) * 4
+  const jsonChunk = Buffer.alloc(paddedJsonLength, 0x20)
+  jsonBytes.copy(jsonChunk)
+
+  const header = Buffer.alloc(12)
+  header.writeUInt32LE(0x46546c67, 0)
+  header.writeUInt32LE(2, 4)
+  header.writeUInt32LE(12 + 8 + jsonChunk.length, 8)
+
+  const chunkHeader = Buffer.alloc(8)
+  chunkHeader.writeUInt32LE(jsonChunk.length, 0)
+  chunkHeader.writeUInt32LE(0x4e4f534a, 4)
+
+  return Buffer.concat([header, chunkHeader, jsonChunk])
+}
+
 function humanoidDraftSidecar(overrides: Record<string, unknown> = {}) {
   return {
     schema: 'modly.humanoid-draft.v1',
@@ -457,6 +493,559 @@ test('normalizes workspace-relative artifact paths and rejects absolute or trave
   })
 })
 
+test('classifies asset library entries by capability evidence instead of file extension buckets', () => {
+  const cases = [
+    {
+      name: 'mesh from artifact sidecar metadata',
+      input: { workspacePath: 'Workflows/generated/hero.glb', artifactKind: 'mesh', previewKind: '3d-model' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'mesh from sidecar-free glb',
+      input: { workspacePath: 'Workflows/generated/mystery.glb', previewKind: '3d-model' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'mesh from sidecar-free gltf',
+      input: { workspacePath: 'Workflows/generated/mystery.gltf', previewKind: '3d-model' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'mesh from sidecar-free obj',
+      input: { workspacePath: 'Workflows/generated/mystery.obj', previewKind: 'binary' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'mesh from sidecar-free stl',
+      input: { workspacePath: 'Workflows/generated/mystery.stl', previewKind: 'binary' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'mesh from sidecar-free ply',
+      input: { workspacePath: 'Workflows/generated/mystery.ply', previewKind: 'binary' },
+      expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'rigged-mesh',
+      input: { workspacePath: 'Workflows/generated/hero.glb', artifactKind: 'mesh', previewKind: '3d-model', evidence: { rigMeta: true } },
+      expected: { capability: 'rigged-mesh', state: 'ready' },
+    },
+    {
+      name: 'animation-motion',
+      input: { workspacePath: 'Workflows/motion-retarget/hero.motion-retarget.v1.json', previewKind: 'text', evidence: { motionRetargetSidecar: true } },
+      expected: { capability: 'animation-motion', state: 'ready' },
+    },
+    {
+      name: 'animation-motion from embedded animation evidence',
+      input: { workspacePath: 'Exports/motions/walk.glb', previewKind: '3d-model', evidence: { embeddedAnimations: true } },
+      expected: { capability: 'animation-motion', state: 'ready' },
+    },
+    {
+      name: 'rigged-mesh from embedded skin evidence',
+      input: { workspacePath: 'Exports/rigged/hero.glb', previewKind: '3d-model', evidence: { embeddedSkins: true } },
+      expected: { capability: 'rigged-mesh', state: 'ready' },
+    },
+    {
+      name: 'embedded animation beats embedded skin when both exist',
+      input: { workspacePath: 'Exports/rigged/hero-animated.glb', previewKind: '3d-model', evidence: { embeddedSkins: true, embeddedAnimations: true } },
+      expected: { capability: 'animation-motion', state: 'ready' },
+    },
+    {
+      name: 'animation-motion from bvh motion file',
+      input: { workspacePath: 'Exports/motions/walk.bvh', previewKind: 'text', evidence: { intrinsicMotionFile: true } },
+      expected: { capability: 'animation-motion', state: 'ready' },
+    },
+    {
+      name: 'animation-motion from npz motion file',
+      input: { workspacePath: 'Exports/motions/walk.npz', previewKind: 'binary', evidence: { intrinsicMotionFile: true } },
+      expected: { capability: 'animation-motion', state: 'ready' },
+    },
+    {
+      name: 'landmarks-sidecar',
+      input: { workspacePath: 'Workflows/landmarks/hero.landmarks.v1.json', previewKind: 'text', evidence: { landmarkSidecar: true } },
+      expected: { capability: 'landmarks-sidecar', state: 'ready' },
+    },
+    {
+      name: 'generated-world',
+      input: { workspacePath: 'Workflows/worlds/hero.world.json', previewKind: 'text', evidence: { manifestCapability: 'generated-world' } },
+      expected: { capability: 'generated-world', state: 'ready' },
+    },
+    {
+      name: 'scene-manifest',
+      input: { workspacePath: 'Workflows/scenes/hero.scene.json', previewKind: 'text', evidence: { manifestCapability: 'scene-manifest' } },
+      expected: { capability: 'scene-manifest', state: 'ready' },
+    },
+    {
+      name: 'unsupported',
+      input: { workspacePath: 'Workflows/notes/readme.txt', artifactKind: 'text', previewKind: 'text' },
+      expected: { capability: undefined, state: 'unsupported' },
+    },
+  ] as const
+
+  for (const testCase of cases) {
+    const result = classifyAssetLibraryCandidate(testCase.input)
+    assert.deepEqual(result, testCase.expected, `${testCase.name} should classify from capability evidence`)
+  }
+})
+
+test('normalizes asset library read requests and rejects encoded escapes plus source-link mismatches', () => {
+  assert.deepEqual(
+    normalizeAssetLibraryReadRequest({
+      workspaceDir: '/workspace',
+      workspacePath: 'Workflows\\generated\\hero.glb',
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+      indexedSourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    }),
+    {
+      workspacePath: 'Workflows/generated/hero.glb',
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    },
+  )
+
+  for (const workspacePath of [
+    '../secret.glb',
+    '/tmp/secret.glb',
+    'Workflows/%2e%2e/secret.glb',
+    'Workflows/%2Fsecret.glb',
+  ]) {
+    assert.throws(
+      () => normalizeAssetLibraryReadRequest({ workspaceDir: '/workspace', workspacePath }),
+      /workspace-relative|traversal|absolute|encoded/i,
+      `${workspacePath} should be rejected before any library read`,
+    )
+  }
+
+  assert.throws(
+    () => normalizeAssetLibraryReadRequest({
+      workspaceDir: '/workspace',
+      workspacePath: 'Workflows/landmarks/hero.landmarks.v1.json',
+      sourceWorkspacePath: 'Workflows/checkpoints/other.glb',
+      indexedSourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    }),
+    /source link does not match/i,
+  )
+})
+
+test('lists workspace asset library entries with projected registry metadata, sidecar evidence, and fallback states', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'sources'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'landmarks', 'run-1'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'worlds'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'notes'), { recursive: true })
+
+    await writeFile(path.join(workspaceDir, 'Workflows', 'sources', 'source.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.gltf'), '{"asset":{"version":"2.0"}}', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.obj'), 'o hero\nv 0 0 0\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.stl'), 'solid hero\nendsolid hero\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nend_header\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'notes', 'readme.md'), '# hello', 'utf-8')
+
+    await writeFile(
+      path.join(workspaceDir, 'Workflows', 'generated', 'hero.glb.artifact.json'),
+      JSON.stringify({
+        artifactId: 'artifact-hero',
+        workspacePath: 'Workflows/generated/hero.glb',
+        metadata: {
+          artifact: {
+            id: 'artifact-hero',
+            kind: 'mesh',
+            versionId: 'artifact-hero-v2',
+            provenance: {
+              workflowId: 'workflow-1',
+              workflowNodeId: 'node-hero',
+              extensionId: 'unirig',
+              extensionNodeId: 'mesh-output',
+            },
+          },
+          displayName: 'Hero Mesh',
+          warnings: ['sidecar-warning'],
+        },
+      }, null, 2),
+      'utf-8',
+    )
+    await writeFile(
+      path.join(workspaceDir, 'Workflows', 'generated', 'hero.rigmeta.json'),
+      JSON.stringify(rigMetaSidecar({ output_mesh: 'hero.glb', source: { workspacePath: 'Workflows/sources/source.glb' } }), null, 2),
+      'utf-8',
+    )
+
+    const motionSidecarPath = 'Workflows/motion-retarget/hero.motion-retarget.v1.json'
+    await writeFile(
+      path.join(workspaceDir, ...motionSidecarPath.split('/')),
+      JSON.stringify(motionRetargetSidecar(), null, 2),
+      'utf-8',
+    )
+
+    const landmarkPath = 'Workflows/landmarks/run-1/hero.landmarks.v1.json'
+    await writeFile(
+      path.join(workspaceDir, ...landmarkPath.split('/')),
+      JSON.stringify(landmarkSidecar({ sidecarPath: landmarkPath }), null, 2),
+      'utf-8',
+    )
+
+    const worldWorkspacePath = 'Workflows/worlds/hero.world.json'
+    await writeFile(
+      path.join(workspaceDir, ...worldWorkspacePath.split('/')),
+      JSON.stringify({ schema: 'modly.generated-world.v1', title: 'Hero World' }, null, 2),
+      'utf-8',
+    )
+    await writeFile(
+      path.join(workspaceDir, 'Workflows', 'worlds', 'hero.world.json.artifact.json'),
+      JSON.stringify({
+        artifactId: 'artifact-world',
+        workspacePath: worldWorkspacePath,
+        metadata: {
+          artifact: {
+            id: 'artifact-world',
+            kind: 'text',
+            versionId: 'artifact-world-v1',
+            provenance: {
+              workflowId: 'workflow-world',
+              workflowNodeId: 'node-world',
+            },
+          },
+          assetLibrary: { capability: 'generated-world', title: 'Hero World' },
+        },
+      }, null, 2),
+      'utf-8',
+    )
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const byPath = new Map(result.entries.map((entry) => [entry.workspacePath, entry]))
+    assert.equal(byPath.has('Workflows/generated/hero.glb.artifact.json'), false)
+    assert.equal(byPath.has('Workflows/generated/hero.rigmeta.json'), false)
+
+    assert.deepEqual(byPath.get('Workflows/generated/hero.glb'), {
+      id: 'artifact-hero',
+      workspacePath: 'Workflows/generated/hero.glb',
+      displayName: 'Hero Mesh',
+      sourceScope: 'workflows',
+      capability: 'rigged-mesh',
+      state: 'ready',
+      artifactId: 'artifact-hero',
+      versionId: 'artifact-hero-v2',
+      provenance: {
+        workflowId: 'workflow-1',
+        workflowNodeId: 'node-hero',
+        extensionId: 'unirig',
+        extensionNodeId: 'mesh-output',
+      },
+      source: {
+        relation: 'derived-from',
+        workspacePath: 'Workflows/sources/source.glb',
+      },
+      previewKind: '3d-model',
+      warnings: [
+        'sidecar-warning',
+        'Rigmeta source mismatch: expected "Workflows/generated/hero.glb" but found "Workflows/sources/source.glb".',
+      ],
+    })
+
+    assert.deepEqual(byPath.get(motionSidecarPath), {
+      id: motionSidecarPath,
+      workspacePath: motionSidecarPath,
+      displayName: 'hero.motion-retarget.v1.json',
+      sourceScope: 'workflows',
+      capability: 'animation-motion',
+      state: 'ready',
+      source: {
+        relation: 'sidecar-source',
+        workspacePath: 'Workflows/checkpoints/source.glb',
+        assetId: 'mesh-artifact-1',
+        versionId: 'mesh-version-1',
+      },
+      previewKind: 'text',
+      warnings: ['Root translation is deferred in MVP.'],
+    })
+
+    assert.deepEqual(byPath.get(landmarkPath), {
+      id: landmarkPath,
+      workspacePath: landmarkPath,
+      displayName: 'hero.landmarks.v1.json',
+      sourceScope: 'workflows',
+      capability: 'landmarks-sidecar',
+      state: 'ready',
+      source: {
+        relation: 'sidecar-source',
+        workspacePath: 'Workflows/checkpoints/source.glb',
+        assetId: 'mesh-artifact-1',
+        versionId: 'mesh-version-1',
+      },
+      previewKind: 'text',
+      warnings: [],
+    })
+
+    assert.deepEqual(byPath.get(worldWorkspacePath), {
+      id: 'artifact-world',
+      workspacePath: worldWorkspacePath,
+      displayName: 'Hero World',
+      sourceScope: 'workflows',
+      capability: 'generated-world',
+      state: 'ready',
+      artifactId: 'artifact-world',
+      versionId: 'artifact-world-v1',
+      provenance: {
+        workflowId: 'workflow-world',
+        workflowNodeId: 'node-world',
+      },
+      manifest: {
+        capability: 'generated-world',
+        workspacePath: worldWorkspacePath,
+        schema: 'modly.generated-world.v1',
+        title: 'Hero World',
+      },
+      previewKind: 'text',
+      warnings: [],
+    })
+
+    assert.deepEqual(byPath.get('Workflows/generated/mystery.glb'), {
+      id: 'Workflows/generated/mystery.glb',
+      workspacePath: 'Workflows/generated/mystery.glb',
+      displayName: 'mystery.glb',
+      sourceScope: 'workflows',
+      capability: 'mesh',
+      state: 'ready',
+      previewKind: '3d-model',
+      warnings: [],
+    })
+
+    assert.deepEqual(byPath.get('Workflows/generated/mystery.gltf'), {
+      id: 'Workflows/generated/mystery.gltf',
+      workspacePath: 'Workflows/generated/mystery.gltf',
+      displayName: 'mystery.gltf',
+      sourceScope: 'workflows',
+      capability: 'mesh',
+      state: 'ready',
+      previewKind: '3d-model',
+      warnings: [],
+    })
+
+    for (const workspacePath of [
+      'Workflows/generated/mystery.obj',
+      'Workflows/generated/mystery.stl',
+      'Workflows/generated/mystery.ply',
+    ]) {
+      const expectedName = path.basename(workspacePath)
+      assert.deepEqual(byPath.get(workspacePath), {
+        id: workspacePath,
+        workspacePath,
+        displayName: expectedName,
+        sourceScope: 'workflows',
+        capability: 'mesh',
+        state: 'ready',
+        previewKind: 'binary',
+        warnings: [],
+      })
+    }
+
+    assert.equal(byPath.has('notes/readme.md'), false)
+  })
+})
+
+test('lists workspace asset library entries with source scope preserved and intrinsic capability evidence under both roots', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Exports', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Exports', 'motions'), { recursive: true })
+
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'static.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'rigged.gltf'), JSON.stringify({ asset: { version: '2.0' }, skins: [{}] }), 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Exports', 'generated', 'animated.glb'), buildMinimalGlb({ asset: { version: '2.0' }, animations: [{ name: 'Walk' }] }))
+    await writeFile(path.join(workspaceDir, 'Exports', 'generated', 'animated-rigged.glb'), buildMinimalGlb({ asset: { version: '2.0' }, skins: [{}], animations: [{ name: 'Walk' }] }))
+    await writeFile(path.join(workspaceDir, 'Exports', 'motions', 'walk.bvh'), 'HIERARCHY\nROOT Hips\nMOTION\nFrames: 1\nFrame Time: 0.0333333\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Exports', 'motions', 'walk.npz'), Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+    await writeFile(path.join(workspaceDir, 'Exports', 'generated', 'broken.glb'), Buffer.from([0x67, 0x6c, 0x62]))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const byPath = new Map(result.entries.map((entry) => [entry.workspacePath, entry]))
+
+    assert.equal(byPath.get('Workflows/generated/static.glb')?.sourceScope, 'workflows')
+    assert.equal(byPath.get('Workflows/generated/static.glb')?.capability, 'mesh')
+    assert.equal(byPath.get('Workflows/generated/rigged.gltf')?.sourceScope, 'workflows')
+    assert.equal(byPath.get('Workflows/generated/rigged.gltf')?.capability, 'rigged-mesh')
+
+    assert.equal(byPath.get('Exports/generated/animated.glb')?.sourceScope, 'exports')
+    assert.equal(byPath.get('Exports/generated/animated.glb')?.capability, 'animation-motion')
+    assert.equal(byPath.get('Exports/generated/animated-rigged.glb')?.sourceScope, 'exports')
+    assert.equal(byPath.get('Exports/generated/animated-rigged.glb')?.capability, 'animation-motion')
+    assert.equal(byPath.get('Exports/motions/walk.bvh')?.capability, 'animation-motion')
+    assert.equal(byPath.get('Exports/motions/walk.npz')?.capability, 'animation-motion')
+
+    assert.equal(byPath.get('Exports/generated/broken.glb')?.capability, 'mesh')
+    assert.match(byPath.get('Exports/generated/broken.glb')?.warnings.join('\n') ?? '', /parse|glb|gltf/i)
+  })
+})
+
+test('lists a real indexed workspace candidate as unknown-metadata when no supported evidence exists', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'opaque-bundle'), Buffer.from([0xde, 0xad, 0xbe, 0xef]))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    assert.deepEqual(result.entries, [
+      {
+        id: 'Workflows/generated/opaque-bundle',
+        workspacePath: 'Workflows/generated/opaque-bundle',
+        displayName: 'opaque-bundle',
+        sourceScope: 'workflows',
+        state: 'unknown-metadata',
+        previewKind: 'none',
+        warnings: [],
+      },
+    ])
+  })
+})
+
+test('lists workspace asset library entries only from Workflows and Exports roots and filters unsupported files', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'notes'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Exports', 'meshes'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'cache'), { recursive: true })
+
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Exports', 'meshes', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'notes', 'readme.md'), '# noise\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'cache', 'tmp.glb'), Buffer.from([0x67, 0x6c, 0x62]))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const workspacePaths = result.entries.map((entry) => entry.workspacePath)
+    assert.deepEqual(workspacePaths, [
+      'Exports/meshes/hero.glb',
+      'Workflows/generated/hero.glb',
+    ])
+    assert.equal(workspacePaths.includes('Workflows/notes/readme.md'), false)
+    assert.equal(workspacePaths.includes('cache/tmp.glb'), false)
+  })
+})
+
+test('lists workspace asset library entries when one scoped root is missing', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Exports', 'meshes'), { recursive: true })
+    await writeFile(path.join(workspaceDir, 'Exports', 'meshes', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    assert.deepEqual(result.entries.map((entry) => entry.workspacePath), ['Exports/meshes/hero.glb'])
+  })
+})
+
+test('prunes internal temporary workspace directories from asset library scanning', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', '.STAGE-P3-SAM', 'run-1', 'PART_MASK'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'tmp', 'drafts'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'cache', 'meshes'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Exports', '.cache', 'meshes'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Exports', 'meshes'), { recursive: true })
+
+    await writeFile(path.join(workspaceDir, 'Workflows', '.STAGE-P3-SAM', 'run-1', 'PART_MASK', 'mask.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'tmp', 'drafts', 'preview.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'cache', 'meshes', 'cached.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Exports', '.cache', 'meshes', 'export-cache.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Exports', 'meshes', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const workspacePaths = result.entries.map((entry) => entry.workspacePath)
+    assert.deepEqual(workspacePaths, [
+      'Exports/meshes/hero.glb',
+      'Workflows/generated/hero.glb',
+    ])
+    assert.equal(workspacePaths.includes('Workflows/.STAGE-P3-SAM/run-1/PART_MASK/mask.glb'), false)
+    assert.equal(workspacePaths.includes('Workflows/tmp/drafts/preview.glb'), false)
+    assert.equal(workspacePaths.includes('Workflows/cache/meshes/cached.glb'), false)
+    assert.equal(workspacePaths.includes('Exports/.cache/meshes/export-cache.glb'), false)
+  })
+})
+
+test('reads and opens workspace asset library entries through the safe library boundary', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    const motionSidecarPath = 'Workflows/motion-retarget/hero.motion-retarget.v1.json'
+    await writeFile(
+      path.join(workspaceDir, ...motionSidecarPath.split('/')),
+      JSON.stringify(motionRetargetSidecar(), null, 2),
+      'utf-8',
+    )
+
+    const readResult = await readWorkspaceAssetLibraryEntry({
+      workspaceDir,
+      workspacePath: motionSidecarPath,
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    })
+
+    assertSuccessfulAssetLibraryRead(readResult)
+    assert.equal(readResult.entry.capability, 'animation-motion')
+    assert.deepEqual(readResult.preview, {
+      kind: 'text',
+      content: JSON.stringify(motionRetargetSidecar(), null, 2),
+      byteLength: JSON.stringify(motionRetargetSidecar(), null, 2).length,
+      truncated: false,
+    })
+
+    const mismatchResult = await readWorkspaceAssetLibraryEntry({
+      workspaceDir,
+      workspacePath: motionSidecarPath,
+      sourceWorkspacePath: 'Workflows/checkpoints/other.glb',
+    })
+    assert.equal(mismatchResult.success, false)
+    assert.match(mismatchResult.error ?? '', /source link does not match/i)
+
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.gltf'), '{"asset":{"version":"2.0"}}', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.obj'), 'o hero\nv 0 0 0\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.stl'), 'solid hero\nendsolid hero\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nend_header\n', 'utf-8')
+
+    const openReadyResult = await openWorkspaceAssetLibraryEntry({
+      workspaceDir,
+      workspacePath: motionSidecarPath,
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+    })
+    assert.deepEqual(openReadyResult, { success: true, entry: readResult.entry })
+
+    for (const workspacePath of [
+      'Workflows/generated/mystery.glb',
+      'Workflows/generated/mystery.gltf',
+      'Workflows/generated/mystery.obj',
+      'Workflows/generated/mystery.stl',
+      'Workflows/generated/mystery.ply',
+    ]) {
+      const openMeshResult = await openWorkspaceAssetLibraryEntry({
+        workspaceDir,
+        workspacePath,
+      })
+      assert.equal(openMeshResult.success, true)
+      if (openMeshResult.success !== true) continue
+      assert.equal(openMeshResult.entry.capability, 'mesh')
+      assert.equal(openMeshResult.entry.state, 'ready')
+    }
+  })
+})
+
 test('writes and reads a .artifact.json sidecar without mutating the original asset', async () => {
   await withTempWorkspace(async (workspaceDir) => {
     await mkdir(path.join(workspaceDir, 'collection'), { recursive: true })
@@ -536,6 +1125,9 @@ test('registers minimal artifact registry IPC handlers for read and write sideca
       'workspace:artifact:writePoseClipSidecar',
       'workspace:artifact:writeRigRenameSidecar',
       'workspace:artifact:writeSidecar',
+      'workspace:library:list',
+      'workspace:library:open',
+      'workspace:library:read',
     ])
 
     const writeHandler = handlers.get('workspace:artifact:writeSidecar')

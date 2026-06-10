@@ -1,112 +1,310 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import {
-  filterAssetLibraryEntries,
-  groupAssetLibraryEntries,
-  projectAssetLibraryEntry,
-  resolveAssetLibraryOpenTarget,
-} from './assetLibraryProjection.ts'
 import type { AssetLibraryEntry } from '../../shared/types/assetLibrary.ts'
+import {
+  projectAssetLibraryEntry,
+  projectAssetLibraryListResult,
+  projectAssetLibraryReadResult,
+} from './assetLibraryProjection.ts'
 
-const glbEntry: AssetLibraryEntry = {
-  id: 'library:Workflows/checkpoints/hero.glb',
-  workspacePath: 'Workflows/checkpoints/hero.glb',
-  displayName: 'hero.glb',
-  sourceScope: 'workflows',
-  capability: 'mesh',
-  state: 'ready',
-  previewKind: '3d-model',
-  warnings: ['safe', 'safe'],
-  openable: true,
+function assetEntry(patch: Partial<AssetLibraryEntry> = {}): AssetLibraryEntry {
+  return {
+    id: 'asset-1',
+    workspacePath: 'Characters/hero.glb',
+    displayName: 'Hero mesh',
+    sourceScope: 'workflows',
+    capability: 'mesh',
+    state: 'ready',
+    artifactId: 'artifact-1',
+    versionId: 'version-1',
+    provenance: {
+      workflowId: 'workflow-1',
+      workflowNodeId: 'node-1',
+    },
+    previewKind: '3d-model',
+    warnings: [],
+    ...patch,
+  }
 }
 
-test('projects entries with deduped warnings and workspace URL open target', () => {
-  const projected = projectAssetLibraryEntry(glbEntry)
-  assert.deepEqual(projected.warnings, ['safe'])
-  assert.deepEqual(resolveAssetLibraryOpenTarget(projected), {
-    kind: 'self',
-    url: '/workspace/Workflows/checkpoints/hero.glb',
-    workspacePath: 'Workflows/checkpoints/hero.glb',
-  })
+test('projectAssetLibraryEntry keeps ready mesh entries openable through their own workspace path', () => {
+  assert.deepEqual(
+    projectAssetLibraryEntry(assetEntry({ warnings: ['duplicate warning', 'duplicate warning'] })),
+    {
+      id: 'asset-1',
+      workspacePath: 'Characters/hero.glb',
+      displayName: 'Hero mesh',
+      sourceScope: 'workflows',
+      capability: 'mesh',
+      state: 'ready',
+      artifactId: 'artifact-1',
+      versionId: 'version-1',
+      provenance: {
+        workflowId: 'workflow-1',
+        workflowNodeId: 'node-1',
+      },
+      previewKind: '3d-model',
+      warnings: ['duplicate warning'],
+      openTarget: {
+        kind: 'self',
+        workspacePath: 'Characters/hero.glb',
+      },
+    },
+  )
 })
 
-test('projects sidecars with safe GLB source links as linked-source open targets', () => {
-  const projected = projectAssetLibraryEntry({
-    ...glbEntry,
-    id: 'library:Workflows/checkpoints/hero.landmarks.v1.json',
-    workspacePath: 'Workflows/checkpoints/hero.landmarks.v1.json',
-    displayName: 'hero.landmarks.v1.json',
+test('projectAssetLibraryEntry keeps linked-source sidecars openable while degrading unsafe source links', () => {
+  const openableSidecar = projectAssetLibraryEntry(assetEntry({
+    id: 'landmark-1',
+    workspacePath: 'Workflows/landmarks/run-1/node-1.landmarks.v1.json',
+    displayName: 'Shoulder landmarks',
     capability: 'landmarks-sidecar',
     previewKind: 'text',
-    openable: false,
-    nonOpenableReason: 'Open the linked source mesh.',
-    source: { workspacePath: 'Workflows/checkpoints/hero.glb', displayName: 'hero.glb', role: 'source-mesh' },
-    manifest: { workspacePath: 'Workflows/checkpoints/hero.scene.json', capability: 'scene-manifest' },
-  })
+    source: {
+      relation: 'sidecar-source',
+      workspacePath: 'Characters/source.glb',
+      assetId: 'source-asset-1',
+      versionId: 'source-version-1',
+    },
+  }))
 
-  assert.deepEqual(projected.source, { workspacePath: 'Workflows/checkpoints/hero.glb', displayName: 'hero.glb', role: 'source-mesh' })
-  assert.deepEqual(projected.manifest, { workspacePath: 'Workflows/checkpoints/hero.scene.json', capability: 'scene-manifest' })
-  assert.deepEqual(resolveAssetLibraryOpenTarget(projected), {
+  assert.deepEqual(openableSidecar.openTarget, {
     kind: 'linked-source',
-    workspacePath: 'Workflows/checkpoints/hero.landmarks.v1.json',
-    sourceWorkspacePath: 'Workflows/checkpoints/hero.glb',
-    url: '/workspace/Workflows/checkpoints/hero.glb',
+    workspacePath: 'Characters/source.glb',
+    relation: 'sidecar-source',
   })
-})
+  assert.deepEqual(openableSidecar.source, {
+    relation: 'sidecar-source',
+    workspacePath: 'Characters/source.glb',
+    assetId: 'source-asset-1',
+    versionId: 'source-version-1',
+  })
 
-test('degrades unsafe source and manifest paths and unsupported formats to unavailable targets', () => {
-  const projected = projectAssetLibraryEntry({
-    ...glbEntry,
-    id: 'unsafe-source',
-    workspacePath: 'Workflows/checkpoints/hero.landmarks.v1.json',
-    displayName: 'hero.landmarks.v1.json',
+  const degradedSidecar = projectAssetLibraryEntry(assetEntry({
+    id: 'landmark-2',
+    workspacePath: 'Workflows/landmarks/run-1/node-2.landmarks.v1.json',
+    displayName: 'Degraded landmarks',
     capability: 'landmarks-sidecar',
     previewKind: 'text',
-    openable: false,
-    source: { workspacePath: 'Workflows/%2e%2e/secret.glb' },
-    manifest: { workspacePath: '../secret.scene.json', capability: 'scene-manifest' },
-  })
-  const splat = projectAssetLibraryEntry({ ...glbEntry, id: 'splat', workspacePath: 'Workflows/scan.splat', displayName: 'scan.splat', openable: true })
+    source: {
+      relation: 'sidecar-source',
+      workspacePath: '../outside/source.glb',
+      assetId: 'source-asset-2',
+    },
+  }))
 
-  assert.equal(projected.source, undefined)
-  assert.equal(projected.manifest, undefined)
-  assert.deepEqual(projected.warnings, ['safe', 'Ignored unsafe source workspace path.', 'Ignored unsafe manifest workspace path.'])
-  assert.deepEqual(resolveAssetLibraryOpenTarget(projected), {
-    kind: 'unavailable',
-    reason: 'Workspace asset is not openable.',
+  assert.deepEqual(degradedSidecar.source, {
+    relation: 'sidecar-source',
+    assetId: 'source-asset-2',
+    degraded: true,
   })
-  assert.deepEqual(resolveAssetLibraryOpenTarget(splat), {
+  assert.deepEqual(degradedSidecar.openTarget, {
     kind: 'unavailable',
-    reason: 'Only safe .glb/.gltf workspace assets are openable in this release.',
+    reason: 'missing-source-link',
   })
+  assert.equal(degradedSidecar.warnings.at(-1), 'Renderer rejected unsafe asset-library source workspace path.')
 })
 
-test('marks unsafe or non-openable entries unavailable without throwing', () => {
-  const projected = projectAssetLibraryEntry({
-    ...glbEntry,
-    workspacePath: '../escape.glb',
-    state: 'unsafe',
-    openable: false,
-    nonOpenableReason: 'Unsafe workspace path.',
+test('projectAssetLibraryEntry preserves rigged meshes and manifest capabilities without coercing them into mesh semantics', () => {
+  const riggedMesh = projectAssetLibraryEntry(assetEntry({
+    id: 'rigged-1',
+    workspacePath: 'Characters/hero-rigged.glb',
+    displayName: 'Rigged hero',
+    capability: 'rigged-mesh',
+  }))
+
+  assert.deepEqual(riggedMesh.openTarget, {
+    kind: 'self',
+    workspacePath: 'Characters/hero-rigged.glb',
   })
-  assert.equal(projected.state, 'unsafe')
-  assert.deepEqual(resolveAssetLibraryOpenTarget(projected), {
-    kind: 'unavailable',
-    reason: 'Unsafe workspace path.',
+
+  for (const workspacePath of ['Characters/hero.obj', 'Characters/hero.stl', 'Characters/hero.ply']) {
+    assert.deepEqual(
+      projectAssetLibraryEntry(assetEntry({
+        id: workspacePath,
+        workspacePath,
+        displayName: workspacePath.split('/').at(-1) ?? workspacePath,
+        capability: 'mesh',
+        previewKind: 'binary',
+      })).openTarget,
+      {
+        kind: 'unavailable',
+        reason: 'capability-not-viewable',
+      },
+      `${workspacePath} should stay classified as mesh without pretending Generate can open it directly yet`,
+    )
+  }
+
+  const manifestEntries = projectAssetLibraryListResult({
+    success: true,
+    entries: [
+      assetEntry({
+        id: 'world-1',
+        workspacePath: 'Worlds/generated-world.json',
+        displayName: 'Generated world',
+        sourceScope: 'workflows',
+        capability: 'generated-world',
+        previewKind: 'text',
+        manifest: {
+          capability: 'generated-world',
+          workspacePath: 'Worlds/generated-world.json',
+          schema: 'modly.generated-world.v1',
+          title: 'Generated world',
+        },
+      }),
+      assetEntry({
+        id: 'scene-1',
+        workspacePath: 'Scenes/scene-manifest.json',
+        displayName: 'Scene manifest',
+        sourceScope: 'exports',
+        capability: 'scene-manifest',
+        previewKind: 'text',
+        manifest: {
+          capability: 'scene-manifest',
+          workspacePath: 'Scenes/scene-manifest.json',
+          schema: 'modly.scene-manifest.v1',
+          title: 'Scene manifest',
+        },
+      }),
+    ],
   })
+
+  assert.equal(manifestEntries.success, true)
+  if (manifestEntries.success !== true) return
+
+    assert.deepEqual(
+      manifestEntries.entries.map((entry) => ({
+        capability: entry.capability,
+        sourceScope: entry.sourceScope,
+        manifest: entry.manifest,
+        openTarget: entry.openTarget,
+      })),
+    [
+      {
+        capability: 'generated-world',
+        sourceScope: 'workflows',
+        manifest: {
+          capability: 'generated-world',
+          workspacePath: 'Worlds/generated-world.json',
+          schema: 'modly.generated-world.v1',
+          title: 'Generated world',
+        },
+        openTarget: {
+          kind: 'unavailable',
+          reason: 'capability-not-viewable',
+        },
+      },
+      {
+        capability: 'scene-manifest',
+        sourceScope: 'exports',
+        manifest: {
+          capability: 'scene-manifest',
+          workspacePath: 'Scenes/scene-manifest.json',
+          schema: 'modly.scene-manifest.v1',
+          title: 'Scene manifest',
+        },
+        openTarget: {
+          kind: 'unavailable',
+          reason: 'capability-not-viewable',
+        },
+      },
+    ],
+  )
 })
 
-test('filters by name, path, capability, scope, and groups by scope then capability', () => {
-  const entries = [
-    projectAssetLibraryEntry(glbEntry),
-    projectAssetLibraryEntry({ ...glbEntry, id: 'export', workspacePath: 'Exports/static.ply', displayName: 'static.ply', sourceScope: 'exports', openable: false }),
-  ]
-  assert.deepEqual(filterAssetLibraryEntries(entries, 'exports').map((entry) => entry.workspacePath), ['Exports/static.ply'])
-  assert.deepEqual(filterAssetLibraryEntries(entries, 'hero.glb').map((entry) => entry.displayName), ['hero.glb'])
-  assert.deepEqual(filterAssetLibraryEntries(entries, 'mesh').map((entry) => entry.displayName), ['hero.glb', 'static.ply'])
-  assert.deepEqual(groupAssetLibraryEntries(entries).map((group) => [group.scope, group.capabilityGroups.map((capability) => capability.capability)]), [
-    ['exports', ['mesh']],
-    ['workflows', ['mesh']],
-  ])
+test('projectAssetLibraryEntry opens animation-motion entries through their own safe glb or gltf workspace path', () => {
+  for (const workspacePath of ['Animations/walk-cycle.glb', 'Animations/walk-cycle.gltf']) {
+    assert.deepEqual(
+      projectAssetLibraryEntry(assetEntry({
+        id: workspacePath,
+        workspacePath,
+        displayName: workspacePath.split('/').at(-1) ?? workspacePath,
+        capability: 'animation-motion',
+        source: undefined,
+      })).openTarget,
+      {
+        kind: 'self',
+        workspacePath,
+      },
+      `${workspacePath} should open directly when the animation entry itself is a safe glb/gltf`,
+    )
+  }
+
+  assert.deepEqual(
+    projectAssetLibraryEntry(assetEntry({
+      id: 'Animations/walk-cycle.bvh',
+      workspacePath: 'Animations/walk-cycle.bvh',
+      displayName: 'walk-cycle.bvh',
+      capability: 'animation-motion',
+      previewKind: 'binary',
+      source: undefined,
+    })).openTarget,
+    {
+      kind: 'unavailable',
+      reason: 'missing-source-link',
+    },
+    'BVH motion assets must stay non-openable unless they have a safe source link',
+  )
+})
+
+test('projectAssetLibraryReadResult fails closed when the main-process payload includes an unsafe entry path', () => {
+  const result = projectAssetLibraryReadResult({
+    success: true,
+    entry: assetEntry({
+      workspacePath: '../outside/escape.glb',
+      displayName: '   ',
+    }),
+    preview: {
+      kind: '3d-model',
+      viewerKind: 'glb',
+    },
+  })
+
+  assert.equal(result.success, true)
+  if (result.success !== true) return
+
+  assert.deepEqual(result.entry.openTarget, {
+    kind: 'unavailable',
+    reason: 'unsafe-entry',
+  })
+  assert.equal(result.entry.state, 'unsafe')
+  assert.equal(result.entry.displayName, 'escape.glb')
+  assert.match(result.entry.warnings.join('\n'), /unsafe asset-library entry workspace path/i)
+})
+
+test('projectAssetLibraryEntry preserves source scope while deriving openability independently', () => {
+  const workflowMesh = projectAssetLibraryEntry(assetEntry({
+    id: 'workflow-mesh',
+    workspacePath: 'Workflows/generated/hero.glb',
+    sourceScope: 'workflows',
+    displayName: 'Workflow hero',
+    capability: 'mesh',
+  }))
+
+  const exportMotion = projectAssetLibraryEntry(assetEntry({
+    id: 'export-motion',
+    workspacePath: 'Exports/motions/walk.npz',
+    sourceScope: 'exports',
+    displayName: 'Export walk',
+    capability: 'animation-motion',
+    previewKind: 'binary',
+    source: {
+      relation: 'sidecar-source',
+      workspacePath: 'Exports/rigged/hero.glb',
+    },
+  }))
+
+  assert.equal(workflowMesh.sourceScope, 'workflows')
+  assert.deepEqual(workflowMesh.openTarget, {
+    kind: 'self',
+    workspacePath: 'Workflows/generated/hero.glb',
+  })
+
+  assert.equal(exportMotion.sourceScope, 'exports')
+  assert.deepEqual(exportMotion.openTarget, {
+    kind: 'linked-source',
+    workspacePath: 'Exports/rigged/hero.glb',
+    relation: 'sidecar-source',
+  })
 })

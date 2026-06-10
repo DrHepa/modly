@@ -1,68 +1,49 @@
 import type {
-  AssetLibraryError,
-  AssetLibraryListResult,
   AssetLibraryOpenRequest,
-  AssetLibraryOpenResult,
   AssetLibraryReadRequest,
-  AssetLibraryReadResult,
-} from '../../shared/types/assetLibrary'
-import { projectAssetLibraryEntry, type ProjectedAssetLibraryEntry } from './assetLibraryProjection'
+} from '../../shared/types/assetLibrary.ts'
+import { isSafeViewerWorkspaceRelativePath } from './viewerAssetTarget.ts'
+import {
+  projectAssetLibraryListResult,
+  projectAssetLibraryOpenResult,
+  projectAssetLibraryReadResult,
+  type RendererAssetLibraryListResult,
+  type RendererAssetLibraryOpenResult,
+  type RendererAssetLibraryReadResult,
+} from './assetLibraryProjection.ts'
 
-export interface AssetLibraryPreloadApi {
-  list: () => Promise<AssetLibraryListResult>
-  read: (request: AssetLibraryReadRequest) => Promise<AssetLibraryReadResult>
-  open: (request: AssetLibraryOpenRequest) => Promise<AssetLibraryOpenResult>
+const UNSAFE_WORKSPACE_PATH_ERROR = 'Asset library service requires a safe workspace-relative path.'
+
+export function listAssetLibraryEntries(): Promise<RendererAssetLibraryListResult> {
+  return getWorkspaceLibraryApi().list().then(projectAssetLibraryListResult)
 }
 
-export type ProjectedAssetLibraryListResult =
-  | { success: true, entries: ProjectedAssetLibraryEntry[] }
-  | { success: false, error: AssetLibraryError }
-
-export type ProjectedAssetLibraryReadResult =
-  | { success: true, entry: ProjectedAssetLibraryEntry, preview: Extract<AssetLibraryReadResult, { success: true }>['preview'] }
-  | { success: false, error: AssetLibraryError }
-
-export type ProjectedAssetLibraryOpenResult =
-  | { success: true, entry: ProjectedAssetLibraryEntry }
-  | { success: false, error: AssetLibraryError }
-
-function unsafeError(message = 'Workspace path must stay under Workflows/ or Exports/.'): AssetLibraryError {
-  return { code: 'unsafe-path', message }
+export function readAssetLibraryEntry(request: AssetLibraryReadRequest): Promise<RendererAssetLibraryReadResult> {
+  const unsafe = createUnsafeWorkspacePathError(request)
+  if (unsafe) return Promise.reject(unsafe)
+  return getWorkspaceLibraryApi().read(request).then(projectAssetLibraryReadResult)
 }
 
-function validateWorkspacePath(workspacePath: string): AssetLibraryError | null {
-  const trimmed = workspacePath.trim()
-  if (!trimmed || trimmed.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith('\\\\')) return unsafeError()
-  if (/%2e|%2f|%5c/i.test(trimmed) || trimmed.split(/[\\/]+/).includes('..')) return unsafeError()
-  const normalized = trimmed.replace(/\\/g, '/')
-  if (!normalized.startsWith('Workflows/') && !normalized.startsWith('Exports/')) return unsafeError()
-  return null
+export function openAssetLibraryEntry(request: AssetLibraryOpenRequest): Promise<RendererAssetLibraryOpenResult> {
+  const unsafe = createUnsafeWorkspacePathError(request)
+  if (unsafe) return Promise.reject(unsafe)
+  return getWorkspaceLibraryApi().open(request).then(projectAssetLibraryOpenResult)
 }
 
-export function createAssetLibraryService(api: AssetLibraryPreloadApi) {
-  return {
-    async list(): Promise<ProjectedAssetLibraryListResult> {
-      const result = await api.list()
-      if (!result.success) return result
-      return { success: true, entries: result.entries.map(projectAssetLibraryEntry) }
-    },
-    async read(request: AssetLibraryReadRequest): Promise<ProjectedAssetLibraryReadResult> {
-      const invalid = validateWorkspacePath(request.workspacePath) ?? (request.sourceWorkspacePath ? validateWorkspacePath(request.sourceWorkspacePath) : null)
-      if (invalid) return { success: false, error: invalid }
-      const result = await api.read(request)
-      if (!result.success) return result
-      return { success: true, entry: projectAssetLibraryEntry(result.entry), preview: result.preview }
-    },
-    async open(request: AssetLibraryOpenRequest): Promise<ProjectedAssetLibraryOpenResult> {
-      const invalid = validateWorkspacePath(request.workspacePath) ?? (request.sourceWorkspacePath ? validateWorkspacePath(request.sourceWorkspacePath) : null)
-      if (invalid) return { success: false, error: invalid }
-      const result = await api.open(request)
-      if (!result.success) return result
-      return { success: true, entry: projectAssetLibraryEntry(result.entry) }
-    },
+function createUnsafeWorkspacePathError(request: AssetLibraryReadRequest): Error | undefined {
+  if (!isSafeViewerWorkspaceRelativePath(request.workspacePath)) {
+    return new Error(UNSAFE_WORKSPACE_PATH_ERROR)
   }
+  if (request.sourceWorkspacePath && !isSafeViewerWorkspaceRelativePath(request.sourceWorkspacePath)) {
+    return new Error(UNSAFE_WORKSPACE_PATH_ERROR)
+  }
+  return undefined
 }
 
-export function getDefaultAssetLibraryService() {
-  return createAssetLibraryService(window.electron.workspace.library)
+function getWorkspaceLibraryApi() {
+  const libraryApi = window.electron?.workspace?.library
+  if (!libraryApi) {
+    throw new Error('Workspace asset-library APIs are unavailable.')
+  }
+  return libraryApi
 }

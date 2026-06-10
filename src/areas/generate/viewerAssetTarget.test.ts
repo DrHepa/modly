@@ -3,7 +3,8 @@ import test from 'node:test'
 
 import type { ArtifactRef } from '../../shared/types/artifacts.ts'
 import type { GenerationJob } from '../../shared/stores/appStore.ts'
-import { resolveViewerAssetTarget } from './viewerAssetTarget.ts'
+import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
+import { resolveViewerAssetTarget, resolveViewerAssetTargetFromLibraryEntry } from './viewerAssetTarget.ts'
 
 const API_URL = 'http://127.0.0.1:8000'
 
@@ -162,6 +163,162 @@ test('resolveViewerAssetTarget prefers workflow artifact metadata while preservi
         extensionId: 'mesh-exporter',
         extensionNodeId: 'mesh-output',
       },
+    },
+  )
+})
+
+function libraryEntry(patch: Partial<RendererAssetLibraryEntry> = {}): RendererAssetLibraryEntry {
+  return {
+    id: 'library-1',
+    workspacePath: 'Workflows/Characters/hero.glb',
+    displayName: 'Library hero',
+    sourceScope: 'workflows',
+    capability: 'mesh',
+    state: 'ready',
+    artifactId: 'artifact-1',
+    versionId: 'version-1',
+    provenance: {
+      workflowId: 'workflow-1',
+      workflowNodeId: 'node-1',
+    },
+    previewKind: '3d-model',
+    warnings: [],
+    openTarget: {
+      kind: 'self',
+      workspacePath: 'Workflows/Characters/hero.glb',
+    },
+    ...patch,
+  }
+}
+
+test('resolveViewerAssetTargetFromLibraryEntry opens ready mesh library entries without currentJob parsing', () => {
+  assert.deepEqual(
+    resolveViewerAssetTargetFromLibraryEntry(libraryEntry(), API_URL),
+    {
+      kind: 'final',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/Characters/hero.glb',
+      isCheckpointPreview: false,
+      label: 'Final output',
+      sourceLabel: 'Library hero',
+      sourceKind: 'import',
+      workspacePath: 'Workflows/Characters/hero.glb',
+      artifactId: 'artifact-1',
+      versionId: 'version-1',
+      provenance: {
+        workflowId: 'workflow-1',
+        workflowNodeId: 'node-1',
+      },
+    },
+  )
+})
+
+test('resolveViewerAssetTargetFromLibraryEntry adapts linked sidecars through their source mesh metadata', () => {
+  assert.deepEqual(
+    resolveViewerAssetTargetFromLibraryEntry(libraryEntry({
+      id: 'landmark-1',
+      workspacePath: 'Workflows/landmarks/run-1/node-1.landmarks.v1.json',
+      displayName: 'Shoulder landmarks',
+      capability: 'landmarks-sidecar',
+      previewKind: 'text',
+      artifactId: 'sidecar-artifact-1',
+      versionId: 'sidecar-version-1',
+      provenance: undefined,
+      source: {
+        relation: 'sidecar-source',
+        workspacePath: 'Workflows/Characters/source.glb',
+        assetId: 'source-asset-1',
+        versionId: 'source-version-1',
+      },
+      openTarget: {
+        kind: 'linked-source',
+        workspacePath: 'Workflows/Characters/source.glb',
+        relation: 'sidecar-source',
+      },
+    }), API_URL),
+    {
+      kind: 'final',
+      modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/Characters/source.glb',
+      isCheckpointPreview: false,
+      label: 'Final output',
+      sourceLabel: 'Shoulder landmarks',
+      sourceKind: 'import',
+      workspacePath: 'Workflows/Characters/source.glb',
+      artifactId: 'source-asset-1',
+      versionId: 'source-version-1',
+    },
+  )
+})
+
+test('resolveViewerAssetTargetFromLibraryEntry opens animation-motion glb or gltf entries through their own viewer target seam', () => {
+  for (const workspacePath of ['Workflows/Animations/walk-cycle.glb', 'Exports/Animations/walk-cycle.gltf']) {
+    assert.deepEqual(
+      resolveViewerAssetTargetFromLibraryEntry(libraryEntry({
+        id: workspacePath,
+        workspacePath,
+        displayName: workspacePath.split('/').at(-1) ?? workspacePath,
+        sourceScope: workspacePath.startsWith('Exports/') ? 'exports' : 'workflows',
+        capability: 'animation-motion',
+        previewKind: '3d-model',
+        source: undefined,
+        openTarget: {
+          kind: 'self',
+          workspacePath,
+        },
+      }), API_URL),
+      {
+        kind: 'final',
+        modelUrl: `${API_URL}/workspace/${workspacePath}`,
+        isCheckpointPreview: false,
+        label: 'Final output',
+        sourceLabel: workspacePath.split('/').at(-1) ?? workspacePath,
+        sourceKind: 'import',
+        workspacePath,
+        artifactId: 'artifact-1',
+        versionId: 'version-1',
+        provenance: {
+          workflowId: 'workflow-1',
+          workflowNodeId: 'node-1',
+        },
+      },
+      workspacePath,
+    )
+  }
+})
+
+test('resolveViewerAssetTargetFromLibraryEntry fails closed for entries that are not openable in Generate', () => {
+  assert.deepEqual(
+    resolveViewerAssetTargetFromLibraryEntry(libraryEntry({
+      workspacePath: 'Worlds/generated-world.json',
+      displayName: 'Generated world',
+      capability: 'generated-world',
+      previewKind: 'text',
+      openTarget: {
+        kind: 'unavailable',
+        reason: 'capability-not-viewable',
+      },
+    }), API_URL),
+    {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
+    },
+  )
+
+  assert.deepEqual(
+    resolveViewerAssetTargetFromLibraryEntry(libraryEntry({
+      workspacePath: 'Characters/hero.obj',
+      displayName: 'OBJ hero',
+      capability: 'mesh',
+      previewKind: 'binary',
+      openTarget: {
+        kind: 'unavailable',
+        reason: 'capability-not-viewable',
+      },
+    }), API_URL),
+    {
+      kind: 'none',
+      modelUrl: null,
+      isCheckpointPreview: false,
     },
   )
 })

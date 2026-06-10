@@ -1,99 +1,197 @@
-import type { AssetCapability, AssetLibraryEntry, AssetLibrarySourceScope } from '../../shared/types/assetLibrary'
+import type {
+  AssetCapability,
+  AssetLibraryEntry,
+  AssetLibraryListResult,
+  AssetLibraryManifestRef,
+  AssetLibraryOpenResult,
+  AssetLibraryReadResult,
+  AssetLibrarySourceLink,
+} from '../../shared/types/assetLibrary.ts'
+import { isSafeViewerWorkspaceRelativePath } from './viewerAssetTarget.ts'
 
-export interface ProjectedAssetLibraryEntry extends AssetLibraryEntry {
-  warnings: string[]
+const UNSAFE_ENTRY_WARNING = 'Renderer rejected unsafe asset-library entry workspace path.'
+const UNSAFE_SOURCE_WARNING = 'Renderer rejected unsafe asset-library source workspace path.'
+const UNSAFE_MANIFEST_WARNING = 'Renderer rejected unsafe asset-library manifest workspace path.'
+
+export type RendererAssetLibraryOpenTargetReason =
+  | 'unsafe-entry'
+  | 'state-not-openable'
+  | 'missing-capability'
+  | 'missing-source-link'
+  | 'capability-not-viewable'
+
+export type RendererAssetLibraryOpenTarget =
+  | {
+      kind: 'self'
+      workspacePath: string
+    }
+  | {
+      kind: 'linked-source'
+      workspacePath: string
+      relation: NonNullable<AssetLibrarySourceLink['relation']>
+    }
+  | {
+      kind: 'unavailable'
+      reason: RendererAssetLibraryOpenTargetReason
+    }
+
+export interface RendererAssetLibraryEntry extends Omit<AssetLibraryEntry, 'source' | 'manifest'> {
+  source?: AssetLibrarySourceLink
+  manifest?: AssetLibraryManifestRef
+  openTarget: RendererAssetLibraryOpenTarget
 }
 
-export type AssetLibraryOpenTarget =
-  | { kind: 'self', url: string, workspacePath: string }
-  | { kind: 'linked-source', url: string, workspacePath: string, sourceWorkspacePath: string }
-  | { kind: 'unavailable', reason: string }
+export type RendererAssetLibraryListResult =
+  | { success: true; entries: RendererAssetLibraryEntry[] }
+  | { success: false; error: string }
 
-export interface AssetLibraryCapabilityGroup {
-  capability: AssetCapability | 'uncategorized'
-  entries: ProjectedAssetLibraryEntry[]
-}
+export type RendererAssetLibraryReadResult =
+  | { success: true; entry: RendererAssetLibraryEntry; preview: Extract<AssetLibraryReadResult, { success: true }>['preview'] }
+  | { success: false; error: string }
 
-export interface AssetLibraryScopeGroup {
-  scope: AssetLibrarySourceScope
-  capabilityGroups: AssetLibraryCapabilityGroup[]
-}
+export type RendererAssetLibraryOpenResult =
+  | { success: true; entry: RendererAssetLibraryEntry }
+  | { success: false; error: string }
 
-function isSafeWorkspacePath(workspacePath: string): boolean {
-  const normalized = workspacePath.replace(/\\/g, '/').trim()
-  return /^(Workflows|Exports)\//.test(normalized)
-    && !normalized.split('/').includes('..')
-    && !/%2e|%2f|%5c/i.test(normalized)
-    && !normalized.startsWith('/')
-    && !/^[a-zA-Z]:[\\/]/.test(workspacePath)
-    && !workspacePath.startsWith('\\\\')
-}
+export function projectAssetLibraryEntry(entry: AssetLibraryEntry): RendererAssetLibraryEntry {
+  const warnings = dedupeWarnings(entry.warnings)
+  const safeWorkspacePath = normalizeWorkspacePath(entry.workspacePath)
+  const source = projectSourceLink(entry.source, warnings)
+  const manifest = projectManifestRef(entry.manifest, warnings)
+  const displayName = resolveDisplayName(entry.displayName, safeWorkspacePath ?? entry.workspacePath)
 
-function isGlbOrGltf(workspacePath: string): boolean {
-  return /\.(glb|gltf)$/i.test(workspacePath)
-}
-
-export function projectAssetLibraryEntry(entry: AssetLibraryEntry): ProjectedAssetLibraryEntry {
-  const warnings = [...new Set(entry.warnings)]
-  if (!isSafeWorkspacePath(entry.workspacePath)) {
-    return { ...entry, state: 'unsafe', openable: false, nonOpenableReason: entry.nonOpenableReason ?? 'Unsafe workspace path.', warnings }
+  if (!safeWorkspacePath) {
+    warnings.push(UNSAFE_ENTRY_WARNING)
   }
-  const safeSource = entry.source && isSafeWorkspacePath(entry.source.workspacePath) ? entry.source : undefined
-  const safeManifest = entry.manifest && isSafeWorkspacePath(entry.manifest.workspacePath) ? entry.manifest : undefined
-  if (entry.source && !safeSource) warnings.push('Ignored unsafe source workspace path.')
-  if (entry.manifest && !safeManifest) warnings.push('Ignored unsafe manifest workspace path.')
-  return { ...entry, source: safeSource, manifest: safeManifest, warnings: [...new Set(warnings)] }
+
+  return {
+    ...entry,
+    workspacePath: safeWorkspacePath ?? entry.workspacePath,
+    displayName,
+    state: safeWorkspacePath ? entry.state : 'unsafe',
+    ...(source ? { source } : {}),
+    ...(manifest ? { manifest } : {}),
+    warnings: dedupeWarnings(warnings),
+    openTarget: resolveOpenTarget(entry.capability, safeWorkspacePath, safeWorkspacePath ? entry.state : 'unsafe', source),
+  }
 }
 
-export function resolveAssetLibraryOpenTarget(entry: ProjectedAssetLibraryEntry): AssetLibraryOpenTarget {
-  if (entry.state !== 'ready') {
-    return { kind: 'unavailable', reason: entry.nonOpenableReason ?? 'Workspace asset is not openable.' }
+export function projectAssetLibraryListResult(result: AssetLibraryListResult): RendererAssetLibraryListResult {
+  if (result.success !== true) return result
+  return { success: true, entries: result.entries.map(projectAssetLibraryEntry) }
+}
+
+export function projectAssetLibraryReadResult(result: AssetLibraryReadResult): RendererAssetLibraryReadResult {
+  if (result.success !== true) return result
+  return {
+    success: true,
+    entry: projectAssetLibraryEntry(result.entry),
+    preview: result.preview,
   }
-  if (entry.source?.workspacePath) {
-    if (!isSafeWorkspacePath(entry.source.workspacePath) || entry.source.workspacePath === entry.workspacePath || !isGlbOrGltf(entry.source.workspacePath)) {
-      return { kind: 'unavailable', reason: 'Linked source mesh is unavailable.' }
+}
+
+export function projectAssetLibraryOpenResult(result: AssetLibraryOpenResult): RendererAssetLibraryOpenResult {
+  if (result.success !== true) return result
+  return {
+    success: true,
+    entry: projectAssetLibraryEntry(result.entry),
+  }
+}
+
+function resolveOpenTarget(
+  capability: AssetCapability | undefined,
+  workspacePath: string | undefined,
+  state: AssetLibraryEntry['state'],
+  source: AssetLibrarySourceLink | undefined,
+): RendererAssetLibraryOpenTarget {
+  if (!workspacePath) {
+    return { kind: 'unavailable', reason: 'unsafe-entry' }
+  }
+  if (state !== 'ready') {
+    return { kind: 'unavailable', reason: 'state-not-openable' }
+  }
+  if (!capability) {
+    return { kind: 'unavailable', reason: 'missing-capability' }
+  }
+  if (capability === 'mesh' || capability === 'rigged-mesh') {
+    if (!isSafeViewerWorkspaceRelativePath(workspacePath, { meshOnly: true })) {
+      return { kind: 'unavailable', reason: 'capability-not-viewable' }
+    }
+    return { kind: 'self', workspacePath }
+  }
+  if (capability === 'animation-motion') {
+    if (isSafeViewerWorkspaceRelativePath(workspacePath, { meshOnly: true })) {
+      return { kind: 'self', workspacePath }
+    }
+    if (!source?.workspacePath) {
+      return { kind: 'unavailable', reason: 'missing-source-link' }
     }
     return {
       kind: 'linked-source',
-      url: `/workspace/${entry.source.workspacePath}`,
-      workspacePath: entry.workspacePath,
-      sourceWorkspacePath: entry.source.workspacePath,
+      workspacePath: source.workspacePath,
+      relation: source.relation,
     }
   }
-  if (!entry.openable) {
-    return { kind: 'unavailable', reason: entry.nonOpenableReason ?? 'Workspace asset is not openable.' }
-  }
-  if (!isGlbOrGltf(entry.workspacePath)) {
-    return { kind: 'unavailable', reason: 'Only safe .glb/.gltf workspace assets are openable in this release.' }
-  }
-  return { kind: 'self', url: `/workspace/${entry.workspacePath}`, workspacePath: entry.workspacePath }
-}
-
-export function filterAssetLibraryEntries(entries: ProjectedAssetLibraryEntry[], query: string): ProjectedAssetLibraryEntry[] {
-  const needle = query.trim().toLowerCase()
-  if (!needle) return entries
-  return entries.filter((entry) => [
-    entry.displayName,
-    entry.workspacePath,
-    entry.capability ?? '',
-    entry.sourceScope,
-    entry.state,
-    entry.source?.workspacePath ?? '',
-    entry.manifest?.workspacePath ?? '',
-  ].some((value) => value.toLowerCase().includes(needle)))
-}
-
-export function groupAssetLibraryEntries(entries: ProjectedAssetLibraryEntry[]): AssetLibraryScopeGroup[] {
-  const scopes = [...new Set(entries.map((entry) => entry.sourceScope))].sort()
-  return scopes.map((scope) => {
-    const scopeEntries = entries.filter((entry) => entry.sourceScope === scope)
-    const capabilities = [...new Set(scopeEntries.map((entry) => entry.capability ?? 'uncategorized'))].sort()
+  if (capability === 'landmarks-sidecar') {
+    if (!source?.workspacePath) {
+      return { kind: 'unavailable', reason: 'missing-source-link' }
+    }
     return {
-      scope,
-      capabilityGroups: capabilities.map((capability) => ({
-        capability,
-        entries: scopeEntries.filter((entry) => (entry.capability ?? 'uncategorized') === capability),
-      })),
+      kind: 'linked-source',
+      workspacePath: source.workspacePath,
+      relation: source.relation,
     }
-  })
+  }
+  return { kind: 'unavailable', reason: 'capability-not-viewable' }
+}
+
+function projectSourceLink(source: AssetLibrarySourceLink | undefined, warnings: string[]): AssetLibrarySourceLink | undefined {
+  if (!source) return undefined
+
+  const workspacePath = source.workspacePath ? normalizeWorkspacePath(source.workspacePath) : undefined
+  if (source.workspacePath && !workspacePath) {
+    warnings.push(UNSAFE_SOURCE_WARNING)
+  }
+
+  return {
+    relation: source.relation,
+    ...(workspacePath ? { workspacePath } : {}),
+    ...(source.assetId ? { assetId: source.assetId } : {}),
+    ...(source.versionId ? { versionId: source.versionId } : {}),
+    ...(source.degraded || (source.workspacePath !== undefined && !workspacePath) ? { degraded: true } : {}),
+  }
+}
+
+function projectManifestRef(manifest: AssetLibraryManifestRef | undefined, warnings: string[]): AssetLibraryManifestRef | undefined {
+  if (!manifest) return undefined
+
+  const workspacePath = normalizeWorkspacePath(manifest.workspacePath)
+  if (!workspacePath) {
+    warnings.push(UNSAFE_MANIFEST_WARNING)
+    return undefined
+  }
+
+  return {
+    capability: manifest.capability,
+    workspacePath,
+    ...(manifest.schema ? { schema: manifest.schema } : {}),
+    ...(manifest.title ? { title: manifest.title } : {}),
+  }
+}
+
+function normalizeWorkspacePath(workspacePath: string | undefined): string | undefined {
+  if (typeof workspacePath !== 'string') return undefined
+  const normalized = workspacePath.replace(/\\/g, '/').trim()
+  return isSafeViewerWorkspaceRelativePath(normalized) ? normalized : undefined
+}
+
+function resolveDisplayName(displayName: string, workspacePath: string): string {
+  const trimmed = displayName.trim()
+  if (trimmed) return trimmed
+  const segments = workspacePath.replace(/\\/g, '/').split('/')
+  return segments.at(-1) || workspacePath
+}
+
+function dedupeWarnings(warnings: string[]): string[] {
+  return [...new Set(warnings.map((warning) => warning.trim()).filter(Boolean))]
 }

@@ -49,6 +49,21 @@ function assertSuccessfulAssetLibraryRead(result: AssetLibraryReadResult): asser
   }
 }
 
+function stripAssetLibraryEntryTimestamps<T extends { createdAt?: string, updatedAt?: string } | undefined>(entry: T): Omit<NonNullable<T>, 'createdAt' | 'updatedAt'> | undefined {
+  if (!entry) return undefined
+  const { createdAt: _createdAt, updatedAt: _updatedAt, ...rest } = entry
+  return rest
+}
+
+function resolveExpectedAssetLibraryEntryTimestamps(fileStats: Awaited<ReturnType<typeof stat>>): { createdAt: string, updatedAt: string } {
+  const createdAt = fileStats.birthtime.getTime() > 0 ? fileStats.birthtime : fileStats.mtime
+  const updatedAt = fileStats.mtime.getTime() > 0 ? fileStats.mtime : fileStats.birthtime
+  return {
+    createdAt: createdAt.toISOString(),
+    updatedAt: updatedAt.toISOString(),
+  }
+}
+
 type RigRenameSidecarWriter = (request: {
   workspaceDir: string
   sidecarWorkspacePath: string
@@ -722,7 +737,7 @@ test('lists workspace asset library entries with projected registry metadata, si
     assert.equal(byPath.has('Workflows/generated/hero.glb.artifact.json'), false)
     assert.equal(byPath.has('Workflows/generated/hero.rigmeta.json'), false)
 
-    assert.deepEqual(byPath.get('Workflows/generated/hero.glb'), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/hero.glb')), {
       id: 'artifact-hero',
       workspacePath: 'Workflows/generated/hero.glb',
       displayName: 'Hero Mesh',
@@ -748,7 +763,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       ],
     })
 
-    assert.deepEqual(byPath.get(motionSidecarPath), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get(motionSidecarPath)), {
       id: motionSidecarPath,
       workspacePath: motionSidecarPath,
       displayName: 'hero.motion-retarget.v1.json',
@@ -765,7 +780,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: ['Root translation is deferred in MVP.'],
     })
 
-    assert.deepEqual(byPath.get(landmarkPath), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get(landmarkPath)), {
       id: landmarkPath,
       workspacePath: landmarkPath,
       displayName: 'hero.landmarks.v1.json',
@@ -782,7 +797,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: [],
     })
 
-    assert.deepEqual(byPath.get(worldWorkspacePath), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get(worldWorkspacePath)), {
       id: 'artifact-world',
       workspacePath: worldWorkspacePath,
       displayName: 'Hero World',
@@ -805,7 +820,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: [],
     })
 
-    assert.deepEqual(byPath.get('Workflows/generated/mystery.glb'), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/mystery.glb')), {
       id: 'Workflows/generated/mystery.glb',
       workspacePath: 'Workflows/generated/mystery.glb',
       displayName: 'mystery.glb',
@@ -816,7 +831,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: [],
     })
 
-    assert.deepEqual(byPath.get('Workflows/generated/mystery.gltf'), {
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/mystery.gltf')), {
       id: 'Workflows/generated/mystery.gltf',
       workspacePath: 'Workflows/generated/mystery.gltf',
       displayName: 'mystery.gltf',
@@ -833,7 +848,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       'Workflows/generated/mystery.ply',
     ]) {
       const expectedName = path.basename(workspacePath)
-      assert.deepEqual(byPath.get(workspacePath), {
+      assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get(workspacePath)), {
         id: workspacePath,
         workspacePath,
         displayName: expectedName,
@@ -895,7 +910,7 @@ test('lists a real indexed workspace candidate as unknown-metadata when no suppo
 
     assertSuccessfulAssetLibraryList(result)
 
-    assert.deepEqual(result.entries, [
+    assert.deepEqual(result.entries.map((entry) => stripAssetLibraryEntryTimestamps(entry)), [
       {
         id: 'Workflows/generated/opaque-bundle',
         workspacePath: 'Workflows/generated/opaque-bundle',
@@ -906,6 +921,26 @@ test('lists a real indexed workspace candidate as unknown-metadata when no suppo
         warnings: [],
       },
     ])
+  })
+})
+
+test('lists workspace asset library entries with created and updated timestamps from file stats', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    const workspacePath = 'Workflows/generated/dated.glb'
+    const absolutePath = path.join(workspaceDir, 'Workflows', 'generated', 'dated.glb')
+    await writeFile(absolutePath, buildMinimalGlb({ asset: { version: '2.0' } }))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const entry = result.entries.find((candidate) => candidate.workspacePath === workspacePath)
+    assert.ok(entry, 'expected dated asset entry to be listed')
+
+    const expectedTimestamps = resolveExpectedAssetLibraryEntryTimestamps(await stat(absolutePath))
+    assert.equal(entry?.createdAt, expectedTimestamps.createdAt)
+    assert.equal(entry?.updatedAt, expectedTimestamps.updatedAt)
   })
 })
 

@@ -39,6 +39,8 @@ export interface AssetLibraryEntry {
   id: string
   workspacePath: string
   displayName: string
+  createdAt?: string
+  updatedAt?: string
   sourceScope: AssetLibrarySourceScope
   capability?: AssetCapability
   state: AssetEntryState

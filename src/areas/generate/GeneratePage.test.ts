@@ -454,6 +454,90 @@ test('GeneratePage library seam exposes accessible search and empty-result statu
   }
 })
 
+test('GeneratePage library seam exposes an accessible sort selector and reorders entries by name, date, and type while preserving scope hierarchy', async () => {
+  const { module, cleanup } = await loadGeneratePageModule()
+
+  try {
+    const entries = [
+      libraryEntry({ id: 'mesh-zulu', workspacePath: 'Workflows/Characters/zulu.glb', displayName: 'Zulu mesh', capability: 'mesh', createdAt: '2026-06-10T00:01:00.000Z' }),
+      libraryEntry({ id: 'rig-alpha', workspacePath: 'Workflows/Rigs/alpha.glb', displayName: 'Alpha rig', capability: 'rigged-mesh', createdAt: '2026-06-10T00:02:00.000Z' }),
+      libraryEntry({ id: 'motion-bravo', workspacePath: 'Workflows/Motions/bravo.pose-clip.v1.json', displayName: 'Bravo motion', capability: 'animation-motion', createdAt: '2026-06-10T00:03:00.000Z', previewKind: 'text', openTarget: { kind: 'linked-source', workspacePath: 'Workflows/Characters/zulu.glb', relation: 'sidecar-source' } }),
+      libraryEntry({ id: 'export-chair', workspacePath: 'Exports/Props/chair.glb', displayName: 'Chair export', sourceScope: 'exports', capability: 'mesh', createdAt: '2026-06-10T00:04:00.000Z', openTarget: { kind: 'self', workspacePath: 'Exports/Props/chair.glb' } }),
+    ]
+
+    const typeMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'mesh-zulu',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'type',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    const nameMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'mesh-zulu',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'name',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    const dateMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'mesh-zulu',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'date',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    assert.match(typeMarkup, /<label[^>]*for="asset-library-sort"[^>]*>Sort<\/label>/)
+    assert.match(typeMarkup, /<select[^>]*id="asset-library-sort"/)
+    assert.match(typeMarkup, /<option value="name">Name<\/option>/)
+    assert.match(typeMarkup, /<option value="date">Date<\/option>/)
+    assert.match(typeMarkup, /<option value="type" selected="">Type<\/option>/)
+    assert.ok(typeMarkup.indexOf('Workflows') < typeMarkup.indexOf('Exports'))
+    assert.ok(typeMarkup.indexOf('Zulu mesh') < typeMarkup.indexOf('Alpha rig'))
+    assert.ok(typeMarkup.indexOf('Alpha rig') < typeMarkup.indexOf('Bravo motion'))
+    assert.ok(nameMarkup.indexOf('Workflows') < nameMarkup.indexOf('Exports'))
+    assert.ok(nameMarkup.indexOf('Alpha rig') < nameMarkup.indexOf('Bravo motion'))
+    assert.ok(nameMarkup.indexOf('Bravo motion') < nameMarkup.indexOf('Zulu mesh'))
+    assert.ok(dateMarkup.indexOf('Workflows') < dateMarkup.indexOf('Exports'))
+    assert.ok(dateMarkup.indexOf('Bravo motion') < dateMarkup.indexOf('Alpha rig'))
+    assert.ok(dateMarkup.indexOf('Alpha rig') < dateMarkup.indexOf('Zulu mesh'))
+  } finally {
+    await cleanup()
+  }
+})
+
 test('GeneratePage library seam keeps the library panel open for library open and import flows', async () => {
   const { module, cleanup } = await loadGeneratePageModule()
 

@@ -333,8 +333,10 @@ export interface AssetLibraryPopoverProps {
   opening: boolean
   error: string | null
   searchQuery: string
+  sortMode?: AssetLibrarySortMode
   onSelectEntry: (entryId: string) => void
   onSearchQueryChange: (value: string) => void
+  onSortModeChange?: (sortMode: AssetLibrarySortMode) => void
   onOpenSelected: () => void
   onRefresh: () => void
   collapsedSectionKeys: string[]
@@ -362,6 +364,8 @@ interface AssetLibrarySourceScopeGroup {
   entryGroups: AssetLibraryEntryGroup[]
 }
 
+export type AssetLibrarySortMode = 'type' | 'name' | 'date'
+
 const ASSET_LIBRARY_CAPABILITY_SECTIONS = [
   { capability: 'mesh', label: 'Mesh' },
   { capability: 'rigged-mesh', label: 'Rigged mesh' },
@@ -375,6 +379,16 @@ const ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS = [
   { sourceScope: 'workflows', label: 'Workflows' },
   { sourceScope: 'exports', label: 'Exports' },
 ] as const satisfies ReadonlyArray<{ sourceScope: RendererAssetLibraryEntry['sourceScope'], label: string }>
+
+const ASSET_LIBRARY_SORT_OPTIONS = [
+  { value: 'type', label: 'Type' },
+  { value: 'name', label: 'Name' },
+  { value: 'date', label: 'Date' },
+] as const satisfies ReadonlyArray<{ value: AssetLibrarySortMode, label: string }>
+
+const ASSET_LIBRARY_CAPABILITY_ORDER = new Map(
+  ASSET_LIBRARY_CAPABILITY_SECTIONS.map((section, index) => [section.capability, index]),
+)
 
 const ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES = new Set(['tmp', 'temp', 'cache'])
 export type GenerateOpenPanel = 'export' | 'decimate' | 'smooth' | 'import' | 'library' | 'light' | null
@@ -423,8 +437,10 @@ export function AssetLibraryPopover({
   opening,
   error,
   searchQuery = '',
+  sortMode = 'type',
   onSelectEntry,
   onSearchQueryChange,
+  onSortModeChange = () => undefined,
   onOpenSelected,
   onRefresh,
   collapsedSectionKeys = getDefaultAssetLibraryCollapsedSectionKeys(),
@@ -432,7 +448,7 @@ export function AssetLibraryPopover({
   onClose,
 }: AssetLibraryPopoverProps): JSX.Element {
   const visibleEntries = filterVisibleAssetLibraryEntries(entries)
-  const scopeGroups = filterAssetLibraryScopeGroups(visibleEntries, searchQuery)
+  const scopeGroups = filterAssetLibraryScopeGroups(visibleEntries, searchQuery, sortMode)
   const visibleEntryIds = new Set(scopeGroups.flatMap((scopeGroup) => scopeGroup.entryGroups.flatMap((group) => group.entries.map((entry) => entry.id))))
   const selectedEntry = selectedEntryId && (visibleEntryIds.has(selectedEntryId) || visibleEntries.some((entry) => entry.id === selectedEntryId))
     ? visibleEntries.find((entry) => entry.id === selectedEntryId) ?? null
@@ -475,18 +491,36 @@ export function AssetLibraryPopover({
         </button>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <label htmlFor="asset-library-search" className="text-[11px] text-zinc-300">
-          Search workspace assets
-        </label>
-        <input
-          id="asset-library-search"
-          type="search"
-          value={searchQuery}
-          onChange={(event) => onSearchQueryChange(event.target.value)}
-          placeholder="Search by name, path, scope, or capability"
-          className="bg-zinc-800 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 w-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-        />
+      <div className="flex items-end gap-2">
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+          <label htmlFor="asset-library-search" className="text-[11px] text-zinc-300">
+            Search workspace assets
+          </label>
+          <input
+            id="asset-library-search"
+            type="search"
+            value={searchQuery}
+            onChange={(event) => onSearchQueryChange(event.target.value)}
+            placeholder="Search by name, path, scope, or capability"
+            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 w-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
+          />
+        </div>
+
+        <div className="flex w-24 shrink-0 flex-col gap-1.5">
+          <label htmlFor="asset-library-sort" className="text-[11px] text-zinc-300">
+            Sort
+          </label>
+          <select
+            id="asset-library-sort"
+            value={sortMode}
+            onChange={(event) => onSortModeChange(event.target.value as AssetLibrarySortMode)}
+            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
+          >
+            {ASSET_LIBRARY_SORT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {loading ? (
@@ -639,7 +673,11 @@ function filterVisibleAssetLibraryEntries(entries: RendererAssetLibraryEntry[]):
   return entries.filter((entry) => entry.state !== 'unsupported' && !hasInternalAssetLibraryDirectory(entry.workspacePath))
 }
 
-function filterAssetLibraryScopeGroups(entries: RendererAssetLibraryEntry[], searchQuery: string): AssetLibrarySourceScopeGroup[] {
+function filterAssetLibraryScopeGroups(
+  entries: RendererAssetLibraryEntry[],
+  searchQuery: string,
+  sortMode: AssetLibrarySortMode,
+): AssetLibrarySourceScopeGroup[] {
   const normalizedSearchQuery = normalizeAssetLibrarySearchQuery(searchQuery)
   return ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS
     .map((scopeSection) => {
@@ -662,21 +700,87 @@ function filterAssetLibraryScopeGroups(entries: RendererAssetLibraryEntry[], sea
             capability: capabilitySection.capability,
             capabilityLabel: capabilitySection.label,
             sectionKey: `capability:${scopeSection.sourceScope}:${capabilitySection.capability}`,
-            entries: visibleCapabilityEntries,
+            entries: sortAssetLibraryEntries(visibleCapabilityEntries, sortMode),
           }
         })
         .filter((group): group is AssetLibraryEntryGroup => group !== null)
 
-      if (entryGroups.length === 0) return null
+      const sortedEntryGroups = sortMode === 'type'
+        ? entryGroups
+        : [...entryGroups].sort((left, right) => compareAssetLibraryEntryGroups(left, right, sortMode))
+
+      if (sortedEntryGroups.length === 0) return null
 
       return {
         sourceScope: scopeSection.sourceScope,
         sourceScopeLabel: scopeSection.label,
         sectionKey: `scope:${scopeSection.sourceScope}`,
-        entryGroups,
+        entryGroups: sortedEntryGroups,
       }
     })
     .filter((group): group is AssetLibrarySourceScopeGroup => group !== null)
+}
+
+function sortAssetLibraryEntries(
+  entries: RendererAssetLibraryEntry[],
+  sortMode: AssetLibrarySortMode,
+): RendererAssetLibraryEntry[] {
+  return [...entries].sort((left, right) => compareAssetLibraryEntries(left, right, sortMode))
+}
+
+function compareAssetLibraryEntryGroups(
+  left: AssetLibraryEntryGroup,
+  right: AssetLibraryEntryGroup,
+  sortMode: Exclude<AssetLibrarySortMode, 'type'>,
+): number {
+  const entryComparison = compareAssetLibraryEntries(left.entries[0], right.entries[0], sortMode)
+  if (entryComparison !== 0) return entryComparison
+
+  return (ASSET_LIBRARY_CAPABILITY_ORDER.get(left.capability) ?? Number.MAX_SAFE_INTEGER)
+    - (ASSET_LIBRARY_CAPABILITY_ORDER.get(right.capability) ?? Number.MAX_SAFE_INTEGER)
+}
+
+function compareAssetLibraryEntries(
+  left: RendererAssetLibraryEntry,
+  right: RendererAssetLibraryEntry,
+  sortMode: AssetLibrarySortMode,
+): number {
+  if (sortMode === 'date') {
+    const leftTime = resolveAssetLibrarySortTimestamp(left)
+    const rightTime = resolveAssetLibrarySortTimestamp(right)
+
+    if (leftTime !== null && rightTime !== null && leftTime !== rightTime) {
+      return rightTime - leftTime
+    }
+    if (leftTime !== null && rightTime === null) return -1
+    if (leftTime === null && rightTime !== null) return 1
+  }
+
+  return compareAssetLibraryEntryNames(left, right)
+}
+
+function compareAssetLibraryEntryNames(
+  left: RendererAssetLibraryEntry,
+  right: RendererAssetLibraryEntry,
+): number {
+  const displayNameComparison = left.displayName.localeCompare(right.displayName, undefined, { sensitivity: 'base' })
+  if (displayNameComparison !== 0) return displayNameComparison
+
+  const workspacePathComparison = left.workspacePath.localeCompare(right.workspacePath, undefined, { sensitivity: 'base' })
+  if (workspacePathComparison !== 0) return workspacePathComparison
+
+  return left.id.localeCompare(right.id, undefined, { sensitivity: 'base' })
+}
+
+function resolveAssetLibrarySortTimestamp(entry: RendererAssetLibraryEntry): number | null {
+  return parseAssetLibrarySortTimestamp(entry.createdAt)
+    ?? parseAssetLibrarySortTimestamp(entry.updatedAt)
+}
+
+function parseAssetLibrarySortTimestamp(value: string | undefined): number | null {
+  if (typeof value !== 'string' || value.length === 0) return null
+  const epochMs = Date.parse(value)
+  return Number.isFinite(epochMs) ? epochMs : null
 }
 
 function normalizeAssetLibrarySearchQuery(searchQuery: string): string {
@@ -991,6 +1095,7 @@ export default function GeneratePage(): JSX.Element {
   const [libraryOpening, setLibraryOpening] = useState(false)
   const [libraryError, setLibraryError] = useState<string | null>(null)
   const [librarySearchQuery, setLibrarySearchQuery] = useState('')
+  const [librarySortMode, setLibrarySortMode] = useState<AssetLibrarySortMode>('type')
   const [libraryCollapsedSectionKeys, setLibraryCollapsedSectionKeys] = useState<string[]>(() => getDefaultAssetLibraryCollapsedSectionKeys())
   const dragging = useRef(false)
   // Populated by Viewer3D — undoes the latest live gizmo transform, if any.
@@ -1345,12 +1450,16 @@ export default function GeneratePage(): JSX.Element {
                 opening={libraryOpening}
                 error={libraryError}
                 searchQuery={librarySearchQuery}
+                sortMode={librarySortMode}
                 onSelectEntry={(entryId) => {
                   setLibraryError(null)
                   setLibrarySelectedEntryId(entryId)
                 }}
                 onSearchQueryChange={(value) => {
                   setLibrarySearchQuery(value)
+                }}
+                onSortModeChange={(value) => {
+                  setLibrarySortMode(value)
                 }}
                 onOpenSelected={() => {
                   void handleOpenSelectedLibraryEntry()

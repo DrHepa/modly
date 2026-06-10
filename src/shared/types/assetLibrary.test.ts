@@ -39,6 +39,8 @@ test('AssetLibraryEntry contracts keep manifest and source-link metadata explici
     id: 'asset:hero-world',
     workspacePath: 'Workflows/worlds/hero.world.json',
     displayName: 'hero.world.json',
+    createdAt: '2026-06-10T00:00:00.000Z',
+    updatedAt: '2026-06-10T00:05:00.000Z',
     sourceScope: 'workflows',
     capability: 'generated-world',
     state: 'ready',
@@ -85,6 +87,8 @@ test('AssetLibraryEntry contracts keep manifest and source-link metadata explici
 
   assert.equal(readyEntry.source?.relation, 'manifest-source')
   assert.equal(readyEntry.sourceScope, 'workflows')
+  assert.equal(readyEntry.createdAt, '2026-06-10T00:00:00.000Z')
+  assert.equal(readyEntry.updatedAt, '2026-06-10T00:05:00.000Z')
   assert.equal(degradedResult.entry.source?.degraded, true)
   assert.equal(degradedResult.preview.kind, '3d-model')
 })

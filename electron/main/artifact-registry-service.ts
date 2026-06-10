@@ -1,5 +1,6 @@
 import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import type { Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, relative, resolve as resolvePath } from 'node:path'
 
 import type { ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
@@ -735,13 +736,16 @@ async function readMotionRetargetLibraryState(workspaceDir: string, workspacePat
 async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePath: string): Promise<AssetLibraryEntry | null> {
   if (shouldSkipWorkspaceAssetLibraryPath(workspacePath)) return null
 
+  const normalizedWorkspaceArtifact = normalizeWorkspaceArtifactPath(workspaceDir, workspacePath)
+  const fileStats = await stat(normalizedWorkspaceArtifact.absolutePath)
+  const { createdAt, updatedAt } = resolveAssetLibraryEntryTimestamps(fileStats)
   const sourceScope = deriveAssetLibrarySourceScope(workspacePath)
   const previewKind = resolveAssetLibraryPreviewKind(workspacePath)
   const { sidecar, warnings: sidecarWarnings } = await readArtifactRegistrySidecarForLibrary(workspaceDir, workspacePath)
   const metadata = extractAssetLibraryMetadataRecord(sidecar)
   const manifestFromMetadata = extractManifestRefFromMetadata(metadata, workspacePath)
   const manifestRecord = previewKind === 'text' && resolveWorkspaceArtifactExtension(workspacePath) === 'json'
-    ? await readJsonRecordIfPresent(normalizeWorkspaceArtifactPath(workspaceDir, workspacePath).absolutePath)
+    ? await readJsonRecordIfPresent(normalizedWorkspaceArtifact.absolutePath)
     : { status: 'not-found' as const }
   const manifestFromRecord = manifestRecord.status === 'found' ? extractManifestRefFromRecord(manifestRecord.value, workspacePath) : undefined
 
@@ -806,6 +810,8 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     id: sidecar?.artifactId ?? workspacePath,
     workspacePath,
     displayName,
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
     sourceScope,
     ...(classification.capability ? { capability: classification.capability } : {}),
     state: classification.state,
@@ -817,6 +823,25 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     previewKind,
     warnings: [...new Set(warnings)],
   }
+}
+
+function resolveAssetLibraryEntryTimestamps(fileStats: Stats): { createdAt?: string, updatedAt?: string } {
+  const createdAt = resolveValidAssetLibraryIsoTimestamp(fileStats.birthtime)
+    ?? resolveValidAssetLibraryIsoTimestamp(fileStats.mtime)
+  const updatedAt = resolveValidAssetLibraryIsoTimestamp(fileStats.mtime)
+    ?? resolveValidAssetLibraryIsoTimestamp(fileStats.birthtime)
+
+  return {
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
+  }
+}
+
+function resolveValidAssetLibraryIsoTimestamp(value: Date | undefined): string | undefined {
+  if (!(value instanceof Date)) return undefined
+  const epochMs = value.getTime()
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return undefined
+  return value.toISOString()
 }
 
 function mapWorkspaceArtifactPreviewToLibraryPayload(result: Extract<WorkspaceArtifactPreviewResult, { success: true }>): AssetLibraryPreviewPayload {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
+import { constants, type Stats } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
 import { readdir, readFile, stat, mkdir, rename, rm, writeFile, lstat, realpath, mkdtemp, link, open } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, resolve as resolvePath, sep } from 'node:path'
@@ -780,6 +780,7 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
   const stats = await lstat(physical.absolutePath)
   if (shouldSkipWorkspaceAssetLibraryPath(workspacePath)) return null
 
+  const { createdAt, updatedAt } = resolveAssetLibraryEntryTimestamps(stats)
   const sourceScope = deriveAssetLibrarySourceScope(workspacePath)
   const previewKind = resolveAssetLibraryPreviewKind(workspacePath)
   const { sidecar, warnings: sidecarWarnings } = await readArtifactRegistrySidecarForLibrary(workspaceDir, workspacePath)
@@ -863,10 +864,9 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     id: `library:${workspacePath}`,
     workspacePath,
     displayName,
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
     sourceScope,
-    ...(Number.isFinite(stats.birthtimeMs) && stats.birthtimeMs > 0 ? { createdAt: new Date(stats.birthtimeMs).toISOString() }
-      : Number.isFinite(stats.mtimeMs) && stats.mtimeMs > 0 ? { createdAt: new Date(stats.mtimeMs).toISOString() } : {}),
-    ...(Number.isFinite(stats.mtimeMs) && stats.mtimeMs > 0 ? { updatedAt: new Date(stats.mtimeMs).toISOString() } : {}),
     ...(classification.capability ? { capability: classification.capability } : {}),
     state: classification.state,
     ...(sidecar?.artifactId ? { artifactId: sidecar.artifactId } : {}),
@@ -877,6 +877,23 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     previewKind,
     warnings: [...new Set(warnings)],
   }
+}
+
+export function resolveAssetLibraryEntryTimestamps(stats: Pick<Stats, 'birthtimeMs' | 'mtimeMs'>): { createdAt?: string, updatedAt?: string } {
+  const birthtime = resolveValidAssetLibraryIsoTimestamp(stats.birthtimeMs)
+  const mtime = resolveValidAssetLibraryIsoTimestamp(stats.mtimeMs)
+  const createdAt = birthtime ?? mtime
+  const updatedAt = mtime ?? birthtime
+  return {
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
+  }
+}
+
+function resolveValidAssetLibraryIsoTimestamp(epochMs: number): string | undefined {
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return undefined
+  const date = new Date(epochMs)
+  return Number.isFinite(date.getTime()) && date.getTime() > 0 ? date.toISOString() : undefined
 }
 
 function mapWorkspaceArtifactPreviewToLibraryPayload(result: Extract<WorkspaceArtifactPreviewResult, { success: true }>): AssetLibraryPreviewPayload {

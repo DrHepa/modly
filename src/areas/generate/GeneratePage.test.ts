@@ -494,6 +494,90 @@ test('GeneratePage library seam exposes accessible search and empty-result statu
   }
 })
 
+test('GeneratePage library seam exposes an accessible sort selector and reorders entries by name, date, and type while preserving scope hierarchy', async () => {
+  const { module, cleanup } = await loadGeneratePageModule()
+
+  try {
+    const entries = [
+      libraryEntry({ id: 'library:Workflows/Characters/zulu.glb', workspacePath: 'Workflows/Characters/zulu.glb', displayName: 'Zulu mesh', capability: 'mesh', createdAt: '2026-06-10T00:01:00.000Z' }),
+      libraryEntry({ id: 'library:Workflows/Rigs/alpha.glb', workspacePath: 'Workflows/Rigs/alpha.glb', displayName: 'Alpha rig', capability: 'rigged-mesh', createdAt: '2026-06-10T00:02:00.000Z' }),
+      libraryEntry({ id: 'library:Workflows/Motions/bravo.pose-clip.v1.json', workspacePath: 'Workflows/Motions/bravo.pose-clip.v1.json', displayName: 'Bravo motion', capability: 'animation-motion', createdAt: '2026-06-10T00:03:00.000Z', previewKind: 'text', openTarget: { kind: 'linked-source', workspacePath: 'Workflows/Characters/zulu.glb', relation: 'sidecar-source' } }),
+      libraryEntry({ id: 'library:Exports/Props/chair.glb', workspacePath: 'Exports/Props/chair.glb', displayName: 'Chair export', sourceScope: 'exports', capability: 'mesh', createdAt: '2026-06-10T00:04:00.000Z', openTarget: { kind: 'self', workspacePath: 'Exports/Props/chair.glb' } }),
+    ]
+
+    const typeMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'library:Workflows/Characters/zulu.glb',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'type',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    const nameMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'library:Workflows/Characters/zulu.glb',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'name',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    const dateMarkup = renderToStaticMarkup(createElement(module.AssetLibraryPopover, {
+      entries,
+      selectedEntryId: 'library:Workflows/Characters/zulu.glb',
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      sortMode: 'date',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+
+    assert.match(typeMarkup, /<label[^>]*for="asset-library-sort"[^>]*>Sort<\/label>/)
+    assert.match(typeMarkup, /<select[^>]*id="asset-library-sort"/)
+    assert.match(typeMarkup, /<option value="name">Name<\/option>/)
+    assert.match(typeMarkup, /<option value="date">Date<\/option>/)
+    assert.match(typeMarkup, /<option value="type" selected="">Type<\/option>/)
+    assert.ok(typeMarkup.indexOf('Workflows') < typeMarkup.indexOf('Exports'))
+    assert.ok(typeMarkup.indexOf('Zulu mesh') < typeMarkup.indexOf('Alpha rig'))
+    assert.ok(typeMarkup.indexOf('Alpha rig') < typeMarkup.indexOf('Bravo motion'))
+    assert.ok(nameMarkup.indexOf('Workflows') < nameMarkup.indexOf('Exports'))
+    assert.ok(nameMarkup.indexOf('Alpha rig') < nameMarkup.indexOf('Bravo motion'))
+    assert.ok(nameMarkup.indexOf('Bravo motion') < nameMarkup.indexOf('Zulu mesh'))
+    assert.ok(dateMarkup.indexOf('Workflows') < dateMarkup.indexOf('Exports'))
+    assert.ok(dateMarkup.indexOf('Bravo motion') < dateMarkup.indexOf('Alpha rig'))
+    assert.ok(dateMarkup.indexOf('Alpha rig') < dateMarkup.indexOf('Zulu mesh'))
+  } finally {
+    await cleanup()
+  }
+})
+
 test('GeneratePage library seam keeps the library panel open for library open and import flows', async () => {
   const { module, cleanup } = await loadGeneratePageModule()
 
@@ -685,7 +769,8 @@ test('mounted GeneratePage fences stale lists and opens across API, selection, o
     const { openTarget: _rendererOnly, ...entry } = libraryEntry({ id: `library:Workflows/${name.toLowerCase()}.glb`, artifactId: 'shared-producer-artifact', workspacePath: `Workflows/${name.toLowerCase()}.glb`, displayName: `Asset ${name}` })
     return entry
   }
-  const a = rawEntry('A'), b = rawEntry('B')
+  const a = { ...rawEntry('A'), capability: 'rigged-mesh', createdAt: '2026-06-10T00:01:00.000Z' }
+  const b = { ...rawEntry('B'), createdAt: '2026-06-10T00:02:00.000Z' }
   const success = { success: true, entries: [a, b] }
   const electron = {
     settings: { get: async () => { settingsReads++; return { workspaceDir } } },
@@ -732,7 +817,42 @@ test('mounted GeneratePage fences stale lists and opens across API, selection, o
   await until(() => listCalls.length === 2 && enabled('Open selected asset'), 'Fresh API list completed')
   click('Toggle Workflows assets')
   click('Toggle Mesh assets in Workflows')
+  click('Toggle Rigged mesh assets in Workflows')
   assert.ok(selected('Asset A'))
+  function assetOrder(node = host): string[] {
+    return [
+      ...(node.type === 'button' && node.props['aria-label']?.startsWith('Select library asset ')
+        ? [node.props['aria-label'].slice('Select library asset '.length)] : []),
+      ...node.children.flatMap(child => assetOrder(child)),
+    ]
+  }
+  const sortLabel = find(node => node.type === 'label' && node.props.htmlFor === 'asset-library-sort')
+  assert.ok(sortLabel)
+  assert.equal(textContent(sortLabel), 'Sort')
+  const sortControl = () => {
+    const control = find(node => node.type === 'select' && node.props.id === sortLabel.props.htmlFor)
+    assert.ok(control, 'Sort label references a rendered native select')
+    assert.equal(typeof control.props.onChange, 'function')
+    return control
+  }
+  assert.deepEqual(sortControl().children.map(option => [option.type, option.props.value, textContent(option)]), [
+    ['option', 'type', 'Type'], ['option', 'name', 'Name'], ['option', 'date', 'Date'],
+  ])
+  const listsBeforeSort = listCalls.length
+  for (const [mode, order] of [
+    ['type', ['Asset B', 'Asset A']],
+    ['name', ['Asset A', 'Asset B']],
+    ['date', ['Asset B', 'Asset A']],
+    ['type', ['Asset B', 'Asset A']],
+  ] as const) {
+    flush(() => sortControl().props.onChange({ target: { value: mode } }))
+    assert.equal(sortControl().props.value, mode)
+    assert.deepEqual(assetOrder(), [...order], `Mounted ${mode} order`)
+    assert.ok(selected('Asset A') && enabled('Open selected asset'))
+    assert.deepEqual(snapshot(), initial, 'Sorting preserves job, history and history index')
+    assert.equal(openCalls.length, 0, 'Sorting must not open or reselect an asset')
+    assert.equal(listCalls.length, listsBeforeSort, 'Sorting must not reload the library')
+  }
   let reads = settingsReads
   firstList.resolve({ success: true, entries: [{ ...a, displayName: 'Retired list' }] })
   await until(() => settingsReads > reads, 'Stale successful list reached post-read fence')

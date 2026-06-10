@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, lstat, symlink, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -7,6 +7,7 @@ import test from 'node:test'
 
 import {
   classifyAssetLibraryCandidate,
+  resolveAssetLibraryEntryTimestamps,
   normalizeWorkspaceAssetPath,
   listWorkspaceAssetLibrary,
   openWorkspaceAssetLibraryEntry,
@@ -1145,6 +1146,60 @@ test('lists a real indexed workspace candidate as unknown-metadata when no suppo
         warnings: [],
       },
     ])
+  })
+})
+
+test('asset library timestamp fallback accepts only positive representable dates without fabricating metadata', () => {
+  const birthtimeMs = Date.parse('2026-06-10T00:00:00.000Z')
+  const mtimeMs = Date.parse('2026-06-10T00:05:00.000Z')
+  const createdAt = new Date(birthtimeMs).toISOString()
+  const updatedAt = new Date(mtimeMs).toISOString()
+  assert.deepEqual(resolveAssetLibraryEntryTimestamps({ birthtimeMs, mtimeMs }), { createdAt, updatedAt })
+  for (const invalid of [0.5, 0, -1, NaN, Infinity, -Infinity, 8_640_000_000_000_001, Number.MAX_VALUE]) {
+    assert.deepEqual(resolveAssetLibraryEntryTimestamps({ birthtimeMs: invalid, mtimeMs }), {
+      createdAt: updatedAt, updatedAt,
+    }, `Creation falls back from ${invalid} to modification`)
+    assert.deepEqual(resolveAssetLibraryEntryTimestamps({ birthtimeMs, mtimeMs: invalid }), {
+      createdAt, updatedAt: createdAt,
+    }, `Modification falls back from ${invalid} to creation`)
+    assert.deepEqual(resolveAssetLibraryEntryTimestamps({ birthtimeMs: invalid, mtimeMs: invalid }), {}, `No timestamp for ${invalid}`)
+  }
+  assert.deepEqual(resolveAssetLibraryEntryTimestamps({ birthtimeMs: 1, mtimeMs: 8_640_000_000_000_000 }), {
+    createdAt: '1970-01-01T00:00:00.001Z', updatedAt: '+275760-09-13T00:00:00.000Z',
+  })
+})
+
+test('lists, reads and opens workspace asset library entries with timestamps from physically checked file stats', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    const workspacePath = 'Workflows/generated/dated.glb'
+    const absolutePath = path.join(workspaceDir, 'Workflows', 'generated', 'dated.glb')
+    await writeFile(absolutePath, buildMinimalGlb({ asset: { version: '2.0' } }))
+
+    const result = await listWorkspaceAssetLibrary({ workspaceDir })
+
+    assertSuccessfulAssetLibraryList(result)
+
+    const entry = result.entries.find((candidate) => candidate.workspacePath === workspacePath)
+    assert.ok(entry, 'expected dated asset entry to be listed')
+
+    const fileStats = await lstat(absolutePath)
+    assert.ok(fileStats.isFile() && !fileStats.isSymbolicLink())
+    assert.ok(fileStats.mtimeMs > 0)
+    const expectedCreatedAt = new Date(fileStats.birthtimeMs > 0 ? fileStats.birthtimeMs : fileStats.mtimeMs).toISOString()
+    const expectedUpdatedAt = new Date(fileStats.mtimeMs).toISOString()
+    assert.equal(entry.id, `library:${workspacePath}`)
+    assert.equal(entry.createdAt, expectedCreatedAt)
+    assert.equal(entry.updatedAt, expectedUpdatedAt)
+
+    const read = await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+    assertSuccessfulAssetLibraryRead(read)
+    assert.equal(read.entry.createdAt, expectedCreatedAt)
+    assert.equal(read.entry.updatedAt, expectedUpdatedAt)
+    const opened = await openWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+    assert.equal(opened.success, true)
+    assert.equal(opened.entry.createdAt, expectedCreatedAt)
+    assert.equal(opened.entry.updatedAt, expectedUpdatedAt)
   })
 })
 

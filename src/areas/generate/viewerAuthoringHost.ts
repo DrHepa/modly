@@ -65,6 +65,13 @@ export interface ViewerAuthoringContribution {
 
 export type ResolvedViewerAuthoringContribution = Omit<ViewerAuthoringContribution, 'isVisible'>
 
+export function hasViewerAuthoringContribution(
+  contributions: readonly ResolvedViewerAuthoringContribution[],
+  id: ViewerAuthoringContributionId,
+): boolean {
+  return contributions.some((contribution) => contribution.id === id)
+}
+
 const SLOT_ORDER = new Map<ViewerAuthoringHostSlot, number>(
   VIEWER_AUTHORING_HOST_SLOTS.map((slot, index) => [slot, index]),
 )

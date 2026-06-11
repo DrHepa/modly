@@ -20,6 +20,7 @@ import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 import {
   createViewerAuthoringHostContext,
   DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+  hasViewerAuthoringContribution,
   resolveViewerAuthoringContributions,
 } from '../viewerAuthoringHost'
 
@@ -407,8 +408,9 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
     createViewerAuthoringHostContext({ hasModel: !!modelUrl, meshSelected: selected }),
   ), [modelUrl, selected])
-  const showViewToolbar = authoringHostContributions.some(
-    (contribution) => contribution.id === 'view-toolbar',
+  const showViewToolbar = hasViewerAuthoringContribution(
+    authoringHostContributions,
+    'view-toolbar',
   )
 
   // Reset view state when model changes

@@ -14,6 +14,7 @@ import {
 import {
   createViewerAuthoringHostContext,
   DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+  hasViewerAuthoringContribution,
   resolveViewerAuthoringContributions,
 } from './viewerAuthoringHost'
 
@@ -323,8 +324,9 @@ export default function GeneratePage(): JSX.Element {
     DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
     createViewerAuthoringHostContext({ hasModel, meshSelected, hasTransformTools: true }),
   ), [hasModel, meshSelected])
-  const showTransformToolbar = authoringContributions.some(
-    (contribution) => contribution.id === 'transform-toolbar',
+  const showTransformToolbar = hasViewerAuthoringContribution(
+    authoringContributions,
+    'transform-toolbar',
   )
 
   // Drop the active transform tool when the mesh is deselected, so it doesn't

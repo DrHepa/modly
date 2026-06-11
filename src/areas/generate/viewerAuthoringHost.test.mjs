@@ -135,6 +135,24 @@ test('view toolbar contribution remains visible with a model regardless of selec
   ])
 })
 
+test('resolved contribution helper returns true when an id is present', () => {
+  const contributions = mod.resolveViewerAuthoringContributions(
+    mod.DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+    { hasModel: true, meshSelected: true, hasTransformTools: true },
+  )
+
+  assert.equal(mod.hasViewerAuthoringContribution(contributions, 'transform-toolbar'), true)
+})
+
+test('resolved contribution helper returns false when an id is absent', () => {
+  const contributions = mod.resolveViewerAuthoringContributions(
+    mod.DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+    { hasModel: true, meshSelected: false, hasTransformTools: true },
+  )
+
+  assert.equal(mod.hasViewerAuthoringContribution(contributions, 'transform-toolbar'), false)
+})
+
 test('contribution sorting is deterministic by slot, order, and id', () => {
   const visible = {
     label: 'Toolbar',

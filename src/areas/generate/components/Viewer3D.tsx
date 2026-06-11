@@ -449,9 +449,19 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
       <ViewerAuthoringHost
         hasModel={!!modelUrl}
         contributions={authoringHostContributions}
+        slots={{
+          viewRail: showViewToolbar ? (
+            <ViewerToolbar
+              viewMode={viewMode}
+              autoRotate={autoRotate}
+              onViewMode={setViewMode}
+              onAutoRotate={() => setAutoRotate((v) => !v)}
+              onScreenshot={handleScreenshot}
+            />
+          ) : null,
+        }}
       >
-        <div className="relative w-full h-full bg-surface-400">
-          {!modelUrl && <EmptyState />}
+        {!modelUrl && <EmptyState />}
 
         <Canvas
           onPointerMissed={() => setSelected(false)}
@@ -524,17 +534,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
           </GizmoHelper>
         </Canvas>
 
-        {/* Left toolbar — visible only when a model is loaded */}
-        {showViewToolbar && (
-          <ViewerToolbar
-            viewMode={viewMode}
-            autoRotate={autoRotate}
-            onViewMode={setViewMode}
-            onAutoRotate={() => setAutoRotate((v) => !v)}
-            onScreenshot={handleScreenshot}
-          />
-        )}
-
         {/* Bottom-left stats overlay */}
         {meshStats && (
           <div className="absolute bottom-4 left-4 pointer-events-none">
@@ -555,7 +554,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
             </p>
           </div>
         )}
-        </div>
       </ViewerAuthoringHost>
     </ModelErrorBoundary>
   )

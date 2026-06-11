@@ -9,6 +9,11 @@ const viewerAuthoringHostComponentSource = () => readFile(
   'utf8',
 )
 
+const viewerTransformToolbarComponentSource = () => readFile(
+  new URL('./components/ViewerTransformToolbar.tsx', import.meta.url),
+  'utf8',
+)
+
 test('host slots are explicit and stable through contribution descriptors', () => {
   assert.deepEqual(mod.VIEWER_AUTHORING_HOST_SLOTS, [
     'view-rail',
@@ -173,4 +178,15 @@ test('ViewerAuthoringHost slot helper renders named internal slots without plugi
   assert.match(source, /return slots\?\.\[slotName\] \?\? null/)
   assert.equal(source.includes('eventBus'), false)
   assert.equal(source.includes('commandBus'), false)
+})
+
+test('ViewerTransformToolbar exposes explicit props without owning state', async () => {
+  const source = await viewerTransformToolbarComponentSource()
+
+  assert.match(source, /export type ViewerTransformMode = 'translate' \| 'rotate' \| 'scale' \| null/)
+  assert.match(source, /export interface ViewerTransformToolbarProps \{[\s\S]*mode: ViewerTransformMode/)
+  assert.match(source, /export interface ViewerTransformToolbarProps \{[\s\S]*onModeChange: \(mode: ViewerTransformMode\) => void/)
+  assert.match(source, /export default function ViewerTransformToolbar\(\{[\s\S]*mode,[\s\S]*onModeChange,/)
+  assert.equal(source.includes('useState'), false)
+  assert.equal(source.includes('useAppStore'), false)
 })

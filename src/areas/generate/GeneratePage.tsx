@@ -1,11 +1,11 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
-import type { ReactNode } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import type { GenerationJob } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { ColorPicker } from '@shared/components/ui'
 import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
+import ViewerTransformToolbar, { type ViewerTransformMode } from './components/ViewerTransformToolbar'
 import WorkflowPanel from './components/WorkflowPanel'
 import {
   renderViewerAuthoringHostSlot,
@@ -52,38 +52,6 @@ function ExportDropdown({
         </button>
       ))}
     </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// ToolButton — icon-only toolbar button with tooltip + active state
-// ---------------------------------------------------------------------------
-
-function ToolButton({
-  label,
-  active,
-  onClick,
-  children,
-}: {
-  label: string
-  active: boolean
-  onClick: () => void
-  children: ReactNode
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={label}
-      aria-label={label}
-      aria-pressed={active}
-      className={`flex items-center justify-center w-7 h-7 rounded-lg border transition-colors
-        ${active
-          ? 'bg-zinc-700 border-zinc-600 text-zinc-200'
-          : 'bg-zinc-800 border-zinc-700/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600'
-        }`}
-    >
-      {children}
-    </button>
   )
 }
 
@@ -320,7 +288,7 @@ export default function GeneratePage(): JSX.Element {
   const [decimating, setDecimating] = useState(false)
   const [smoothing, setSmoothing] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [gizmoMode, setGizmoMode] = useState<'translate' | 'rotate' | 'scale' | null>(null)
+  const [gizmoMode, setGizmoMode] = useState<ViewerTransformMode>(null)
   const dragging = useRef(false)
 
   const isGenerating = useAppStore((s) =>
@@ -469,44 +437,7 @@ export default function GeneratePage(): JSX.Element {
 
   const viewerAuthoringHostSlots = {
     editRail: showTransformToolbar ? (
-      <>
-        <ToolButton
-          label="Move"
-          active={gizmoMode === 'translate'}
-          onClick={() => setGizmoMode((m) => (m === 'translate' ? null : 'translate'))}
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <polyline points="5 9 2 12 5 15" />
-            <polyline points="9 5 12 2 15 5" />
-            <polyline points="15 19 12 22 9 19" />
-            <polyline points="19 9 22 12 19 15" />
-            <line x1="2" y1="12" x2="22" y2="12" />
-            <line x1="12" y1="2" x2="12" y2="22" />
-          </svg>
-        </ToolButton>
-        <ToolButton
-          label="Rotate"
-          active={gizmoMode === 'rotate'}
-          onClick={() => setGizmoMode((m) => (m === 'rotate' ? null : 'rotate'))}
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <path d="M21 2v6h-6" />
-            <path d="M21 13a9 9 0 1 1-3-7.7L21 8" />
-          </svg>
-        </ToolButton>
-        <ToolButton
-          label="Scale"
-          active={gizmoMode === 'scale'}
-          onClick={() => setGizmoMode((m) => (m === 'scale' ? null : 'scale'))}
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <path d="M15 3h6v6" />
-            <path d="M9 21H3v-6" />
-            <path d="M21 3l-7 7" />
-            <path d="M3 21l7-7" />
-          </svg>
-        </ToolButton>
-      </>
+      <ViewerTransformToolbar mode={gizmoMode} onModeChange={setGizmoMode} />
     ) : null,
   } satisfies Pick<ViewerAuthoringHostSlots, 'editRail'>
 

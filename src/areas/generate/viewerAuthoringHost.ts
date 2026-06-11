@@ -1,3 +1,10 @@
+// Internal Viewer Authoring Host contract. This is NOT a plugin API: slots are
+// first-party/internal composition points only. Rig Editor and PoseClip should
+// be added later as built-in adapters that contribute to this host, not as
+// externally loaded plugins.
+
+// Slots
+
 export const VIEWER_AUTHORING_HOST_SLOTS = [
   'view-rail',
   'edit-rail',
@@ -25,12 +32,7 @@ export function getViewerAuthoringHostSlotProp(
   return VIEWER_AUTHORING_HOST_SLOT_PROPS[slot]
 }
 
-export const VIEWER_AUTHORING_CONTRIBUTION_IDS = [
-  'view-toolbar',
-  'transform-toolbar',
-] as const
-
-export type ViewerAuthoringContributionId = (typeof VIEWER_AUTHORING_CONTRIBUTION_IDS)[number]
+// Context
 
 export interface ViewerAuthoringHostContext {
   hasModel: boolean
@@ -53,6 +55,15 @@ export function createViewerAuthoringHostContext(
     hasTransformTools: input.hasTransformTools ?? false,
   }
 }
+
+// Contributions
+
+export const VIEWER_AUTHORING_CONTRIBUTION_IDS = [
+  'view-toolbar',
+  'transform-toolbar',
+] as const
+
+export type ViewerAuthoringContributionId = (typeof VIEWER_AUTHORING_CONTRIBUTION_IDS)[number]
 
 export interface ViewerAuthoringContribution {
   id: ViewerAuthoringContributionId
@@ -94,6 +105,8 @@ export const DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS: readonly ViewerAuthoringCon
     isVisible: (ctx) => ctx.hasModel && ctx.meshSelected && ctx.hasTransformTools,
   },
 ]
+
+// Resolution helpers
 
 export function resolveViewerAuthoringContributions(
   contributions: readonly ViewerAuthoringContribution[],

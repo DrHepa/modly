@@ -4,6 +4,11 @@ import { readFile } from 'node:fs/promises'
 
 import * as mod from './viewerAuthoringHost.ts'
 
+const viewerAuthoringHostSource = () => readFile(
+  new URL('./viewerAuthoringHost.ts', import.meta.url),
+  'utf8',
+)
+
 const viewerAuthoringHostComponentSource = () => readFile(
   new URL('./components/ViewerAuthoringHost.tsx', import.meta.url),
   'utf8',
@@ -191,6 +196,23 @@ test('resolved host contributions do not expose an external plugin platform surf
   assert.equal('manifest' in resolved, false)
   assert.equal('permissions' in resolved, false)
   assert.equal('plugin' in resolved, false)
+  assert.equal('eventBus' in resolved, false)
+  assert.equal('commandBus' in resolved, false)
+  assert.equal('external' in resolved, false)
+})
+
+test('viewer authoring host module does not export plugin platform identifiers', async () => {
+  const source = await viewerAuthoringHostSource()
+
+  assert.match(source, /Internal Viewer Authoring Host contract/)
+  assert.match(source, /NOT a plugin API/)
+  assert.equal(source.includes('PluginManifest'), false)
+  assert.equal(source.includes('ViewerAuthoringPlugin'), false)
+  assert.equal(source.includes('permissions'), false)
+  assert.equal(source.includes('eventBus'), false)
+  assert.equal(source.includes('commandBus'), false)
+  assert.equal(source.includes('externalUrl'), false)
+  assert.equal(source.includes('loadExternal'), false)
 })
 
 test('ViewerAuthoringHost component exposes a minimal internal prop contract', async () => {
@@ -218,6 +240,7 @@ test('ViewerAuthoringHost component exposes a minimal internal prop contract', a
   assert.equal(source.includes('permissions'), false)
   assert.equal(source.includes('eventBus'), false)
   assert.equal(source.includes('commandBus'), false)
+  assert.equal(source.includes('external'), false)
 })
 
 test('ViewerAuthoringHost slot helper renders named internal slots without plugin surface', async () => {
@@ -226,8 +249,12 @@ test('ViewerAuthoringHost slot helper renders named internal slots without plugi
   assert.match(source, /export function renderViewerAuthoringHostSlot\(/)
   assert.match(source, /slotName: ViewerAuthoringHostSlotProp/)
   assert.match(source, /return slots\?\.\[slotName\] \?\? null/)
+  assert.equal(source.includes('manifest'), false)
+  assert.equal(source.includes('plugin'), false)
+  assert.equal(source.includes('permissions'), false)
   assert.equal(source.includes('eventBus'), false)
   assert.equal(source.includes('commandBus'), false)
+  assert.equal(source.includes('external'), false)
 })
 
 test('ViewerTransformToolbar exposes explicit props without owning state', async () => {

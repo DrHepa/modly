@@ -16,6 +16,10 @@ import { useAppStore } from '@shared/stores/appStore'
 import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
+import {
+  DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+  resolveViewerAuthoringContributions,
+} from '../viewerAuthoringHost'
 
 const SELECTION_OUTLINE_VISIBLE_COLOR = 0x8b5cf6
 const SELECTION_OUTLINE_HIDDEN_COLOR = 0x5b21b6
@@ -397,6 +401,10 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     currentJob?.status === 'done' && currentJob.outputUrl
       ? `${apiUrl}${currentJob.outputUrl}`
       : null
+  const showViewToolbar = useMemo(() => resolveViewerAuthoringContributions(
+    DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+    { hasModel: !!modelUrl, meshSelected: selected, hasTransformTools: false },
+  ).some((contribution) => contribution.id === 'view-toolbar'), [modelUrl, selected])
 
   // Reset view state when model changes
   useEffect(() => {
@@ -509,7 +517,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
         </Canvas>
 
         {/* Left toolbar — visible only when a model is loaded */}
-        {modelUrl && (
+        {showViewToolbar && (
           <ViewerToolbar
             viewMode={viewMode}
             autoRotate={autoRotate}

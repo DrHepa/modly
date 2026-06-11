@@ -56,6 +56,21 @@ test('transform toolbar contribution is visible only with model, mesh selection,
   ])
 })
 
+test('view toolbar contribution remains visible with a model regardless of selection and transform tools', () => {
+  const resolve = (ctx) => mod.resolveViewerAuthoringContributions(
+    mod.DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+    ctx,
+  ).map(({ id }) => id)
+
+  assert.deepEqual(resolve({ hasModel: true, meshSelected: false, hasTransformTools: false }), ['view-toolbar'])
+  assert.deepEqual(resolve({ hasModel: true, meshSelected: true, hasTransformTools: false }), ['view-toolbar'])
+  assert.deepEqual(resolve({ hasModel: true, meshSelected: false, hasTransformTools: true }), ['view-toolbar'])
+  assert.deepEqual(resolve({ hasModel: true, meshSelected: true, hasTransformTools: true }), [
+    'view-toolbar',
+    'transform-toolbar',
+  ])
+})
+
 test('contribution sorting is deterministic by slot, order, and id', () => {
   const visible = {
     label: 'Toolbar',

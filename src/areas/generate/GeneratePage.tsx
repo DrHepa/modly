@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import type { GenerationJob } from '@shared/stores/appStore'
@@ -7,6 +7,10 @@ import { ColorPicker } from '@shared/components/ui'
 import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
+import {
+  DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+  resolveViewerAuthoringContributions,
+} from './viewerAuthoringHost'
 
 const MIN_WIDTH = 220
 const MAX_WIDTH = 520
@@ -342,6 +346,13 @@ export default function GeneratePage(): JSX.Element {
   }, [undoMesh, redoMesh])
 
   const hasModel = currentJob?.status === 'done' && !!currentJob.outputUrl
+  const authoringContributions = useMemo(() => resolveViewerAuthoringContributions(
+    DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
+    { hasModel, meshSelected, hasTransformTools: true },
+  ), [hasModel, meshSelected])
+  const showTransformToolbar = authoringContributions.some(
+    (contribution) => contribution.id === 'transform-toolbar',
+  )
 
   // Drop the active transform tool when the mesh is deselected, so it doesn't
   // silently re-activate on the next selection.
@@ -692,7 +703,7 @@ export default function GeneratePage(): JSX.Element {
 
         {/* Tools bar — always visible; transform tools appear once a mesh is selected */}
         <div className="flex items-center gap-2 px-3 h-10 border-b border-zinc-800 bg-surface-400 shrink-0">
-          {hasModel && meshSelected && (
+          {showTransformToolbar && (
             <>
               <ToolButton
                 label="Move"

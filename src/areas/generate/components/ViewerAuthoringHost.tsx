@@ -4,6 +4,7 @@ import type { ResolvedViewerAuthoringContribution } from '../viewerAuthoringHost
 
 export interface ViewerAuthoringHostSlots {
   viewRail?: ReactNode
+  editRail?: ReactNode
 }
 
 export interface ViewerAuthoringHostProps {
@@ -13,11 +14,18 @@ export interface ViewerAuthoringHostProps {
   slots?: ViewerAuthoringHostSlots
 }
 
+export function renderViewerAuthoringHostSlot(
+  slots: ViewerAuthoringHostSlots | undefined,
+  slotName: keyof ViewerAuthoringHostSlots,
+): ReactNode {
+  return slots?.[slotName] ?? null
+}
+
 export function ViewerAuthoringHost({ children, slots }: ViewerAuthoringHostProps): JSX.Element {
   return (
     <div className="relative w-full h-full bg-surface-400">
       {children}
-      {slots?.viewRail}
+      {renderViewerAuthoringHostSlot(slots, 'viewRail')}
     </div>
   )
 }

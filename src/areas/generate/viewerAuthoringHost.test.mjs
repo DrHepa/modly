@@ -156,10 +156,21 @@ test('ViewerAuthoringHost component exposes a minimal internal prop contract', a
   assert.match(source, /export interface ViewerAuthoringHostProps \{[\s\S]*hasModel: boolean/)
   assert.match(source, /export interface ViewerAuthoringHostProps \{[\s\S]*contributions: readonly ResolvedViewerAuthoringContribution\[\]/)
   assert.match(source, /export interface ViewerAuthoringHostSlots \{[\s\S]*viewRail\?: ReactNode/)
+  assert.match(source, /export interface ViewerAuthoringHostSlots \{[\s\S]*editRail\?: ReactNode/)
   assert.match(source, /slots\?: ViewerAuthoringHostSlots/)
-  assert.match(source, /<div className="relative w-full h-full bg-surface-400">[\s\S]*\{children\}[\s\S]*\{slots\?\.viewRail\}/)
+  assert.match(source, /<div className="relative w-full h-full bg-surface-400">[\s\S]*\{children\}[\s\S]*\{renderViewerAuthoringHostSlot\(slots, 'viewRail'\)\}/)
   assert.equal(source.includes('createContext'), false)
   assert.equal(source.includes('manifest'), false)
   assert.equal(source.includes('plugin'), false)
   assert.equal(source.includes('permissions'), false)
+})
+
+test('ViewerAuthoringHost slot helper renders named internal slots without plugin surface', async () => {
+  const source = await viewerAuthoringHostComponentSource()
+
+  assert.match(source, /export function renderViewerAuthoringHostSlot\(/)
+  assert.match(source, /slotName: keyof ViewerAuthoringHostSlots/)
+  assert.match(source, /return slots\?\.\[slotName\] \?\? null/)
+  assert.equal(source.includes('eventBus'), false)
+  assert.equal(source.includes('commandBus'), false)
 })

@@ -8,6 +8,10 @@ import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
 import {
+  renderViewerAuthoringHostSlot,
+  type ViewerAuthoringHostSlots,
+} from './components/ViewerAuthoringHost'
+import {
   createViewerAuthoringHostContext,
   DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
   resolveViewerAuthoringContributions,
@@ -463,6 +467,49 @@ export default function GeneratePage(): JSX.Element {
     window.addEventListener('mouseup', onMouseUp)
   }, [])
 
+  const viewerAuthoringHostSlots = {
+    editRail: showTransformToolbar ? (
+      <>
+        <ToolButton
+          label="Move"
+          active={gizmoMode === 'translate'}
+          onClick={() => setGizmoMode((m) => (m === 'translate' ? null : 'translate'))}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+            <polyline points="5 9 2 12 5 15" />
+            <polyline points="9 5 12 2 15 5" />
+            <polyline points="15 19 12 22 9 19" />
+            <polyline points="19 9 22 12 19 15" />
+            <line x1="2" y1="12" x2="22" y2="12" />
+            <line x1="12" y1="2" x2="12" y2="22" />
+          </svg>
+        </ToolButton>
+        <ToolButton
+          label="Rotate"
+          active={gizmoMode === 'rotate'}
+          onClick={() => setGizmoMode((m) => (m === 'rotate' ? null : 'rotate'))}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+            <path d="M21 2v6h-6" />
+            <path d="M21 13a9 9 0 1 1-3-7.7L21 8" />
+          </svg>
+        </ToolButton>
+        <ToolButton
+          label="Scale"
+          active={gizmoMode === 'scale'}
+          onClick={() => setGizmoMode((m) => (m === 'scale' ? null : 'scale'))}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+            <path d="M15 3h6v6" />
+            <path d="M9 21H3v-6" />
+            <path d="M21 3l-7 7" />
+            <path d="M3 21l7-7" />
+          </svg>
+        </ToolButton>
+      </>
+    ) : null,
+  } satisfies Pick<ViewerAuthoringHostSlots, 'editRail'>
+
   return (
     <>
       <div className="flex flex-col border-r border-zinc-800 bg-surface-400 overflow-hidden shrink-0" style={{ width: panelWidth }}>
@@ -704,46 +751,7 @@ export default function GeneratePage(): JSX.Element {
 
         {/* Tools bar — always visible; transform tools appear once a mesh is selected */}
         <div className="flex items-center gap-2 px-3 h-10 border-b border-zinc-800 bg-surface-400 shrink-0">
-          {showTransformToolbar && (
-            <>
-              <ToolButton
-                label="Move"
-                active={gizmoMode === 'translate'}
-                onClick={() => setGizmoMode((m) => (m === 'translate' ? null : 'translate'))}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <polyline points="5 9 2 12 5 15" />
-                  <polyline points="9 5 12 2 15 5" />
-                  <polyline points="15 19 12 22 9 19" />
-                  <polyline points="19 9 22 12 19 15" />
-                  <line x1="2" y1="12" x2="22" y2="12" />
-                  <line x1="12" y1="2" x2="12" y2="22" />
-                </svg>
-              </ToolButton>
-              <ToolButton
-                label="Rotate"
-                active={gizmoMode === 'rotate'}
-                onClick={() => setGizmoMode((m) => (m === 'rotate' ? null : 'rotate'))}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <path d="M21 2v6h-6" />
-                  <path d="M21 13a9 9 0 1 1-3-7.7L21 8" />
-                </svg>
-              </ToolButton>
-              <ToolButton
-                label="Scale"
-                active={gizmoMode === 'scale'}
-                onClick={() => setGizmoMode((m) => (m === 'scale' ? null : 'scale'))}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <path d="M15 3h6v6" />
-                  <path d="M9 21H3v-6" />
-                  <path d="M21 3l-7 7" />
-                  <path d="M3 21l7-7" />
-                </svg>
-              </ToolButton>
-            </>
-          )}
+          {renderViewerAuthoringHostSlot(viewerAuthoringHostSlots, 'editRail')}
         </div>
 
         {/* Viewer area */}

@@ -8,6 +8,23 @@ export const VIEWER_AUTHORING_HOST_SLOTS = [
 
 export type ViewerAuthoringHostSlot = (typeof VIEWER_AUTHORING_HOST_SLOTS)[number]
 
+export const VIEWER_AUTHORING_HOST_SLOT_PROPS = {
+  'view-rail': 'viewRail',
+  'edit-rail': 'editRail',
+  'top-right': 'topRight',
+  'top-right-stack': 'topRightStack',
+  'bottom-drawer': 'bottomDrawer',
+} as const satisfies Record<ViewerAuthoringHostSlot, string>
+
+export type ViewerAuthoringHostSlotProp =
+  (typeof VIEWER_AUTHORING_HOST_SLOT_PROPS)[ViewerAuthoringHostSlot]
+
+export function getViewerAuthoringHostSlotProp(
+  slot: ViewerAuthoringHostSlot,
+): ViewerAuthoringHostSlotProp {
+  return VIEWER_AUTHORING_HOST_SLOT_PROPS[slot]
+}
+
 export const VIEWER_AUTHORING_CONTRIBUTION_IDS = [
   'view-toolbar',
   'transform-toolbar',

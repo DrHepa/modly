@@ -1,6 +1,10 @@
 import type { ReactNode } from 'react'
 
-import type { ResolvedViewerAuthoringContribution } from '../viewerAuthoringHost'
+import {
+  getViewerAuthoringHostSlotProp,
+  type ResolvedViewerAuthoringContribution,
+  type ViewerAuthoringHostSlotProp,
+} from '../viewerAuthoringHost'
 
 export interface ViewerAuthoringHostSlots {
   viewRail?: ReactNode
@@ -19,16 +23,28 @@ export interface ViewerAuthoringHostProps {
 
 export function renderViewerAuthoringHostSlot(
   slots: ViewerAuthoringHostSlots | undefined,
-  slotName: keyof ViewerAuthoringHostSlots,
+  slotName: ViewerAuthoringHostSlotProp,
 ): ReactNode {
   return slots?.[slotName] ?? null
 }
 
 export function ViewerAuthoringHost({ children, slots }: ViewerAuthoringHostProps): JSX.Element {
-  const viewRail = renderViewerAuthoringHostSlot(slots, 'viewRail')
-  const topRight = renderViewerAuthoringHostSlot(slots, 'topRight')
-  const topRightStack = renderViewerAuthoringHostSlot(slots, 'topRightStack')
-  const bottomDrawer = renderViewerAuthoringHostSlot(slots, 'bottomDrawer')
+  const viewRail = renderViewerAuthoringHostSlot(
+    slots,
+    getViewerAuthoringHostSlotProp('view-rail'),
+  )
+  const topRight = renderViewerAuthoringHostSlot(
+    slots,
+    getViewerAuthoringHostSlotProp('top-right'),
+  )
+  const topRightStack = renderViewerAuthoringHostSlot(
+    slots,
+    getViewerAuthoringHostSlotProp('top-right-stack'),
+  )
+  const bottomDrawer = renderViewerAuthoringHostSlot(
+    slots,
+    getViewerAuthoringHostSlotProp('bottom-drawer'),
+  )
 
   return (
     <div className="relative w-full h-full bg-surface-400">

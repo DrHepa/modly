@@ -31,6 +31,27 @@ test('host slots are explicit and stable through contribution descriptors', () =
   )
 })
 
+test('host slot prop mapping is complete and explicit for every contribution slot', () => {
+  assert.deepEqual(mod.VIEWER_AUTHORING_HOST_SLOT_PROPS, {
+    'view-rail': 'viewRail',
+    'edit-rail': 'editRail',
+    'top-right': 'topRight',
+    'top-right-stack': 'topRightStack',
+    'bottom-drawer': 'bottomDrawer',
+  })
+
+  assert.deepEqual(
+    mod.VIEWER_AUTHORING_HOST_SLOTS.map((slot) => [slot, mod.getViewerAuthoringHostSlotProp(slot)]),
+    [
+      ['view-rail', 'viewRail'],
+      ['edit-rail', 'editRail'],
+      ['top-right', 'topRight'],
+      ['top-right-stack', 'topRightStack'],
+      ['bottom-drawer', 'bottomDrawer'],
+    ],
+  )
+})
+
 test('viewer authoring host context helper defaults every optional flag to false', () => {
   assert.deepEqual(mod.createViewerAuthoringHostContext({}), {
     hasModel: false,
@@ -166,10 +187,10 @@ test('ViewerAuthoringHost component exposes a minimal internal prop contract', a
   assert.match(source, /export interface ViewerAuthoringHostSlots \{[\s\S]*topRightStack\?: ReactNode/)
   assert.match(source, /export interface ViewerAuthoringHostSlots \{[\s\S]*bottomDrawer\?: ReactNode/)
   assert.match(source, /slots\?: ViewerAuthoringHostSlots/)
-  assert.match(source, /const viewRail = renderViewerAuthoringHostSlot\(slots, 'viewRail'\)/)
-  assert.match(source, /const topRight = renderViewerAuthoringHostSlot\(slots, 'topRight'\)/)
-  assert.match(source, /const topRightStack = renderViewerAuthoringHostSlot\(slots, 'topRightStack'\)/)
-  assert.match(source, /const bottomDrawer = renderViewerAuthoringHostSlot\(slots, 'bottomDrawer'\)/)
+  assert.match(source, /const viewRail = renderViewerAuthoringHostSlot\([\s\S]*getViewerAuthoringHostSlotProp\('view-rail'\)/)
+  assert.match(source, /const topRight = renderViewerAuthoringHostSlot\([\s\S]*getViewerAuthoringHostSlotProp\('top-right'\)/)
+  assert.match(source, /const topRightStack = renderViewerAuthoringHostSlot\([\s\S]*getViewerAuthoringHostSlotProp\('top-right-stack'\)/)
+  assert.match(source, /const bottomDrawer = renderViewerAuthoringHostSlot\([\s\S]*getViewerAuthoringHostSlotProp\('bottom-drawer'\)/)
   assert.match(source, /<div className="relative w-full h-full bg-surface-400">[\s\S]*\{children\}[\s\S]*\{viewRail\}/)
   assert.match(source, /\{topRight \|\| topRightStack \? \([\s\S]*<div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-2">[\s\S]*\{topRight\}[\s\S]*\{topRightStack\}[\s\S]*<\/div>[\s\S]*\) : null\}/)
   assert.match(source, /\{bottomDrawer \? <div className="absolute inset-x-4 bottom-4 z-20">\{bottomDrawer\}<\/div> : null\}/)
@@ -185,7 +206,7 @@ test('ViewerAuthoringHost slot helper renders named internal slots without plugi
   const source = await viewerAuthoringHostComponentSource()
 
   assert.match(source, /export function renderViewerAuthoringHostSlot\(/)
-  assert.match(source, /slotName: keyof ViewerAuthoringHostSlots/)
+  assert.match(source, /slotName: ViewerAuthoringHostSlotProp/)
   assert.match(source, /return slots\?\.\[slotName\] \?\? null/)
   assert.equal(source.includes('eventBus'), false)
   assert.equal(source.includes('commandBus'), false)

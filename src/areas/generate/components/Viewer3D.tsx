@@ -14,6 +14,7 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast
 import { useGeneration } from '@shared/hooks/useGeneration'
 import { useAppStore } from '@shared/stores/appStore'
 import { ViewerToolbar, type ViewMode } from './ViewerToolbar'
+import { ViewerAuthoringHost } from './ViewerAuthoringHost'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 import {
@@ -401,10 +402,13 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     currentJob?.status === 'done' && currentJob.outputUrl
       ? `${apiUrl}${currentJob.outputUrl}`
       : null
-  const showViewToolbar = useMemo(() => resolveViewerAuthoringContributions(
+  const authoringHostContributions = useMemo(() => resolveViewerAuthoringContributions(
     DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
     { hasModel: !!modelUrl, meshSelected: selected, hasTransformTools: false },
-  ).some((contribution) => contribution.id === 'view-toolbar'), [modelUrl, selected])
+  ), [modelUrl, selected])
+  const showViewToolbar = authoringHostContributions.some(
+    (contribution) => contribution.id === 'view-toolbar',
+  )
 
   // Reset view state when model changes
   useEffect(() => {
@@ -442,8 +446,12 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
 
   return (
     <ModelErrorBoundary resetKey={modelUrl} fallback={<ModelLoadError />}>
-      <div className="relative w-full h-full bg-surface-400">
-        {!modelUrl && <EmptyState />}
+      <ViewerAuthoringHost
+        hasModel={!!modelUrl}
+        contributions={authoringHostContributions}
+      >
+        <div className="relative w-full h-full bg-surface-400">
+          {!modelUrl && <EmptyState />}
 
         <Canvas
           onPointerMissed={() => setSelected(false)}
@@ -547,7 +555,8 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
             </p>
           </div>
         )}
-      </div>
+        </div>
+      </ViewerAuthoringHost>
     </ModelErrorBoundary>
   )
 }

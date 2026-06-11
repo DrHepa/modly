@@ -1,6 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+
 import * as mod from './viewerAuthoringHost.ts'
+
+const viewerAuthoringHostComponentSource = () => readFile(
+  new URL('./components/ViewerAuthoringHost.tsx', import.meta.url),
+  'utf8',
+)
 
 test('host slots are explicit and stable through contribution descriptors', () => {
   assert.deepEqual(mod.VIEWER_AUTHORING_HOST_SLOTS, [
@@ -109,4 +116,16 @@ test('resolved host contributions do not expose an external plugin platform surf
   assert.equal('manifest' in resolved, false)
   assert.equal('permissions' in resolved, false)
   assert.equal('plugin' in resolved, false)
+})
+
+test('ViewerAuthoringHost component exposes a minimal internal prop contract', async () => {
+  const source = await viewerAuthoringHostComponentSource()
+
+  assert.match(source, /export interface ViewerAuthoringHostProps \{[\s\S]*children: ReactNode/)
+  assert.match(source, /export interface ViewerAuthoringHostProps \{[\s\S]*hasModel: boolean/)
+  assert.match(source, /export interface ViewerAuthoringHostProps \{[\s\S]*contributions: readonly ResolvedViewerAuthoringContribution\[\]/)
+  assert.equal(source.includes('createContext'), false)
+  assert.equal(source.includes('manifest'), false)
+  assert.equal(source.includes('plugin'), false)
+  assert.equal(source.includes('permissions'), false)
 })

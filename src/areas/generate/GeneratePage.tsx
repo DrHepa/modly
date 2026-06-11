@@ -8,6 +8,7 @@ import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
 import {
+  createViewerAuthoringHostContext,
   DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
   resolveViewerAuthoringContributions,
 } from './viewerAuthoringHost'
@@ -348,7 +349,7 @@ export default function GeneratePage(): JSX.Element {
   const hasModel = currentJob?.status === 'done' && !!currentJob.outputUrl
   const authoringContributions = useMemo(() => resolveViewerAuthoringContributions(
     DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
-    { hasModel, meshSelected, hasTransformTools: true },
+    createViewerAuthoringHostContext({ hasModel, meshSelected, hasTransformTools: true }),
   ), [hasModel, meshSelected])
   const showTransformToolbar = authoringContributions.some(
     (contribution) => contribution.id === 'transform-toolbar',

@@ -26,6 +26,37 @@ test('host slots are explicit and stable through contribution descriptors', () =
   )
 })
 
+test('viewer authoring host context helper defaults every optional flag to false', () => {
+  assert.deepEqual(mod.createViewerAuthoringHostContext({}), {
+    hasModel: false,
+    meshSelected: false,
+    hasTransformTools: false,
+  })
+})
+
+test('viewer authoring host context helper preserves explicit true flags', () => {
+  assert.deepEqual(mod.createViewerAuthoringHostContext({
+    hasModel: true,
+    meshSelected: true,
+    hasTransformTools: true,
+  }), {
+    hasModel: true,
+    meshSelected: true,
+    hasTransformTools: true,
+  })
+})
+
+test('viewer authoring host context helper keeps transform tools disabled unless explicitly enabled', () => {
+  assert.deepEqual(mod.createViewerAuthoringHostContext({
+    hasModel: true,
+    meshSelected: true,
+  }), {
+    hasModel: true,
+    meshSelected: true,
+    hasTransformTools: false,
+  })
+})
+
 test('hidden contributions are omitted when their visibility predicate is false', () => {
   const contributions = [
     {

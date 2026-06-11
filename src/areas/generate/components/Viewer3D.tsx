@@ -18,6 +18,7 @@ import { ViewerAuthoringHost } from './ViewerAuthoringHost'
 import type { LightSettings } from '../GeneratePage'
 import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 import {
+  createViewerAuthoringHostContext,
   DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
   resolveViewerAuthoringContributions,
 } from '../viewerAuthoringHost'
@@ -404,7 +405,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
       : null
   const authoringHostContributions = useMemo(() => resolveViewerAuthoringContributions(
     DEFAULT_VIEWER_AUTHORING_CONTRIBUTIONS,
-    { hasModel: !!modelUrl, meshSelected: selected, hasTransformTools: false },
+    createViewerAuthoringHostContext({ hasModel: !!modelUrl, meshSelected: selected }),
   ), [modelUrl, selected])
   const showViewToolbar = authoringHostContributions.some(
     (contribution) => contribution.id === 'view-toolbar',

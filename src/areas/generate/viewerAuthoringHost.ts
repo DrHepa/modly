@@ -21,6 +21,22 @@ export interface ViewerAuthoringHostContext {
   hasTransformTools: boolean
 }
 
+export interface ViewerAuthoringHostContextInput {
+  hasModel?: boolean
+  meshSelected?: boolean
+  hasTransformTools?: boolean
+}
+
+export function createViewerAuthoringHostContext(
+  input: ViewerAuthoringHostContextInput,
+): ViewerAuthoringHostContext {
+  return {
+    hasModel: input.hasModel ?? false,
+    meshSelected: input.meshSelected ?? false,
+    hasTransformTools: input.hasTransformTools ?? false,
+  }
+}
+
 export interface ViewerAuthoringContribution {
   id: ViewerAuthoringContributionId
   slot: ViewerAuthoringHostSlot

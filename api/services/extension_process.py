@@ -299,7 +299,7 @@ class ExtensionProcess:
             while True:
                 msg = self._recv_matching(
                     expected_types={"loaded", "unloaded", "error"},
-                    ignored_types={"runtime_readiness", "log"},
+                    ignored_types={"runtime_readiness", "ready", "log"},
                     timeout=None,
                     context="load",
                 )

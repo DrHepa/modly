@@ -32,6 +32,30 @@ def test_extension_process_load_ignores_queued_runtime_readiness_before_loaded(m
     assert process.is_loaded() is True
 
 
+def test_extension_process_load_ignores_stale_ready_before_loaded(monkeypatch, tmp_path):
+    process = ExtensionProcess(tmp_path, {"id": "hy-world-2/worldnav"})
+    sent: list[dict] = []
+    responses = iter([
+        {"type": "ready", "params_schema": []},
+        {"type": "loaded"},
+    ])
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+    monkeypatch.setattr(process, "_recv", lambda timeout=None: next(responses))
+
+    process.load()
+
+    assert sent == [{"action": "load"}]
+    assert process.is_loaded() is True
+
+
 def test_extension_process_readiness_ignores_stale_loaded_before_runtime_readiness(monkeypatch, tmp_path):
     process = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
     sent: list[dict] = []

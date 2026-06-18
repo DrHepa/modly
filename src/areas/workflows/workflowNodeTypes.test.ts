@@ -47,6 +47,16 @@ test('workflow nodeTypes maps landmarksNode to the LandmarksNode component', asy
   }
 })
 
+test('workflow nodeTypes maps sceneNode to the LoadSceneNode component', async () => {
+  const { module, cleanup } = await bundleModule(nodeTypesEntry, 'workflow-node-types-scene')
+
+  try {
+    assert.equal(module.WORKFLOW_NODE_TYPES.sceneNode?.name, 'LoadSceneNode')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('LandmarksNode renders basic beginner-friendly guidance copy', async () => {
   const { module, cleanup } = await bundleModule(landmarksNodeEntry, 'landmarks-node')
 

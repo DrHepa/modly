@@ -35,6 +35,7 @@ import {
   createBuiltinWorkflowNode,
 } from './workflowBuiltinNodeCatalog'
 import { WORKFLOW_NODE_TYPES } from './workflowNodeTypes'
+import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -52,14 +53,14 @@ const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFE
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
-const IO_STYLES: Record<'image' | 'text' | 'mesh' | 'audio', string> = {
-  audio: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
+const IO_STYLES: Record<ArtifactKind, string> = {
   image: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',
+  scene: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
   text:  'bg-amber-500/15 text-amber-400 border-amber-500/25',
 }
 
-function IoBadge({ type }: { type: 'image' | 'text' | 'mesh' | 'audio' }) {
+function IoBadge({ type }: { type: ArtifactKind }) {
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type]}`}>
       {type}

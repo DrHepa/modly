@@ -1,4 +1,4 @@
-export const ARTIFACT_KINDS = ['image', 'text', 'mesh'] as const
+export const ARTIFACT_KINDS = ['image', 'text', 'mesh', 'scene'] as const
 export const ARTIFACT_VERSION_ROLES = ['original', 'current', 'edited'] as const
 export const ARTIFACT_SUBSTITUTION_STATUSES = ['declared', 'applied', 'rejected'] as const
 export const ARTIFACT_REPLACEMENT_STATUSES = ['accepted', 'rejected', 'noop'] as const
@@ -50,6 +50,18 @@ export interface ArtifactSidecar {
   artifactId: string
   workspacePath: string
   metadata: Record<string, unknown>
+}
+
+export interface SceneArtifactManifestPreview {
+  image?: string
+  video?: string
+}
+
+export interface SceneArtifactManifestV1 {
+  schema: 'modly.scene-manifest.v1'
+  sceneRoot: string
+  preview?: SceneArtifactManifestPreview
+  assets: unknown[]
 }
 
 export interface ArtifactLineage {

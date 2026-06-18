@@ -40,7 +40,7 @@ if (!globalThis.localStorage) {
 }
 
 const { useAppStore } = await import(new URL('../../shared/stores/appStore.ts', import.meta.url).href)
-const { useWorkflowRunStore } = await import(new URL('./workflowRunStore.ts', import.meta.url).href)
+const { useWorkflowRunStore, buildModelGenerationRequest } = await import(new URL('./workflowRunStore.ts', import.meta.url).href)
 
 type AxiosClientMock = {
   post: (path: string, data?: unknown, config?: unknown) => Promise<unknown>
@@ -174,6 +174,13 @@ beforeEach(() => {
         deleteDirectory: async () => {},
         readFileBase64: async (filePath: string) => {
           fsReadCalls.push(filePath)
+          if (filePath.endsWith('/scene-manifest.json')) {
+            return Buffer.from(JSON.stringify({
+              schema: 'modly.scene-manifest.v1',
+              sceneRoot: '.',
+              assets: [],
+            }), 'utf8').toString('base64')
+          }
           return Buffer.from('fs-bytes').toString('base64')
         },
       },
@@ -1339,6 +1346,157 @@ test('workflowRunStore blocks model dispatch before backend requests when capabi
     assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
     assert.equal(useWorkflowRunStore.getState().runState.error, scenario.expectedError)
   }
+})
+
+test('buildModelGenerationRequest accepts scene model inputs as scene path params', () => {
+  const ext = createWorkflowExtension({
+    id: 'hy-world-2/worldstereo-2',
+    extensionId: 'hy-world-2',
+    nodeId: 'worldstereo-2',
+    type: 'model',
+    input: 'scene',
+    output: 'scene',
+  })
+  const node = createNode('worldstereo-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: { steps: 12 },
+  })
+
+  const request = buildModelGenerationRequest({
+    ext,
+    node,
+    nodeParams: { steps: 12 },
+    nodeInputPath: '/home/drhepa/Documentos/Modly/workspace/Default/worlds/scene.scene.json',
+    workspaceDir: '/home/drhepa/Documentos/Modly/workspace',
+  })
+
+  assert.equal(request.kind, 'scene')
+  assert.equal(request.scenePath, 'Default/worlds/scene.scene.json')
+  assert.deepEqual(request.params, {
+    steps: 12,
+    scene_path: 'Default/worlds/scene.scene.json',
+    input_scene_path: 'Default/worlds/scene.scene.json',
+  })
+})
+
+test('workflowRunStore dispatches scene-capability model nodes to /generate/from-scene as JSON without reading image bytes', async () => {
+  const ext = createWorkflowExtension({
+    id: 'hy-world-2/worldstereo-2',
+    extensionId: 'hy-world-2',
+    nodeId: 'worldstereo-2',
+    type: 'model',
+    input: 'scene',
+    output: 'scene',
+  })
+  const workflow: Workflow = {
+    id: 'workflow-scene-model',
+    name: 'Scene Dispatch Workflow',
+    description: '',
+    nodes: [
+      createNode('scene-source', 'sceneNode', {
+        enabled: true,
+        params: { path: 'Default/worlds/hero-scene' },
+      }),
+      createNode('scene-model-node', 'extensionNode', {
+        extensionId: ext.id,
+        enabled: true,
+        params: { steps: 12 },
+      }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-scene', source: 'scene-source', target: 'scene-model-node' },
+      { id: 'edge-output', source: 'scene-model-node', target: 'output-node' },
+    ],
+    createdAt: '2026-06-15T00:00:00.000Z',
+    updatedAt: '2026-06-15T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: Record<string, unknown>; config: unknown }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown, config?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown>, config })
+      return { data: { job_id: 'job-scene-1' } }
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/world.scene.json' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal(postCalls[0].path, '/generate/from-scene')
+  assert.deepEqual(postCalls[0].data, {
+    scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      steps: 12,
+      scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
+      input_scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
+    },
+  })
+  assert.equal(postCalls[0].config, undefined)
+  assert.deepEqual(fsReadCalls, ['/workspace/Default/worlds/hero-scene/scene-manifest.json'])
+  assert.equal(runProcessCalls.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/world.scene.json')
+  assert.deepEqual(useWorkflowRunStore.getState().nodeArtifacts['scene-source']?.legacy, {
+    filePath: '/workspace/Default/worlds/hero-scene/scene-manifest.json',
+    outputType: 'scene',
+  })
+})
+
+test('workflowRunStore sends Load Scene outputs to downstream scene process nodes without rerouting through image handling', async () => {
+  const ext = createWorkflowExtension({
+    id: 'hy-world-2/worldmirror-2',
+    extensionId: 'hy-world-2',
+    nodeId: 'worldmirror-2',
+    type: 'process',
+    input: 'scene',
+    output: 'mesh',
+  })
+  const workflow: Workflow = {
+    id: 'workflow-scene-process',
+    name: 'Scene Process Workflow',
+    description: '',
+    nodes: [
+      createNode('scene-source', 'sceneNode', { enabled: true, params: { path: 'Default/worlds/hero-scene' } }),
+      createNode('scene-process-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: { variant: 'mirror' } }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-scene', source: 'scene-source', target: 'scene-process-node' },
+      { id: 'edge-output', source: 'scene-process-node', target: 'output-node' },
+    ],
+    createdAt: '2026-06-17T00:00:00.000Z',
+    updatedAt: '2026-06-17T00:00:00.000Z',
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(fsReadCalls, ['/workspace/Default/worlds/hero-scene/scene-manifest.json'])
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0], {
+    extensionId: 'hy-world-2',
+    input: {
+      filePath: '/workspace/Default/worlds/hero-scene/scene-manifest.json',
+      text: undefined,
+      nodeId: 'worldmirror-2',
+    },
+    params: { variant: 'mirror' },
+  })
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore sends resolved process image-to-mesh nodes through runProcess', async () => {

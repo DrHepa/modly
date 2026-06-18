@@ -1,5 +1,5 @@
 // Type declarations for the Electron API exposed via preload
-import type { ArtifactRef, ArtifactSidecar } from './artifacts'
+import type { ArtifactKind, ArtifactRef, ArtifactSidecar } from './artifacts'
 import type { AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult } from './assetLibrary.ts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
@@ -16,6 +16,8 @@ export type {
   ArtifactVersion,
   ArtifactVersionRole,
   LegacyArtifactPayload,
+  SceneArtifactManifestPreview,
+  SceneArtifactManifestV1,
 } from './artifacts'
 
 export type {
@@ -46,8 +48,8 @@ import type {
 export interface ExtensionNode {
   id:               string
   name:             string
-  input:            'image' | 'text' | 'mesh'
-  output:           'image' | 'text' | 'mesh'
+  input:            ArtifactKind
+  output:           ArtifactKind
   inputs?:          ProcessPort[]
   paramsSchema:     RawParamSchema[]
   hfRepo?:          string
@@ -68,7 +70,7 @@ export interface CapabilityPauseMetadata {
 
 export interface CapabilitySubstitutionMetadata {
   supported: boolean
-  artifactKinds?: ('image' | 'text' | 'mesh')[]
+  artifactKinds?: ArtifactKind[]
   boundary?: 'ui_only' | 'electron'
   headless?: boolean
 }
@@ -91,12 +93,12 @@ export interface ModelOwnershipMetadata {
 export interface ProcessPort {
   name:     string
   label?:   string
-  type:     'image' | 'text' | 'mesh'
+  type:     ArtifactKind
   required?: boolean
 }
 
 export interface NamedProcessInput {
-  type:         'image' | 'text' | 'mesh'
+  type:         ArtifactKind
   filePath?:    string
   text?:        string
   sourceNodeId: string
@@ -324,7 +326,7 @@ export interface ProcessInput {
 export interface ProcessResult {
   filePath?: string
   text?:     string
-  outputType?: 'image' | 'text' | 'mesh'
+  outputType?: ArtifactKind
   artifact?: ArtifactRef
 }
 
@@ -914,8 +916,8 @@ export interface AutomationProcessCapability {
   builtin: boolean
   trusted: boolean
   entry: string
-  input?: 'image' | 'text' | 'mesh'
-  output?: 'image' | 'text' | 'mesh'
+  input?: ArtifactKind
+  output?: ArtifactKind
   inputs?: ProcessPort[]
   params_schema?: unknown
   automation?: CapabilityAutomationMetadata
@@ -997,6 +999,7 @@ declare global {
       fs: {
         selectImage:     () => Promise<string | null>
         selectMeshFile:  () => Promise<string | null>
+        selectSceneFile: () => Promise<string | null>
         saveModel:       (defaultName: string) => Promise<string | null>
         readFileBase64:  (filePath: string) => Promise<string>
         selectDirectory: (defaultPath?: string) => Promise<string | null>

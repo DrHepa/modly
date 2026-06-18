@@ -38,6 +38,7 @@ import {
   resolveArtifactReplacement,
   type LegacyWorkflowOutput,
 } from './workflowArtifacts.ts'
+import { resolveSceneSourceManifest } from './workflowSceneSource.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -488,6 +489,11 @@ type ModelGenerationRequest =
         params: Record<string, unknown>
       }
     }
+  | {
+      kind: 'scene'
+      scenePath: string
+      params: Record<string, unknown>
+    }
 
 const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
 
@@ -613,7 +619,7 @@ function resolveModelMeshRouting(args: {
   }
 }
 
-function buildModelGenerationRequest(args: {
+export function buildModelGenerationRequest(args: {
   ext: WorkflowExtension
   node: WFNode
   nodeParams: Record<string, unknown>
@@ -674,6 +680,23 @@ function buildModelGenerationRequest(args: {
         enable_texture: false,
         texture_resolution: 1024,
         params: textParams,
+      },
+    }
+  }
+
+  if (ext.input === 'scene') {
+    const activeScenePath = nodeInputPath
+    if (!activeScenePath) {
+      throw new Error(`Missing required scene input for extension ${ext.id}`)
+    }
+    const scenePath = normalizeWorkflowPath(activeScenePath, workspaceDir)
+    return {
+      kind: 'scene',
+      scenePath,
+      params: {
+        ...nodeParams,
+        scene_path: scenePath,
+        input_scene_path: scenePath,
       },
     }
   }
@@ -1286,6 +1309,22 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         } catch (err) {
           fail(String(err), 'Failed to read folder'); return
         }
+        if (node.type === 'sceneNode') {
+          const scenePath = node.data.params?.path as string | undefined
+          if (scenePath) {
+            const resolution = await resolveSceneSourceManifest({
+              scenePath,
+              workspaceDir,
+              readFileBase64: window.electron.fs.readFileBase64,
+            })
+            if (!resolution.ok) {
+              throw new Error(`Load Scene: ${resolution.error}`)
+            }
+            const output = { filePath: resolution.manifestAbsolutePath, outputType: 'scene' }
+            nodeOutputs.set(node.id, output)
+            rememberArtifactOutput(node.id, output)
+          }
+        }
       }
 
       // ── Loop table ─────────────────────────────────────────────────────────────
@@ -1580,26 +1619,35 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
           set((s) => ({ runState: { ...s.runState, blockProgress: 5, blockStep: 'Submitting to model…' } }))
 
-          const { data } = await (request.kind === 'image'
-            ? (async () => {
-              const base64 = request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)
-              const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-              const blob  = new Blob([bytes], { type: 'image/png' })
-              const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
-              const fd = new FormData()
-              fd.append('image', blob, fname)
-              fd.append('model_id', node.data.extensionId ?? '')
-              fd.append('collection', 'Workflows')
-              fd.append('remesh', 'none')
-              fd.append('enable_texture', 'false')
-              fd.append('texture_resolution', '1024')
-              fd.append('params', JSON.stringify(request.params))
-              return client.post<{ job_id: string }>(
-                '/generate/from-image', fd,
-                { headers: { 'Content-Type': 'multipart/form-data' } },
-              )
-            })()
-            : client.post<{ job_id: string }>('/generate/from-text', request.payload))
+          const { data } = await (request.kind === 'scene'
+            ? client.post<{ job_id: string }>('/generate/from-scene', {
+              scene_path: request.scenePath,
+              model_id: node.data.extensionId ?? '',
+              collection: 'Workflows',
+              remesh: 'none',
+              enable_texture: false,
+              texture_resolution: 1024,
+              params: request.params,
+            })
+            : request.kind === 'image'
+              ? (async () => {
+                const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
+                const blob  = new Blob([bytes], { type: 'image/png' })
+                const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
+                const fd = new FormData()
+                fd.append('image', blob, fname)
+                fd.append('model_id', node.data.extensionId ?? '')
+                fd.append('collection', 'Workflows')
+                fd.append('remesh', 'none')
+                fd.append('enable_texture', 'false')
+                fd.append('texture_resolution', '1024')
+                fd.append('params', JSON.stringify(request.params))
+                return client.post<{ job_id: string }>(
+                  '/generate/from-image', fd,
+                  { headers: { 'Content-Type': 'multipart/form-data' } },
+                )
+              })()
+              : client.post<{ job_id: string }>('/generate/from-text', request.payload))
           _activeJobId.current = data.job_id
 
           while (true) {

@@ -42,6 +42,21 @@ test('legacyOutputToArtifactRef adapts mesh and image file outputs without dropp
   })
 })
 
+test('legacyOutputToArtifactRef adapts scene manifest file outputs without coercing them to mesh', () => {
+  const scene = legacyOutputToArtifactRef(
+    { filePath: '/workspace/worlds/hero.scene.json', outputType: 'scene' },
+    { artifactId: 'artifact-scene', versionId: 'version-scene' },
+  )
+
+  assert.deepEqual(scene, {
+    id: 'artifact-scene',
+    kind: 'scene',
+    uri: '/workspace/worlds/hero.scene.json',
+    versionId: 'version-scene',
+    legacy: { filePath: '/workspace/worlds/hero.scene.json', outputType: 'scene' },
+  })
+})
+
 test('legacyOutputToArtifactRef adapts text outputs and ignores empty legacy outputs', () => {
   const text = legacyOutputToArtifactRef(
     { text: 'A small robot', outputType: 'text' },
@@ -81,6 +96,20 @@ test('artifactRefToLegacyOutput reconstructs legacy output when legacy payload i
   assert.deepEqual(artifactRefToLegacyOutput(ref), {
     filePath: '/workspace/output/generated.png',
     outputType: 'image',
+  })
+})
+
+test('artifactRefToLegacyOutput reconstructs manifest-backed scene outputs when legacy payload is absent', () => {
+  const ref: ArtifactRef = {
+    id: 'artifact-scene',
+    kind: 'scene',
+    uri: '/workspace/worlds/hero.scene.json',
+    versionId: 'version-scene',
+  }
+
+  assert.deepEqual(artifactRefToLegacyOutput(ref), {
+    filePath: '/workspace/worlds/hero.scene.json',
+    outputType: 'scene',
   })
 })
 

@@ -70,3 +70,22 @@ test('createBuiltinWorkflowNode initializes landmarksNode with the standard enab
     await cleanup()
   }
 })
+
+test('workflow built-in catalog exposes Load Scene with scene-focused copy', async () => {
+  const { module, cleanup } = await loadCatalogModule()
+
+  try {
+    const panelNodes = module.WORKFLOW_BUILTIN_PANEL_NODES as BuiltinCatalogNode[]
+    const paletteNodes = module.WORKFLOW_BUILTIN_PALETTE_NODES as BuiltinCatalogNode[]
+    const panelEntry = panelNodes.find((node) => node.type === 'sceneNode')
+    const paletteEntry = paletteNodes.find((node) => node.type === 'sceneNode')
+
+    assert.deepEqual(
+      [panelEntry?.label, paletteEntry?.label, module.WORKFLOW_BUILTIN_NODE_TYPES.includes('sceneNode')],
+      ['Load Scene', 'Load Scene', true],
+    )
+    assert.match(paletteEntry?.description ?? '', /scene manifest|scene directory/i)
+  } finally {
+    await cleanup()
+  }
+})

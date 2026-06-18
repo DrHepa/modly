@@ -2,6 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  ARTIFACT_KINDS,
+} from './artifacts.ts'
+import {
   ASSET_CAPABILITIES,
   ASSET_ENTRY_STATES,
   ASSET_LIBRARY_SOURCE_SCOPES,
@@ -27,6 +30,13 @@ test('declares the capability-first asset library taxonomy and entry states', ()
   assert.deepEqual(ASSET_LIBRARY_SOURCE_SCOPES, ['workflows', 'exports'])
   assert.deepEqual(ASSET_LIBRARY_PREVIEW_KINDS, ['3d-model', 'text', 'binary', 'none'])
   assert.deepEqual(ASSET_LIBRARY_MANIFEST_CAPABILITIES, ['generated-world', 'scene-manifest'])
+})
+
+test('keeps scene-manifest as a manifest capability while scene is an artifact kind', () => {
+  assert.ok(ARTIFACT_KINDS.includes('scene'))
+  assert.ok(!(ASSET_CAPABILITIES as readonly string[]).includes('scene'))
+  assert.ok(ASSET_CAPABILITIES.includes('scene-manifest'))
+  assert.ok(ASSET_LIBRARY_MANIFEST_CAPABILITIES.includes('scene-manifest'))
 })
 
 test('AssetLibraryEntry contracts keep manifest and source-link metadata explicit', () => {

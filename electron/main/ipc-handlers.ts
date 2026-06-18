@@ -373,6 +373,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     return result.canceled ? null : result.filePaths[0]
   })
 
+  ipcMain.handle('fs:selectSceneFile', async (event) => {
+    const win = getWindow()
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return null
+
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Select a scene manifest',
+      filters: [{ name: 'Scene manifest', extensions: ['json'] }],
+      properties: ['openFile']
+    })
+
+    if (getWindow() !== win || win.isDestroyed() || event.sender !== win.webContents) return null
+    return result.canceled ? null : result.filePaths[0] ?? null
+  })
+
   ipcMain.handle('fs:saveModel', async (_, defaultName: string) => {
     const win = getWindow()
     if (!win) return null

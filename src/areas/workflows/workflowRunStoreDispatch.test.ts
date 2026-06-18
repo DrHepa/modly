@@ -1350,6 +1350,77 @@ test('workflowRunStore blocks model dispatch before backend requests when capabi
   }
 })
 
+function sceneWorkflow(): { workflow: Workflow; ext: WorkflowExtension } {
+  const ext = createWorkflowExtension({ id: 'scene/model', extensionId: 'scene', nodeId: 'model', input: 'scene', output: 'scene', type: 'model' })
+  const workflow = createWorkflow(createNode('scene-model', 'extensionNode', { enabled: true, extensionId: ext.id, params: { steps: 12, flag: false, zero: 0, metadata: { opaque: ['preserved'] } } }))
+  workflow.nodes = [createNode('scene-source', 'sceneNode', { enabled: true, params: { path: 'Scenes/hero', manifestPath: 'stale/scene-manifest.json' } }), ...workflow.nodes.filter((node) => node.type !== 'imageNode')]
+  workflow.edges = [{ id: 'scene-model', source: 'scene-source', target: 'scene-model' }]
+  return { workflow, ext }
+}
+
+const validSceneBytes = (): string => Buffer.from(JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [], metadata: { opaque: true } })).toString('base64')
+
+test('runtime scene validation uses current path and typed from-artifact JSON without reading image bytes', async () => {
+  const { workflow, ext } = sceneWorkflow()
+  readFile = async () => validSceneBytes()
+  const requests: unknown[] = []
+  axiosClientMock = {
+    async post(path, body, config) { requests.push({ path, body: JSON.parse(JSON.stringify(body)), config }); return { data: { job_id: 'scene-job' } } },
+    async get() { return { data: { status: 'done', output_url: '/workspace/output/scene-manifest.json' } } },
+  }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.deepEqual(requests, [{ path: '/generate/from-artifact', body: { input_kind: 'scene', input_path: 'Scenes/hero/scene-manifest.json', model_id: ext.id, collection: 'Workflows', params: { steps: 12, flag: false, zero: 0, metadata: { opaque: ['preserved'] } } }, config: undefined }])
+  assert.deepEqual(fsReadCalls, ['/workspace/Scenes/hero/scene-manifest.json'])
+  assert.equal(runProcessCalls.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/output/scene-manifest.json')
+  assert.deepEqual(JSON.parse(JSON.stringify(useWorkflowRunStore.getState().nodeArtifacts['scene-source']?.legacy)), { filePath: '/workspace/Scenes/hero/scene-manifest.json', outputType: 'scene' })
+})
+
+test('runtime scene validation rejects invalid manifests instead of trusting cached validation', async () => {
+  const { workflow, ext } = sceneWorkflow()
+  readFile = async () => Buffer.from('{"schema":"wrong"}').toString('base64')
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Load Scene:.*schema/)
+  assert.deepEqual(fsReadCalls, ['/workspace/Scenes/hero/scene-manifest.json'])
+  assert.deepEqual(Object.keys(useWorkflowRunStore.getState().nodeArtifacts), [])
+  assert.equal(runProcessCalls.length, 0)
+})
+
+for (const operation of ['cancel', 'reset', 'replace'] as const) {
+  for (const outcome of ['resolve', 'reject'] as const) {
+    test(`late scene validation cannot resurrect a run after ${operation}/${outcome}`, async () => {
+      const { workflow, ext } = sceneWorkflow()
+      const gate = deferred<string>()
+      readFile = () => gate.promise
+      const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+      await waitFor(() => fsReadCalls.length === 1)
+      if (operation === 'replace') await useWorkflowRunStore.getState().run(checkpointWorkflow(), [])
+      else useWorkflowRunStore.getState()[operation]()
+      const state = useWorkflowRunStore.getState()
+      const job = appState.currentJob
+      const jobBytes = JSON.stringify(job)
+      if (outcome === 'resolve') gate.resolve(validSceneBytes())
+      else gate.reject(new Error('old read failed'))
+      await pending
+      assert.equal(useWorkflowRunStore.getState(), state)
+      assert.equal(appState.currentJob, job)
+      assert.equal(JSON.stringify(appState.currentJob), jobBytes)
+      assert.equal(runProcessCalls.length, 0)
+    })
+  }
+}
+
+test('Load Scene does not enable unsupported scene PROCESS dispatch before its own revision', async () => {
+  const { workflow, ext } = sceneWorkflow()
+  ext.type = 'process'; ext.output = 'mesh'
+  readFile = async () => validSceneBytes()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.deepEqual(fsReadCalls, ['/workspace/Scenes/hero/scene-manifest.json'])
+  assert.equal(runProcessCalls.length, 0)
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /unsupported scene/)
+})
+
 test('workflowRunStore sends resolved process image-to-mesh nodes through runProcess', async () => {
   const ext = createWorkflowExtension({
     id: 'vendor/image-to-mesh',
@@ -1962,17 +2033,18 @@ test('workspace-relative edited copies are materialized as absolute runtime PROC
 
 test('scene MODEL preserves from-artifact routing and outputPath through a manual boundary', async () => {
   const workflow = checkpointWorkflow()
-  workflow.nodes[0] = createNode('source', 'sceneNode', { enabled: true, params: { manifestPath: 'input/scene.json' } })
+  workflow.nodes[0] = createNode('source', 'sceneNode', { enabled: true, params: { path: 'input', manifestPath: 'input/scene-manifest.json' } })
+  readFile = async () => validSceneBytes()
   const ext = addProcess(workflow, 'model', 'wait')
   ext.type = 'model'; ext.input = 'scene'; ext.output = 'scene'
   const requests: any[] = []
   axiosClientMock = { async post(path, body) { requests.push(JSON.parse(JSON.stringify({ path, body }))); return { data: { job_id: 'scene' } } }, async get() { return { data: { status: 'done', output_url: '/workspace/final/scene.json' } } } }
   await useWorkflowRunStore.getState().run(workflow, [ext])
   await useWorkflowRunStore.getState().continueRun('wait')
-  assert.deepEqual(requests, [{ path: '/generate/from-artifact', body: { input_kind: 'scene', input_path: 'input/scene.json', model_id: ext.id, collection: 'Workflows', params: {} } }])
+  assert.deepEqual(requests, [{ path: '/generate/from-artifact', body: { input_kind: 'scene', input_path: 'input/scene-manifest.json', model_id: ext.id, collection: 'Workflows', params: {} } }])
   assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/final/scene.json')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
-  assert.deepEqual(fsReadCalls, [])
+  assert.deepEqual(fsReadCalls, ['/workspace/input/scene-manifest.json'])
 })
 
 test('unsupported scene PROCESS declaration remains rejected before dispatch', async () => {
@@ -2772,7 +2844,7 @@ test('mounted cancellation clears busy state and late rejection cannot clear a n
 // Original54: provenance is descriptive lineage, never a humanoid trust receipt.
 test('artifact adapter adds optional provenance without changing identity, legacy payload or absent behavior', () => {
   const provenance = { workflowId: 'workflow', workflowNodeId: 'node', extensionId: 'resolved', extensionNodeId: 'capability' }
-  for (const outputType of ['image', 'mesh', 'text']) {
+  for (const outputType of ['image', 'mesh', 'text', 'scene']) {
     const output = outputType === 'text' ? { text: '', outputType } : { filePath: `/workspace/result.${outputType}`, outputType }
     const original = legacyOutputToArtifactRef(output)!
     const described = legacyOutputToArtifactRef(output, { provenance })!
@@ -2783,7 +2855,7 @@ test('artifact adapter adds optional provenance without changing identity, legac
       ...original, id: 'run:node', versionId: 'run:node:2', provenance,
     })
   }
-  for (const absent of [undefined, {}, { outputType: 'mesh' }, { filePath: '/unsupported', outputType: 'unknown' }, { filePath: '/result.wav', outputType: 'audio' }, { filePath: '/result.mp4', outputType: 'video' }, { filePath: '/scene.json', outputType: 'scene' }]) {
+  for (const absent of [undefined, {}, { outputType: 'mesh' }, { outputType: 'scene' }, { filePath: '/unsupported', outputType: 'unknown' }, { filePath: '/result.wav', outputType: 'audio' }, { filePath: '/result.mp4', outputType: 'video' }]) {
     assert.equal(legacyOutputToArtifactRef(absent, { provenance }), undefined)
   }
   assert.equal(legacyOutputToArtifactRef({ text: 'legacy text', outputType: 'unknown' }, { provenance })?.kind, 'text')

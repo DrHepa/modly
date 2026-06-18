@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import test from 'node:test'
@@ -13,6 +14,10 @@ const landmarksNodeEntry = path.join(projectRoot, 'src/areas/workflows/nodes/Lan
 const landmarksNodeGuideEntry = path.join(projectRoot, 'src/areas/workflows/nodes/LandmarksNodeGuide.tsx')
 
 async function bundleModule(entry: string, _bundleName: string) {
+  // XYFlow's require condition is a UMD bundle; execute its canonical ESM entry.
+  const xyflowPath = fileURLToPath(import.meta.resolve('@xyflow/react'))
+  const xyflow = await import(xyflowPath)
+  const require = createRequire(import.meta.url)
   const result = await build({
     entryPoints: [entry], write: false, bundle: true, format: 'cjs', platform: 'node',
     tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
@@ -21,7 +26,7 @@ async function bundleModule(entry: string, _bundleName: string) {
   })
   const module = { exports: {} as any }
   vm.runInNewContext(result.outputFiles[0].text, {
-    module, exports: module.exports, require: createRequire(import.meta.url), console, process, Promise,
+    module, exports: module.exports, require: (id: string) => id === '@xyflow/react' ? xyflow : require(id), console, process, Promise,
     localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
   })
   return { module: module.exports, async cleanup() {} }
@@ -33,6 +38,16 @@ test('workflow nodeTypes maps landmarksNode to the LandmarksNode component', asy
   try {
     assert.equal(module.WORKFLOW_NODE_TYPES.landmarksNode?.name, 'LandmarksNode')
     assert.deepEqual(Object.keys(module.WORKFLOW_NODE_TYPES), ['extensionNode', 'imageNode', 'textNode', 'outputNode', 'meshNode', 'sceneNode', 'imagePreviewNode', 'previewImageNode', 'previewNode', 'landmarksNode', 'waitNode', 'whileNode', 'forEachNode'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('workflow nodeTypes maps sceneNode to the LoadSceneNode component', async () => {
+  const { module, cleanup } = await bundleModule(nodeTypesEntry, 'workflow-node-types-scene')
+
+  try {
+    assert.equal(module.WORKFLOW_NODE_TYPES.sceneNode?.name, 'LoadSceneNode')
   } finally {
     await cleanup()
   }

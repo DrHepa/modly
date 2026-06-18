@@ -6,6 +6,7 @@ import axios, { AxiosInstance } from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
 import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
+import { resolveSceneSourceManifest } from './workflowSceneSource'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadResult, RigMetaSidecarReadResult } from '@shared/types/electron.d'
@@ -1391,14 +1392,21 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             }
           }
           if (node.type === 'sceneNode') {
-            const manifestPath = node.data.params?.manifestPath as string | undefined
-            if (manifestPath) nodeOutputs.set(node.id, {
-              filePath: `${workspaceDir}/${manifestPath.replace(/^\/+/, '')}`,
-              outputType: 'scene',
+            // Revalidate the live source, never trust a persisted UI validation cache.
+            const resolution = await resolveSceneSourceManifest({
+              scenePath: typeof node.data.params?.path === 'string' ? node.data.params.path : '',
+              workspaceDir,
+              readFileBase64: window.electron.fs.readFileBase64,
             })
+            // Validation runs before a context exists. Its epoch must still own
+            // this run before either publishing an error or installing outputs.
+            if (epoch !== executionEpoch || _cancel.current) return
+            if (!resolution.ok) throw new Error(`Load Scene: ${resolution.error}`)
+            nodeOutputs.set(node.id, { filePath: resolution.manifestAbsolutePath, outputType: 'scene' })
           }
         }
 
+        if (epoch !== executionEpoch || _cancel.current) return
         const ctx: RunContext = {
           runId, epoch, jobId, checkpoints: new Map(), nodeArtifacts: new Map(), outputRevisions: new Map(), checkpointRevision: 0, reviewRequests: new Map(),
           workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,

@@ -15,7 +15,24 @@ import type {
 } from './artifacts.ts'
 
 test('declares the artifact kinds supported by workflow artifact refs', () => {
-  assert.deepEqual(ARTIFACT_KINDS, ['image', 'text', 'mesh'])
+  assert.deepEqual(ARTIFACT_KINDS, ['image', 'text', 'mesh', 'scene'])
+})
+
+test('scene artifacts are manifest-file backed legacy outputs', () => {
+  const sceneArtifact = {
+    id: 'scene-asset',
+    kind: 'scene',
+    uri: '/workspace/Worlds/hero.scene.json',
+    versionId: 'scene-asset-v1',
+    legacy: { filePath: '/workspace/Worlds/hero.scene.json', outputType: 'scene' },
+  } satisfies ArtifactRef
+
+  assert.equal(sceneArtifact.kind, 'scene')
+  assert.equal(sceneArtifact.uri, '/workspace/Worlds/hero.scene.json')
+  assert.deepEqual(sceneArtifact.legacy, {
+    filePath: '/workspace/Worlds/hero.scene.json',
+    outputType: 'scene',
+  })
 })
 
 test('declares version roles and substitution statuses for lineage contracts', () => {

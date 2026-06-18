@@ -1,5 +1,5 @@
 // Type declarations for the Electron API exposed via preload
-import type { ArtifactRef, ArtifactSidecar } from './artifacts'
+import type { ArtifactKind, ArtifactRef, ArtifactSidecar } from './artifacts'
 import type { AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult } from './assetLibrary.ts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
@@ -16,6 +16,8 @@ export type {
   ArtifactVersion,
   ArtifactVersionRole,
   LegacyArtifactPayload,
+  SceneArtifactManifestPreview,
+  SceneArtifactManifestV1,
 } from './artifacts'
 
 export type {
@@ -67,7 +69,7 @@ export interface CapabilityPauseMetadata {
 
 export interface CapabilitySubstitutionMetadata {
   supported: boolean
-  artifactKinds?: ('image' | 'text' | 'mesh')[]
+  artifactKinds?: ArtifactKind[]
   boundary?: 'ui_only' | 'electron'
   headless?: boolean
 }
@@ -1026,6 +1028,7 @@ declare global {
         getPathForFile:  (file: File) => string
         selectImage:     () => Promise<string | null>
         selectMeshFile:  () => Promise<string | null>
+        selectSceneFile: () => Promise<string | null>
         saveModel:       (defaultName: string) => Promise<string | null>
         readFileBase64:  (filePath: string) => Promise<string>
         selectDirectory: (defaultPath?: string) => Promise<string | null>

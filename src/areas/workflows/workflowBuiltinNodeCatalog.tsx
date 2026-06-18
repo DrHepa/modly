@@ -26,7 +26,7 @@ export const WORKFLOW_BUILTIN_PALETTE_NODES = [
   { type: 'imageNode', label: 'Image', color: '#38bdf8', description: 'Image input' },
   { type: 'textNode', label: 'Text', color: '#fbbf24', description: 'Text input' },
   { type: 'meshNode', label: 'Load 3D Mesh', color: '#a78bfa', description: 'Load a 3D mesh file or use current model' },
-  { type: 'sceneNode', label: 'Load Scene', color: '#f472b6', description: 'Load and validate a workspace scene directory' },
+  { type: 'sceneNode', label: 'Load Scene', color: '#f472b6', description: 'Load and validate a workspace scene manifest or directory' },
   { type: 'outputNode', label: 'Add to Scene', color: '#a78bfa', description: 'Output node — adds the mesh to the 3D scene' },
   { type: PREVIEW_IMAGE_NODE_TYPE, label: PREVIEW_IMAGE_TITLE, color: '#38bdf8', description: 'Displays a single upstream image output' },
   { type: PREVIEW_VIEWS_NODE_TYPE, label: PREVIEW_VIEWS_TITLE, color: '#38bdf8', description: 'Displays multi-view image strips in a 2×3 grid' },

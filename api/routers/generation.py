@@ -1,15 +1,18 @@
 import re as _re
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
-from schemas.generation import GenerateFromTextRequest
+from schemas.generation import GenerateFromSceneRequest, GenerateFromTextRequest
 from services.generator_registry import generator_registry
 from services.generation_jobs import (
     cancel_job as cancel_generation_job,
     create_from_image_job,
+    create_from_scene_job,
     create_from_text_job,
     get_job_status,
     parse_params_object,
+    resolve_validated_scene_manifest_path,
     validate_image_upload,
+    validate_scene_manifest_path,
     validate_model_id,
 )
 
@@ -86,6 +89,36 @@ async def generate_from_text(
     }
 
     job = create_from_text_job(background_tasks, prompt, full_params, collection)
+    return {"job_id": job.job_id}
+
+
+@router.post("/from-scene")
+async def generate_from_scene(
+    payload: GenerateFromSceneRequest,
+    background_tasks: BackgroundTasks,
+):
+    if payload.remesh not in ("quad", "triangle", "none"):
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+
+    collection = sanitize_collection_name(payload.collection)
+    model_id = payload.model_id.strip()
+    validate_model_id(model_id)
+    scene_path = validate_scene_manifest_path(payload.scene_path)
+    scene_manifest_path = resolve_validated_scene_manifest_path(scene_path)
+
+    generator_registry.switch_model(model_id)
+
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+        "scene_manifest_path": str(scene_manifest_path),
+        "scene_path": scene_path,
+        "input_scene_path": scene_path,
+    }
+
+    job = create_from_scene_job(background_tasks, full_params, collection)
     return {"job_id": job.job_id}
 
 

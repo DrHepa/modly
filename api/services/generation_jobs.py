@@ -5,7 +5,7 @@ import logging
 import threading
 import traceback
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Optional, Tuple
 
 from fastapi import BackgroundTasks, HTTPException, UploadFile
@@ -21,6 +21,7 @@ _cancel_events: Dict[str, threading.Event] = {}
 _last_logged_snapshots: Dict[str, Tuple[str, int, Optional[str]]] = {}
 _log_lock = threading.Lock()
 _generation_logger = logging.getLogger("modly.generation.jobs")
+SCENE_MANIFEST_SCHEMA = "modly.scene-manifest.v1"
 
 
 def _log_job_progress(job: JobStatus) -> bool:
@@ -84,6 +85,14 @@ def create_from_text_job(background_tasks: BackgroundTasks, prompt: str, params:
     return create_generation_job(
         background_tasks,
         prompt=prompt,
+        params=params,
+        collection=collection,
+    )
+
+
+def create_from_scene_job(background_tasks: BackgroundTasks, params: dict, collection: str = "Default") -> JobStatus:
+    return create_generation_job(
+        background_tasks,
         params=params,
         collection=collection,
     )
@@ -165,6 +174,51 @@ def parse_params_object(params: Optional[str], *, strict: bool) -> dict:
     return parsed
 
 
+def validate_scene_manifest_path(scene_path: str) -> str:
+    candidate = scene_path.strip().replace("\\", "/")
+    if not candidate:
+        raise HTTPException(400, "scene_path is required")
+
+    posix_path = PurePosixPath(candidate)
+    windows_path = PureWindowsPath(candidate)
+    if posix_path.is_absolute() or windows_path.is_absolute():
+        raise HTTPException(400, "scene_path must be workspace-relative")
+
+    if posix_path.suffix.lower() != ".json":
+        raise HTTPException(400, "scene_path must reference a .json scene manifest")
+
+    if any(part == ".." for part in posix_path.parts):
+        raise HTTPException(400, "scene_path must not traverse outside the workspace")
+
+    workspace_root = WORKSPACE_DIR.resolve()
+    scene_file = (workspace_root / posix_path).resolve()
+    if workspace_root != scene_file and workspace_root not in scene_file.parents:
+        raise HTTPException(400, "scene_path must stay within the workspace")
+    if not scene_file.exists() or not scene_file.is_file():
+        raise HTTPException(404, "scene_path was not found in the workspace")
+
+    try:
+        manifest = json.loads(scene_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "scene_path must reference a valid JSON scene manifest") from exc
+
+    if not isinstance(manifest, dict):
+        raise HTTPException(400, "scene manifest must be a JSON object")
+    if manifest.get("schema") != SCENE_MANIFEST_SCHEMA:
+        raise HTTPException(400, f"scene manifest schema must be {SCENE_MANIFEST_SCHEMA}")
+
+    scene_root = manifest.get("sceneRoot")
+    if not isinstance(scene_root, str) or not scene_root.strip():
+        raise HTTPException(400, "scene manifest sceneRoot is required")
+
+    return scene_file.relative_to(workspace_root).as_posix()
+
+
+def resolve_validated_scene_manifest_path(scene_path: str) -> Path:
+    workspace_relative = validate_scene_manifest_path(scene_path)
+    return (WORKSPACE_DIR.resolve() / workspace_relative).resolve()
+
+
 def get_workspace_path(output_path: Path) -> Optional[str]:
     try:
         return output_path.relative_to(WORKSPACE_DIR).as_posix()
@@ -194,11 +248,23 @@ def build_scene_candidate(output_path: Optional[Path], collection: str = "Defaul
 
     output_url = build_output_url(output_path, collection)
     return SceneCandidate(
-        kind="mesh",
+        kind="scene" if is_scene_manifest_path(output_path) else "mesh",
         workspace_path=workspace_path,
         output_url=output_url,
         display_name=output_path.name,
     )
+
+
+def is_scene_manifest_path(output_path: Path) -> bool:
+    if output_path.suffix.lower() != ".json":
+        return False
+
+    try:
+        manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    return isinstance(manifest, dict) and manifest.get("schema") == SCENE_MANIFEST_SCHEMA
 
 
 async def _run_generation(

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import json
 
 
 def assert_backend_ready(client) -> None:
@@ -103,6 +104,169 @@ def test_generate_from_text_rejects_missing_or_blank_prompt_without_creating_job
     assert blank_prompt_response.status_code == 400
     assert api_modules["generation_jobs"]._jobs == {}
 
+
+def test_generate_from_scene_validates_workspace_relative_scene_manifest_and_creates_job(client, api_modules, monkeypatch):
+    assert_backend_ready(client)
+
+    scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero.scene.json"
+    scene_manifest.parent.mkdir(parents=True)
+    scene_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "modly.scene-manifest.v1",
+                "sceneRoot": "Worlds/hero",
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+    original_generate = api_modules["fake_generator"].generate
+
+    def capture_generate(image_bytes: bytes, params: dict, progress_cb=None, cancel_event=None):
+        captured["image_bytes"] = image_bytes
+        captured["params"] = dict(params)
+        return original_generate(image_bytes, params, progress_cb, cancel_event)
+
+    monkeypatch.setattr(api_modules["fake_generator"], "generate", capture_generate)
+
+    create_response = client.post(
+        "/generate/from-scene",
+        json={
+            "scene_path": "Worlds/hero.scene.json",
+            "model_id": api_modules["valid_model_id"],
+            "collection": "SceneRuns",
+            "remesh": "none",
+            "enable_texture": False,
+            "texture_resolution": 2048,
+            "params": {"steps": 12, "filename": "hero-scene.glb"},
+        },
+    )
+
+    assert create_response.status_code == 200
+    create_body = create_response.json()
+    assert create_body["job_id"]
+
+    status_response = client.get(f"/generate/status/{create_body['job_id']}")
+
+    assert status_response.status_code == 200
+    assert status_response.json()["output_url"] == "/workspace/SceneRuns/hero-scene.glb"
+    assert captured == {
+        "image_bytes": b"",
+        "params": {
+            "remesh": "none",
+            "enable_texture": False,
+            "texture_resolution": 2048,
+            "steps": 12,
+            "filename": "hero-scene.glb",
+            "scene_manifest_path": str(scene_manifest.resolve()),
+            "scene_path": "Worlds/hero.scene.json",
+            "input_scene_path": "Worlds/hero.scene.json",
+        },
+    }
+
+
+def test_generate_from_scene_rejects_absolute_traversal_and_invalid_manifest_paths(client, api_modules):
+    assert_backend_ready(client)
+
+    absolute_response = client.post(
+        "/generate/from-scene",
+        json={
+            "scene_path": "/tmp/hero.scene.json",
+            "model_id": api_modules["valid_model_id"],
+        },
+    )
+    assert absolute_response.status_code == 400
+    assert absolute_response.json()["detail"] == "scene_path must be workspace-relative"
+
+    traversal_response = client.post(
+        "/generate/from-scene",
+        json={
+            "scene_path": "../hero.scene.json",
+            "model_id": api_modules["valid_model_id"],
+        },
+    )
+    assert traversal_response.status_code == 400
+    assert traversal_response.json()["detail"] == "scene_path must not traverse outside the workspace"
+
+    missing_response = client.post(
+        "/generate/from-scene",
+        json={
+            "scene_path": "Worlds/missing.scene.json",
+            "model_id": api_modules["valid_model_id"],
+        },
+    )
+    assert missing_response.status_code == 404
+    assert missing_response.json()["detail"] == "scene_path was not found in the workspace"
+
+    invalid_scene_manifest = api_modules["workspace_dir"] / "Worlds" / "invalid.scene.json"
+    invalid_scene_manifest.parent.mkdir(parents=True)
+    invalid_scene_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "modly.scene-manifest.v0",
+                "sceneRoot": "",
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    invalid_response = client.post(
+        "/generate/from-scene",
+        json={
+            "scene_path": "Worlds/invalid.scene.json",
+            "model_id": api_modules["valid_model_id"],
+        },
+    )
+    assert invalid_response.status_code == 400
+    assert invalid_response.json()["detail"] == "scene manifest schema must be modly.scene-manifest.v1"
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+def test_build_scene_candidate_detects_scene_manifest_outputs(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero.scene.json"
+    scene_manifest.parent.mkdir(parents=True)
+    scene_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "modly.scene-manifest.v1",
+                "sceneRoot": "Worlds/hero",
+                "preview": {"image": "Worlds/hero/panorama.png"},
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidate = generation_jobs.build_scene_candidate(scene_manifest)
+
+    assert candidate is not None
+    assert candidate.model_dump() == {
+        "kind": "scene",
+        "workspace_path": "Worlds/hero.scene.json",
+        "output_url": "/workspace/Worlds/hero.scene.json",
+        "display_name": "hero.scene.json",
+    }
+
+
+def test_build_scene_candidate_keeps_mesh_outputs_as_mesh(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    mesh_output = api_modules["workspace_dir"] / "Meshes" / "hero.glb"
+    mesh_output.parent.mkdir(parents=True)
+    mesh_output.write_bytes(b"glb")
+
+    candidate = generation_jobs.build_scene_candidate(mesh_output)
+
+    assert candidate is not None
+    assert candidate.model_dump() == {
+        "kind": "mesh",
+        "workspace_path": "Meshes/hero.glb",
+        "output_url": "/workspace/Meshes/hero.glb",
+        "display_name": "hero.glb",
+    }
 
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry

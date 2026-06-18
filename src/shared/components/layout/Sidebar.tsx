@@ -24,6 +24,19 @@ const NAV_ITEMS: { id: Page; label: string; icon: JSX.Element }[] = [
     )
   },
   {
+    id: 'worlds',
+    label: 'Worlds',
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <circle cx="12" cy="12" r="8.5" />
+        <path d="M3.8 9.5h16.4" />
+        <path d="M3.8 14.5h16.4" />
+        <path d="M12 3.5c2.2 2.35 3.3 5.18 3.3 8.5s-1.1 6.15-3.3 8.5" />
+        <path d="M12 3.5C9.8 5.85 8.7 8.68 8.7 12s1.1 6.15 3.3 8.5" />
+      </svg>
+    )
+  },
+  {
     id: 'models',
     label: 'Extensions',
     icon: (

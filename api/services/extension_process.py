@@ -364,8 +364,9 @@ class ExtensionProcess:
             while True:
                 msg = self._recv(timeout=None)  # model load can be arbitrarily slow
                 # A cooperative unload may time out before its acknowledgement
-                # arrives. It does not confirm this load, nor does startup ready.
-                if msg.get("type") == "unloaded":
+                # arrives. Ignore it and stale startup ready; neither confirms
+                # this load. Only loaded from the same live worker can do that.
+                if msg.get("type") in {"unloaded", "ready"}:
                     continue
                 if msg.get("type") == "loaded":
                     if proc is None or self._proc is not proc or proc.poll() is not None:

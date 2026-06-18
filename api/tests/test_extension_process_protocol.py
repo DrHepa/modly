@@ -57,21 +57,35 @@ def test_extension_process_load_ignores_multiple_stale_unloaded_acks(
 
 
 @pytest.mark.parametrize("stale_ack", [False, True])
-def test_extension_process_load_rejects_ready_without_loaded(
+def test_extension_process_load_does_not_accept_ready_without_loaded(
     monkeypatch, load_process, stale_ack
 ):
     process, sent = load_process
     process._loaded = True
+    waits = []
+
+    class ObservedQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            assert not process._loaded and not process.is_loaded()
+            assert process._invocation_lock.locked()
+            waits.append(timeout)
+            # Fail immediately if the bounded fixture exhausts its replies.
+            return super().get(block=False)
+
+    process._queue = ObservedQueue()
     if stale_ack:
         process._queue.put({"type": "unloaded"})
-    send_load_reply(monkeypatch, process, sent, {"type": "ready"})
+    # EOF terminates the ready-only load without relying on a test timeout.
+    send_load_reply(monkeypatch, process, sent, {"type": "ready"}, None)
 
-    with pytest.raises(RuntimeError, match="Unexpected response to load.*ready"):
+    with pytest.raises(RuntimeError, match="Subprocess died unexpectedly"):
         process.load()
 
     assert sent == [{"action": "load"}]
+    assert waits == [None] * (3 if stale_ack else 2)
     assert not process._loaded and not process.is_loaded()
     assert process._queue.empty()
+    assert not process._invocation_lock.locked()
 
 
 @pytest.mark.parametrize(
@@ -233,18 +247,93 @@ def test_extension_process_load_preserves_unbounded_wait_after_stale_acks(
     assert process.is_loaded()
 
 
-def test_extension_process_ready_does_not_consume_later_loaded_ack(monkeypatch, load_process):
+@pytest.mark.parametrize("stale_count", [1, 3])
+def test_extension_process_load_ignores_stale_ready_before_loaded(
+    monkeypatch, load_process, stale_count
+):
     process, sent = load_process
-    send_load_reply(monkeypatch, process, sent, {"type": "ready"}, {"type": "loaded"})
+    worker, schema = process._proc, process._params_schema
+    waits = []
 
-    with pytest.raises(RuntimeError, match="Unexpected response to load.*ready"):
+    class ObservedQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            assert not process._loaded and not process.is_loaded()
+            assert process._invocation_lock.locked()
+            waits.append(timeout)
+            return super().get(block=False)
+
+    process._queue = ObservedQueue()
+    stale = [reply for _ in range(stale_count) for reply in (
+        {"type": "ready", "params_schema": [{"name": "stale"}]},
+        {"type": "unloaded"},
+    )]
+    send_load_reply(monkeypatch, process, sent, *stale, {"type": "loaded"})
+
+    process.load()
+
+    assert sent == [{"action": "load"}]
+    assert process._proc is worker and process.is_loaded()
+    assert process._params_schema is schema
+    assert waits == [None] * (2 * stale_count + 1)
+    assert process._queue.empty()
+    assert not process._invocation_lock.locked()
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        ({"type": "error", "traceback": "ready load traceback", "message": "short"}, "ready load traceback"),
+        ({"type": "error", "message": "ready load message"}, "ready load message"),
+    ],
+)
+def test_extension_process_load_propagates_error_after_stale_ready(
+    monkeypatch, load_process, error, expected
+):
+    process, sent = load_process
+    process._loaded = True
+    send_load_reply(monkeypatch, process, sent, {"type": "ready"}, error, None)
+
+    with pytest.raises(RuntimeError, match=expected):
         process.load()
 
-    assert not process.is_loaded()
-    # Ordinary acknowledgements have no request ID. This remaining frame is not
-    # claimed to be distinguishable from a later request's reply on this worker.
-    assert process._queue.get_nowait() == {"type": "loaded"}
+    assert sent == [{"action": "load"}]
+    assert not process._loaded and not process.is_loaded()
+    assert process._queue.get_nowait() is None and process._queue.empty()
+    assert not process._invocation_lock.locked()
+
+
+@pytest.mark.parametrize("change", ["died", "replaced"])
+def test_extension_process_load_checks_worker_after_stale_ready(
+    monkeypatch, load_process, change
+):
+    process, sent = load_process
+    worker = process._proc
+    seen = []
+
+    class ChangedWorkerQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            assert not process._loaded and process._invocation_lock.locked()
+            assert timeout is None
+            reply = super().get(block=False)
+            seen.append(reply["type"])
+            if reply["type"] == "loaded":
+                if change == "died":
+                    worker.dead = True
+                else:
+                    process._proc = InertWorker()
+            return reply
+
+    process._queue = ChangedWorkerQueue()
+    send_load_reply(monkeypatch, process, sent, {"type": "ready"}, {"type": "loaded"})
+
+    with pytest.raises(RuntimeError, match="worker changed or stopped"):
+        process.load()
+
+    assert seen == ["ready", "loaded"]
+    assert sent == [{"action": "load"}]
+    assert not process._loaded and not process.is_loaded()
     assert process._queue.empty()
+    assert not process._invocation_lock.locked()
 
 
 @pytest.fixture(params=["image", "artifact"])

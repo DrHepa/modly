@@ -107,7 +107,7 @@ test('validateInstallManifest accepts scene IO without rejecting third-party art
   }
 })
 
-test('scene is model-only, single-input, while image-multi to scene stays valid', () => {
+test('scene PROCESS ports are supported while MODEL remains single-input', () => {
   const mod = loadModule()
   const modelFiles = { hasEntryFile: () => false, hasGeneratorFile: () => true }
   const processFiles = { hasEntryFile: () => true, hasGeneratorFile: () => false }
@@ -121,8 +121,10 @@ test('scene is model-only, single-input, while image-multi to scene stays valid'
   for (const node of [
     { id: 'input', input: 'scene', output: 'mesh' },
     { id: 'output', input: 'image', output: 'scene' },
+    { id: 'positional', inputs: ['scene', 'text', 'scene'], output: 'scene' },
+    { id: 'named', inputs: [{ name: 'world', type: 'scene' }, { name: 'extra', type: 'scene', required: false }], output: 'scene' },
   ]) {
-    assert.throws(() => mod.validateInstallManifest({ id: 'proc', type: 'process', entry: 'processor.js', nodes: [node] }, processFiles, 'repository'), /scene.*model|model.*scene/i)
+    assert.equal(mod.validateInstallManifest({ id: 'proc', type: 'process', entry: 'processor.js', nodes: [node] }, processFiles, 'repository').isProcess, true)
   }
   assert.doesNotThrow(() => mod.validateInstallManifest({
     id: 'images-to-scene', generator_class: 'Generator',
@@ -506,4 +508,3 @@ test('validateInstallManifest validates weight variants and keeps them off proce
     nodes: [{ id: 'run', hf_repo: 'org/model', weight_variants: weightVariants }],
   }, files, 'repository'), /weight_variants is supported only for model nodes/)
 })
-

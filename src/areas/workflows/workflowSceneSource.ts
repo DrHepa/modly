@@ -150,7 +150,7 @@ function normalizeSceneRoot(sceneRoot: unknown): string | undefined {
   return isSafeRelativePath(sceneRoot, true) ? sceneRoot.replace(/\\/g, '/') : undefined
 }
 
-function validateSceneManifest(manifest: unknown): { ok: true; manifest: SceneArtifactManifestV1; sceneRoot: string } | { ok: false; error: string } {
+export function validateSceneManifest(manifest: unknown): { ok: true; manifest: SceneArtifactManifestV1; sceneRoot: string } | { ok: false; error: string } {
   if (!isPlainObject(manifest)) {
     return { ok: false, error: 'Scene manifest must be a JSON object.' }
   }

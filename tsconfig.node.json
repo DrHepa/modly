@@ -26,6 +26,8 @@
     "src/areas/generate/rigEffectiveNaming.ts",
     "src/areas/generate/rigMetaNaming.ts",
     "src/areas/generate/rigRenamePlan.ts",
-    "src/areas/generate/poseClipPlan.ts"
+    "src/areas/generate/poseClipPlan.ts",
+    "src/areas/workflows/workflowSceneSource.ts",
+    "src/areas/workflows/processPorts.ts"
   ]
 }

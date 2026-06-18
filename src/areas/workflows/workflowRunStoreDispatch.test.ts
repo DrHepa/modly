@@ -1411,14 +1411,17 @@ for (const operation of ['cancel', 'reset', 'replace'] as const) {
   }
 }
 
-test('Load Scene does not enable unsupported scene PROCESS dispatch before its own revision', async () => {
+test('Load Scene dispatches PROCESS with canonical scene input and producer identity', async () => {
   const { workflow, ext } = sceneWorkflow()
   ext.type = 'process'; ext.output = 'mesh'
   readFile = async () => validSceneBytes()
   await useWorkflowRunStore.getState().run(workflow, [ext])
   assert.deepEqual(fsReadCalls, ['/workspace/Scenes/hero/scene-manifest.json'])
-  assert.equal(runProcessCalls.length, 0)
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /unsupported scene/)
+  assert.equal(runProcessCalls.length, 1)
+  assert.deepEqual(runProcessCalls[0].input, { nodeId: ext.nodeId, filePath: '/workspace/Scenes/hero/scene-manifest.json', inputs: {
+    'input-0': { type: 'scene', filePath: '/workspace/Scenes/hero/scene-manifest.json', sourceNodeId: 'scene-source' },
+  } })
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore sends resolved process image-to-mesh nodes through runProcess', async () => {
@@ -2047,13 +2050,16 @@ test('scene MODEL preserves from-artifact routing and outputPath through a manua
   assert.deepEqual(fsReadCalls, ['/workspace/input/scene-manifest.json'])
 })
 
-test('unsupported scene PROCESS declaration remains rejected before dispatch', async () => {
+test('scene PROCESS output survives Wait continuation with declared scene provenance', async () => {
   const workflow = checkpointWorkflow()
   const ext = addProcess(workflow, 'process', 'wait'); ext.output = 'scene'
+  processResult = async () => ({ success: true, result: { filePath: '/workspace/output/scene-manifest.json' } })
   await useWorkflowRunStore.getState().run(workflow, [ext])
   await useWorkflowRunStore.getState().continueRun('wait')
-  assert.equal(runProcessCalls.length, 0)
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /unsupported scene/)
+  assert.equal(runProcessCalls.length, 1)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/output/scene-manifest.json')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
 })
 
 test('audio PROCESS input remains an audio path and is never coerced into checkpoint mesh', async () => {
@@ -3162,3 +3168,115 @@ test('workflowRunStore keeps final viewer identity and drops stale artifact meta
     })
   } finally { useAppStore.setState(before, true) }
 })
+
+test('actual store preserves repeated scene slots, text index and scene provenance without image fallback contamination', async () => {
+  const { workflow, ext } = sceneWorkflow()
+  ext.type = 'process'; ext.inputs = ['scene', 'text', 'scene']; ext.output = 'scene'
+  workflow.nodes.push(createNode('scene-b', 'sceneNode', { enabled: true, params: { path: 'Scenes/b', manifestPath: 'Scenes/b/scene-manifest.json' } }),
+    createNode('prompt', 'textNode', { enabled: true, params: { text: 'combine' } }))
+  workflow.edges = [
+    { id: 'b', source: 'scene-b', target: 'scene-model', targetHandle: 'input-2' },
+    { id: 'a', source: 'scene-source', target: 'scene-model', targetHandle: 'input-0' },
+    { id: 't', source: 'prompt', target: 'scene-model', targetHandle: 'input-1' },
+  ]
+  readFile = async () => validSceneBytes()
+  processResult = async () => ({ success: true, result: { filePath: '/workspace/result/scene-manifest.json', outputType: 'scene' } })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  const input = runProcessCalls[0].input as any
+  assert.deepEqual(input.inputs, {
+    'input-0': { type: 'scene', filePath: '/workspace/Scenes/hero/scene-manifest.json', sourceNodeId: 'scene-source' },
+    'input-1': { type: 'text', text: 'combine', sourceNodeId: 'prompt' },
+    'input-2': { type: 'scene', filePath: '/workspace/Scenes/b/scene-manifest.json', sourceNodeId: 'scene-b' },
+  })
+  assert.equal(input.filePath, '/workspace/Scenes/hero/scene-manifest.json')
+  assert.deepEqual(input.texts, [null, 'combine']) // JSON IPC fixture retains the legacy sparse texts array.
+  assert.equal(runProcessCalls[0].params.extra_image_paths, undefined)
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
+})
+
+for (const boundary of ['input-validation', 'worker-and-output-validation']) {
+  for (const outcome of ['resolve', 'reject']) test(`late scene PROCESS ${boundary} ${outcome} cannot resurrect cancelled/replaced state`, async () => {
+    const { workflow, ext } = sceneWorkflow(); ext.type = 'process'
+    let release!: (value: any) => void, reject!: (error: Error) => void
+    const gate = new Promise<any>((resolve, fail) => { release = resolve; reject = fail })
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    readFile = async () => { if (boundary === 'input-validation') { entered(); return gate }; return validSceneBytes() }
+    processResult = async () => { entered(); return gate }
+    const pending = useWorkflowRunStore.getState().run(workflow, [ext])
+    await started
+    useWorkflowRunStore.getState().cancel()
+    useWorkflowRunStore.getState().reset()
+    const replacement = checkpointWorkflow(); replacement.id = 'replacement'
+    await useWorkflowRunStore.getState().run(replacement, [])
+    const state = useWorkflowRunStore.getState(), job = appState.currentJob
+    const stateBytes = JSON.stringify(state), jobBytes = JSON.stringify(job)
+    if (outcome === 'reject') reject(new Error('late boundary failed'))
+    else release(boundary === 'input-validation' ? validSceneBytes() : { success: true, result: { filePath: '/workspace/stale/scene-manifest.json' } })
+    await pending
+    assert.equal(useWorkflowRunStore.getState(), state)
+    assert.equal(JSON.stringify(state), stateBytes)
+    assert.equal(appState.currentJob, job)
+    assert.equal(JSON.stringify(job), jobBytes)
+  })
+}
+
+test('declared scene output never uses legacy input fallback when the process returns no explicit file', async () => {
+  const { workflow, ext } = sceneWorkflow(); ext.type = 'process'
+  readFile = async () => validSceneBytes()
+  processResult = async () => ({ success: true, result: { outputType: 'scene' } })
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /explicit scene manifest/)
+})
+
+for (const name of ['__proto__', 'constructor', 'toString', 'normal']) {
+  test(`named scene port ownership allows omitted optional ${name}`, async () => {
+    const ext = createWorkflowExtension({ type: 'process', output: 'audio', inputs: [
+      { name: 'reference', type: 'image' }, { name, type: 'scene', required: false },
+    ] })
+    const workflow = createWorkflow(createExtensionNode(ext.id))
+    workflow.edges[0].targetHandle = 'reference'
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done', useWorkflowRunStore.getState().runState.error)
+    assert.equal(runProcessCalls.length, 1)
+    const input = runProcessCalls[0].input as { inputs: Record<string, unknown> }
+    assert.equal(Object.hasOwn(input.inputs, name), false)
+    assert.deepEqual(input.inputs, { reference: { type: 'image', sourceNodeId: 'image-source', filePath: '/tmp/source.png' } })
+  })
+
+  test(`named scene port ownership preserves connected optional ${name}`, async () => {
+    const ext = createWorkflowExtension({ type: 'process', output: 'audio', inputs: [
+      { name: 'reference', type: 'image' }, { name, type: 'scene', required: false },
+    ] })
+    const workflow = createWorkflow(createExtensionNode(ext.id))
+    workflow.edges[0].targetHandle = 'reference'
+    workflow.nodes.push(createNode('scene-source', 'sceneNode', { enabled: true, params: { path: 'Scenes/hero' } }))
+    workflow.edges.push({ id: 'scene-input', source: 'scene-source', target: 'node-1', targetHandle: name })
+    readFile = async () => validSceneBytes()
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done', useWorkflowRunStore.getState().runState.error)
+    assert.equal(runProcessCalls.length, 1)
+    const input = runProcessCalls[0].input as { inputs: Record<string, unknown> }
+    assert.equal(Object.hasOwn(input.inputs, name), true)
+    assert.deepEqual(input.inputs, {
+      reference: { type: 'image', sourceNodeId: 'image-source', filePath: '/tmp/source.png' },
+      [name]: { type: 'scene', sourceNodeId: 'scene-source', filePath: '/workspace/Scenes/hero/scene-manifest.json' },
+    })
+    assert.equal(Object.hasOwn(input, 'filePath'), false)
+    assert.equal(Object.hasOwn(input, 'text'), false)
+  })
+
+  test(`named scene port ownership rejects missing required ${name}`, async () => {
+    const ext = createWorkflowExtension({ type: 'process', output: 'audio', inputs: [
+      { name: 'reference', type: 'image' }, { name, type: 'scene', required: true },
+    ] })
+    const workflow = createWorkflow(createExtensionNode(ext.id))
+    workflow.edges[0].targetHandle = 'reference'
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+    assert.equal(runProcessCalls.length, 0)
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+    assert.ok(useWorkflowRunStore.getState().runState.error?.includes(`Required port "${name}" is missing.`))
+  })
+}

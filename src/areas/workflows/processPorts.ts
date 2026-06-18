@@ -17,6 +17,7 @@ export const PROCESS_PORT_HANDLE_COLOR: Record<string, string> = {
   audio: '#34d399',
   image: '#38bdf8',
   mesh: '#a78bfa',
+  scene: '#f472b6',
   text: '#fbbf24',
 }
 

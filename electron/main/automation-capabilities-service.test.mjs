@@ -8,6 +8,7 @@ import { register } from 'node:module'
 
 register('../../scripts/node-ts-extensionless-loader.mjs', import.meta.url)
 const { buildAutomationCapabilities, parseExtensionManifest } = await import('./automation-capabilities.ts')
+const defaultProcessAutomation = { boundary: 'electron', headless: true, pause: { supported: false }, substitution: { supported: false } }
 const {
   getAutomationCapabilitiesWithDeps,
   resolveAutomationCapabilitiesContextWithDeps,
@@ -201,6 +202,7 @@ test('buildAutomationCapabilities returns full canonical payload when backend is
       })
       assert.equal(response.processes.length, 1)
       assert.deepEqual(response.processes[0], {
+        automation: defaultProcessAutomation,
         kind: 'process',
         source: 'electron-manifest',
         id: 'mesh-tools/optimize',
@@ -220,7 +222,7 @@ test('buildAutomationCapabilities returns full canonical payload when backend is
       })
       assert.equal(response.errors, undefined)
       assert.ok(Array.isArray(response.excluded.ui_only_nodes))
-      assert.equal(response.excluded.ui_only_nodes.length, 4)
+      assert.equal(response.excluded.ui_only_nodes.length, 5)
       assert.deepEqual(response.excluded.ui_only_nodes.find((node) => node.label === 'Add to Scene'), {
         kind: 'ui_only',
         source: 'ui-only',
@@ -309,6 +311,7 @@ test('buildAutomationCapabilities keeps backend_ready=true on partial model para
         'Text',
         'Load 3D Mesh',
         'Add to Scene',
+        'Artifact substitution',
       ])
     } finally {
       axios.get = originalGet
@@ -341,6 +344,7 @@ test('parseExtensionManifest preserves legacy process nodes without inputs[]', (
   assert.equal(extension.type, 'process')
   assert.deepEqual(extension.nodes, [
     {
+      automation: defaultProcessAutomation,
       id: 'optimize',
       name: 'Optimize Mesh',
       input: 'mesh',
@@ -384,6 +388,7 @@ test('parseExtensionManifest normalizes optional process inputs[] with required=
 
   assert.equal(extension.type, 'process')
   assert.deepEqual(extension.nodes[0], {
+    automation: defaultProcessAutomation,
     id: 'refine',
     name: 'Refine Mesh',
     input: 'mesh',
@@ -443,6 +448,7 @@ test('buildAutomationCapabilities emits normalized inputs[] for process nodes wi
 
       assert.equal(response.processes.length, 1)
       assert.deepEqual(response.processes[0], {
+        automation: defaultProcessAutomation,
         kind: 'process',
         source: 'electron-manifest',
         id: 'mesh-refiners/refine',
@@ -482,7 +488,7 @@ test('named and positional declarations preserve upstream labels, defaults, audi
   assert.deepEqual(result.nodes[0].paramDefaults, { mode: '' })
   assert.equal(result.nodes[0].output, 'video')
   assert.deepEqual(result.nodes[1].inputs, [{ name: 'sound', type: 'audio', required: true }])
-  assert.throws(() => parseExtensionManifest({ type: 'process', nodes: [{ id: 'scene', inputs: [{ name: 'world', type: 'scene' }] }] }, 'scene', new Set()), /scene/i)
+  assert.deepEqual(parseExtensionManifest({ type: 'process', nodes: [{ id: 'scene', inputs: [{ name: 'world', type: 'scene' }] }] }, 'scene', new Set()).nodes[0].inputs, [{ name: 'world', type: 'scene', required: true }])
 })
 
 test('installer applies the existing scene ABI boundary to named declarations without restricting custom types', async () => {
@@ -492,6 +498,6 @@ test('installer applies the existing scene ABI boundary to named declarations wi
   assert.equal(validate('model', { inputs: ['capture'], output: 'video' }).isProcess, false)
   assert.equal(validate('model', { input: 'scene', output: 'scene' }).isProcess, false)
   assert.equal(validate('model', { inputs: [{ name: 'frame', type: 'image' }] }).isProcess, false)
-  assert.throws(() => validate('process', { inputs: [{ name: 'world', type: 'scene' }] }), /scene.*model/)
+  assert.equal(validate('process', { inputs: [{ name: 'world', type: 'scene' }] }).isProcess, true)
   assert.throws(() => validate('model', { inputs: [{ name: 'world', type: 'scene' }] }), /scene.*single/)
 })

@@ -1,3 +1,4 @@
+import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
 import axios from 'axios'
 import { describeModelOwnership } from './model-ownership'
 import { join, resolve as resolvePath } from 'path'
@@ -69,7 +70,7 @@ type CapabilityPauseMetadata = {
 
 type CapabilitySubstitutionMetadata = {
   supported: boolean
-  artifactKinds?: Array<'image' | 'text' | 'mesh'>
+  artifactKinds?: ArtifactKind[]
   boundary?: 'ui_only' | 'electron'
   headless?: boolean
 }
@@ -188,7 +189,7 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene'], boundary: 'ui_only', headless: false },
     },
   },
 ]
@@ -271,13 +272,13 @@ type PartialCapabilityAutomationMetadata = {
   substitution?: PartialCapabilitySubstitutionMetadata
 }
 
-const CAPABILITY_ARTIFACT_KINDS = new Set(['image', 'text', 'mesh'])
+const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene'])
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
   const pauseSupported = input?.pause?.supported === true
   const checkpoint = input?.pause?.checkpoint === 'interactive' ? 'interactive' : undefined
   const rawArtifactKinds = Array.isArray(input?.substitution?.artifactKinds)
-    ? input.substitution.artifactKinds.filter((kind): kind is 'image' | 'text' | 'mesh' => typeof kind === 'string' && CAPABILITY_ARTIFACT_KINDS.has(kind))
+    ? input.substitution.artifactKinds.filter((kind): kind is ArtifactKind => typeof kind === 'string' && CAPABILITY_ARTIFACT_KINDS.has(kind as ArtifactKind))
     : undefined
   const substitutionSupported = input?.substitution?.supported === true
   const substitutionBoundary = input?.substitution?.boundary === 'ui_only' ? 'ui_only' : undefined

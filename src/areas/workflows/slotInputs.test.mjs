@@ -52,3 +52,10 @@ test('text slots never claim a file path, and empty slots are skipped', () => {
   assert.equal(r.nodeInputMeshPath, undefined)
   assert.deepEqual(r.extraImagePaths, [])
 })
+
+test('scene fallbacks retain physical mixed-slot indices and deterministic mesh precedence', () => {
+  assert.deepEqual(assignSlotFilePaths(['scene', 'text', 'scene'], ['a/scene-manifest.json', undefined, 'b/scene-manifest.json']), { nodeInputPath: 'a/scene-manifest.json', extraImagePaths: [] })
+  assert.deepEqual(assignSlotFilePaths(['text', 'scene'], [undefined, 'b/scene-manifest.json']), { nodeInputPath: 'b/scene-manifest.json', extraImagePaths: [] })
+  assert.deepEqual(assignSlotFilePaths(['scene', 'image', 'mesh'], ['a/scene-manifest.json', 'image.png', 'mesh.glb']), { nodeInputPath: 'a/scene-manifest.json', nodeInputMeshPath: 'mesh.glb', extraImagePaths: ['image.png'] })
+  assert.deepEqual(assignSlotFilePaths(['image', 'scene'], ['image.png', 'a/scene-manifest.json']), { nodeInputPath: 'image.png', extraImagePaths: [] })
+})

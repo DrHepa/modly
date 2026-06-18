@@ -51,7 +51,7 @@ test('extracted parser keeps upstream scene and managed-weight rejection boundar
   assert.throws(() => parse({ id: 'bad', model_sources: [source] }), /model_sources.*model node/)
   assert.throws(() => parse({ ...processManifest('bad'), weight_groups: [] }), /weight_groups.*model/)
   assert.throws(() => parse({ ...processManifest('bad'), nodes: [{ id: 'bad', model_sources: [source] }] }), /model_sources.*model/)
-  assert.throws(() => parse({ ...processManifest('bad'), nodes: [{ id: 'bad', output: 'scene' }] }), /scene.*model|model.*scene/i)
+  assert.equal(parse({ ...processManifest('scene'), nodes: [{ id: 'run', output: 'scene' }] }).nodes[0].output, 'scene')
   assert.throws(() => parse({ id: 'bad', nodes: [{ id: 'generate', input: 'scene', inputs: ['scene'] }] }), /scene.*single|single.*scene/i)
   assert.equal(parse({ id: 'scene', nodes: [{ id: 'generate', input: 'scene', output: 'scene' }] }).nodes[0].output, 'scene')
 })

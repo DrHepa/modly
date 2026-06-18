@@ -162,7 +162,7 @@ export function validateWorkflowPreflight(
       continue
     }
 
-    if (ext.type === 'process' && hasNamedProcessInputs(ext.inputs)) {
+    if (ext.type === 'process' && (hasNamedProcessInputs(ext.inputs) || ext.input === 'scene' || getPositionalInputTypes(ext)?.includes('scene'))) {
       const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
       if (issue) pushIssue(issues, { key: `${node.id}:${issue.code}:${issue.portName}`, nodeId: node.id, message: issue.message })
       continue

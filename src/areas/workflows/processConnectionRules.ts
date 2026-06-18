@@ -1,7 +1,7 @@
 import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
-import { getProcessTargetPort, getProcessTargetPorts, hasNamedProcessInputs } from './processPorts.ts'
+import { getProcessTargetPort, getProcessTargetPorts, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
 
 import { resolveDataSource } from './nodeBehaviors.ts'
 
@@ -69,7 +69,8 @@ export function resolveProcessConnectionSource(
 function getPortAwareTargetExtension(node: WFNode | undefined, allExtensions: WorkflowExtension[]): WorkflowExtension | undefined {
   const extension = getExtensionForNode(node, allExtensions)
   if (!extension || extension.type !== 'process') return undefined
-  if (!hasNamedProcessInputs(extension.inputs)) return undefined
+  if (!hasNamedProcessInputs(extension.inputs)
+    && extension.input !== 'scene' && !getPositionalInputTypes(extension)?.includes('scene')) return undefined
   return extension
 }
 
@@ -104,7 +105,8 @@ export function validateProcessConnection({ connection, nodes, edges, allExtensi
   const targetPort = getProcessTargetPort(targetExtension, connection.targetHandle)
   if (!targetPort) return null
 
-  const duplicateEdges = edges.filter((edge) => edge.target === targetNode.id && edge.targetHandle === targetPort.name)
+  const duplicateEdges = edges.filter((edge) => edge.target === targetNode.id
+    && getProcessTargetPort(targetExtension, edge.targetHandle)?.name === targetPort.name)
   if (duplicateEdges.length > 0) {
     return createIssue({
       phase: 'connect',
@@ -142,7 +144,7 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions, target
     const targetEdges = edges.filter((edge) => edge.target === node.id)
 
     for (const port of getProcessTargetPorts(extension)) {
-      const portEdges = targetEdges.filter((edge) => edge.targetHandle === port.name)
+      const portEdges = targetEdges.filter((edge) => getProcessTargetPort(extension, edge.targetHandle)?.name === port.name)
       if (portEdges.length > 1) {
         return createIssue({
           phase: 'run',

@@ -691,6 +691,8 @@ async function executeExtensionNode(
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
   const positionalInputs = ext && getPositionalInputTypes(ext)
   const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
+  const scenePositional = mode === 'process' && !hasNamedInputs
+    && (ext.input === 'scene' || positionalInputs?.includes('scene'))
   // This adapter is only the named front/side image MODEL contract, not a
   // generic named-input ABI and not the named PROCESS transport below.
   const namedModelImagePorts = mode === 'model' && ext.input === 'image' && hasNamedProcessInputs(ext.inputs)
@@ -716,10 +718,8 @@ async function executeExtensionNode(
     // Named front wins regardless of edge order; sides never replace primary.
     nodeInputPath ??= legacyImagePath
   } else if (positionalInputs && positionalInputs.length > 1) {
-    // Scene is intentionally a single-input-only model contract. The guard
-    // above rejects it before this multi-slot path, and filtering it here also
-    // narrows the remaining declarations to assignSlotFilePaths' exact ABI.
-    const inputTypes = positionalInputs.filter((input) => input !== 'scene') as SlotInputType[]
+    // MODEL shape is checked above; PROCESS retains the physical slot indices.
+    const inputTypes = positionalInputs as SlotInputType[]
     // Resolved by target handle first, then typed by that slot's declared input --
     // not by the arrival order of `incomingEdges`, which does not match slot order.
     const inputPaths  = new Array<string | undefined>(inputTypes.length).fill(undefined)
@@ -932,14 +932,14 @@ async function executeExtensionNode(
     const processParams: Record<string, unknown> = { ...liveParams }
     const sidecar = consumesLandmarks(ext) ? incomingLandmarkSidecar(ctx, node.id) : undefined
     if (sidecar) processParams.landmarks_sidecar_path = sidecar
-    if (nodeInputMeshPath && nodeInputPath) {
+    if (!scenePositional && nodeInputMeshPath && nodeInputPath) {
       // Texture node: mesh is filePath, all images in extra_image_paths
       processParams.extra_image_paths = [nodeInputPath, ...extraImagePaths]
-    } else if (extraImagePaths.length > 0) {
+    } else if (!scenePositional && extraImagePaths.length > 0) {
       processParams.extra_image_paths = extraImagePaths
     }
 
-    const processInput = hasNamedInputs ? buildProcessExecutionInput({
+    const processInput = hasNamedInputs || scenePositional ? buildProcessExecutionInput({
       node, nodes: workflow.nodes, edges: workflow.edges, allExtensions, nodeOutputs,
     }) : {
       filePath: nodeInputMeshPath ?? nodeInputPath,
@@ -947,12 +947,23 @@ async function executeExtensionNode(
       texts: nodeInputTexts.length > 0 ? nodeInputTexts : undefined,
       nodeId: ext.nodeId,
     }
-    if (hasNamedInputs) {
+    if (hasNamedInputs || scenePositional) {
       const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
       if (issue) throw new Error(issue.message)
       for (const port of getProcessTargetPorts(ext!)) {
-        if (port.required && !Object.hasOwn(processInput.inputs ?? {}, port.name!)) throw new Error(`Required port "${port.name}" has no input data.`)
+        const name = port.name ?? 'input-0'
+        const value = processInput.inputs && Object.hasOwn(processInput.inputs, name) ? processInput.inputs[name] : undefined
+        if (port.required && !value) throw new Error(`Required port "${port.name}" has no input data.`)
+        if (value && (value.type !== port.type || (port.type === 'scene' && !value.filePath?.trim()))) {
+          throw new Error(`Port "${port.name}" requires ${port.type} input data.`)
+        }
       }
+    }
+    if (scenePositional) {
+      const images = Object.values(processInput.inputs ?? {}).filter((value) => value.type === 'image' && value.filePath && value.filePath !== processInput.filePath).map((value) => value.filePath!)
+      if (images.length) processParams.extra_image_paths = images
+    }
+    if (hasNamedInputs) {
       // Named values never leak into the legacy top-level fallback/output fields.
       nodeInputPath = undefined
       nodeInputText = undefined
@@ -966,6 +977,10 @@ async function executeExtensionNode(
     const result = await window.electron.extensions.runProcess(ext.extensionId, processInput, processParams)
     assertCurrentContext(ctx)
     if (!result.success) throw new Error(result.error ?? 'Process extension failed')
+    if (ext.output === 'scene' && (!result.result?.filePath?.trim()
+      || (result.result.outputType !== undefined && result.result.outputType !== 'scene'))) {
+      throw new Error('Scene process must return an explicit scene manifest output')
+    }
     nodeInputPath = result.result?.filePath ?? nodeInputPath
     nodeInputText = result.result?.text     ?? nodeInputText
     setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Done' }))

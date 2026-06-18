@@ -58,10 +58,30 @@ export function buildProcessExecutionInput({
   const nodeId = getProcessNodeId(node, extension)
   const incomingEdges = edges.filter((edge) => edge.target === node.id)
   const hasNamedInputs = hasNamedProcessInputs(extension?.inputs)
+  const scenePositional = extension?.type === 'process' && !hasNamedInputs
+    && (extension.input === 'scene' || getPositionalInputTypes(extension)?.includes('scene'))
+  // Physical slot order owns the additive map and legacy fallbacks.
+  if (scenePositional) incomingEdges.sort((a, b) =>
+    Number((a.targetHandle ?? 'input-0').slice(6)) - Number((b.targetHandle ?? 'input-0').slice(6)))
   const nodeMap = new Map(nodes.map((source) => [source.id, source]))
   const resolveOutput = (sourceId: string) => {
     const realId = resolveDataSource(sourceId, edges, nodeMap, nodeOutputs)
     return realId ? nodeOutputs.get(realId) : undefined
+  }
+
+  const inputs: Record<string, NamedProcessInput> = {}
+  if (hasNamedInputs || scenePositional) for (const edge of incomingEdges) {
+    const port = extension && getProcessTargetPort(extension, edge.targetHandle)
+    if (!port) continue
+    const sourceNodeId = resolveDataSource(edge.source, edges, nodeMap, nodeOutputs)
+    const output = sourceNodeId ? nodeOutputs.get(sourceNodeId) : undefined
+    if (!output || (output.filePath === undefined && output.text === undefined)) continue
+    const type = output.outputType ?? getNodeOutputType(nodeMap.get(sourceNodeId!), allExtensions) ?? port.type
+    Object.defineProperty(inputs, port.name ?? 'input-0', { enumerable: true, configurable: true, writable: true, value: {
+      type, sourceNodeId: sourceNodeId!,
+      ...(output.filePath !== undefined ? { filePath: output.filePath } : {}),
+      ...(output.text !== undefined ? { text: output.text } : {}),
+    } })
   }
 
   if (!hasNamedInputs) {
@@ -99,32 +119,7 @@ export function buildProcessExecutionInput({
       text = previousNodeOutput?.text
     }
 
-    return { filePath, text, nodeId, ...(texts.length ? { texts } : {}) }
-  }
-
-  const inputs: Record<string, NamedProcessInput> = {}
-
-  for (const edge of incomingEdges) {
-    const targetHandle = edge.targetHandle ?? null
-    const targetPort = extension ? getProcessTargetPort(extension, targetHandle) : null
-    if (!targetPort || targetPort.isLegacy) continue
-
-    const sourceNodeId = resolveDataSource(edge.source, edges, nodeMap, nodeOutputs)
-    const sourceOutput = sourceNodeId ? nodeOutputs.get(sourceNodeId) : undefined
-    if (!sourceOutput || (sourceOutput.filePath === undefined && sourceOutput.text === undefined)) continue
-
-    const sourceNode = nodes.find((candidate) => candidate.id === sourceNodeId)
-    const type = sourceOutput.outputType ?? getNodeOutputType(sourceNode, allExtensions) ?? targetPort.type
-
-    const portName = targetPort.name
-    if (!portName) continue
-
-    Object.defineProperty(inputs, portName, { enumerable: true, configurable: true, writable: true, value: {
-      type,
-      sourceNodeId: sourceNodeId!,
-      ...(sourceOutput.filePath !== undefined ? { filePath: sourceOutput.filePath } : {}),
-      ...(sourceOutput.text !== undefined ? { text: sourceOutput.text } : {}),
-    } })
+    return { filePath, text, nodeId, ...(texts.length ? { texts } : {}), ...(scenePositional ? { inputs } : {}) }
   }
 
   return {

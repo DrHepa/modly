@@ -154,7 +154,7 @@ test('Load Scene must be validated before a workflow can run', () => {
   assert.equal(issues[0].key, 'scene:scene-invalid')
 })
 
-test('renderer fails closed for unsupported process and mixed scene node shapes', () => {
+test('renderer admits PROCESS scene while retaining mixed MODEL scene rejection', () => {
   const { validateWorkflowPreflight } = loadModule()
   const scene = { id: 'scene', type: 'sceneNode', position: { x: 0, y: 0 }, data: { params: { manifestPath: 'Workflows/room/scene-manifest.json' } } }
   const target = { id: 'target', type: 'extensionNode', position: { x: 0, y: 0 }, data: { extensionId: 'pack/process-node' } }
@@ -163,7 +163,8 @@ test('renderer fails closed for unsupported process and mixed scene node shapes'
     ext({ input: 'scene', inputs: ['scene', 'text'], output: 'mesh', type: 'model' }),
   ]) {
     const issues = validateWorkflowPreflight(wf([scene, target], [{ id: 'e', source: 'scene', target: 'target' }]), [extension])
-    assert.ok(issues.some((issue) => issue.key === 'target:unsupported-scene-shape'))
+    if (extension.type === 'model') assert.ok(issues.some((issue) => issue.key === 'target:unsupported-scene-shape'))
+    else assert.deepEqual(issues, [])
   }
 })
 
@@ -194,4 +195,21 @@ test('single text slot uses the text alias but explicit empty prompt takes prece
   assert.deepEqual(validateWorkflowPreflight(workflow, [capability]), [])
   workflow.nodes[0].data.params = { prompt: '' }
   assert.equal(validateWorkflowPreflight(workflow, [capability]).length, 1)
+})
+
+test('scene positional preflight checks each physical slot instead of a set of kinds', () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const scene = (id) => ({ id, type: 'sceneNode', position: { x: 0, y: 0 }, data: { params: { path: `${id}/scene-manifest.json`, manifestPath: `${id}/scene-manifest.json`, sceneRoot: '.' } } })
+  const target = { id: 'proc', type: 'extensionNode', position: { x: 0, y: 0 }, data: { extensionId: 'pack/process-node' } }
+  const nodes = [scene('a'), textNode('t'), scene('b'), target]
+  const extensions = [ext({ input: 'scene', inputs: ['scene', 'text', 'scene'], output: 'scene' })]
+  const edges = [
+    { id: 'a', source: 'a', target: 'proc', targetHandle: 'input-0' },
+    { id: 't', source: 't', target: 'proc', targetHandle: 'input-1' },
+    { id: 'b', source: 'b', target: 'proc', targetHandle: 'input-2' },
+  ]
+  assert.deepEqual(validateWorkflowPreflight(wf(nodes, edges), extensions), [])
+  assert.ok(validateWorkflowPreflight(wf(nodes, edges.slice(0, 2)), extensions).some((issue) => /input-2/.test(issue.message)))
+  const swapped = edges.map((edge) => ({ ...edge, targetHandle: edge.id === 't' ? 'input-2' : edge.id === 'b' ? 'input-1' : edge.targetHandle }))
+  assert.ok(validateWorkflowPreflight(wf(nodes, swapped), extensions).some((issue) => /expects/.test(issue.message)))
 })

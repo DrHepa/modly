@@ -2296,7 +2296,7 @@ async function assertPathDoesNotExist(absolutePath: string, label: string): Prom
  * This is static-path confinement, not an OS sandbox against concurrent hostile
  * directory replacement by another process with write access to the workspace.
  */
-async function physicalArtifactPath(
+export async function physicalArtifactPath(
   workspaceDir: string,
   workspacePath: string,
   mode: 'read' | 'write' | 'optional' | 'directory' = 'read',

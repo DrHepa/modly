@@ -64,6 +64,7 @@ export interface ProcessInput {
 export interface ProcessResult {
   filePath?: string
   text?:     string
+  outputType?: string
 }
 
 export interface IProcessRunner {

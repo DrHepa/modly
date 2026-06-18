@@ -159,3 +159,13 @@ test('workflow discovery keeps defaults and labels for both representations with
   assert.equal(result[1].params[0].default, '')
   assert.deepEqual(nodes, original)
 })
+
+test('resolves scene process ports with the existing pink scene identity, distinct from audio', () => {
+  const owner = { input: 'scene', inputs: [{ name: 'world_scene', label: 'World scene', type: 'scene' }] }
+  assert.deepEqual(getProcessTargetPorts(owner), [
+    { name: 'world_scene', label: 'World scene', type: 'scene', required: true, isLegacy: false },
+  ])
+  assert.equal(resolveProcessTargetColor(owner, 'world_scene'), '#f472b6')
+  assert.equal(resolveProcessTargetColor({ input: 'scene' }), '#f472b6')
+  assert.equal(resolveProcessTargetColor({ input: 'audio' }), '#34d399')
+})

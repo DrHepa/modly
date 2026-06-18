@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { register } from 'node:module'
 import type { ParsedManifest } from './automation-capabilities'
+register('../../scripts/node-ts-extensionless-loader.mjs', import.meta.url)
 
 const { getProcessTargetPort, getProcessTargetPorts } = await import(
   new URL('../../src/areas/workflows/processPorts.ts', import.meta.url).href,
@@ -130,6 +132,43 @@ test('parseExtensionManifest accepts declarative interactive checkpoint and subs
   })
 })
 
+test('parseExtensionManifest accepts scene process ports and scene substitution metadata', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'world-tools',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [{
+        id: 'stereo',
+        name: 'World Stereo',
+        input: 'scene',
+        output: 'scene',
+        inputs: ['scene'],
+        input_contract: [{ name: 'world_scene', label: 'World scene', type: 'scene', required: true }],
+        automation: {
+          substitution: { supported: true, artifactKinds: ['scene'], boundary: 'ui_only' },
+        },
+      }],
+    },
+    'world-tools',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.equal(extension.nodes[0].input, 'scene')
+  assert.equal(extension.nodes[0].output, 'scene')
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'world_scene', label: 'World scene', type: 'scene', required: true },
+  ])
+  assert.deepEqual(extension.nodes[0].automation?.substitution, {
+    supported: true,
+    artifactKinds: ['scene'],
+    boundary: 'ui_only',
+    headless: false,
+  })
+})
+
 test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headlessly', () => {
   const artifactCapability = (getUiOnlyNodes() as UiOnlyNodeForTest[]).find((node) => node.id === 'artifact-substitution')
 
@@ -144,7 +183,7 @@ test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headle
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene'], boundary: 'ui_only', headless: false },
     },
   })
 })
@@ -242,11 +281,9 @@ test('input_contract ignores invalid labels and contradictory types without inve
     { name: 'prompt', type: 'text', required: true },
     { name: 'rigged_mesh', type: 'mesh', required: false },
   ])
-  for (const type of ['model', 'process'] as const) {
-    assert.throws(() => parseInputNode({ id: 'scene', input: 'scene', inputs: ['scene'],
-      input_contract: [{ name: 'mesh', type: 'mesh' }],
-    }, type), /scene/i)
-  }
+  const scene = { id: 'scene', input: 'scene', inputs: ['scene'], input_contract: [{ name: 'mesh', type: 'mesh' }] }
+  assert.throws(() => parseInputNode(scene, 'model'), /scene/i)
+  assert.deepEqual(parseInputNode(scene, 'process').inputs, [{ name: 'mesh', type: 'scene', required: true }])
 })
 
 test('missing contract retains arbitrary modalities and every repeated slot', () => {

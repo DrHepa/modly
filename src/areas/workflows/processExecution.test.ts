@@ -175,3 +175,30 @@ test('runtime process input stops at materialized checkpoints without changing s
   assert.equal(result.inputs?.coarse_mesh.sourceNodeId, 'wait')
   assert.equal(outputs.get('source')?.filePath, '/source.glb')
 })
+
+test('scene-bearing positional PROCESS keeps every original slot and resolved source in an additive map', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const scenes = [createNode('a', 'sceneNode'), createNode('b', 'sceneNode')]
+  const text = createNode('prompt', 'textNode')
+  const edges: WFEdge[] = [
+    { id: 'b', source: 'b', target: target.id, targetHandle: 'input-2' },
+    { id: 'p', source: 'prompt', target: target.id, targetHandle: 'input-1' },
+    { id: 'a', source: 'a', target: target.id, targetHandle: 'input-0' },
+  ]
+  const args = { node: target, nodes: [...scenes, text, target], edges,
+    allExtensions: [{ ...createProcessExtension(['scene', 'text', 'scene']), input: 'scene', output: 'scene' }],
+    nodeOutputs: new Map([
+      ['a', { filePath: '/workspace/a/scene-manifest.json', outputType: 'scene' }],
+      ['b', { filePath: '/workspace/b/scene-manifest.json', outputType: 'scene' }],
+      ['prompt', { text: 'combine', outputType: 'text' }],
+    ]) }
+  const payload = buildProcessExecutionInput(args)
+  assert.deepEqual(payload, buildProcessExecutionInput({ ...args, edges: [...edges].reverse() }))
+  assert.deepEqual(payload.inputs, {
+    'input-0': { type: 'scene', filePath: '/workspace/a/scene-manifest.json', sourceNodeId: 'a' },
+    'input-1': { type: 'text', text: 'combine', sourceNodeId: 'prompt' },
+    'input-2': { type: 'scene', filePath: '/workspace/b/scene-manifest.json', sourceNodeId: 'b' },
+  })
+  assert.equal(payload.filePath, '/workspace/a/scene-manifest.json')
+  assert.equal(payload.texts?.[1], 'combine')
+})

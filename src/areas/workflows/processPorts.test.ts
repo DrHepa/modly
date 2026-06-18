@@ -74,3 +74,18 @@ test('uses targetHandle to resolve process target colors and preserves legacy fa
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'reference_image'), '#38bdf8')
   assert.equal(resolveProcessTargetColor({ input: 'text' }), '#fbbf24')
 })
+
+test('resolves scene process ports and colors as first-class workflow handles', () => {
+  const sceneProcessNode = {
+    input: 'scene' as const,
+    inputs: [
+      { name: 'world_scene', label: 'World scene', type: 'scene' as const },
+    ],
+  }
+
+  assert.deepEqual(getProcessTargetPorts(sceneProcessNode), [
+    { name: 'world_scene', label: 'World scene', type: 'scene', required: true, isLegacy: false },
+  ])
+  assert.equal(resolveProcessTargetColor(sceneProcessNode, 'world_scene'), '#34d399')
+  assert.equal(resolveProcessTargetColor({ input: 'scene' }), '#34d399')
+})

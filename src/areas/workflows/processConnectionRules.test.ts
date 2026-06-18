@@ -35,6 +35,18 @@ function createProcessExtension(inputs?: WorkflowExtension['inputs']): WorkflowE
   }
 }
 
+function createSceneProcessExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  return {
+    ...createProcessExtension([{ name: 'input_scene', type: 'scene' }]),
+    id: 'ext/scene-consumer',
+    nodeId: 'scene-consumer',
+    name: 'Scene Consumer',
+    input: 'scene',
+    output: 'scene',
+    ...overrides,
+  }
+}
+
 function createConnection(overrides: Partial<Connection>): Connection {
   return {
     source: 'source-node',
@@ -242,4 +254,46 @@ test('keeps legacy single-input linear workflows runnable under the shared valid
   })
 
   assert.equal(issue, null)
+})
+
+test('accepts scene-to-scene connections for named scene process ports', () => {
+  const source = createNode('source-node', 'sceneNode', { enabled: true, params: { path: 'Scenes/castle' } })
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/scene-consumer', enabled: true, params: {} })
+
+  const issue = validateProcessConnection({
+    connection: createConnection({ targetHandle: 'input_scene' }),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [
+      createSceneProcessExtension(),
+    ],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('rejects scene outputs wired into non-scene process ports', () => {
+  const source = createNode('source-node', 'sceneNode', { enabled: true, params: { path: 'Scenes/castle' } })
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+
+  const issue = validateProcessConnection({
+    connection: createConnection({ targetHandle: 'reference_image' }),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [
+      createProcessExtension([{ name: 'reference_image', type: 'image' }]),
+    ],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'connect',
+    code: 'type-mismatch',
+    message: 'Port "reference_image" expects image but received scene.',
+    targetNodeId: 'target-node',
+    targetHandle: 'reference_image',
+    portName: 'reference_image',
+    expectedType: 'image',
+    actualType: 'scene',
+    sourceNodeId: 'source-node',
+  })
 })

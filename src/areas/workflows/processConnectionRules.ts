@@ -1,9 +1,10 @@
 import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
+import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 import type { WorkflowExtension } from './mockExtensions'
 import { getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
 
-type ArtifactType = 'image' | 'text' | 'mesh'
+type ArtifactType = ArtifactKind
 
 type ProcessRulePhase = 'connect' | 'run'
 type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port'
@@ -46,6 +47,7 @@ function resolveNodeOutputType(node: WFNode | undefined, allExtensions: Workflow
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
+  if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
 
   return getExtensionForNode(node, allExtensions)?.output

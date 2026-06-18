@@ -115,6 +115,43 @@ test('parseExtensionManifest accepts declarative interactive checkpoint and subs
   })
 })
 
+test('parseExtensionManifest accepts scene process ports and scene substitution metadata', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'world-tools',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [{
+        id: 'stereo',
+        name: 'World Stereo',
+        input: 'scene',
+        output: 'scene',
+        inputs: ['scene'],
+        input_contract: [{ name: 'world_scene', label: 'World scene', type: 'scene', required: true }],
+        automation: {
+          substitution: { supported: true, artifactKinds: ['scene'], boundary: 'ui_only' },
+        },
+      }],
+    },
+    'world-tools',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.equal(extension.nodes[0].input, 'scene')
+  assert.equal(extension.nodes[0].output, 'scene')
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'world_scene', label: 'World scene', type: 'scene', required: true },
+  ])
+  assert.deepEqual(extension.nodes[0].automation?.substitution, {
+    supported: true,
+    artifactKinds: ['scene'],
+    boundary: 'ui_only',
+    headless: false,
+  })
+})
+
 test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headlessly', () => {
   const artifactCapability = (getUiOnlyNodes() as UiOnlyNodeForTest[]).find((node) => node.id === 'artifact-substitution')
 
@@ -129,7 +166,7 @@ test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headle
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene'], boundary: 'ui_only', headless: false },
     },
   })
 })

@@ -1,6 +1,7 @@
 import type { ProcessPort } from '../../shared/types/electron.d'
+import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 
-type ArtifactType = 'image' | 'text' | 'mesh'
+type ArtifactType = ArtifactKind
 
 type ProcessPortOwner = {
   input?: ArtifactType
@@ -18,6 +19,7 @@ export type ResolvedProcessTargetPort = {
 export const PROCESS_PORT_HANDLE_COLOR: Record<ArtifactType, string> = {
   image: '#38bdf8',
   mesh: '#a78bfa',
+  scene: '#34d399',
   text: '#fbbf24',
 }
 

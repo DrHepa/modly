@@ -23,6 +23,11 @@ const multiInputPayload: ProcessInput = {
       filePath: '/tmp/coarse.glb',
       sourceNodeId: 'mesh-source',
     },
+    world_scene: {
+      type: 'scene',
+      filePath: '/tmp/world.scene.json',
+      sourceNodeId: 'scene-source',
+    },
   },
 }
 

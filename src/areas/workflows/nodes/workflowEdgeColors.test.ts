@@ -21,6 +21,18 @@ test('resolveWorkflowEdgeTargetColor falls back to process target ports for exte
   assert.equal(color, PROCESS_PORT_HANDLE_COLOR.image)
 })
 
+test('resolveWorkflowEdgeTargetColor uses the scene color for scene extension targets', () => {
+  const color = resolveWorkflowEdgeTargetColor({
+    targetNodeType: 'extensionNode',
+    targetExtension: {
+      inputs: [{ name: 'scene', type: 'scene', required: true }],
+    },
+    targetHandle: 'scene',
+  })
+
+  assert.equal(color, PROCESS_PORT_HANDLE_COLOR.scene)
+})
+
 test('resolveWorkflowEdgeTargetColor keeps mesh outputs targeting scene nodes purple', () => {
   assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'outputNode' }), PROCESS_PORT_HANDLE_COLOR.mesh)
 })

@@ -1,12 +1,13 @@
 import { PROCESS_PORT_HANDLE_COLOR, resolveProcessTargetColor } from '../processPorts'
+import type { ArtifactKind } from '../../../shared/types/artifacts.ts'
 
 import { isPreviewNodeType } from './previewNodeShared'
 
 type WorkflowEdgeTargetColorArgs = {
   targetNodeType?: string
   targetExtension?: {
-    input?: 'image' | 'text' | 'mesh'
-    inputs?: Array<{ name: string; type: 'image' | 'text' | 'mesh'; required?: boolean }>
+    input?: ArtifactKind
+    inputs?: Array<{ name: string; type: ArtifactKind; required?: boolean }>
   }
   targetHandle?: string | null
 }

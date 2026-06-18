@@ -1,6 +1,7 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import type { ParamSchema, ProcessPort } from '@shared/types/electron.d'
+import type { ArtifactKind } from '@shared/types/artifacts.ts'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
 
 export interface WorkflowExtension {
@@ -11,8 +12,8 @@ export interface WorkflowExtension {
   nodeId:          string   // "node_id"
   name:            string
   description:     string
-  input:           'image' | 'text' | 'mesh'
-  output:          'image' | 'text' | 'mesh'
+  input:           ArtifactKind
+  output:          ArtifactKind
   inputs?:         ProcessPort[]
   params:          ParamSchema[]
   builtin:         boolean

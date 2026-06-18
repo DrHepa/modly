@@ -2,6 +2,7 @@ import { Worker }      from 'worker_threads'
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { existsSync }  from 'fs'
 import { join }        from 'path'
+import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
 
 // ─── Worker code for JS process extensions ────────────────────────────────────
 
@@ -53,7 +54,7 @@ export interface ProcessInput {
   texts?:    (string | undefined)[]
   nodeId?:   string
   inputs?:   Record<string, {
-    type: 'image' | 'text' | 'mesh'
+    type: ArtifactKind
     filePath?: string
     text?: string
     sourceNodeId: string
@@ -63,6 +64,7 @@ export interface ProcessInput {
 export interface ProcessResult {
   filePath?: string
   text?:     string
+  outputType?: ArtifactKind
 }
 
 export interface IProcessRunner {

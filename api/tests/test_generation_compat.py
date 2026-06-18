@@ -4,6 +4,7 @@ import logging
 import sys
 import threading
 import time
+import json
 
 import pytest
 
@@ -118,6 +119,284 @@ def test_generate_from_text_rejects_missing_or_blank_prompt_without_creating_job
     assert blank_prompt_response.status_code == 400
     assert api_modules["generation_jobs"]._jobs == {}
 
+
+@pytest.fixture
+def scene_contract(api_modules, monkeypatch):
+    from services.generator_registry import generator_registry
+
+    workspace = api_modules["workspace_dir"]
+    scene_manifest = workspace / "Worlds" / "hero" / "scene-manifest.json"
+    scene_manifest.parent.mkdir(parents=True)
+    assets = workspace / "Worlds" / "assets"
+    assets.mkdir()
+    (assets / "mesh.glb").write_bytes(b"glb")
+    (assets / "preview.png").write_bytes(b"preview")
+    document = {
+        "schema": "modly.scene-manifest.v1",
+        "sceneRoot": "Worlds/assets",
+        "assets": [{"path": "mesh.glb", "custom": {"role": "ground"}}, "opaque-extension-value"],
+        "preview": {"image": "preview.png"},
+        "initialView": {"position": [1, 2, 3], "target": [0, 0, 0]},
+        "extensionMetadata": {"customRoot": "not-a-host-path"},
+    }
+    scene_manifest.write_text(json.dumps(document), encoding="utf-8")
+    generator_registry._manifests[api_modules["valid_model_id"]].update(input="scene", output="mesh")
+    captured = []
+    original_generate = api_modules["fake_generator"].generate
+
+    def generate_artifact(kind, path, params, progress_cb=None, cancel_event=None):
+        captured.append((kind, path, dict(params), json.loads(path.read_text())))
+        return original_generate(b"glb", params, progress_cb, cancel_event)
+
+    monkeypatch.setattr(api_modules["fake_generator"], "generate_artifact", generate_artifact, raising=False)
+    return scene_manifest, document, captured
+
+
+@pytest.mark.parametrize("scene_path", ["Worlds/hero", "Worlds/hero/scene-manifest.json"])
+def test_generate_from_scene_validates_workspace_relative_scene_manifest_and_creates_job(
+    client, api_modules, scene_contract, scene_path,
+):
+    assert_backend_ready(client)
+    scene_manifest, document, captured = scene_contract
+    response = client.post("/generate/from-scene", json={
+        "scene_path": scene_path, "model_id": api_modules["valid_model_id"],
+        "collection": "SceneRuns", "remesh": "none", "enable_texture": False,
+        "texture_resolution": 2048, "params": {"steps": 12, "filename": "hero-scene.glb"},
+    })
+    assert response.status_code == 200
+    status = client.get(f"/generate/status/{response.json()['job_id']}").json()
+    assert status["status"] == "done"
+    assert status["output_url"] == "/workspace/SceneRuns/hero-scene.glb"
+    assert captured == [("scene", scene_manifest.resolve(), {
+        "remesh": "none", "enable_texture": False, "texture_resolution": 2048,
+        "steps": 12, "filename": "hero-scene.glb", "scene_manifest_path": str(scene_manifest.resolve()),
+    }, document)]
+
+
+@pytest.mark.parametrize("route", ["from-scene", "from-artifact"])
+def test_scene_routes_strip_transport_aliases_without_dropping_model_params(
+    client, api_modules, scene_contract, route,
+):
+    scene_manifest, _, captured = scene_contract
+    params = {name: "spoofed" for name in (
+        "artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path", "input_scene_path",
+    )}
+    params.update(steps=7, custom_path="legitimate", metadata={"input_scene_path": "opaque"})
+    payload = {"model_id": api_modules["valid_model_id"], "params": params}
+    payload.update({"scene_path": "Worlds/hero"} if route == "from-scene" else {
+        "input_kind": "scene", "input_path": "Worlds/hero",
+    })
+    response = client.post(f"/generate/{route}", json=payload)
+    assert response.status_code == 200
+    assert client.get(f"/generate/status/{response.json()['job_id']}").json()["status"] == "done"
+    expected = {"steps": 7, "custom_path": "legitimate", "metadata": {"input_scene_path": "opaque"},
+                "scene_manifest_path": str(scene_manifest.resolve())}
+    if route == "from-scene":
+        expected.update(remesh="quad", enable_texture=False, texture_resolution=1024)
+    assert captured[0][2] == expected
+    assert payload["params"]["input_scene_path"] == "spoofed"
+
+
+@pytest.mark.parametrize("scene_path", [
+    "/tmp/scene-manifest.json", "../scene-manifest.json", "C:\\outside\\scene-manifest.json",
+    "file:///outside", "Worlds/%2e%2e/scene-manifest.json", "Worlds/missing", "Worlds/hero.scene.json",
+])
+def test_generate_from_scene_rejects_unsafe_or_missing_paths_before_queue(
+    client, api_modules, scene_contract, monkeypatch, scene_path,
+):
+    from services.generator_registry import generator_registry
+
+    monkeypatch.setattr(generator_registry, "switch_model", lambda *_: pytest.fail("request-time switch"))
+    response = client.post("/generate/from-scene", json={
+        "scene_path": scene_path, "model_id": api_modules["valid_model_id"],
+    })
+    assert response.status_code == 400
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+@pytest.mark.parametrize("change", [
+    {"schema": "modly.scene-manifest.v0"}, {"sceneRoot": "../outside"},
+    {"assets": [{"path": "../missing.glb"}]}, {"preview": {"image": "missing.png"}},
+    {"initialView": {"position": [0, 0, 0], "target": [0, 0, 0]}},
+])
+def test_generate_from_scene_keeps_authoritative_manifest_validation(
+    client, api_modules, scene_contract, change,
+):
+    manifest, document, _ = scene_contract
+    manifest.write_text(json.dumps(document | change))
+    response = client.post("/generate/from-scene", json={
+        "scene_path": "Worlds/hero", "model_id": api_modules["valid_model_id"],
+    })
+    assert response.status_code == 400
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+@pytest.mark.parametrize("link_kind", ["directory", "manifest", "asset"])
+def test_generate_from_scene_rejects_physical_symlinks(client, api_modules, scene_contract, link_kind):
+    manifest, _, _ = scene_contract
+    workspace = api_modules["workspace_dir"]
+    path = "Worlds/hero"
+    if link_kind == "directory":
+        (workspace / "linked").symlink_to(manifest.parent, target_is_directory=True)
+        path = "linked"
+    else:
+        target = manifest if link_kind == "manifest" else workspace / "Worlds/assets/mesh.glb"
+        original = target.with_name("original-" + target.name)
+        target.rename(original)
+        target.symlink_to(original)
+    response = client.post("/generate/from-scene", json={
+        "scene_path": path, "model_id": api_modules["valid_model_id"],
+    })
+    assert response.status_code == 400
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+@pytest.mark.parametrize("case", ["missing-model", "image-model", "bad-remesh"])
+def test_generate_from_scene_rejects_model_or_remesh_before_queue(
+    client, api_modules, scene_contract, monkeypatch, case,
+):
+    from services.generator_registry import generator_registry
+
+    model_id = api_modules["valid_model_id"]
+    if case == "image-model":
+        generator_registry._manifests[model_id]["input"] = "image"
+    monkeypatch.setattr(generator_registry, "switch_model", lambda *_: pytest.fail("request-time switch"))
+    response = client.post("/generate/from-scene", json={
+        "scene_path": "Worlds/hero", "model_id": "missing" if case == "missing-model" else model_id,
+        "remesh": "invalid" if case == "bad-remesh" else "none",
+    })
+    assert response.status_code == 400
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+def _queue_scene_request(api_modules, **changes):
+    from fastapi import BackgroundTasks
+    from routers.generation import generate_from_scene
+    from schemas.generation import GenerateFromSceneRequest
+
+    payload = {"scene_path": "Worlds/hero", "model_id": api_modules["valid_model_id"], **changes}
+    tasks = BackgroundTasks()
+    result = asyncio.run(generate_from_scene(GenerateFromSceneRequest(**payload), tasks))
+    return tasks, api_modules["generation_jobs"].get_job(result["job_id"])
+
+
+@pytest.mark.parametrize("cancel_queued", [False, True])
+def test_scene_adapter_defers_model_switch_and_pins_queue_ownership(
+    api_modules, scene_contract, monkeypatch, cancel_queued,
+):
+    from services.generator_registry import generator_registry
+
+    requested = api_modules["valid_model_id"]
+    other = type(api_modules["fake_generator"])(api_modules["workspace_dir"])
+    generator_registry._generators["demo/other"] = other
+    generator_registry._manifests["demo/other"] = {"id": "demo/other", "input": "image"}
+    generator_registry._active_id = "demo/other"
+    switched, variants = [], []
+    switch = generator_registry.switch_model
+
+    def switch_model(model_id):
+        switched.append(model_id)
+        return switch(model_id)
+
+    monkeypatch.setattr(generator_registry, "switch_model", switch_model)
+    monkeypatch.setattr(generator_registry, "get_active", lambda: pytest.fail("mutable active generator"))
+    monkeypatch.setattr(generator_registry, "assert_weight_variant_installed",
+                        lambda params, model_id=None: variants.append((model_id, params["variant"])))
+    tasks, job = _queue_scene_request(
+        api_modules, model_id=f" {requested} ", collection="../escape",
+        params={"variant": "small", "remesh": "triangle", "texture_resolution": 512},
+    )
+    assert job.status == "pending"
+    assert switched == [] and variants == []
+    queued = tasks.tasks[0]
+    assert queued.args[1].kind == "scene"
+    assert queued.args[3:] == ("Default", "mesh", requested)
+    assert queued.args[2]["remesh"] == "triangle" and queued.args[2]["texture_resolution"] == 512
+    if cancel_queued:
+        api_modules["generation_jobs"].cancel_job(job.job_id)
+        assert api_modules["generation_jobs"]._cancel_events[job.job_id].is_set()
+    asyncio.run(tasks())
+    assert job.status == ("cancelled" if cancel_queued else "done")
+    assert switched == ([] if cancel_queued else [requested])
+    assert variants == ([] if cancel_queued else [(requested, "small")])
+    assert len(scene_contract[2]) == (0 if cancel_queued else 1)
+    assert generator_registry._active_id == ("demo/other" if cancel_queued else requested)
+    assert job.job_id not in api_modules["generation_jobs"]._job_generators
+
+
+def test_scene_adapter_revalidates_changed_manifest_before_generator_invocation(api_modules, scene_contract):
+    manifest, document, captured = scene_contract
+    tasks, job = _queue_scene_request(api_modules)
+    manifest.write_text(json.dumps(document | {"assets": [{"path": "missing.glb"}]}))
+    asyncio.run(tasks())
+    assert job.status == "error" and "missing or unreadable" in job.error
+    assert captured == [] and job.output_url is None and job.scene_candidate is None
+
+
+@pytest.mark.parametrize("output_kind,filename", [("image", "image.png"), ("audio", "sound.wav")])
+def test_scene_adapter_preserves_non_mesh_output_without_mesh_candidate(
+    client, api_modules, scene_contract, output_kind, filename,
+):
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["output"] = output_kind
+    response = client.post("/generate/from-scene", json={
+        "scene_path": "Worlds/hero", "model_id": api_modules["valid_model_id"],
+        "params": {"filename": filename},
+    })
+    assert response.status_code == 200
+    status = client.get(f"/generate/status/{response.json()['job_id']}").json()
+    assert status["status"] == "done" and status["output_url"] == f"/workspace/Default/{filename}"
+    assert status["scene_candidate"] is None
+
+
+@pytest.mark.parametrize("valid_output", [False, True])
+def test_scene_adapter_revalidates_scene_output_and_keeps_mesh_candidate_private(
+    client, api_modules, scene_contract, monkeypatch, valid_output,
+):
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["output"] = "scene"
+    generator = api_modules["fake_generator"]
+
+    def generate_artifact(kind, path, params, progress_cb=None, cancel_event=None):
+        output = generator.outputs_dir / "scene-manifest.json"
+        document = {"schema": "modly.scene-manifest.v1", "sceneRoot": ".", "assets": []}
+        if not valid_output:
+            document["assets"] = [{"path": "missing.glb"}]
+        output.write_text(json.dumps(document))
+        return output
+
+    monkeypatch.setattr(generator, "generate_artifact", generate_artifact)
+    response = client.post("/generate/from-scene", json={
+        "scene_path": "Worlds/hero", "model_id": api_modules["valid_model_id"],
+    })
+    assert response.status_code == 200
+    status = client.get(f"/generate/status/{response.json()['job_id']}").json()
+    assert status["status"] == ("done" if valid_output else "error")
+    assert status["scene_candidate"] is None
+    if valid_output:
+        assert status["output_url"] == "/workspace/Default/scene-manifest.json"
+    else:
+        assert status["output_url"] is None
+        assert "Generated scene output is not a valid workspace scene" in status["error"]
+
+
+def test_build_scene_candidate_keeps_mesh_outputs_as_mesh(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    mesh_output = api_modules["workspace_dir"] / "Meshes" / "hero.glb"
+    mesh_output.parent.mkdir(parents=True)
+    mesh_output.write_bytes(b"glb")
+
+    candidate = generation_jobs.build_scene_candidate(mesh_output)
+
+    assert candidate is not None
+    assert candidate.model_dump() == {
+        "kind": "mesh",
+        "workspace_path": "Meshes/hero.glb",
+        "output_url": "/workspace/Meshes/hero.glb",
+        "display_name": "hero.glb",
+    }
 
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry

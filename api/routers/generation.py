@@ -1,7 +1,11 @@
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
 
 import services.generator_registry as registry
-from schemas.generation import GenerateFromArtifactRequest, GenerateFromTextRequest
+from schemas.generation import (
+    GenerateFromArtifactRequest,
+    GenerateFromSceneRequest,
+    GenerateFromTextRequest,
+)
 from services.artifact_input import RESERVED_ARTIFACT_PARAMS, validate_artifact_input
 from services.generation_jobs import (
     VALID_REMESH_MODES,
@@ -88,13 +92,37 @@ async def generate_from_artifact(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    params = {k: v for k, v in request.params.items() if k not in RESERVED_ARTIFACT_PARAMS}
+    # The compatibility route historically exposed input_scene_path too. Strip
+    # that transport alias on both routes; only the validated typed input owns it.
+    params = {
+        k: v for k, v in request.params.items()
+        if k not in RESERVED_ARTIFACT_PARAMS and k != "input_scene_path"
+    }
     params["scene_manifest_path"] = str(artifact.path)
     job = create_generation_job(
         background_tasks, artifact, params, request.collection,
         manifest.get("output", "mesh"), request.model_id,
     )
     return {"job_id": job.job_id}
+
+
+@router.post("/from-scene")
+async def generate_from_scene(payload: GenerateFromSceneRequest, background_tasks: BackgroundTasks):
+    """Adapt the legacy scene request to the authoritative typed-artifact route."""
+    if payload.remesh not in VALID_REMESH_MODES:
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+    return await generate_from_artifact(GenerateFromArtifactRequest(
+        input_kind="scene",
+        input_path=payload.scene_path,
+        model_id=payload.model_id.strip(),
+        collection=payload.collection,
+        params={
+            "remesh": payload.remesh,
+            "enable_texture": payload.enable_texture,
+            "texture_resolution": payload.texture_resolution,
+            **payload.params,
+        },
+    ), background_tasks)
 
 
 @router.get("/status/{job_id}")

@@ -44,3 +44,14 @@ class GenerateFromArtifactRequest(BaseModel):
     model_id: str
     collection: str = "Workflows"
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateFromSceneRequest(BaseModel):
+    """Compatibility request; scene_path uses the typed scene-input contract."""
+    scene_path: str
+    model_id: str = "sf3d"
+    collection: str = "Default"
+    remesh: str = "quad"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
+    params: dict[str, Any] = Field(default_factory=dict)

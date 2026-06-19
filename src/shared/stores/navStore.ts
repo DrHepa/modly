@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 
-export type Page = 'generate' | 'workflows' | 'worlds' | 'models' | 'settings'
+export const NAV_PAGES = ['generate', 'workflows', 'worlds', 'models', 'settings'] as const
+
+export type Page = (typeof NAV_PAGES)[number]
 
 interface NavState {
   currentPage: Page

@@ -102,3 +102,12 @@ test('AssetLibraryEntry contracts keep manifest and source-link metadata explici
   assert.equal(degradedResult.entry.source?.degraded, true)
   assert.equal(degradedResult.preview.kind, '3d-model')
 })
+
+test('optional PLY header inspection evidence preserves legacy entry and binary preview contracts', () => {
+  const legacy = { id: 'library:Workflows/a.ply', workspacePath: 'Workflows/a.ply', displayName: 'A', sourceScope: 'workflows', state: 'ready', previewKind: 'binary', warnings: [] } satisfies AssetLibraryEntry
+  const inspected = { ...legacy, plyHeader: { status: 'complete', content: 'ply\nend_header\n' } } satisfies AssetLibraryEntry
+  const unavailable = { ...legacy, plyHeader: { status: 'unavailable', reason: 'header-too-large' } } satisfies AssetLibraryEntry
+  assert.equal('plyHeader' in legacy, false)
+  assert.equal(inspected.plyHeader.status, 'complete')
+  assert.equal(unavailable.plyHeader.reason, 'header-too-large')
+})

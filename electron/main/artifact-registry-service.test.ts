@@ -1077,6 +1077,7 @@ test('lists workspace asset library entries with projected registry metadata, si
         id: `library:${workspacePath}`,
         workspacePath,
         displayName: expectedName,
+        ...(workspacePath.endsWith('.ply') ? { plyHeader: { status: 'complete', content: 'ply\nformat ascii 1.0\nend_header\n' } } : {}),
         sourceScope: 'workflows',
         capability: 'mesh',
         state: 'ready',
@@ -4290,3 +4291,119 @@ test('enriches sidecars with safe source, manifest, artifact, version, and prove
   assert.ok(registry.success && registry.sidecar)
   assert.deepEqual(registry.sidecar.metadata.producerExtra, { arbitrary: ['preserved by registry'] })
 }))
+
+const WORLD_PLY_HEADER = 'ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n'
+
+test('library list/read expose bounded PLY headers while Generate open remains mesh-only', () => withWorkspace(async (workspaceDir) => {
+  await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+  const workspacePath = 'Workflows/世界 con espacios.ply'
+  const filePath = path.join(workspaceDir, workspacePath)
+  await writeFile(filePath, WORLD_PLY_HEADER + '0 0 0\n')
+  const { open } = await import('node:fs/promises')
+  const handle = await open(filePath, 'r+')
+  try { await handle.truncate(32 * 1024 * 1024) } finally { await handle.close() }
+  const list = await listWorkspaceAssetLibrary({ workspaceDir })
+  assert.ok(list.success)
+  const entry = list.entries.find(item => item.workspacePath === workspacePath)
+  assert.deepEqual(entry?.plyHeader, { status: 'complete', content: WORLD_PLY_HEADER })
+  const read = await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+  assert.ok(read.success)
+  assert.deepEqual(read.entry.plyHeader, entry?.plyHeader)
+  assert.equal(read.preview.kind, 'binary')
+  const opened = await openWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+  assert.ok(!opened.success)
+  assert.match(opened.error, /safe GLB\/GLTF/)
+  const replacement = WORLD_PLY_HEADER.replace('end_header', 'property float f_dc_0\nproperty float scale_0\nproperty float rot_0\nend_header')
+  await writeFile(filePath, replacement)
+  const fresh = await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+  assert.ok(fresh.success)
+  assert.deepEqual(fresh.entry.plyHeader, { status: 'complete', content: replacement })
+}))
+
+test('PLY header inspection reports unavailable evidence without reading an unbounded model', () => withWorkspace(async (workspaceDir) => {
+  await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+  for (const [name, bytes, reason] of [
+    ['long', Buffer.from('ply\ncomment ' + 'x'.repeat(65536) + '\nend_header\n'), 'header-too-large'],
+    ['short', Buffer.from('ply\nformat ascii 1.0\n'), 'incomplete-header'],
+    ['encoding', Buffer.concat([Buffer.from('ply\ncomment '), Buffer.from([255]), Buffer.from('\nend_header\n')]), 'invalid-header-encoding'],
+  ] as const) {
+    const workspacePath = `Workflows/${name}.ply`
+    await writeFile(path.join(workspaceDir, workspacePath), bytes)
+    const result = await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath })
+    assert.ok(result.success)
+    assert.deepEqual(result.entry.plyHeader, { status: 'unavailable', reason })
+  }
+  const listed = await listWorkspaceAssetLibrary({ workspaceDir })
+  assert.ok(listed.success)
+  assert.equal(listed.entries.length, 3)
+}))
+
+test('bounded PLY descriptor reader respects short reads, delimiter and byte ceiling', async () => {
+  const { readBoundedPlyHeader } = await import('./artifact-registry-service.ts')
+  for (const content of [Buffer.from(WORLD_PLY_HEADER + 'body'.repeat(30000)), Buffer.alloc(100000, 120)]) {
+    let readBytes = 0
+    const reads: number[] = []
+    const result = await readBoundedPlyHeader({ read: async (buffer, offset, length, position) => {
+      reads.push(length)
+      const bytesRead = Math.min(17, length, content.length - position)
+      if (bytesRead > 0) content.copy(buffer, offset, position, position + bytesRead)
+      readBytes += bytesRead
+      return { bytesRead }
+    } })
+    assert.ok(reads.every(length => length <= 4096))
+    assert.ok(readBytes <= 65536)
+    if (content[0] === 112) {
+      assert.deepEqual(result, { status: 'complete', content: WORLD_PLY_HEADER })
+      assert.ok(readBytes < WORLD_PLY_HEADER.length + 17)
+    } else {
+      assert.deepEqual(result, { status: 'unavailable', reason: 'header-too-large' })
+      assert.equal(readBytes, 65536)
+    }
+  }
+})
+
+test('PLY read retains root-alias support and rejects physical links or nonregular leaves', () => withWorkspace(async (workspaceDir) => {
+  await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+  await writeFile(path.join(workspaceDir, 'Workflows/real.ply'), WORLD_PLY_HEADER)
+  await mkdir(path.join(workspaceDir, 'Workflows/directory.ply'))
+  await symlink(path.join(workspaceDir, 'Workflows/real.ply'), path.join(workspaceDir, 'Workflows/link.ply'))
+  await symlink(path.join(workspaceDir, 'missing'), path.join(workspaceDir, 'Workflows/broken.ply'))
+  const alias = workspaceDir + '-root-alias'
+  await symlink(workspaceDir, alias)
+  try {
+    const positive = await readWorkspaceAssetLibraryEntry({ workspaceDir: alias, workspacePath: 'Workflows/real.ply' })
+    assert.ok(positive.success && positive.entry.plyHeader?.status === 'complete')
+    for (const name of ['directory', 'link', 'broken']) {
+      assert.equal((await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath: `Workflows/${name}.ply` })).success, false)
+    }
+  } finally { await rm(alias) }
+}))
+
+test('bounded PLY inspection preserves CR, CRLF and LF delimiters across short reads without accepting trailing whitespace', async () => {
+  const { readBoundedPlyHeader } = await import('./artifact-registry-service.ts')
+  for (const newline of ['\n', '\r', '\r\n']) {
+    const header = WORLD_PLY_HEADER.replaceAll('\n', newline)
+    for (const chunkSize of [1, 7, 4096]) {
+      const source = Buffer.from(header + '0 0 0' + newline)
+      let total = 0
+      const result = await readBoundedPlyHeader({ async read(buffer, offset, length, position) {
+        assert.ok(length <= 4096)
+        const bytesRead = Math.min(length, chunkSize, source.length - position)
+        source.copy(buffer, offset, position, position + bytesRead)
+        total += bytesRead
+        return { bytesRead }
+      } })
+      assert.deepEqual(result, { status: 'complete', content: header })
+      assert.ok(total <= 65536)
+    }
+  }
+  for (const suffix of [' ', '\t']) {
+    const source = Buffer.from(WORLD_PLY_HEADER.replace('end_header', `end_header${suffix}`))
+    const result = await readBoundedPlyHeader({ async read(buffer, offset, length, position) {
+      const bytesRead = Math.min(length, source.length - position)
+      source.copy(buffer, offset, position, position + bytesRead)
+      return { bytesRead }
+    } })
+    assert.deepEqual(result, { status: 'unavailable', reason: 'incomplete-header' })
+  }
+})

@@ -35,6 +35,11 @@ export interface AssetLibraryManifestRef {
   title?: string
 }
 
+/** Bounded header evidence only; this does not validate the PLY body. */
+export type AssetLibraryPlyHeader =
+  | { status: 'complete'; content: string }
+  | { status: 'unavailable'; reason: 'header-too-large' | 'incomplete-header' | 'invalid-header-encoding' }
+
 export interface AssetLibraryEntry {
   id: string
   workspacePath: string
@@ -50,6 +55,7 @@ export interface AssetLibraryEntry {
   createdAt?: string
   updatedAt?: string
   previewKind: AssetLibraryPreviewKind
+  plyHeader?: AssetLibraryPlyHeader
   warnings: string[]
 }
 

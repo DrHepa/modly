@@ -983,3 +983,29 @@ test('preload workspace asset library exposes list, read, and open IPC channels'
     { channel: 'workspace:library:open', args: [openRequest] },
   ])
 })
+
+test('actual preload/main channels carry PLY read evidence without relaxing mesh open', async () => {
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { registerWorkspaceAssetLibraryIpcHandlers } = await import('../main/artifact-registry-service.ts')
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'modly-ply-preload-'))
+  try {
+    await mkdir(join(workspaceDir, 'Workflows'))
+    const content = 'ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n'
+    await writeFile(join(workspaceDir, 'Workflows/points.ply'), content + '0 0 0\n')
+    await writeFile(join(workspaceDir, 'Workflows/hero.glb'), 'glb')
+    const handlers = new Map<string, (event: unknown, payload: unknown) => unknown>()
+    registerWorkspaceAssetLibraryIpcHandlers({ ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) } }, getWorkspaceDir: () => workspaceDir })
+    const calls: string[] = []
+    const api = createElectronApi({ invoke: async (channel, payload) => { calls.push(channel); return handlers.get(channel)?.({}, payload) }, send: () => undefined, on: () => undefined, removeAllListeners: () => undefined }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+    const listed = await api.workspace.library.list()
+    const read = await api.workspace.library.read({ workspacePath: 'Workflows/points.ply' })
+    assert.ok(listed.success && read.success)
+    assert.deepEqual(read.entry.plyHeader, { status: 'complete', content })
+    assert.deepEqual(listed.entries.find(entry => entry.workspacePath.endsWith('.ply'))?.plyHeader, read.entry.plyHeader)
+    assert.equal((await api.workspace.library.open({ workspacePath: 'Workflows/points.ply' })).success, false)
+    assert.equal((await api.workspace.library.open({ workspacePath: 'Workflows/hero.glb' })).success, true)
+    assert.deepEqual(calls, ['workspace:library:list', 'workspace:library:read', 'workspace:library:open', 'workspace:library:open'])
+  } finally { await rm(workspaceDir, { recursive: true, force: true }) }
+})

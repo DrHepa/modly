@@ -7,6 +7,7 @@ import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve,
 // Artifact sidecars are also available outside the asset-library roots.
 import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
 import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
+import type { AssetLibraryPlyHeader } from '../../src/shared/types/assetLibrary.ts'
 import type { AssetCapability, AssetEntryState, AssetLibraryEntry, AssetLibraryListResult, AssetLibraryManifestCapability, AssetLibraryManifestRef, AssetLibraryOpenResult, AssetLibraryPreviewKind, AssetLibraryPreviewPayload, AssetLibraryReadResult, AssetLibrarySourceLink, AssetLibrarySourceScope } from '../../src/shared/types/assetLibrary.ts'
 
 const SIDECAR_SUFFIX = '.artifact.json'
@@ -774,11 +775,57 @@ async function readMotionRetargetLibraryState(workspaceDir: string, workspacePat
   }
 }
 
+/** Inspect only a bounded header, never the complete model body. */
+export async function readBoundedPlyHeader(handle: {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>
+}): Promise<AssetLibraryPlyHeader> {
+  const limit = 64 * 1024
+  const buffer = Buffer.alloc(limit)
+  let length = 0
+  let headerEnd: number | undefined
+  const complete = (end: number): AssetLibraryPlyHeader => {
+    try {
+      return { status: 'complete', content: new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, end)) }
+    } catch {
+      return { status: 'unavailable', reason: 'invalid-header-encoding' }
+    }
+  }
+  while (length < limit) {
+    const { bytesRead } = await handle.read(buffer, length, Math.min(4096, limit - length), length)
+    if (bytesRead === 0) return headerEnd === undefined ? { status: 'unavailable', reason: 'incomplete-header' } : complete(headerEnd)
+    length += bytesRead
+    // Latin-1 preserves byte offsets; decode only the complete header as UTF-8.
+    // PLYLoader accepts CR, CRLF and LF, but not trailing terminator whitespace.
+    const delimiter = /(?:^|[\r\n])[\t ]*end_header(?:\r\n|\r|\n)/.exec(buffer.toString('latin1', 0, length))
+    if (delimiter) {
+      headerEnd = delimiter.index + delimiter[0].length
+      // A short read may split CRLF; inspect the next bounded chunk before
+      // returning, so the evidence includes the complete newline when present.
+      if (headerEnd === length && buffer[length - 1] === 13 && length < limit) continue
+      return complete(headerEnd)
+    }
+  }
+  return { status: 'unavailable', reason: 'header-too-large' }
+}
+
+async function inspectPhysicalPlyHeader(absolutePath: string): Promise<AssetLibraryPlyHeader> {
+  const handle = await open(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    if (!(await handle.stat()).isFile()) throw new Error('PLY asset must be a regular file.')
+    return await readBoundedPlyHeader(handle)
+  } finally {
+    await handle.close()
+  }
+}
+
 async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePath: string): Promise<AssetLibraryEntry | null> {
   normalizeWorkspaceAssetPath(workspaceDir, workspacePath)
   const physical = await physicalArtifactPath(workspaceDir, workspacePath)
   const stats = await lstat(physical.absolutePath)
   if (shouldSkipWorkspaceAssetLibraryPath(workspacePath)) return null
+  const plyHeader = resolveWorkspaceArtifactExtension(workspacePath) === 'ply'
+    ? await inspectPhysicalPlyHeader(physical.absolutePath)
+    : undefined
 
   const { createdAt, updatedAt } = resolveAssetLibraryEntryTimestamps(stats)
   const sourceScope = deriveAssetLibrarySourceScope(workspacePath)
@@ -875,6 +922,7 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     ...(source ? { source } : {}),
     ...(manifest ? { manifest } : {}),
     previewKind,
+    ...(plyHeader ? { plyHeader } : {}),
     warnings: [...new Set(warnings)],
   }
 }

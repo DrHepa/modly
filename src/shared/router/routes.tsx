@@ -15,7 +15,7 @@ export interface RouteConfig {
 export const ROUTES: Record<Page, RouteConfig> = {
   generate:  { component: GeneratePage,  wrapperClass: 'flex flex-1 overflow-hidden' },
   workflows: { component: WorkflowsPage, wrapperClass: 'flex flex-1 overflow-hidden' },
-  worlds:    { component: WorldsPage,    wrapperClass: 'flex-1 overflow-hidden'      },
+  worlds:    { component: WorldsPage,    wrapperClass: 'flex flex-1 overflow-hidden' },
   models:    { component: ModelsPage,    wrapperClass: 'flex-1 overflow-y-auto'      },
   settings:  { component: SettingsPage,  wrapperClass: 'flex-1 overflow-hidden'      },
 }

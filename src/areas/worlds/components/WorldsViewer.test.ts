@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import * as THREE from 'three'
 
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
 
@@ -151,6 +152,9 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [
         {
@@ -169,6 +173,9 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [],
     })
@@ -206,6 +213,9 @@ test('WorldsViewer routes GLB and GLTF scene items through the GLTF render targe
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [
         {
@@ -308,12 +318,149 @@ test('WorldsMouseLookCameraControls handles only left-drag look without pointer 
     assert.equal(mouseLookControlsSource.includes('pointerLock'), false)
     assert.equal(mouseLookControlsSource.includes('event.button !== 0'), true)
     assert.equal(mouseLookControlsSource.includes("canvas.addEventListener('pointerdown', handlePointerDown, { capture: true })"), true)
+    assert.equal(mouseLookControlsSource.includes('LOOK_DRAG_START_THRESHOLD_PX'), true)
+    assert.equal(mouseLookControlsSource.includes('pendingPointerRef'), true)
     assert.equal(mouseLookControlsSource.includes('event.stopImmediatePropagation()'), true)
+    assert.equal(mouseLookControlsSource.includes('pendingPointerRef.current = {'), true)
+    assert.equal(mouseLookControlsSource.includes('if (dragDistance < LOOK_DRAG_START_THRESHOLD_PX) return'), true)
     assert.equal(mouseLookControlsSource.includes('camera.quaternion.setFromEuler'), true)
     assert.equal(mouseLookControlsSource.includes('controls.target.copy'), true)
     assert.equal(mouseLookControlsSource.includes('WORLD_CAMERA_LOOK_PITCH_LIMIT'), true)
     assert.equal(viewerSource.includes('enableRotate: false'), true)
-    assert.equal(viewerSource.includes('<WorldsMouseLookCameraControls inputScopeRef={inputScopeRef} orbitControlsRef={orbitControlsRef} />'), true)
+    assert.equal(viewerSource.includes('<WorldsMouseLookCameraControls'), true)
+    assert.equal(viewerSource.includes('enabled={!transformMode && !transformDraggingRef.current}'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer exposes selection state and a local transform toolbar contract', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.deepEqual(module.WORLD_VIEWER_TRANSFORM_CONTROLS, {
+      modes: ['translate', 'rotate', 'scale'],
+      placement: 'right-canvas-toolbar',
+      disabledUntilSelection: true,
+      backendBake: false,
+    })
+    assert.deepEqual(module.describeWorldsViewerScene([item('ply-mesh', 'mesh.ply')], [], 'world:mesh.ply'), {
+      hasRenderableItems: true,
+      hasGrid: true,
+      hasOrbitControls: true,
+      hasUnifiedKeyboardMovement: true,
+      hasGizmo: true,
+      hasSelection: true,
+      selectedItemId: 'world:mesh.ply',
+      transformControls: {
+        modes: ['translate', 'rotate', 'scale'],
+        attachedItemId: 'world:mesh.ply',
+      },
+      unsupported: [],
+      renderTargets: [
+        {
+          workspacePath: 'mesh.ply',
+          kind: 'ply-mesh',
+          loader: 'ply',
+          primitive: 'mesh',
+          cameraFit: 'bounds',
+          visibleDescription: 'PLY mesh geometry',
+        },
+      ],
+    })
+    assert.equal(viewerSource.includes('WorldsTransformToolbar'), true)
+    assert.equal(viewerSource.includes('items={visibleItems}'), true)
+    assert.equal(viewerSource.includes('onRemoveItem={onRemoveItem}'), true)
+    assert.equal(viewerSource.includes('TransformControls'), true)
+    assert.equal(viewerSource.includes('transformDraggingRef'), true)
+    assert.equal(viewerSource.includes('if (transformDraggingRef.current) return'), true)
+    assert.equal(viewerSource.includes('onMouseDown={() => { draggingRef.current = true }}'), true)
+    assert.equal(viewerSource.includes('onMouseUp={() => { draggingRef.current = false; syncTransform() }}'), true)
+    assert.equal(viewerSource.includes('resolveWorldsSceneItemIdFromIntersections'), true)
+    assert.equal(viewerSource.includes('BoxHelper'), false)
+    assert.equal(viewerSource.includes('EffectComposer'), true)
+    assert.equal(viewerSource.includes('Outline'), true)
+    assert.equal(viewerSource.includes('resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}'), true)
+    assert.equal(viewerSource.includes('xRay={false}'), true)
+    assert.equal(viewerSource.includes('autoClear={false}'), false)
+    assert.equal(viewerSource.includes('WorldsSelectionSilhouette'), true)
+    assert.equal(viewerSource.includes('THREE.BackSide'), true)
+    assert.equal(viewerSource.includes('worldsSelectionSilhouette'), true)
+    assert.equal(viewerSource.includes('Select enabled={selected}'), true)
+    assert.equal(viewerSource.includes('computeBoundsTree'), true)
+    assert.equal(viewerSource.includes('acceleratedRaycast'), true)
+    assert.equal(viewerSource.includes('SkeletonUtils'), true)
+    assert.equal(viewerSource.includes('cloneSkeletonScene(gltf.scene)'), true)
+    assert.equal(viewerSource.includes('material.side = THREE.DoubleSide'), true)
+    assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
+    assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
+    assert.equal(viewerSource.includes('calculateWorldsSelectionBounds'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer resolves selection from real mesh intersections before expanded hitboxes', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const itemGroup = new THREE.Group()
+    itemGroup.userData.worldsSceneItemId = 'world:real-mesh'
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial())
+    itemGroup.add(mesh)
+
+    const hitbox = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), new THREE.MeshBasicMaterial())
+    hitbox.userData.worldsSelectionHitbox = true
+    hitbox.userData.worldsSceneItemId = 'world:hitbox'
+    const silhouette = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), new THREE.MeshBasicMaterial())
+    silhouette.userData.worldsSelectionSilhouette = true
+    silhouette.userData.worldsSceneItemId = 'world:silhouette'
+
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(mesh), 'world:real-mesh')
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(hitbox), null)
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(silhouette), null)
+    assert.equal(module.resolveWorldsSceneItemIdFromIntersections([{ object: hitbox }, { object: silhouette }, { object: mesh }], 'world:fallback'), 'world:real-mesh')
+    assert.equal(module.resolveWorldsSceneItemIdFromIntersections([{ object: hitbox }], 'world:fallback'), 'world:fallback')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer computes an expanded invisible bounds hitbox for easy asset reselection', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const target = new THREE.Group()
+    target.position.set(4, 0, -2)
+    const narrowMesh = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.1, 0.2), new THREE.MeshBasicMaterial())
+    target.add(narrowMesh)
+    target.updateWorldMatrix(true, true)
+
+    const bounds = module.calculateWorldsSelectionBounds(target)
+    assert.ok(bounds)
+    assert.deepEqual(bounds.center.toArray(), [4, 0, -2])
+    assert.deepEqual(bounds.size.toArray(), [0.3, 0.3, 0.3])
+
+    narrowMesh.userData.worldsSelectionHitbox = true
+    assert.equal(module.calculateWorldsSelectionBounds(target), null)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsMouseLookCameraControls can be disabled so selection and transform gizmos receive pointer events', async () => {
+  const { cleanup } = await loadViewerModule()
+  const mouseLookControlsSource = await readFile(mouseLookControlsEntry, 'utf8')
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.equal(mouseLookControlsSource.includes('enabled = true'), true)
+    assert.equal(mouseLookControlsSource.includes('if (!enabled) return'), true)
+    assert.equal(viewerSource.includes('enabled={!transformMode && !transformDraggingRef.current}'), true)
+    assert.equal(viewerSource.includes('selectSceneItemFromCanvas'), true)
+    assert.equal(viewerSource.includes('if (transformMode) return'), true)
+    assert.equal(viewerSource.includes('onPointerMissed={() => selectSceneItemFromCanvas(null)}'), true)
   } finally {
     await cleanup()
   }
@@ -334,12 +481,17 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
     assert.equal(viewerSource.includes('bounds.refresh()'), true)
     assert.equal(viewerSource.includes('bounds.getSize()'), true)
     assert.equal(viewerSource.includes('WORLDS_DEFAULT_CAMERA_POSITION'), true)
+    assert.equal(viewerSource.includes('const shouldApplyInitialFit = cameraFitSnapshotRef.current === null'), true)
     assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = snapshot'), true)
+    assert.equal(viewerSource.includes('if (shouldApplyInitialFit) applySnapshot(snapshot)'), true)
     assert.equal(viewerSource.includes('controls.target.copy(snapshot.target)'), true)
     assert.equal(viewerSource.includes('controls.saveState?.()'), true)
     assert.equal(viewerSource.includes('refresh().clip().fit()'), false)
     assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems, cameraState.resetToken)'), false)
     assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems)'), true)
+    assert.equal(viewerSource.includes('fallback={<HtmlStatus message="Loading world asset…" />}'), false)
+    assert.equal(viewerSource.includes('<Suspense fallback={null}>'), true)
+    assert.equal(viewerSource.includes('<Suspense fallback={null}>\n                    <WorldSceneItemObject'), true)
   } finally {
     await cleanup()
   }

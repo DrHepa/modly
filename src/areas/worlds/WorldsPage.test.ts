@@ -21,7 +21,7 @@ function stubViewerPlugin(): Plugin {
         contents: `
           import React from 'react'
           export function WorldsViewer(props) {
-            return <section aria-label="Worlds 3D canvas" data-items={props.items.length} data-unsupported={(props.unsupportedItems || []).length}>Worlds canvas</section>
+            return <section aria-label="Worlds 3D canvas" data-items={props.items.length} data-selected={props.selectedItemId || ''} data-unsupported={(props.unsupportedItems || []).length}>Worlds canvas</section>
           }
           export default WorldsViewer
         `,
@@ -79,6 +79,8 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       selectorOpen: true,
       assets: [asset('fuse', 'Fuse simplified')],
       selectedAssetId: 'fuse',
+      selectedSceneItemId: 'world:Workflows/fuse.ply',
+      transformMode: null,
       sceneItems: [asset('fuse', 'Fuse simplified').item],
       unsupportedItems: [],
       loadingAssets: false,
@@ -88,6 +90,10 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onCloseSelector: () => undefined,
       onRefreshAssets: () => undefined,
       onSelectAsset: () => undefined,
+      onSelectSceneItem: () => undefined,
+      onTransformModeChange: () => undefined,
+      onTransformSceneItem: () => undefined,
+      onRemoveSceneItem: () => undefined,
       onOpenSelected: () => undefined,
     }))
 
@@ -111,6 +117,8 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       selectorOpen: false,
       assets: [],
       selectedAssetId: null,
+      selectedSceneItemId: null,
+      transformMode: null,
       sceneItems: [],
       unsupportedItems: [],
       loadingAssets: false,
@@ -120,6 +128,10 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onCloseSelector: () => undefined,
       onRefreshAssets: () => undefined,
       onSelectAsset: () => undefined,
+      onSelectSceneItem: () => undefined,
+      onTransformModeChange: () => undefined,
+      onTransformSceneItem: () => undefined,
+      onRemoveSceneItem: () => undefined,
       onOpenSelected: () => undefined,
     }))
 
@@ -137,4 +149,98 @@ test('WorldsPage does not automatically close the selector after opening an asse
   const source = await readFile(pageEntry, 'utf8')
 
   assert.doesNotMatch(source, /setUnsupportedItems\(\[\]\)\s*setSelectorOpen\(false\)/)
+})
+
+test('WorldsPage appends opened assets with unique scene ids, deterministic offsets, and selects the newest item', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    const existingFuse = asset('fuse', 'Fuse simplified').item
+    const openedFuseAgain = { ...asset('fuse', 'Fuse simplified').item }
+    const openedHull = asset('hull', 'Hull').item
+
+    assert.deepEqual(module.appendWorldSceneItem([existingFuse], openedHull), {
+      sceneItems: [existingFuse, { ...openedHull, transform: { ...openedHull.transform, position: [1.75, 0, 0] } }],
+      selectedSceneItemId: 'world:Workflows/hull.ply',
+    })
+
+    assert.deepEqual(module.appendWorldSceneItem([existingFuse], openedFuseAgain), {
+      sceneItems: [existingFuse, { ...openedFuseAgain, id: 'world:Workflows/fuse.ply#2', transform: { ...openedFuseAgain.transform, position: [1.75, 0, 0] } }],
+      selectedSceneItemId: 'world:Workflows/fuse.ply#2',
+    })
+
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(0), [0, 0, 0])
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(1), [1.75, 0, 0])
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(2), [0, 0, 1.75])
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(8), [1.75, 0, -1.75])
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(9), [3.5, 0, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage removes only the selected in-memory scene item and recovers selection', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    const fuse = asset('fuse', 'Fuse simplified').item
+    const hull = asset('hull', 'Hull').item
+    const tower = asset('tower', 'Tower').item
+
+    assert.deepEqual(module.removeWorldSceneItem([fuse, hull, tower], hull.id), {
+      sceneItems: [fuse, tower],
+      selectedSceneItemId: tower.id,
+    })
+    assert.deepEqual(module.removeWorldSceneItem([fuse, hull, tower], tower.id), {
+      sceneItems: [fuse, hull],
+      selectedSceneItemId: hull.id,
+    })
+    assert.deepEqual(module.removeWorldSceneItem([fuse], fuse.id), {
+      sceneItems: [],
+      selectedSceneItemId: null,
+    })
+    assert.deepEqual(module.removeWorldSceneItem([fuse], null), {
+      sceneItems: [fuse],
+      selectedSceneItemId: null,
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage updates the selected scene item transform without mutating other assets', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    const fuse = asset('fuse', 'Fuse simplified').item
+    const hull = asset('hull', 'Hull').item
+    const movedHull = module.updateWorldSceneItemTransform([fuse, hull], hull.id, {
+      position: [1, 2, 3],
+      rotation: [0.1, 0.2, 0.3],
+      scale: [2, 2, 2],
+    })
+
+    assert.deepEqual(movedHull, [
+      fuse,
+      {
+        ...hull,
+        transform: {
+          position: [1, 2, 3],
+          rotation: [0.1, 0.2, 0.3],
+          scale: [2, 2, 2],
+        },
+      },
+    ])
+    assert.deepEqual(module.updateWorldSceneItemTransform([fuse, hull], 'missing', { position: [9, 9, 9], rotation: [0, 0, 0], scale: [1, 1, 1] }), [fuse, hull])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage keeps composed scene state in the Worlds store for tab navigation and rapid asset opens', async () => {
+  const source = await readFile(pageEntry, 'utf8')
+
+  assert.match(source, /useWorldsSceneStore/)
+  assert.match(source, /useWorldsSceneStore\.getState\(\)\.sceneItems/)
+  assert.doesNotMatch(source, /useState<\{ sceneItems: WorldSceneItem\[\]; selectedSceneItemId: string \| null \}>/)
 })

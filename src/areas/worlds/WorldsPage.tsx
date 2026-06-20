@@ -15,6 +15,13 @@ import {
   type WorldAssetLibraryRenderable,
 } from './worldAssetLibraryService.ts'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import {
+  DEFAULT_WORLDS_SCENE_MANIFEST_PATH,
+  buildWorldsSceneManifest,
+  decodeBase64Utf8,
+  parseWorldsSceneManifestText,
+  workspaceRelativePathFromAbsolute,
+} from './worldsSceneManifest.ts'
 
 export interface WorldsPageViewProps {
   selectorOpen: boolean
@@ -26,6 +33,9 @@ export interface WorldsPageViewProps {
   unsupportedItems: WorldsViewerUnsupportedItem[]
   loadingAssets: boolean
   openingAsset: boolean
+  savingScene: boolean
+  importingScene: boolean
+  sceneStatus: string | null
   error: string | null
   searchQuery: string
   sortMode: WorkspaceAssetLibrarySortMode
@@ -42,6 +52,8 @@ export interface WorldsPageViewProps {
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
   onRemoveSceneItem: (itemId: string | null) => void
   onOpenSelected: () => void
+  onSaveScene: () => void
+  onImportScene: () => void
 }
 
 export function WorldsPageView({
@@ -54,6 +66,9 @@ export function WorldsPageView({
   unsupportedItems,
   loadingAssets,
   openingAsset,
+  savingScene,
+  importingScene,
+  sceneStatus,
   error,
   searchQuery,
   sortMode,
@@ -70,7 +85,12 @@ export function WorldsPageView({
   onTransformSceneItem,
   onRemoveSceneItem,
   onOpenSelected,
+  onSaveScene,
+  onImportScene,
 }: WorldsPageViewProps): JSX.Element {
+  const hasSceneItems = sceneItems.length > 0
+  const sceneActionBusy = savingScene || importingScene
+
   return (
     <main className="relative flex flex-1 overflow-hidden bg-surface-400 text-zinc-100" aria-label="Worlds viewer">
       <WorldsViewer
@@ -103,6 +123,26 @@ export function WorldsPageView({
           onToggleSection={onToggleSection}
           onOpenSelected={onOpenSelected}
         />
+      </div>
+      <div className="absolute right-3 top-3 z-20 flex items-center gap-2 rounded-xl border border-zinc-700/70 bg-zinc-950/70 p-1 shadow-xl backdrop-blur" aria-label="Worlds scene persistence">
+        <button
+          type="button"
+          className="rounded-lg px-3 py-2 text-xs font-semibold text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={!hasSceneItems || sceneActionBusy}
+          onClick={onSaveScene}
+          title={hasSceneItems ? 'Save the current Worlds scene manifest' : 'Add assets before saving a Worlds scene'}
+        >
+          {savingScene ? 'Saving…' : 'Save scene'}
+        </button>
+        <button
+          type="button"
+          className="rounded-lg px-3 py-2 text-xs font-semibold text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={sceneActionBusy}
+          onClick={onImportScene}
+        >
+          {importingScene ? 'Importing…' : 'Import scene'}
+        </button>
+        {sceneStatus ? <span className="max-w-52 truncate px-2 text-xs text-emerald-300" role="status">{sceneStatus}</span> : null}
       </div>
     </main>
   )
@@ -212,6 +252,9 @@ export default function WorldsPage(): JSX.Element {
   const [unsupportedItems, setUnsupportedItems] = useState<WorldsViewerUnsupportedItem[]>([])
   const [loadingAssets, setLoadingAssets] = useState(false)
   const [openingAsset, setOpeningAsset] = useState(false)
+  const [savingScene, setSavingScene] = useState(false)
+  const [importingScene, setImportingScene] = useState(false)
+  const [sceneStatus, setSceneStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const selectedAsset = useMemo(
@@ -244,6 +287,11 @@ export default function WorldsPage(): JSX.Element {
   async function openSelectedAsset(): Promise<void> {
     if (!selectedAsset) return
 
+    if (selectedAsset.openable === true && 'sceneManifest' in selectedAsset) {
+      await importSceneManifestFromWorkspacePath(selectedAsset.workspacePath)
+      return
+    }
+
     if (selectedAsset.openable === false) {
       setSelectedSceneItemId(null)
       clearTransformMode()
@@ -261,8 +309,13 @@ export default function WorldsPage(): JSX.Element {
       }
 
       if (result.asset.openable === true) {
-        setWorldScene(appendWorldSceneItem(useWorldsSceneStore.getState().sceneItems, result.asset.item))
-        setUnsupportedItems([])
+        if ('sceneManifest' in result.asset) {
+          await importSceneManifestFromWorkspacePath(result.asset.workspacePath)
+        } else {
+          setWorldScene(appendWorldSceneItem(useWorldsSceneStore.getState().sceneItems, result.asset.item))
+          setUnsupportedItems([])
+          setSceneStatus(null)
+        }
       } else {
         setSelectedSceneItemId(null)
         clearTransformMode()
@@ -275,6 +328,92 @@ export default function WorldsPage(): JSX.Element {
       setError(reason instanceof Error ? reason.message : 'Unable to open world asset.')
     } finally {
       setOpeningAsset(false)
+    }
+  }
+
+  async function saveSceneManifest(): Promise<void> {
+    const currentItems = useWorldsSceneStore.getState().sceneItems
+    if (currentItems.length === 0) return
+
+    setSavingScene(true)
+    setError(null)
+    setSceneStatus(null)
+    try {
+      const settings = await window.electron.settings.get()
+      const savePath = await window.electron.fs.savePath({
+        filters: [{ name: 'Scene manifest', extensions: ['json'] }],
+        defaultPath: `${settings.workspaceDir.replace(/[/\\]+$/, '')}/${DEFAULT_WORLDS_SCENE_MANIFEST_PATH}`,
+      })
+      if (!savePath) return
+
+      const workspacePath = workspaceRelativePathFromAbsolute(savePath, settings.workspaceDir)
+      if (!workspacePath) {
+        setError('Save scene requires a destination inside the Modly workspace.')
+        return
+      }
+
+      const result = await window.electron.workspace.worlds.writeSceneManifest({
+        workspacePath,
+        manifest: buildWorldsSceneManifest(currentItems),
+      })
+      if (result.success !== true) {
+        setError(result.error)
+        return
+      }
+
+      setSceneStatus(`Saved ${result.workspacePath}`)
+      void refreshAssets()
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : 'Unable to save Worlds scene.')
+    } finally {
+      setSavingScene(false)
+    }
+  }
+
+  async function importSceneManifest(): Promise<void> {
+    setImportingScene(true)
+    setError(null)
+    setSceneStatus(null)
+    try {
+      const filePath = await window.electron.fs.selectSceneFile()
+      if (!filePath) return
+      const settings = await window.electron.settings.get()
+      const workspacePath = workspaceRelativePathFromAbsolute(filePath, settings.workspaceDir)
+      if (!workspacePath) {
+        setError('Import scene requires a scene manifest inside the Modly workspace.')
+        return
+      }
+      await importSceneManifestFromWorkspacePath(workspacePath, settings.workspaceDir)
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : 'Unable to import Worlds scene.')
+    } finally {
+      setImportingScene(false)
+    }
+  }
+
+  async function importSceneManifestFromWorkspacePath(workspacePath: string, knownWorkspaceDir?: string): Promise<void> {
+    setImportingScene(true)
+    setError(null)
+    setSceneStatus(null)
+    try {
+      const workspaceDir = knownWorkspaceDir ?? (await window.electron.settings.get()).workspaceDir
+      const base64 = await window.electron.fs.readFileBase64(`${workspaceDir.replace(/[/\\]+$/, '')}/${workspacePath}`)
+      const parsed = parseWorldsSceneManifestText(decodeBase64Utf8(base64), { apiUrl })
+      if (parsed.success !== true) {
+        setError(parsed.error)
+        return
+      }
+
+      setWorldScene({
+        sceneItems: parsed.sceneItems,
+        selectedSceneItemId: parsed.sceneItems.find((item) => item.visible)?.id ?? null,
+      })
+      setUnsupportedItems([])
+      setSceneStatus(`Imported ${workspacePath}`)
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : 'Unable to import Worlds scene.')
+    } finally {
+      setImportingScene(false)
     }
   }
 
@@ -299,6 +438,9 @@ export default function WorldsPage(): JSX.Element {
       unsupportedItems={unsupportedItems}
       loadingAssets={loadingAssets}
       openingAsset={openingAsset}
+      savingScene={savingScene}
+      importingScene={importingScene}
+      sceneStatus={sceneStatus}
       error={error}
       searchQuery={librarySearchQuery}
       sortMode={librarySortMode}
@@ -330,6 +472,8 @@ export default function WorldsPage(): JSX.Element {
         clearTransformMode()
       }}
       onOpenSelected={() => void openSelectedAsset()}
+      onSaveScene={() => void saveSceneManifest()}
+      onImportScene={() => void importSceneManifest()}
     />
   )
 }

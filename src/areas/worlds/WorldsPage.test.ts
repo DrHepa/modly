@@ -90,6 +90,9 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
+      savingScene: false,
+      importingScene: false,
+      sceneStatus: null,
       error: null,
       searchQuery: '',
       sortMode: 'type',
@@ -106,12 +109,16 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onTransformSceneItem: () => undefined,
       onRemoveSceneItem: () => undefined,
       onOpenSelected: () => undefined,
+      onSaveScene: () => undefined,
+      onImportScene: () => undefined,
     }))
 
     assert.match(markup, /<main[^>]*aria-label="Worlds viewer"/)
     assert.match(markup, /aria-label="Worlds 3D canvas"/)
     assert.match(markup, /role="dialog"/)
     assert.match(markup, /Open asset/)
+    assert.match(markup, /Save scene/)
+    assert.match(markup, /Import scene/)
     assert.match(markup, /z-20/)
     assert.match(markup, /data-items="1"/)
     assert.doesNotMatch(markup, /<aside|page card|boxed|Metadata|Inspector|Raw|Schema|Provenance|Details/i)
@@ -134,6 +141,9 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
+      savingScene: false,
+      importingScene: false,
+      sceneStatus: null,
       error: null,
       searchQuery: '',
       sortMode: 'type',
@@ -150,12 +160,15 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onTransformSceneItem: () => undefined,
       onRemoveSceneItem: () => undefined,
       onOpenSelected: () => undefined,
+      onSaveScene: () => undefined,
+      onImportScene: () => undefined,
     }))
 
     assert.doesNotMatch(markup, /Open a workflow world or renderable asset/i)
     assert.doesNotMatch(markup, /role="dialog"/)
     assert.match(markup, /aria-haspopup="dialog"/)
     assert.match(markup, /aria-expanded="false"/)
+    assert.match(markup, /disabled=""[^>]*>Save scene/)
     assert.doesNotMatch(markup, /metadata|inspector|raw json|schema|provenance|details/i)
   } finally {
     await cleanup()

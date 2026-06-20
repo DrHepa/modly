@@ -1,5 +1,5 @@
 // Type declarations for the Electron API exposed via preload
-import type { ArtifactKind, ArtifactRef, ArtifactSidecar } from './artifacts'
+import type { ArtifactKind, ArtifactRef, ArtifactSidecar, SceneArtifactManifestV1 } from './artifacts'
 import type { AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult } from './assetLibrary.ts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
@@ -359,6 +359,21 @@ export interface EditedSceneArtifactWriteRequest {
   bytes: Uint8Array | ArrayBuffer
   metadata: Record<string, unknown>
 }
+
+export interface WorldsSceneManifestWriteRequest {
+  workspacePath: string
+  manifest: SceneArtifactManifestV1
+}
+
+export type WorldsSceneManifestWriteResult =
+  | {
+      success: true
+      workspacePath: string
+    }
+  | {
+      success: false
+      error: string
+    }
 
 export interface LandmarkSidecarWriteRequest {
   sidecarWorkspacePath: string
@@ -1071,6 +1086,9 @@ declare global {
           list: () => Promise<AssetLibraryListResult>
           read: (request: AssetLibraryReadRequest) => Promise<AssetLibraryReadResult>
           open: (request: AssetLibraryOpenRequest) => Promise<AssetLibraryOpenResult>
+        }
+        worlds: {
+          writeSceneManifest: (request: WorldsSceneManifestWriteRequest) => Promise<WorldsSceneManifestWriteResult>
         }
         artifacts: {
           writeSidecar: (request: ArtifactRegistryWriteRequest) => Promise<ArtifactRegistryWriteResult>

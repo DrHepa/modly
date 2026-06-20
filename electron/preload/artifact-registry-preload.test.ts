@@ -104,6 +104,28 @@ test('preload workspace artifact registry invokes edited scene artifact IPC chan
   assert.deepEqual(invocations, [{ channel: 'workspace:artifact:writeEditedSceneArtifact', args: [request] }])
 })
 
+test('preload exposes scoped Worlds scene manifest writer IPC channel', async () => {
+  const invocations: Array<{ channel: string; args: unknown[] }> = []
+  const api = createElectronApi({
+    send() {},
+    on() {},
+    removeAllListeners() {},
+    async invoke(channel: string, ...args: unknown[]) {
+      invocations.push({ channel, args })
+      return { success: true, workspacePath: 'Exports/Worlds/scene-manifest.json' }
+    },
+  })
+
+  const request = {
+    workspacePath: 'Exports/Worlds/scene-manifest.json',
+    manifest: { schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] },
+  } as const
+  const result = await api.workspace.worlds.writeSceneManifest(request)
+
+  assert.deepEqual(result, { success: true, workspacePath: 'Exports/Worlds/scene-manifest.json' })
+  assert.deepEqual(invocations, [{ channel: 'workspace:worlds:writeSceneManifest', args: [request] }])
+})
+
 test('preload workspace artifact registry exposes landmark sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
   const api = createElectronApi({

@@ -1,11 +1,19 @@
-import { Component, Suspense, useEffect, useMemo, useState } from 'react'
-import { Canvas } from '@react-three/fiber'
-import { Bounds, GizmoHelper, GizmoViewport, Html, OrbitControls, useGLTF } from '@react-three/drei'
+import { Component, Suspense, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { Canvas, useThree } from '@react-three/fiber'
+import { Bounds, GizmoHelper, GizmoViewport, Html, OrbitControls, useBounds, useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 
 import { classifyPlyGeometry } from '../plyClassification.ts'
+import { createWorldsCameraState } from '../worldCameraNavigation.ts'
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
+import { WorldsKeyboardCameraControls, type WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.tsx'
+import { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
+
+export { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
+export { WorldsKeyboardCameraControls } from './WorldsKeyboardCameraControls.tsx'
+export { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
 
 export type WorldsViewerUnsupportedItem = {
   workspacePath: string
@@ -26,10 +34,15 @@ export type PlyRenderModel = {
   viewerNormalization: 'hy-world-z-up-to-y-up-floor-centered'
 }
 
+export const WORLD_VIEWER_CAMERA_NAVIGATION = {
+  orbitControls: 'always-enabled',
+  keyboardMovement: 'focused-viewer-scope',
+} as const
+
 export const WORLD_VIEWER_ORBIT_CONTROLS = {
   enablePan: true,
   enableZoom: true,
-  enableRotate: true,
+  enableRotate: false,
   screenSpacePanning: true,
   minPolarAngle: 0,
   maxPolarAngle: Math.PI,
@@ -39,6 +52,20 @@ export const WORLD_VIEWER_ORBIT_CONTROLS = {
   panSpeed: 1.2,
   rotateSpeed: 0.75,
 } as const
+
+const WORLDS_CAMERA_HELP_TEXT = 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space/E up · Q/Shift down'
+const WORLDS_DEFAULT_CAMERA_POSITION = new THREE.Vector3(2.4, 1.8, 2.8)
+const WORLDS_DEFAULT_CAMERA_TARGET = new THREE.Vector3(0, 0, 0)
+const worldsFitDirection = new THREE.Vector3()
+const worldsFitPosition = new THREE.Vector3()
+
+type WorldsCameraFitSnapshot = {
+  position: THREE.Vector3
+  target: THREE.Vector3
+  near: number
+  far: number
+  maxDistance: number
+}
 
 export type WorldSceneItemRenderTarget = {
   workspacePath: string
@@ -50,11 +77,32 @@ export type WorldSceneItemRenderTarget = {
 }
 
 export function WorldsViewer({ items, unsupportedItems = [] }: WorldsViewerProps): JSX.Element {
+  const inputScopeRef = useRef<HTMLElement>(null)
+  const orbitControlsRef = useRef<WorldsOrbitControlsHandle | null>(null)
+  const cameraFitSnapshotRef = useRef<WorldsCameraFitSnapshot | null>(null)
+  const [cameraState, setCameraState] = useState(() => createWorldsCameraState())
   const visibleItems = useMemo(() => items.filter((item) => item.visible), [items])
+  const sceneFitKey = useMemo(() => createWorldsSceneFitKey(visibleItems), [visibleItems])
   const description = describeWorldsViewerScene(items, unsupportedItems)
 
   return (
-    <section className="relative h-full w-full overflow-hidden" aria-label="Worlds 3D canvas">
+    <section
+      ref={inputScopeRef}
+      className="relative h-full w-full overflow-hidden focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400"
+      aria-label="Worlds 3D canvas"
+      tabIndex={0}
+      onPointerDown={(event) => event.currentTarget.focus()}
+    >
+      <WorldsCameraOverlay
+        speed={cameraState.speed}
+        onSpeedChange={(nextSpeed) => {
+          setCameraState((state) => ({ ...state, speed: nextSpeed }))
+        }}
+        onResetCamera={() => {
+          setCameraState((state) => ({ ...state, resetToken: state.resetToken + 1 }))
+        }}
+        helpText={WORLDS_CAMERA_HELP_TEXT}
+      />
       <Canvas
         camera={{ position: [2.4, 1.8, 2.8], fov: 45, near: 0.01, far: 500 }}
         dpr={[1, 1]}
@@ -66,15 +114,22 @@ export function WorldsViewer({ items, unsupportedItems = [] }: WorldsViewerProps
         <directionalLight position={[4, 6, 4]} intensity={1.2} />
         <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
         <Suspense fallback={<HtmlStatus message="Loading world asset…" />}>
-          <Bounds fit clip observe margin={1.25}>
+          <Bounds margin={1.25}>
             {visibleItems.map((item) => (
               <WorldSceneItemErrorBoundary key={item.id}>
                 <WorldSceneItemObject item={item} />
               </WorldSceneItemErrorBoundary>
             ))}
+            <SceneFitController
+              fitKey={sceneFitKey}
+              resetToken={cameraState.resetToken}
+              orbitControlsRef={orbitControlsRef}
+              cameraFitSnapshotRef={cameraFitSnapshotRef}
+            />
           </Bounds>
         </Suspense>
         <OrbitControls
+          ref={orbitControlsRef}
           makeDefault
           enableDamping
           dampingFactor={0.08}
@@ -90,6 +145,12 @@ export function WorldsViewer({ items, unsupportedItems = [] }: WorldsViewerProps
           panSpeed={WORLD_VIEWER_ORBIT_CONTROLS.panSpeed}
           rotateSpeed={WORLD_VIEWER_ORBIT_CONTROLS.rotateSpeed}
         />
+        <WorldsKeyboardCameraControls
+          speed={cameraState.speed}
+          inputScopeRef={inputScopeRef}
+          orbitControlsRef={orbitControlsRef}
+        />
+        <WorldsMouseLookCameraControls inputScopeRef={inputScopeRef} orbitControlsRef={orbitControlsRef} />
         <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
           <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="#f4f4f5" />
         </GizmoHelper>
@@ -110,10 +171,19 @@ export function describeWorldsViewerScene(items: WorldSceneItem[], unsupportedIt
     hasRenderableItems: visibleItems.length > 0,
     hasGrid: true,
     hasOrbitControls: true,
+    hasUnifiedKeyboardMovement: true,
     hasGizmo: true,
     unsupported: unsupportedItems,
     renderTargets: visibleItems.map(getWorldSceneItemRenderTarget),
   }
+}
+
+export function createWorldsSceneFitKey(items: WorldSceneItem[]): string {
+  const assetKey = items
+    .filter((item) => item.visible)
+    .map((item) => `${item.id}:${item.workspacePath}`)
+    .join('|')
+  return assetKey
 }
 
 export function getWorldSceneItemRenderTarget(item: WorldSceneItem): WorldSceneItemRenderTarget {
@@ -256,6 +326,62 @@ function PlySceneObject({ item }: { item: WorldSceneItem }): JSX.Element | null 
 function GltfSceneObject({ item }: { item: WorldSceneItem }): JSX.Element {
   const gltf = useGLTF(item.url)
   return <primitive object={gltf.scene} position={item.transform.position} rotation={item.transform.rotation} scale={item.transform.scale} />
+}
+
+function SceneFitController({
+  fitKey,
+  resetToken,
+  orbitControlsRef,
+  cameraFitSnapshotRef,
+}: {
+  fitKey: string
+  resetToken: number
+  orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
+  cameraFitSnapshotRef: RefObject<WorldsCameraFitSnapshot | null>
+}): null {
+  const bounds = useBounds()
+  const { camera } = useThree()
+
+  const applySnapshot = (snapshot: WorldsCameraFitSnapshot) => {
+    camera.position.copy(snapshot.position)
+    camera.near = snapshot.near
+    camera.far = snapshot.far
+    camera.updateProjectionMatrix()
+    camera.updateMatrixWorld()
+
+    const controls = orbitControlsRef.current
+    if (controls) {
+      controls.target.copy(snapshot.target)
+      controls.maxDistance = snapshot.maxDistance
+      controls.update()
+      controls.saveState?.()
+    }
+  }
+
+  useEffect(() => {
+    bounds.refresh()
+    const { center, distance } = bounds.getSize()
+    const safeDistance = Number.isFinite(distance) && distance > 0 ? distance : WORLDS_DEFAULT_CAMERA_POSITION.length()
+    worldsFitDirection.copy(WORLDS_DEFAULT_CAMERA_POSITION).sub(WORLDS_DEFAULT_CAMERA_TARGET).normalize()
+    const snapshot = {
+      position: worldsFitPosition.copy(center).addScaledVector(worldsFitDirection, safeDistance).clone(),
+      target: center.clone(),
+      near: safeDistance / 100,
+      far: safeDistance * 100,
+      maxDistance: safeDistance * 10,
+    }
+    cameraFitSnapshotRef.current = snapshot
+    applySnapshot(snapshot)
+  }, [bounds, cameraFitSnapshotRef, fitKey])
+
+  useEffect(() => {
+    if (resetToken === 0) return
+    const snapshot = cameraFitSnapshotRef.current
+    if (!snapshot) return
+    applySnapshot(snapshot)
+  }, [cameraFitSnapshotRef, resetToken])
+
+  return null
 }
 
 class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element }, { message: string | null }> {

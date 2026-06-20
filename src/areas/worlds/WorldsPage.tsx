@@ -44,7 +44,7 @@ export function WorldsPageView({
   return (
     <main className="relative flex flex-1 overflow-hidden bg-surface-400 text-zinc-100" aria-label="Worlds viewer">
       <WorldsViewer items={sceneItems} unsupportedItems={unsupportedItems} />
-      <div className="absolute left-3 top-3 flex items-center gap-2 rounded-xl border border-zinc-700/70 bg-zinc-950/70 p-1 shadow-xl backdrop-blur">
+      <div className="absolute left-3 top-3 z-20 flex items-center gap-2 rounded-xl border border-zinc-700/70 bg-zinc-950/70 p-1 shadow-xl backdrop-blur">
         <WorldAssetSelector
           open={selectorOpen}
           assets={assets}

@@ -95,6 +95,7 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
     assert.match(markup, /aria-label="Worlds 3D canvas"/)
     assert.match(markup, /role="dialog"/)
     assert.match(markup, /Open asset/)
+    assert.match(markup, /z-20/)
     assert.match(markup, /data-items="1"/)
     assert.doesNotMatch(markup, /<aside|page card|boxed|Metadata|Inspector|Raw|Schema|Provenance|Details/i)
   } finally {

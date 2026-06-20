@@ -2,6 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 
 import WorldAssetSelector from './components/WorldAssetSelector.tsx'
 import WorldsViewer, { type WorldsViewerUnsupportedItem } from './components/WorldsViewer.tsx'
+import {
+  getDefaultWorkspaceAssetLibraryCollapsedSectionKeys,
+  type WorkspaceAssetLibrarySortMode,
+} from '../../shared/components/WorkspaceAssetLibrary.tsx'
 import { useAppStore } from '../../shared/stores/appStore.ts'
 import type { WorldsTransformMode } from './components/WorldsTransformToolbar.tsx'
 import { useWorldsSceneStore } from './worldsSceneStore.ts'
@@ -23,10 +27,16 @@ export interface WorldsPageViewProps {
   loadingAssets: boolean
   openingAsset: boolean
   error: string | null
+  searchQuery: string
+  sortMode: WorkspaceAssetLibrarySortMode
+  collapsedSectionKeys: string[]
   onToggleSelector: () => void
   onCloseSelector: () => void
   onRefreshAssets: () => void
   onSelectAsset: (assetId: string) => void
+  onSearchQueryChange: (value: string) => void
+  onSortModeChange: (sortMode: WorkspaceAssetLibrarySortMode) => void
+  onToggleSection: (sectionKey: string) => void
   onSelectSceneItem: (itemId: string | null) => void
   onTransformModeChange: (mode: WorldsTransformMode | null) => void
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
@@ -45,10 +55,16 @@ export function WorldsPageView({
   loadingAssets,
   openingAsset,
   error,
+  searchQuery,
+  sortMode,
+  collapsedSectionKeys,
   onToggleSelector,
   onCloseSelector,
   onRefreshAssets,
   onSelectAsset,
+  onSearchQueryChange,
+  onSortModeChange,
+  onToggleSection,
   onSelectSceneItem,
   onTransformModeChange,
   onTransformSceneItem,
@@ -75,10 +91,16 @@ export function WorldsPageView({
           loading={loadingAssets}
           opening={openingAsset}
           error={error}
+          searchQuery={searchQuery}
+          sortMode={sortMode}
+          collapsedSectionKeys={collapsedSectionKeys}
           onToggle={onToggleSelector}
           onClose={onCloseSelector}
           onRefresh={onRefreshAssets}
           onSelectAsset={onSelectAsset}
+          onSearchQueryChange={onSearchQueryChange}
+          onSortModeChange={onSortModeChange}
+          onToggleSection={onToggleSection}
           onOpenSelected={onOpenSelected}
         />
       </div>
@@ -177,6 +199,9 @@ export default function WorldsPage(): JSX.Element {
   const [selectorOpen, setSelectorOpen] = useState(false)
   const [assets, setAssets] = useState<WorldAssetLibraryRenderable[]>([])
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
+  const [librarySearchQuery, setLibrarySearchQuery] = useState('')
+  const [librarySortMode, setLibrarySortMode] = useState<WorkspaceAssetLibrarySortMode>('type')
+  const [libraryCollapsedSectionKeys, setLibraryCollapsedSectionKeys] = useState<string[]>(() => getDefaultWorkspaceAssetLibraryCollapsedSectionKeys())
   const sceneItems = useWorldsSceneStore((state) => state.sceneItems)
   const selectedSceneItemId = useWorldsSceneStore((state) => state.selectedSceneItemId)
   const transformMode = useWorldsSceneStore((state) => state.transformMode)
@@ -219,7 +244,7 @@ export default function WorldsPage(): JSX.Element {
   async function openSelectedAsset(): Promise<void> {
     if (!selectedAsset) return
 
-    if (!selectedAsset.openable) {
+    if (selectedAsset.openable === false) {
       setSelectedSceneItemId(null)
       clearTransformMode()
       setUnsupportedItems((items) => [...items, { workspacePath: selectedAsset.workspacePath, reason: selectedAsset.reason }])
@@ -235,13 +260,16 @@ export default function WorldsPage(): JSX.Element {
         return
       }
 
-      if (result.asset.openable) {
+      if (result.asset.openable === true) {
         setWorldScene(appendWorldSceneItem(useWorldsSceneStore.getState().sceneItems, result.asset.item))
         setUnsupportedItems([])
       } else {
         setSelectedSceneItemId(null)
         clearTransformMode()
-        setUnsupportedItems((items) => [...items, { workspacePath: result.asset.workspacePath, reason: result.asset.reason }])
+        const unsupportedAsset = result.asset.openable === false ? result.asset : null
+        if (unsupportedAsset) {
+          setUnsupportedItems((items) => [...items, { workspacePath: unsupportedAsset.workspacePath, reason: unsupportedAsset.reason }])
+        }
       }
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : 'Unable to open world asset.')
@@ -272,10 +300,20 @@ export default function WorldsPage(): JSX.Element {
       loadingAssets={loadingAssets}
       openingAsset={openingAsset}
       error={error}
+      searchQuery={librarySearchQuery}
+      sortMode={librarySortMode}
+      collapsedSectionKeys={libraryCollapsedSectionKeys}
       onToggleSelector={() => setSelectorOpen((open) => !open)}
       onCloseSelector={() => setSelectorOpen(false)}
       onRefreshAssets={() => void refreshAssets()}
       onSelectAsset={setSelectedAssetId}
+      onSearchQueryChange={setLibrarySearchQuery}
+      onSortModeChange={setLibrarySortMode}
+      onToggleSection={(sectionKey) => {
+        setLibraryCollapsedSectionKeys((current) => current.includes(sectionKey)
+          ? current.filter((value) => value !== sectionKey)
+          : [...current, sectionKey])
+      }}
       onSelectSceneItem={(itemId) => {
         setSelectedSceneItemId(itemId)
         if (!itemId) setTransformMode(null)

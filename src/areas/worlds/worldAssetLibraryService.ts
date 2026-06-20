@@ -4,6 +4,7 @@ import type {
   AssetLibraryOpenRequest,
   AssetLibraryOpenResult,
 } from '../../shared/types/assetLibrary.ts'
+import type { WorkspaceAssetLibraryEntry } from '../../shared/components/WorkspaceAssetLibrary.tsx'
 import {
   resolveWorldRenderable,
   type WorldRenderable,
@@ -16,24 +17,22 @@ const UNSAFE_WORKSPACE_PATH_ERROR = 'World asset library service requires a safe
 export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
-  | {
+  | (WorkspaceAssetLibraryEntry & {
       id: string
       name: string
       type: WorldAssetLibraryType
-      sourceScope: 'workflows' | 'exports'
       openable: true
       workspacePath: string
       item: WorldSceneItem
-    }
-  | {
+    })
+  | (WorkspaceAssetLibraryEntry & {
       id: string
       name: string
       type: WorldAssetLibraryType
-      sourceScope: 'workflows' | 'exports'
       openable: false
       workspacePath: string
       reason: WorldUnsupportedReason
-    }
+    })
 
 export type WorldAssetLibraryListResult =
   | { success: true; assets: WorldAssetLibraryRenderable[] }
@@ -63,7 +62,7 @@ export function projectWorldAssetLibraryListResult(result: AssetLibraryListResul
   if (result.success !== true) return result
   return {
     success: true,
-    assets: result.entries.filter(isWorkflowWorldCandidate).map((entry) => projectWorldAssetLibraryEntry(entry, apiUrl)),
+    assets: result.entries.filter(isWorldLibraryCandidate).map((entry) => projectWorldAssetLibraryEntry(entry, apiUrl)),
   }
 }
 
@@ -78,33 +77,32 @@ export function projectWorldAssetLibraryOpenResult(result: AssetLibraryOpenResul
 function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string): WorldAssetLibraryRenderable {
   const renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl })
   const name = resolveName(entry)
-  const sourceScope = entry.sourceScope
+  const baseEntry = {
+    ...entry,
+    name,
+    displayName: name,
+  }
 
   if (renderable.openable) {
     return {
-      id: entry.id,
+      ...baseEntry,
       name,
       type: describeRenderableType(renderable),
-      sourceScope,
       openable: true,
-      workspacePath: entry.workspacePath,
       item: renderable.item,
     }
   }
 
   return {
-    id: entry.id,
+    ...baseEntry,
     name,
     type: describeUnsupportedType(renderable.reason),
-    sourceScope,
     openable: false,
-    workspacePath: entry.workspacePath,
     reason: renderable.reason,
   }
 }
 
-function isWorkflowWorldCandidate(entry: AssetLibraryEntry): boolean {
-  if (entry.sourceScope !== 'workflows') return false
+function isWorldLibraryCandidate(entry: AssetLibraryEntry): boolean {
   if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
     return true
   }

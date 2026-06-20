@@ -103,7 +103,7 @@ test.afterEach(() => {
   })
 })
 
-test('world asset library service lists Workflows renderables with only compact viewer fields', async () => {
+test('world asset library service lists shared-contract workspace renderables across scopes', async () => {
   const listCalls: AssetLibraryListRequest[] = []
   installLibraryWindow({ listCalls })
 
@@ -113,44 +113,30 @@ test('world asset library service lists Workflows renderables with only compact 
   assert.equal(result.success, true)
   if (result.success !== true) return
 
-  assert.deepEqual(result.assets, [
-    {
-      id: 'world-mesh',
-      name: 'Fuse simplified',
-      type: 'PLY mesh',
-      sourceScope: 'workflows',
-      openable: true,
-      workspacePath: 'Workflows/worldmirror/result/ply/fuse_simplified.ply',
-      item: {
-        id: 'world:Workflows/worldmirror/result/ply/fuse_simplified.ply',
-        workspacePath: 'Workflows/worldmirror/result/ply/fuse_simplified.ply',
-        url: 'http://127.0.0.1:8000/workspace/Workflows/worldmirror/result/ply/fuse_simplified.ply',
-        kind: 'ply-mesh',
-        visible: true,
-        transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
-      },
-    },
-    {
-      id: 'gaussian',
-      name: 'Gaussian splat',
-      type: 'Unsupported',
-      sourceScope: 'workflows',
-      openable: false,
-      workspacePath: 'Workflows/worldmirror/result/point_cloud_1499.spz',
-      reason: 'unsupported-spz',
-    },
-    {
-      id: 'unsafe',
-      name: '../outside/hero.glb',
-      type: 'Unavailable',
-      sourceScope: 'workflows',
-      openable: false,
-      workspacePath: '../outside/hero.glb',
-      reason: 'unsafe',
-    },
+  assert.equal(result.assets.length, 4)
+  assert.deepEqual(result.assets.map((asset) => ({ id: asset.id, sourceScope: asset.sourceScope, capability: asset.capability, displayName: asset.displayName, openable: asset.openable })), [
+    { id: 'world-mesh', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Fuse simplified', openable: true },
+    { id: 'export-mesh', sourceScope: 'exports', capability: 'mesh', displayName: 'Hero export', openable: true },
+    { id: 'gaussian', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Gaussian splat', openable: false },
+    { id: 'unsafe', sourceScope: 'workflows', capability: 'mesh', displayName: '../outside/hero.glb', openable: false },
   ])
-  assert.equal('provenance' in result.assets[0], false)
-  assert.equal('warnings' in result.assets[1], false)
+
+  const worldMesh = result.assets[0]
+  assert.equal(worldMesh.openable, true)
+  if (worldMesh.openable === true) {
+    assert.deepEqual(worldMesh.item, {
+      id: 'world:Workflows/worldmirror/result/ply/fuse_simplified.ply',
+      workspacePath: 'Workflows/worldmirror/result/ply/fuse_simplified.ply',
+      url: 'http://127.0.0.1:8000/workspace/Workflows/worldmirror/result/ply/fuse_simplified.ply',
+      kind: 'ply-mesh',
+      visible: true,
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    })
+  }
+  assert.equal(result.assets[2].openable, false)
+  if (result.assets[2].openable === false) assert.equal(result.assets[2].reason, 'unsupported-spz')
+  assert.deepEqual(result.assets[0].warnings, [])
+  assert.deepEqual(result.assets[2].warnings, ['hidden detail'])
 })
 
 test('world asset library service opens safe Workflows renderables and rejects unsafe requests before preload', async () => {

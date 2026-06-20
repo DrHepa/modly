@@ -36,8 +36,13 @@ function openableAsset(id: string, name: string, type: string, sourceScope = 'wo
   return {
     id,
     name,
+    displayName: name,
     type,
     sourceScope,
+    capability: 'mesh',
+    state: 'ready',
+    previewKind: '3d-model',
+    warnings: [],
     openable: true,
     workspacePath: `Workflows/${id}.ply`,
     item: {
@@ -51,7 +56,7 @@ function openableAsset(id: string, name: string, type: string, sourceScope = 'wo
   }
 }
 
-test('WorldAssetSelector renders a compact accessible dialog with only name type and openability', async () => {
+test('WorldAssetSelector renders the shared workspace library with search sort and grouped world assets', async () => {
   const { module, cleanup } = await loadSelectorModule()
 
   try {
@@ -59,27 +64,36 @@ test('WorldAssetSelector renders a compact accessible dialog with only name type
       open: true,
       assets: [
         openableAsset('fuse', 'Fuse simplified', 'PLY mesh'),
-        { id: 'spz', name: 'Gaussian splat', type: 'Unsupported', sourceScope: 'workflows', openable: false, workspacePath: 'Workflows/splat.spz', reason: 'unsupported-spz' },
+        { id: 'spz', name: 'Gaussian splat', displayName: 'Gaussian splat', type: 'Unsupported', sourceScope: 'workflows', capability: 'generated-world', state: 'ready', previewKind: 'binary', warnings: [], openable: false, workspacePath: 'Workflows/splat.spz', reason: 'unsupported-spz' },
         openableAsset('hero', 'Hero GLB', 'GLB model', 'exports'),
       ],
       selectedAssetId: 'fuse',
       loading: false,
       opening: false,
       error: null,
+      searchQuery: '',
+      sortMode: 'type',
+      collapsedSectionKeys: [],
       onToggle: () => undefined,
       onClose: () => undefined,
       onRefresh: () => undefined,
       onSelectAsset: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onToggleSection: () => undefined,
       onOpenSelected: () => undefined,
     }))
 
     assert.match(markup, /role="dialog"/)
     assert.match(markup, /aria-label="World asset selector"/)
+    assert.match(markup, /Search workspace assets/)
+    assert.match(markup, /<select[^>]*id="asset-library-sort"/)
     assert.match(markup, /role="list"/)
     assert.match(markup, /Fuse simplified/)
-    assert.match(markup, /PLY mesh/)
-    assert.match(markup, /Ready/)
-    assert.match(markup, /Unsupported/)
+    assert.match(markup, /mesh/)
+    assert.match(markup, /Ready to open in Worlds\./)
+    assert.match(markup, /Generated worlds/)
+    assert.match(markup, /Gaussian splat/)
     assert.match(markup, /Workflows/)
     assert.match(markup, /Exports/)
     assert.doesNotMatch(markup, /metadata|inspector|raw|schema|provenance|details/i)
@@ -94,15 +108,21 @@ test('WorldAssetSelector keeps the overlay compact and disables open when select
   try {
     const markup = renderToStaticMarkup(createElement(module.WorldAssetSelector, {
       open: true,
-      assets: [{ id: 'spz', name: 'Gaussian splat', type: 'Unsupported', sourceScope: 'workflows', openable: false, workspacePath: 'Workflows/splat.spz', reason: 'unsupported-spz' }],
+      assets: [{ id: 'spz', name: 'Gaussian splat', displayName: 'Gaussian splat', type: 'Unsupported', sourceScope: 'workflows', capability: 'generated-world', state: 'ready', previewKind: 'binary', warnings: [], openable: false, workspacePath: 'Workflows/splat.spz', reason: 'unsupported-spz' }],
       selectedAssetId: 'spz',
       loading: false,
       opening: false,
       error: null,
+      searchQuery: '',
+      sortMode: 'type',
+      collapsedSectionKeys: [],
       onToggle: () => undefined,
       onClose: () => undefined,
       onRefresh: () => undefined,
       onSelectAsset: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onSortModeChange: () => undefined,
+      onToggleSection: () => undefined,
       onOpenSelected: () => undefined,
     }))
 
@@ -110,6 +130,7 @@ test('WorldAssetSelector keeps the overlay compact and disables open when select
     assert.match(markup, /aria-haspopup="dialog"/)
     assert.match(markup, /aria-expanded="true"/)
     assert.match(markup, /disabled=""[^>]*>Open selected asset/)
+    assert.match(markup, /cannot open in Worlds yet/)
     assert.doesNotMatch(markup, /<aside|Permanent|Inspector|Metadata|Provenance|Schema|Details/)
   } finally {
     await cleanup()

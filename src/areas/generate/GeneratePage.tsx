@@ -4,6 +4,18 @@ import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 import type { GenerationJob, LightSettings } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { ColorPicker } from '@shared/components/ui'
+import {
+  AssetLibraryPopover,
+  AssetLibraryToggleButton,
+  getDefaultAssetLibraryCollapsedSectionKeys,
+  type AssetLibrarySortMode,
+} from '@shared/components/WorkspaceAssetLibrary.tsx'
+export {
+  AssetLibraryPopover,
+  AssetLibraryToggleButton,
+  getDefaultAssetLibraryCollapsedSectionKeys,
+} from '@shared/components/WorkspaceAssetLibrary.tsx'
+export type { AssetLibrarySortMode } from '@shared/components/WorkspaceAssetLibrary.tsx'
 import type { AssetLibraryOpenRequest } from '../../shared/types/assetLibrary.ts'
 import {
   listAssetLibraryEntries,
@@ -320,313 +332,14 @@ function SmoothPopover({
   )
 }
 
-export interface AssetLibraryToggleButtonProps {
-  open: boolean
-  disabled: boolean
-  onToggle: () => void
-}
-
-export interface AssetLibraryPopoverProps {
-  entries: RendererAssetLibraryEntry[]
-  selectedEntryId: string | null
-  loading: boolean
-  opening: boolean
-  error: string | null
-  searchQuery: string
-  sortMode?: AssetLibrarySortMode
-  onSelectEntry: (entryId: string) => void
-  onSearchQueryChange: (value: string) => void
-  onSortModeChange?: (sortMode: AssetLibrarySortMode) => void
-  onOpenSelected: () => void
-  onRefresh: () => void
-  collapsedSectionKeys: string[]
-  onToggleSection: (sectionKey: string) => void
-  onClose: () => void
-}
-
 export interface AssetLibraryOpenSelection {
   historyUrl: string
   target: Extract<ViewerAssetTarget, { kind: 'final' }>
   job: GenerationJob
 }
 
-interface AssetLibraryEntryGroup {
-  capability: NonNullable<RendererAssetLibraryEntry['capability']>
-  capabilityLabel: string
-  sectionKey: string
-  entries: RendererAssetLibraryEntry[]
-}
-
-interface AssetLibrarySourceScopeGroup {
-  sourceScope: RendererAssetLibraryEntry['sourceScope']
-  sourceScopeLabel: string
-  sectionKey: string
-  entryGroups: AssetLibraryEntryGroup[]
-}
-
-export type AssetLibrarySortMode = 'type' | 'name' | 'date'
-
-const ASSET_LIBRARY_CAPABILITY_SECTIONS = [
-  { capability: 'mesh', label: 'Mesh' },
-  { capability: 'rigged-mesh', label: 'Rigged mesh' },
-  { capability: 'animation-motion', label: 'Animations/motions' },
-  { capability: 'landmarks-sidecar', label: 'Landmarks sidecars' },
-  { capability: 'generated-world', label: 'Generated worlds' },
-  { capability: 'scene-manifest', label: 'Scene manifests' },
-] as const satisfies ReadonlyArray<{ capability: NonNullable<RendererAssetLibraryEntry['capability']>, label: string }>
-
-const ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS = [
-  { sourceScope: 'workflows', label: 'Workflows' },
-  { sourceScope: 'exports', label: 'Exports' },
-] as const satisfies ReadonlyArray<{ sourceScope: RendererAssetLibraryEntry['sourceScope'], label: string }>
-
-const ASSET_LIBRARY_SORT_OPTIONS = [
-  { value: 'type', label: 'Type' },
-  { value: 'name', label: 'Name' },
-  { value: 'date', label: 'Date' },
-] as const satisfies ReadonlyArray<{ value: AssetLibrarySortMode, label: string }>
-
-const ASSET_LIBRARY_CAPABILITY_ORDER = new Map(
-  ASSET_LIBRARY_CAPABILITY_SECTIONS.map((section, index) => [section.capability, index]),
-)
-
-const ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES = new Set(['tmp', 'temp', 'cache'])
 export type GenerateOpenPanel = 'export' | 'decimate' | 'smooth' | 'import' | 'library' | 'light' | null
 export type MeshImportOrigin = 'toolbar'
-
-export function getDefaultAssetLibraryCollapsedSectionKeys(): string[] {
-  const sectionKeys = ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS.flatMap((scopeSection) => {
-    const capabilityKeys = ASSET_LIBRARY_CAPABILITY_SECTIONS.map(
-      (capabilitySection) => `capability:${scopeSection.sourceScope}:${capabilitySection.capability}`,
-    )
-
-    return [`scope:${scopeSection.sourceScope}`, ...capabilityKeys]
-  })
-
-  return [...sectionKeys]
-}
-
-export function AssetLibraryToggleButton({ open, disabled, onToggle }: AssetLibraryToggleButtonProps): JSX.Element {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      disabled={disabled}
-      aria-haspopup="dialog"
-      aria-expanded={open}
-      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium border transition-colors disabled:opacity-50 disabled:pointer-events-none
-        ${open
-          ? 'bg-zinc-700 border-zinc-600 text-zinc-200'
-          : 'bg-zinc-800 border-zinc-700/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600'
-        }`}
-    >
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden="true">
-        <path d="M4 6h16" />
-        <path d="M4 12h16" />
-        <path d="M4 18h10" />
-      </svg>
-      Library
-    </button>
-  )
-}
-
-export function AssetLibraryPopover({
-  entries,
-  selectedEntryId,
-  loading,
-  opening,
-  error,
-  searchQuery = '',
-  sortMode = 'type',
-  onSelectEntry,
-  onSearchQueryChange,
-  onSortModeChange = () => undefined,
-  onOpenSelected,
-  onRefresh,
-  collapsedSectionKeys = getDefaultAssetLibraryCollapsedSectionKeys(),
-  onToggleSection,
-  onClose,
-}: AssetLibraryPopoverProps): JSX.Element {
-  const visibleEntries = filterVisibleAssetLibraryEntries(entries)
-  const scopeGroups = filterAssetLibraryScopeGroups(visibleEntries, searchQuery, sortMode)
-  const visibleEntryIds = new Set(scopeGroups.flatMap((scopeGroup) => scopeGroup.entryGroups.flatMap((group) => group.entries.map((entry) => entry.id))))
-  const selectedEntry = selectedEntryId && (visibleEntryIds.has(selectedEntryId) || visibleEntries.some((entry) => entry.id === selectedEntryId))
-    ? visibleEntries.find((entry) => entry.id === selectedEntryId) ?? null
-    : null
-  const normalizedSearchQuery = normalizeAssetLibrarySearchQuery(searchQuery)
-  const openDisabled = !selectedEntry || !isAssetLibraryEntryOpenable(selectedEntry) || loading || opening
-  const selectedMessage = selectedEntry
-    ? describeAssetLibraryOpenability(selectedEntry)
-    : scopeGroups.length === 0 && normalizedSearchQuery
-      ? `No workspace assets match “${searchQuery.trim()}”.`
-      : 'Select an asset to open it in Generate.'
-
-  return (
-    <div
-      role="dialog"
-      aria-label="Workspace library"
-      className="absolute top-full left-0 mt-1 z-50 w-[320px] max-w-[calc(100vw-2rem)] bg-zinc-900 border border-zinc-700/60 rounded-xl p-3 flex flex-col gap-3 shadow-xl"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <div>
-          <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Workspace library</p>
-          <p className="text-xs text-zinc-300">Select a workspace asset and open the supported source in Generate.</p>
-        </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="px-2 py-1 text-[11px] text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors"
-        >
-          Close library
-        </button>
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={loading || opening}
-          className="px-2.5 py-1.5 text-[11px] text-zinc-300 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:pointer-events-none rounded-lg transition-colors"
-        >
-          Refresh assets
-        </button>
-      </div>
-
-      <div className="flex items-end gap-2">
-        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-          <label htmlFor="asset-library-search" className="text-[11px] text-zinc-300">
-            Search workspace assets
-          </label>
-          <input
-            id="asset-library-search"
-            type="search"
-            value={searchQuery}
-            onChange={(event) => onSearchQueryChange(event.target.value)}
-            placeholder="Search by name, path, scope, or capability"
-            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 w-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-          />
-        </div>
-
-        <div className="flex w-24 shrink-0 flex-col gap-1.5">
-          <label htmlFor="asset-library-sort" className="text-[11px] text-zinc-300">
-            Sort
-          </label>
-          <select
-            id="asset-library-sort"
-            value={sortMode}
-            onChange={(event) => onSortModeChange(event.target.value as AssetLibrarySortMode)}
-            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-          >
-            {ASSET_LIBRARY_SORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {loading ? (
-        <p role="status" className="text-xs text-zinc-400">Loading workspace assets…</p>
-      ) : visibleEntries.length === 0 && !normalizedSearchQuery ? (
-        <p role="status" className="text-xs text-zinc-500">No workspace assets are indexed yet.</p>
-      ) : scopeGroups.length === 0 && normalizedSearchQuery ? (
-        <p role="status" className="text-xs text-zinc-500">No workspace assets match “{searchQuery.trim()}”.</p>
-      ) : scopeGroups.length === 0 ? (
-        <p role="status" className="text-xs text-zinc-500">No categorized workspace assets are available yet.</p>
-      ) : (
-        <div role="list" aria-label="Workspace library assets" className="max-h-64 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/40">
-          {scopeGroups.map((scopeGroup) => {
-            const scopeExpanded = !collapsedSectionKeys.includes(scopeGroup.sectionKey)
-            const scopeRegionId = `asset-library-${scopeGroup.sectionKey.replace(/[^a-z0-9-]+/gi, '-')}`
-            return (
-              <section key={scopeGroup.sectionKey} role="group" aria-label={`Source scope ${scopeGroup.sourceScopeLabel}`} className="border-b border-zinc-800 last:border-b-0">
-                <button
-                  type="button"
-                  aria-expanded={scopeExpanded}
-                  aria-controls={scopeRegionId}
-                  aria-label={`Toggle ${scopeGroup.sourceScopeLabel} assets`}
-                  onClick={() => onToggleSection(scopeGroup.sectionKey)}
-                  className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-                >
-                  <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-300">{scopeGroup.sourceScopeLabel}</span>
-                  <span className="text-[10px] text-zinc-500">{scopeExpanded ? 'Hide' : 'Show'}</span>
-                </button>
-
-                {scopeExpanded && (
-                  <div id={scopeRegionId}>
-                    {scopeGroup.entryGroups.map((group) => {
-                      const capabilityExpanded = !collapsedSectionKeys.includes(group.sectionKey)
-                      const capabilityRegionId = `asset-library-${group.sectionKey.replace(/[^a-z0-9-]+/gi, '-')}`
-
-                      return (
-                        <section key={group.sectionKey} role="group" aria-label={`Capability category ${group.capabilityLabel}`} className="border-t border-zinc-800 first:border-t-0">
-                          <button
-                            type="button"
-                            aria-expanded={capabilityExpanded}
-                            aria-controls={capabilityRegionId}
-                            aria-label={`Toggle ${group.capabilityLabel} assets in ${scopeGroup.sourceScopeLabel}`}
-                            onClick={() => onToggleSection(group.sectionKey)}
-                            className="flex w-full items-center justify-between gap-2 px-4 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-                          >
-                            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-400">{group.capabilityLabel}</span>
-                            <span className="text-[10px] text-zinc-500">{capabilityExpanded ? 'Hide' : 'Show'}</span>
-                          </button>
-
-                          {capabilityExpanded && (
-                            <div id={capabilityRegionId}>
-                              {group.entries.map((entry) => {
-                                const selected = entry.id === selectedEntryId
-                                return (
-                                  <button
-                                    key={entry.id}
-                                    type="button"
-                                    role="listitem"
-                                    aria-pressed={selected}
-                                    aria-label={`Select library asset ${entry.displayName}`}
-                                    onClick={() => onSelectEntry(entry.id)}
-                                    className={`w-full text-left px-4 py-2 border-t border-zinc-800 first:border-t-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400
-                                      ${selected
-                                        ? 'bg-violet-500/10 text-zinc-100'
-                                        : 'text-zinc-300 hover:bg-zinc-800/80'
-                                      }`}
-                                  >
-                                    <div className="flex items-center justify-between gap-2">
-                                      <span className="text-xs font-medium">{entry.displayName}</span>
-                                      <span className="text-[10px] uppercase tracking-wider text-zinc-500">{formatAssetLibraryBadge(entry)}</span>
-                                    </div>
-                                  </button>
-                                )
-                              })}
-                            </div>
-                          )}
-                        </section>
-                      )
-                    })}
-                  </div>
-                )}
-              </section>
-            )
-          })}
-        </div>
-      )}
-
-      <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-        <p className="text-[11px] text-zinc-400">{selectedMessage}</p>
-        {error && (
-          <p role="alert" className="mt-2 text-[11px] text-amber-300">{error}</p>
-        )}
-      </div>
-
-      <button
-        type="button"
-        onClick={onOpenSelected}
-        disabled={openDisabled}
-        aria-label="Open selected asset"
-        className="px-3 py-2 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs rounded-lg transition-colors font-medium"
-      >
-        {opening ? 'Opening…' : 'Open selected asset'}
-      </button>
-    </div>
-  )
-}
 
 export function buildAssetLibraryOpenRequest(entry: RendererAssetLibraryEntry): AssetLibraryOpenRequest {
   return {
@@ -669,146 +382,6 @@ export function describeAssetLibraryOpenability(entry: RendererAssetLibraryEntry
   }
 }
 
-function filterVisibleAssetLibraryEntries(entries: RendererAssetLibraryEntry[]): RendererAssetLibraryEntry[] {
-  return entries.filter((entry) => entry.state !== 'unsupported' && !hasInternalAssetLibraryDirectory(entry.workspacePath))
-}
-
-function filterAssetLibraryScopeGroups(
-  entries: RendererAssetLibraryEntry[],
-  searchQuery: string,
-  sortMode: AssetLibrarySortMode,
-): AssetLibrarySourceScopeGroup[] {
-  const normalizedSearchQuery = normalizeAssetLibrarySearchQuery(searchQuery)
-  return ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS
-    .map((scopeSection) => {
-      const scopeEntries = entries.filter((entry) => entry.sourceScope === scopeSection.sourceScope)
-      const scopeMatches = normalizedSearchQuery.length > 0 && matchesAssetLibrarySearch(scopeSection.label, normalizedSearchQuery)
-
-      const entryGroups = ASSET_LIBRARY_CAPABILITY_SECTIONS
-        .map((capabilitySection) => {
-          const capabilityEntries = scopeEntries.filter((entry) => entry.capability === capabilitySection.capability)
-          if (capabilityEntries.length === 0) return null
-
-          const capabilityMatches = scopeMatches || (normalizedSearchQuery.length > 0 && matchesAssetLibrarySearch(capabilitySection.label, normalizedSearchQuery))
-          const visibleCapabilityEntries = !normalizedSearchQuery || capabilityMatches
-            ? capabilityEntries
-            : capabilityEntries.filter((entry) => matchesAssetLibraryEntrySearch(entry, normalizedSearchQuery))
-
-          if (visibleCapabilityEntries.length === 0) return null
-
-          return {
-            capability: capabilitySection.capability,
-            capabilityLabel: capabilitySection.label,
-            sectionKey: `capability:${scopeSection.sourceScope}:${capabilitySection.capability}`,
-            entries: sortAssetLibraryEntries(visibleCapabilityEntries, sortMode),
-          }
-        })
-        .filter((group): group is AssetLibraryEntryGroup => group !== null)
-
-      const sortedEntryGroups = sortMode === 'type'
-        ? entryGroups
-        : [...entryGroups].sort((left, right) => compareAssetLibraryEntryGroups(left, right, sortMode))
-
-      if (sortedEntryGroups.length === 0) return null
-
-      return {
-        sourceScope: scopeSection.sourceScope,
-        sourceScopeLabel: scopeSection.label,
-        sectionKey: `scope:${scopeSection.sourceScope}`,
-        entryGroups: sortedEntryGroups,
-      }
-    })
-    .filter((group): group is AssetLibrarySourceScopeGroup => group !== null)
-}
-
-function sortAssetLibraryEntries(
-  entries: RendererAssetLibraryEntry[],
-  sortMode: AssetLibrarySortMode,
-): RendererAssetLibraryEntry[] {
-  return [...entries].sort((left, right) => compareAssetLibraryEntries(left, right, sortMode))
-}
-
-function compareAssetLibraryEntryGroups(
-  left: AssetLibraryEntryGroup,
-  right: AssetLibraryEntryGroup,
-  sortMode: Exclude<AssetLibrarySortMode, 'type'>,
-): number {
-  const entryComparison = compareAssetLibraryEntries(left.entries[0], right.entries[0], sortMode)
-  if (entryComparison !== 0) return entryComparison
-
-  return (ASSET_LIBRARY_CAPABILITY_ORDER.get(left.capability) ?? Number.MAX_SAFE_INTEGER)
-    - (ASSET_LIBRARY_CAPABILITY_ORDER.get(right.capability) ?? Number.MAX_SAFE_INTEGER)
-}
-
-function compareAssetLibraryEntries(
-  left: RendererAssetLibraryEntry,
-  right: RendererAssetLibraryEntry,
-  sortMode: AssetLibrarySortMode,
-): number {
-  if (sortMode === 'date') {
-    const leftTime = resolveAssetLibrarySortTimestamp(left)
-    const rightTime = resolveAssetLibrarySortTimestamp(right)
-
-    if (leftTime !== null && rightTime !== null && leftTime !== rightTime) {
-      return rightTime - leftTime
-    }
-    if (leftTime !== null && rightTime === null) return -1
-    if (leftTime === null && rightTime !== null) return 1
-  }
-
-  return compareAssetLibraryEntryNames(left, right)
-}
-
-function compareAssetLibraryEntryNames(
-  left: RendererAssetLibraryEntry,
-  right: RendererAssetLibraryEntry,
-): number {
-  const displayNameComparison = left.displayName.localeCompare(right.displayName, undefined, { sensitivity: 'base' })
-  if (displayNameComparison !== 0) return displayNameComparison
-
-  const workspacePathComparison = left.workspacePath.localeCompare(right.workspacePath, undefined, { sensitivity: 'base' })
-  if (workspacePathComparison !== 0) return workspacePathComparison
-
-  return left.id.localeCompare(right.id, undefined, { sensitivity: 'base' })
-}
-
-function resolveAssetLibrarySortTimestamp(entry: RendererAssetLibraryEntry): number | null {
-  return parseAssetLibrarySortTimestamp(entry.createdAt)
-    ?? parseAssetLibrarySortTimestamp(entry.updatedAt)
-}
-
-function parseAssetLibrarySortTimestamp(value: string | undefined): number | null {
-  if (typeof value !== 'string' || value.length === 0) return null
-  const epochMs = Date.parse(value)
-  return Number.isFinite(epochMs) ? epochMs : null
-}
-
-function normalizeAssetLibrarySearchQuery(searchQuery: string): string {
-  return searchQuery.trim().toLocaleLowerCase()
-}
-
-function matchesAssetLibraryEntrySearch(entry: RendererAssetLibraryEntry, normalizedSearchQuery: string): boolean {
-  return [
-    entry.displayName,
-    entry.workspacePath,
-    entry.capability,
-    entry.sourceScope,
-    entry.source?.workspacePath,
-    entry.manifest?.workspacePath,
-  ]
-    .filter((value): value is string => typeof value === 'string' && value.length > 0)
-    .some((value) => matchesAssetLibrarySearch(value, normalizedSearchQuery))
-}
-
-function matchesAssetLibrarySearch(value: string, normalizedSearchQuery: string): boolean {
-  return value.toLocaleLowerCase().includes(normalizedSearchQuery)
-}
-
-function hasInternalAssetLibraryDirectory(workspacePath: string): boolean {
-  const segments = workspacePath.replace(/\\/g, '/').trim().split('/').filter(Boolean)
-  return segments.slice(1, -1).some((segment) => segment.startsWith('.') || ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES.has(segment.toLocaleLowerCase()))
-}
-
 export function resolveOpenPanelAfterLibrarySelection(currentPanel: GenerateOpenPanel): GenerateOpenPanel {
   return currentPanel === 'library' ? 'library' : currentPanel
 }
@@ -837,11 +410,6 @@ export function resolveAssetLibraryOpenSelection(
       displayName: entry.displayName,
     }, now),
   }
-}
-
-function formatAssetLibraryBadge(entry: RendererAssetLibraryEntry): string {
-  if (entry.capability) return entry.capability
-  return entry.state.replace(/-/g, ' ')
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1042,8 @@ export default function GeneratePage(): JSX.Element {
                     : [...current, sectionKey])
                 }}
                 onClose={() => setOpenPanel(null)}
+                isEntryOpenable={isAssetLibraryEntryOpenable}
+                describeEntryOpenability={describeAssetLibraryOpenability}
               />
             )}
           </div>

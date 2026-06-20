@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   buildWorldsSceneManifest,
+  createDefaultWorldsSceneManifestPath,
   parseWorldsSceneManifest,
   workspaceRelativePathFromAbsolute,
   normalizeWorldsWorkspacePath,
@@ -116,4 +117,11 @@ test('workspace path helpers require safe workspace-relative destinations', () =
   assert.equal(normalizeWorldsWorkspacePath('Workflows/../hero.glb'), null)
   assert.equal(workspaceRelativePathFromAbsolute('/home/user/Modly/workspace/Exports/Worlds/scene-manifest.json', '/home/user/Modly/workspace'), 'Exports/Worlds/scene-manifest.json')
   assert.equal(workspaceRelativePathFromAbsolute('/home/user/Modly/outside/scene-manifest.json', '/home/user/Modly/workspace'), null)
+})
+
+test('createDefaultWorldsSceneManifestPath avoids fixed overwrite-prone scene manifest paths', () => {
+  assert.equal(
+    createDefaultWorldsSceneManifestPath(new Date(2026, 5, 20, 19, 35)),
+    'Exports/Worlds/worlds-scene-2026-06-20-1935/scene-manifest.json',
+  )
 })

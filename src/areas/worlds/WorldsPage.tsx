@@ -16,8 +16,8 @@ import {
 } from './worldAssetLibraryService.ts'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
 import {
-  DEFAULT_WORLDS_SCENE_MANIFEST_PATH,
   buildWorldsSceneManifest,
+  createDefaultWorldsSceneManifestPath,
   decodeBase64Utf8,
   parseWorldsSceneManifestText,
   workspaceRelativePathFromAbsolute,
@@ -342,7 +342,7 @@ export default function WorldsPage(): JSX.Element {
       const settings = await window.electron.settings.get()
       const savePath = await window.electron.fs.savePath({
         filters: [{ name: 'Scene manifest', extensions: ['json'] }],
-        defaultPath: `${settings.workspaceDir.replace(/[/\\]+$/, '')}/${DEFAULT_WORLDS_SCENE_MANIFEST_PATH}`,
+        defaultPath: `${settings.workspaceDir.replace(/[/\\]+$/, '')}/${createDefaultWorldsSceneManifestPath()}`,
       })
       if (!savePath) return
 

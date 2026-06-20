@@ -2,7 +2,7 @@ import type { SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
 
 export const WORLDS_SCENE_MANIFEST_SCHEMA = 'modly.scene-manifest.v1'
-export const DEFAULT_WORLDS_SCENE_MANIFEST_PATH = 'Exports/Worlds/scene-manifest.json'
+export const WORLDS_SCENE_MANIFEST_FILE_NAME = 'scene-manifest.json'
 
 export type WorldsSceneAssetRole = 'asset' | 'base-scene'
 
@@ -48,6 +48,10 @@ export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: 
       transform: cloneTransform(item.transform),
     })),
   }
+}
+
+export function createDefaultWorldsSceneManifestPath(now: Date = new Date()): string {
+  return `Exports/Worlds/worlds-scene-${formatWorldsSceneTimestamp(now)}/${WORLDS_SCENE_MANIFEST_FILE_NAME}`
 }
 
 export function parseWorldsSceneManifestText(text: string, options: { apiUrl?: string } = {}): ParseWorldsSceneManifestResult {
@@ -194,6 +198,15 @@ function uniqueSceneItemId(baseId: string, usedIds: Set<string>): string {
 
 function resolveWorkspaceBasename(workspacePath: string): string {
   return workspacePath.replace(/\\/g, '/').split('/').at(-1) || workspacePath
+}
+
+function formatWorldsSceneTimestamp(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  return `${year}-${month}-${day}-${hours}${minutes}`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

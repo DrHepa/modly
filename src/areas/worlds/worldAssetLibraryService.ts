@@ -15,7 +15,7 @@ import { listAssetLibraryEntries, readAssetLibraryEntry, openAssetLibraryEntry }
 import { projectAssetLibraryEntry } from '../generate/assetLibraryProjection.ts'
 import { isSafeViewerWorkspaceRelativePath } from '../generate/viewerAssetTarget.ts'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
   | (WorkspaceAssetLibraryEntry & {
@@ -25,6 +25,14 @@ export type WorldAssetLibraryRenderable =
       openable: true
       workspacePath: string
       item: WorldSceneItem
+    })
+  | (WorkspaceAssetLibraryEntry & {
+      id: string
+      name: string
+      type: 'Scene manifest'
+      openable: true
+      workspacePath: string
+      sceneManifest: true
     })
   | (WorkspaceAssetLibraryEntry & {
       id: string
@@ -89,6 +97,16 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     ...entry,
     name,
     displayName: name,
+  }
+
+  if (entry.capability === 'scene-manifest' || entry.manifest?.capability === 'scene-manifest') {
+    return {
+      ...baseEntry,
+      name,
+      type: 'Scene manifest',
+      openable: true,
+      sceneManifest: true,
+    }
   }
 
   if (renderable.openable) {

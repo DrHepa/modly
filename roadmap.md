@@ -36,6 +36,10 @@ Worlds is now the primary scene-composition surface for browsing workspace asset
   - scope/capability grouping;
   - collapsible sections;
   - shared styling and openability messaging hooks.
+- ✅ Added Worlds scene persistence:
+  - save/export composed scenes as `modly.scene-manifest.v1` JSON under the workspace;
+  - import/open saved scene manifests back into Worlds;
+  - persist asset workspace paths, kinds, visibility, roles, and numeric transforms without copying source assets.
 
 ### Follow-ups
 
@@ -48,16 +52,17 @@ Worlds is now the primary scene-composition surface for browsing workspace asset
 #### Scene composition UX
 
 - 🔲 Add a concept of one or more base scene/world assets so newly added objects can be placed relative to the chosen scene space.
+- 🔲 Use the saved manifest `role: 'base-scene' | 'asset'` field for base-scene-relative placement in a follow-up.
 - 🔲 Preserve camera position more intentionally across add/remove/load operations while still supporting explicit Reset Camera.
 - 🔲 Improve placement heuristics for large worlds versus small props/characters.
 - 🔲 Consider multi-select for batch transform/remove after single-select editing is stable.
 
 #### Scene persistence
 
-- 🔲 Save/export a composed Worlds scene with multiple assets and transforms.
-- 🔲 Import/open a saved composed scene back into Worlds.
-- 🔲 Define a durable scene manifest contract for placed assets, transforms, base-scene roles, and provenance.
-- 🔲 Connect saved Worlds scenes to existing `scene-manifest` and `generate/from-scene` contracts where appropriate.
+- ✅ Save/export a composed Worlds scene with multiple assets and transforms.
+- ✅ Import/open a saved composed scene back into Worlds.
+- ✅ Define a durable scene manifest contract for placed assets, transforms, and future base-scene roles.
+- 🔲 Validate saved Worlds scenes against downstream `generate/from-scene` usage with real workflow scenes.
 
 #### Rendering support
 

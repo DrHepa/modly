@@ -3,7 +3,7 @@ import { runProcessExtensionWithDeps } from './run-process-handler'
 import { ipcMain, BrowserWindow, Notification, dialog, app, shell } from 'electron'
 import { installGitHubExtensionRepo } from './github-extension-install'
 import { autoUpdater } from 'electron-updater'
-import { basename, join } from 'path'
+import { basename, dirname, join } from 'path'
 import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp, symlink, lstat, copyFile } from 'fs/promises'
 import { existsSync, mkdirSync, readdirSync, statSync } from 'fs'
 import axios from 'axios'
@@ -46,6 +46,7 @@ import { getBuiltinExtensionsDir } from './builtin-sync'
 import { activeExtensionInstalls, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { fetchTrustedRepos } from './trusted-repos'
+import type { WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { spawn, execFile } from 'child_process'
 import {
@@ -81,6 +82,7 @@ import { readLocalFileBase64 } from './bounded-file-reader'
 import { encryptSecret, decryptSecret } from './secure-store'
 import { getHfToken, initHfToken, setHfToken } from './hf-token'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
+import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -1035,6 +1037,25 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       })
       return { canceled: result.canceled, filePath: result.filePath }
     },
+  })
+
+  ipcMain.handle('workspace:worlds:writeSceneManifest', async (_event, request: WorldsSceneManifestWriteRequest): Promise<WorldsSceneManifestWriteResult> => {
+    try {
+      const workspaceDir = getSettings(app.getPath('userData')).workspaceDir
+      const workspaceRelativePath = resolveSafeWorkspaceJsonPath(workspaceDir, request.workspacePath)
+      if (!workspaceRelativePath) {
+        return { success: false, error: 'Worlds scene manifests must be saved as safe workspace-relative JSON files.' }
+      }
+      if (!isSceneManifestRecord(request.manifest)) {
+        return { success: false, error: 'Worlds scene manifest payload is invalid.' }
+      }
+
+      await mkdir(dirname(workspaceRelativePath.absolutePath), { recursive: true })
+      await writeFile(workspaceRelativePath.absolutePath, `${JSON.stringify(request.manifest, null, 2)}\n`, 'utf-8')
+      return { success: true, workspacePath: workspaceRelativePath.workspacePath }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
   })
 
   ipcMain.handle('workspace:listCollections', async () => {

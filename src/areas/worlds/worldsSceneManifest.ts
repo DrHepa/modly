@@ -1,0 +1,201 @@
+import type { SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
+import type { WorldSceneItem } from './worldRenderableResolver.ts'
+
+export const WORLDS_SCENE_MANIFEST_SCHEMA = 'modly.scene-manifest.v1'
+export const DEFAULT_WORLDS_SCENE_MANIFEST_PATH = 'Exports/Worlds/scene-manifest.json'
+
+export type WorldsSceneAssetRole = 'asset' | 'base-scene'
+
+export interface WorldsSceneManifestAssetV1 {
+  id?: string
+  name?: string
+  role?: WorldsSceneAssetRole
+  workspacePath: string
+  kind: WorldSceneItem['kind']
+  visible?: boolean
+  transform: WorldSceneItem['transform']
+}
+
+export interface WorldsSceneManifestV1 extends SceneArtifactManifestV1 {
+  schema: typeof WORLDS_SCENE_MANIFEST_SCHEMA
+  sceneRoot: '.'
+  generator: 'modly.worlds'
+  version: 1
+  createdAt: string
+  assets: WorldsSceneManifestAssetV1[]
+}
+
+type ParseWorldsSceneManifestResult =
+  | { success: true; manifest: WorldsSceneManifestV1; sceneItems: WorldSceneItem[] }
+  | { success: false; error: string }
+
+const WORLD_SCENE_ITEM_KINDS = new Set<WorldSceneItem['kind']>(['glb', 'gltf', 'ply-mesh', 'ply-points'])
+
+export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: { now?: Date } = {}): WorldsSceneManifestV1 {
+  return {
+    schema: WORLDS_SCENE_MANIFEST_SCHEMA,
+    sceneRoot: '.',
+    generator: 'modly.worlds',
+    version: 1,
+    createdAt: (options.now ?? new Date()).toISOString(),
+    assets: sceneItems.map((item) => ({
+      id: item.id,
+      name: resolveWorkspaceBasename(item.workspacePath),
+      role: 'asset',
+      workspacePath: normalizeWorldsWorkspacePath(item.workspacePath) ?? item.workspacePath,
+      kind: item.kind,
+      visible: item.visible,
+      transform: cloneTransform(item.transform),
+    })),
+  }
+}
+
+export function parseWorldsSceneManifestText(text: string, options: { apiUrl?: string } = {}): ParseWorldsSceneManifestResult {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    return { success: false, error: `Worlds scene manifest is not valid JSON: ${String(error)}` }
+  }
+
+  return parseWorldsSceneManifest(parsed, options)
+}
+
+export function parseWorldsSceneManifest(manifest: unknown, options: { apiUrl?: string } = {}): ParseWorldsSceneManifestResult {
+  if (!isRecord(manifest)) return { success: false, error: 'Worlds scene manifest must be a JSON object.' }
+  if (manifest.schema !== WORLDS_SCENE_MANIFEST_SCHEMA) return { success: false, error: 'Worlds scene manifest schema must be modly.scene-manifest.v1.' }
+  if (manifest.sceneRoot !== '.') return { success: false, error: 'Worlds scene manifest sceneRoot must be ".".' }
+  if (!Array.isArray(manifest.assets)) return { success: false, error: 'Worlds scene manifest assets must be an array.' }
+
+  const usedIds = new Set<string>()
+  const sceneItems: WorldSceneItem[] = []
+  const assets: WorldsSceneManifestAssetV1[] = []
+
+  for (const [index, value] of manifest.assets.entries()) {
+    const asset = parseWorldsSceneManifestAsset(value, index, usedIds, options.apiUrl)
+    if (!asset.success) return { success: false, error: asset.error }
+    sceneItems.push(asset.sceneItem)
+    assets.push(asset.manifestAsset)
+  }
+
+  return {
+    success: true,
+    manifest: {
+      ...manifest,
+      schema: WORLDS_SCENE_MANIFEST_SCHEMA,
+      sceneRoot: '.',
+      generator: manifest.generator === 'modly.worlds' ? 'modly.worlds' : 'modly.worlds',
+      version: 1,
+      createdAt: typeof manifest.createdAt === 'string' ? manifest.createdAt : '',
+      assets,
+    },
+    sceneItems,
+  }
+}
+
+export function normalizeWorldsWorkspacePath(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().replace(/\\/g, '/').replace(/^\.\//, '')
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized) || normalized.includes('\0')) return null
+  if (/%2e|%2f|%5c/i.test(normalized)) return null
+  const segments = normalized.split('/')
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return null
+  return segments.join('/')
+}
+
+export function workspaceRelativePathFromAbsolute(filePath: string, workspaceDir: string): string | null {
+  const normalizedFile = filePath.trim().replace(/\\/g, '/')
+  const normalizedWorkspace = workspaceDir.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  if (!normalizedFile || !normalizedWorkspace) return null
+  if (normalizedFile === normalizedWorkspace) return null
+  if (!normalizedFile.startsWith(`${normalizedWorkspace}/`)) return null
+  return normalizeWorldsWorkspacePath(normalizedFile.slice(normalizedWorkspace.length + 1))
+}
+
+export function decodeBase64Utf8(base64: string): string {
+  const binary = atob(base64)
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+function parseWorldsSceneManifestAsset(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+  apiUrl?: string,
+): { success: true; manifestAsset: WorldsSceneManifestAssetV1; sceneItem: WorldSceneItem } | { success: false; error: string } {
+  if (!isRecord(value)) return { success: false, error: `Worlds scene asset ${index + 1} must be an object.` }
+  const workspacePath = normalizeWorldsWorkspacePath(value.workspacePath)
+  if (!workspacePath) return { success: false, error: `Worlds scene asset ${index + 1} has an unsafe workspacePath.` }
+  if (!WORLD_SCENE_ITEM_KINDS.has(value.kind as WorldSceneItem['kind'])) return { success: false, error: `Worlds scene asset ${index + 1} has an unsupported kind.` }
+  const transform = parseTransform(value.transform)
+  if (!transform) return { success: false, error: `Worlds scene asset ${index + 1} has an invalid transform.` }
+  const visible = value.visible !== false
+  const role = value.role === 'base-scene' ? 'base-scene' : 'asset'
+  const requestedId = typeof value.id === 'string' && value.id.trim() ? value.id.trim() : `world:${workspacePath}`
+  const id = uniqueSceneItemId(requestedId, usedIds)
+  const kind = value.kind as WorldSceneItem['kind']
+
+  return {
+    success: true,
+    manifestAsset: {
+      id,
+      name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : resolveWorkspaceBasename(workspacePath),
+      role,
+      workspacePath,
+      kind,
+      visible,
+      transform,
+    },
+    sceneItem: {
+      id,
+      workspacePath,
+      url: apiUrl ? `${apiUrl}/workspace/${workspacePath}` : `/workspace/${workspacePath}`,
+      kind,
+      visible,
+      transform,
+    },
+  }
+}
+
+function parseTransform(value: unknown): WorldSceneItem['transform'] | null {
+  if (!isRecord(value)) return null
+  const position = parseVector3(value.position)
+  const rotation = parseVector3(value.rotation)
+  const scale = parseVector3(value.scale)
+  if (!position || !rotation || !scale) return null
+  return { position, rotation, scale }
+}
+
+function parseVector3(value: unknown): [number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 3) return null
+  if (!value.every((component) => typeof component === 'number' && Number.isFinite(component))) return null
+  return [value[0], value[1], value[2]]
+}
+
+function cloneTransform(transform: WorldSceneItem['transform']): WorldSceneItem['transform'] {
+  return {
+    position: [...transform.position],
+    rotation: [...transform.rotation],
+    scale: [...transform.scale],
+  }
+}
+
+function uniqueSceneItemId(baseId: string, usedIds: Set<string>): string {
+  let candidate = baseId
+  let duplicateIndex = 2
+  while (usedIds.has(candidate)) {
+    candidate = `${baseId}#${duplicateIndex}`
+    duplicateIndex += 1
+  }
+  usedIds.add(candidate)
+  return candidate
+}
+
+function resolveWorkspaceBasename(workspacePath: string): string {
+  return workspacePath.replace(/\\/g, '/').split('/').at(-1) || workspacePath
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}

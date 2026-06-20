@@ -8,16 +8,25 @@ import type { WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.t
 export interface WorldsMouseLookCameraControlsProps {
   inputScopeRef: RefObject<HTMLElement>
   orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
+  enabled?: boolean
 }
 
 const LOOK_SENSITIVITY = 0.003
+const LOOK_DRAG_START_THRESHOLD_PX = 3
 const lookDirection = new THREE.Vector3()
 const lookTarget = new THREE.Vector3()
 const lookEuler = new THREE.Euler(0, 0, 0, 'YXZ')
 
-export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef }: WorldsMouseLookCameraControlsProps): null {
+type PendingLookPointer = {
+  pointerId: number
+  startX: number
+  startY: number
+}
+
+export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef, enabled = true }: WorldsMouseLookCameraControlsProps): null {
   const { camera, gl } = useThree()
   const draggingRef = useRef<number | null>(null)
+  const pendingPointerRef = useRef<PendingLookPointer | null>(null)
 
   useEffect(() => {
     const canvas = gl.domElement
@@ -32,18 +41,28 @@ export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef 
     }
 
     const handlePointerDown = (event: PointerEvent) => {
+      if (!enabled) return
       if (event.button !== 0) return
       if (!inputScopeRef.current?.contains(canvas)) return
-      if (draggingRef.current !== null) return
+      if (pendingPointerRef.current || draggingRef.current !== null) return
       inputScopeRef.current.focus()
-      draggingRef.current = event.pointerId
-      canvas.setPointerCapture?.(event.pointerId)
-      event.preventDefault()
-      event.stopPropagation()
-      event.stopImmediatePropagation()
+      pendingPointerRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+      }
     }
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (!enabled) return
+      const pendingPointer = pendingPointerRef.current
+      if (draggingRef.current === null) {
+        if (!pendingPointer || pendingPointer.pointerId !== event.pointerId) return
+        const dragDistance = Math.hypot(event.clientX - pendingPointer.startX, event.clientY - pendingPointer.startY)
+        if (dragDistance < LOOK_DRAG_START_THRESHOLD_PX) return
+        draggingRef.current = event.pointerId
+        canvas.setPointerCapture?.(event.pointerId)
+      }
       if (draggingRef.current !== event.pointerId) return
       lookEuler.setFromQuaternion(camera.quaternion)
       lookEuler.y -= event.movementX * LOOK_SENSITIVITY
@@ -58,12 +77,16 @@ export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef 
     const releasePointer = () => {
       const pointerId = draggingRef.current
       draggingRef.current = null
+      pendingPointerRef.current = null
       if (pointerId !== null && canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture?.(pointerId)
     }
 
     const stopDragging = (event: PointerEvent) => {
-      if (draggingRef.current !== event.pointerId) return
+      if (draggingRef.current !== event.pointerId && pendingPointerRef.current?.pointerId !== event.pointerId) return
+      const wasDragging = draggingRef.current !== null
       releasePointer()
+      if (!wasDragging) return
+      event.preventDefault()
       event.stopPropagation()
       event.stopImmediatePropagation()
     }
@@ -81,7 +104,7 @@ export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef 
       canvas.removeEventListener('lostpointercapture', stopDragging, { capture: true })
       releasePointer()
     }
-  }, [camera, gl, inputScopeRef, orbitControlsRef])
+  }, [camera, enabled, gl, inputScopeRef, orbitControlsRef])
 
   return null
 }

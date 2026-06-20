@@ -37,13 +37,21 @@ async function loadViewerModule() {
       api.onLoad({ filter: /.*/, namespace: 'cpu' }, () => ({ loader: 'tsx', contents: `
         import { forwardRef, useEffect, useImperativeHandle } from 'react'
         export const Canvas = ({children}) => children
-        export const Bounds = Canvas, Html = Canvas, GizmoHelper = Canvas
+        export const Bounds = ({children}) => <cpuBounds>{children}</cpuBounds>
+        export const Html = Canvas, GizmoHelper = Canvas, TransformControls = Canvas
         export const GizmoViewport = () => null
         export const useThree = () => globalThis.__worldsCpu
         export const useBounds = () => globalThis.__worldsCpu.bounds
         export const useFrame = callback => { useEffect(() => { const frames = globalThis.__worldsCpu.frames; frames.add(callback); return () => frames.delete(callback) }) }
         export const OrbitControls = forwardRef((_props, ref) => { useImperativeHandle(ref, () => globalThis.__worldsCpu.controls); return null })
         export const useGLTF = url => globalThis.__worldsGltf(url)
+      ` }))
+      api.onResolve({ filter: /^@react-three\/postprocessing$/ }, () => ({ path: 'postprocessing', namespace: 'cpu-postprocessing' }))
+      api.onLoad({ filter: /.*/, namespace: 'cpu-postprocessing' }, () => ({ loader: 'tsx', contents: `
+        export const Selection = ({children}) => children
+        export const Select = Selection
+        export const EffectComposer = () => null
+        export const Outline = () => null
       ` }))
       api.onResolve({ filter: /^(react(?:\/.*)?|three(?:\/.*)?)$/ }, args => ({ path: fileURLToPath(import.meta.resolve(args.path)), external: true }))
     } }],
@@ -214,6 +222,9 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [
         {
@@ -232,6 +243,9 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [],
     })
@@ -269,6 +283,9 @@ test('WorldsViewer routes GLB and GLTF scene items through the GLTF render targe
       hasOrbitControls: true,
       hasUnifiedKeyboardMovement: true,
       hasGizmo: true,
+      hasSelection: false,
+      selectedItemId: null,
+      transformControls: null,
       unsupported: [],
       renderTargets: [
         {
@@ -371,12 +388,149 @@ test('WorldsMouseLookCameraControls handles only left-drag look without pointer 
     assert.equal(mouseLookControlsSource.includes('pointerLock'), false)
     assert.equal(mouseLookControlsSource.includes('event.button !== 0'), true)
     assert.equal(mouseLookControlsSource.includes("canvas.addEventListener('pointerdown', handlePointerDown, { capture: true })"), true)
+    assert.equal(mouseLookControlsSource.includes('LOOK_DRAG_START_THRESHOLD_PX'), true)
+    assert.equal(mouseLookControlsSource.includes('pendingPointerRef'), true)
     assert.equal(mouseLookControlsSource.includes('event.stopImmediatePropagation()'), true)
+    assert.equal(mouseLookControlsSource.includes('pendingPointerRef.current = {'), true)
+    assert.equal(mouseLookControlsSource.includes('if (dragDistance < LOOK_DRAG_START_THRESHOLD_PX) return'), true)
     assert.equal(mouseLookControlsSource.includes('camera.quaternion.setFromEuler'), true)
     assert.equal(mouseLookControlsSource.includes('controls.target.copy'), true)
     assert.equal(mouseLookControlsSource.includes('WORLD_CAMERA_LOOK_PITCH_LIMIT'), true)
     assert.equal(viewerSource.includes('enableRotate: false'), true)
-    assert.equal(viewerSource.includes('<WorldsMouseLookCameraControls inputScopeRef={inputScopeRef} orbitControlsRef={orbitControlsRef} />'), true)
+    assert.equal(viewerSource.includes('<WorldsMouseLookCameraControls'), true)
+    assert.equal(viewerSource.includes('enabled={!transformMode && !transformDraggingRef.current}'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer exposes selection state and a local transform toolbar contract', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.deepEqual(module.WORLD_VIEWER_TRANSFORM_CONTROLS, {
+      modes: ['translate', 'rotate', 'scale'],
+      placement: 'right-canvas-toolbar',
+      disabledUntilSelection: true,
+      backendBake: false,
+    })
+    assert.deepEqual(module.describeWorldsViewerScene([item('ply-mesh', 'mesh.ply')], [], 'world:mesh.ply'), {
+      hasRenderableItems: true,
+      hasGrid: true,
+      hasOrbitControls: true,
+      hasUnifiedKeyboardMovement: true,
+      hasGizmo: true,
+      hasSelection: true,
+      selectedItemId: 'world:mesh.ply',
+      transformControls: {
+        modes: ['translate', 'rotate', 'scale'],
+        attachedItemId: 'world:mesh.ply',
+      },
+      unsupported: [],
+      renderTargets: [
+        {
+          workspacePath: 'mesh.ply',
+          kind: 'ply-mesh',
+          loader: 'ply',
+          primitive: 'mesh',
+          cameraFit: 'bounds',
+          visibleDescription: 'PLY mesh geometry',
+        },
+      ],
+    })
+    assert.equal(viewerSource.includes('WorldsTransformToolbar'), true)
+    assert.equal(viewerSource.includes('items={visibleItems}'), true)
+    assert.equal(viewerSource.includes('onRemoveItem={onRemoveItem}'), true)
+    assert.equal(viewerSource.includes('TransformControls'), true)
+    assert.equal(viewerSource.includes('transformDraggingRef'), true)
+    assert.equal(viewerSource.includes('if (transformDraggingRef.current) return'), true)
+    assert.equal(viewerSource.includes('onMouseDown={() => { draggingRef.current = true }}'), true)
+    assert.equal(viewerSource.includes('onMouseUp={() => { draggingRef.current = false; syncTransform() }}'), true)
+    assert.equal(viewerSource.includes('resolveWorldsSceneItemIdFromIntersections'), true)
+    assert.equal(viewerSource.includes('BoxHelper'), false)
+    assert.equal(viewerSource.includes('EffectComposer'), true)
+    assert.equal(viewerSource.includes('Outline'), true)
+    assert.equal(viewerSource.includes('resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}'), true)
+    assert.equal(viewerSource.includes('xRay={false}'), true)
+    assert.equal(viewerSource.includes('autoClear={false}'), false)
+    assert.equal(viewerSource.includes('WorldsSelectionSilhouette'), true)
+    assert.equal(viewerSource.includes('THREE.BackSide'), true)
+    assert.equal(viewerSource.includes('worldsSelectionSilhouette'), true)
+    assert.equal(viewerSource.includes('Select enabled={selected}'), true)
+    assert.equal(viewerSource.includes('computeBoundsTree'), true)
+    assert.equal(viewerSource.includes('acceleratedRaycast'), true)
+    assert.equal(viewerSource.includes('SkeletonUtils'), true)
+    assert.equal(viewerSource.includes('cloneSkeletonScene(gltf.scene)'), true)
+    assert.equal(viewerSource.includes('material.side = THREE.DoubleSide'), true)
+    assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
+    assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
+    assert.equal(viewerSource.includes('calculateWorldsSelectionBounds'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer resolves selection from real mesh intersections before expanded hitboxes', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const itemGroup = new THREE.Group()
+    itemGroup.userData.worldsSceneItemId = 'world:real-mesh'
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial())
+    itemGroup.add(mesh)
+
+    const hitbox = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), new THREE.MeshBasicMaterial())
+    hitbox.userData.worldsSelectionHitbox = true
+    hitbox.userData.worldsSceneItemId = 'world:hitbox'
+    const silhouette = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), new THREE.MeshBasicMaterial())
+    silhouette.userData.worldsSelectionSilhouette = true
+    silhouette.userData.worldsSceneItemId = 'world:silhouette'
+
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(mesh), 'world:real-mesh')
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(hitbox), null)
+    assert.equal(module.resolveWorldsSceneItemIdFromObject(silhouette), null)
+    assert.equal(module.resolveWorldsSceneItemIdFromIntersections([{ object: hitbox }, { object: silhouette }, { object: mesh }], 'world:fallback'), 'world:real-mesh')
+    assert.equal(module.resolveWorldsSceneItemIdFromIntersections([{ object: hitbox }], 'world:fallback'), 'world:fallback')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer computes an expanded invisible bounds hitbox for easy asset reselection', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const target = new THREE.Group()
+    target.position.set(4, 0, -2)
+    const narrowMesh = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.1, 0.2), new THREE.MeshBasicMaterial())
+    target.add(narrowMesh)
+    target.updateWorldMatrix(true, true)
+
+    const bounds = module.calculateWorldsSelectionBounds(target)
+    assert.ok(bounds)
+    assert.deepEqual(bounds.center.toArray(), [4, 0, -2])
+    assert.deepEqual(bounds.size.toArray(), [0.3, 0.3, 0.3])
+
+    narrowMesh.userData.worldsSelectionHitbox = true
+    assert.equal(module.calculateWorldsSelectionBounds(target), null)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsMouseLookCameraControls can be disabled so selection and transform gizmos receive pointer events', async () => {
+  const { cleanup } = await loadViewerModule()
+  const mouseLookControlsSource = await readFile(mouseLookControlsEntry, 'utf8')
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.equal(mouseLookControlsSource.includes('enabled = true'), true)
+    assert.equal(mouseLookControlsSource.includes('if (!enabled) return'), true)
+    assert.equal(viewerSource.includes('enabled={!transformMode && !transformDraggingRef.current}'), true)
+    assert.equal(viewerSource.includes('selectSceneItemFromCanvas'), true)
+    assert.equal(viewerSource.includes('if (transformMode) return'), true)
+    assert.equal(viewerSource.includes('onPointerMissed={() => selectSceneItemFromCanvas(null)}'), true)
   } finally {
     await cleanup()
   }
@@ -400,12 +554,17 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
     assert.equal(viewerSource.includes('bounds.refresh()'), true)
     assert.equal(viewerSource.includes('bounds.getSize()'), true)
     assert.equal(viewerSource.includes('WORLDS_DEFAULT_CAMERA_POSITION'), true)
+    assert.equal(viewerSource.includes('if (!ready || cameraFitSnapshotRef.current?.fitKey === fitKey) return'), true)
     assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = snapshot'), true)
+    assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = null'), true)
     assert.equal(viewerSource.includes('controls.target.copy(snapshot.target)'), true)
     assert.equal(viewerSource.includes('controls.saveState?.()'), true)
     assert.equal(viewerSource.includes('refresh().clip().fit()'), false)
     assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems, cameraState.resetToken)'), false)
     assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems)'), true)
+    assert.equal(viewerSource.includes('fallback={<HtmlStatus message="Loading world asset…" />}'), false)
+    assert.equal(viewerSource.includes('<Suspense fallback={null}>'), true)
+    assert.equal(viewerSource.includes('<Suspense fallback={null}>\n                    <WorldSceneItemObject'), true)
   } finally {
     await cleanup()
   }
@@ -522,13 +681,13 @@ async function listProductionWorldsFiles(root: string): Promise<string[]> {
   return files.flat()
 }
 // Real React lifecycle on a CPU mutation host; the canvas alone is substituted.
-type Host = { type: string; props: any; children: Host[]; tagName?: string; focus?: () => void; contains?: (value: unknown) => boolean; closest?: () => null }
+type Host = { type: string; props: any; children: Host[]; object3D?: THREE.Object3D; tagName?: string; focus?: () => void; contains?: (value: unknown) => boolean; closest?: () => null }
 class CpuEvents {
   listeners = new Map<string, Set<(event: any) => void>>()
   addEventListener(type: string, callback: (event: any) => void) { const set = this.listeners.get(type) ?? new Set(); set.add(callback); this.listeners.set(type, set) }
   removeEventListener(type: string, callback: (event: any) => void) { this.listeners.get(type)?.delete(callback) }
   emit(type: string, props: Record<string, unknown> = {}) {
-    const event = { type, target: this, pointerId: 1, button: 0, buttons: 1, movementX: 0, movementY: 0, prevented: false, stopped: false,
+    const event = { type, target: this, pointerId: 1, button: 0, buttons: 1, movementX: 0, movementY: 0, clientX: 0, clientY: 0, prevented: false, stopped: false,
       preventDefault() { this.prevented = true }, stopPropagation() { this.stopped = true }, stopImmediatePropagation() { this.stopped = true }, ...props }
     for (const callback of this.listeners.get(type) ?? []) callback(event)
     return event
@@ -548,19 +707,19 @@ function cpuHost() {
   const frames = new Set<(state: { camera: THREE.PerspectiveCamera }, delta: number) => void>()
   const bounds = { refreshes: 0, box: new THREE.Box3(), refresh() {
     this.refreshes++; this.box.makeEmpty()
-    const visit = (node: Host) => {
+    const visit = (node: Host, parentMatrix = new THREE.Matrix4()) => {
+      const matrix = parentMatrix.clone().multiply(new THREE.Matrix4().compose(new THREE.Vector3(...(node.props.position ?? [0, 0, 0]) as [number, number, number]), new THREE.Quaternion().setFromEuler(new THREE.Euler(...(node.props.rotation ?? [0, 0, 0]) as [number, number, number])), new THREE.Vector3(...(node.props.scale ?? [1, 1, 1]) as [number, number, number])))
       const geometry = node.props.geometry as THREE.BufferGeometry | undefined
       if (geometry) {
         geometry.computeBoundingBox()
         if (geometry.boundingBox) {
-          const matrix = new THREE.Matrix4().compose(new THREE.Vector3(...(node.props.position ?? [0, 0, 0]) as [number, number, number]), new THREE.Quaternion().setFromEuler(new THREE.Euler(...(node.props.rotation ?? [0, 0, 0]) as [number, number, number])), new THREE.Vector3(...(node.props.scale ?? [1, 1, 1]) as [number, number, number]))
           this.box.union(geometry.boundingBox.clone().applyMatrix4(matrix))
         }
       }
       if (node.props.object instanceof THREE.Object3D) this.box.union(new THREE.Box3().setFromObject(node.props.object))
-      node.children.forEach(visit)
+      node.children.forEach(child => visit(child, matrix))
     }
-    visit(host); return this
+    const fitRoot = find(n => n.type === 'cpuBounds'); if (fitRoot) visit(fitRoot); return this
   }, getSize() { return { box: this.box.clone(), center: this.box.getCenter(new THREE.Vector3()), distance: this.box.getSize(new THREE.Vector3()).length() * 2 } } }
   const state = { camera, controls, frames, bounds, gl: { domElement: canvas } }
   const install = () => { globals.window = windowEvents; globals.document = documentEvents; globals.__worldsCpu = state }
@@ -570,15 +729,28 @@ function cpuHost() {
   const require = createRequire(reconcilerPath)
   assert.equal(require('react'), React)
   const context = {}
-  const remove = (p: Host, c: Host) => { const i = p.children.indexOf(c); if (i >= 0) p.children.splice(i, 1) }
-  const append = (p: Host, c: Host) => { remove(p, c); p.children.push(c) }
-  const insert = (p: Host, c: Host, b: Host) => { remove(p, c); p.children.splice(p.children.indexOf(b), 0, c) }
+  const remove = (p: Host, c: Host) => { const i = p.children.indexOf(c); if (i >= 0) p.children.splice(i, 1); if (p.object3D && c.object3D) p.object3D.remove(c.object3D) }
+  const append = (p: Host, c: Host) => { remove(p, c); p.children.push(c); if (p.object3D && c.object3D) p.object3D.add(c.object3D) }
+  const insert = (p: Host, c: Host, b: Host) => { remove(p, c); p.children.splice(p.children.indexOf(b), 0, c); if (p.object3D && c.object3D) p.object3D.add(c.object3D) }
+  const syncObject = (node: Host) => {
+    const object = node.object3D
+    if (!object) return
+    object.position.fromArray(node.props.position ?? [0, 0, 0])
+    object.rotation.fromArray([...(node.props.rotation ?? [0, 0, 0]), 'XYZ'])
+    object.scale.fromArray(node.props.scale ?? [1, 1, 1])
+    object.userData = node.props.userData ?? {}
+  }
   const renderer = require(reconcilerPath)({
     now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
-    getRootHostContext: () => context, getChildHostContext: () => context, getPublicInstance: (x: Host) => x,
+    getRootHostContext: () => context, getChildHostContext: () => context, getPublicInstance: (x: Host) => x.object3D ?? x,
     prepareForCommit: () => null, resetAfterCommit: () => undefined,
     createInstance: (type: string, props: any) => {
       const node: Host = { type, props, children: [], tagName: type.toUpperCase(), closest: () => null }
+      if (type === 'group') node.object3D = new THREE.Group()
+      if (type === 'mesh') node.object3D = new THREE.Mesh(props.geometry)
+      if (type === 'points') node.object3D = new THREE.Points(props.geometry)
+      if (type === 'primitive') node.object3D = props.object
+      syncObject(node)
       node.focus = () => { documentEvents.activeElement = node }
       node.contains = value => value === node || (type === 'section' && value === canvas) || node.children.some(child => child.contains?.(value))
       return node
@@ -587,7 +759,7 @@ function cpuHost() {
     appendInitialChild: append, appendChild: append, appendChildToContainer: append,
     removeChild: remove, removeChildFromContainer: remove, insertBefore: insert, insertInContainerBefore: insert,
     finalizeInitialChildren: () => false, shouldSetTextContent: () => false, prepareUpdate: () => true,
-    commitUpdate: (x: Host, _p: unknown, _t: string, _old: unknown, props: any) => { x.props = props },
+    commitUpdate: (x: Host, _p: unknown, _t: string, _old: unknown, props: any) => { x.props = props; syncObject(x) },
     commitTextUpdate: (x: Host, _old: string, text: string) => { x.props.text = text },
     clearContainer: (x: Host) => { x.children = [] }, detachDeletedInstance: () => undefined,
     scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
@@ -753,7 +925,8 @@ test('left drag explicitly focuses the viewer for keyboard movement while right 
     assert.equal(right.prevented, false); assert.equal(right.stopped, false)
     const left = cpu.canvas.emit('pointerdown')
     assert.equal(cpu.documentEvents.activeElement, section, 'captured left drag must not rely on stopped bubbling to focus')
-    assert.equal(left.prevented, true); assert.ok(cpu.captures.has(1))
+    assert.equal(left.prevented, false); assert.equal(cpu.captures.size, 0, 'a click remains available for selection')
+    const drag = cpu.canvas.emit('pointermove', { clientX: 4, movementX: 4 }); assert.equal(drag.prevented, true); assert.ok(cpu.captures.has(1))
     const before = cpu.camera.position.clone()
     cpu.windowEvents.emit('keydown', { code: 'KeyW', target: section }); cpu.frame(0.1)
     assert.ok(cpu.camera.position.distanceTo(before) > 0)
@@ -768,7 +941,7 @@ test('mouse look owns one pointer, clamps pitch and releases on cancel, lost cap
     const before = cpu.camera.quaternion.clone()
     cpu.canvas.emit('pointermove', { pointerId: 8, movementX: 100 })
     assert.ok(cpu.camera.quaternion.equals(before), 'another pointer cannot move the owned camera')
-    cpu.canvas.emit('pointermove', { pointerId: 7, movementX: 30, movementY: 100000 })
+    cpu.canvas.emit('pointermove', { pointerId: 7, clientX: 4, movementX: 30, movementY: 100000 })
     const pitch = new THREE.Euler().setFromQuaternion(cpu.camera.quaternion, 'YXZ').x
     assert.ok(Math.abs(pitch) <= Math.PI / 2 - 0.05 + 1e-9)
     const direction = cpu.camera.getWorldDirection(new THREE.Vector3())
@@ -777,7 +950,7 @@ test('mouse look owns one pointer, clamps pitch and releases on cancel, lost cap
     const cancelled = cpu.camera.quaternion.clone(); cpu.canvas.emit('pointermove', { pointerId: 7, movementX: 30 }); assert.ok(cpu.camera.quaternion.equals(cancelled))
     cpu.canvas.emit('pointerdown', { pointerId: 9 }); cpu.captures.delete(9); cpu.canvas.emit('lostpointercapture', { pointerId: 9 })
     cpu.canvas.emit('pointermove', { pointerId: 9, movementX: 30 }); assert.ok(cpu.camera.quaternion.equals(cancelled))
-    cpu.canvas.emit('pointerdown', { pointerId: 10 }); cpu.render(null); assert.equal(cpu.captures.size, 0)
+    cpu.canvas.emit('pointerdown', { pointerId: 10 }); cpu.canvas.emit('pointermove', { pointerId: 10, clientX: 4 }); assert.ok(cpu.captures.has(10)); cpu.render(null); assert.equal(cpu.captures.size, 0)
   } finally { cpu.render(null); await cleanup() }
 })
 

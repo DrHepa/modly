@@ -11,6 +11,7 @@ interface WorldsTransformToolbarProps {
   onSelectItem?: (itemId: string | null) => void
   onModeChange: (mode: WorldsTransformMode | null) => void
   onRemoveItem?: (itemId: string | null) => void
+  onToggleBaseSceneItem?: (itemId: string | null) => void
 }
 
 const TRANSFORM_MODES: { mode: WorldsTransformMode; label: string; icon: ReactNode }[] = [
@@ -58,6 +59,7 @@ export function WorldsTransformToolbar({
   onSelectItem = () => undefined,
   onModeChange,
   onRemoveItem = () => undefined,
+  onToggleBaseSceneItem = () => undefined,
 }: WorldsTransformToolbarProps): JSX.Element | null {
   const visibleItems = items.filter((item) => item.visible)
   if (visibleItems.length === 0) return null
@@ -84,6 +86,23 @@ export function WorldsTransformToolbar({
           ))}
         </select>
       </label>
+
+      <button
+        type="button"
+        title={selectedItem ? (selectedItem.role === 'base-scene' ? 'Unset selected asset as a base world' : 'Set selected asset as a base world') : 'Select an asset to mark as a base world'}
+        aria-label={selectedItem?.role === 'base-scene' ? 'Unset selected asset as base world' : 'Set selected asset as base world'}
+        aria-pressed={selectedItem?.role === 'base-scene'}
+        disabled={!selectedItem}
+        onClick={() => onToggleBaseSceneItem(selectedItemId)}
+        className={`flex items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left text-[10px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 ${
+          selectedItem?.role === 'base-scene'
+            ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-200'
+            : 'border-zinc-700/70 bg-zinc-900/70 text-zinc-300 hover:border-violet-400/50 hover:bg-violet-500/10 disabled:hover:border-zinc-700/70 disabled:hover:bg-zinc-900/70'
+        }`}
+      >
+        <span>{selectedItem?.role === 'base-scene' ? 'Base world' : 'Set as base'}</span>
+        <span className="text-[9px] font-medium text-zinc-500">relative placement</span>
+      </button>
 
       <div className="flex items-center gap-1">
         {TRANSFORM_MODES.map((entry) => {
@@ -120,9 +139,10 @@ export function WorldsTransformToolbar({
   )
 }
 
-export function formatWorldSceneItemLabel(item: Pick<WorldSceneItem, 'workspacePath' | 'id'>, index: number): string {
+export function formatWorldSceneItemLabel(item: Pick<WorldSceneItem, 'workspacePath' | 'id' | 'role'>, index: number): string {
   const fileName = item.workspacePath.split('/').at(-1) || item.id
-  return `${index + 1}. ${fileName}`
+  const roleSuffix = item.role === 'base-scene' ? ' · base' : ''
+  return `${index + 1}. ${fileName}${roleSuffix}`
 }
 
 export default WorldsTransformToolbar

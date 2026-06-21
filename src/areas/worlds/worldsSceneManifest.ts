@@ -1,10 +1,10 @@
 import type { SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
-import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import type { WorldSceneItem, WorldSceneItemRole } from './worldRenderableResolver.ts'
 
 export const WORLDS_SCENE_MANIFEST_SCHEMA = 'modly.scene-manifest.v1'
 export const WORLDS_SCENE_MANIFEST_FILE_NAME = 'scene-manifest.json'
 
-export type WorldsSceneAssetRole = 'asset' | 'base-scene'
+export type WorldsSceneAssetRole = WorldSceneItemRole
 
 export interface WorldsSceneManifestAssetV1 {
   id?: string
@@ -41,7 +41,7 @@ export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: 
     assets: sceneItems.map((item) => ({
       id: item.id,
       name: resolveWorkspaceBasename(item.workspacePath),
-      role: 'asset',
+      role: item.role,
       workspacePath: normalizeWorldsWorkspacePath(item.workspacePath) ?? item.workspacePath,
       kind: item.kind,
       visible: item.visible,
@@ -156,6 +156,7 @@ function parseWorldsSceneManifestAsset(
       workspacePath,
       url: apiUrl ? `${apiUrl}/workspace/${workspacePath}` : `/workspace/${workspacePath}`,
       kind,
+      role,
       visible,
       transform,
     },

@@ -10,6 +10,13 @@ import { useAppStore } from '../../shared/stores/appStore.ts'
 import type { WorldsTransformMode } from './components/WorldsTransformToolbar.tsx'
 import { useWorldsSceneStore } from './worldsSceneStore.ts'
 import {
+  appendWorldSceneItem,
+  calculateWorldSceneItemPlacementOffset,
+  removeWorldSceneItem,
+  toggleWorldSceneItemBaseRole,
+  updateWorldSceneItemTransform,
+} from './worldsScenePlacement.ts'
+import {
   listWorldAssetLibraryRenderables,
   openWorldAssetLibraryRenderable,
   type WorldAssetLibraryRenderable,
@@ -51,6 +58,8 @@ export interface WorldsPageViewProps {
   onTransformModeChange: (mode: WorldsTransformMode | null) => void
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
   onRemoveSceneItem: (itemId: string | null) => void
+  onToggleBaseSceneItem: (itemId: string | null) => void
+  onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
   onOpenSelected: () => void
   onSaveScene: () => void
   onImportScene: () => void
@@ -84,6 +93,8 @@ export function WorldsPageView({
   onTransformModeChange,
   onTransformSceneItem,
   onRemoveSceneItem,
+  onToggleBaseSceneItem,
+  onSceneItemAnchorChange,
   onOpenSelected,
   onSaveScene,
   onImportScene,
@@ -102,6 +113,8 @@ export function WorldsPageView({
         onTransformModeChange={onTransformModeChange}
         onTransformItem={onTransformSceneItem}
         onRemoveItem={onRemoveSceneItem}
+        onToggleBaseSceneItem={onToggleBaseSceneItem}
+        onSceneItemAnchorChange={onSceneItemAnchorChange}
       />
       <div className="absolute left-3 top-3 z-20 flex items-center gap-2 rounded-xl border border-zinc-700/70 bg-zinc-950/70 p-1 shadow-xl backdrop-blur">
         <WorldAssetSelector
@@ -148,91 +161,7 @@ export function WorldsPageView({
   )
 }
 
-export function appendWorldSceneItem(sceneItems: WorldSceneItem[], item: WorldSceneItem): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string } {
-  const existingIds = new Set(sceneItems.map((sceneItem) => sceneItem.id))
-  const placementOffset = calculateWorldSceneItemPlacementOffset(sceneItems.length)
-  const placedItem = {
-    ...item,
-    transform: {
-      position: [
-        item.transform.position[0] + placementOffset[0],
-        item.transform.position[1] + placementOffset[1],
-        item.transform.position[2] + placementOffset[2],
-      ] as [number, number, number],
-      rotation: [...item.transform.rotation] as [number, number, number],
-      scale: [...item.transform.scale] as [number, number, number],
-    },
-  }
-  const uniqueItem = existingIds.has(placedItem.id) ? { ...placedItem, id: createDuplicateWorldSceneItemId(placedItem.id, existingIds) } : placedItem
-  return {
-    sceneItems: [...sceneItems, uniqueItem],
-    selectedSceneItemId: uniqueItem.id,
-  }
-}
-
-export function calculateWorldSceneItemPlacementOffset(itemIndex: number): [number, number, number] {
-  if (itemIndex <= 0) return [0, 0, 0]
-
-  const spacing = 1.75
-  const directions: Array<[number, number]> = [
-    [1, 0],
-    [0, 1],
-    [-1, 0],
-    [0, -1],
-    [1, 1],
-    [-1, 1],
-    [-1, -1],
-    [1, -1],
-  ]
-  const zeroBasedOffsetIndex = itemIndex - 1
-  const ring = Math.floor(zeroBasedOffsetIndex / directions.length) + 1
-  const [xDirection, zDirection] = directions[zeroBasedOffsetIndex % directions.length]
-
-  return [xDirection * ring * spacing, 0, zDirection * ring * spacing]
-}
-
-export function removeWorldSceneItem(sceneItems: WorldSceneItem[], selectedItemId: string | null): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string | null } {
-  if (!selectedItemId) return { sceneItems, selectedSceneItemId: null }
-
-  const removedIndex = sceneItems.findIndex((item) => item.id === selectedItemId)
-  if (removedIndex === -1) return { sceneItems, selectedSceneItemId: null }
-
-  const nextSceneItems = sceneItems.filter((item) => item.id !== selectedItemId)
-  const nextSelectedItem = nextSceneItems[removedIndex] ?? nextSceneItems[removedIndex - 1] ?? null
-
-  return {
-    sceneItems: nextSceneItems,
-    selectedSceneItemId: nextSelectedItem?.id ?? null,
-  }
-}
-
-export function updateWorldSceneItemTransform(
-  sceneItems: WorldSceneItem[],
-  itemId: string,
-  transform: WorldSceneItem['transform'],
-): WorldSceneItem[] {
-  if (!sceneItems.some((item) => item.id === itemId)) return sceneItems
-  return sceneItems.map((item) => item.id === itemId
-    ? {
-      ...item,
-      transform: {
-        position: [...transform.position],
-        rotation: [...transform.rotation],
-        scale: [...transform.scale],
-      },
-    }
-    : item)
-}
-
-function createDuplicateWorldSceneItemId(baseId: string, existingIds: Set<string>): string {
-  let duplicateIndex = 2
-  let candidate = `${baseId}#${duplicateIndex}`
-  while (existingIds.has(candidate)) {
-    duplicateIndex += 1
-    candidate = `${baseId}#${duplicateIndex}`
-  }
-  return candidate
-}
+export { appendWorldSceneItem, calculateWorldSceneItemPlacementOffset, removeWorldSceneItem, toggleWorldSceneItemBaseRole, updateWorldSceneItemTransform }
 
 export default function WorldsPage(): JSX.Element {
   const apiUrl = useAppStore((state) => state.apiUrl)
@@ -245,6 +174,7 @@ export default function WorldsPage(): JSX.Element {
   const sceneItems = useWorldsSceneStore((state) => state.sceneItems)
   const selectedSceneItemId = useWorldsSceneStore((state) => state.selectedSceneItemId)
   const transformMode = useWorldsSceneStore((state) => state.transformMode)
+  const setSceneItemAnchor = useWorldsSceneStore((state) => state.setSceneItemAnchor)
   const setWorldScene = useWorldsSceneStore((state) => state.setScene)
   const setSelectedSceneItemId = useWorldsSceneStore((state) => state.setSelectedSceneItemId)
   const setTransformMode = useWorldsSceneStore((state) => state.setTransformMode)
@@ -312,7 +242,8 @@ export default function WorldsPage(): JSX.Element {
         if ('sceneManifest' in result.asset) {
           await importSceneManifestFromWorkspacePath(result.asset.workspacePath)
         } else {
-          setWorldScene(appendWorldSceneItem(useWorldsSceneStore.getState().sceneItems, result.asset.item))
+          const sceneState = useWorldsSceneStore.getState()
+          setWorldScene(appendWorldSceneItem(sceneState.sceneItems, result.asset.item, sceneState.sceneItemAnchors))
           setUnsupportedItems([])
           setSceneStatus(null)
         }
@@ -471,6 +402,13 @@ export default function WorldsPage(): JSX.Element {
         setWorldScene(removeWorldSceneItem(useWorldsSceneStore.getState().sceneItems, itemId))
         clearTransformMode()
       }}
+      onToggleBaseSceneItem={(itemId) => {
+        setWorldScene({
+          sceneItems: toggleWorldSceneItemBaseRole(useWorldsSceneStore.getState().sceneItems, itemId),
+          selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
+        })
+      }}
+      onSceneItemAnchorChange={setSceneItemAnchor}
       onOpenSelected={() => void openSelectedAsset()}
       onSaveScene={() => void saveSceneManifest()}
       onImportScene={() => void importSceneManifest()}

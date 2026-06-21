@@ -70,6 +70,7 @@ function asset(id: string, name: string) {
       workspacePath: `Workflows/${id}.ply`,
       url: `Workflows/${id}.ply`,
       kind: 'ply-mesh',
+      role: 'asset',
       visible: true,
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
     },
@@ -108,6 +109,7 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onRemoveSceneItem: () => undefined,
+      onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
       onSaveScene: () => undefined,
       onImportScene: () => undefined,
@@ -159,6 +161,7 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onRemoveSceneItem: () => undefined,
+      onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
       onSaveScene: () => undefined,
       onImportScene: () => undefined,
@@ -204,6 +207,24 @@ test('WorldsPage appends opened assets with unique scene ids, deterministic offs
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(2), [0, 0, 1.75])
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(8), [1.75, 0, -1.75])
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(9), [3.5, 0, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage places new assets relative to existing base worlds using transform anchors', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    const base = { ...asset('base', 'Base').item, role: 'base-scene', transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+    const secondBase = { ...asset('base-b', 'Base B').item, role: 'base-scene', transform: { position: [14, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+    const prop = asset('prop', 'Prop').item
+
+    assert.deepEqual(module.appendWorldSceneItem([base], prop).sceneItems[1].transform.position, [11.75, 0, -4])
+    assert.deepEqual(module.appendWorldSceneItem([base, secondBase], prop).sceneItems[2].transform.position, [13.75, 0, -2])
+    assert.deepEqual(module.appendWorldSceneItem([base], prop, { [base.id]: [40, 2, -20] }).sceneItems[1].transform.position, [41.75, 2, -20])
+    assert.deepEqual(module.toggleWorldSceneItemBaseRole([prop], prop.id)[0].role, 'base-scene')
+    assert.deepEqual(module.toggleWorldSceneItemBaseRole([{ ...prop, role: 'base-scene' }], prop.id)[0].role, 'asset')
   } finally {
     await cleanup()
   }

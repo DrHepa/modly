@@ -40,6 +40,10 @@ Worlds is now the primary scene-composition surface for browsing workspace asset
   - save/export composed scenes as `modly.scene-manifest.v1` JSON under the workspace;
   - import/open saved scene manifests back into Worlds;
   - persist asset workspace paths, kinds, visibility, roles, and numeric transforms without copying source assets.
+- ✅ Added base scene/world roles and relative placement:
+  - toggle one or more placed assets as `base-scene` from the compact transform toolbar;
+  - persist and restore `role: 'base-scene' | 'asset'` in scene manifests;
+  - place newly added props near the combined base-scene transform anchor instead of global origin.
 
 ### Follow-ups
 
@@ -51,10 +55,10 @@ Worlds is now the primary scene-composition surface for browsing workspace asset
 
 #### Scene composition UX
 
-- 🔲 Add a concept of one or more base scene/world assets so newly added objects can be placed relative to the chosen scene space.
-- 🔲 Use the saved manifest `role: 'base-scene' | 'asset'` field for base-scene-relative placement in a follow-up.
+- ✅ Add a concept of one or more base scene/world assets so newly added objects can be placed relative to the chosen scene space.
+- ✅ Use the saved manifest `role: 'base-scene' | 'asset'` field for base-scene-relative placement.
 - 🔲 Preserve camera position more intentionally across add/remove/load operations while still supporting explicit Reset Camera.
-- 🔲 Improve placement heuristics for large worlds versus small props/characters.
+- 🔲 Improve placement heuristics for large worlds versus small props/characters with bounds-aware anchors; current MVP uses serializable transform positions only.
 - 🔲 Consider multi-select for batch transform/remove after single-select editing is stable.
 
 #### Scene persistence

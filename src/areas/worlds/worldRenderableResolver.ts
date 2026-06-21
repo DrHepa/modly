@@ -1,6 +1,7 @@
 import { classifyPlyHeader } from './plyClassification.ts'
 
 export type WorldAssetKind = 'glb' | 'gltf' | 'ply-mesh' | 'ply-points' | 'gaussian-ply' | 'spz'
+export type WorldSceneItemRole = 'asset' | 'base-scene'
 
 export type WorldUnsupportedReason =
   | 'unsafe'
@@ -14,6 +15,7 @@ export interface WorldSceneItem {
   workspacePath: string
   url: string
   kind: Exclude<WorldAssetKind, 'gaussian-ply' | 'spz'>
+  role: WorldSceneItemRole
   visible: boolean
   transform: {
     position: [number, number, number]
@@ -98,6 +100,7 @@ function createSceneItem(workspacePath: string, kind: WorldSceneItem['kind'], in
     workspacePath,
     url: resolveWorldRenderableUrl(workspacePath, input),
     kind,
+    role: 'asset',
     visible: true,
     transform: {
       position: [...IDENTITY_TRANSFORM.position],

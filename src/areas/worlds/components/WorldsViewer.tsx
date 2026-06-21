@@ -37,6 +37,8 @@ export interface WorldsViewerProps {
   onTransformModeChange?: (mode: WorldsTransformMode | null) => void
   onTransformItem?: (itemId: string, transform: WorldSceneItem['transform']) => void
   onRemoveItem?: (itemId: string | null) => void
+  onToggleBaseSceneItem?: (itemId: string | null) => void
+  onSceneItemAnchorChange?: (itemId: string, anchor: [number, number, number] | null) => void
 }
 
 export type PlyRenderModel = {
@@ -113,6 +115,8 @@ export function WorldsViewer({
   onTransformModeChange = () => undefined,
   onTransformItem = () => undefined,
   onRemoveItem = () => undefined,
+  onToggleBaseSceneItem = () => undefined,
+  onSceneItemAnchorChange = () => undefined,
 }: WorldsViewerProps): JSX.Element {
   const inputScopeRef = useRef<HTMLElement>(null)
   const orbitControlsRef = useRef<WorldsOrbitControlsHandle | null>(null)
@@ -161,6 +165,7 @@ export function WorldsViewer({
         onSelectItem={onSelectItem}
         onModeChange={onTransformModeChange}
         onRemoveItem={onRemoveItem}
+        onToggleBaseSceneItem={onToggleBaseSceneItem}
       />
       <Canvas
         camera={{ position: [2.4, 1.8, 2.8], fov: 45, near: 0.01, far: 500 }}
@@ -193,9 +198,10 @@ export function WorldsViewer({
                     <WorldSceneItemObject
                       item={item}
                       selected={item.id === selectedItemId}
-                      onSelectItem={selectSceneItemFromCanvas}
-                      onRegisterObject={registerSceneObject}
-                    />
+                    onSelectItem={selectSceneItemFromCanvas}
+                    onRegisterObject={registerSceneObject}
+                    onSceneItemAnchorChange={onSceneItemAnchorChange}
+                  />
                   </Suspense>
                 </WorldSceneItemErrorBoundary>
               ))}
@@ -377,18 +383,42 @@ function WorldSceneItemObject({
   selected,
   onSelectItem,
   onRegisterObject,
+  onSceneItemAnchorChange,
 }: {
   item: WorldSceneItem
   selected: boolean
   onSelectItem: (itemId: string | null) => void
   onRegisterObject: (itemId: string, object: THREE.Object3D | null) => void
+  onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
 }): JSX.Element | null {
   const groupRef = useRef<THREE.Group>(null)
+  const boundsRef = useRef(new THREE.Box3())
+  const centerRef = useRef(new THREE.Vector3())
+  const lastAnchorRef = useRef<[number, number, number] | null>(null)
 
   useEffect(() => {
     onRegisterObject(item.id, groupRef.current)
     return () => onRegisterObject(item.id, null)
   }, [item.id, onRegisterObject])
+
+  useEffect(() => {
+    if (item.role !== 'base-scene') {
+      lastAnchorRef.current = null
+      onSceneItemAnchorChange(item.id, null)
+    }
+  }, [item.id, item.role, onSceneItemAnchorChange])
+
+  useFrame(() => {
+    if (item.role !== 'base-scene' || !groupRef.current) return
+    const bounds = boundsRef.current.setFromObject(groupRef.current)
+    if (bounds.isEmpty()) return
+    const center = bounds.getCenter(centerRef.current)
+    const anchor: [number, number, number] = [center.x, center.y, center.z]
+    const previous = lastAnchorRef.current
+    if (previous && previous.every((value, index) => Math.abs(value - anchor[index]) < 0.001)) return
+    lastAnchorRef.current = anchor
+    onSceneItemAnchorChange(item.id, anchor)
+  })
 
   const handleClick = (event: WorldsObjectClickEvent) => {
     event.stopPropagation()

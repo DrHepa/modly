@@ -16,6 +16,7 @@ function sceneItem(overrides: Partial<WorldSceneItem> = {}): WorldSceneItem {
     workspacePath: 'Workflows/hero.glb',
     url: '/workspace/Workflows/hero.glb',
     kind: 'glb',
+    role: 'asset',
     visible: true,
     transform: {
       position: [1, 2, 3],
@@ -50,6 +51,12 @@ test('buildWorldsSceneManifest persists schema-compatible assets with numeric tr
   ])
 })
 
+test('buildWorldsSceneManifest persists selected base-scene roles', () => {
+  const manifest = buildWorldsSceneManifest([sceneItem({ role: 'base-scene' })], { now: new Date('2026-06-20T12:00:00.000Z') })
+
+  assert.equal(manifest.assets[0].role, 'base-scene')
+})
+
 test('parseWorldsSceneManifest restores scene items and preserves future base-scene roles', () => {
   const result = parseWorldsSceneManifest({
     schema: 'modly.scene-manifest.v1',
@@ -74,12 +81,13 @@ test('parseWorldsSceneManifest restores scene items and preserves future base-sc
 
   assert.equal(result.success, true)
   if (result.success !== true) return
-  assert.deepEqual(result.sceneItems.map((item) => ({ id: item.id, workspacePath: item.workspacePath, url: item.url, kind: item.kind, visible: item.visible, transform: item.transform })), [
+  assert.deepEqual(result.sceneItems.map((item) => ({ id: item.id, workspacePath: item.workspacePath, url: item.url, kind: item.kind, role: item.role, visible: item.visible, transform: item.transform })), [
     {
       id: 'base',
       workspacePath: 'Workflows/world/base.gltf',
       url: 'http://127.0.0.1:8000/workspace/Workflows/world/base.gltf',
       kind: 'gltf',
+      role: 'base-scene',
       visible: false,
       transform: { position: [0, 0, 0], rotation: [0, 0.5, 0], scale: [1, 1, 1] },
     },
@@ -88,6 +96,7 @@ test('parseWorldsSceneManifest restores scene items and preserves future base-sc
       workspacePath: 'Exports/prop.ply',
       url: 'http://127.0.0.1:8000/workspace/Exports/prop.ply',
       kind: 'ply-mesh',
+      role: 'asset',
       visible: true,
       transform: { position: [4, 5, 6], rotation: [0, 0, 0], scale: [0.5, 0.5, 0.5] },
     },

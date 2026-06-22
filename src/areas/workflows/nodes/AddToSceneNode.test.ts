@@ -3,26 +3,24 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
-import { resolveWorkflowOutputWorldsWorkspacePath } from '../workflowWorldsOutput.ts'
-
 const sourcePath = path.join(import.meta.dirname, 'AddToSceneNode.tsx')
 
-test('AddToSceneNode preserves Generate as the default destination', async () => {
+test('AddToSceneNode preserves the stable Generate 3D scene destination', async () => {
   const source = await readFile(sourcePath, 'utf8')
 
-  assert.match(source, /const openInWorlds = data\.params\.openInWorlds === true/)
   assert.match(source, /navigate\('generate'\)/)
   assert.match(source, /setCurrentJob\(\{ id: 'workflow-output'/)
+  assert.match(source, /Add to 3D scene/)
 })
 
-test('AddToSceneNode persists a boolean option and navigates workflow output to Worlds when enabled', async () => {
+test('AddToSceneNode does not embed Worlds routing inside the base scene output node', async () => {
   const source = await readFile(sourcePath, 'utf8')
 
-  assert.match(source, /aria-label="Open workflow output in Worlds"/)
-  assert.match(source, /updateNodeData\(id, \{ params: \{ \.\.\.data\.params, openInWorlds: !openInWorlds \} \}\)/)
-  assert.match(source, /resolveWorkflowOutputWorldsWorkspacePath\(outputUrl\)/)
-  assert.match(source, /appendWorldSceneItem\(useWorldsSceneStore\.getState\(\)\.sceneItems, renderable\.item\)/)
-  assert.match(source, /navigate\('worlds'\)/)
+  assert.doesNotMatch(source, /Open in Worlds/)
+  assert.doesNotMatch(source, /openInWorlds/)
+  assert.doesNotMatch(source, /navigate\('worlds'\)/)
+  assert.doesNotMatch(source, /useWorldsSceneStore/)
+  assert.doesNotMatch(source, /appendWorldSceneItem/)
 })
 
 test('AddToSceneNode does not invent backend dispatch for Worlds', async () => {
@@ -30,14 +28,4 @@ test('AddToSceneNode does not invent backend dispatch for Worlds', async () => {
 
   assert.doesNotMatch(source, /window\.electron\.(?!.*settings)/)
   assert.doesNotMatch(source, /fetch\(/)
-})
-
-test('resolveWorkflowOutputWorldsWorkspacePath accepts only safe workspace URLs', () => {
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/workspace/Workflows/generated/hero.glb'), 'Workflows/generated/hero.glb')
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('http://127.0.0.1:8765/workspace/Exports/hero.glb'), 'Exports/hero.glb')
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/workspace/Workflows/%68ero.glb'), 'Workflows/hero.glb')
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/workspace/../outside.glb'), null)
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/workspace/%2e%2e/outside.glb'), null)
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/not-workspace/hero.glb'), null)
-  assert.equal(resolveWorkflowOutputWorldsWorkspacePath('/workspace/C:/outside.glb'), null)
 })

@@ -28,6 +28,7 @@ import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminatePro
 import { getBuiltinExtensionsDir } from './builtin-sync'
 import { listVisibleExtensions } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
+import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { spawn } from 'child_process'
 import { fetchTrustedRepos } from './trusted-repos'
 import type { ProcessInput, WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
@@ -1156,27 +1157,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('workflows:list', async () => {
     const dir = workflowsDir()
-    const files = readdirSync(dir).filter(f => f.endsWith('.json'))
-    const workflows = []
-    for (const file of files) {
-      try {
-        const raw = await readFile(join(dir, file), 'utf-8')
-        workflows.push(JSON.parse(raw))
-      } catch { /* skip corrupted files */ }
+    const result = await listStoredWorkflows(dir)
+    if (result.diagnostics.filenameIdMismatches.length > 0 || result.diagnostics.duplicateIds.length > 0 || result.diagnostics.corruptedFiles.length > 0) {
+      logger.warn('Workflow list diagnostics', result.diagnostics)
     }
-    return workflows.sort((a: { updatedAt?: string }, b: { updatedAt?: string }) =>
-      (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')
-    )
+    return result.workflows
   })
 
   ipcMain.handle('workflows:save', async (_, workflow: { id: string; [key: string]: unknown }) => {
-    try {
-      const path = join(workflowsDir(), `${workflow.id}.json`)
-      await writeFile(path, JSON.stringify(workflow, null, 2), 'utf-8')
-      return { success: true }
-    } catch (err) {
-      return { success: false, error: String(err) }
-    }
+    return saveWorkflowWithBackup(workflowsDir(), workflow)
   })
 
   ipcMain.handle('workflows:delete', async (_, id: string) => {
@@ -1196,15 +1185,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       properties: ['openFile'],
     })
     if (result.canceled || result.filePaths.length === 0) return { success: false }
-    try {
-      const raw = await readFile(result.filePaths[0], 'utf-8')
-      const workflow = JSON.parse(raw)
-      if (!workflow.id || !workflow.nodes) return { success: false, error: 'Invalid workflow file' }
-      await writeFile(join(workflowsDir(), `${workflow.id}.json`), JSON.stringify(workflow, null, 2), 'utf-8')
-      return { success: true, workflow }
-    } catch (err) {
-      return { success: false, error: String(err) }
-    }
+    return importWorkflowAvoidingIdCollision(workflowsDir(), result.filePaths[0])
   })
 
   ipcMain.handle('workflows:export', async (_, workflow: { id: string; name?: string; [key: string]: unknown }) => {

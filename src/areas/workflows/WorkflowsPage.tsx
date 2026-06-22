@@ -1783,9 +1783,8 @@ export default function WorkflowsPage(): JSX.Element {
     <div className="flex flex-col flex-1 overflow-hidden">
 
       {/* Tab bar */}
-      {!loading && (
-        <div className="flex items-stretch border-b border-zinc-800 bg-zinc-950/30 overflow-x-auto shrink-0 h-9">
-          {openWorkflows.map((wf) => (
+      <div className="flex items-stretch border-b border-zinc-800 bg-zinc-950/30 overflow-x-auto shrink-0 h-9">
+          {workflows.map((wf) => (
             <div
               key={wf.id}
               draggable
@@ -1832,17 +1831,10 @@ export default function WorkflowsPage(): JSX.Element {
               </button>
             </div>
           ))}
-          <button
-            onClick={handleCreateBlank}
-            title="New workflow"
-            className="shrink-0 flex items-center justify-center w-9 h-full text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/40 transition-colors"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-          </button>
-        </div>
-      )}
+          {loading && workflows.length > 0 ? (
+            <div className="flex items-center px-3 text-[10px] text-zinc-600">Refreshing…</div>
+          ) : null}
+      </div>
 
       {/* Tab context menu */}
       {tabMenu && (

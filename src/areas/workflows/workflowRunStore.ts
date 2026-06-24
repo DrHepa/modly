@@ -7,6 +7,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { resolveSceneSourceManifest } from './workflowSceneSource'
+import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadResult, RigMetaSidecarReadResult } from '@shared/types/electron.d'
@@ -999,6 +1000,9 @@ async function executeExtensionNode(
     ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
     updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
   }
+  if (url && workflow.edges.some((edge) => edge.source === node.id && nodeMap.get(edge.target)?.type === 'addToWorldsNode')) {
+    addWorkflowOutputUrlToWorlds(url)
+  }
 }
 
 // ─── Wait dependency helpers ───────────────────────────────────────────────────
@@ -1026,17 +1030,22 @@ function descendantWaits(rootId: string, ctx: RunContext): Set<string> {
  */
 function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
   for (const node of ctx.ordered) {
-    if (!isSceneOutput(node.type)) continue
+    if (!isSceneOutput(node.type) && node.type !== 'addToWorldsNode') continue
     const owners = nearestUpstreamWaits(node.id, ctx.workflow.edges, ctx.nodeMap)
     if (owners.size !== 1 || [...owners][0] !== waitId) continue
     const inEdge = ctx.workflow.edges.find((e) => e.target === node.id)
     if (!inEdge) continue
+    if (node.type === 'addToWorldsNode' && ctx.nodeMap.get(inEdge.source)?.type === 'extensionNode') continue
     const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
     const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
     const url = isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
     if (url) {
-      ctx.lastSceneMesh = url
-      updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
+      if (node.type === 'addToWorldsNode') {
+        addWorkflowOutputUrlToWorlds(url)
+      } else {
+        ctx.lastSceneMesh = url
+        updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
+      }
     }
   }
 }
@@ -1162,7 +1171,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     let outputUrl:  string | undefined = ctx.lastSceneMesh
     let outputPath: string | undefined
 
-    const lastOutputNode = outputUrl ? undefined : [...ctx.ordered].reverse().find((n) => isSceneOutput(n.type))
+    const lastOutputNode = outputUrl ? undefined : [...ctx.ordered].reverse().find((n) => isSceneOutput(n.type) || n.type === 'addToWorldsNode')
     if (lastOutputNode) {
       for (const edge of ctx.workflow.edges.filter((e) => e.target === lastOutputNode.id)) {
         const src = ctx.nodeOutputs.get(edge.source)

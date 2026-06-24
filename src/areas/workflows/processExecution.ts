@@ -30,7 +30,7 @@ function getNodeOutputType(node: WFNode | undefined, allExtensions: WorkflowExte
   if (node.type === 'textNode') return 'text'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'forEachNode') return String(node.data.params?.mode ?? 'image')
-  if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
+  if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
 
   if (node.type !== 'extensionNode') return undefined
 

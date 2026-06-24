@@ -2,6 +2,7 @@ import ExtensionNode from './nodes/ExtensionNode'
 import ImageNode from './nodes/ImageNode'
 import TextNode from './nodes/TextNode'
 import AddToSceneNode from './nodes/AddToSceneNode'
+import AddToWorldsNode from './nodes/AddToWorldsNode'
 import Load3DMeshNode from './nodes/Load3DMeshNode'
 import LoadSceneNode from './nodes/LoadSceneNode'
 import PreviewImageNode from './nodes/PreviewImageNode'
@@ -16,6 +17,7 @@ export const WORKFLOW_NODE_TYPES = {
   imageNode: ImageNode,
   textNode: TextNode,
   outputNode: AddToSceneNode,
+  addToWorldsNode: AddToWorldsNode,
   meshNode: Load3DMeshNode,
   sceneNode: LoadSceneNode,
   [PREVIEW_IMAGE_NODE_TYPE]: PreviewImageNode,

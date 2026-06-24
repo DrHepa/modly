@@ -39,6 +39,7 @@ import {
   type LegacyWorkflowOutput,
 } from './workflowArtifacts.ts'
 import { resolveSceneSourceManifest } from './workflowSceneSource.ts'
+import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1172,7 +1173,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       const nodeLandmarkSidecars = new Map<string, string>()
       const landmarkSidecarMetadata = new Map<string, LandmarkSidecarLineageMetadata>()
       const waitCheckpointHumanoidReviews = new Map<string, WaitCheckpointReviewState>()
-      const outputNodeIds = new Set(ordered.filter((n) => n.type === 'outputNode').map((n) => n.id))
+      const addToSceneNodeIds = new Set(ordered.filter((n) => n.type === 'outputNode').map((n) => n.id))
+      const addToWorldsNodeIds = new Set(ordered.filter((n) => n.type === 'addToWorldsNode').map((n) => n.id))
+      const sceneOutputNodeIds = new Set([...addToSceneNodeIds, ...addToWorldsNodeIds])
 
       const rememberArtifactOutput = (
         nodeId: string,
@@ -1715,7 +1718,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const norm = nodeInputPath?.replace(/\\/g, '/')
         if (
           norm?.startsWith(workspaceDir) &&
-          workflow.edges.some((e) => e.source === node.id && outputNodeIds.has(e.target))
+          workflow.edges.some((e) => e.source === node.id && addToSceneNodeIds.has(e.target))
         ) {
           useAppStore.getState().updateCurrentJob({
             status:    'done',
@@ -1723,6 +1726,12 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             outputUrl: `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`,
             previewKind: undefined,
           })
+        }
+        if (norm?.startsWith(workspaceDir)) {
+          const outputUrl = `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
+          if (workflow.edges.some((e) => e.source === node.id && addToWorldsNodeIds.has(e.target))) {
+            addWorkflowOutputUrlToWorlds(outputUrl)
+          }
         }
       }
       for (const group of forEachGroups.values()) {
@@ -1741,8 +1750,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       let outputPath: string | undefined
       let artifact:   ArtifactRef | undefined
 
-      // Use the last AddToScene in topo order — its predecessor is the final scene mesh.
-      const outputNodeDef = [...ordered].reverse().find((n) => n.type === 'outputNode')
+      // Use the last scene output node in topo order — its predecessor is the final scene mesh.
+      const outputNodeDef = [...ordered].reverse().find((n) => sceneOutputNodeIds.has(n.id))
       if (outputNodeDef) {
         for (const edge of workflow.edges.filter((e) => e.target === outputNodeDef.id)) {
           const src = nodeOutputs.get(edge.source)

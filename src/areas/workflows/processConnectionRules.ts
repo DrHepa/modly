@@ -48,7 +48,7 @@ function resolveNodeOutputType(node: WFNode | undefined, allExtensions: Workflow
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'sceneNode') return 'scene'
-  if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
+  if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
 
   return getExtensionForNode(node, allExtensions)?.output
 }

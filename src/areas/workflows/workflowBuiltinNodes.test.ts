@@ -71,6 +71,25 @@ test('workflow catalog includes Load Scene as a first-class built-in source node
   }
 })
 
+test('workflow catalog exposes Add to Worlds as a separate output node', async () => {
+  const { module, cleanup } = await loadCatalogModule()
+
+  try {
+    assert.ok(module.WORKFLOW_BUILTIN_NODE_TYPES.includes('addToWorldsNode'))
+    assert.deepEqual(
+      module.WORKFLOW_BUILTIN_PALETTE_NODES.find((node) => node.type === 'addToWorldsNode'),
+      {
+        type: 'addToWorldsNode',
+        label: 'Add to Worlds',
+        color: '#a78bfa',
+        description: 'Output node — adds the mesh to Worlds',
+      },
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
 test('createBuiltinWorkflowNode initializes preview nodes with workflow-safe defaults', async () => {
   const { module, cleanup } = await loadCatalogModule()
 

@@ -13,7 +13,7 @@ type WorkflowEdgeTargetColorArgs = {
 }
 
 export function resolveWorkflowEdgeTargetColor({ targetNodeType, targetExtension = {}, targetHandle }: WorkflowEdgeTargetColorArgs): string {
-  if (targetNodeType === 'outputNode') return PROCESS_PORT_HANDLE_COLOR.mesh
+  if (targetNodeType === 'outputNode' || targetNodeType === 'addToWorldsNode') return PROCESS_PORT_HANDLE_COLOR.mesh
   if (isPreviewNodeType(targetNodeType)) return PROCESS_PORT_HANDLE_COLOR.image
 
   return resolveProcessTargetColor(targetExtension, targetHandle)

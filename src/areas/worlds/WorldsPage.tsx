@@ -11,8 +11,10 @@ import type { WorldsTransformMode } from './components/WorldsTransformToolbar.ts
 import { useWorldsSceneStore } from './worldsSceneStore.ts'
 import {
   appendWorldSceneItem,
+  attachWorldSceneItemAnimation,
   calculateWorldSceneItemPlacementOffset,
   removeWorldSceneItem,
+  resolveWorldSceneItemForPoseClip,
   toggleWorldSceneItemBaseRole,
   updateWorldSceneItemTransform,
 } from './worldsScenePlacement.ts'
@@ -59,6 +61,7 @@ export interface WorldsPageViewProps {
   onSelectSceneItem: (itemId: string | null) => void
   onTransformModeChange: (mode: WorldsTransformMode | null) => void
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
   onRemoveSceneItem: (itemId: string | null) => void
   onToggleBaseSceneItem: (itemId: string | null) => void
   onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
@@ -94,6 +97,7 @@ export function WorldsPageView({
   onSelectSceneItem,
   onTransformModeChange,
   onTransformSceneItem,
+  onAnimationMetadata,
   onRemoveSceneItem,
   onToggleBaseSceneItem,
   onSceneItemAnchorChange,
@@ -114,6 +118,7 @@ export function WorldsPageView({
         onSelectItem={onSelectSceneItem}
         onTransformModeChange={onTransformModeChange}
         onTransformItem={onTransformSceneItem}
+        onAnimationMetadata={onAnimationMetadata}
         onRemoveItem={onRemoveSceneItem}
         onToggleBaseSceneItem={onToggleBaseSceneItem}
         onSceneItemAnchorChange={onSceneItemAnchorChange}
@@ -163,7 +168,7 @@ export function WorldsPageView({
   )
 }
 
-export { appendWorldSceneItem, calculateWorldSceneItemPlacementOffset, removeWorldSceneItem, toggleWorldSceneItemBaseRole, updateWorldSceneItemTransform }
+export { appendWorldSceneItem, attachWorldSceneItemAnimation, calculateWorldSceneItemPlacementOffset, removeWorldSceneItem, resolveWorldSceneItemForPoseClip, toggleWorldSceneItemBaseRole, updateWorldSceneItemTransform }
 
 export default function WorldsPage(): JSX.Element {
   const apiUrl = useAppStore((state) => state.apiUrl)
@@ -285,6 +290,11 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
       if (result.asset.openable === true) {
         if ('sceneManifest' in result.asset) {
           await importSceneManifestFromWorkspacePath(result.asset.workspacePath)
+        } else if ('poseClip' in result.asset) {
+          const nextScene = attachPoseClipAsset(result.asset)
+          setWorldScene(nextScene)
+          setUnsupportedItems([])
+          setSceneStatus(`Attached motion to ${result.asset.animation.sourceWorkspacePath}`)
         } else {
           const sceneState = useWorldsSceneStore.getState()
           setWorldScene(appendWorldSceneItem(sceneState.sceneItems, result.asset.item, sceneState.sceneItemAnchors))
@@ -305,6 +315,24 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
     } finally {
       if (ownsOpen()) setOpeningAsset(false)
     }
+  }
+
+  function attachPoseClipAsset(asset: Extract<WorldAssetLibraryRenderable, { poseClip: true }>): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string | null } {
+    const sceneState = useWorldsSceneStore.getState()
+    const existingTarget = resolveWorldSceneItemForPoseClip(sceneState.sceneItems, asset.animation.sourceWorkspacePath, sceneState.selectedSceneItemId)
+    if (existingTarget) {
+      return {
+        sceneItems: attachWorldSceneItemAnimation(sceneState.sceneItems, existingTarget.id, asset.animation),
+        selectedSceneItemId: existingTarget.id,
+      }
+    }
+
+    if (asset.linkedItem) {
+      const appended = appendWorldSceneItem(sceneState.sceneItems, { ...asset.linkedItem, animation: asset.animation }, sceneState.sceneItemAnchors)
+      return appended
+    }
+
+    return { sceneItems: sceneState.sceneItems, selectedSceneItemId: sceneState.selectedSceneItemId }
   }
 
   async function saveSceneManifest(): Promise<void> {
@@ -447,6 +475,12 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
       onTransformSceneItem={(itemId, transform) => {
         setWorldScene({
           sceneItems: updateWorldSceneItemTransform(useWorldsSceneStore.getState().sceneItems, itemId, transform),
+          selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
+        })
+      }}
+      onAnimationMetadata={(itemId, animation) => {
+        setWorldScene({
+          sceneItems: attachWorldSceneItemAnimation(useWorldsSceneStore.getState().sceneItems, itemId, animation),
           selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
         })
       }}

@@ -6,10 +6,17 @@ import * as THREE from 'three'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import { clone as cloneSkeletonScene } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh'
+import type { PoseClipSidecarV1 } from '../../../shared/types/electron.d.ts'
 
 import { classifyPlyGeometry, classifyPlyHeader } from '../plyClassification.ts'
 import { createWorldsCameraState, shouldIgnoreWorldCameraKeyTarget } from '../worldCameraNavigation.ts'
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import {
+  applyWorldsPoseClipAtTime,
+  createWorldsPoseClipBoneMap,
+  takeWorldsPoseClipSnapshot,
+  type WorldsPoseClipBoneSnapshot,
+} from '../worldsPoseClipPlayback.ts'
 import { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
 import { WorldsKeyboardCameraControls, type WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.tsx'
 import { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
@@ -39,6 +46,13 @@ export interface WorldsViewerProps {
   onRemoveItem?: (itemId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
   onSceneItemAnchorChange?: (itemId: string, anchor: [number, number, number] | null) => void
+  onAnimationMetadata?: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
+}
+
+type WorldsPlaybackRef = {
+  playing: boolean
+  timeSeconds: number
+  durationSeconds: number
 }
 
 export type PlyRenderModel = {
@@ -121,6 +135,7 @@ export function WorldsViewer({
   onRemoveItem = () => undefined,
   onToggleBaseSceneItem = () => undefined,
   onSceneItemAnchorChange = () => undefined,
+  onAnimationMetadata = () => undefined,
 }: WorldsViewerProps): JSX.Element {
   const inputScopeRef = useRef<HTMLElement>(null)
   const orbitControlsRef = useRef<ComponentRef<typeof OrbitControls> | null>(null)
@@ -142,6 +157,12 @@ export function WorldsViewer({
   const sceneObjectsRef = useRef(new Map<string, THREE.Object3D>())
   const transformDraggingRef = useRef(false)
   const [sceneObjectVersion, setSceneObjectVersion] = useState(0)
+  const playbackRef = useRef<WorldsPlaybackRef>({ playing: false, timeSeconds: 0, durationSeconds: 0 })
+  const playbackScrubRef = useRef<HTMLInputElement>(null)
+  const playbackTimeLabelRef = useRef<HTMLSpanElement>(null)
+  const playbackDuration = useMemo(() => resolveWorldsPlaybackDuration(visibleItems), [visibleItems])
+  const [playbackPlaying, setPlaybackPlaying] = useState(false)
+  const [playbackControlTime, setPlaybackControlTime] = useState(0)
   const selectedObject = useMemo(() => selectedItemId ? sceneObjectsRef.current.get(selectedItemId) ?? null : null, [sceneObjectVersion, selectedItemId])
   const selectSceneItemFromCanvas = useCallback((itemId: string | null) => {
     if (transformMode) return
@@ -152,6 +173,24 @@ export function WorldsViewer({
     if (object) sceneObjectsRef.current.set(itemId, object)
     else sceneObjectsRef.current.delete(itemId)
     setSceneObjectVersion((version) => version + 1)
+  }, [])
+
+  useEffect(() => {
+    playbackRef.current.durationSeconds = playbackDuration
+    if (playbackRef.current.timeSeconds > playbackDuration) playbackRef.current.timeSeconds = playbackDuration
+    updatePlaybackOverlayRefs(playbackRef.current.timeSeconds, playbackDuration, playbackScrubRef, playbackTimeLabelRef)
+  }, [playbackDuration])
+
+  const setPlaybackTime = useCallback((timeSeconds: number) => {
+    const clamped = clampPlaybackTime(timeSeconds, playbackRef.current.durationSeconds)
+    playbackRef.current.timeSeconds = clamped
+    setPlaybackControlTime(clamped)
+    updatePlaybackOverlayRefs(clamped, playbackRef.current.durationSeconds, playbackScrubRef, playbackTimeLabelRef)
+  }, [])
+
+  const setPlaybackIsPlaying = useCallback((playing: boolean) => {
+    playbackRef.current.playing = playing && playbackRef.current.durationSeconds > 0
+    setPlaybackPlaying(playbackRef.current.playing)
   }, [])
 
   return (
@@ -182,6 +221,19 @@ export function WorldsViewer({
         onModeChange={onTransformModeChange}
         onRemoveItem={onRemoveItem}
         onToggleBaseSceneItem={onToggleBaseSceneItem}
+      />
+      <WorldsPlaybackControls
+        durationSeconds={playbackDuration}
+        playing={playbackPlaying}
+        controlTimeSeconds={playbackControlTime}
+        scrubRef={playbackScrubRef}
+        timeLabelRef={playbackTimeLabelRef}
+        onTogglePlaying={() => setPlaybackIsPlaying(!playbackRef.current.playing)}
+        onTimeChange={setPlaybackTime}
+        onReset={() => {
+          setPlaybackIsPlaying(false)
+          setPlaybackTime(0)
+        }}
       />
       <Canvas
         camera={{ position: [2.4, 1.8, 2.8], fov: 45, near: 0.01, far: 500 }}
@@ -215,9 +267,11 @@ export function WorldsViewer({
                       item={item}
                       onSettled={onItemSettled}
                       selected={item.id === selectedItemId}
+                    playbackRef={playbackRef}
                     onSelectItem={selectSceneItemFromCanvas}
                     onRegisterObject={registerSceneObject}
                     onSceneItemAnchorChange={onSceneItemAnchorChange}
+                    onAnimationMetadata={onAnimationMetadata}
                   />
                   </Suspense>
                 </WorldSceneItemErrorBoundary>
@@ -261,6 +315,7 @@ export function WorldsViewer({
           orbitControlsRef={orbitControlsRef}
         />
         <WorldsMouseLookCameraControls inputScopeRef={inputScopeRef} orbitControlsRef={orbitControlsRef} enabled={!transformMode && !transformDraggingRef.current} />
+        <WorldsPlaybackFrameController playbackRef={playbackRef} scrubRef={playbackScrubRef} timeLabelRef={playbackTimeLabelRef} />
         <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
           <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="#f4f4f5" />
         </GizmoHelper>
@@ -273,6 +328,65 @@ export function WorldsViewer({
       ) : null}
     </section>
   )
+}
+
+function WorldsPlaybackControls({
+  durationSeconds,
+  playing,
+  controlTimeSeconds,
+  scrubRef,
+  timeLabelRef,
+  onTogglePlaying,
+  onTimeChange,
+  onReset,
+}: {
+  durationSeconds: number
+  playing: boolean
+  controlTimeSeconds: number
+  scrubRef: RefObject<HTMLInputElement>
+  timeLabelRef: RefObject<HTMLSpanElement>
+  onTogglePlaying: () => void
+  onTimeChange: (timeSeconds: number) => void
+  onReset: () => void
+}): JSX.Element | null {
+  if (durationSeconds <= 0) return null
+
+  return (
+    <div className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-zinc-700/70 bg-zinc-950/75 px-2 py-1.5 text-xs text-zinc-200 shadow-xl backdrop-blur" aria-label="Worlds pose clip playback">
+      <button type="button" className="rounded-lg px-2 py-1 font-semibold hover:bg-zinc-800" onClick={onTogglePlaying}>{playing ? 'Pause' : 'Play'}</button>
+      <input
+        ref={scrubRef}
+        aria-label="Pose clip global time"
+        className="h-1 w-36 accent-violet-400"
+        type="range"
+        min={0}
+        max={durationSeconds}
+        step={0.01}
+        defaultValue={controlTimeSeconds}
+        onChange={(event) => onTimeChange(Number(event.currentTarget.value))}
+      />
+      <span ref={timeLabelRef} className="min-w-24 tabular-nums text-zinc-300">{formatPlaybackTime(controlTimeSeconds)} / {formatPlaybackTime(durationSeconds)}</span>
+      <button type="button" className="rounded-lg px-2 py-1 font-semibold hover:bg-zinc-800" onClick={onReset}>Reset</button>
+    </div>
+  )
+}
+
+function WorldsPlaybackFrameController({
+  playbackRef,
+  scrubRef,
+  timeLabelRef,
+}: {
+  playbackRef: MutableRefObject<WorldsPlaybackRef>
+  scrubRef: RefObject<HTMLInputElement>
+  timeLabelRef: RefObject<HTMLSpanElement>
+}): null {
+  useFrame((_, delta) => {
+    const playback = playbackRef.current
+    if (!playback || !playback.playing || playback.durationSeconds <= 0) return
+    playback.timeSeconds = (playback.timeSeconds + delta) % playback.durationSeconds
+    updatePlaybackOverlayRefs(playback.timeSeconds, playback.durationSeconds, scrubRef, timeLabelRef)
+  })
+  return null
 }
 
 export function describeWorldsViewerScene(items: WorldSceneItem[], unsupportedItems: WorldsViewerUnsupportedItem[] = [], selectedItemId: string | null = null) {
@@ -408,16 +522,20 @@ function WorldSceneItemObject({
   item,
   onSettled,
   selected,
+  playbackRef,
   onSelectItem,
   onRegisterObject,
   onSceneItemAnchorChange,
+  onAnimationMetadata,
 }: {
   item: WorldSceneItem
   onSettled: WorldSceneItemSettlement
   selected: boolean
+  playbackRef: MutableRefObject<WorldsPlaybackRef>
   onSelectItem: (itemId: string | null) => void
   onRegisterObject: (itemId: string, object: THREE.Object3D | null) => void
   onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
+  onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
 }): JSX.Element | null {
   const groupRef = useRef<THREE.Group>(null)
   const boundsRef = useRef(new THREE.Box3())
@@ -467,7 +585,7 @@ function WorldSceneItemObject({
           scale={item.transform.scale}
           onClick={handleClick}
         >
-          <WorldSceneItemGeometry item={item} onSettled={onSettled} />
+          <WorldSceneItemGeometry item={item} onSettled={onSettled} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} />
         </group>
       </Select>
     </>
@@ -580,11 +698,11 @@ function WorldsSelectionHitbox({
   )
 }
 
-function WorldSceneItemGeometry({ item, onSettled }: WorldSceneObjectProps): JSX.Element | null {
+function WorldSceneItemGeometry({ item, onSettled, playbackRef, onAnimationMetadata }: WorldSceneObjectProps & { playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void }): JSX.Element | null {
   if (item.kind === 'ply-mesh' || item.kind === 'ply-points') {
     return <PlySceneObject item={item} onSettled={onSettled} />
   }
-  return <GltfSceneObject item={item} onSettled={onSettled} />
+  return <GltfSceneObject item={item} onSettled={onSettled} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} />
 }
 
 function PlySceneObject({ item, onSettled }: WorldSceneObjectProps): JSX.Element | null {
@@ -645,7 +763,7 @@ function PlySceneObject({ item, onSettled }: WorldSceneObjectProps): JSX.Element
   )
 }
 
-function GltfSceneObject({ item, onSettled }: WorldSceneObjectProps): JSX.Element {
+function GltfSceneObject({ item, onSettled, playbackRef, onAnimationMetadata }: WorldSceneObjectProps & { playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void }): JSX.Element {
   const gltf = useGLTF(item.url)
   // Cached resources remain shared, but each mounted item owns its object/bone hierarchy.
   const scene = useMemo(() => {
@@ -661,6 +779,11 @@ function GltfSceneObject({ item, onSettled }: WorldSceneObjectProps): JSX.Elemen
     })
     return clone
   }, [gltf.scene])
+  const poseClipRef = useRef<{
+    sidecar: PoseClipSidecarV1
+    bonesById: Map<string, THREE.Bone>
+    snapshot: WorldsPoseClipBoneSnapshot
+  } | null>(null)
   const key = worldSceneItemKey(item)
   useEffect(() => {
     onSettled(key, 'ready')
@@ -673,7 +796,68 @@ function GltfSceneObject({ item, onSettled }: WorldSceneObjectProps): JSX.Elemen
       })
     }
   }, [scene, key, onSettled])
+  useEffect(() => {
+    const animation = item.animation
+    poseClipRef.current = null
+    if (!animation || animation.kind !== 'pose-clip') return
+    if (item.workspacePath !== animation.sourceWorkspacePath) return
+
+    let cancelled = false
+    window.electron.workspace.artifacts.readPoseClipSidecar({
+      sidecarWorkspacePath: animation.sidecarWorkspacePath,
+      ...(animation.legacySidecarWorkspacePath ? { legacySidecarWorkspacePath: animation.legacySidecarWorkspacePath } : {}),
+      sourceWorkspacePath: animation.sourceWorkspacePath,
+    }).then((result) => {
+      if (cancelled || result.success !== true || result.status !== 'found') return
+      const bonesById = createWorldsPoseClipBoneMap(scene, result.sidecar)
+      const snapshot = takeWorldsPoseClipSnapshot(bonesById)
+      poseClipRef.current = { sidecar: result.sidecar, bonesById, snapshot }
+      const nextAnimation = {
+        ...animation,
+        clipId: result.sidecar.clip.id,
+        clipName: result.sidecar.clip.name,
+        durationSeconds: result.sidecar.clip.durationSeconds,
+      }
+      if (animation.clipId !== nextAnimation.clipId || animation.clipName !== nextAnimation.clipName || animation.durationSeconds !== nextAnimation.durationSeconds) {
+        onAnimationMetadata(item.id, nextAnimation)
+      }
+    }).catch(() => undefined)
+
+    return () => {
+      cancelled = true
+      poseClipRef.current = null
+    }
+  }, [item.animation, item.id, item.workspacePath, onAnimationMetadata, scene])
+  useFrame(() => {
+    const poseClip = poseClipRef.current
+    if (!poseClip) return
+    applyWorldsPoseClipAtTime({
+      sidecar: poseClip.sidecar,
+      bonesById: poseClip.bonesById,
+      snapshot: poseClip.snapshot,
+      timeSeconds: playbackRef.current?.timeSeconds ?? 0,
+    })
+  })
   return <primitive object={scene} dispose={null} />
+}
+
+function resolveWorldsPlaybackDuration(items: WorldSceneItem[]): number {
+  return items.reduce((duration, item) => Math.max(duration, item.animation?.durationSeconds ?? 0), 0)
+}
+
+function clampPlaybackTime(timeSeconds: number, durationSeconds: number): number {
+  if (!Number.isFinite(timeSeconds)) return 0
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 0
+  return Math.min(Math.max(timeSeconds, 0), durationSeconds)
+}
+
+function updatePlaybackOverlayRefs(timeSeconds: number, durationSeconds: number, scrubRef: RefObject<HTMLInputElement>, labelRef: RefObject<HTMLSpanElement>): void {
+  if (scrubRef.current) scrubRef.current.value = String(timeSeconds)
+  if (labelRef.current) labelRef.current.textContent = `${formatPlaybackTime(timeSeconds)} / ${formatPlaybackTime(durationSeconds)}`
+}
+
+function formatPlaybackTime(timeSeconds: number): string {
+  return `${Math.max(0, timeSeconds).toFixed(2)}s`
 }
 
 function WorldsSelectionSilhouette({ target }: { target: THREE.Object3D }): JSX.Element {

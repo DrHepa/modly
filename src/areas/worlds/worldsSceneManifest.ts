@@ -13,6 +13,7 @@ export interface WorldsSceneManifestAssetV1 {
   workspacePath: string
   kind: WorldSceneItem['kind']
   visible?: boolean
+  animation?: WorldSceneItem['animation']
   transform: WorldSceneItem['transform']
 }
 
@@ -45,6 +46,7 @@ export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: 
       workspacePath: normalizeWorldsWorkspacePath(item.workspacePath) ?? item.workspacePath,
       kind: item.kind,
       visible: item.visible,
+      ...(item.animation ? { animation: cloneAnimationBinding(item.animation) } : {}),
       transform: cloneTransform(item.transform),
     })),
   }
@@ -134,6 +136,8 @@ function parseWorldsSceneManifestAsset(
   if (!WORLD_SCENE_ITEM_KINDS.has(value.kind as WorldSceneItem['kind'])) return { success: false, error: `Worlds scene asset ${index + 1} has an unsupported kind.` }
   const transform = parseTransform(value.transform)
   if (!transform) return { success: false, error: `Worlds scene asset ${index + 1} has an invalid transform.` }
+  const animation = parseAnimationBinding(value.animation, index)
+  if (animation.success !== true) return { success: false, error: animation.error }
   const visible = value.visible !== false
   const role = value.role === 'base-scene' ? 'base-scene' : 'asset'
   const requestedId = typeof value.id === 'string' && value.id.trim() ? value.id.trim() : `world:${workspacePath}`
@@ -149,6 +153,7 @@ function parseWorldsSceneManifestAsset(
       workspacePath,
       kind,
       visible,
+      ...(animation.binding ? { animation: animation.binding } : {}),
       transform,
     },
     sceneItem: {
@@ -158,7 +163,37 @@ function parseWorldsSceneManifestAsset(
       kind,
       role,
       visible,
+      ...(animation.binding ? { animation: animation.binding } : {}),
       transform,
+    },
+  }
+}
+
+function parseAnimationBinding(value: unknown, assetIndex: number): { success: true; binding?: WorldSceneItem['animation'] } | { success: false; error: string } {
+  if (value === undefined) return { success: true }
+  if (!isRecord(value) || value.kind !== 'pose-clip') return { success: false, error: `Worlds scene asset ${assetIndex + 1} has an invalid animation binding.` }
+
+  const sidecarWorkspacePath = normalizeWorldsWorkspacePath(value.sidecarWorkspacePath)
+  const legacySidecarWorkspacePath = value.legacySidecarWorkspacePath === undefined ? undefined : normalizeWorldsWorkspacePath(value.legacySidecarWorkspacePath)
+  const sourceWorkspacePath = normalizeWorldsWorkspacePath(value.sourceWorkspacePath)
+  if (!sidecarWorkspacePath || !sourceWorkspacePath || (value.legacySidecarWorkspacePath !== undefined && !legacySidecarWorkspacePath)) {
+    return { success: false, error: `Worlds scene asset ${assetIndex + 1} has an unsafe animation path.` }
+  }
+
+  const durationSeconds = typeof value.durationSeconds === 'number' && Number.isFinite(value.durationSeconds) && value.durationSeconds > 0
+    ? value.durationSeconds
+    : undefined
+
+  return {
+    success: true,
+    binding: {
+      kind: 'pose-clip',
+      sidecarWorkspacePath,
+      ...(legacySidecarWorkspacePath ? { legacySidecarWorkspacePath } : {}),
+      sourceWorkspacePath,
+      ...(typeof value.clipId === 'string' && value.clipId.trim() ? { clipId: value.clipId.trim() } : {}),
+      ...(typeof value.clipName === 'string' && value.clipName.trim() ? { clipName: value.clipName.trim() } : {}),
+      ...(durationSeconds ? { durationSeconds } : {}),
     },
   }
 }
@@ -184,6 +219,10 @@ function cloneTransform(transform: WorldSceneItem['transform']): WorldSceneItem[
     rotation: [...transform.rotation],
     scale: [...transform.scale],
   }
+}
+
+function cloneAnimationBinding(animation: NonNullable<WorldSceneItem['animation']>): NonNullable<WorldSceneItem['animation']> {
+  return { ...animation }
 }
 
 function uniqueSceneItemId(baseId: string, usedIds: Set<string>): string {

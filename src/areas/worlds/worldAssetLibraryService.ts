@@ -15,7 +15,7 @@ import { listAssetLibraryEntries, readAssetLibraryEntry, openAssetLibraryEntry }
 import { projectAssetLibraryEntry } from '../generate/assetLibraryProjection.ts'
 import { isSafeViewerWorkspaceRelativePath } from '../generate/viewerAssetTarget.ts'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
   | (WorkspaceAssetLibraryEntry & {
@@ -33,6 +33,16 @@ export type WorldAssetLibraryRenderable =
       openable: true
       workspacePath: string
       sceneManifest: true
+    })
+  | (WorkspaceAssetLibraryEntry & {
+      id: string
+      name: string
+      type: 'Pose clip'
+      openable: true
+      workspacePath: string
+      poseClip: true
+      animation: NonNullable<WorldSceneItem['animation']>
+      linkedItem?: WorldSceneItem
     })
   | (WorkspaceAssetLibraryEntry & {
       id: string
@@ -56,9 +66,9 @@ export async function listWorldAssetLibraryRenderables(apiUrl: string): Promise<
 }
 
 export async function openWorldAssetLibraryRenderable(request: AssetLibraryOpenRequest, apiUrl: string): Promise<WorldAssetLibraryOpenResult> {
-  // Both facades validate the complete request before IPC. PLY uses authorised
-  // read, not Generate's intentionally GLB/GLTF-only open policy.
-  const read = typeof request?.workspacePath === 'string' && getExtension(request.workspacePath) === '.ply'
+  // Both facades validate the complete request before IPC. PLY and JSON metadata
+  // use authorised read, not Generate's intentionally GLB/GLTF-only open policy.
+  const read = typeof request?.workspacePath === 'string' && ['.ply', '.json'].includes(getExtension(request.workspacePath))
   const result = await (read ? readAssetLibraryEntry(request) : openAssetLibraryEntry(request))
   return projectWorldAssetLibraryOpenResult(result, apiUrl)
 }
@@ -109,6 +119,37 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     }
   }
 
+  if (entry.capability === 'animation-motion') {
+    const sourceWorkspacePath = entry.source?.relation === 'sidecar-source' ? entry.source.workspacePath : undefined
+    const safeSidecarPath = isSafeViewerWorkspaceRelativePath(entry.workspacePath)
+    const safeSourcePath = typeof sourceWorkspacePath === 'string' && isSafeViewerWorkspaceRelativePath(sourceWorkspacePath)
+    const linkedRenderable = safeSourcePath ? resolveWorldRenderable({ workspacePath: sourceWorkspacePath, apiUrl }) : null
+
+    if (safeSidecarPath && safeSourcePath && sourceWorkspacePath && linkedRenderable?.openable === true) {
+      return {
+        ...baseEntry,
+        name,
+        type: 'Pose clip',
+        openable: true,
+        poseClip: true,
+        animation: {
+          kind: 'pose-clip',
+          sidecarWorkspacePath: entry.workspacePath,
+          sourceWorkspacePath,
+        },
+        linkedItem: linkedRenderable.item,
+      }
+    }
+
+    return {
+      ...baseEntry,
+      name,
+      type: safeSidecarPath ? 'Unavailable' : 'Unsupported',
+      openable: false,
+      reason: safeSidecarPath ? 'unavailable' : 'unsafe',
+    }
+  }
+
   if (renderable.openable) {
     return {
       ...baseEntry,
@@ -129,7 +170,7 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
 }
 
 function isWorldLibraryCandidate(entry: AssetLibraryEntry): boolean {
-  if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
+  if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh' || entry.capability === 'animation-motion') {
     return true
   }
   return ['.ply', '.glb', '.gltf', '.spz'].includes(getExtension(entry.workspacePath))

@@ -95,6 +95,24 @@ export function updateWorldSceneItemTransform(
     : item)
 }
 
+export function attachWorldSceneItemAnimation(
+  sceneItems: WorldSceneItem[],
+  itemId: string,
+  animation: NonNullable<WorldSceneItem['animation']>,
+): WorldSceneItem[] {
+  return sceneItems.map((item) => item.id === itemId ? { ...item, animation: { ...animation } } : item)
+}
+
+export function resolveWorldSceneItemForPoseClip(
+  sceneItems: WorldSceneItem[],
+  sourceWorkspacePath: string,
+  selectedItemId: string | null,
+): WorldSceneItem | null {
+  const matches = sceneItems.filter((item) => item.workspacePath === sourceWorkspacePath && (item.kind === 'glb' || item.kind === 'gltf'))
+  if (matches.length === 0) return null
+  return matches.find((item) => item.id === selectedItemId) ?? matches[0] ?? null
+}
+
 export function toggleWorldSceneItemBaseRole(sceneItems: WorldSceneItem[], itemId: string | null): WorldSceneItem[] {
   if (!itemId || !sceneItems.some((item) => item.id === itemId)) return sceneItems
   return sceneItems.map((item) => item.id === itemId ? { ...item, role: item.role === 'base-scene' ? 'asset' : 'base-scene' } : item)

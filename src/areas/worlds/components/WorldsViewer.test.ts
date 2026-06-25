@@ -268,6 +268,15 @@ test('WorldsViewer keeps camera navigation state local with pan zoom look and ke
   }
 })
 
+test('WorldsViewer pose playback uses useFrame refs instead of setInterval React state churn', async () => {
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  assert.equal(viewerSource.includes('setInterval'), false)
+  assert.equal(viewerSource.includes('WorldsPlaybackFrameController'), true)
+  assert.equal(viewerSource.includes('useFrame((_, delta)'), true)
+  assert.equal(viewerSource.includes('playbackRef'), true)
+})
+
 test('WorldsKeyboardCameraControls uses scoped key refs, useFrame movement, and moves the orbit target with the camera', async () => {
   const { source, module, cleanup } = await loadViewerModule()
   const keyboardControlsSource = await readFile(keyboardControlsEntry, 'utf8')

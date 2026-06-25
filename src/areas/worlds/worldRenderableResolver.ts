@@ -17,11 +17,22 @@ export interface WorldSceneItem {
   kind: Exclude<WorldAssetKind, 'gaussian-ply' | 'spz'>
   role: WorldSceneItemRole
   visible: boolean
+  animation?: WorldSceneItemAnimationBinding
   transform: {
     position: [number, number, number]
     rotation: [number, number, number]
     scale: [number, number, number]
   }
+}
+
+export interface WorldSceneItemAnimationBinding {
+  kind: 'pose-clip'
+  sidecarWorkspacePath: string
+  legacySidecarWorkspacePath?: string
+  sourceWorkspacePath: string
+  clipId?: string
+  clipName?: string
+  durationSeconds?: number
 }
 
 export type WorldRenderable =

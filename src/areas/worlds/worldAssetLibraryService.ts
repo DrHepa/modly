@@ -14,7 +14,7 @@ import {
 
 const UNSAFE_WORKSPACE_PATH_ERROR = 'World asset library service requires a safe workspace-relative path.'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
   | (WorkspaceAssetLibraryEntry & {
@@ -32,6 +32,16 @@ export type WorldAssetLibraryRenderable =
       openable: true
       workspacePath: string
       sceneManifest: true
+    })
+  | (WorkspaceAssetLibraryEntry & {
+      id: string
+      name: string
+      type: 'Pose clip'
+      openable: true
+      workspacePath: string
+      poseClip: true
+      animation: NonNullable<WorldSceneItem['animation']>
+      linkedItem?: WorldSceneItem
     })
   | (WorkspaceAssetLibraryEntry & {
       id: string
@@ -100,6 +110,37 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     }
   }
 
+  if (entry.capability === 'animation-motion') {
+    const sourceWorkspacePath = entry.source?.relation === 'sidecar-source' ? entry.source.workspacePath : undefined
+    const safeSidecarPath = isSafeWorkspacePath(entry.workspacePath)
+    const safeSourcePath = typeof sourceWorkspacePath === 'string' && isSafeWorkspacePath(sourceWorkspacePath)
+    const linkedRenderable = safeSourcePath ? resolveWorldRenderable({ workspacePath: sourceWorkspacePath, apiUrl }) : null
+
+    if (safeSidecarPath && safeSourcePath && sourceWorkspacePath && linkedRenderable?.openable === true) {
+      return {
+        ...baseEntry,
+        name,
+        type: 'Pose clip',
+        openable: true,
+        poseClip: true,
+        animation: {
+          kind: 'pose-clip',
+          sidecarWorkspacePath: entry.workspacePath,
+          sourceWorkspacePath,
+        },
+        linkedItem: linkedRenderable.item,
+      }
+    }
+
+    return {
+      ...baseEntry,
+      name,
+      type: safeSidecarPath ? 'Unavailable' : 'Unsupported',
+      openable: false,
+      reason: safeSidecarPath ? 'unavailable' : 'unsafe',
+    }
+  }
+
   const renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl })
 
   if (renderable.openable) {
@@ -122,7 +163,7 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
 }
 
 function isWorldLibraryCandidate(entry: AssetLibraryEntry): boolean {
-  if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
+  if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh' || entry.capability === 'animation-motion') {
     return true
   }
   return ['.ply', '.glb', '.gltf', '.spz'].includes(getExtension(entry.workspacePath))

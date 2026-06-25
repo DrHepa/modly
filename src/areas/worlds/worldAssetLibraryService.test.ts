@@ -70,6 +70,17 @@ function installLibraryWindow(stubs: {
                     warnings: [],
                   },
                   {
+                    id: 'walk-motion',
+                    workspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+                    displayName: 'Walk motion',
+                    sourceScope: 'workflows',
+                    capability: 'animation-motion',
+                    state: 'ready',
+                    previewKind: 'text',
+                    warnings: [],
+                    source: { relation: 'sidecar-source', workspacePath: 'Workflows/Characters/hero.glb' },
+                  },
+                  {
                     id: 'unsafe',
                     workspacePath: '../outside/hero.glb',
                     displayName: '',
@@ -123,12 +134,13 @@ test('world asset library service lists shared-contract workspace renderables ac
   assert.equal(result.success, true)
   if (result.success !== true) return
 
-  assert.equal(result.assets.length, 5)
+  assert.equal(result.assets.length, 6)
   assert.deepEqual(result.assets.map((asset) => ({ id: asset.id, sourceScope: asset.sourceScope, capability: asset.capability, displayName: asset.displayName, openable: asset.openable })), [
     { id: 'world-mesh', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Fuse simplified', openable: true },
     { id: 'export-mesh', sourceScope: 'exports', capability: 'mesh', displayName: 'Hero export', openable: true },
     { id: 'gaussian', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Gaussian splat', openable: false },
     { id: 'saved-scene', sourceScope: 'exports', capability: 'scene-manifest', displayName: 'Saved scene', openable: true },
+    { id: 'walk-motion', sourceScope: 'workflows', capability: 'animation-motion', displayName: 'Walk motion', openable: true },
     { id: 'unsafe', sourceScope: 'workflows', capability: 'mesh', displayName: '../outside/hero.glb', openable: false },
   ])
 
@@ -140,6 +152,7 @@ test('world asset library service lists shared-contract workspace renderables ac
       workspacePath: 'Workflows/worldmirror/result/ply/fuse_simplified.ply',
       url: 'http://127.0.0.1:8000/workspace/Workflows/worldmirror/result/ply/fuse_simplified.ply',
       kind: 'ply-mesh',
+      role: 'asset',
       visible: true,
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
     })
@@ -148,6 +161,16 @@ test('world asset library service lists shared-contract workspace renderables ac
   if (result.assets[2].openable === false) assert.equal(result.assets[2].reason, 'unsupported-spz')
   assert.equal(result.assets[3].openable, true)
   if (result.assets[3].openable === true) assert.equal('sceneManifest' in result.assets[3], true)
+  assert.equal(result.assets[4].openable, true)
+  if (result.assets[4].openable === true && 'poseClip' in result.assets[4]) {
+    assert.equal(result.assets[4].type, 'Pose clip')
+    assert.deepEqual(result.assets[4].animation, {
+      kind: 'pose-clip',
+      sidecarWorkspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+      sourceWorkspacePath: 'Workflows/Characters/hero.glb',
+    })
+    assert.equal(result.assets[4].linkedItem?.workspacePath, 'Workflows/Characters/hero.glb')
+  }
   assert.deepEqual(result.assets[0].warnings, [])
   assert.deepEqual(result.assets[2].warnings, ['hidden detail'])
 })

@@ -57,6 +57,30 @@ test('buildWorldsSceneManifest persists selected base-scene roles', () => {
   assert.equal(manifest.assets[0].role, 'base-scene')
 })
 
+test('buildWorldsSceneManifest persists pose-clip animation bindings', () => {
+  const manifest = buildWorldsSceneManifest([sceneItem({
+    animation: {
+      kind: 'pose-clip',
+      sidecarWorkspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+      legacySidecarWorkspacePath: 'Workflows/Motions/walk.legacy.json',
+      sourceWorkspacePath: 'Workflows/hero.glb',
+      clipId: 'walk',
+      clipName: 'Walk',
+      durationSeconds: 1.5,
+    },
+  })], { now: new Date('2026-06-20T12:00:00.000Z') })
+
+  assert.deepEqual(manifest.assets[0].animation, {
+    kind: 'pose-clip',
+    sidecarWorkspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+    legacySidecarWorkspacePath: 'Workflows/Motions/walk.legacy.json',
+    sourceWorkspacePath: 'Workflows/hero.glb',
+    clipId: 'walk',
+    clipName: 'Walk',
+    durationSeconds: 1.5,
+  })
+})
+
 test('parseWorldsSceneManifest restores scene items and preserves future base-scene roles', () => {
   const result = parseWorldsSceneManifest({
     schema: 'modly.scene-manifest.v1',
@@ -102,6 +126,48 @@ test('parseWorldsSceneManifest restores scene items and preserves future base-sc
     },
   ])
   assert.equal(result.manifest.assets[0].role, 'base-scene')
+})
+
+test('parseWorldsSceneManifest restores pose-clip bindings and rejects unsafe animation paths', () => {
+  const result = parseWorldsSceneManifest({
+    schema: 'modly.scene-manifest.v1',
+    sceneRoot: '.',
+    assets: [{
+      workspacePath: 'Workflows/hero.glb',
+      kind: 'glb',
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      animation: {
+        kind: 'pose-clip',
+        sidecarWorkspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+        sourceWorkspacePath: 'Workflows/hero.glb',
+        clipName: 'Walk',
+        durationSeconds: 2,
+      },
+    }],
+  })
+
+  assert.equal(result.success, true)
+  if (result.success === true) {
+    assert.deepEqual(result.sceneItems[0].animation, {
+      kind: 'pose-clip',
+      sidecarWorkspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+      sourceWorkspacePath: 'Workflows/hero.glb',
+      clipName: 'Walk',
+      durationSeconds: 2,
+    })
+  }
+
+  const unsafe = parseWorldsSceneManifest({
+    schema: 'modly.scene-manifest.v1',
+    sceneRoot: '.',
+    assets: [{
+      workspacePath: 'Workflows/hero.glb',
+      kind: 'glb',
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      animation: { kind: 'pose-clip', sidecarWorkspacePath: '../escape.json', sourceWorkspacePath: 'Workflows/hero.glb' },
+    }],
+  })
+  assert.deepEqual(unsafe, { success: false, error: 'Worlds scene asset 1 has an unsafe animation path.' })
 })
 
 test('parseWorldsSceneManifest rejects unsafe asset paths and invalid transforms', () => {

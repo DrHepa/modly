@@ -11,7 +11,7 @@ export const WORLD_VIEWER_CAMERA_OVERLAY = {
     reset: 'Reset camera',
     help: 'Camera and keyboard movement help',
   },
-  helpText: 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space/E up · Q/Shift down',
+  helpText: 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space up · Shift down · Q/E yaw',
 } as const
 
 export interface WorldsCameraOverlayProps {

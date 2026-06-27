@@ -5,6 +5,7 @@ import * as THREE from 'three'
 import {
   deriveWorldsMovementVector,
   normalizeWorldCameraKey,
+  rotateWorldsCameraYawTarget,
   shouldHandleWorldCameraKeyInput,
   updateWorldsMovementKeys,
   type WorldsMovementKeyState,
@@ -27,16 +28,34 @@ const forwardVector = new THREE.Vector3()
 const rightVector = new THREE.Vector3()
 const movementVector = new THREE.Vector3()
 const scaledMovementVector = new THREE.Vector3()
+const lookDirectionVector = new THREE.Vector3()
+const WORLD_CAMERA_YAW_SPEED = Math.PI / 2
+
+type WorldsRotationKeyState = {
+  yawLeft: boolean
+  yawRight: boolean
+}
+
+function isWorldCameraRotationKey(code: string): code is 'KeyQ' | 'KeyE' {
+  return code === 'KeyQ' || code === 'KeyE'
+}
+
+function updateWorldsRotationKeys(keys: WorldsRotationKeyState, code: 'KeyQ' | 'KeyE', pressed: boolean): WorldsRotationKeyState {
+  if (code === 'KeyQ') return { ...keys, yawLeft: pressed }
+  return { ...keys, yawRight: pressed }
+}
 
 export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitControlsRef }: WorldsKeyboardCameraControlsProps): null {
   const keysRef = useRef<WorldsMovementKeyState>({})
   const heldCodesRef = useRef(new Set<string>())
+  const rotationKeysRef = useRef<WorldsRotationKeyState>({ yawLeft: false, yawRight: false })
 
   useEffect(() => {
     const heldCodes = heldCodesRef.current
     const clearKeys = () => {
       heldCodes.clear()
       keysRef.current = {}
+      rotationKeysRef.current = { yawLeft: false, yawRight: false }
     }
     const updateKeys = () => {
       let keys: WorldsMovementKeyState = {}
@@ -54,13 +73,19 @@ export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitContro
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!isScopedEvent(event)) { clearKeys(); return }
-      if (!normalizeWorldCameraKey(event.code)) return
-      heldCodes.add(event.code)
-      updateKeys()
+      const movementKey = normalizeWorldCameraKey(event.code)
+      const rotationKey = isWorldCameraRotationKey(event.code)
+      if (!movementKey && !rotationKey) return
+      if (movementKey) {
+        heldCodes.add(event.code)
+        updateKeys()
+      }
+      if (rotationKey) rotationKeysRef.current = updateWorldsRotationKeys(rotationKeysRef.current, event.code, true)
       event.preventDefault()
     }
 
     const handleKeyUp = (event: KeyboardEvent) => {
+      if (isWorldCameraRotationKey(event.code)) rotationKeysRef.current = updateWorldsRotationKeys(rotationKeysRef.current, event.code, false)
       heldCodes.delete(event.code)
       updateKeys()
     }
@@ -89,6 +114,7 @@ export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitContro
     if (!shouldHandleWorldCameraKeyInput({ target: document.activeElement as HTMLElement | null, activeElement: document.activeElement as HTMLElement | null, inputScope: scope })) {
       keysRef.current = {}
       heldCodesRef.current.clear()
+      rotationKeysRef.current = { yawLeft: false, yawRight: false }
       return
     }
 
@@ -101,11 +127,27 @@ export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitContro
       up: camera.up,
     })
 
-    if (movement.x === 0 && movement.y === 0 && movement.z === 0) return
-    movementVector.set(movement.x, movement.y, movement.z)
-    scaledMovementVector.copy(movementVector).multiplyScalar(speed * delta)
-    camera.position.add(scaledMovementVector)
-    orbitControlsRef.current?.target.add(scaledMovementVector)
+    const yawDirection = Number(rotationKeysRef.current.yawLeft) - Number(rotationKeysRef.current.yawRight)
+    const hasMovement = movement.x !== 0 || movement.y !== 0 || movement.z !== 0
+    const hasYaw = yawDirection !== 0
+
+    if (!hasMovement && !hasYaw) return
+    if (hasMovement) {
+      movementVector.set(movement.x, movement.y, movement.z)
+      scaledMovementVector.copy(movementVector).multiplyScalar(speed * delta)
+      camera.position.add(scaledMovementVector)
+      orbitControlsRef.current?.target.add(scaledMovementVector)
+    }
+    if (hasYaw && orbitControlsRef.current) {
+      camera.getWorldDirection(lookDirectionVector)
+      orbitControlsRef.current.target.copy(rotateWorldsCameraYawTarget({
+        cameraPosition: camera.position,
+        target: orbitControlsRef.current.target,
+        yawAngle: yawDirection * WORLD_CAMERA_YAW_SPEED * delta,
+        up: camera.up,
+        fallbackLookDirection: lookDirectionVector,
+      }))
+    }
     orbitControlsRef.current?.update()
   })
 

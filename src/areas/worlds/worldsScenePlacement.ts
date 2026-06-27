@@ -1,21 +1,40 @@
+import { Euler, Quaternion, Vector3 } from 'three'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+
+export type WorldSceneTransformMode = 'translate' | 'rotate' | 'scale'
+
+export interface WorldSceneItemTransformUpdate {
+  itemId: string
+  transform: WorldSceneItem['transform']
+}
+
+export interface WorldSceneTransformSnapshot {
+  itemId: string
+  transform: WorldSceneItem['transform']
+}
+
+export interface AppendWorldSceneItemOptions {
+  sceneItemAnchors?: Record<string, [number, number, number]>
+  selectedSceneItemId?: string | null
+}
 
 export function appendWorldSceneItem(
   sceneItems: WorldSceneItem[],
   item: WorldSceneItem,
-  sceneItemAnchors: Record<string, [number, number, number]> = {},
+  options: AppendWorldSceneItemOptions = {},
 ): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string } {
+  const { sceneItemAnchors = {}, selectedSceneItemId = null } = options
   const existingIds = new Set(sceneItems.map((sceneItem) => sceneItem.id))
   const placementOffset = calculateWorldSceneItemPlacementOffset(resolvePlacementIndex(sceneItems, item))
-  const baseAnchor = item.role === 'base-scene' ? [0, 0, 0] as [number, number, number] : calculateBaseSceneAnchor(sceneItems, sceneItemAnchors)
+  const placementAnchor = resolvePlacementAnchor(sceneItems, sceneItemAnchors, selectedSceneItemId)
   const placedItem = {
     ...item,
     role: item.role ?? 'asset',
     transform: {
       position: [
-        item.transform.position[0] + baseAnchor[0] + placementOffset[0],
-        item.transform.position[1] + baseAnchor[1] + placementOffset[1],
-        item.transform.position[2] + baseAnchor[2] + placementOffset[2],
+        item.transform.position[0] + placementAnchor[0] + placementOffset[0],
+        item.transform.position[1] + placementAnchor[1] + placementOffset[1],
+        item.transform.position[2] + placementAnchor[2] + placementOffset[2],
       ] as [number, number, number],
       rotation: [...item.transform.rotation] as [number, number, number],
       scale: [...item.transform.scale] as [number, number, number],
@@ -55,11 +74,9 @@ export function calculateWorldSceneItemPlacementOffset(itemIndex: number): [numb
     [-1, -1],
     [1, -1],
   ]
-  const zeroBasedOffsetIndex = itemIndex - 1
-  const ring = Math.floor(zeroBasedOffsetIndex / directions.length) + 1
-  const [xDirection, zDirection] = directions[zeroBasedOffsetIndex % directions.length]
+  const [xDirection, zDirection] = directions[(itemIndex - 1) % directions.length]
 
-  return [xDirection * ring * spacing, 0, zDirection * ring * spacing]
+  return [xDirection * spacing, 0, zDirection * spacing]
 }
 
 export function removeWorldSceneItem(sceneItems: WorldSceneItem[], selectedItemId: string | null): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string | null } {
@@ -95,6 +112,130 @@ export function updateWorldSceneItemTransform(
     : item)
 }
 
+export function updateWorldSceneItemTransforms(
+  sceneItems: WorldSceneItem[],
+  updates: WorldSceneItemTransformUpdate[],
+): WorldSceneItem[] {
+  if (updates.length === 0) return sceneItems
+  const updatesById = new Map(updates.map((update) => [update.itemId, update.transform]))
+  if (updatesById.size === 0) return sceneItems
+
+  let changed = false
+  const nextItems = sceneItems.map((item) => {
+    const transform = updatesById.get(item.id)
+    if (!transform) return item
+    changed = true
+    return {
+      ...item,
+      transform: {
+        position: [...transform.position],
+        rotation: [...transform.rotation],
+        scale: [...transform.scale],
+      },
+    }
+  })
+
+  return changed ? nextItems : sceneItems
+}
+
+export function createWorldSceneSelectionTransformUpdates({
+  mode,
+  activeItemId,
+  snapshot,
+  activeTransform,
+}: {
+  mode: WorldSceneTransformMode
+  activeItemId: string
+  snapshot: WorldSceneTransformSnapshot[]
+  activeTransform: WorldSceneItem['transform']
+}): WorldSceneItemTransformUpdate[] {
+  const baselineItems = new Map(snapshot.map((entry) => [entry.itemId, entry.transform]))
+  const activeBaseline = baselineItems.get(activeItemId)
+  if (!activeBaseline) {
+    return [{ itemId: activeItemId, transform: cloneWorldSceneTransform(activeTransform) }]
+  }
+
+  const updates: WorldSceneItemTransformUpdate[] = [{
+    itemId: activeItemId,
+    transform: cloneWorldSceneTransform(activeTransform),
+  }]
+
+  if (baselineItems.size === 1) return updates
+
+  const pivot = toVector3(activeBaseline.position)
+  const activeBaselineQuaternion = toQuaternion(activeBaseline.rotation)
+
+  if (mode === 'translate') {
+    const positionDelta = toVector3(activeTransform.position).sub(pivot)
+    for (const [itemId, transform] of baselineItems) {
+      if (itemId === activeItemId) continue
+      const nextPosition = toVector3(transform.position).add(positionDelta)
+      updates.push({
+        itemId,
+        transform: {
+          position: nextPosition.toArray() as [number, number, number],
+          rotation: [...transform.rotation],
+          scale: [...transform.scale],
+        },
+      })
+    }
+    return updates
+  }
+
+  if (mode === 'rotate') {
+    const activeRotationQuaternion = toQuaternion(activeTransform.rotation)
+    const rotationDelta = activeRotationQuaternion.clone().multiply(activeBaselineQuaternion.clone().invert())
+
+    for (const [itemId, transform] of baselineItems) {
+      if (itemId === activeItemId) continue
+      const offset = toVector3(transform.position).sub(pivot).applyQuaternion(rotationDelta)
+      const nextQuaternion = rotationDelta.clone().multiply(toQuaternion(transform.rotation))
+      const nextEuler = new Euler().setFromQuaternion(nextQuaternion, 'XYZ')
+      updates.push({
+        itemId,
+        transform: {
+          position: pivot.clone().add(offset).toArray() as [number, number, number],
+          rotation: [nextEuler.x, nextEuler.y, nextEuler.z],
+          scale: [...transform.scale],
+        },
+      })
+    }
+    return updates
+  }
+
+  const scaleRatio = [0, 1, 2].map((axis) => {
+    const baseline = activeBaseline.scale[axis]
+    if (Math.abs(baseline) < 1e-6) return 1
+    return activeTransform.scale[axis] / baseline
+  }) as [number, number, number]
+  const inverseActiveBaselineQuaternion = activeBaselineQuaternion.clone().invert()
+
+  for (const [itemId, transform] of baselineItems) {
+    if (itemId === activeItemId) continue
+    const localOffset = toVector3(transform.position).sub(pivot).applyQuaternion(inverseActiveBaselineQuaternion)
+    localOffset.set(
+      localOffset.x * scaleRatio[0],
+      localOffset.y * scaleRatio[1],
+      localOffset.z * scaleRatio[2],
+    )
+    const nextPosition = localOffset.applyQuaternion(activeBaselineQuaternion).add(pivot)
+    updates.push({
+      itemId,
+      transform: {
+        position: nextPosition.toArray() as [number, number, number],
+        rotation: [...transform.rotation],
+        scale: [
+          transform.scale[0] * scaleRatio[0],
+          transform.scale[1] * scaleRatio[1],
+          transform.scale[2] * scaleRatio[2],
+        ],
+      },
+    })
+  }
+
+  return updates
+}
+
 export function attachWorldSceneItemAnimation(
   sceneItems: WorldSceneItem[],
   itemId: string,
@@ -122,6 +263,38 @@ function resolvePlacementIndex(sceneItems: WorldSceneItem[], item: WorldSceneIte
   const hasBaseScene = sceneItems.some((sceneItem) => sceneItem.visible && sceneItem.role === 'base-scene')
   if (!hasBaseScene || item.role === 'base-scene') return sceneItems.length
   return sceneItems.filter((sceneItem) => sceneItem.role !== 'base-scene').length + 1
+}
+
+function resolvePlacementAnchor(
+  sceneItems: WorldSceneItem[],
+  sceneItemAnchors: Record<string, [number, number, number]>,
+  selectedSceneItemId: string | null,
+): [number, number, number] {
+  if (selectedSceneItemId) {
+    const selectedAnchor = sceneItemAnchors[selectedSceneItemId]
+    if (selectedAnchor) return [...selectedAnchor] as [number, number, number]
+
+    const selectedItem = sceneItems.find((sceneItem) => sceneItem.id === selectedSceneItemId)
+    if (selectedItem) return [...selectedItem.transform.position] as [number, number, number]
+  }
+
+  return calculateBaseSceneAnchor(sceneItems, sceneItemAnchors)
+}
+
+function cloneWorldSceneTransform(transform: WorldSceneItem['transform']): WorldSceneItem['transform'] {
+  return {
+    position: [...transform.position],
+    rotation: [...transform.rotation],
+    scale: [...transform.scale],
+  }
+}
+
+function toVector3(vector: [number, number, number]): Vector3 {
+  return new Vector3(vector[0], vector[1], vector[2])
+}
+
+function toQuaternion(rotation: [number, number, number]): Quaternion {
+  return new Quaternion().setFromEuler(new Euler(rotation[0], rotation[1], rotation[2], 'XYZ'))
 }
 
 function createDuplicateWorldSceneItemId(baseId: string, existingIds: Set<string>): string {

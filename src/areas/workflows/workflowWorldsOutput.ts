@@ -37,6 +37,9 @@ export function addWorkflowOutputUrlToWorlds(outputUrl: string): boolean {
   const renderable = resolveWorldRenderable({ workspacePath, apiUrl })
   if (!renderable.openable) return false
   const sceneState = useWorldsSceneStore.getState()
-  useWorldsSceneStore.getState().setScene(appendWorldSceneItem(sceneState.sceneItems, renderable.item, sceneState.sceneItemAnchors))
+  useWorldsSceneStore.getState().setScene(appendWorldSceneItem(sceneState.sceneItems, renderable.item, {
+    sceneItemAnchors: sceneState.sceneItemAnchors,
+    selectedSceneItemId: sceneState.selectedSceneItemId,
+  }))
   return true
 }

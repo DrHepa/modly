@@ -7,8 +7,9 @@ export type WorldsTransformMode = 'translate' | 'rotate' | 'scale'
 interface WorldsTransformToolbarProps {
   items?: WorldSceneItem[]
   selectedItemId: string | null
+  selectedItemIds?: string[]
   mode: WorldsTransformMode | null
-  onSelectItem?: (itemId: string | null) => void
+  onSelectItem?: (itemId: string | null, options?: { preserveSelection?: boolean }) => void
   onModeChange: (mode: WorldsTransformMode | null) => void
   onRemoveItem?: (itemId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
@@ -55,6 +56,7 @@ const TRANSFORM_MODES: { mode: WorldsTransformMode; label: string; icon: ReactNo
 export function WorldsTransformToolbar({
   items = [],
   selectedItemId,
+  selectedItemIds = [],
   mode,
   onSelectItem = () => undefined,
   onModeChange,
@@ -65,6 +67,7 @@ export function WorldsTransformToolbar({
   if (visibleItems.length === 0) return null
 
   const selectedItem = selectedItemId ? visibleItems.find((item) => item.id === selectedItemId) ?? null : null
+  const selectedItemCount = selectedItemIds.length
 
   return (
     <div
@@ -74,10 +77,11 @@ export function WorldsTransformToolbar({
     >
       <label className="flex flex-col gap-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-zinc-500">
         Scene assets
+        {selectedItemCount > 1 ? <span className="text-[0.6rem] normal-case tracking-normal text-zinc-400">{selectedItemCount} selected, transforms use the active item as the pivot</span> : null}
         <select
           value={selectedItemId ?? ''}
           aria-label="Select world asset"
-          onChange={(event) => onSelectItem(event.currentTarget.value || null)}
+          onChange={(event) => onSelectItem(event.currentTarget.value || null, { preserveSelection: true })}
           className="w-56 rounded-xl border border-zinc-700/70 bg-zinc-900/90 px-2.5 py-2 text-xs font-medium normal-case tracking-normal text-zinc-100 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30"
         >
           <option value="">Select asset…</option>

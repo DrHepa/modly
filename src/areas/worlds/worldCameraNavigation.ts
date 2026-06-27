@@ -19,6 +19,15 @@ export interface WorldsMovementAxes {
   up?: WorldsVector3Like
 }
 
+export interface WorldsYawRotationInput {
+  cameraPosition: WorldsVector3Like
+  target: WorldsVector3Like
+  yawAngle: number
+  up?: WorldsVector3Like
+  fallbackLookDirection?: WorldsVector3Like
+  fallbackDistance?: number
+}
+
 export interface WorldsKeyboardTargetLike {
   tagName?: string
   isContentEditable?: boolean
@@ -56,8 +65,6 @@ const MOVEMENT_KEY_BY_CODE: Readonly<Record<string, WorldsMovementDirection>> = 
   KeyD: 'right',
   ArrowRight: 'right',
   Space: 'up',
-  KeyE: 'up',
-  KeyQ: 'down',
   ShiftLeft: 'down',
   ShiftRight: 'down',
 }
@@ -66,6 +73,7 @@ const EDITABLE_TAG_NAMES = new Set(['INPUT', 'SELECT', 'TEXTAREA'])
 const DIALOG_SCOPE_SELECTOR = 'dialog,[role="dialog"],[aria-modal="true"]'
 const ZERO_VECTOR: WorldsVector3Like = { x: 0, y: 0, z: 0 }
 const WORLD_UP: WorldsVector3Like = { x: 0, y: 1, z: 0 }
+const DEFAULT_FORWARD: WorldsVector3Like = { x: 0, y: 0, z: -1 }
 
 export function createWorldsCameraState(overrides: Partial<WorldsCameraState> = {}): WorldsCameraState {
   return {
@@ -128,6 +136,32 @@ export function deriveWorldsMovementVector(keys: WorldsMovementKeyState, axes: W
   })
 }
 
+export function rotateWorldsCameraYawTarget({
+  cameraPosition,
+  target,
+  yawAngle,
+  up = WORLD_UP,
+  fallbackLookDirection = DEFAULT_FORWARD,
+  fallbackDistance = 1,
+}: WorldsYawRotationInput): WorldsVector3Like {
+  const lookOffset = {
+    x: target.x - cameraPosition.x,
+    y: target.y - cameraPosition.y,
+    z: target.z - cameraPosition.z,
+  }
+  const offsetLength = Math.hypot(lookOffset.x, lookOffset.y, lookOffset.z)
+  const baseOffset = offsetLength === 0
+    ? scaleVector(normalizeVector(fallbackLookDirection), fallbackDistance)
+    : lookOffset
+  const rotatedOffset = rotateVectorAroundAxis(baseOffset, normalizeVector(up), yawAngle)
+
+  return {
+    x: cameraPosition.x + rotatedOffset.x,
+    y: cameraPosition.y + rotatedOffset.y,
+    z: cameraPosition.z + rotatedOffset.z,
+  }
+}
+
 function normalizeMovementKeys(keys: WorldsMovementKeyState): Required<WorldsMovementKeyState> {
   return {
     forward: Boolean(keys.forward),
@@ -136,6 +170,34 @@ function normalizeMovementKeys(keys: WorldsMovementKeyState): Required<WorldsMov
     right: Boolean(keys.right),
     up: Boolean(keys.up),
     down: Boolean(keys.down),
+  }
+}
+
+function rotateVectorAroundAxis(vector: WorldsVector3Like, axis: WorldsVector3Like, angle: number): WorldsVector3Like {
+  const normalizedAxis = normalizeVector(axis)
+  if (normalizedAxis === ZERO_VECTOR) return vector
+
+  const cosAngle = Math.cos(angle)
+  const sinAngle = Math.sin(angle)
+  const dot = vector.x * normalizedAxis.x + vector.y * normalizedAxis.y + vector.z * normalizedAxis.z
+  const cross = {
+    x: normalizedAxis.y * vector.z - normalizedAxis.z * vector.y,
+    y: normalizedAxis.z * vector.x - normalizedAxis.x * vector.z,
+    z: normalizedAxis.x * vector.y - normalizedAxis.y * vector.x,
+  }
+
+  return {
+    x: vector.x * cosAngle + cross.x * sinAngle + normalizedAxis.x * dot * (1 - cosAngle),
+    y: vector.y * cosAngle + cross.y * sinAngle + normalizedAxis.y * dot * (1 - cosAngle),
+    z: vector.z * cosAngle + cross.z * sinAngle + normalizedAxis.z * dot * (1 - cosAngle),
+  }
+}
+
+function scaleVector(vector: WorldsVector3Like, scalar: number): WorldsVector3Like {
+  return {
+    x: vector.x * scalar,
+    y: vector.y * scalar,
+    z: vector.z * scalar,
   }
 }
 

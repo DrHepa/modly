@@ -154,6 +154,7 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasGizmo: true,
       hasSelection: false,
       selectedItemId: null,
+      selectedItemIds: [],
       transformControls: null,
       unsupported: [],
       renderTargets: [
@@ -175,6 +176,7 @@ test('WorldsViewer exposes unified mouse and keyboard controls without importing
       hasGizmo: true,
       hasSelection: false,
       selectedItemId: null,
+      selectedItemIds: [],
       transformControls: null,
       unsupported: [],
       renderTargets: [],
@@ -215,6 +217,7 @@ test('WorldsViewer routes GLB and GLTF scene items through the GLTF render targe
       hasGizmo: true,
       hasSelection: false,
       selectedItemId: null,
+      selectedItemIds: [],
       transformControls: null,
       unsupported: [],
       renderTargets: [
@@ -277,7 +280,7 @@ test('WorldsViewer pose playback uses useFrame refs instead of setInterval React
   assert.equal(viewerSource.includes('playbackRef'), true)
 })
 
-test('WorldsKeyboardCameraControls uses scoped key refs, useFrame movement, and moves the orbit target with the camera', async () => {
+test('WorldsKeyboardCameraControls uses scoped key refs, useFrame movement, and yaws by rotating the look target in place', async () => {
   const { source, module, cleanup } = await loadViewerModule()
   const keyboardControlsSource = await readFile(keyboardControlsEntry, 'utf8')
   const viewerSource = await readFile(viewerEntry, 'utf8')
@@ -298,6 +301,13 @@ test('WorldsKeyboardCameraControls uses scoped key refs, useFrame movement, and 
     assert.equal(keyboardControlsSource.includes('shouldHandleWorldCameraKeyInput'), true)
     assert.equal(keyboardControlsSource.includes('updateWorldsMovementKeys'), true)
     assert.equal(keyboardControlsSource.includes('deriveWorldsMovementVector'), true)
+    assert.equal(keyboardControlsSource.includes("isWorldCameraRotationKey(code: string): code is 'KeyQ' | 'KeyE'"), true)
+    assert.equal(keyboardControlsSource.includes("rotationKeysRef.current = updateWorldsRotationKeys(rotationKeysRef.current, event.code, true)"), true)
+    assert.equal(keyboardControlsSource.includes('rotateWorldsCameraYawTarget'), true)
+    assert.equal(keyboardControlsSource.includes('camera.getWorldDirection(lookDirectionVector)'), true)
+    assert.equal(keyboardControlsSource.includes('orbitControlsRef.current.target.copy(rotateWorldsCameraYawTarget({'), true)
+    assert.equal(keyboardControlsSource.includes('camera.position.copy(orbitControlsRef.current.target).add('), false)
+    assert.equal(keyboardControlsSource.includes('orbitOffsetVector.copy(camera.position).sub(orbitControlsRef.current.target)'), false)
     assert.equal(keyboardControlsSource.includes('activeElement: document.activeElement'), true)
     assert.equal(keyboardControlsSource.includes('orbitControlsRef.current?.target.add(scaledMovementVector)'), true)
     assert.equal(keyboardControlsSource.includes('orbitControlsRef.current?.update()'), true)
@@ -354,7 +364,7 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
       disabledUntilSelection: true,
       backendBake: false,
     })
-    assert.deepEqual(module.describeWorldsViewerScene([item('ply-mesh', 'mesh.ply')], [], 'world:mesh.ply'), {
+    assert.deepEqual(module.describeWorldsViewerScene([item('ply-mesh', 'mesh.ply')], [], 'world:mesh.ply', ['world:mesh.ply', 'world:ghost.ply']), {
       hasRenderableItems: true,
       hasGrid: true,
       hasOrbitControls: true,
@@ -362,6 +372,7 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
       hasGizmo: true,
       hasSelection: true,
       selectedItemId: 'world:mesh.ply',
+      selectedItemIds: ['world:mesh.ply'],
       transformControls: {
         modes: ['translate', 'rotate', 'scale'],
         attachedItemId: 'world:mesh.ply',
@@ -380,17 +391,35 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     })
     assert.equal(viewerSource.includes('WorldsTransformToolbar'), true)
     assert.equal(viewerSource.includes('items={visibleItems}'), true)
+    assert.equal(viewerSource.includes('selectedItemIds={selectedItemIds}'), true)
+    assert.equal(viewerSource.includes('const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id))'), true)
     assert.equal(viewerSource.includes('onRemoveItem={onRemoveItem}'), true)
     assert.equal(viewerSource.includes('onToggleBaseSceneItem={onToggleBaseSceneItem}'), true)
     assert.equal(viewerSource.includes('onSceneItemAnchorChange={onSceneItemAnchorChange}'), true)
-    assert.equal(viewerSource.includes("item.role !== 'base-scene'"), true)
-    assert.equal(viewerSource.includes('boundsRef.current.setFromObject(groupRef.current)'), true)
+    assert.equal(viewerSource.includes('setFocusRequest'), true)
+    assert.equal(viewerSource.includes('focusSceneItemFromCanvas'), true)
+    assert.equal(viewerSource.includes('boundsRef.current.setFromObject(groupRef.current)'), false)
     assert.equal(viewerSource.includes('TransformControls'), true)
     assert.equal(viewerSource.includes('transformDraggingRef'), true)
     assert.equal(viewerSource.includes('if (transformDraggingRef.current) return'), true)
-    assert.equal(viewerSource.includes('onMouseDown={() => { draggingRef.current = true }}'), true)
-    assert.equal(viewerSource.includes('onMouseUp={() => { draggingRef.current = false; syncTransform() }}'), true)
+    assert.equal(viewerSource.includes('suppressSelectionUntilRef'), true)
+    assert.equal(viewerSource.includes('Date.now() < suppressSelectionUntilRef.current'), true)
+    assert.equal(viewerSource.includes('selectedItems={selectedItems}'), true)
+    assert.equal(viewerSource.includes('onTransformItems={onTransformItems}'), true)
+    assert.equal(viewerSource.includes('createWorldSceneSelectionTransformUpdates'), true)
+    assert.equal(viewerSource.includes('const transformSnapshotRef = useRef<WorldSceneTransformSnapshot[] | null>(null)'), true)
+    assert.equal(viewerSource.includes('transformSnapshotRef.current = selectedItems.map((item) => ({'), true)
+    assert.equal(viewerSource.includes('export function isWorldsBatchTransformSnapshot(snapshot: WorldSceneTransformSnapshot[] | null)'), true)
+    assert.equal(viewerSource.includes('if (!shouldResetWorldsTransformSnapshot(draggingRef.current)) return'), true)
+    assert.equal(viewerSource.includes('if (!isWorldsBatchTransformSnapshot(snapshot))'), true)
+    assert.equal(viewerSource.includes('onTransformItems(createWorldSceneSelectionTransformUpdates({'), true)
+    assert.equal(viewerSource.includes('takeSnapshot()'), true)
+    assert.equal(viewerSource.includes('onDragEndSelectionBlock={handleTransformDragEnd}'), true)
+    assert.equal(viewerSource.includes('onDragEndSelectionBlock()'), true)
     assert.equal(viewerSource.includes('resolveWorldsSceneItemIdFromIntersections'), true)
+    assert.equal(viewerSource.includes('onDoubleClick={handleDoubleClick}'), true)
+    assert.equal(viewerSource.includes('<SceneFocusController'), true)
+    assert.equal(viewerSource.includes('focusWorldsCameraOnObject'), true)
     assert.equal(viewerSource.includes('BoxHelper'), false)
     assert.equal(viewerSource.includes('EffectComposer'), true)
     assert.equal(viewerSource.includes('Outline'), true)
@@ -398,9 +427,16 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('xRay={false}'), true)
     assert.equal(viewerSource.includes('autoClear={false}'), false)
     assert.equal(viewerSource.includes('WorldsSelectionSilhouette'), true)
+    assert.equal(viewerSource.includes('selectedSceneObjects.secondaryObjects.map'), true)
+    assert.equal(viewerSource.includes('resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, selectedItemIds, selectedItemId)'), true)
+    assert.equal(viewerSource.includes('WORLD_SELECTION_SECONDARY_SILHOUETTE_COLOR'), true)
+    assert.equal(viewerSource.includes('WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR'), true)
     assert.equal(viewerSource.includes('THREE.BackSide'), true)
+    assert.equal(viewerSource.includes('child instanceof THREE.Points'), true)
+    assert.equal(viewerSource.includes('new THREE.PointsMaterial({'), true)
     assert.equal(viewerSource.includes('worldsSelectionSilhouette'), true)
     assert.equal(viewerSource.includes('Select enabled={selected}'), true)
+    assert.equal(viewerSource.includes('toggle: isWorldsMultiSelectToggleGesture(event.nativeEvent)'), true)
     assert.equal(viewerSource.includes('computeBoundsTree'), true)
     assert.equal(viewerSource.includes('acceleratedRaycast'), true)
     assert.equal(viewerSource.includes('SkeletonUtils'), true)
@@ -409,6 +445,56 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('calculateWorldsSelectionBounds'), true)
+    assert.equal(viewerSource.includes('measureWorldsObjectBounds'), true)
+    assert.equal(viewerSource.includes('const [selectedBoundsVersion, setSelectedBoundsVersion] = useState(0)'), true)
+    assert.equal(viewerSource.includes('boundsVersion={item.id === selectedItemId ? selectedBoundsVersion : 0}'), true)
+    assert.equal(viewerSource.includes('onBoundsChange={invalidateSelectedBounds}'), true)
+    assert.equal(viewerSource.includes('useFrame(() => {\n    const hitbox = hitboxRef.current'), false)
+    assert.equal(viewerSource.includes('useFrame(() => {\n    if (!groupRef.current) return'), false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer keeps batch transform snapshots alive during drag and only batches multi-item snapshots', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.equal(module.shouldResetWorldsTransformSnapshot(true), false)
+    assert.equal(module.shouldResetWorldsTransformSnapshot(false), true)
+    assert.equal(module.isWorldsBatchTransformSnapshot(null), false)
+    assert.equal(module.isWorldsBatchTransformSnapshot([]), false)
+    assert.equal(module.isWorldsBatchTransformSnapshot([{ itemId: 'world:active', transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }]), false)
+    assert.equal(module.isWorldsBatchTransformSnapshot([
+      { itemId: 'world:active', transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+      { itemId: 'world:secondary', transform: { position: [1, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+    ]), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer resolves active and secondary scene objects for multi-select feedback without duplicating the active item', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const active = new THREE.Group()
+    const secondary = new THREE.Group()
+    const ignored = new THREE.Group()
+    const sceneObjects = new Map<string, THREE.Object3D>([
+      ['world:active', active],
+      ['world:secondary', secondary],
+      ['world:ignored', ignored],
+    ])
+
+    assert.deepEqual(module.resolveWorldsSelectedSceneObjects(sceneObjects, ['world:secondary', 'world:active', 'world:secondary', 'world:missing'], 'world:active'), {
+      activeObject: active,
+      secondaryObjects: [secondary],
+    })
+    assert.deepEqual(module.resolveWorldsSelectedSceneObjects(sceneObjects, ['world:secondary'], 'world:missing'), {
+      activeObject: null,
+      secondaryObjects: [secondary],
+    })
   } finally {
     await cleanup()
   }
@@ -472,8 +558,82 @@ test('WorldsMouseLookCameraControls can be disabled so selection and transform g
     assert.equal(mouseLookControlsSource.includes('if (!enabled) return'), true)
     assert.equal(viewerSource.includes('enabled={!transformMode && !transformDraggingRef.current}'), true)
     assert.equal(viewerSource.includes('selectSceneItemFromCanvas'), true)
-    assert.equal(viewerSource.includes('if (transformMode) return'), true)
-    assert.equal(viewerSource.includes('onPointerMissed={() => selectSceneItemFromCanvas(null)}'), true)
+    assert.equal(viewerSource.includes('if (transformMode) return'), false)
+    assert.equal(viewerSource.includes('onPointerMissed={handleCanvasPointerMissed}'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer uses Ctrl plus left click for multi-select toggles and preserves selection on Ctrl-empty clicks', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.equal(module.isWorldsMultiSelectToggleGesture({ button: 0, ctrlKey: true }), true)
+    assert.equal(module.isWorldsMultiSelectToggleGesture({ button: 0, ctrlKey: false, shiftKey: true }), false)
+    assert.equal(module.isWorldsMultiSelectToggleGesture({ button: 2, ctrlKey: true }), false)
+    assert.equal(module.shouldWorldsPointerMissClearSelection({ ctrlKey: true }), false)
+    assert.equal(module.shouldWorldsPointerMissClearSelection({ ctrlKey: false }), true)
+    assert.equal(module.shouldWorldsPointerMissClearSelection(undefined), true)
+    assert.equal(viewerSource.includes('ctrlKey'), true)
+    assert.equal(viewerSource.includes('shiftKey &&'), false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer suppresses the immediate post-transform selection event without blocking later transform-mode clicks', async () => {
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  assert.equal(viewerSource.includes('const WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS = 180'), true)
+  assert.equal(viewerSource.includes('if (Date.now() < suppressSelectionUntilRef.current) return'), true)
+  assert.equal(viewerSource.includes('suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS'), true)
+  assert.equal(viewerSource.includes('if (transformMode) return'), false)
+})
+
+test('WorldsViewer focus helper frames selected bounds instead of preserving the old camera distance', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const target = new THREE.Group()
+    target.position.set(10, 0, -4)
+    target.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), new THREE.MeshBasicMaterial()))
+    target.updateWorldMatrix(true, true)
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    camera.position.set(30, 40, 50)
+    const orbitTarget = new THREE.Vector3(1, 1, 1)
+    let updateCalls = 0
+    const previousDistance = camera.position.distanceTo(orbitTarget)
+    const previousDirection = camera.position.clone().sub(orbitTarget).normalize()
+
+    const focused = module.focusWorldsCameraOnObject(camera, {
+      target: orbitTarget,
+      maxDistance: 500,
+      update: () => { updateCalls += 1 },
+    }, target)
+
+    assert.equal(focused, true)
+    assert.deepEqual(orbitTarget.toArray(), [10, 0, -4])
+    const bounds = module.calculateWorldsSelectionBounds(target)
+    assert.ok(bounds)
+    const expectedRadius = Math.max(bounds.size.length() * 0.5, module.WORLD_VIEWER_ORBIT_CONTROLS.minDistance)
+    const focusedDistance = camera.position.distanceTo(orbitTarget)
+    assert.ok(focusedDistance < previousDistance)
+    assert.ok(focusedDistance > expectedRadius)
+    assert.ok(focusedDistance < expectedRadius * 10)
+    const focusedDirection = camera.position.clone().sub(orbitTarget).normalize()
+    assert.ok(focusedDirection.distanceTo(previousDirection) < 1e-6)
+    assert.equal(updateCalls, 1)
+    assert.ok(camera.near >= 0.01)
+
+    const empty = new THREE.Group()
+    assert.equal(module.focusWorldsCameraOnObject(camera, {
+      target: orbitTarget,
+      maxDistance: 500,
+      update: () => undefined,
+    }, empty), false)
   } finally {
     await cleanup()
   }
@@ -504,7 +664,7 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
     assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems)'), true)
     assert.equal(viewerSource.includes('fallback={<HtmlStatus message="Loading world asset…" />}'), false)
     assert.equal(viewerSource.includes('<Suspense fallback={null}>'), true)
-    assert.equal(viewerSource.includes('<Suspense fallback={null}>\n                    <WorldSceneItemObject'), true)
+    assert.equal(viewerSource.includes('<WorldSceneItemObject'), true)
   } finally {
     await cleanup()
   }
@@ -524,7 +684,7 @@ test('WorldsCameraOverlay exposes compact accessible speed reset and help contro
         reset: 'Reset camera',
         help: 'Camera and keyboard movement help',
       },
-      helpText: 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space/E up · Q/Shift down',
+      helpText: 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space up · Shift down · Q/E yaw',
     })
     assert.equal(source.includes('WorldsCameraOverlay'), true)
     assert.equal(viewerSource.includes('<WorldsCameraOverlay'), true)
@@ -565,11 +725,18 @@ test('WorldsCameraOverlay renders speed choices, reset and look guidance without
     assert.match(markup, /<option[^>]*value="5"[^>]*selected=""[^>]*>5×<\/option>/)
     assert.match(markup, /aria-label="Reset camera"[^>]*>Reset camera</)
     assert.doesNotMatch(markup, /Mouse look|Pointer lock|Release mouse|aria-pressed/)
-    assert.match(markup, /Left-drag look · Right-drag pan · Wheel zoom · WASD\/Arrows move · Space\/E up · Q\/Shift down/)
+    assert.match(markup, /Left-drag look · Right-drag pan · Wheel zoom · WASD\/Arrows move · Space up · Shift down · Q\/E yaw/)
     assert.doesNotMatch(markup, /<aside|Inspector|side panel/i)
   } finally {
     await cleanup()
   }
+})
+
+test('WorldsTransformToolbar clarifies that multi-select transforms use the active item as the pivot', async () => {
+  const toolbarSource = await readFile(path.join(projectRoot, 'src/areas/worlds/components/WorldsTransformToolbar.tsx'), 'utf8')
+
+  assert.equal(toolbarSource.includes('transforms use the active item as the pivot'), true)
+  assert.equal(toolbarSource.includes('only the active item gets transform controls'), false)
 })
 
 test('production Worlds modules keep a static boundary from Generate Viewer3D implementations', async () => {

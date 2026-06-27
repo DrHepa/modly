@@ -8,6 +8,8 @@ import { build, type Plugin } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
+import { normalizeWorldsSelectedSceneItemIds, toggleWorldsSelectedSceneItem, useWorldsSceneStore } from './worldsSceneStore.ts'
+
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const pageEntry = path.join(projectRoot, 'src/areas/worlds/WorldsPage.tsx')
 
@@ -86,6 +88,7 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       assets: [asset('fuse', 'Fuse simplified')],
       selectedAssetId: 'fuse',
       selectedSceneItemId: 'world:Workflows/fuse.ply',
+      selectedSceneItemIds: ['world:Workflows/fuse.ply'],
       transformMode: null,
       sceneItems: [asset('fuse', 'Fuse simplified').item],
       unsupportedItems: [],
@@ -108,6 +111,7 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onSelectSceneItem: () => undefined,
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
+      onTransformSceneItems: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
@@ -138,6 +142,7 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       assets: [],
       selectedAssetId: null,
       selectedSceneItemId: null,
+      selectedSceneItemIds: [],
       transformMode: null,
       sceneItems: [],
       unsupportedItems: [],
@@ -160,6 +165,7 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onSelectSceneItem: () => undefined,
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
+      onTransformSceneItems: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
@@ -206,7 +212,7 @@ test('WorldsPage appends opened assets with unique scene ids, deterministic offs
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(1), [1.75, 0, 0])
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(2), [0, 0, 1.75])
     assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(8), [1.75, 0, -1.75])
-    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(9), [3.5, 0, 0])
+    assert.deepEqual(module.calculateWorldSceneItemPlacementOffset(9), [1.75, 0, 0])
   } finally {
     await cleanup()
   }
@@ -222,9 +228,33 @@ test('WorldsPage places new assets relative to existing base worlds using transf
 
     assert.deepEqual(module.appendWorldSceneItem([base], prop).sceneItems[1].transform.position, [11.75, 0, -4])
     assert.deepEqual(module.appendWorldSceneItem([base, secondBase], prop).sceneItems[2].transform.position, [13.75, 0, -2])
-    assert.deepEqual(module.appendWorldSceneItem([base], prop, { [base.id]: [40, 2, -20] }).sceneItems[1].transform.position, [41.75, 2, -20])
+    assert.deepEqual(module.appendWorldSceneItem([base], prop, { sceneItemAnchors: { [base.id]: [40, 2, -20] } }).sceneItems[1].transform.position, [41.75, 2, -20])
     assert.deepEqual(module.toggleWorldSceneItemBaseRole([prop], prop.id)[0].role, 'base-scene')
     assert.deepEqual(module.toggleWorldSceneItemBaseRole([{ ...prop, role: 'base-scene' }], prop.id)[0].role, 'asset')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage places new assets near the actively selected item before falling back to the base scene area', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    const selected = { ...asset('selected', 'Selected').item, transform: { position: [3, 1, 5], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+    const base = { ...asset('base', 'Base').item, role: 'base-scene', transform: { position: [20, 0, -10], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+    const prop = asset('prop', 'Prop').item
+
+    assert.deepEqual(module.appendWorldSceneItem([selected, base], prop, {
+      selectedSceneItemId: selected.id,
+      sceneItemAnchors: {
+        [selected.id]: [8, 2, 4],
+        [base.id]: [40, 0, -20],
+      },
+    }).sceneItems[2].transform.position, [8, 2, 5.75])
+
+    assert.deepEqual(module.appendWorldSceneItem([selected], prop, {
+      selectedSceneItemId: selected.id,
+    }).sceneItems[1].transform.position, [4.75, 1, 5])
   } finally {
     await cleanup()
   }
@@ -288,10 +318,75 @@ test('WorldsPage updates the selected scene item transform without mutating othe
   }
 })
 
+test('WorldsPage exposes a batched multi-item transform callback through the viewer contract', async () => {
+  const source = await readFile(pageEntry, 'utf8')
+
+  assert.match(source, /selectedItemIds=\{selectedSceneItemIds\}/)
+  assert.match(source, /onTransformItems=\{onTransformSceneItems\}/)
+  assert.match(source, /onTransformSceneItems:\s*\(updates: WorldSceneItemTransformUpdate\[\]\) => void/)
+  assert.match(source, /sceneItems: updateWorldSceneItemTransforms\(state\.sceneItems, updates\)/)
+  assert.match(source, /selectedSceneItemIds: state\.selectedSceneItemIds/)
+})
+
+test('Worlds scene store can switch the active item without collapsing an existing multi-selection', () => {
+  const store = useWorldsSceneStore.getState()
+  useWorldsSceneStore.setState({
+    sceneItems: [asset('a', 'A').item, asset('b', 'B').item],
+    selectedSceneItemId: 'world:b',
+    selectedSceneItemIds: ['world:a', 'world:b'],
+    transformMode: 'translate',
+    sceneItemAnchors: {},
+  })
+
+  try {
+    store.setSelectedSceneItemId('world:a', { preserveSelection: true })
+    assert.deepEqual(useWorldsSceneStore.getState().selectedSceneItemIds, ['world:a', 'world:b'])
+    assert.equal(useWorldsSceneStore.getState().selectedSceneItemId, 'world:a')
+  } finally {
+    useWorldsSceneStore.setState({
+      sceneItems: [],
+      selectedSceneItemId: null,
+      selectedSceneItemIds: [],
+      transformMode: null,
+      sceneItemAnchors: {},
+    })
+  }
+})
+
+test('Worlds scene store toggles ctrl multi-selection and keeps the last active item as primary', () => {
+  assert.deepEqual(toggleWorldsSelectedSceneItem(['world:a'], 'world:a', 'world:b'), {
+    selectedSceneItemIds: ['world:a', 'world:b'],
+    selectedSceneItemId: 'world:b',
+  })
+
+  assert.deepEqual(toggleWorldsSelectedSceneItem(['world:a', 'world:b'], 'world:b', 'world:b'), {
+    selectedSceneItemIds: ['world:a'],
+    selectedSceneItemId: 'world:a',
+  })
+
+  assert.deepEqual(toggleWorldsSelectedSceneItem(['world:a', 'world:b'], 'world:b', 'world:a'), {
+    selectedSceneItemIds: ['world:b'],
+    selectedSceneItemId: 'world:b',
+  })
+})
+
+test('Worlds scene store normalizes multi-selection to visible scene items and preserves the active item when valid', () => {
+  const visible = asset('visible', 'Visible').item
+  const hidden = { ...asset('hidden', 'Hidden').item, visible: false }
+
+  assert.deepEqual(
+    normalizeWorldsSelectedSceneItemIds([visible, hidden], visible.id, [hidden.id, visible.id, hidden.id]),
+    [visible.id],
+  )
+  assert.deepEqual(normalizeWorldsSelectedSceneItemIds([visible], visible.id, []), [visible.id])
+})
+
 test('WorldsPage keeps composed scene state in the Worlds store for tab navigation and rapid asset opens', async () => {
   const source = await readFile(pageEntry, 'utf8')
 
   assert.match(source, /useWorldsSceneStore/)
   assert.match(source, /useWorldsSceneStore\.getState\(\)\.sceneItems/)
+  assert.match(source, /selectedSceneItemIds/)
+  assert.match(source, /toggleSelectedSceneItemId/)
   assert.doesNotMatch(source, /useState<\{ sceneItems: WorldSceneItem\[\]; selectedSceneItemId: string \| null \}>/)
 })

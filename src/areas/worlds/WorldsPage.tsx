@@ -13,6 +13,8 @@ import {
   appendWorldSceneItem,
   attachWorldSceneItemAnimation,
   calculateWorldSceneItemPlacementOffset,
+  type WorldSceneItemTransformUpdate,
+  updateWorldSceneItemTransforms,
   removeWorldSceneItem,
   resolveWorldSceneItemForPoseClip,
   toggleWorldSceneItemBaseRole,
@@ -37,6 +39,7 @@ export interface WorldsPageViewProps {
   assets: WorldAssetLibraryRenderable[]
   selectedAssetId: string | null
   selectedSceneItemId: string | null
+  selectedSceneItemIds: string[]
   transformMode: WorldsTransformMode | null
   sceneItems: WorldSceneItem[]
   unsupportedItems: WorldsViewerUnsupportedItem[]
@@ -56,9 +59,10 @@ export interface WorldsPageViewProps {
   onSearchQueryChange: (value: string) => void
   onSortModeChange: (sortMode: WorkspaceAssetLibrarySortMode) => void
   onToggleSection: (sectionKey: string) => void
-  onSelectSceneItem: (itemId: string | null) => void
+  onSelectSceneItem: (itemId: string | null, options?: { toggle?: boolean }) => void
   onTransformModeChange: (mode: WorldsTransformMode | null) => void
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onTransformSceneItems: (updates: WorldSceneItemTransformUpdate[]) => void
   onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
   onRemoveSceneItem: (itemId: string | null) => void
   onToggleBaseSceneItem: (itemId: string | null) => void
@@ -73,6 +77,7 @@ export function WorldsPageView({
   assets,
   selectedAssetId,
   selectedSceneItemId,
+  selectedSceneItemIds,
   transformMode,
   sceneItems,
   unsupportedItems,
@@ -95,6 +100,7 @@ export function WorldsPageView({
   onSelectSceneItem,
   onTransformModeChange,
   onTransformSceneItem,
+  onTransformSceneItems,
   onAnimationMetadata,
   onRemoveSceneItem,
   onToggleBaseSceneItem,
@@ -112,10 +118,12 @@ export function WorldsPageView({
         items={sceneItems}
         unsupportedItems={unsupportedItems}
         selectedItemId={selectedSceneItemId}
+        selectedItemIds={selectedSceneItemIds}
         transformMode={transformMode}
         onSelectItem={onSelectSceneItem}
         onTransformModeChange={onTransformModeChange}
         onTransformItem={onTransformSceneItem}
+        onTransformItems={onTransformSceneItems}
         onAnimationMetadata={onAnimationMetadata}
         onRemoveItem={onRemoveSceneItem}
         onToggleBaseSceneItem={onToggleBaseSceneItem}
@@ -178,10 +186,12 @@ export default function WorldsPage(): JSX.Element {
   const [libraryCollapsedSectionKeys, setLibraryCollapsedSectionKeys] = useState<string[]>(() => getDefaultWorkspaceAssetLibraryCollapsedSectionKeys())
   const sceneItems = useWorldsSceneStore((state) => state.sceneItems)
   const selectedSceneItemId = useWorldsSceneStore((state) => state.selectedSceneItemId)
+  const selectedSceneItemIds = useWorldsSceneStore((state) => state.selectedSceneItemIds)
   const transformMode = useWorldsSceneStore((state) => state.transformMode)
   const setSceneItemAnchor = useWorldsSceneStore((state) => state.setSceneItemAnchor)
   const setWorldScene = useWorldsSceneStore((state) => state.setScene)
   const setSelectedSceneItemId = useWorldsSceneStore((state) => state.setSelectedSceneItemId)
+  const toggleSelectedSceneItemId = useWorldsSceneStore((state) => state.toggleSelectedSceneItemId)
   const setTransformMode = useWorldsSceneStore((state) => state.setTransformMode)
   const clearTransformMode = useWorldsSceneStore((state) => state.clearTransformMode)
   const [unsupportedItems, setUnsupportedItems] = useState<WorldsViewerUnsupportedItem[]>([])
@@ -253,7 +263,10 @@ export default function WorldsPage(): JSX.Element {
           setSceneStatus(`Attached motion to ${result.asset.animation.sourceWorkspacePath}`)
         } else {
           const sceneState = useWorldsSceneStore.getState()
-          setWorldScene(appendWorldSceneItem(sceneState.sceneItems, result.asset.item, sceneState.sceneItemAnchors))
+          setWorldScene(appendWorldSceneItem(sceneState.sceneItems, result.asset.item, {
+            sceneItemAnchors: sceneState.sceneItemAnchors,
+            selectedSceneItemId: sceneState.selectedSceneItemId,
+          }))
           setUnsupportedItems([])
           setSceneStatus(null)
         }
@@ -283,7 +296,10 @@ export default function WorldsPage(): JSX.Element {
     }
 
     if (asset.linkedItem) {
-      const appended = appendWorldSceneItem(sceneState.sceneItems, { ...asset.linkedItem, animation: asset.animation }, sceneState.sceneItemAnchors)
+      const appended = appendWorldSceneItem(sceneState.sceneItems, { ...asset.linkedItem, animation: asset.animation }, {
+        sceneItemAnchors: sceneState.sceneItemAnchors,
+        selectedSceneItemId: sceneState.selectedSceneItemId,
+      })
       return appended
     }
 
@@ -381,10 +397,21 @@ export default function WorldsPage(): JSX.Element {
   }, [apiUrl])
 
   useEffect(() => {
-    if (selectedSceneItemId && sceneItems.some((item) => item.id === selectedSceneItemId && item.visible)) return
-    if (selectedSceneItemId) setSelectedSceneItemId(null)
-    clearTransformMode()
-  }, [clearTransformMode, sceneItems, selectedSceneItemId, setSelectedSceneItemId])
+    const visibleItemIds = new Set(sceneItems.filter((item) => item.visible).map((item) => item.id))
+    const nextSelectedSceneItemIds = selectedSceneItemIds.filter((itemId) => visibleItemIds.has(itemId))
+    const nextSelectedSceneItemId = selectedSceneItemId && visibleItemIds.has(selectedSceneItemId)
+      ? selectedSceneItemId
+      : nextSelectedSceneItemIds.at(-1) ?? null
+
+    if (nextSelectedSceneItemId === selectedSceneItemId && nextSelectedSceneItemIds.length === selectedSceneItemIds.length) return
+
+    setWorldScene({
+      sceneItems,
+      selectedSceneItemId: nextSelectedSceneItemId,
+      selectedSceneItemIds: nextSelectedSceneItemIds,
+    })
+    if (!nextSelectedSceneItemId) clearTransformMode()
+  }, [clearTransformMode, sceneItems, selectedSceneItemId, selectedSceneItemIds, setWorldScene])
 
   return (
     <WorldsPageView
@@ -392,6 +419,7 @@ export default function WorldsPage(): JSX.Element {
       assets={assets}
       selectedAssetId={selectedAssetId}
       selectedSceneItemId={selectedSceneItemId}
+      selectedSceneItemIds={selectedSceneItemIds}
       transformMode={transformMode}
       sceneItems={sceneItems}
       unsupportedItems={unsupportedItems}
@@ -415,21 +443,34 @@ export default function WorldsPage(): JSX.Element {
           ? current.filter((value) => value !== sectionKey)
           : [...current, sectionKey])
       }}
-      onSelectSceneItem={(itemId) => {
-        setSelectedSceneItemId(itemId)
+      onSelectSceneItem={(itemId, options) => {
+        if (options?.toggle && itemId) toggleSelectedSceneItemId(itemId)
+        else setSelectedSceneItemId(itemId, { preserveSelection: options?.preserveSelection })
         if (!itemId) setTransformMode(null)
       }}
       onTransformModeChange={setTransformMode}
       onTransformSceneItem={(itemId, transform) => {
+        const state = useWorldsSceneStore.getState()
         setWorldScene({
-          sceneItems: updateWorldSceneItemTransform(useWorldsSceneStore.getState().sceneItems, itemId, transform),
-          selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
+          sceneItems: updateWorldSceneItemTransform(state.sceneItems, itemId, transform),
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
+        })
+      }}
+      onTransformSceneItems={(updates) => {
+        const state = useWorldsSceneStore.getState()
+        setWorldScene({
+          sceneItems: updateWorldSceneItemTransforms(state.sceneItems, updates),
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
         })
       }}
       onAnimationMetadata={(itemId, animation) => {
+        const state = useWorldsSceneStore.getState()
         setWorldScene({
-          sceneItems: attachWorldSceneItemAnimation(useWorldsSceneStore.getState().sceneItems, itemId, animation),
-          selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
+          sceneItems: attachWorldSceneItemAnimation(state.sceneItems, itemId, animation),
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
         })
       }}
       onRemoveSceneItem={(itemId) => {
@@ -437,9 +478,11 @@ export default function WorldsPage(): JSX.Element {
         clearTransformMode()
       }}
       onToggleBaseSceneItem={(itemId) => {
+        const state = useWorldsSceneStore.getState()
         setWorldScene({
-          sceneItems: toggleWorldSceneItemBaseRole(useWorldsSceneStore.getState().sceneItems, itemId),
-          selectedSceneItemId: useWorldsSceneStore.getState().selectedSceneItemId,
+          sceneItems: toggleWorldSceneItemBaseRole(state.sceneItems, itemId),
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
         })
       }}
       onSceneItemAnchorChange={setSceneItemAnchor}

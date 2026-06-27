@@ -11,6 +11,7 @@ import type { PoseClipSidecarV1 } from '../../../shared/types/electron.d.ts'
 import { classifyPlyGeometry } from '../plyClassification.ts'
 import { createWorldsCameraState } from '../worldCameraNavigation.ts'
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import { createWorldSceneSelectionTransformUpdates, type WorldSceneItemTransformUpdate, type WorldSceneTransformSnapshot } from '../worldsScenePlacement.ts'
 import {
   applyWorldsPoseClipAtTime,
   createWorldsPoseClipBoneMap,
@@ -39,10 +40,12 @@ export interface WorldsViewerProps {
   items: WorldSceneItem[]
   unsupportedItems?: WorldsViewerUnsupportedItem[]
   selectedItemId?: string | null
+  selectedItemIds?: string[]
   transformMode?: WorldsTransformMode | null
-  onSelectItem?: (itemId: string | null) => void
+  onSelectItem?: (itemId: string | null, options?: { toggle?: boolean }) => void
   onTransformModeChange?: (mode: WorldsTransformMode | null) => void
   onTransformItem?: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onTransformItems?: (updates: WorldSceneItemTransformUpdate[]) => void
   onRemoveItem?: (itemId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
   onSceneItemAnchorChange?: (itemId: string, anchor: [number, number, number] | null) => void
@@ -96,12 +99,20 @@ const WORLD_SELECTION_OUTLINE_EDGE_STRENGTH = 2.5
 const WORLD_SELECTION_OUTLINE_BLUR = false
 const WORLD_SELECTION_OUTLINE_MULTISAMPLING = 0
 const WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE = 0.5
+const WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR = 0x8b5cf6
+const WORLD_SELECTION_ACTIVE_SILHOUETTE_OPACITY = 0.8
+const WORLD_SELECTION_ACTIVE_SILHOUETTE_SCALE = 1.012
+const WORLD_SELECTION_SECONDARY_SILHOUETTE_COLOR = 0x38bdf8
+const WORLD_SELECTION_SECONDARY_SILHOUETTE_OPACITY = 0.52
+const WORLD_SELECTION_SECONDARY_SILHOUETTE_SCALE = 1.008
 
-const WORLDS_CAMERA_HELP_TEXT = 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space/E up · Q/Shift down'
+const WORLDS_CAMERA_HELP_TEXT = 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space up · Shift down · Q/E yaw'
 const WORLDS_DEFAULT_CAMERA_POSITION = new THREE.Vector3(2.4, 1.8, 2.8)
 const WORLDS_DEFAULT_CAMERA_TARGET = new THREE.Vector3(0, 0, 0)
+const WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS = 180
 const worldsFitDirection = new THREE.Vector3()
 const worldsFitPosition = new THREE.Vector3()
+const worldsFocusSize = new THREE.Vector3()
 
 type WorldsCameraFitSnapshot = {
   position: THREE.Vector3
@@ -109,6 +120,14 @@ type WorldsCameraFitSnapshot = {
   near: number
   far: number
   maxDistance: number
+}
+
+export function isWorldsBatchTransformSnapshot(snapshot: WorldSceneTransformSnapshot[] | null): snapshot is WorldSceneTransformSnapshot[] {
+  return !!snapshot && snapshot.length > 1
+}
+
+export function shouldResetWorldsTransformSnapshot(isDragging: boolean): boolean {
+  return !isDragging
 }
 
 export type WorldSceneItemRenderTarget = {
@@ -120,14 +139,21 @@ export type WorldSceneItemRenderTarget = {
   visibleDescription: 'PLY mesh geometry' | 'PLY point cloud geometry' | 'GLB/GLTF model scene'
 }
 
+type WorldsMeasuredBounds = {
+  center: THREE.Vector3
+  size: THREE.Vector3
+}
+
 export function WorldsViewer({
   items,
   unsupportedItems = [],
   selectedItemId = null,
+  selectedItemIds = [],
   transformMode = null,
   onSelectItem = () => undefined,
   onTransformModeChange = () => undefined,
   onTransformItem = () => undefined,
+  onTransformItems = () => undefined,
   onRemoveItem = () => undefined,
   onToggleBaseSceneItem = () => undefined,
   onSceneItemAnchorChange = () => undefined,
@@ -139,9 +165,10 @@ export function WorldsViewer({
   const [cameraState, setCameraState] = useState(() => createWorldsCameraState())
   const visibleItems = useMemo(() => items.filter((item) => item.visible), [items])
   const sceneFitKey = useMemo(() => createWorldsSceneFitKey(visibleItems), [visibleItems])
-  const description = describeWorldsViewerScene(items, unsupportedItems, selectedItemId)
+  const description = describeWorldsViewerScene(items, unsupportedItems, selectedItemId, selectedItemIds)
   const sceneObjectsRef = useRef(new Map<string, THREE.Object3D>())
   const transformDraggingRef = useRef(false)
+  const suppressSelectionUntilRef = useRef(0)
   const [sceneObjectVersion, setSceneObjectVersion] = useState(0)
   const playbackRef = useRef<WorldsPlaybackRef>({ playing: false, timeSeconds: 0, durationSeconds: 0 })
   const playbackScrubRef = useRef<HTMLInputElement>(null)
@@ -149,12 +176,26 @@ export function WorldsViewer({
   const playbackDuration = useMemo(() => resolveWorldsPlaybackDuration(visibleItems), [visibleItems])
   const [playbackPlaying, setPlaybackPlaying] = useState(false)
   const [playbackControlTime, setPlaybackControlTime] = useState(0)
+  const [focusRequest, setFocusRequest] = useState<{ itemId: string; token: number } | null>(null)
+  const [selectedBoundsVersion, setSelectedBoundsVersion] = useState(0)
   const selectedObject = useMemo(() => selectedItemId ? sceneObjectsRef.current.get(selectedItemId) ?? null : null, [sceneObjectVersion, selectedItemId])
-  const selectSceneItemFromCanvas = useCallback((itemId: string | null) => {
-    if (transformMode) return
+  const selectedItemIdSet = useMemo(() => new Set(selectedItemIds), [selectedItemIds])
+  const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id)), [selectedItemIdSet, visibleItems])
+  const selectedSceneObjects = useMemo(() => resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, selectedItemIds, selectedItemId), [sceneObjectVersion, selectedItemId, selectedItemIds])
+  const selectSceneItemFromCanvas = useCallback((itemId: string | null, options?: { toggle?: boolean }) => {
     if (transformDraggingRef.current) return
-    onSelectItem(itemId)
-  }, [onSelectItem, transformMode])
+    if (Date.now() < suppressSelectionUntilRef.current) return
+    onSelectItem(itemId, options)
+  }, [onSelectItem])
+  const handleTransformDragEnd = useCallback(() => {
+    suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS
+  }, [])
+  const focusSceneItemFromCanvas = useCallback((itemId: string) => {
+    setFocusRequest((current) => ({ itemId, token: (current?.token ?? 0) + 1 }))
+  }, [])
+  const invalidateSelectedBounds = useCallback(() => {
+    setSelectedBoundsVersion((version) => version + 1)
+  }, [])
   const registerSceneObject = useCallback((itemId: string, object: THREE.Object3D | null) => {
     if (object) sceneObjectsRef.current.set(itemId, object)
     else sceneObjectsRef.current.delete(itemId)
@@ -179,6 +220,11 @@ export function WorldsViewer({
     setPlaybackPlaying(playbackRef.current.playing)
   }, [])
 
+  const handleCanvasPointerMissed = useCallback((event: { ctrlKey?: boolean } | undefined) => {
+    if (!shouldWorldsPointerMissClearSelection(event)) return
+    selectSceneItemFromCanvas(null)
+  }, [selectSceneItemFromCanvas])
+
   return (
     <section
       ref={inputScopeRef}
@@ -200,6 +246,7 @@ export function WorldsViewer({
       <WorldsTransformToolbar
         items={visibleItems}
         selectedItemId={selectedItemId}
+        selectedItemIds={selectedItemIds}
         mode={transformMode}
         onSelectItem={onSelectItem}
         onModeChange={onTransformModeChange}
@@ -224,58 +271,87 @@ export function WorldsViewer({
         dpr={[1, 1]}
         gl={{ antialias: true, alpha: false }}
         className="h-full w-full bg-[#18181b]"
-        onPointerMissed={() => selectSceneItemFromCanvas(null)}
+        onPointerMissed={handleCanvasPointerMissed}
       >
         <color attach="background" args={['#18181b']} />
         <ambientLight intensity={0.65} />
         <directionalLight position={[4, 6, 4]} intensity={1.2} />
         <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
         <Bounds margin={1.25}>
-            <Selection enabled={Boolean(selectedItemId)}>
-              <EffectComposer
-                multisampling={WORLD_SELECTION_OUTLINE_MULTISAMPLING}
-                resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}
-              >
-                <Outline
-                  blur={WORLD_SELECTION_OUTLINE_BLUR}
-                  edgeStrength={WORLD_SELECTION_OUTLINE_EDGE_STRENGTH}
-                  visibleEdgeColor={WORLD_SELECTION_OUTLINE_VISIBLE_COLOR}
-                  hiddenEdgeColor={WORLD_SELECTION_OUTLINE_HIDDEN_COLOR}
-                  xRay={false}
-                />
-              </EffectComposer>
-              {visibleItems.map((item) => (
-                <WorldSceneItemErrorBoundary key={item.id}>
-                  <Suspense fallback={null}>
-                    <WorldSceneItemObject
-                      item={item}
-                      selected={item.id === selectedItemId}
+          <Selection enabled={selectedItemIds.length > 0}>
+            <EffectComposer
+              multisampling={WORLD_SELECTION_OUTLINE_MULTISAMPLING}
+              resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}
+            >
+              <Outline
+                blur={WORLD_SELECTION_OUTLINE_BLUR}
+                edgeStrength={WORLD_SELECTION_OUTLINE_EDGE_STRENGTH}
+                visibleEdgeColor={WORLD_SELECTION_OUTLINE_VISIBLE_COLOR}
+                hiddenEdgeColor={WORLD_SELECTION_OUTLINE_HIDDEN_COLOR}
+                xRay={false}
+              />
+            </EffectComposer>
+            {visibleItems.map((item) => (
+              <WorldSceneItemErrorBoundary key={item.id}>
+                <Suspense fallback={null}>
+                  <WorldSceneItemObject
+                    item={item}
+                    selected={selectedItemIdSet.has(item.id)}
+                    boundsVersion={item.id === selectedItemId ? selectedBoundsVersion : 0}
                     playbackRef={playbackRef}
                     onSelectItem={selectSceneItemFromCanvas}
+                    onFocusItem={focusSceneItemFromCanvas}
                     onRegisterObject={registerSceneObject}
                     onSceneItemAnchorChange={onSceneItemAnchorChange}
                     onAnimationMetadata={onAnimationMetadata}
                   />
-                  </Suspense>
-                </WorldSceneItemErrorBoundary>
-              ))}
-            </Selection>
-            {selectedObject ? <WorldsSelectionSilhouette target={selectedObject} /> : null}
-            {selectedObject && transformMode ? (
-              <WorldsTransformControls
-                object={selectedObject}
-                mode={transformMode}
-                selectedItemId={selectedItemId}
-                draggingRef={transformDraggingRef}
-                onTransformItem={onTransformItem}
-              />
-            ) : null}
-            <SceneFitController
-              fitKey={sceneFitKey}
-              resetToken={cameraState.resetToken}
-              orbitControlsRef={orbitControlsRef}
-              cameraFitSnapshotRef={cameraFitSnapshotRef}
+                </Suspense>
+              </WorldSceneItemErrorBoundary>
+            ))}
+          </Selection>
+          {selectedSceneObjects.secondaryObjects.map((object) => (
+            <WorldsSelectionSilhouette
+              key={object.uuid}
+              target={object}
+              color={WORLD_SELECTION_SECONDARY_SILHOUETTE_COLOR}
+              opacity={WORLD_SELECTION_SECONDARY_SILHOUETTE_OPACITY}
+              scaleMultiplier={WORLD_SELECTION_SECONDARY_SILHOUETTE_SCALE}
+              renderOrder={1}
             />
+          ))}
+          {selectedSceneObjects.activeObject ? (
+            <WorldsSelectionSilhouette
+              target={selectedSceneObjects.activeObject}
+              color={WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR}
+              opacity={WORLD_SELECTION_ACTIVE_SILHOUETTE_OPACITY}
+              scaleMultiplier={WORLD_SELECTION_ACTIVE_SILHOUETTE_SCALE}
+              renderOrder={2}
+            />
+          ) : null}
+          {selectedObject && transformMode ? (
+            <WorldsTransformControls
+              object={selectedObject}
+              mode={transformMode}
+              selectedItemId={selectedItemId}
+              selectedItems={selectedItems}
+              draggingRef={transformDraggingRef}
+              onDragEndSelectionBlock={handleTransformDragEnd}
+              onBoundsChange={invalidateSelectedBounds}
+              onTransformItem={onTransformItem}
+              onTransformItems={onTransformItems}
+            />
+          ) : null}
+          <SceneFitController
+            fitKey={sceneFitKey}
+            resetToken={cameraState.resetToken}
+            orbitControlsRef={orbitControlsRef}
+            cameraFitSnapshotRef={cameraFitSnapshotRef}
+          />
+          <SceneFocusController
+            focusRequest={focusRequest}
+            orbitControlsRef={orbitControlsRef}
+            sceneObjectsRef={sceneObjectsRef}
+          />
         </Bounds>
         <OrbitControls
           ref={orbitControlsRef}
@@ -374,17 +450,24 @@ function WorldsPlaybackFrameController({
   return null
 }
 
-export function describeWorldsViewerScene(items: WorldSceneItem[], unsupportedItems: WorldsViewerUnsupportedItem[] = [], selectedItemId: string | null = null) {
+export function describeWorldsViewerScene(
+  items: WorldSceneItem[],
+  unsupportedItems: WorldsViewerUnsupportedItem[] = [],
+  selectedItemId: string | null = null,
+  selectedItemIds: string[] = selectedItemId ? [selectedItemId] : [],
+) {
   const visibleItems = items.filter((item) => item.visible)
   const selectedItem = selectedItemId ? visibleItems.find((item) => item.id === selectedItemId) ?? null : null
+  const resolvedSelectedItemIds = selectedItemIds.filter((itemId, index) => selectedItemIds.indexOf(itemId) === index && visibleItems.some((item) => item.id === itemId))
   return {
     hasRenderableItems: visibleItems.length > 0,
     hasGrid: true,
     hasOrbitControls: true,
     hasUnifiedKeyboardMovement: true,
     hasGizmo: true,
-    hasSelection: Boolean(selectedItem),
+    hasSelection: resolvedSelectedItemIds.length > 0,
     selectedItemId: selectedItem?.id ?? null,
+    selectedItemIds: resolvedSelectedItemIds,
     transformControls: selectedItem
       ? {
         modes: [...WORLD_VIEWER_TRANSFORM_CONTROLS.modes],
@@ -394,6 +477,29 @@ export function describeWorldsViewerScene(items: WorldSceneItem[], unsupportedIt
     unsupported: unsupportedItems,
     renderTargets: visibleItems.map(getWorldSceneItemRenderTarget),
   }
+}
+
+export function resolveWorldsSelectedSceneObjects(
+  sceneObjects: ReadonlyMap<string, THREE.Object3D>,
+  selectedItemIds: readonly string[],
+  activeItemId: string | null,
+): {
+  activeObject: THREE.Object3D | null
+  secondaryObjects: THREE.Object3D[]
+} {
+  const activeObject = activeItemId ? sceneObjects.get(activeItemId) ?? null : null
+  const secondaryObjects: THREE.Object3D[] = []
+  const seen = new Set<string>()
+
+  for (const itemId of selectedItemIds) {
+    if (!itemId || itemId === activeItemId || seen.has(itemId)) continue
+    const object = sceneObjects.get(itemId)
+    if (!object) continue
+    secondaryObjects.push(object)
+    seen.add(itemId)
+  }
+
+  return { activeObject, secondaryObjects }
 }
 
 export function createWorldsSceneFitKey(items: WorldSceneItem[]): string {
@@ -495,52 +601,100 @@ type WorldsObjectClickEvent = ThreeEvent<MouseEvent> & {
 function WorldSceneItemObject({
   item,
   selected,
+  boundsVersion,
   playbackRef,
   onSelectItem,
+  onFocusItem,
   onRegisterObject,
   onSceneItemAnchorChange,
   onAnimationMetadata,
 }: {
   item: WorldSceneItem
   selected: boolean
+  boundsVersion: number
   playbackRef: MutableRefObject<WorldsPlaybackRef>
-  onSelectItem: (itemId: string | null) => void
+  onSelectItem: (itemId: string | null, options?: { toggle?: boolean }) => void
+  onFocusItem: (itemId: string) => void
   onRegisterObject: (itemId: string, object: THREE.Object3D | null) => void
   onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
   onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
 }): JSX.Element | null {
   const groupRef = useRef<THREE.Group>(null)
   const boundsRef = useRef(new THREE.Box3())
+  const childBoundsRef = useRef(new THREE.Box3())
   const centerRef = useRef(new THREE.Vector3())
+  const sizeRef = useRef(new THREE.Vector3())
   const lastAnchorRef = useRef<[number, number, number] | null>(null)
+  const [contentVersion, setContentVersion] = useState(0)
 
-  useEffect(() => {
-    onRegisterObject(item.id, groupRef.current)
-    return () => onRegisterObject(item.id, null)
-  }, [item.id, onRegisterObject])
+  const invalidateBounds = useCallback(() => {
+    setContentVersion((version) => version + 1)
+  }, [])
 
-  useEffect(() => {
-    if (item.role !== 'base-scene') {
-      lastAnchorRef.current = null
-      onSceneItemAnchorChange(item.id, null)
+  const updateAnchor = useCallback(() => {
+    const group = groupRef.current
+    if (!group) return
+
+    const bounds = measureWorldsObjectBounds(group, boundsRef.current, childBoundsRef.current, centerRef.current, sizeRef.current)
+    if (!bounds) {
+      if (lastAnchorRef.current) {
+        lastAnchorRef.current = null
+        onSceneItemAnchorChange(item.id, null)
+      }
+      return
     }
-  }, [item.id, item.role, onSceneItemAnchorChange])
 
-  useFrame(() => {
-    if (item.role !== 'base-scene' || !groupRef.current) return
-    const bounds = boundsRef.current.setFromObject(groupRef.current)
-    if (bounds.isEmpty()) return
-    const center = bounds.getCenter(centerRef.current)
-    const anchor: [number, number, number] = [center.x, center.y, center.z]
+    const anchor: [number, number, number] = [bounds.center.x, bounds.center.y, bounds.center.z]
     const previous = lastAnchorRef.current
     if (previous && previous.every((value, index) => Math.abs(value - anchor[index]) < 0.001)) return
     lastAnchorRef.current = anchor
     onSceneItemAnchorChange(item.id, anchor)
-  })
+  }, [item.id, onSceneItemAnchorChange])
+
+  useEffect(() => {
+    onRegisterObject(item.id, groupRef.current)
+    invalidateBounds()
+    return () => onRegisterObject(item.id, null)
+  }, [invalidateBounds, item.id, onRegisterObject])
+
+  useEffect(() => {
+    return () => {
+      lastAnchorRef.current = null
+      onSceneItemAnchorChange(item.id, null)
+    }
+  }, [item.id, onSceneItemAnchorChange])
+
+  useEffect(() => {
+    updateAnchor()
+  }, [
+    boundsVersion,
+    contentVersion,
+    item.id,
+    item.role,
+    item.transform.position[0],
+    item.transform.position[1],
+    item.transform.position[2],
+    item.transform.rotation[0],
+    item.transform.rotation[1],
+    item.transform.rotation[2],
+    item.transform.scale[0],
+    item.transform.scale[1],
+    item.transform.scale[2],
+    item.visible,
+    selected,
+    updateAnchor,
+  ])
 
   const handleClick = (event: WorldsObjectClickEvent) => {
     event.stopPropagation()
-    onSelectItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, item.id))
+    onSelectItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, item.id), {
+      toggle: isWorldsMultiSelectToggleGesture(event.nativeEvent),
+    })
+  }
+
+  const handleDoubleClick = (event: WorldsObjectClickEvent) => {
+    event.stopPropagation()
+    onFocusItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, item.id))
   }
 
   const selectionName = selected ? `${item.id} selected` : item.id
@@ -556,11 +710,12 @@ function WorldSceneItemObject({
           rotation={item.transform.rotation}
           scale={item.transform.scale}
           onClick={handleClick}
+          onDoubleClick={handleDoubleClick}
         >
-          <WorldSceneItemGeometry item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} />
+          <WorldSceneItemGeometry item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} onBoundsChange={invalidateBounds} />
         </group>
       </Select>
-      <WorldsSelectionHitbox itemId={item.id} targetRef={groupRef} onSelectItem={onSelectItem} />
+      <WorldsSelectionHitbox itemId={item.id} targetRef={groupRef} boundsVersion={boundsVersion + contentVersion} onSelectItem={onSelectItem} onFocusItem={onFocusItem} />
     </>
   )
 }
@@ -585,11 +740,26 @@ export function resolveWorldsSceneItemIdFromIntersections(intersections: Array<{
   return fallbackItemId
 }
 
-export function calculateWorldsSelectionBounds(target: THREE.Object3D): { center: THREE.Vector3; size: THREE.Vector3 } | null {
-  target.updateWorldMatrix(true, true)
+export function isWorldsMultiSelectToggleGesture(event: Pick<MouseEvent, 'button' | 'ctrlKey'>): boolean {
+  return event.button === 0 && event.ctrlKey
+}
 
-  const bounds = new THREE.Box3()
-  const childBounds = new THREE.Box3()
+export function shouldWorldsPointerMissClearSelection(
+  event: Pick<MouseEvent, 'ctrlKey'> | { ctrlKey?: boolean; nativeEvent?: Pick<MouseEvent, 'ctrlKey'> } | null | undefined,
+): boolean {
+  const ctrlKey = 'nativeEvent' in (event ?? {}) ? event?.nativeEvent?.ctrlKey : event?.ctrlKey
+  return ctrlKey !== true
+}
+
+export function measureWorldsObjectBounds(
+  target: THREE.Object3D,
+  bounds: THREE.Box3,
+  childBounds: THREE.Box3,
+  center: THREE.Vector3,
+  size: THREE.Vector3,
+): WorldsMeasuredBounds | null {
+  target.updateWorldMatrix(true, true)
+  bounds.makeEmpty()
   let hasBounds = false
 
   target.traverse((object) => {
@@ -608,8 +778,6 @@ export function calculateWorldsSelectionBounds(target: THREE.Object3D): { center
 
   if (!hasBounds || bounds.isEmpty()) return null
 
-  const center = new THREE.Vector3()
-  const size = new THREE.Vector3()
   bounds.getCenter(center)
   bounds.getSize(size)
 
@@ -619,16 +787,28 @@ export function calculateWorldsSelectionBounds(target: THREE.Object3D): { center
   return { center, size }
 }
 
+export function calculateWorldsSelectionBounds(target: THREE.Object3D): { center: THREE.Vector3; size: THREE.Vector3 } | null {
+  return measureWorldsObjectBounds(target, new THREE.Box3(), new THREE.Box3(), new THREE.Vector3(), new THREE.Vector3())
+}
+
 function WorldsSelectionHitbox({
   itemId,
   targetRef,
+  boundsVersion,
   onSelectItem,
+  onFocusItem,
 }: {
   itemId: string
   targetRef: RefObject<THREE.Object3D | null>
-  onSelectItem: (itemId: string | null) => void
+  boundsVersion: number
+  onSelectItem: (itemId: string | null, options?: { toggle?: boolean }) => void
+  onFocusItem: (itemId: string) => void
 }): JSX.Element {
   const hitboxRef = useRef<THREE.Mesh>(null)
+  const boundsRef = useRef(new THREE.Box3())
+  const childBoundsRef = useRef(new THREE.Box3())
+  const centerRef = useRef(new THREE.Vector3())
+  const sizeRef = useRef(new THREE.Vector3())
 
   const handlePointerDown = (event: { stopPropagation: () => void }) => {
     event.stopPropagation()
@@ -636,15 +816,22 @@ function WorldsSelectionHitbox({
 
   const handleClick = (event: WorldsObjectClickEvent) => {
     event.stopPropagation()
-    onSelectItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, itemId))
+    onSelectItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, itemId), {
+      toggle: isWorldsMultiSelectToggleGesture(event.nativeEvent),
+    })
   }
 
-  useFrame(() => {
+  const handleDoubleClick = (event: WorldsObjectClickEvent) => {
+    event.stopPropagation()
+    onFocusItem(resolveWorldsSceneItemIdFromIntersections(event.intersections, itemId))
+  }
+
+  useEffect(() => {
     const hitbox = hitboxRef.current
     const target = targetRef.current
     if (!hitbox || !target) return
 
-    const bounds = calculateWorldsSelectionBounds(target)
+    const bounds = measureWorldsObjectBounds(target, boundsRef.current, childBoundsRef.current, centerRef.current, sizeRef.current)
     if (!bounds) {
       hitbox.visible = false
       return
@@ -653,7 +840,7 @@ function WorldsSelectionHitbox({
     hitbox.visible = true
     hitbox.position.copy(bounds.center)
     hitbox.scale.copy(bounds.size)
-  })
+  }, [boundsVersion, targetRef])
 
   return (
     <mesh
@@ -662,6 +849,7 @@ function WorldsSelectionHitbox({
       userData={{ worldsSelectionHitbox: true }}
       onPointerDown={handlePointerDown}
       onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
     >
       <boxGeometry args={[1, 1, 1]} />
       <meshBasicMaterial transparent opacity={0} depthWrite={false} color="#ffffff" />
@@ -669,14 +857,14 @@ function WorldsSelectionHitbox({
   )
 }
 
-function WorldSceneItemGeometry({ item, playbackRef, onAnimationMetadata }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void }): JSX.Element | null {
+function WorldSceneItemGeometry({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element | null {
   if (item.kind === 'ply-mesh' || item.kind === 'ply-points') {
-    return <PlySceneObject item={item} />
+    return <PlySceneObject item={item} onBoundsChange={onBoundsChange} />
   }
-  return <GltfSceneObject item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} />
+  return <GltfSceneObject item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} onBoundsChange={onBoundsChange} />
 }
 
-function PlySceneObject({ item }: { item: WorldSceneItem }): JSX.Element | null {
+function PlySceneObject({ item, onBoundsChange }: { item: WorldSceneItem; onBoundsChange: () => void }): JSX.Element | null {
   const [model, setModel] = useState<PlyRenderModel | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -703,6 +891,10 @@ function PlySceneObject({ item }: { item: WorldSceneItem }): JSX.Element | null 
   }, [item])
 
   useEffect(() => {
+    if (model) onBoundsChange()
+  }, [model, onBoundsChange])
+
+  useEffect(() => {
     return () => {
       ;(model?.geometry as any)?.disposeBoundsTree?.()
       model?.geometry.dispose()
@@ -727,7 +919,7 @@ function PlySceneObject({ item }: { item: WorldSceneItem }): JSX.Element | null 
   )
 }
 
-function GltfSceneObject({ item, playbackRef, onAnimationMetadata }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void }): JSX.Element {
+function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element {
   const gltf = useGLTF(item.url)
   const scene = useMemo(() => cloneSkeletonScene(gltf.scene), [gltf.scene])
   const poseClipRef = useRef<{
@@ -747,6 +939,7 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata }: { item: Wor
         })
       }
     })
+    onBoundsChange()
     return () => {
       scene.traverse((child) => {
         if (child instanceof THREE.Mesh) {
@@ -754,7 +947,7 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata }: { item: Wor
         }
       })
     }
-  }, [item.id, scene])
+  }, [item.id, onBoundsChange, scene])
   useEffect(() => {
     const animation = item.animation
     poseClipRef.current = null
@@ -819,7 +1012,19 @@ function formatPlaybackTime(timeSeconds: number): string {
   return `${Math.max(0, timeSeconds).toFixed(2)}s`
 }
 
-function WorldsSelectionSilhouette({ target }: { target: THREE.Object3D }): JSX.Element {
+function WorldsSelectionSilhouette({
+  target,
+  color,
+  opacity,
+  scaleMultiplier,
+  renderOrder,
+}: {
+  target: THREE.Object3D
+  color: number
+  opacity: number
+  scaleMultiplier: number
+  renderOrder: number
+}): JSX.Element {
   const silhouette = useMemo(() => {
     const clone = cloneSkeletonScene(target)
     clone.userData.worldsSelectionSilhouette = true
@@ -828,24 +1033,41 @@ function WorldsSelectionSilhouette({ target }: { target: THREE.Object3D }): JSX.
       if (child instanceof THREE.Mesh) {
         child.raycast = () => undefined
         child.material = new THREE.MeshBasicMaterial({
-          color: 0x8b5cf6,
+          color,
           side: THREE.BackSide,
           transparent: true,
-          opacity: 0.8,
+          opacity,
           depthWrite: false,
           depthTest: true,
         })
-        child.renderOrder = 2
+        child.renderOrder = renderOrder
+      }
+      if (child instanceof THREE.Points) {
+        child.raycast = () => undefined
+        const sourceMaterial = child.material
+        const pointSize = sourceMaterial instanceof THREE.PointsMaterial && Number.isFinite(sourceMaterial.size)
+          ? Math.max(sourceMaterial.size * 1.75, 0.03)
+          : 0.05
+        child.material = new THREE.PointsMaterial({
+          color,
+          size: pointSize,
+          sizeAttenuation: true,
+          transparent: true,
+          opacity,
+          depthWrite: false,
+          depthTest: true,
+        })
+        child.renderOrder = renderOrder
       }
     })
-    clone.scale.multiplyScalar(1.012)
+    clone.scale.multiplyScalar(scaleMultiplier)
     return clone
-  }, [target])
+  }, [color, opacity, renderOrder, scaleMultiplier, target])
 
   useFrame(() => {
     silhouette.position.copy(target.position)
     silhouette.quaternion.copy(target.quaternion)
-    silhouette.scale.copy(target.scale).multiplyScalar(1.012)
+    silhouette.scale.copy(target.scale).multiplyScalar(scaleMultiplier)
     silhouette.updateMatrixWorld(true)
   })
 
@@ -867,32 +1089,88 @@ function WorldsTransformControls({
   object,
   mode,
   selectedItemId,
+  selectedItems,
   draggingRef,
+  onDragEndSelectionBlock,
+  onBoundsChange,
   onTransformItem,
+  onTransformItems,
 }: {
   object: THREE.Object3D
   mode: WorldsTransformMode
   selectedItemId: string | null
+  selectedItems: WorldSceneItem[]
   draggingRef: RefObject<boolean>
+  onDragEndSelectionBlock: () => void
+  onBoundsChange: () => void
   onTransformItem: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onTransformItems: (updates: WorldSceneItemTransformUpdate[]) => void
 }): JSX.Element | null {
-  if (!selectedItemId) return null
+  const transformSnapshotRef = useRef<WorldSceneTransformSnapshot[] | null>(null)
 
-  const syncTransform = () => {
-    onTransformItem(selectedItemId, {
-      position: object.position.toArray() as [number, number, number],
-      rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
-      scale: object.scale.toArray() as [number, number, number],
-    })
-  }
+  const createActiveTransform = useCallback((): WorldSceneItem['transform'] => ({
+    position: object.position.toArray() as [number, number, number],
+    rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
+    scale: object.scale.toArray() as [number, number, number],
+  }), [object])
+
+  const takeSnapshot = useCallback(() => {
+    transformSnapshotRef.current = selectedItems.map((item) => ({
+      itemId: item.id,
+      transform: item.id === selectedItemId
+        ? createActiveTransform()
+        : {
+          position: [...item.transform.position],
+          rotation: [...item.transform.rotation],
+          scale: [...item.transform.scale],
+        },
+    }))
+  }, [createActiveTransform, selectedItemId, selectedItems])
+
+  useEffect(() => {
+    if (!shouldResetWorldsTransformSnapshot(draggingRef.current)) return
+    transformSnapshotRef.current = null
+  }, [draggingRef, mode, object, selectedItemId, selectedItems])
+
+  const syncTransform = useCallback(() => {
+    if (!selectedItemId) return
+    const activeTransform = createActiveTransform()
+    const snapshot = transformSnapshotRef.current
+    if (!isWorldsBatchTransformSnapshot(snapshot)) {
+      onTransformItem(selectedItemId, activeTransform)
+      return
+    }
+
+    onTransformItems(createWorldSceneSelectionTransformUpdates({
+      mode,
+      activeItemId: selectedItemId,
+      snapshot,
+      activeTransform,
+    }))
+  }, [createActiveTransform, mode, onTransformItem, onTransformItems, selectedItemId])
+
+  if (!selectedItemId) return null
 
   return (
     <TransformControls
       object={object}
       mode={mode}
-      onMouseDown={() => { draggingRef.current = true }}
-      onMouseUp={() => { draggingRef.current = false; syncTransform() }}
-      onObjectChange={syncTransform}
+      onMouseDown={() => {
+        draggingRef.current = true
+        takeSnapshot()
+      }}
+      onMouseUp={() => {
+        draggingRef.current = false
+        onDragEndSelectionBlock()
+        syncTransform()
+        onBoundsChange()
+        transformSnapshotRef.current = null
+      }}
+      onObjectChange={() => {
+        if (!transformSnapshotRef.current) takeSnapshot()
+        syncTransform()
+        onBoundsChange()
+      }}
     />
   )
 }
@@ -952,6 +1230,59 @@ function SceneFitController({
   }, [cameraFitSnapshotRef, resetToken])
 
   return null
+}
+
+function SceneFocusController({
+  focusRequest,
+  orbitControlsRef,
+  sceneObjectsRef,
+}: {
+  focusRequest: { itemId: string; token: number } | null
+  orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
+  sceneObjectsRef: MutableRefObject<Map<string, THREE.Object3D>>
+}): null {
+  const { camera } = useThree()
+
+  useEffect(() => {
+    if (!focusRequest) return
+    const object = sceneObjectsRef.current.get(focusRequest.itemId)
+    const controls = orbitControlsRef.current
+    if (!object || !controls) return
+    focusWorldsCameraOnObject(camera, controls, object)
+  }, [camera, focusRequest, orbitControlsRef, sceneObjectsRef])
+
+  return null
+}
+
+export function focusWorldsCameraOnObject(camera: THREE.Camera, controls: WorldsOrbitControlsHandle, target: THREE.Object3D): boolean {
+  const bounds = calculateWorldsSelectionBounds(target)
+  if (!bounds) return false
+
+  worldsFocusSize.copy(bounds.size)
+  const radius = Math.max(worldsFocusSize.length() * 0.5, WORLD_VIEWER_ORBIT_CONTROLS.minDistance)
+  worldsFitDirection.copy(camera.position).sub(controls.target)
+  if (worldsFitDirection.lengthSq() === 0) {
+    worldsFitDirection.copy(WORLDS_DEFAULT_CAMERA_POSITION).sub(WORLDS_DEFAULT_CAMERA_TARGET)
+  }
+  worldsFitDirection.normalize()
+
+  let distance = radius * 1.4
+  if (camera instanceof THREE.PerspectiveCamera) {
+    const verticalFov = THREE.MathUtils.degToRad(camera.fov)
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect)
+    const limitingHalfAngle = Math.min(verticalFov, horizontalFov) / 2
+    distance = (radius / Math.sin(Math.max(limitingHalfAngle, 0.01))) * 1.4
+    camera.near = Math.max(0.01, distance / 100)
+    camera.far = Math.max(camera.far, distance * 100)
+    camera.updateProjectionMatrix()
+  }
+
+  distance = THREE.MathUtils.clamp(distance, WORLD_VIEWER_ORBIT_CONTROLS.minDistance, WORLD_VIEWER_ORBIT_CONTROLS.maxDistance)
+  camera.position.copy(bounds.center).addScaledVector(worldsFitDirection, distance)
+  controls.target.copy(bounds.center)
+  camera.updateMatrixWorld()
+  controls.update()
+  return true
 }
 
 class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element }, { message: string | null }> {

@@ -13,6 +13,7 @@ import {
   deriveWorldsMovementVector,
   getWorldsCameraSpeedLabel,
   normalizeWorldCameraKey,
+  rotateWorldsCameraYawTarget,
   shouldHandleWorldCameraKeyInput,
   shouldIgnoreWorldCameraKeyTarget,
   updateWorldsMovementKeys,
@@ -63,7 +64,8 @@ test('movement key updates normalize WASD, arrows, vertical keys, and releases i
     up: true,
     down: true,
   })
-  assert.equal(normalizeWorldCameraKey('KeyQ'), 'down')
+  assert.equal(normalizeWorldCameraKey('KeyQ'), undefined)
+  assert.equal(normalizeWorldCameraKey('KeyE'), undefined)
   assert.equal(normalizeWorldCameraKey('Tab'), undefined)
 
   keys = updateWorldsMovementKeys(keys, 'KeyW', false)
@@ -118,6 +120,35 @@ test('movement vector derives normalized view-relative direction without mode in
   assert.equal(reverseDiagonal.x, 0)
   assert.ok(Math.abs(reverseDiagonal.y + Math.SQRT1_2) < Number.EPSILON)
   assert.ok(Math.abs(reverseDiagonal.z + Math.SQRT1_2) < Number.EPSILON)
+})
+
+test('yaw helper rotates camera look target in place without moving the camera position', () => {
+  const cameraPosition = { x: 4, y: 2, z: 6 }
+  const target = { x: 4, y: 2, z: 1 }
+
+  const yawedTarget = rotateWorldsCameraYawTarget({
+    cameraPosition,
+    target,
+    yawAngle: Math.PI / 2,
+  })
+
+  assert.deepEqual(cameraPosition, { x: 4, y: 2, z: 6 })
+  assert.ok(Math.abs(yawedTarget.x - (-1)) < 1e-9)
+  assert.ok(Math.abs(yawedTarget.y - 2) < 1e-9)
+  assert.ok(Math.abs(yawedTarget.z - 6) < 1e-9)
+})
+
+test('yaw helper falls back to camera look direction when target is at camera position', () => {
+  const yawedTarget = rotateWorldsCameraYawTarget({
+    cameraPosition: { x: 1, y: 3, z: 5 },
+    target: { x: 1, y: 3, z: 5 },
+    yawAngle: -Math.PI / 2,
+    fallbackLookDirection: { x: 0, y: 0, z: -1 },
+  })
+
+  assert.ok(Math.abs(yawedTarget.x - 2) < 1e-9)
+  assert.ok(Math.abs(yawedTarget.y - 3) < 1e-9)
+  assert.ok(Math.abs(yawedTarget.z - 5) < 1e-9)
 })
 
 test('keyboard guard ignores editable controls, selectors, dialogs, and contenteditable targets', () => {

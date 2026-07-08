@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { createPortal } from 'react-dom'
 import {
   ReactFlow,
@@ -19,7 +19,7 @@ import { useWorkflowsStore, NODE_TYPES_WITHOUT_TARGET, NODE_TYPES_WITHOUT_SOURCE
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useAppStore } from '@shared/stores/appStore'
 import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
-import { buildAllWorkflowExtensions } from './mockExtensions'
+import { buildAllWorkflowExtensions, resolveWorkflowUtilityNodeType } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
@@ -74,9 +74,17 @@ function IoBadge({ type }: { type: ArtifactKind }) {
 
 function newId(): string { return crypto.randomUUID() }
 
-// Node clipboard (module-level so Ctrl+C in one workflow tab can be pasted in
-// another — the canvas remounts per tab but the module survives).
-const _nodeClipboard: { current: { nodes: Node[]; edges: Edge[]; pastes: number } | null } = { current: null }
+function workflowSelectionForExtension(extension: WorkflowExtension): { type: string; extensionId?: string } {
+  const utilityNodeType = resolveWorkflowUtilityNodeType(extension)
+  return utilityNodeType ? { type: utilityNodeType } : { type: 'extensionNode', extensionId: extension.id }
+}
+
+function setWorkflowExtensionDragData(event: DragEvent, extension: WorkflowExtension): void {
+  const utilityNodeType = resolveWorkflowUtilityNodeType(extension)
+  if (utilityNodeType) event.dataTransfer.setData(DRAG_NODE_KEY, utilityNodeType)
+  else event.dataTransfer.setData(DRAG_KEY, extension.id)
+  event.dataTransfer.effectAllowed = 'copy'
+}
 
 function newWorkflow(): Workflow {
   const now = new Date().toISOString()
@@ -318,7 +326,7 @@ function ExtensionsPanel({ allExtensions, open }: { allExtensions: WorkflowExten
                       <div
                         key={ext.id}
                         draggable
-                        onDragStart={(e) => { e.dataTransfer.setData(DRAG_KEY, ext.id); e.dataTransfer.effectAllowed = 'copy' }}
+                        onDragStart={(e) => setWorkflowExtensionDragData(e, ext)}
                         className="flex flex-col gap-2 px-3 py-3 rounded-lg border border-zinc-800 bg-zinc-900 transition-colors cursor-grab hover:bg-zinc-800/60 hover:border-zinc-700 active:cursor-grabbing"
                       >
                         <p className="text-xs font-semibold text-zinc-200 truncate">{ext.name}</p>
@@ -358,7 +366,7 @@ function ExtensionsPanel({ allExtensions, open }: { allExtensions: WorkflowExten
                         <div
                           key={ext.id}
                           draggable
-                          onDragStart={(e) => { e.dataTransfer.setData(DRAG_KEY, ext.id); e.dataTransfer.effectAllowed = 'copy' }}
+                          onDragStart={(e) => setWorkflowExtensionDragData(e, ext)}
                           className="flex flex-col gap-2 px-3 py-3 rounded-lg border border-zinc-800 bg-zinc-900 transition-colors cursor-grab hover:bg-zinc-800/60 hover:border-zinc-700 active:cursor-grabbing"
                         >
                           <p className="text-xs font-semibold text-zinc-200 truncate">{ext.name}</p>
@@ -500,7 +508,10 @@ function NodePalette({
       const item = flatItems[activeIndex]
       if (!item) return
       if (item.kind === 'node') onSelect(item.data.type)
-      else onSelect('extensionNode', item.data.id)
+      else {
+        const selection = workflowSelectionForExtension(item.data)
+        onSelect(selection.type, selection.extensionId)
+      }
     }
   }, [activeIndex, flatItems, totalItems, onSelect, onClose])
 
@@ -574,7 +585,10 @@ function NodePalette({
                   <button
                     key={e.id}
                     onMouseEnter={() => setActiveIndex(item.flatIdx)}
-                    onClick={() => onSelect('extensionNode', e.id)}
+                    onClick={() => {
+                      const selection = workflowSelectionForExtension(e)
+                      onSelect(selection.type, selection.extensionId)
+                    }}
                     className={`w-full flex items-center gap-3 px-4 pl-9 py-2.5 transition-colors ${isActive ? 'bg-zinc-800' : 'hover:bg-zinc-800/50'}`}
                   >
                     <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-violet-400" />

@@ -31,6 +31,13 @@ async function createProcessManifest(baseDir, extensionId, manifest) {
   await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
 }
 
+const DEFAULT_PROCESS_AUTOMATION = {
+  boundary: 'electron',
+  headless: true,
+  pause: { supported: false },
+  substitution: { supported: false },
+}
+
 test('resolveAutomationCapabilitiesContextWithDeps assembles canonical service context', async () => {
   const trustedRepos = new Set(['acme/repo'])
 
@@ -213,11 +220,12 @@ test('buildAutomationCapabilities returns full canonical payload when backend is
         input: 'mesh',
         output: 'mesh',
         params_schema: [{ key: 'ratio', type: 'number' }],
+        automation: DEFAULT_PROCESS_AUTOMATION,
         ready: null,
       })
       assert.equal(response.errors, undefined)
       assert.ok(Array.isArray(response.excluded.ui_only_nodes))
-      assert.equal(response.excluded.ui_only_nodes.length, 4)
+      assert.equal(response.excluded.ui_only_nodes.length, 5)
       assert.deepEqual(response.excluded.ui_only_nodes.find((node) => node.label === 'Add to Scene'), {
         kind: 'ui_only',
         source: 'ui-only',
@@ -306,6 +314,7 @@ test('buildAutomationCapabilities keeps backend_ready=true on partial model para
         'Text',
         'Load 3D Mesh',
         'Add to Scene',
+        'Artifact substitution',
       ])
     } finally {
       axios.get = originalGet
@@ -346,6 +355,7 @@ test('parseExtensionManifest preserves legacy process nodes without inputs[]', (
       hfRepo: undefined,
       downloadCheck: undefined,
       hfSkipPrefixes: undefined,
+      automation: DEFAULT_PROCESS_AUTOMATION,
     },
   ])
 })
@@ -390,6 +400,7 @@ test('parseExtensionManifest normalizes optional process inputs[] with required=
     hfRepo: undefined,
     downloadCheck: undefined,
     hfSkipPrefixes: undefined,
+    automation: DEFAULT_PROCESS_AUTOMATION,
   })
 })
 
@@ -453,10 +464,51 @@ test('buildAutomationCapabilities emits normalized inputs[] for process nodes wi
           { name: 'coarse_mesh', type: 'mesh', required: false },
         ],
         params_schema: [{ key: 'strength', type: 'number' }],
+        automation: DEFAULT_PROCESS_AUTOMATION,
         ready: null,
       })
     } finally {
       axios.get = originalGet
     }
   })
+})
+
+
+test('parseExtensionManifest exposes allowlisted workflow utility nodes from manifests', () => {
+  const extension = parseExtensionManifest({
+    id: 'wan-video',
+    displayName: 'Wan Video',
+    type: 'model',
+    nodes: [],
+    workflow_nodes: [
+      {
+        id: 'preview-video',
+        name: 'Preview Video',
+        description: 'Preview generated video artifacts',
+        component: 'video-preview',
+        capability_id: 'modly.workflow.preview.video',
+        singleton: true,
+      },
+      {
+        id: 'unsafe-widget',
+        name: 'Unsafe Widget',
+        component: 'remote-js-bundle',
+        input: 'video',
+        output: 'video',
+      },
+    ],
+  }, 'fallback', new Set(), false)
+
+  assert.deepEqual(extension.workflowNodes, [
+    {
+      id: 'preview-video',
+      name: 'Preview Video',
+      description: 'Preview generated video artifacts',
+      component: 'video-preview',
+      capabilityId: 'modly.workflow.preview.video',
+      input: 'video',
+      output: 'video',
+      singleton: true,
+    },
+  ])
 })

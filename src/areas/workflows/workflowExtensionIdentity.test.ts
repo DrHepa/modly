@@ -55,3 +55,72 @@ test('buildAllWorkflowExtensions keeps 3D workflow identity on ext.id/node.id wh
     ],
   )
 })
+
+
+test('buildAllWorkflowExtensions exposes singleton utility workflow nodes from extension manifests once per capability', () => {
+  const workflowExtensions = buildAllWorkflowExtensions(
+    [
+      {
+        id: 'wan-video',
+        name: 'Wan Video',
+        author: 'Tests',
+        description: 'Video generation',
+        builtin: false,
+        nodes: [],
+        workflowNodes: [
+          {
+            id: 'preview-video',
+            name: 'Preview Video',
+            description: 'Preview generated video artifacts',
+            component: 'video-preview',
+            capabilityId: 'modly.workflow.preview.video',
+            input: 'video',
+            output: 'video',
+            singleton: true,
+          },
+        ],
+      },
+      {
+        id: 'another-video',
+        name: 'Another Video',
+        author: 'Tests',
+        description: 'Another video extension',
+        builtin: false,
+        nodes: [],
+        workflowNodes: [
+          {
+            id: 'preview-video',
+            name: 'Preview Video Duplicate',
+            component: 'video-preview',
+            capabilityId: 'modly.workflow.preview.video',
+            input: 'video',
+            output: 'video',
+            singleton: true,
+          },
+        ],
+      },
+    ],
+    [],
+  )
+
+  assert.deepEqual(
+    workflowExtensions.map((extension: WorkflowExtension) => ({
+      id: extension.id,
+      type: extension.type,
+      workflowNodeType: extension.workflowNodeType,
+      capabilityId: extension.capabilityId,
+      input: extension.input,
+      output: extension.output,
+    })),
+    [
+      {
+        id: 'wan-video/preview-video',
+        type: 'utility',
+        workflowNodeType: 'previewVideoNode',
+        capabilityId: 'modly.workflow.preview.video',
+        input: 'video',
+        output: 'video',
+      },
+    ],
+  )
+})

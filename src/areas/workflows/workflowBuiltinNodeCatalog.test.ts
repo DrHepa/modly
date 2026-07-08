@@ -91,18 +91,16 @@ test('workflow built-in catalog exposes Load Scene with scene-focused copy', asy
 })
 
 
-test('workflow built-in catalog exposes Preview Video node', async () => {
+test('workflow built-in catalog leaves Preview Video to extension-provided utility nodes', async () => {
   const { module, cleanup } = await loadCatalogModule()
 
   try {
     const panelNodes = module.WORKFLOW_BUILTIN_PANEL_NODES as BuiltinCatalogNode[]
     const paletteNodes = module.WORKFLOW_BUILTIN_PALETTE_NODES as BuiltinCatalogNode[]
-    const panelEntry = panelNodes.find((node) => node.type === 'previewVideoNode')
-    const paletteEntry = paletteNodes.find((node) => node.type === 'previewVideoNode')
 
-    assert.equal(panelEntry?.label, 'Preview Video')
-    assert.equal(paletteEntry?.label, 'Preview Video')
-    assert.equal(module.WORKFLOW_BUILTIN_NODE_TYPES.includes('previewVideoNode'), true)
+    assert.equal(panelNodes.some((node) => node.type === 'previewVideoNode'), false)
+    assert.equal(paletteNodes.some((node) => node.type === 'previewVideoNode'), false)
+    assert.equal(module.WORKFLOW_BUILTIN_NODE_TYPES.includes('previewVideoNode'), false)
   } finally {
     await cleanup()
   }

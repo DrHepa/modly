@@ -89,6 +89,9 @@ export type ProcessPort = {
   required?: boolean
 }
 
+type ProcessPortType = ProcessPort['type']
+type WorkflowNodeComponent = 'video-preview'
+
 type LegacyProcessPortContract = {
   name?: string
   label?: string
@@ -226,6 +229,16 @@ export type ParsedManifest = {
     weight_owner_id?: string
     automation?: PartialCapabilityAutomationMetadata
   }[]
+  workflow_nodes?: {
+    id: string
+    name?: string
+    description?: string
+    component?: unknown
+    capability_id?: string
+    input?: ArtifactKind
+    output?: ArtifactKind
+    singleton?: boolean
+  }[]
 }
 
 export type ListedExtensionNode = ReturnType<typeof parseExtensionManifest>['nodes'][number]
@@ -256,6 +269,17 @@ function normalizeProcessPorts(
   return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
 }
 
+export type ListedWorkflowNode = {
+  id: string
+  name: string
+  description?: string
+  component: WorkflowNodeComponent
+  capabilityId: string
+  input: ArtifactKind
+  output: ArtifactKind
+  singleton: boolean
+}
+
 type PartialCapabilityPauseMetadata = {
   supported?: unknown
   checkpoint?: unknown
@@ -273,6 +297,7 @@ type PartialCapabilityAutomationMetadata = {
 }
 
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
   const pauseSupported = input?.pause?.supported === true
@@ -296,6 +321,44 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
       ...(substitutionBoundary ? { boundary: substitutionBoundary, headless: false } : {}),
     },
   }
+}
+
+function isProcessPortType(value: unknown): value is ProcessPortType {
+  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+}
+
+function isWorkflowNodeComponent(value: unknown): value is WorkflowNodeComponent {
+  return typeof value === 'string' && WORKFLOW_NODE_COMPONENTS.has(value as WorkflowNodeComponent)
+}
+
+function normalizeWorkflowNodes(
+  nodes: ParsedManifest['workflow_nodes'],
+  extensionId: string,
+): ListedWorkflowNode[] {
+  if (!Array.isArray(nodes) || nodes.length === 0) return []
+
+  return nodes
+    .map((node) => {
+      if (!node?.id || !isWorkflowNodeComponent(node.component)) return undefined
+      const input: ArtifactKind = node.component === 'video-preview'
+        ? 'video'
+        : isProcessPortType(node.input) ? node.input : 'image'
+      const output: ArtifactKind = node.component === 'video-preview'
+        ? 'video'
+        : isProcessPortType(node.output) ? node.output : input
+
+      return {
+        id: node.id,
+        name: node.name ?? node.id,
+        ...(node.description ? { description: node.description } : {}),
+        component: node.component,
+        capabilityId: node.capability_id ?? `${extensionId}/${node.id}`,
+        input,
+        output,
+        singleton: node.singleton === true,
+      }
+    })
+    .filter((node): node is ListedWorkflowNode => Boolean(node))
 }
 
 type InstallationState = {
@@ -351,6 +414,8 @@ function isTrustedSource(source: string | undefined, trustedRepos: Set<string>):
 }
 
 export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
+  const extensionId = parsed.id ?? fallbackId
+  const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
   const common = {
     id:          parsed.id          ?? fallbackId,
     name:        parsed.displayName ?? parsed.name ?? fallbackId,
@@ -360,6 +425,7 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
     trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
     source:      parsed.source,
     builtin,
+    ...(workflowNodes.length > 0 ? { workflowNodes } : {}),
   }
 
   if (parsed.model_sources !== undefined) {

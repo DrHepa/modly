@@ -35,6 +35,13 @@ async function createProcessManifest(baseDir, extensionId, manifest) {
   await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
 }
 
+const DEFAULT_PROCESS_AUTOMATION = {
+  boundary: 'electron',
+  headless: true,
+  pause: { supported: false },
+  substitution: { supported: false },
+}
+
 test('resolveAutomationCapabilitiesContextWithDeps assembles canonical service context', async () => {
   const trustedRepos = new Set(['acme/repo'])
 
@@ -500,4 +507,43 @@ test('installer applies the existing scene ABI boundary to named declarations wi
   assert.equal(validate('model', { inputs: [{ name: 'frame', type: 'image' }] }).isProcess, false)
   assert.equal(validate('process', { inputs: [{ name: 'world', type: 'scene' }] }).isProcess, true)
   assert.throws(() => validate('model', { inputs: [{ name: 'world', type: 'scene' }] }), /scene.*single/)
+})
+
+test('parseExtensionManifest exposes allowlisted workflow utility nodes from manifests', () => {
+  const extension = parseExtensionManifest({
+    id: 'wan-video',
+    displayName: 'Wan Video',
+    type: 'model',
+    nodes: [],
+    workflow_nodes: [
+      {
+        id: 'preview-video',
+        name: 'Preview Video',
+        description: 'Preview generated video artifacts',
+        component: 'video-preview',
+        capability_id: 'modly.workflow.preview.video',
+        singleton: true,
+      },
+      {
+        id: 'unsafe-widget',
+        name: 'Unsafe Widget',
+        component: 'remote-js-bundle',
+        input: 'video',
+        output: 'video',
+      },
+    ],
+  }, 'fallback', new Set(), false)
+
+  assert.deepEqual(extension.workflowNodes, [
+    {
+      id: 'preview-video',
+      name: 'Preview Video',
+      description: 'Preview generated video artifacts',
+      component: 'video-preview',
+      capabilityId: 'modly.workflow.preview.video',
+      input: 'video',
+      output: 'video',
+      singleton: true,
+    },
+  ])
 })

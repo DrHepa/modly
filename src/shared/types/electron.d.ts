@@ -38,6 +38,8 @@ export {}
 
 // ─── Extension types ──────────────────────────────────────────────────────────
 
+export type WorkflowNodeComponent = 'video-preview'
+
 export interface ExtensionNode {
   id:               string
   name:             string
@@ -79,6 +81,17 @@ export interface CapabilityAutomationMetadata {
   headless: boolean
   pause: CapabilityPauseMetadata
   substitution: CapabilitySubstitutionMetadata
+}
+
+export interface ExtensionWorkflowNode {
+  id:           string
+  name:         string
+  description?: string
+  component:    WorkflowNodeComponent
+  capabilityId: string
+  input:        ArtifactKind
+  output:       ArtifactKind
+  singleton:    boolean
 }
 
 export interface ModelOwnershipMetadata {
@@ -131,6 +144,7 @@ export interface ModelExtension {
   corrupted?:   boolean
   /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */
   manifestError?: 'missing' | 'invalid' | 'incomplete'
+  workflowNodes?: ExtensionWorkflowNode[]
 }
 
 export type PickerIntent = 'folder' | 'image' | 'mesh' | 'text'
@@ -239,6 +253,7 @@ export interface ProcessExtension {
   localPath?:   string
   entry:        string
   nodes:        ExtensionNode[]
+  workflowNodes?: ExtensionWorkflowNode[]
   /** Folder exists but is not a loadable extension — see manifestError */
   corrupted?:   boolean
   /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */

@@ -1,7 +1,8 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
-import type { ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionWorkflowNode, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -17,8 +18,53 @@ export interface WorkflowExtension {
   output:          string
   params:          ParamSchema[]
   builtin:         boolean
-  type:            'model' | 'process'
+  type:            'model' | 'process' | 'utility'
   weightVariants?: WeightVariantsInfo
+  workflowNodeType?: string
+  component?:       ExtensionWorkflowNode['component']
+  capabilityId?:    string
+  singleton?:       boolean
+}
+
+const WORKFLOW_UTILITY_NODE_COMPONENT_TYPES: Record<ExtensionWorkflowNode['component'], string> = {
+  'video-preview': PREVIEW_VIDEO_NODE_TYPE,
+}
+
+export function resolveWorkflowUtilityNodeType(extension: WorkflowExtension): string | undefined {
+  return extension.type === 'utility' ? extension.workflowNodeType : undefined
+}
+
+function appendWorkflowUtilityNodes(
+  result: WorkflowExtension[],
+  extension: ModelExtension | ProcessExtension,
+  seenSingletonCapabilities: Set<string>,
+): void {
+  for (const node of extension.workflowNodes ?? []) {
+    const workflowNodeType = WORKFLOW_UTILITY_NODE_COMPONENT_TYPES[node.component]
+    if (!workflowNodeType) continue
+
+    if (node.singleton && seenSingletonCapabilities.has(node.capabilityId)) continue
+    if (node.singleton) seenSingletonCapabilities.add(node.capabilityId)
+
+    result.push({
+      id:              `${extension.id}/${node.id}`,
+      extensionId:     extension.id,
+      extensionName:   extension.name,
+      extensionAuthor: extension.author ?? '',
+      nodeId:          node.id,
+      name:            node.name,
+      description:     node.description ?? extension.description ?? '',
+      input:           node.input,
+      output:          node.output,
+      params:          [],
+      builtin:         extension.builtin,
+      type:            'utility',
+      workflowNodeType,
+      component:       node.component,
+      capabilityId:    node.capabilityId,
+      singleton:       node.singleton,
+    })
+  }
 }
 
 function applyParamDefaults(
@@ -46,6 +92,7 @@ export function buildAllWorkflowExtensions(
   processExtensions: ProcessExtension[],
 ): WorkflowExtension[] {
   const result: WorkflowExtension[] = []
+  const seenSingletonCapabilities = new Set<string>()
 
   for (const ext of processExtensions) {
     if (ext.corrupted) continue
@@ -67,6 +114,7 @@ export function buildAllWorkflowExtensions(
         type:            'process',
       })
     }
+    appendWorkflowUtilityNodes(result, ext, seenSingletonCapabilities)
   }
 
   for (const ext of modelExtensions) {
@@ -93,6 +141,7 @@ export function buildAllWorkflowExtensions(
         weightVariants:  node.weightVariants,
       })
     }
+    appendWorkflowUtilityNodes(result, ext, seenSingletonCapabilities)
   }
 
   return result

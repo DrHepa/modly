@@ -2,16 +2,22 @@ import { create } from 'zustand'
 
 import type { WorldsTransformMode } from './components/WorldsTransformToolbar.tsx'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import type { WorldCollisionZone } from './worldsCollisionZones.ts'
 
 export interface WorldsSceneState {
   sceneItems: WorldSceneItem[]
+  collisionZones: WorldCollisionZone[]
   selectedSceneItemId: string | null
   selectedSceneItemIds: string[]
+  collisionEditMode: boolean
+  selectedCollisionZoneId: string | null
   transformMode: WorldsTransformMode | null
   sceneItemAnchors: Record<string, [number, number, number]>
-  setScene: (scene: Pick<WorldsSceneState, 'sceneItems' | 'selectedSceneItemId'> & Partial<Pick<WorldsSceneState, 'selectedSceneItemIds'>>) => void
+  setScene: (scene: Pick<WorldsSceneState, 'sceneItems' | 'collisionZones' | 'selectedSceneItemId'> & Partial<Pick<WorldsSceneState, 'selectedSceneItemIds'>>) => void
   setSelectedSceneItemId: (itemId: string | null, options?: { preserveSelection?: boolean }) => void
   toggleSelectedSceneItemId: (itemId: string) => void
+  setCollisionEditMode: (enabled: boolean) => void
+  setSelectedCollisionZoneId: (zoneId: string | null) => void
   setTransformMode: (mode: WorldsTransformMode | null) => void
   setSceneItemAnchor: (itemId: string, anchor: [number, number, number] | null) => void
   clearTransformMode: () => void
@@ -51,8 +57,11 @@ export function toggleWorldsSelectedSceneItem(
 
 export const useWorldsSceneStore = create<WorldsSceneState>((set) => ({
   sceneItems: [],
+  collisionZones: [],
   selectedSceneItemId: null,
   selectedSceneItemIds: [],
+  collisionEditMode: false,
+  selectedCollisionZoneId: null,
   transformMode: null,
   sceneItemAnchors: {},
   setScene: (scene) => set((state) => {
@@ -67,25 +76,31 @@ export const useWorldsSceneStore = create<WorldsSceneState>((set) => ({
 
     return {
       sceneItems: scene.sceneItems,
+      collisionZones: scene.collisionZones,
       selectedSceneItemId,
       selectedSceneItemIds,
-      transformMode: selectedSceneItemId ? state.transformMode : null,
+      selectedCollisionZoneId: state.selectedCollisionZoneId,
+      transformMode: state.transformMode,
     }
   }),
   setSelectedSceneItemId: (itemId, options) => set((state) => ({
     selectedSceneItemId: itemId,
-    selectedSceneItemIds: itemId && options?.preserveSelection && state.selectedSceneItemIds.includes(itemId)
-      ? state.selectedSceneItemIds
-      : itemId ? [itemId] : [],
-    transformMode: itemId ? state.transformMode : null,
+      selectedSceneItemIds: itemId && options?.preserveSelection && state.selectedSceneItemIds.includes(itemId)
+        ? state.selectedSceneItemIds
+        : itemId ? [itemId] : [],
+    selectedCollisionZoneId: itemId ? null : state.selectedCollisionZoneId,
+    transformMode: state.transformMode,
   })),
   toggleSelectedSceneItemId: (itemId) => set((state) => {
     const nextSelection = toggleWorldsSelectedSceneItem(state.selectedSceneItemIds, state.selectedSceneItemId, itemId)
     return {
       ...nextSelection,
-      transformMode: nextSelection.selectedSceneItemId ? state.transformMode : null,
+      selectedCollisionZoneId: null,
+      transformMode: state.transformMode,
     }
   }),
+  setCollisionEditMode: (enabled) => set({ collisionEditMode: enabled }),
+  setSelectedCollisionZoneId: (zoneId) => set({ selectedCollisionZoneId: zoneId }),
   setTransformMode: (mode) => set({ transformMode: mode }),
   setSceneItemAnchor: (itemId, anchor) => set((state) => {
     const current = state.sceneItemAnchors[itemId]

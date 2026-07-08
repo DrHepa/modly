@@ -5,6 +5,7 @@ import test from 'node:test'
 
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
 import {
+  buildWorldSceneCollisionAabbs,
   DEFAULT_WORLDS_CAMERA_STATE,
   WORLD_CAMERA_LOOK_PITCH_LIMIT,
   WORLD_CAMERA_SPEED_PRESETS,
@@ -13,6 +14,7 @@ import {
   deriveWorldsMovementVector,
   getWorldsCameraSpeedLabel,
   normalizeWorldCameraKey,
+  resolveWorldCameraCollisionMovement,
   rotateWorldsCameraYawTarget,
   shouldHandleWorldCameraKeyInput,
   shouldIgnoreWorldCameraKeyTarget,
@@ -198,4 +200,39 @@ test('camera state stays viewer-local and separate from world scene item asset d
   assert.equal('mode' in sceneItem, false)
   assert.equal('speed' in sceneItem, false)
   assert.deepEqual(sceneItem.transform, { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] })
+})
+
+test('collision helpers build transformed world AABBs from scene-level world collision zones', () => {
+  const collisions = buildWorldSceneCollisionAabbs([{
+    id: 'zone-1',
+    shape: 'box',
+    transform: { position: [10, 0, 0], rotation: [0, Math.PI / 2, 0], scale: [4, 2, 2] },
+  }])
+
+  assert.equal(collisions.length, 1)
+  assert.equal(collisions[0]?.itemId, null)
+  assert.equal(collisions[0]?.zoneId, 'zone-1')
+  assert.deepEqual(collisions[0]?.min, { x: 9, y: -1, z: -2 })
+  assert.ok(collisions[0])
+  assert.ok(Math.abs(collisions[0]!.max.x - 11) < 1e-9)
+  assert.ok(Math.abs(collisions[0]!.max.y - 1) < 1e-9)
+  assert.ok(Math.abs(collisions[0]!.max.z - 2) < 1e-9)
+})
+
+test('collision helpers block direct penetration and allow axis slide for keyboard movement', () => {
+  const collisions = [{
+    itemId: 'world:block',
+    zoneId: 'zone-1',
+    min: { x: -0.5, y: -0.5, z: -0.5 },
+    max: { x: 0.5, y: 0.5, z: 0.5 },
+  }]
+
+  assert.deepEqual(
+    resolveWorldCameraCollisionMovement({ x: -1, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, collisions),
+    { x: 0, y: 0, z: 0 },
+  )
+  assert.deepEqual(
+    resolveWorldCameraCollisionMovement({ x: -1, y: 0, z: -0.7 }, { x: 1, y: 0, z: 1 }, collisions),
+    { x: 0, y: 0, z: 1 },
+  )
 })

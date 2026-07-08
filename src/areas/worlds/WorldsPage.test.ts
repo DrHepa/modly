@@ -12,6 +12,7 @@ import { normalizeWorldsSelectedSceneItemIds, toggleWorldsSelectedSceneItem, use
 
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const pageEntry = path.join(projectRoot, 'src/areas/worlds/WorldsPage.tsx')
+const toolbarEntry = path.join(projectRoot, 'src/areas/worlds/components/WorldsTransformToolbar.tsx')
 
 function stubViewerPlugin(): Plugin {
   return {
@@ -44,6 +45,27 @@ async function loadPageModule() {
     tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
     plugins: [stubViewerPlugin()],
     external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime'],
+  })
+  await writeFile(outfile, result.outputFiles[0].text)
+  return {
+    module: await import(pathToFileURL(outfile).href),
+    async cleanup() {
+      await rm(tempDir, { recursive: true, force: true })
+    },
+  }
+}
+
+async function loadToolbarModule() {
+  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-toolbar-test-'))
+  const outfile = path.join(tempDir, 'WorldsTransformToolbar.bundle.mjs')
+  const result = await build({
+    entryPoints: [toolbarEntry],
+    bundle: true,
+    write: false,
+    format: 'esm',
+    platform: 'node',
+    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+    external: ['react', 'react/jsx-runtime'],
   })
   await writeFile(outfile, result.outputFiles[0].text)
   return {
@@ -89,8 +111,11 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       selectedAssetId: 'fuse',
       selectedSceneItemId: 'world:Workflows/fuse.ply',
       selectedSceneItemIds: ['world:Workflows/fuse.ply'],
+      collisionEditMode: false,
+      selectedCollisionZoneId: null,
       transformMode: null,
       sceneItems: [asset('fuse', 'Fuse simplified').item],
+      collisionZones: [],
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
@@ -112,6 +137,11 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onTransformSceneItems: () => undefined,
+      onAddCollisionZone: () => undefined,
+      onCollisionEditModeChange: () => undefined,
+      onSelectCollisionZone: () => undefined,
+      onTransformCollisionZone: () => undefined,
+      onRemoveCollisionZone: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
@@ -143,8 +173,11 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       selectedAssetId: null,
       selectedSceneItemId: null,
       selectedSceneItemIds: [],
+      collisionEditMode: false,
+      selectedCollisionZoneId: null,
       transformMode: null,
       sceneItems: [],
+      collisionZones: [],
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
@@ -166,6 +199,11 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onTransformSceneItems: () => undefined,
+      onAddCollisionZone: () => undefined,
+      onCollisionEditModeChange: () => undefined,
+      onSelectCollisionZone: () => undefined,
+      onTransformCollisionZone: () => undefined,
+      onRemoveCollisionZone: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
       onOpenSelected: () => undefined,
@@ -328,12 +366,76 @@ test('WorldsPage exposes a batched multi-item transform callback through the vie
   assert.match(source, /selectedSceneItemIds: state\.selectedSceneItemIds/)
 })
 
+test('WorldsPage keeps collision edit state separate from scene selection and wires collision helpers through the viewer contract', async () => {
+  const { module, cleanup } = await loadPageModule()
+  const source = await readFile(pageEntry, 'utf8')
+
+  try {
+    const hero = asset('hero', 'Hero').item
+    assert.deepEqual(module.resolveWorldCollisionZonePlacementAnchor([], [hero], { selectedSceneItemId: hero.id }), [0, 0, 0])
+    assert.equal(source.includes('collisionEditMode = useWorldsSceneStore((state) => state.collisionEditMode)'), true)
+    assert.equal(source.includes('selectedCollisionZoneId = useWorldsSceneStore((state) => state.selectedCollisionZoneId)'), true)
+    assert.equal(source.includes('collisionZones = useWorldsSceneStore((state) => state.collisionZones)'), true)
+    assert.equal(source.includes('addWorldCollisionZone'), true)
+    assert.equal(source.includes('updateWorldCollisionZoneTransform'), true)
+    assert.equal(source.includes('removeWorldCollisionZone'), true)
+    assert.equal(source.includes('onAddCollisionZone={onAddCollisionZone}'), true)
+    assert.equal(source.includes('onCollisionEditModeChange={onCollisionEditModeChange}'), true)
+    assert.equal(source.includes('setCollisionEditMode(true)'), true)
+    assert.equal(source.includes('onSelectCollisionZone={setSelectedCollisionZoneId}'), true)
+    assert.equal(source.includes('collisionZones: updateWorldCollisionZoneTransform(state.collisionZones, zoneId, transform)'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsPage creates preset collision zones enabled by default and selects the new zone id', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    assert.deepEqual(module.addWorldCollisionZone([], 'blocker', { anchorPosition: [1, 2, 3] }), {
+      collisionZones: [{
+        id: 'collision-box-1',
+        label: 'Blocker 1',
+        shape: 'box',
+        preset: 'blocker',
+        transform: {
+          position: [1, 2, 3],
+          rotation: [0, 0, 0],
+          scale: [1.2, 1.2, 1.2],
+        },
+      }],
+      selectedCollisionZoneId: 'collision-box-1',
+    })
+
+    assert.deepEqual(module.addWorldCollisionZone([], 'wall', { anchorPosition: [0, 0, 0] }), {
+      collisionZones: [{
+        id: 'collision-box-1',
+        label: 'Wall 1',
+        shape: 'box',
+        preset: 'wall',
+        transform: {
+          position: [0, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [2.4, 2.4, 0.2],
+        },
+      }],
+      selectedCollisionZoneId: 'collision-box-1',
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
 test('Worlds scene store can switch the active item without collapsing an existing multi-selection', () => {
   const store = useWorldsSceneStore.getState()
   useWorldsSceneStore.setState({
     sceneItems: [asset('a', 'A').item, asset('b', 'B').item],
+    collisionZones: [],
     selectedSceneItemId: 'world:b',
     selectedSceneItemIds: ['world:a', 'world:b'],
+    collisionEditMode: false,
+    selectedCollisionZoneId: null,
     transformMode: 'translate',
     sceneItemAnchors: {},
   })
@@ -345,11 +447,83 @@ test('Worlds scene store can switch the active item without collapsing an existi
   } finally {
     useWorldsSceneStore.setState({
       sceneItems: [],
+      collisionZones: [],
       selectedSceneItemId: null,
       selectedSceneItemIds: [],
+      collisionEditMode: false,
+      selectedCollisionZoneId: null,
       transformMode: null,
       sceneItemAnchors: {},
     })
+  }
+})
+
+test('Worlds scene store clears the selected collision zone when an asset becomes active', () => {
+  const store = useWorldsSceneStore.getState()
+  useWorldsSceneStore.setState({
+    sceneItems: [asset('a', 'A').item, asset('b', 'B').item],
+    collisionZones: [{
+      id: 'zone-1',
+      label: 'Zone 1',
+      shape: 'box',
+      preset: 'blocker',
+      transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    }],
+    selectedSceneItemId: null,
+    selectedSceneItemIds: [],
+    collisionEditMode: true,
+    selectedCollisionZoneId: 'zone-1',
+    transformMode: 'translate',
+    sceneItemAnchors: {},
+  })
+
+  try {
+    store.setSelectedSceneItemId('world:a')
+    assert.equal(useWorldsSceneStore.getState().selectedSceneItemId, 'world:a')
+    assert.deepEqual(useWorldsSceneStore.getState().selectedSceneItemIds, ['world:a'])
+    assert.equal(useWorldsSceneStore.getState().selectedCollisionZoneId, null)
+    assert.equal(useWorldsSceneStore.getState().collisionEditMode, true)
+  } finally {
+    useWorldsSceneStore.setState({
+      sceneItems: [],
+      collisionZones: [],
+      selectedSceneItemId: null,
+      selectedSceneItemIds: [],
+      collisionEditMode: false,
+      selectedCollisionZoneId: null,
+      transformMode: null,
+      sceneItemAnchors: {},
+    })
+  }
+})
+
+test('WorldsTransformToolbar falls back to asset transforms when collision edit mode is visible but no zone is selected', async () => {
+  const { module, cleanup } = await loadToolbarModule()
+
+  try {
+    assert.equal(module.resolveWorldsTransformToolbarTarget({
+      collisionEditMode: true,
+      selectedItem: asset('asset', 'Asset').item,
+      selectedCollisionZone: null,
+    }), 'asset')
+    assert.equal(module.resolveWorldsTransformToolbarTarget({
+      collisionEditMode: true,
+      selectedItem: asset('asset', 'Asset').item,
+      selectedCollisionZone: {
+        id: 'zone-1',
+        label: 'Zone 1',
+        shape: 'box',
+        preset: 'blocker',
+        transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      },
+    }), 'collision-zone')
+    assert.equal(module.resolveWorldsTransformToolbarTarget({
+      collisionEditMode: true,
+      selectedItem: null,
+      selectedCollisionZone: null,
+    }), 'none')
+  } finally {
+    await cleanup()
   }
 })
 
@@ -385,7 +559,7 @@ test('WorldsPage keeps composed scene state in the Worlds store for tab navigati
   const source = await readFile(pageEntry, 'utf8')
 
   assert.match(source, /useWorldsSceneStore/)
-  assert.match(source, /useWorldsSceneStore\.getState\(\)\.sceneItems/)
+  assert.match(source, /const sceneItems = useWorldsSceneStore\(\(state\) => state\.sceneItems\)/)
   assert.match(source, /selectedSceneItemIds/)
   assert.match(source, /toggleSelectedSceneItemId/)
   assert.doesNotMatch(source, /useState<\{ sceneItems: WorldSceneItem\[\]; selectedSceneItemId: string \| null \}>/)

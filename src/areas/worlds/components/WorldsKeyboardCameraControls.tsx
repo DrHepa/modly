@@ -3,15 +3,21 @@ import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 
 import {
+  buildWorldSceneCollisionAabbs,
   deriveWorldsMovementVector,
   normalizeWorldCameraKey,
+  resolveWorldCameraCollisionMovement,
   rotateWorldsCameraYawTarget,
   shouldHandleWorldCameraKeyInput,
   updateWorldsMovementKeys,
   type WorldsMovementKeyState,
 } from '../worldCameraNavigation.ts'
+import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import type { WorldCollisionZone } from '../worldsCollisionZones.ts'
 
 export interface WorldsKeyboardCameraControlsProps {
+  items: WorldSceneItem[]
+  collisionZones: WorldCollisionZone[]
   speed: number
   inputScopeRef: RefObject<HTMLElement>
   orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
@@ -45,9 +51,14 @@ function updateWorldsRotationKeys(keys: WorldsRotationKeyState, code: 'KeyQ' | '
   return { ...keys, yawRight: pressed }
 }
 
-export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitControlsRef }: WorldsKeyboardCameraControlsProps): null {
+export function WorldsKeyboardCameraControls({ items: _items, collisionZones, speed, inputScopeRef, orbitControlsRef }: WorldsKeyboardCameraControlsProps): null {
   const keysRef = useRef<WorldsMovementKeyState>({})
   const rotationKeysRef = useRef<WorldsRotationKeyState>({ yawLeft: false, yawRight: false })
+  const collisionsRef = useRef(buildWorldSceneCollisionAabbs(collisionZones))
+
+  useEffect(() => {
+    collisionsRef.current = buildWorldSceneCollisionAabbs(collisionZones)
+  }, [collisionZones])
 
   useEffect(() => {
     const isScopedEvent = (event: KeyboardEvent): boolean =>
@@ -107,6 +118,8 @@ export function WorldsKeyboardCameraControls({ speed, inputScopeRef, orbitContro
     if (hasMovement) {
       movementVector.set(movement.x, movement.y, movement.z)
       scaledMovementVector.copy(movementVector).multiplyScalar(speed * delta)
+      const resolved = resolveWorldCameraCollisionMovement(camera.position, scaledMovementVector, collisionsRef.current)
+      scaledMovementVector.set(resolved.x, resolved.y, resolved.z)
       camera.position.add(scaledMovementVector)
       orbitControlsRef.current?.target.add(scaledMovementVector)
     }

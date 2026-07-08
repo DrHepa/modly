@@ -18,11 +18,25 @@ export interface WorldSceneItem {
   role: WorldSceneItemRole
   visible: boolean
   animation?: WorldSceneItemAnimationBinding
+  collision?: WorldSceneItemCollision
   transform: {
     position: [number, number, number]
     rotation: [number, number, number]
     scale: [number, number, number]
   }
+}
+
+export interface WorldSceneItemCollision {
+  enabled: boolean
+  zones: WorldSceneItemCollisionZone[]
+}
+
+export interface WorldSceneItemCollisionZone {
+  id: string
+  label?: string
+  shape: 'box'
+  offset: [number, number, number]
+  size: [number, number, number]
 }
 
 export interface WorldSceneItemAnimationBinding {

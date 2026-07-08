@@ -1,5 +1,12 @@
 import { Euler, Quaternion, Vector3 } from 'three'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import {
+  cloneWorldCollisionZone,
+  cloneWorldCollisionZoneTransform,
+  getWorldCollisionZonePresetDefinition,
+  type WorldCollisionZone,
+  type WorldCollisionZonePreset,
+} from './worldsCollisionZones.ts'
 
 export type WorldSceneTransformMode = 'translate' | 'rotate' | 'scale'
 
@@ -16,6 +23,10 @@ export interface WorldSceneTransformSnapshot {
 export interface AppendWorldSceneItemOptions {
   sceneItemAnchors?: Record<string, [number, number, number]>
   selectedSceneItemId?: string | null
+}
+
+export interface AddWorldCollisionZoneOptions {
+  anchorPosition?: [number, number, number]
 }
 
 export function appendWorldSceneItem(
@@ -244,6 +255,102 @@ export function attachWorldSceneItemAnimation(
   return sceneItems.map((item) => item.id === itemId ? { ...item, animation: { ...animation } } : item)
 }
 
+export function addWorldCollisionZone(
+  collisionZones: WorldCollisionZone[],
+  preset: WorldCollisionZonePreset = 'blocker',
+  options: AddWorldCollisionZoneOptions = {},
+): { collisionZones: WorldCollisionZone[]; selectedCollisionZoneId: string } {
+  const zoneId = createWorldCollisionZoneId(collisionZones)
+  const presetDefinition = getWorldCollisionZonePresetDefinition(preset)
+  const anchorPosition = options.anchorPosition ?? [0, 0, 0]
+  const nextZone: WorldCollisionZone = {
+    id: zoneId,
+    label: `${presetDefinition.label} ${collisionZones.length + 1}`,
+    shape: 'box',
+    preset,
+    transform: {
+      position: [
+        anchorPosition[0] + presetDefinition.transform.position[0],
+        anchorPosition[1] + presetDefinition.transform.position[1],
+        anchorPosition[2] + presetDefinition.transform.position[2],
+      ],
+      rotation: [...presetDefinition.transform.rotation],
+      scale: [...presetDefinition.transform.scale],
+    },
+  }
+
+  return {
+    collisionZones: [...collisionZones.map(cloneWorldCollisionZone), nextZone],
+    selectedCollisionZoneId: zoneId,
+  }
+}
+
+export function updateWorldCollisionZoneTransform(
+  collisionZones: WorldCollisionZone[],
+  zoneId: string,
+  transform: WorldCollisionZone['transform'],
+): WorldCollisionZone[] {
+  const nextScale = transform.scale.map((component) => Math.max(component, 0.05)) as [number, number, number]
+  let changed = false
+  const nextZones = collisionZones.map((zone) => {
+    if (zone.id !== zoneId) return zone
+    changed = true
+    return {
+      ...cloneWorldCollisionZone(zone),
+      transform: {
+        position: [...transform.position],
+        rotation: [...transform.rotation],
+        scale: nextScale,
+      },
+    }
+  })
+  return changed ? nextZones : collisionZones
+}
+
+export function removeWorldCollisionZone(
+  collisionZones: WorldCollisionZone[],
+  zoneId: string | null,
+): { collisionZones: WorldCollisionZone[]; selectedCollisionZoneId: string | null } {
+  if (!zoneId) return { collisionZones, selectedCollisionZoneId: null }
+
+  const removedIndex = collisionZones.findIndex((zone) => zone.id === zoneId)
+  if (removedIndex === -1) return { collisionZones, selectedCollisionZoneId: null }
+
+  const nextCollisionZones = collisionZones.filter((zone) => zone.id !== zoneId)
+  const nextSelectedZone = nextCollisionZones[removedIndex] ?? nextCollisionZones[removedIndex - 1] ?? null
+
+  return {
+    collisionZones: nextCollisionZones,
+    selectedCollisionZoneId: nextSelectedZone?.id ?? null,
+  }
+}
+
+export function resolveWorldCollisionZonePlacementAnchor(
+  collisionZones: WorldCollisionZone[],
+  sceneItems: WorldSceneItem[],
+  options: {
+    selectedCollisionZoneId?: string | null
+    selectedSceneItemId?: string | null
+    sceneItemAnchors?: Record<string, [number, number, number]>
+  } = {},
+): [number, number, number] {
+  const { selectedCollisionZoneId = null, selectedSceneItemId = null, sceneItemAnchors = {} } = options
+  if (selectedCollisionZoneId) {
+    const selectedZone = collisionZones.find((zone) => zone.id === selectedCollisionZoneId)
+    if (selectedZone) return [...selectedZone.transform.position]
+  }
+
+  if (selectedSceneItemId) {
+    const selectedAnchor = sceneItemAnchors[selectedSceneItemId]
+    if (selectedAnchor) return [...selectedAnchor]
+
+    const selectedItem = sceneItems.find((sceneItem) => sceneItem.id === selectedSceneItemId)
+    if (selectedItem) return [...selectedItem.transform.position]
+  }
+
+  return calculateBaseSceneAnchor(sceneItems, sceneItemAnchors)
+}
+
 export function resolveWorldSceneItemForPoseClip(
   sceneItems: WorldSceneItem[],
   sourceWorkspacePath: string,
@@ -287,6 +394,17 @@ function cloneWorldSceneTransform(transform: WorldSceneItem['transform']): World
     rotation: [...transform.rotation],
     scale: [...transform.scale],
   }
+}
+
+function createWorldCollisionZoneId(zones: readonly WorldCollisionZone[]): string {
+  let index = zones.length + 1
+  let candidate = `collision-box-${index}`
+  const zoneIds = new Set(zones.map((zone) => zone.id))
+  while (zoneIds.has(candidate)) {
+    index += 1
+    candidate = `collision-box-${index}`
+  }
+  return candidate
 }
 
 function toVector3(vector: [number, number, number]): Vector3 {

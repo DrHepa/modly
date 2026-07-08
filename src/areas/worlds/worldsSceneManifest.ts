@@ -1,5 +1,11 @@
 import type { SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
 import type { WorldSceneItem, WorldSceneItemRole } from './worldRenderableResolver.ts'
+import {
+  cloneWorldCollisionZone,
+  cloneWorldCollisionZoneTransform,
+  type WorldCollisionZone,
+  type WorldCollisionZonePreset,
+} from './worldsCollisionZones.ts'
 
 export const WORLDS_SCENE_MANIFEST_SCHEMA = 'modly.scene-manifest.v1'
 export const WORLDS_SCENE_MANIFEST_FILE_NAME = 'scene-manifest.json'
@@ -14,7 +20,16 @@ export interface WorldsSceneManifestAssetV1 {
   kind: WorldSceneItem['kind']
   visible?: boolean
   animation?: WorldSceneItem['animation']
+  collision?: WorldSceneItem['collision']
   transform: WorldSceneItem['transform']
+}
+
+export interface WorldsSceneManifestCollisionZoneV1 {
+  id?: string
+  label?: string
+  shape: 'box'
+  preset?: WorldCollisionZonePreset
+  transform: WorldCollisionZone['transform']
 }
 
 export interface WorldsSceneManifestV1 extends SceneArtifactManifestV1 {
@@ -24,15 +39,16 @@ export interface WorldsSceneManifestV1 extends SceneArtifactManifestV1 {
   version: 1
   createdAt: string
   assets: WorldsSceneManifestAssetV1[]
+  collisionZones: WorldsSceneManifestCollisionZoneV1[]
 }
 
 type ParseWorldsSceneManifestResult =
-  | { success: true; manifest: WorldsSceneManifestV1; sceneItems: WorldSceneItem[] }
+  | { success: true; manifest: WorldsSceneManifestV1; sceneItems: WorldSceneItem[]; collisionZones: WorldCollisionZone[] }
   | { success: false; error: string }
 
 const WORLD_SCENE_ITEM_KINDS = new Set<WorldSceneItem['kind']>(['glb', 'gltf', 'ply-mesh', 'ply-points'])
 
-export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: { now?: Date } = {}): WorldsSceneManifestV1 {
+export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], collisionZones: WorldCollisionZone[], options: { now?: Date } = {}): WorldsSceneManifestV1 {
   return {
     schema: WORLDS_SCENE_MANIFEST_SCHEMA,
     sceneRoot: '.',
@@ -48,6 +64,13 @@ export function buildWorldsSceneManifest(sceneItems: WorldSceneItem[], options: 
       visible: item.visible,
       ...(item.animation ? { animation: cloneAnimationBinding(item.animation) } : {}),
       transform: cloneTransform(item.transform),
+    })),
+    collisionZones: collisionZones.map((zone) => ({
+      id: zone.id,
+      ...(zone.label ? { label: zone.label } : {}),
+      shape: 'box',
+      ...(zone.preset ? { preset: zone.preset } : {}),
+      transform: cloneWorldCollisionZoneTransform(zone.transform),
     })),
   }
 }
@@ -72,17 +95,25 @@ export function parseWorldsSceneManifest(manifest: unknown, options: { apiUrl?: 
   if (manifest.schema !== WORLDS_SCENE_MANIFEST_SCHEMA) return { success: false, error: 'Worlds scene manifest schema must be modly.scene-manifest.v1.' }
   if (manifest.sceneRoot !== '.') return { success: false, error: 'Worlds scene manifest sceneRoot must be ".".' }
   if (!Array.isArray(manifest.assets)) return { success: false, error: 'Worlds scene manifest assets must be an array.' }
+  if (manifest.collisionZones !== undefined && !Array.isArray(manifest.collisionZones)) {
+    return { success: false, error: 'Worlds scene manifest collisionZones must be an array.' }
+  }
 
   const usedIds = new Set<string>()
   const sceneItems: WorldSceneItem[] = []
   const assets: WorldsSceneManifestAssetV1[] = []
+  const legacyCollisionZones: WorldCollisionZone[] = []
 
   for (const [index, value] of manifest.assets.entries()) {
     const asset = parseWorldsSceneManifestAsset(value, index, usedIds, options.apiUrl)
     if (!asset.success) return { success: false, error: asset.error }
     sceneItems.push(asset.sceneItem)
     assets.push(asset.manifestAsset)
+    legacyCollisionZones.push(...asset.legacyCollisionZones)
   }
+
+  const collisionZones = parseWorldsSceneManifestCollisionZones(manifest.collisionZones, legacyCollisionZones)
+  if (collisionZones.success !== true) return { success: false, error: collisionZones.error }
 
   return {
     success: true,
@@ -94,8 +125,10 @@ export function parseWorldsSceneManifest(manifest: unknown, options: { apiUrl?: 
       version: 1,
       createdAt: typeof manifest.createdAt === 'string' ? manifest.createdAt : '',
       assets,
+      collisionZones: collisionZones.zones.map(cloneWorldCollisionZone),
     },
     sceneItems,
+    collisionZones: collisionZones.zones,
   }
 }
 
@@ -129,7 +162,7 @@ function parseWorldsSceneManifestAsset(
   index: number,
   usedIds: Set<string>,
   apiUrl?: string,
-): { success: true; manifestAsset: WorldsSceneManifestAssetV1; sceneItem: WorldSceneItem } | { success: false; error: string } {
+): { success: true; manifestAsset: WorldsSceneManifestAssetV1; sceneItem: WorldSceneItem; legacyCollisionZones: WorldCollisionZone[] } | { success: false; error: string } {
   if (!isRecord(value)) return { success: false, error: `Worlds scene asset ${index + 1} must be an object.` }
   const workspacePath = normalizeWorldsWorkspacePath(value.workspacePath)
   if (!workspacePath) return { success: false, error: `Worlds scene asset ${index + 1} has an unsafe workspacePath.` }
@@ -138,6 +171,8 @@ function parseWorldsSceneManifestAsset(
   if (!transform) return { success: false, error: `Worlds scene asset ${index + 1} has an invalid transform.` }
   const animation = parseAnimationBinding(value.animation, index)
   if (animation.success !== true) return { success: false, error: animation.error }
+  const collision = parseCollision(value.collision, index)
+  if (collision.success !== true) return { success: false, error: collision.error }
   const visible = value.visible !== false
   const role = value.role === 'base-scene' ? 'base-scene' : 'asset'
   const requestedId = typeof value.id === 'string' && value.id.trim() ? value.id.trim() : `world:${workspacePath}`
@@ -166,7 +201,44 @@ function parseWorldsSceneManifestAsset(
       ...(animation.binding ? { animation: animation.binding } : {}),
       transform,
     },
+    legacyCollisionZones: collision.value ? migrateLegacyCollisionZones(id, transform, collision.value) : [],
   }
+}
+
+function parseWorldsSceneManifestCollisionZones(
+  value: unknown,
+  legacyCollisionZones: WorldCollisionZone[],
+): { success: true; zones: WorldCollisionZone[] } | { success: false; error: string } {
+  if (value === undefined) return { success: true, zones: legacyCollisionZones.map(cloneWorldCollisionZone) }
+
+  const zoneIds = new Set<string>()
+  const zones: WorldCollisionZone[] = []
+  for (const [index, zoneValue] of value.entries()) {
+    if (!isRecord(zoneValue) || zoneValue.shape !== 'box') {
+      return { success: false, error: `Worlds scene collision zone ${index + 1} is invalid.` }
+    }
+
+    const zoneId = typeof zoneValue.id === 'string' && zoneValue.id.trim() ? zoneValue.id.trim() : `collision-box-${index + 1}`
+    if (zoneIds.has(zoneId)) {
+      return { success: false, error: 'Worlds scene collision zones must use unique ids.' }
+    }
+
+    const transform = parseTransform(zoneValue.transform)
+    if (!transform || transform.scale.some((component) => component <= 0)) {
+      return { success: false, error: `Worlds scene collision zone ${index + 1} has an invalid transform.` }
+    }
+
+    zoneIds.add(zoneId)
+    zones.push({
+      id: zoneId,
+      ...(typeof zoneValue.label === 'string' && zoneValue.label.trim() ? { label: zoneValue.label.trim() } : {}),
+      shape: 'box',
+      ...(isCollisionPreset(zoneValue.preset) ? { preset: zoneValue.preset } : {}),
+      transform,
+    })
+  }
+
+  return { success: true, zones }
 }
 
 function parseAnimationBinding(value: unknown, assetIndex: number): { success: true; binding?: WorldSceneItem['animation'] } | { success: false; error: string } {
@@ -207,10 +279,62 @@ function parseTransform(value: unknown): WorldSceneItem['transform'] | null {
   return { position, rotation, scale }
 }
 
+function parseCollision(value: unknown, assetIndex: number): { success: true; value?: WorldSceneItem['collision'] } | { success: false; error: string } {
+  if (value === undefined) return { success: true }
+  if (!isRecord(value) || !Array.isArray(value.zones)) {
+    return { success: false, error: `Worlds scene asset ${assetIndex + 1} has an invalid collision definition.` }
+  }
+
+  const zoneIds = new Set<string>()
+  const zones = [] as NonNullable<WorldSceneItem['collision']>['zones']
+  for (const [zoneIndex, zoneValue] of value.zones.entries()) {
+    if (!isRecord(zoneValue) || zoneValue.shape !== 'box') {
+      return { success: false, error: `Worlds scene asset ${assetIndex + 1} has an invalid collision zone.` }
+    }
+
+    const zoneId = typeof zoneValue.id === 'string' && zoneValue.id.trim()
+      ? zoneValue.id.trim()
+      : `collision-zone-${zoneIndex + 1}`
+    if (zoneIds.has(zoneId)) {
+      return { success: false, error: `Worlds scene asset ${assetIndex + 1} has duplicate collision zone ids.` }
+    }
+
+    const offset = parseVector3(zoneValue.offset)
+    const size = parsePositiveVector3(zoneValue.size)
+    if (!offset || !size) {
+      return { success: false, error: `Worlds scene asset ${assetIndex + 1} has an invalid collision zone.` }
+    }
+
+    zoneIds.add(zoneId)
+    zones.push({
+      id: zoneId,
+      ...(typeof zoneValue.label === 'string' && zoneValue.label.trim() ? { label: zoneValue.label.trim() } : {}),
+      shape: 'box',
+      offset,
+      size,
+    })
+  }
+
+  return {
+    success: true,
+    value: {
+      enabled: value.enabled !== false,
+      zones,
+    },
+  }
+}
+
 function parseVector3(value: unknown): [number, number, number] | null {
   if (!Array.isArray(value) || value.length !== 3) return null
   if (!value.every((component) => typeof component === 'number' && Number.isFinite(component))) return null
   return [value[0], value[1], value[2]]
+}
+
+function parsePositiveVector3(value: unknown): [number, number, number] | null {
+  const parsed = parseVector3(value)
+  if (!parsed) return null
+  if (parsed.some((component) => component <= 0)) return null
+  return parsed
 }
 
 function cloneTransform(transform: WorldSceneItem['transform']): WorldSceneItem['transform'] {
@@ -223,6 +347,32 @@ function cloneTransform(transform: WorldSceneItem['transform']): WorldSceneItem[
 
 function cloneAnimationBinding(animation: NonNullable<WorldSceneItem['animation']>): NonNullable<WorldSceneItem['animation']> {
   return { ...animation }
+}
+
+function migrateLegacyCollisionZones(
+  itemId: string,
+  itemTransform: WorldSceneItem['transform'],
+  collision: NonNullable<WorldSceneItem['collision']>,
+): WorldCollisionZone[] {
+  if (collision.enabled !== true) return []
+  return collision.zones.map((zone, index) => ({
+    id: `${itemId}:legacy:${zone.id || index + 1}`,
+    ...(zone.label ? { label: zone.label } : {}),
+    shape: 'box',
+    transform: {
+      position: [
+        itemTransform.position[0] + zone.offset[0],
+        itemTransform.position[1] + zone.offset[1],
+        itemTransform.position[2] + zone.offset[2],
+      ],
+      rotation: [...itemTransform.rotation],
+      scale: [...zone.size],
+    },
+  }))
+}
+
+function isCollisionPreset(value: unknown): value is WorldCollisionZonePreset {
+  return value === 'wall' || value === 'blocker' || value === 'floor-zone'
 }
 
 function uniqueSceneItemId(baseId: string, usedIds: Set<string>): string {

@@ -391,9 +391,22 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     })
     assert.equal(viewerSource.includes('WorldsTransformToolbar'), true)
     assert.equal(viewerSource.includes('items={visibleItems}'), true)
+    assert.equal(viewerSource.includes('collisionZones={collisionZones}'), true)
+    assert.equal(viewerSource.includes('collisionEditMode={collisionEditMode}'), true)
+    assert.equal(viewerSource.includes('selectedCollisionZoneId={selectedCollisionZoneId}'), true)
     assert.equal(viewerSource.includes('selectedItemIds={selectedItemIds}'), true)
+    assert.equal(viewerSource.includes('onAddCollisionZone={onAddCollisionZone}'), true)
+    assert.equal(viewerSource.includes('onCollisionEditModeChange={onCollisionEditModeChange}'), true)
+    assert.equal(viewerSource.includes('onSelectCollisionZone={onSelectCollisionZone}'), true)
+    assert.equal(viewerSource.includes('const selectCollisionZoneFromCanvas = useCallback((zoneId: string | null) => {'), true)
+    assert.equal(viewerSource.includes('onSelectCollisionZone(zoneId)'), true)
+    assert.equal(viewerSource.includes('function WorldCollisionZoneLayer({'), true)
+    assert.equal(viewerSource.includes('rotation={zone.transform.rotation}'), true)
+    assert.equal(viewerSource.includes('onTransformCollisionZone,'), true)
+    assert.equal(viewerSource.includes('onTransformCollisionZone(zone.id, {'), true)
     assert.equal(viewerSource.includes('const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id))'), true)
     assert.equal(viewerSource.includes('onRemoveItem={onRemoveItem}'), true)
+    assert.equal(viewerSource.includes('onRemoveCollisionZone={onRemoveCollisionZone}'), true)
     assert.equal(viewerSource.includes('onToggleBaseSceneItem={onToggleBaseSceneItem}'), true)
     assert.equal(viewerSource.includes('onSceneItemAnchorChange={onSceneItemAnchorChange}'), true)
     assert.equal(viewerSource.includes('setFocusRequest'), true)
@@ -406,6 +419,7 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('Date.now() < suppressSelectionUntilRef.current'), true)
     assert.equal(viewerSource.includes('selectedItems={selectedItems}'), true)
     assert.equal(viewerSource.includes('onTransformItems={onTransformItems}'), true)
+    assert.equal(viewerSource.includes('onTransformCollisionZone={onTransformCollisionZone}'), true)
     assert.equal(viewerSource.includes('createWorldSceneSelectionTransformUpdates'), true)
     assert.equal(viewerSource.includes('const transformSnapshotRef = useRef<WorldSceneTransformSnapshot[] | null>(null)'), true)
     assert.equal(viewerSource.includes('transformSnapshotRef.current = selectedItems.map((item) => ({'), true)
@@ -444,6 +458,12 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('material.side = THREE.DoubleSide'), true)
     assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
+    assert.equal(viewerSource.includes('WorldCollisionZoneLayer'), true)
+    assert.equal(viewerSource.includes('worldsCollisionZone'), true)
+    assert.equal(viewerSource.includes('onClick={(event) => {'), true)
+    assert.equal(viewerSource.includes('event.stopPropagation()'), true)
+    assert.equal(viewerSource.includes('onSelectCollisionZone(zone.id)'), true)
+    assert.equal(viewerSource.includes('onSelect()'), false)
     assert.equal(viewerSource.includes('calculateWorldsSelectionBounds'), true)
     assert.equal(viewerSource.includes('measureWorldsObjectBounds'), true)
     assert.equal(viewerSource.includes('const [selectedBoundsVersion, setSelectedBoundsVersion] = useState(0)'), true)
@@ -589,6 +609,7 @@ test('WorldsViewer suppresses the immediate post-transform selection event witho
   assert.equal(viewerSource.includes('const WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS = 180'), true)
   assert.equal(viewerSource.includes('if (Date.now() < suppressSelectionUntilRef.current) return'), true)
   assert.equal(viewerSource.includes('suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS'), true)
+  assert.equal(viewerSource.includes('selectCollisionZoneFromCanvas'), true)
   assert.equal(viewerSource.includes('if (transformMode) return'), false)
 })
 
@@ -670,6 +691,46 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
   }
 })
 
+test('WorldsViewer keeps collision zones out of normal render targets, bounds selection, and camera fit contracts', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    assert.equal(viewerSource.includes('if (object.userData.worldsCollisionZone === true) return'), true)
+    assert.equal(viewerSource.includes('collisionEditMode ? ('), true)
+    assert.equal(viewerSource.includes('<WorldCollisionZoneLayer'), true)
+    assert.deepEqual(module.describeWorldsViewerScene([{
+      ...item('ply-mesh', 'mesh.ply'),
+      collision: { enabled: true, zones: [{ id: 'zone-1', shape: 'box', offset: [0, 0, 0], size: [1, 1, 1] }] },
+    }]).renderTargets, [
+      {
+        workspacePath: 'mesh.ply',
+        kind: 'ply-mesh',
+        loader: 'ply',
+        primitive: 'mesh',
+        cameraFit: 'bounds',
+        visibleDescription: 'PLY mesh geometry',
+      },
+    ])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer routes collision zone gizmos through the same drag suppression path as asset gizmos', async () => {
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  assert.equal(viewerSource.includes('draggingRef={transformDraggingRef}'), true)
+  assert.equal(viewerSource.includes('onSelectCollisionZone={selectCollisionZoneFromCanvas}'), true)
+  assert.equal(viewerSource.includes('onDragEndSelectionBlock={handleTransformDragEnd}'), true)
+  assert.equal(viewerSource.includes('draggingRef.current = true'), true)
+  assert.equal(viewerSource.includes('draggingRef.current = false'), true)
+  assert.equal(viewerSource.includes('selectedObject && transformMode && !selectedCollisionZoneId'), true)
+  assert.equal(viewerSource.includes('!(collisionEditMode && selectedCollisionZoneId)'), false)
+  assert.equal(viewerSource.includes('{selected && zoneObject && transformMode ? ('), true)
+  assert.equal(viewerSource.includes('object={zoneObject}'), true)
+})
+
 test('WorldsCameraOverlay exposes compact accessible speed reset and help controls without mode UI', async () => {
   const { source, module, cleanup } = await loadViewerModule()
   const viewerSource = await readFile(viewerEntry, 'utf8')
@@ -737,6 +798,13 @@ test('WorldsTransformToolbar clarifies that multi-select transforms use the acti
 
   assert.equal(toolbarSource.includes('transforms use the active item as the pivot'), true)
   assert.equal(toolbarSource.includes('only the active item gets transform controls'), false)
+  assert.equal(toolbarSource.includes('Add collision zone'), true)
+  assert.equal(toolbarSource.includes('Add box'), false)
+  assert.equal(toolbarSource.includes('Wall'), true)
+  assert.equal(toolbarSource.includes('Blocker'), true)
+  assert.equal(toolbarSource.includes('Floor zone'), true)
+  assert.equal(toolbarSource.includes('World collision zones use the same move, rotate, and scale gizmo as scene assets.'), true)
+  assert.equal(toolbarSource.includes('Remove zone'), true)
 })
 
 test('production Worlds modules keep a static boundary from Generate Viewer3D implementations', async () => {

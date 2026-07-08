@@ -22,6 +22,7 @@ import { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCamera
 import { WorldsKeyboardCameraControls, type WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.tsx'
 import { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
 import WorldsTransformToolbar, { type WorldsTransformMode } from './WorldsTransformToolbar.tsx'
+import type { WorldCollisionZone, WorldCollisionZonePreset } from '../worldsCollisionZones.ts'
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree as any
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree as any
@@ -38,14 +39,22 @@ export type WorldsViewerUnsupportedItem = {
 
 export interface WorldsViewerProps {
   items: WorldSceneItem[]
+  collisionZones?: WorldCollisionZone[]
   unsupportedItems?: WorldsViewerUnsupportedItem[]
   selectedItemId?: string | null
   selectedItemIds?: string[]
+  collisionEditMode?: boolean
+  selectedCollisionZoneId?: string | null
   transformMode?: WorldsTransformMode | null
   onSelectItem?: (itemId: string | null, options?: { toggle?: boolean }) => void
+  onAddCollisionZone?: (preset?: WorldCollisionZonePreset) => void
+  onCollisionEditModeChange?: (enabled: boolean) => void
+  onSelectCollisionZone?: (zoneId: string | null) => void
   onTransformModeChange?: (mode: WorldsTransformMode | null) => void
   onTransformItem?: (itemId: string, transform: WorldSceneItem['transform']) => void
   onTransformItems?: (updates: WorldSceneItemTransformUpdate[]) => void
+  onTransformCollisionZone?: (zoneId: string, transform: WorldCollisionZone['transform']) => void
+  onRemoveCollisionZone?: (zoneId: string | null) => void
   onRemoveItem?: (itemId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
   onSceneItemAnchorChange?: (itemId: string, anchor: [number, number, number] | null) => void
@@ -146,14 +155,22 @@ type WorldsMeasuredBounds = {
 
 export function WorldsViewer({
   items,
+  collisionZones = [],
   unsupportedItems = [],
   selectedItemId = null,
   selectedItemIds = [],
+  collisionEditMode = false,
+  selectedCollisionZoneId = null,
   transformMode = null,
   onSelectItem = () => undefined,
+  onAddCollisionZone = () => undefined,
+  onCollisionEditModeChange = () => undefined,
+  onSelectCollisionZone = () => undefined,
   onTransformModeChange = () => undefined,
   onTransformItem = () => undefined,
   onTransformItems = () => undefined,
+  onTransformCollisionZone = () => undefined,
+  onRemoveCollisionZone = () => undefined,
   onRemoveItem = () => undefined,
   onToggleBaseSceneItem = () => undefined,
   onSceneItemAnchorChange = () => undefined,
@@ -187,6 +204,11 @@ export function WorldsViewer({
     if (Date.now() < suppressSelectionUntilRef.current) return
     onSelectItem(itemId, options)
   }, [onSelectItem])
+  const selectCollisionZoneFromCanvas = useCallback((zoneId: string | null) => {
+    if (transformDraggingRef.current) return
+    if (Date.now() < suppressSelectionUntilRef.current) return
+    onSelectCollisionZone(zoneId)
+  }, [onSelectCollisionZone])
   const handleTransformDragEnd = useCallback(() => {
     suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS
   }, [])
@@ -222,8 +244,12 @@ export function WorldsViewer({
 
   const handleCanvasPointerMissed = useCallback((event: { ctrlKey?: boolean } | undefined) => {
     if (!shouldWorldsPointerMissClearSelection(event)) return
+    if (collisionEditMode) {
+      selectCollisionZoneFromCanvas(null)
+      return
+    }
     selectSceneItemFromCanvas(null)
-  }, [selectSceneItemFromCanvas])
+  }, [collisionEditMode, selectCollisionZoneFromCanvas, selectSceneItemFromCanvas])
 
   return (
     <section
@@ -243,16 +269,23 @@ export function WorldsViewer({
         }}
         helpText={WORLDS_CAMERA_HELP_TEXT}
       />
-      <WorldsTransformToolbar
-        items={visibleItems}
-        selectedItemId={selectedItemId}
-        selectedItemIds={selectedItemIds}
-        mode={transformMode}
-        onSelectItem={onSelectItem}
-        onModeChange={onTransformModeChange}
-        onRemoveItem={onRemoveItem}
-        onToggleBaseSceneItem={onToggleBaseSceneItem}
-      />
+        <WorldsTransformToolbar
+          items={visibleItems}
+          collisionZones={collisionZones}
+          selectedItemId={selectedItemId}
+          selectedItemIds={selectedItemIds}
+          collisionEditMode={collisionEditMode}
+          selectedCollisionZoneId={selectedCollisionZoneId}
+          mode={transformMode}
+          onSelectItem={onSelectItem}
+          onAddCollisionZone={onAddCollisionZone}
+          onCollisionEditModeChange={onCollisionEditModeChange}
+          onSelectCollisionZone={onSelectCollisionZone}
+          onModeChange={onTransformModeChange}
+          onRemoveItem={onRemoveItem}
+          onRemoveCollisionZone={onRemoveCollisionZone}
+          onToggleBaseSceneItem={onToggleBaseSceneItem}
+        />
       <WorldsPlaybackControls
         durationSeconds={playbackDuration}
         playing={playbackPlaying}
@@ -308,6 +341,17 @@ export function WorldsViewer({
                 </Suspense>
               </WorldSceneItemErrorBoundary>
             ))}
+            {collisionEditMode ? (
+              <WorldCollisionZoneLayer
+                collisionZones={collisionZones}
+                selectedCollisionZoneId={selectedCollisionZoneId}
+                transformMode={transformMode}
+                draggingRef={transformDraggingRef}
+                onSelectCollisionZone={selectCollisionZoneFromCanvas}
+                onDragEndSelectionBlock={handleTransformDragEnd}
+                onTransformCollisionZone={onTransformCollisionZone}
+              />
+            ) : null}
           </Selection>
           {selectedSceneObjects.secondaryObjects.map((object) => (
             <WorldsSelectionSilhouette
@@ -328,7 +372,7 @@ export function WorldsViewer({
               renderOrder={2}
             />
           ) : null}
-          {selectedObject && transformMode ? (
+          {selectedObject && transformMode && !selectedCollisionZoneId ? (
             <WorldsTransformControls
               object={selectedObject}
               mode={transformMode}
@@ -371,6 +415,8 @@ export function WorldsViewer({
           rotateSpeed={WORLD_VIEWER_ORBIT_CONTROLS.rotateSpeed}
         />
         <WorldsKeyboardCameraControls
+          items={visibleItems}
+          collisionZones={collisionZones}
           speed={cameraState.speed}
           inputScopeRef={inputScopeRef}
           orbitControlsRef={orbitControlsRef}
@@ -725,6 +771,7 @@ export function resolveWorldsSceneItemIdFromObject(object: THREE.Object3D | null
   while (current) {
     if (current.userData.worldsSelectionHitbox === true) return null
     if (current.userData.worldsSelectionSilhouette === true) return null
+    if (current.userData.worldsCollisionZone === true) return null
     const itemId = current.userData.worldsSceneItemId
     if (typeof itemId === 'string' && itemId.length > 0) return itemId
     current = current.parent
@@ -765,6 +812,7 @@ export function measureWorldsObjectBounds(
   target.traverse((object) => {
     if (object.userData.worldsSelectionHitbox === true) return
     if (object.userData.worldsSelectionSilhouette === true) return
+    if (object.userData.worldsCollisionZone === true) return
 
     const geometry = (object as THREE.Mesh | THREE.Points).geometry
     if (!geometry) return
@@ -854,6 +902,106 @@ function WorldsSelectionHitbox({
       <boxGeometry args={[1, 1, 1]} />
       <meshBasicMaterial transparent opacity={0} depthWrite={false} color="#ffffff" />
     </mesh>
+  )
+}
+
+function WorldCollisionZoneLayer({
+  collisionZones,
+  selectedCollisionZoneId,
+  transformMode,
+  draggingRef,
+  onSelectCollisionZone,
+  onDragEndSelectionBlock,
+  onTransformCollisionZone,
+}: {
+  collisionZones: WorldCollisionZone[]
+  selectedCollisionZoneId: string | null
+  transformMode: WorldsTransformMode | null
+  draggingRef: RefObject<boolean>
+  onSelectCollisionZone: (zoneId: string | null) => void
+  onDragEndSelectionBlock: () => void
+  onTransformCollisionZone: (zoneId: string, transform: WorldCollisionZone['transform']) => void
+}): JSX.Element | null {
+  if (collisionZones.length === 0) return null
+
+  return (
+    <>
+      {collisionZones.map((zone) => (
+        <WorldCollisionZoneObject
+          key={zone.id}
+          zone={zone}
+          selected={selectedCollisionZoneId === zone.id}
+          transformMode={transformMode}
+          draggingRef={draggingRef}
+          onSelectCollisionZone={onSelectCollisionZone}
+          onDragEndSelectionBlock={onDragEndSelectionBlock}
+          onTransformCollisionZone={onTransformCollisionZone}
+        />
+      ))}
+    </>
+  )
+}
+
+function WorldCollisionZoneObject({
+  zone,
+  selected,
+  transformMode,
+  draggingRef,
+  onSelectCollisionZone,
+  onDragEndSelectionBlock,
+  onTransformCollisionZone,
+}: {
+  zone: WorldCollisionZone
+  selected: boolean
+  transformMode: WorldsTransformMode | null
+  draggingRef: RefObject<boolean>
+  onSelectCollisionZone: (zoneId: string | null) => void
+  onDragEndSelectionBlock: () => void
+  onTransformCollisionZone: (zoneId: string, transform: WorldCollisionZone['transform']) => void
+}): JSX.Element {
+  const [zoneObject, setZoneObject] = useState<THREE.Mesh | null>(null)
+  const syncZone = useCallback(() => {
+    if (!zoneObject) return
+    onTransformCollisionZone(zone.id, {
+      position: zoneObject.position.toArray() as [number, number, number],
+      rotation: [zoneObject.rotation.x, zoneObject.rotation.y, zoneObject.rotation.z],
+      scale: zoneObject.scale.toArray().map((component) => Math.max(component, 0.05)) as [number, number, number],
+    })
+  }, [onTransformCollisionZone, zone.id, zoneObject])
+
+  return (
+    <>
+      <mesh
+        ref={setZoneObject}
+        userData={{ worldsCollisionZone: true }}
+        position={zone.transform.position}
+        rotation={zone.transform.rotation}
+        scale={zone.transform.scale}
+        onClick={(event) => {
+          event.stopPropagation()
+          onSelectCollisionZone(zone.id)
+        }}
+      >
+        <boxGeometry args={[1, 1, 1]} />
+        <meshBasicMaterial color={selected ? '#38bdf8' : '#f59e0b'} wireframe transparent opacity={selected ? 0.85 : 0.55} depthWrite={false} />
+      </mesh>
+      {selected && zoneObject && transformMode ? (
+        <TransformControls
+          object={zoneObject}
+          mode={transformMode}
+          space="local"
+          onMouseDown={() => {
+            draggingRef.current = true
+          }}
+          onMouseUp={() => {
+            draggingRef.current = false
+            onDragEndSelectionBlock()
+            syncZone()
+          }}
+          onObjectChange={syncZone}
+        />
+      ) : null}
+    </>
   )
 }
 

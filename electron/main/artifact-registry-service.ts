@@ -35,6 +35,7 @@ const ENCODED_WORKSPACE_ESCAPE_PATTERN = /%2e|%2f|%5c/i
 const ASSET_LIBRARY_INTERNAL_SUFFIXES = [SIDECAR_SUFFIX, '.rigmeta.json', HUMANOID_DRAFT_SIDECAR_SUFFIX, HUMANOID_PROMOTION_SIDECAR_SUFFIX] as const
 const ASSET_LIBRARY_SCOPED_ROOTS = ['Workflows', 'Exports'] as const
 const ASSET_LIBRARY_MESH_EXTENSIONS = new Set(['glb', 'gltf', 'obj', 'stl', 'ply'])
+const WORKSPACE_ARTIFACT_AUDIO_EXTENSIONS = new Set(['wav', 'mp3', 'ogg', 'flac'])
 const ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES = new Set(['tmp', 'temp', 'cache'])
 const ASSET_LIBRARY_MANIFEST_SCHEMA_CAPABILITIES: Record<string, AssetLibraryManifestCapability> = {
   'modly.generated-world.v1': 'generated-world',
@@ -297,7 +298,7 @@ export function classifyAssetLibraryCandidate(candidate: AssetLibraryClassificat
     return { capability: 'mesh', state: 'ready' }
   }
 
-  if (candidate.previewKind === '3d-model' || candidate.previewKind === 'none') {
+  if (candidate.previewKind === '3d-model' || candidate.previewKind === 'audio' || candidate.previewKind === 'none') {
     return { capability: undefined, state: 'unknown-metadata' }
   }
 
@@ -354,11 +355,12 @@ function resolveAssetLibraryPreviewKind(workspacePath: string): AssetLibraryPrev
   const extension = resolveWorkspaceArtifactExtension(workspacePath)
   if (extension === 'glb' || extension === 'gltf') return '3d-model'
   if (isWorkspaceArtifactTextPreviewExtension(extension)) return 'text'
+  if (isWorkspaceArtifactAudioPreviewExtension(extension)) return 'audio'
   return extension ? 'binary' : 'none'
 }
 
 function isArtifactKind(value: unknown): value is ArtifactKind {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene'
+  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio'
 }
 
 function isAssetLibraryManifestCapability(value: unknown): value is AssetLibraryManifestCapability {
@@ -854,6 +856,14 @@ function mapWorkspaceArtifactPreviewToLibraryPayload(result: Extract<WorkspaceAr
       truncated: result.truncated,
     }
   }
+  if (result.status === 'audio') {
+    return {
+      kind: 'audio',
+      audioKind: result.audioKind,
+      byteLength: result.byteLength,
+      sourceUrl: result.sourceUrl,
+    }
+  }
   if (result.status === 'binary') {
     return {
       kind: 'binary',
@@ -1219,6 +1229,10 @@ function resolveWorkspaceArtifactExtension(workspacePath: string): string {
 
 function isWorkspaceArtifactTextPreviewExtension(extension: string): boolean {
   return new Set(['json', 'bvh', 'txt', 'log', 'md', 'csv', 'yaml', 'yml']).has(extension)
+}
+
+function isWorkspaceArtifactAudioPreviewExtension(extension: string): extension is 'wav' | 'mp3' | 'ogg' | 'flac' {
+  return WORKSPACE_ARTIFACT_AUDIO_EXTENSIONS.has(extension)
 }
 
 function resolveWorkspaceArtifactBinaryKind(extension: string): string {
@@ -2689,6 +2703,18 @@ export async function previewWorkspaceArtifact(request: WorkspaceArtifactPreview
         workspacePath: normalized.workspacePath,
         displayName,
         viewerKind: extension as 'glb' | 'gltf',
+      }
+    }
+
+    if (isWorkspaceArtifactAudioPreviewExtension(extension)) {
+      return {
+        success: true,
+        status: 'audio',
+        workspacePath: normalized.workspacePath,
+        displayName,
+        byteLength: fileStats.size,
+        audioKind: extension,
+        sourceUrl: `/workspace/${normalized.workspacePath}`,
       }
     }
 

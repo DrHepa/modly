@@ -178,7 +178,7 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio'], boundary: 'ui_only', headless: false },
     },
   },
 ]
@@ -244,7 +244,7 @@ type PartialCapabilityAutomationMetadata = {
   substitution?: PartialCapabilitySubstitutionMetadata
 }
 
-const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene'])
+const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio'])
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
   const pauseSupported = input?.pause?.supported === true
@@ -271,7 +271,7 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
 }
 
 function isProcessPortType(value: unknown): value is ProcessPortType {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene'
+  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio'
 }
 
 function normalizeLegacyProcessPort(
@@ -413,15 +413,16 @@ export function parseExtensionManifest(
     const ownerId = node.weight_owner_id ?? node.id
     const weightOwnerId = `${extensionId}/${ownerId}`
     const legacyPaths = [...(legacyPathsByOwner.get(weightOwnerId) ?? [capabilityId])]
-    const modelOwnership = parsed.type === 'process'
-      ? {}
-      : {
+    const hasModelAssets = Boolean(node.hf_repo || node.download_check || node.weight_owner_id)
+    const modelOwnership = parsed.type !== 'process' || hasModelAssets
+      ? {
           capabilityId,
           bundleId: extensionId,
           weightOwnerId,
           sharedOwner: legacyPaths.length > 1,
           legacyPaths,
         }
+      : {}
 
     const automationMetadata = parsed.type === 'process' || node.automation
       ? { automation: normalizeCapabilityAutomationMetadata(node.automation) }

@@ -1516,6 +1516,15 @@ export type Viewer3DArtifactPreviewState =
       truncated: boolean
     }
   | {
+      status: 'audio'
+      title: string
+      workspacePath: string
+      displayName: string
+      byteLength: number
+      audioKind: 'wav' | 'mp3' | 'ogg' | 'flac'
+      sourceUrl: string
+    }
+  | {
       status: 'binary'
       title: string
       workspacePath: string
@@ -2710,6 +2719,18 @@ function applyViewer3DMotionRetargetArtifactPreviewResult(
       byteLength: result.byteLength,
       binaryKind: result.binaryKind,
       message: result.message,
+    }
+  }
+
+  if (result.status === 'audio') {
+    return {
+      status: 'audio',
+      title: artifact.label,
+      workspacePath: result.workspacePath,
+      displayName: result.displayName,
+      byteLength: result.byteLength,
+      audioKind: result.audioKind,
+      sourceUrl: result.sourceUrl,
     }
   }
 
@@ -5495,6 +5516,13 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 <p className="mb-2 text-xs text-zinc-400">{artifactPreviewState.byteLength} bytes{artifactPreviewState.truncated ? ' · preview truncated' : ''}</p>
                 <pre className="max-h-[40vh] overflow-auto rounded-xl bg-black/40 p-3 text-xs text-zinc-100">{artifactPreviewState.content}</pre>
               </>
+            ) : artifactPreviewState.status === 'audio' ? (
+              <div className="space-y-3 rounded-xl bg-black/30 p-3 text-xs text-zinc-200">
+                <audio controls preload="metadata" className="w-full" src={artifactPreviewState.sourceUrl}>
+                  Your browser does not support audio playback.
+                </audio>
+                <p className="text-zinc-400">{artifactPreviewState.audioKind.toUpperCase()} · {artifactPreviewState.byteLength} bytes</p>
+              </div>
             ) : (
               <div className="space-y-2 rounded-xl bg-black/30 p-3 text-xs text-zinc-200">
                 <p>{artifactPreviewState.message}</p>

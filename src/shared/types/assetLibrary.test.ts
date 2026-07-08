@@ -28,7 +28,7 @@ test('declares the capability-first asset library taxonomy and entry states', ()
   ])
   assert.deepEqual(ASSET_ENTRY_STATES, ['ready', 'unknown-metadata', 'unsupported', 'unsafe'])
   assert.deepEqual(ASSET_LIBRARY_SOURCE_SCOPES, ['workflows', 'exports'])
-  assert.deepEqual(ASSET_LIBRARY_PREVIEW_KINDS, ['3d-model', 'text', 'binary', 'none'])
+  assert.deepEqual(ASSET_LIBRARY_PREVIEW_KINDS, ['3d-model', 'text', 'audio', 'binary', 'none'])
   assert.deepEqual(ASSET_LIBRARY_MANIFEST_CAPABILITIES, ['generated-world', 'scene-manifest'])
 })
 

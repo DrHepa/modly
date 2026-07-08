@@ -10,7 +10,7 @@ export const ASSET_CAPABILITIES = [
 ] as const
 
 export const ASSET_ENTRY_STATES = ['ready', 'unknown-metadata', 'unsupported', 'unsafe'] as const
-export const ASSET_LIBRARY_PREVIEW_KINDS = ['3d-model', 'text', 'binary', 'none'] as const
+export const ASSET_LIBRARY_PREVIEW_KINDS = ['3d-model', 'text', 'audio', 'binary', 'none'] as const
 export const ASSET_LIBRARY_MANIFEST_CAPABILITIES = ['generated-world', 'scene-manifest'] as const
 export const ASSET_LIBRARY_SOURCE_SCOPES = ['workflows', 'exports'] as const
 
@@ -63,6 +63,12 @@ export type AssetLibraryPreviewPayload =
       content: string
       byteLength: number
       truncated: boolean
+    }
+  | {
+      kind: 'audio'
+      audioKind: 'wav' | 'mp3' | 'ogg' | 'flac'
+      byteLength: number
+      sourceUrl: string
     }
   | {
       kind: 'binary'

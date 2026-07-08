@@ -541,6 +541,11 @@ test('classifies asset library entries by capability evidence instead of file ex
       expected: { capability: 'mesh', state: 'ready' },
     },
     {
+      name: 'audio stays indexed as unknown metadata instead of being dropped',
+      input: { workspacePath: 'Workflows/audio/theme.ogg', previewKind: 'audio' },
+      expected: { capability: undefined, state: 'unknown-metadata' },
+    },
+    {
       name: 'rigged-mesh',
       input: { workspacePath: 'Workflows/generated/hero.glb', artifactKind: 'mesh', previewKind: '3d-model', evidence: { rigMeta: true } },
       expected: { capability: 'rigged-mesh', state: 'ready' },
@@ -1251,6 +1256,25 @@ test('workspace artifact preview classifies NPZ as binary and GLB as Viewer3D-ow
       workspacePath: 'Workflows/kimodo/run-1/animated.glb',
       displayName: 'animated.glb',
       viewerKind: 'glb',
+    })
+  })
+})
+
+test('workspace artifact preview recognizes audio artifacts with direct workspace playback URLs', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows/audio/run-1'), { recursive: true })
+    await writeFile(path.join(workspaceDir, 'Workflows/audio/run-1/theme.wav'), new Uint8Array([82, 73, 70, 70]))
+
+    const result = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'Workflows/audio/run-1/theme.wav' })
+
+    assert.deepEqual(result, {
+      success: true,
+      status: 'audio',
+      workspacePath: 'Workflows/audio/run-1/theme.wav',
+      displayName: 'theme.wav',
+      byteLength: 4,
+      audioKind: 'wav',
+      sourceUrl: '/workspace/Workflows/audio/run-1/theme.wav',
     })
   })
 })

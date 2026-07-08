@@ -58,6 +58,7 @@ const IO_STYLES: Record<ArtifactKind, string> = {
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',
   scene: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
   text:  'bg-amber-500/15 text-amber-400 border-amber-500/25',
+  audio: 'bg-pink-500/15 text-pink-400 border-pink-500/25',
 }
 
 function IoBadge({ type }: { type: ArtifactKind }) {

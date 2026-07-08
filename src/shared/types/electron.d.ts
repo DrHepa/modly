@@ -632,6 +632,15 @@ export type WorkspaceArtifactPreviewResult =
     }
   | {
       success: true
+      status: 'audio'
+      workspacePath: string
+      displayName: string
+      byteLength: number
+      audioKind: 'wav' | 'mp3' | 'ogg' | 'flac'
+      sourceUrl: string
+    }
+  | {
+      success: true
       status: 'binary'
       workspacePath: string
       displayName: string

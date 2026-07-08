@@ -21,6 +21,7 @@ export const PROCESS_PORT_HANDLE_COLOR: Record<ArtifactType, string> = {
   mesh: '#a78bfa',
   scene: '#34d399',
   text: '#fbbf24',
+  audio: '#f472b6',
 }
 
 export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessTargetPort[] {

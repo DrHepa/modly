@@ -1076,6 +1076,8 @@ interface WorkflowRunStore {
   whileProgress:    Record<string, { current: number; total: number | null }>
   /** iterator ids paused together at a shared boundary (lockstep For Each group) */
   pausedGroup:      string[]
+  /** nodeId → workspace URL for video outputs */
+  nodeVideoOutputs: Record<string, string>
 
   run:         (workflow: Workflow, allExtensions: WorkflowExtension[], overrideImageData?: string) => Promise<void>
   cancel:      () => void
@@ -1163,6 +1165,19 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     return out
   }
 
+  const collectVideoOutputs = (ctx: RunContext): Record<string, string> => {
+    const out: Record<string, string> = {}
+    for (const [nodeId, o] of ctx.nodeOutputs) {
+      if (o.outputType === 'video' && o.filePath) {
+        const norm = o.filePath.replace(/\\/g, '/')
+        if (norm.startsWith(ctx.workspaceDir)) {
+          out[nodeId] = `/workspace/${norm.slice(ctx.workspaceDir.length).replace(/^\//, '')}`
+        }
+      }
+    }
+    return out
+  }
+
   const finalize = (ctx: RunContext, finalWaitStates?: Record<string, WaitState>): void => {
     if (!isCurrentContext(ctx)) return
     syncCheckpoints(ctx)
@@ -1207,6 +1222,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       pausedGroup:      [],
       waitStates:       finalWaitStates ?? s.waitStates,
       nodeImageOutputs: collectImageOutputs(ctx),
+      nodeVideoOutputs: collectVideoOutputs(ctx),
       runState: {
         status:        'done',
         blockIndex:    0,
@@ -1228,7 +1244,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {},
     activeNodeId:     null,
     activeWorkflowId: null,
-    nodeImageOutputs: {},
+    nodeImageOutputs: {}, nodeVideoOutputs: {},
     waitStates:       {},
     runningBranchId:  null,
     whileProgress:    {},
@@ -1341,6 +1357,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           forEachGroups.set(l.lastIdx, g)
         }
       }
+
       for (const group of forEachGroups.values()) {
         const union = new Set<string>()
         let maxIter = 0
@@ -1357,7 +1374,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
       set({
         activeWorkflowId: workflow.id,
-        nodeImageOutputs: {},
+        nodeImageOutputs: {}, nodeVideoOutputs: {},
         // Top-level Waits are pending; nested Waits start blocked until their parent finishes.
         waitStates:       Object.fromEntries(waitIds.map((id) => [id, parentWait.get(id) ? 'blocked' as WaitState : 'pending' as WaitState])),
         runningBranchId:  null,
@@ -1782,7 +1799,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         _activeJobId.current = null
       }
       _ctx.current = null
-      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, nodeVideoOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
       if (ctx && useAppStore.getState().currentJob?.id === ctx.jobId) useAppStore.getState().setCurrentJob(null)
     },
 
@@ -1794,7 +1811,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       _pauseRequested.current = false
       flushResume()
       _ctx.current = null
-      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      set({ executionId: null, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, nodeVideoOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
     },
 
     getCheckpointOwner(nodeId) {

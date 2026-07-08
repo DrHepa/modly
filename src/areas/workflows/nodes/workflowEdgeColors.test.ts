@@ -49,3 +49,7 @@ test('target colors preserve positional, named, audio and custom port dialects',
   assert.equal(resolveWorkflowEdgeTargetColor({ targetExtension: { input: 'audio' } }), PROCESS_PORT_HANDLE_COLOR.audio)
   assert.equal(resolveWorkflowEdgeTargetColor({ targetExtension: { inputs: ['image'] }, targetHandle: 'input-9' }), '#52525b')
 })
+
+test('video preview node uses the video handle color as target color', () => {
+  assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'previewVideoNode' }), PROCESS_PORT_HANDLE_COLOR.video)
+})

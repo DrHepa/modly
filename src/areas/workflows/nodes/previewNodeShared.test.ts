@@ -7,7 +7,9 @@ import {
   PREVIEW_VIEWS_NODE_TYPE,
   isPreviewNodeType,
   normalizePreviewImageUrl,
+  normalizePreviewVideoUrl,
   resolvePreviewImageUrl,
+  resolvePreviewVideoUrl,
 } from './previewNodeShared.ts'
 
 test('normalizePreviewImageUrl prefixes workspace-relative outputs with apiUrl', () => {
@@ -124,4 +126,24 @@ test('current API changes, rewiring and disconnection retain the authoritative u
   assert.equal(resolvePreviewImageUrl({ ...args, apiUrl: '' }), undefined)
   assert.equal(resolvePreviewImageUrl({ ...args, apiUrl: 'http://127.0.0.1:9000', edges: [] }), undefined)
   assert.equal(resolvePreviewImageUrl({ ...args, apiUrl: 'http://127.0.0.1:9000', nodeImageOutputs: {} }), undefined)
+})
+
+
+test('normalizePreviewVideoUrl prefixes workspace-relative outputs with apiUrl', () => {
+  const videoUrl = normalizePreviewVideoUrl({ videoUrl: '/workspace/video/generated.mp4', apiUrl: 'http://127.0.0.1:8000' })
+
+  assert.equal(videoUrl, 'http://127.0.0.1:8000/workspace/video/generated.mp4')
+})
+
+test('resolvePreviewVideoUrl returns the upstream video output for the first incoming edge', () => {
+  const videoUrl = resolvePreviewVideoUrl({
+    nodeId: 'preview-video',
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'source-a', target: 'preview-video' }],
+    nodeVideoOutputs: {
+      'source-a': '/workspace/video/generated.mp4',
+    },
+  })
+
+  assert.equal(videoUrl, 'http://127.0.0.1:8000/workspace/video/generated.mp4')
 })

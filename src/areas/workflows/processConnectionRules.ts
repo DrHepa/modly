@@ -2,6 +2,7 @@ import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
 import { getProcessTargetPort, getProcessTargetPorts, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
+import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
 
 import { resolveDataSource } from './nodeBehaviors.ts'
 
@@ -99,8 +100,28 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
 
 export function validateProcessConnection({ connection, nodes, edges, allExtensions }: ConnectionValidationContext): ProcessConnectionRuleIssue | null {
   const targetNode = getNodeById(nodes, connection.target)
+  if (!targetNode) return null
+
+  const previewTargetKind = previewNodeTargetArtifactKind(targetNode.type)
+  if (previewTargetKind) {
+    const actualType = resolveNodeOutputType(getNodeById(nodes, connection.source), allExtensions)
+    if (actualType && actualType !== previewTargetKind) {
+      return createIssue({
+        phase: 'connect',
+        code: 'type-mismatch',
+        targetNodeId: targetNode.id,
+        targetHandle: connection.targetHandle ?? null,
+        portName: previewTargetKind,
+        expectedType: previewTargetKind,
+        actualType,
+        sourceNodeId: connection.source ?? undefined,
+      })
+    }
+    return null
+  }
+
   const targetExtension = getPortAwareTargetExtension(targetNode, allExtensions)
-  if (!targetNode || !targetExtension) return null
+  if (!targetExtension) return null
 
   const targetPort = getProcessTargetPort(targetExtension, connection.targetHandle)
   if (!targetPort) return null
@@ -138,6 +159,25 @@ export function validateProcessConnection({ connection, nodes, edges, allExtensi
 export function validateWorkflowProcessRun({ nodes, edges, allExtensions, targetNodeId }: ValidationContext): ProcessConnectionRuleIssue | null {
   for (const node of nodes) {
     if (node.data.enabled === false || (targetNodeId && node.id !== targetNodeId)) continue
+    const previewTargetKind = previewNodeTargetArtifactKind(node.type)
+    if (previewTargetKind) {
+      const previewEdge = edges.find((edge) => edge.target === node.id)
+      const actualType = resolveNodeOutputType(getNodeById(nodes, previewEdge?.source), allExtensions)
+      if (actualType && actualType !== previewTargetKind) {
+        return createIssue({
+          phase: 'run',
+          code: 'type-mismatch',
+          targetNodeId: node.id,
+          targetHandle: previewEdge?.targetHandle ?? null,
+          portName: previewTargetKind,
+          expectedType: previewTargetKind,
+          actualType,
+          sourceNodeId: previewEdge?.source,
+        })
+      }
+      continue
+    }
+
     const extension = getPortAwareTargetExtension(node, allExtensions)
     if (!extension) continue
 

@@ -72,6 +72,21 @@ test('legacyOutputToArtifactRef adapts audio file outputs without coercing them 
   })
 })
 
+test('legacyOutputToArtifactRef adapts video file outputs without coercing them to binary mesh semantics', () => {
+  const video = legacyOutputToArtifactRef(
+    { filePath: '/workspace/video/generated.mp4', outputType: 'video' },
+    { artifactId: 'artifact-video', versionId: 'version-video' },
+  )
+
+  assert.deepEqual(video, {
+    id: 'artifact-video',
+    kind: 'video',
+    uri: '/workspace/video/generated.mp4',
+    versionId: 'version-video',
+    legacy: { filePath: '/workspace/video/generated.mp4', outputType: 'video' },
+  })
+})
+
 test('legacyOutputToArtifactRef adapts text outputs and ignores empty legacy outputs', () => {
   const text = legacyOutputToArtifactRef(
     { text: 'A small robot', outputType: 'text' },
@@ -139,6 +154,20 @@ test('artifactRefToLegacyOutput reconstructs audio outputs when legacy payload i
   assert.deepEqual(artifactRefToLegacyOutput(ref), {
     filePath: '/workspace/audio/theme.wav',
     outputType: 'audio',
+  })
+})
+
+test('artifactRefToLegacyOutput reconstructs video outputs when legacy payload is absent', () => {
+  const ref: ArtifactRef = {
+    id: 'artifact-video',
+    kind: 'video',
+    uri: '/workspace/video/generated.mp4',
+    versionId: 'version-video',
+  }
+
+  assert.deepEqual(artifactRefToLegacyOutput(ref), {
+    filePath: '/workspace/video/generated.mp4',
+    outputType: 'video',
   })
 })
 

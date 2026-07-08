@@ -224,3 +224,13 @@ test('LandmarksNodeGuide renders partial and complete states with real progress 
     await cleanup()
   }
 })
+
+
+test('workflow nodeTypes maps previewVideoNode to the PreviewVideoNode component', async () => {
+  const { module, cleanup } = await bundleModule(nodeTypesEntry, 'workflow-node-types-preview-video')
+  try {
+    assert.equal(module.WORKFLOW_NODE_TYPES.previewVideoNode?.name, 'PreviewVideoNode')
+  } finally {
+    cleanup()
+  }
+})

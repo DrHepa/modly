@@ -19,6 +19,8 @@ const TAG_CLS: Record<string, string> = {
   mesh:  'border-violet-500/30 bg-violet-500/10 text-violet-400',
   scene: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
   text:  'border-amber-500/30 bg-amber-500/10 text-amber-400',
+  audio: 'border-pink-500/30 bg-pink-500/10 text-pink-400',
+  video: 'border-rose-500/30 bg-rose-500/10 text-rose-400',
 }
 
 // ─── ExtensionNode ────────────────────────────────────────────────────────────

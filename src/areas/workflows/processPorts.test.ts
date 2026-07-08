@@ -104,3 +104,19 @@ test('resolves audio process ports and colors as first-class workflow handles', 
   assert.equal(resolveProcessTargetColor(audioProcessNode, 'track'), '#f472b6')
   assert.equal(resolveProcessTargetColor({ input: 'audio' }), '#f472b6')
 })
+
+
+test('resolves video process ports and colors as first-class workflow handles', () => {
+  const videoProcessNode = {
+    input: 'video' as const,
+    inputs: [
+      { name: 'clip', label: 'Clip', type: 'video' as const },
+    ],
+  }
+
+  assert.deepEqual(getProcessTargetPorts(videoProcessNode), [
+    { name: 'clip', label: 'Clip', type: 'video', required: true, isLegacy: false },
+  ])
+  assert.equal(resolveProcessTargetColor(videoProcessNode, 'clip'), '#fb7185')
+  assert.equal(resolveProcessTargetColor({ input: 'video' }), '#fb7185')
+})

@@ -178,7 +178,7 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio', 'video'], boundary: 'ui_only', headless: false },
     },
   },
 ]
@@ -244,7 +244,7 @@ type PartialCapabilityAutomationMetadata = {
   substitution?: PartialCapabilitySubstitutionMetadata
 }
 
-const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio'])
+const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
   const pauseSupported = input?.pause?.supported === true
@@ -271,7 +271,7 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
 }
 
 function isProcessPortType(value: unknown): value is ProcessPortType {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio'
+  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
 }
 
 function normalizeLegacyProcessPort(

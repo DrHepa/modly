@@ -1,7 +1,7 @@
-import { PROCESS_PORT_HANDLE_COLOR, resolveProcessTargetColor } from '../processPorts'
+import { PROCESS_PORT_HANDLE_COLOR, resolveProcessTargetColor } from '../processPorts.ts'
 import type { ArtifactKind } from '../../../shared/types/artifacts.ts'
 
-import { isPreviewNodeType } from './previewNodeShared'
+import { previewNodeTargetArtifactKind } from './previewNodeShared.ts'
 
 type WorkflowEdgeTargetColorArgs = {
   targetNodeType?: string
@@ -14,7 +14,8 @@ type WorkflowEdgeTargetColorArgs = {
 
 export function resolveWorkflowEdgeTargetColor({ targetNodeType, targetExtension = {}, targetHandle }: WorkflowEdgeTargetColorArgs): string {
   if (targetNodeType === 'outputNode' || targetNodeType === 'addToWorldsNode') return PROCESS_PORT_HANDLE_COLOR.mesh
-  if (isPreviewNodeType(targetNodeType)) return PROCESS_PORT_HANDLE_COLOR.image
+  const previewTargetKind = previewNodeTargetArtifactKind(targetNodeType)
+  if (previewTargetKind) return PROCESS_PORT_HANDLE_COLOR[previewTargetKind]
 
   return resolveProcessTargetColor(targetExtension, targetHandle)
 }

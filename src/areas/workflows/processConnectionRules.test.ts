@@ -35,6 +35,19 @@ function createProcessExtension(inputs?: WorkflowExtension['inputs']): WorkflowE
   }
 }
 
+
+function createVideoProcessExtension(): WorkflowExtension {
+  return {
+    ...createProcessExtension(),
+    id: 'ext/video-producer',
+    extensionId: 'ext',
+    nodeId: 'video-producer',
+    name: 'Video Producer',
+    input: 'image',
+    output: 'video',
+  }
+}
+
 function createSceneProcessExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
   return {
     ...createProcessExtension([{ name: 'input_scene', type: 'scene' }]),
@@ -295,5 +308,66 @@ test('rejects scene outputs wired into non-scene process ports', () => {
     expectedType: 'image',
     actualType: 'scene',
     sourceNodeId: 'source-node',
+  })
+})
+
+test('rejects non-video sources connected to Preview Video nodes at connect time', () => {
+  const source = createNode('source-node', 'imageNode')
+  const target = createNode('target-node', 'previewVideoNode')
+
+  const issue = validateProcessConnection({
+    connection: createConnection({}),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'connect',
+    code: 'type-mismatch',
+    message: 'Port "video" expects video but received image.',
+    targetNodeId: 'target-node',
+    targetHandle: null,
+    portName: 'video',
+    expectedType: 'video',
+    actualType: 'image',
+    sourceNodeId: 'source-node',
+  })
+})
+
+test('accepts video extension outputs connected to Preview Video nodes', () => {
+  const source = createNode('source-node', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} })
+  const target = createNode('target-node', 'previewVideoNode')
+
+  const issue = validateProcessConnection({
+    connection: createConnection({}),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [createVideoProcessExtension()],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('rejects persisted video outputs wired into image preview nodes before run', () => {
+  const source = createNode('video-source', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} })
+  const target = createNode('preview-image', 'previewImageNode')
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [source, target],
+    edges: [{ id: 'edge-video-preview', source: 'video-source', target: 'preview-image' }],
+    allExtensions: [createVideoProcessExtension()],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'run',
+    code: 'type-mismatch',
+    message: 'Port "image" expects image but received video.',
+    targetNodeId: 'preview-image',
+    targetHandle: null,
+    portName: 'image',
+    expectedType: 'image',
+    actualType: 'video',
+    sourceNodeId: 'video-source',
   })
 })

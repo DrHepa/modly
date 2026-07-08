@@ -1088,6 +1088,8 @@ export interface WorkflowRunStore {
   pendingReplacement?: ArtifactRef
   /** nodeId → workspace URL for image outputs (populated after each run) */
   nodeImageOutputs: Record<string, string>
+  /** nodeId → workspace URL for video outputs (populated after each run) */
+  nodeVideoOutputs: Record<string, string>
   /** nodeId → ArtifactRef wrapper for legacy node outputs */
   nodeArtifacts: Record<string, ArtifactRef>
   /** artifactId → immutable-original lineage metadata */
@@ -1116,6 +1118,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
   activeWorkflowId: null,
   pendingReplacement: undefined,
   nodeImageOutputs: {},
+  nodeVideoOutputs: {},
   nodeArtifacts: {},
   artifactLineages: {},
   landmarkSidecars: {},
@@ -1141,6 +1144,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       activeWorkflowId: workflow.id,
       pendingReplacement: undefined,
       nodeImageOutputs: {},
+      nodeVideoOutputs: {},
       nodeArtifacts: {},
       artifactLineages: {},
       landmarkSidecars: {},
@@ -1718,6 +1722,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         const norm = nodeInputPath?.replace(/\\/g, '/')
         if (
           norm?.startsWith(workspaceDir) &&
+          outputType === 'mesh' &&
           workflow.edges.some((e) => e.source === node.id && addToSceneNodeIds.has(e.target))
         ) {
           useAppStore.getState().updateCurrentJob({
@@ -1734,12 +1739,18 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           }
         }
       }
-      for (const group of forEachGroups.values()) {
-        const union = new Set<string>()
-        let maxIter = 0
-        for (const l of group) {
-          l.bodyIds.forEach((id) => union.add(id))
-          if (l.iterations != null) maxIter = Math.max(maxIter, l.iterations)
+
+      // ── Collect media outputs for preview nodes ──────────────────────
+      const imageOutputs: Record<string, string> = {}
+      const videoOutputs: Record<string, string> = {}
+      for (const [nodeId, out] of nodeOutputs) {
+        if ((out.outputType === 'image' || out.outputType === 'video') && out.filePath) {
+          const norm = out.filePath.replace(/\\/g, '/')
+          if (norm.startsWith(workspaceDir)) {
+            const workspaceUrl = `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
+            if (out.outputType === 'image') imageOutputs[nodeId] = workspaceUrl
+            if (out.outputType === 'video') videoOutputs[nodeId] = workspaceUrl
+          }
         }
         if (maxIter > 0) loopExtraSteps += (maxIter - 1) * union.size
       }
@@ -1782,6 +1793,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       set((s) => ({
         activeNodeId:     null,
         nodeImageOutputs: imageOutputs,
+        nodeVideoOutputs: videoOutputs,
         landmarkSession:  undefined,
         waitCheckpointReview: undefined,
         runState: {
@@ -1796,7 +1808,13 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           ...(s.runState.replacementResult !== undefined ? { replacementResult: s.runState.replacementResult } : {}),
         },
       }))
-      useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, step: undefined, outputUrl, previewKind: undefined })
+      useAppStore.getState().updateCurrentJob({
+        status: 'done',
+        progress: 100,
+        step: undefined,
+        outputUrl: artifact?.kind === 'mesh' ? outputUrl : undefined,
+        previewKind: undefined,
+      })
 
     } catch (err) {
       if (!_cancel.current) {
@@ -1817,13 +1835,13 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       _activeJobId.current = null
     }
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
   },
 
   reset() {
     clearPendingCheckpointState()
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
   },
 
   continueRun(options) {

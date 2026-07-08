@@ -189,6 +189,43 @@ test('parseExtensionManifest accepts audio process ports and audio substitution 
   })
 })
 
+test('parseExtensionManifest accepts video process ports and video substitution metadata', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'video-tools',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [{
+        id: 'trim-video',
+        name: 'Trim Video',
+        input: 'video',
+        output: 'video',
+        inputs: ['video'],
+        input_contract: [{ name: 'clip', label: 'Clip', type: 'video', required: true }],
+        automation: {
+          substitution: { supported: true, artifactKinds: ['video'], boundary: 'ui_only' },
+        },
+      }],
+    },
+    'video-tools',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.equal(extension.nodes[0].input, 'video')
+  assert.equal(extension.nodes[0].output, 'video')
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'clip', label: 'Clip', type: 'video', required: true },
+  ])
+  assert.deepEqual(extension.nodes[0].automation?.substitution, {
+    supported: true,
+    artifactKinds: ['video'],
+    boundary: 'ui_only',
+    headless: false,
+  })
+})
+
 test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headlessly', () => {
   const artifactCapability = (getUiOnlyNodes() as UiOnlyNodeForTest[]).find((node) => node.id === 'artifact-substitution')
 
@@ -203,7 +240,7 @@ test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headle
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio', 'video'], boundary: 'ui_only', headless: false },
     },
   })
 })

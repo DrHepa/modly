@@ -1550,6 +1550,36 @@ test('workflowRunStore sends resolved process image-to-mesh nodes through runPro
   assert.deepEqual(useWorkflowRunStore.getState().nodeArtifacts['process-node']?.kind, 'mesh')
 })
 
+test('workflowRunStore captures video process outputs for video preview nodes without publishing them to Generate Viewer3D', async () => {
+  const ext = createWorkflowExtension({
+    id: 'vendor/image-to-video',
+    extensionId: 'vendor-video-process',
+    nodeId: 'image-to-video',
+    type: 'process',
+    output: 'video',
+  })
+  const workflow = createWorkflow(createNode('video-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: {},
+  }))
+
+  window.electron.extensions.runProcess = async (extensionId: string, input: unknown, params: Record<string, unknown>) => {
+    runProcessCalls.push({ extensionId, input, params })
+    return { success: true, result: { filePath: '/workspace/video/generated.mp4' } }
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/video/generated.mp4')
+  assert.equal(useWorkflowRunStore.getState().runState.artifact?.kind, 'video')
+  assert.deepEqual(useWorkflowRunStore.getState().nodeVideoOutputs, {
+    'video-node': '/workspace/video/generated.mp4',
+  })
+  assert.equal(useAppStore.getState().currentJob?.outputUrl, undefined)
+})
+
 test('workflowRunStore hydrates missing defaults for legacy process nodes before runProcess', async () => {
   const ext = createWorkflowExtension({
     id: 'vendor/legacy-process',

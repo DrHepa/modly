@@ -25,6 +25,8 @@ export default function WorkflowEdge({
     ? PROCESS_PORT_HANDLE_COLOR.text
     : sourceNode?.type === 'meshNode'
     ? PROCESS_PORT_HANDLE_COLOR.mesh
+    : sourceNode?.type === 'sceneNode'
+    ? PROCESS_PORT_HANDLE_COLOR.scene
     : (extensionOutput ? PROCESS_PORT_HANDLE_COLOR[extensionOutput] : '#52525b')
 
   const targetColor = resolveWorkflowEdgeTargetColor({

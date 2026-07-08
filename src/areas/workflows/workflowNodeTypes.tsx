@@ -7,10 +7,11 @@ import Load3DMeshNode from './nodes/Load3DMeshNode'
 import LoadSceneNode from './nodes/LoadSceneNode'
 import PreviewImageNode from './nodes/PreviewImageNode'
 import PreviewViewsNode from './nodes/PreviewViewsNode'
+import PreviewVideoNode from './nodes/PreviewVideoNode'
 import LandmarksNode from './nodes/LandmarksNode'
 import WaitNode from './nodes/WaitNode'
 
-import { PREVIEW_IMAGE_NODE_TYPE, PREVIEW_VIEWS_NODE_TYPE } from './nodes/previewNodeShared'
+import { PREVIEW_IMAGE_NODE_TYPE, PREVIEW_VIDEO_NODE_TYPE, PREVIEW_VIEWS_NODE_TYPE } from './nodes/previewNodeShared'
 
 export const WORKFLOW_NODE_TYPES = {
   extensionNode: ExtensionNode,
@@ -22,6 +23,7 @@ export const WORKFLOW_NODE_TYPES = {
   sceneNode: LoadSceneNode,
   [PREVIEW_IMAGE_NODE_TYPE]: PreviewImageNode,
   [PREVIEW_VIEWS_NODE_TYPE]: PreviewViewsNode,
+  [PREVIEW_VIDEO_NODE_TYPE]: PreviewVideoNode,
   landmarksNode: LandmarksNode,
   waitNode: WaitNode,
 }

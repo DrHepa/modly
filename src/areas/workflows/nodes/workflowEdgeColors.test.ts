@@ -36,3 +36,8 @@ test('resolveWorkflowEdgeTargetColor uses the scene color for scene extension ta
 test('resolveWorkflowEdgeTargetColor keeps mesh outputs targeting scene nodes purple', () => {
   assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'outputNode' }), PROCESS_PORT_HANDLE_COLOR.mesh)
 })
+
+
+test('video preview node uses the video handle color as target color', () => {
+  assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'previewVideoNode' }), PROCESS_PORT_HANDLE_COLOR.video)
+})

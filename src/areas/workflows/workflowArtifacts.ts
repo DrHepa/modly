@@ -111,7 +111,7 @@ export interface EditedCheckpointArtifactRefResult {
   lineageIntent: EditedCheckpointArtifactLineageIntent
 }
 
-const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio'])
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
 
 function isArtifactKind(value: unknown): value is ArtifactKind {
   return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
@@ -176,7 +176,7 @@ export function artifactRefToLegacyOutput(ref: ArtifactRef | undefined): LegacyA
     return undefined
   }
 
-  if ((outputType === 'mesh' || outputType === 'image' || outputType === 'scene' || outputType === 'audio') && filePath === undefined) {
+  if ((outputType === 'mesh' || outputType === 'image' || outputType === 'scene' || outputType === 'audio' || outputType === 'video') && filePath === undefined) {
     return undefined
   }
 

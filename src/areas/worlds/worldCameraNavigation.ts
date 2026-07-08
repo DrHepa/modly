@@ -1,3 +1,8 @@
+import { Box3, Euler, Matrix4, Quaternion, Vector3 } from 'three'
+
+import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import type { WorldCollisionZone } from './worldsCollisionZones.ts'
+
 export interface WorldsCameraState {
   speed: number
   resetToken: number
@@ -17,6 +22,13 @@ export interface WorldsMovementAxes {
   forward: WorldsVector3Like
   right: WorldsVector3Like
   up?: WorldsVector3Like
+}
+
+export interface WorldsCollisionAabb {
+  itemId: string | null
+  zoneId: string
+  min: WorldsVector3Like
+  max: WorldsVector3Like
 }
 
 export interface WorldsYawRotationInput {
@@ -74,6 +86,15 @@ const DIALOG_SCOPE_SELECTOR = 'dialog,[role="dialog"],[aria-modal="true"]'
 const ZERO_VECTOR: WorldsVector3Like = { x: 0, y: 0, z: 0 }
 const WORLD_UP: WorldsVector3Like = { x: 0, y: 1, z: 0 }
 const DEFAULT_FORWARD: WorldsVector3Like = { x: 0, y: 0, z: -1 }
+const worldCollisionMatrix = new Matrix4()
+const worldCollisionQuaternion = new Quaternion()
+const worldCollisionPosition = new Vector3()
+const worldCollisionScale = new Vector3()
+const worldCollisionCorner = new Vector3()
+const worldCollisionBounds = new Box3()
+const worldCameraProbeBounds = new Box3()
+const worldCameraProbePosition = new Vector3()
+const WORLD_CAMERA_COLLISION_HALF_EXTENTS = { x: 0.2, y: 0.35, z: 0.2 } as const
 
 export function createWorldsCameraState(overrides: Partial<WorldsCameraState> = {}): WorldsCameraState {
   return {
@@ -162,6 +183,60 @@ export function rotateWorldsCameraYawTarget({
   }
 }
 
+export function buildWorldSceneCollisionAabbs(collisionZones: WorldCollisionZone[]): WorldsCollisionAabb[] {
+  const collisions: WorldsCollisionAabb[] = []
+
+  for (const zone of collisionZones) {
+    worldCollisionPosition.set(...zone.transform.position)
+    worldCollisionQuaternion.setFromEuler(new Euler(...zone.transform.rotation, 'XYZ'))
+    worldCollisionScale.set(...zone.transform.scale)
+    worldCollisionMatrix.compose(worldCollisionPosition, worldCollisionQuaternion, worldCollisionScale)
+
+    worldCollisionBounds.makeEmpty()
+    for (const xSign of [-1, 1] as const) {
+      for (const ySign of [-1, 1] as const) {
+        for (const zSign of [-1, 1] as const) {
+          worldCollisionCorner.set(0.5 * xSign, 0.5 * ySign, 0.5 * zSign).applyMatrix4(worldCollisionMatrix)
+          worldCollisionBounds.expandByPoint(worldCollisionCorner)
+        }
+      }
+    }
+    collisions.push({
+      itemId: null,
+      zoneId: zone.id,
+      min: vectorFromVector3(worldCollisionBounds.min),
+      max: vectorFromVector3(worldCollisionBounds.max),
+    })
+  }
+
+  return collisions
+}
+
+export function resolveWorldCameraCollisionMovement(
+  position: WorldsVector3Like,
+  delta: WorldsVector3Like,
+  collisions: readonly WorldsCollisionAabb[],
+  halfExtents: WorldsVector3Like = WORLD_CAMERA_COLLISION_HALF_EXTENTS,
+): WorldsVector3Like {
+  if (collisions.length === 0) return delta
+
+  worldCameraProbePosition.set(position.x, position.y, position.z)
+  const allowed = { x: 0, y: 0, z: 0 }
+
+  for (const axis of ['x', 'y', 'z'] as const) {
+    const amount = delta[axis]
+    if (amount === 0) continue
+    worldCameraProbePosition[axis] += amount
+    if (doesWorldCameraProbeIntersect(worldCameraProbePosition, collisions, halfExtents)) {
+      worldCameraProbePosition[axis] -= amount
+      continue
+    }
+    allowed[axis] = amount
+  }
+
+  return allowed
+}
+
 function normalizeMovementKeys(keys: WorldsMovementKeyState): Required<WorldsMovementKeyState> {
   return {
     forward: Boolean(keys.forward),
@@ -171,6 +246,24 @@ function normalizeMovementKeys(keys: WorldsMovementKeyState): Required<WorldsMov
     up: Boolean(keys.up),
     down: Boolean(keys.down),
   }
+}
+
+function doesWorldCameraProbeIntersect(
+  position: Vector3,
+  collisions: readonly WorldsCollisionAabb[],
+  halfExtents: WorldsVector3Like,
+): boolean {
+  worldCameraProbeBounds.min.set(position.x - halfExtents.x, position.y - halfExtents.y, position.z - halfExtents.z)
+  worldCameraProbeBounds.max.set(position.x + halfExtents.x, position.y + halfExtents.y, position.z + halfExtents.z)
+
+  return collisions.some((collision) => (
+    worldCameraProbeBounds.min.x <= collision.max.x
+    && worldCameraProbeBounds.max.x >= collision.min.x
+    && worldCameraProbeBounds.min.y <= collision.max.y
+    && worldCameraProbeBounds.max.y >= collision.min.y
+    && worldCameraProbeBounds.min.z <= collision.max.z
+    && worldCameraProbeBounds.max.z >= collision.min.z
+  ))
 }
 
 function rotateVectorAroundAxis(vector: WorldsVector3Like, axis: WorldsVector3Like, angle: number): WorldsVector3Like {
@@ -213,4 +306,8 @@ function normalizeVector(vector: WorldsVector3Like): WorldsVector3Like {
     y: vector.y / length,
     z: vector.z / length,
   }
+}
+
+function vectorFromVector3(vector: Vector3): WorldsVector3Like {
+  return { x: vector.x, y: vector.y, z: vector.z }
 }

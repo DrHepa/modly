@@ -2,12 +2,16 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  addWorldCollisionZone,
   appendWorldSceneItem,
   attachWorldSceneItemAnimation,
   calculateBaseSceneAnchor,
   calculateWorldSceneItemPlacementOffset,
   createWorldSceneSelectionTransformUpdates,
+  removeWorldCollisionZone,
   resolveWorldSceneItemForPoseClip,
+  resolveWorldCollisionZonePlacementAnchor,
+  updateWorldCollisionZoneTransform,
   updateWorldSceneItemTransforms,
 } from './worldsScenePlacement.ts'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
@@ -155,4 +159,39 @@ test('updateWorldSceneItemTransforms applies batched updates without mutating un
     { ...secondary, transform: { position: [4, 5, 6], rotation: [0.4, 0.5, 0.6], scale: [3, 3, 3] } },
     untouched,
   ])
+})
+
+test('collision placement helpers add, anchor, update, and remove scene-level world zones', () => {
+  const hero = { ...item('hero'), transform: { position: [4, 1, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const base = { ...item('base', 'Workflows/base.glb'), role: 'base-scene' as const, transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+
+  assert.deepEqual(resolveWorldCollisionZonePlacementAnchor([], [hero], { selectedSceneItemId: hero.id }), [4, 1, -2])
+  assert.deepEqual(resolveWorldCollisionZonePlacementAnchor([], [base], { sceneItemAnchors: { [base.id]: [12, 2, -8] } }), [12, 2, -8])
+
+  const added = addWorldCollisionZone([], 'blocker', { anchorPosition: [4, 1, -2] })
+  assert.equal(added.selectedCollisionZoneId, 'collision-box-1')
+  assert.deepEqual(added.collisionZones, [{
+    id: 'collision-box-1',
+    label: 'Blocker 1',
+    shape: 'box',
+    preset: 'blocker',
+    transform: { position: [4, 1, -2], rotation: [0, 0, 0], scale: [1.2, 1.2, 1.2] },
+  }])
+
+  assert.deepEqual(updateWorldCollisionZoneTransform(added.collisionZones, 'collision-box-1', {
+    position: [2, 3, 4],
+    rotation: [0.1, 0.2, 0.3],
+    scale: [5, 0.01, 7],
+  }), [{
+    id: 'collision-box-1',
+    label: 'Blocker 1',
+    shape: 'box',
+    preset: 'blocker',
+    transform: { position: [2, 3, 4], rotation: [0.1, 0.2, 0.3], scale: [5, 0.05, 7] },
+  }])
+
+  assert.deepEqual(removeWorldCollisionZone(added.collisionZones, 'collision-box-1'), {
+    collisionZones: [],
+    selectedCollisionZoneId: null,
+  })
 })

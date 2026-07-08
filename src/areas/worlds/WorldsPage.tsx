@@ -10,16 +10,21 @@ import { useAppStore } from '../../shared/stores/appStore.ts'
 import type { WorldsTransformMode } from './components/WorldsTransformToolbar.tsx'
 import { useWorldsSceneStore } from './worldsSceneStore.ts'
 import {
+  addWorldCollisionZone,
   appendWorldSceneItem,
   attachWorldSceneItemAnimation,
   calculateWorldSceneItemPlacementOffset,
+  removeWorldCollisionZone,
+  resolveWorldCollisionZonePlacementAnchor,
   type WorldSceneItemTransformUpdate,
+  updateWorldCollisionZoneTransform,
   updateWorldSceneItemTransforms,
   removeWorldSceneItem,
   resolveWorldSceneItemForPoseClip,
   toggleWorldSceneItemBaseRole,
   updateWorldSceneItemTransform,
 } from './worldsScenePlacement.ts'
+import type { WorldCollisionZone, WorldCollisionZonePreset } from './worldsCollisionZones.ts'
 import {
   listWorldAssetLibraryRenderables,
   openWorldAssetLibraryRenderable,
@@ -43,8 +48,11 @@ export interface WorldsPageViewProps {
   selectedAssetId: string | null
   selectedSceneItemId: string | null
   selectedSceneItemIds: string[]
+  collisionEditMode: boolean
+  selectedCollisionZoneId: string | null
   transformMode: WorldsTransformMode | null
   sceneItems: WorldSceneItem[]
+  collisionZones: WorldCollisionZone[]
   unsupportedItems: WorldsViewerUnsupportedItem[]
   loadingAssets: boolean
   openingAsset: boolean
@@ -66,6 +74,11 @@ export interface WorldsPageViewProps {
   onTransformModeChange: (mode: WorldsTransformMode | null) => void
   onTransformSceneItem: (itemId: string, transform: WorldSceneItem['transform']) => void
   onTransformSceneItems: (updates: WorldSceneItemTransformUpdate[]) => void
+  onAddCollisionZone: (preset?: WorldCollisionZonePreset) => void
+  onCollisionEditModeChange: (enabled: boolean) => void
+  onSelectCollisionZone: (zoneId: string | null) => void
+  onTransformCollisionZone: (zoneId: string, transform: WorldCollisionZone['transform']) => void
+  onRemoveCollisionZone: (zoneId: string | null) => void
   onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
   onRemoveSceneItem: (itemId: string | null) => void
   onToggleBaseSceneItem: (itemId: string | null) => void
@@ -81,8 +94,11 @@ export function WorldsPageView({
   selectedAssetId,
   selectedSceneItemId,
   selectedSceneItemIds,
+  collisionEditMode,
+  selectedCollisionZoneId,
   transformMode,
   sceneItems,
+  collisionZones,
   unsupportedItems,
   loadingAssets,
   openingAsset,
@@ -104,6 +120,11 @@ export function WorldsPageView({
   onTransformModeChange,
   onTransformSceneItem,
   onTransformSceneItems,
+  onAddCollisionZone,
+  onCollisionEditModeChange,
+  onSelectCollisionZone,
+  onTransformCollisionZone,
+  onRemoveCollisionZone,
   onAnimationMetadata,
   onRemoveSceneItem,
   onToggleBaseSceneItem,
@@ -113,6 +134,7 @@ export function WorldsPageView({
   onImportScene,
 }: WorldsPageViewProps): JSX.Element {
   const hasSceneItems = sceneItems.length > 0
+  const hasSceneContent = hasSceneItems || collisionZones.length > 0
   const sceneActionBusy = savingScene || importingScene
 
   return (
@@ -122,11 +144,19 @@ export function WorldsPageView({
         unsupportedItems={unsupportedItems}
         selectedItemId={selectedSceneItemId}
         selectedItemIds={selectedSceneItemIds}
+        collisionEditMode={collisionEditMode}
+        selectedCollisionZoneId={selectedCollisionZoneId}
         transformMode={transformMode}
+        collisionZones={collisionZones}
         onSelectItem={onSelectSceneItem}
+        onAddCollisionZone={onAddCollisionZone}
+        onCollisionEditModeChange={onCollisionEditModeChange}
+        onSelectCollisionZone={onSelectCollisionZone}
         onTransformModeChange={onTransformModeChange}
         onTransformItem={onTransformSceneItem}
         onTransformItems={onTransformSceneItems}
+        onTransformCollisionZone={onTransformCollisionZone}
+        onRemoveCollisionZone={onRemoveCollisionZone}
         onAnimationMetadata={onAnimationMetadata}
         onRemoveItem={onRemoveSceneItem}
         onToggleBaseSceneItem={onToggleBaseSceneItem}
@@ -157,9 +187,9 @@ export function WorldsPageView({
         <button
           type="button"
           className="rounded-lg px-3 py-2 text-xs font-semibold text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-45"
-          disabled={!hasSceneItems || sceneActionBusy}
+          disabled={!hasSceneContent || sceneActionBusy}
           onClick={onSaveScene}
-          title={hasSceneItems ? 'Save the current Worlds scene manifest' : 'Add assets before saving a Worlds scene'}
+          title={hasSceneContent ? 'Save the current Worlds scene manifest' : 'Add assets or collision zones before saving a Worlds scene'}
         >
           {savingScene ? 'Saving…' : 'Save scene'}
         </button>
@@ -177,7 +207,19 @@ export function WorldsPageView({
   )
 }
 
-export { appendWorldSceneItem, attachWorldSceneItemAnimation, calculateWorldSceneItemPlacementOffset, removeWorldSceneItem, resolveWorldSceneItemForPoseClip, toggleWorldSceneItemBaseRole, updateWorldSceneItemTransform }
+export {
+  addWorldCollisionZone,
+  appendWorldSceneItem,
+  attachWorldSceneItemAnimation,
+  calculateWorldSceneItemPlacementOffset,
+  removeWorldSceneItem,
+  removeWorldCollisionZone,
+  resolveWorldSceneItemForPoseClip,
+  resolveWorldCollisionZonePlacementAnchor,
+  toggleWorldSceneItemBaseRole,
+  updateWorldCollisionZoneTransform,
+  updateWorldSceneItemTransform,
+}
 
 export default function WorldsPage(): JSX.Element {
   const apiUrl = useAppStore((state) => state.apiUrl)
@@ -197,10 +239,15 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
   const transformMode = useWorldsSceneStore((state) => state.workspaceKey === apiUrl ? state.transformMode : null)
   const setWorkspace = useWorldsSceneStore((state) => state.setWorkspace)
   const selectedSceneItemIds = useWorldsSceneStore((state) => state.workspaceKey === apiUrl ? state.selectedSceneItemIds : EMPTY_WORLD_SELECTION)
+  const collisionZones = useWorldsSceneStore((state) => state.collisionZones)
+  const collisionEditMode = useWorldsSceneStore((state) => state.collisionEditMode)
+  const selectedCollisionZoneId = useWorldsSceneStore((state) => state.selectedCollisionZoneId)
   const setSceneItemAnchor = useWorldsSceneStore((state) => state.setSceneItemAnchor)
   const setWorldScene = useWorldsSceneStore((state) => state.setScene)
   const setSelectedSceneItemId = useWorldsSceneStore((state) => state.setSelectedSceneItemId)
   const toggleSelectedSceneItemId = useWorldsSceneStore((state) => state.toggleSelectedSceneItemId)
+  const setCollisionEditMode = useWorldsSceneStore((state) => state.setCollisionEditMode)
+  const setSelectedCollisionZoneId = useWorldsSceneStore((state) => state.setSelectedCollisionZoneId)
   const setTransformMode = useWorldsSceneStore((state) => state.setTransformMode)
   const clearTransformMode = useWorldsSceneStore((state) => state.clearTransformMode)
   const [unsupportedItems, setUnsupportedItems] = useState<WorldsViewerUnsupportedItem[]>([])
@@ -308,10 +355,14 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
           setSceneStatus(`Attached motion to ${result.asset.animation.sourceWorkspacePath}`)
         } else {
           const sceneState = useWorldsSceneStore.getState()
-          setWorldScene(appendWorldSceneItem(sceneState.sceneItems, result.asset.item, {
+          const appended = appendWorldSceneItem(sceneState.sceneItems, result.asset.item, {
             sceneItemAnchors: sceneState.sceneItemAnchors,
             selectedSceneItemId: sceneState.selectedSceneItemId,
-          }))
+          })
+          setWorldScene({
+            ...appended,
+            collisionZones: sceneState.collisionZones,
+          })
           setUnsupportedItems([])
           setSceneStatus(null)
         }
@@ -331,12 +382,13 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
     }
   }
 
-  function attachPoseClipAsset(asset: Extract<WorldAssetLibraryRenderable, { poseClip: true }>): { sceneItems: WorldSceneItem[]; selectedSceneItemId: string | null } {
+  function attachPoseClipAsset(asset: Extract<WorldAssetLibraryRenderable, { poseClip: true }>): { sceneItems: WorldSceneItem[]; collisionZones: WorldCollisionZone[]; selectedSceneItemId: string | null } {
     const sceneState = useWorldsSceneStore.getState()
     const existingTarget = resolveWorldSceneItemForPoseClip(sceneState.sceneItems, asset.animation.sourceWorkspacePath, sceneState.selectedSceneItemId)
     if (existingTarget) {
       return {
         sceneItems: attachWorldSceneItemAnimation(sceneState.sceneItems, existingTarget.id, asset.animation),
+        collisionZones: sceneState.collisionZones,
         selectedSceneItemId: existingTarget.id,
       }
     }
@@ -346,15 +398,20 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
         sceneItemAnchors: sceneState.sceneItemAnchors,
         selectedSceneItemId: sceneState.selectedSceneItemId,
       })
-      return appended
+      return { ...appended, collisionZones: sceneState.collisionZones }
     }
 
-    return { sceneItems: sceneState.sceneItems, selectedSceneItemId: sceneState.selectedSceneItemId }
+    return {
+      sceneItems: sceneState.sceneItems,
+      collisionZones: sceneState.collisionZones,
+      selectedSceneItemId: sceneState.selectedSceneItemId,
+    }
   }
 
   async function saveSceneManifest(): Promise<void> {
-    const currentItems = useWorldsSceneStore.getState().sceneItems
-    if (currentItems.length === 0) return
+      const sceneState = useWorldsSceneStore.getState()
+      const currentItems = sceneState.sceneItems
+      if (currentItems.length === 0 && sceneState.collisionZones.length === 0) return
 
     setSavingScene(true)
     setError(null)
@@ -373,10 +430,10 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
         return
       }
 
-      const result = await window.electron.workspace.worlds.writeSceneManifest({
-        workspacePath,
-        manifest: buildWorldsSceneManifest(currentItems),
-      })
+        const result = await window.electron.workspace.worlds.writeSceneManifest({
+          workspacePath,
+          manifest: buildWorldsSceneManifest(currentItems, sceneState.collisionZones),
+        })
       if (result.success !== true) {
         setError(result.error)
         return
@@ -427,6 +484,7 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
 
       setWorldScene({
         sceneItems: parsed.sceneItems,
+        collisionZones: parsed.collisionZones,
         selectedSceneItemId: parsed.sceneItems.find((item) => item.visible)?.id ?? null,
       })
       setUnsupportedItems([])
@@ -460,11 +518,18 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
 
     setWorldScene({
       sceneItems,
+      collisionZones,
       selectedSceneItemId: nextSelectedSceneItemId,
       selectedSceneItemIds: nextSelectedSceneItemIds,
     })
-    if (!nextSelectedSceneItemId) clearTransformMode()
-  }, [clearTransformMode, sceneItems, selectedSceneItemId, selectedSceneItemIds, setWorldScene])
+    if (!nextSelectedSceneItemId && !selectedCollisionZoneId) clearTransformMode()
+  }, [clearTransformMode, collisionZones, sceneItems, selectedCollisionZoneId, selectedSceneItemId, selectedSceneItemIds, setWorldScene])
+
+  useEffect(() => {
+    const hasSelectedZone = collisionZones.some((zone) => zone.id === selectedCollisionZoneId)
+    if (selectedCollisionZoneId && !hasSelectedZone) setSelectedCollisionZoneId(null)
+    if (collisionEditMode && collisionZones.length === 0) setCollisionEditMode(false)
+  }, [collisionEditMode, collisionZones, selectedCollisionZoneId, setCollisionEditMode, setSelectedCollisionZoneId])
 
   return (
     <WorldsPageView
@@ -473,8 +538,11 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
       selectedAssetId={selectedAssetId}
       selectedSceneItemId={selectedSceneItemId}
       selectedSceneItemIds={selectedSceneItemIds}
+      collisionEditMode={collisionEditMode}
+      selectedCollisionZoneId={selectedCollisionZoneId}
       transformMode={transformMode}
       sceneItems={sceneItems}
+      collisionZones={collisionZones}
       unsupportedItems={unsupportedItems}
       loadingAssets={loadingAssets}
       openingAsset={openingAsset}
@@ -499,13 +567,14 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
       onSelectSceneItem={(itemId, options) => {
         if (options?.toggle && itemId) toggleSelectedSceneItemId(itemId)
         else setSelectedSceneItemId(itemId, { preserveSelection: options?.preserveSelection })
-        if (!itemId) setTransformMode(null)
+        if (!itemId && !selectedCollisionZoneId) setTransformMode(null)
       }}
       onTransformModeChange={setTransformMode}
       onTransformSceneItem={(itemId, transform) => {
         const state = useWorldsSceneStore.getState()
         setWorldScene({
           sceneItems: updateWorldSceneItemTransform(state.sceneItems, itemId, transform),
+          collisionZones: state.collisionZones,
           selectedSceneItemId: state.selectedSceneItemId,
           selectedSceneItemIds: state.selectedSceneItemIds,
         })
@@ -514,26 +583,77 @@ function WorldsWorkspace({ apiUrl }: { apiUrl: string }): JSX.Element {
         const state = useWorldsSceneStore.getState()
         setWorldScene({
           sceneItems: updateWorldSceneItemTransforms(state.sceneItems, updates),
+          collisionZones: state.collisionZones,
           selectedSceneItemId: state.selectedSceneItemId,
           selectedSceneItemIds: state.selectedSceneItemIds,
         })
+      }}
+      onAddCollisionZone={(preset) => {
+        const state = useWorldsSceneStore.getState()
+        const next = addWorldCollisionZone(state.collisionZones, preset, {
+          anchorPosition: resolveWorldCollisionZonePlacementAnchor(state.collisionZones, state.sceneItems, {
+            selectedCollisionZoneId: state.selectedCollisionZoneId,
+            selectedSceneItemId: state.selectedSceneItemId,
+            sceneItemAnchors: state.sceneItemAnchors,
+          }),
+        })
+        setWorldScene({
+          sceneItems: state.sceneItems,
+          collisionZones: next.collisionZones,
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
+        })
+        setCollisionEditMode(true)
+        setSelectedCollisionZoneId(next.selectedCollisionZoneId)
+      }}
+      onCollisionEditModeChange={(enabled) => {
+        setCollisionEditMode(enabled)
+        if (!enabled) setSelectedCollisionZoneId(null)
+      }}
+      onSelectCollisionZone={setSelectedCollisionZoneId}
+      onTransformCollisionZone={(zoneId, transform) => {
+        const state = useWorldsSceneStore.getState()
+        setWorldScene({
+          sceneItems: state.sceneItems,
+          collisionZones: updateWorldCollisionZoneTransform(state.collisionZones, zoneId, transform),
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
+        })
+      }}
+      onRemoveCollisionZone={(zoneId) => {
+        const state = useWorldsSceneStore.getState()
+        const next = removeWorldCollisionZone(state.collisionZones, zoneId)
+        setWorldScene({
+          sceneItems: state.sceneItems,
+          collisionZones: next.collisionZones,
+          selectedSceneItemId: state.selectedSceneItemId,
+          selectedSceneItemIds: state.selectedSceneItemIds,
+        })
+        setSelectedCollisionZoneId(next.selectedCollisionZoneId)
+        if (!next.selectedCollisionZoneId) setTransformMode(null)
       }}
       onAnimationMetadata={(itemId, animation) => {
         const state = useWorldsSceneStore.getState()
         setWorldScene({
           sceneItems: attachWorldSceneItemAnimation(state.sceneItems, itemId, animation),
+          collisionZones: state.collisionZones,
           selectedSceneItemId: state.selectedSceneItemId,
           selectedSceneItemIds: state.selectedSceneItemIds,
         })
       }}
       onRemoveSceneItem={(itemId) => {
-        setWorldScene(removeWorldSceneItem(useWorldsSceneStore.getState().sceneItems, itemId))
-        clearTransformMode()
+        const state = useWorldsSceneStore.getState()
+        setWorldScene({
+          ...removeWorldSceneItem(state.sceneItems, itemId),
+          collisionZones: state.collisionZones,
+        })
+        if (!state.selectedCollisionZoneId) clearTransformMode()
       }}
       onToggleBaseSceneItem={(itemId) => {
         const state = useWorldsSceneStore.getState()
         setWorldScene({
           sceneItems: toggleWorldSceneItemBaseRole(state.sceneItems, itemId),
+          collisionZones: state.collisionZones,
           selectedSceneItemId: state.selectedSceneItemId,
           selectedSceneItemIds: state.selectedSceneItemIds,
         })

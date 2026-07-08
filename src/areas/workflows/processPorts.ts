@@ -19,6 +19,7 @@ export const PROCESS_PORT_HANDLE_COLOR: Record<string, string> = {
   mesh: '#a78bfa',
   scene: '#f472b6',
   text: '#fbbf24',
+  audio: '#f472b6',
 }
 
 export function hasNamedProcessInputs(inputs: ProcessPortOwner['inputs']): inputs is ProcessPort[] {

@@ -169,3 +169,18 @@ test('resolves scene process ports with the existing pink scene identity, distin
   assert.equal(resolveProcessTargetColor({ input: 'scene' }), '#f472b6')
   assert.equal(resolveProcessTargetColor({ input: 'audio' }), '#34d399')
 })
+
+test('resolves audio process ports and colors as first-class workflow handles', () => {
+  const audioProcessNode = {
+    input: 'audio' as const,
+    inputs: [
+      { name: 'track', label: 'Track', type: 'audio' as const },
+    ],
+  }
+
+  assert.deepEqual(getProcessTargetPorts(audioProcessNode), [
+    { name: 'track', label: 'Track', type: 'audio', required: true, isLegacy: false },
+  ])
+  assert.equal(resolveProcessTargetColor(audioProcessNode, 'track'), '#f472b6')
+  assert.equal(resolveProcessTargetColor({ input: 'audio' }), '#f472b6')
+})

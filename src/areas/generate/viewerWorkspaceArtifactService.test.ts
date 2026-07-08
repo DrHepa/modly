@@ -146,3 +146,29 @@ test('captured workspace services retire before dispatch and after await instead
     assert.deepEqual(dispatched, ['original'])
   }
 })
+
+test('viewer workspace artifact service passes through audio preview payloads without reshaping', async () => {
+  installArtifactWindow({
+    previewResult: {
+      success: true,
+      status: 'audio',
+      workspacePath: 'Workflows/audio/theme.ogg',
+      displayName: 'theme.ogg',
+      byteLength: 128,
+      audioKind: 'ogg',
+      sourceUrl: '/workspace/Workflows/audio/theme.ogg',
+    },
+  })
+
+  const previewResult = await previewWorkspaceArtifact({ workspacePath: 'Workflows/audio/theme.ogg' })
+
+  assert.deepEqual(previewResult, {
+    success: true,
+    status: 'audio',
+    workspacePath: 'Workflows/audio/theme.ogg',
+    displayName: 'theme.ogg',
+    byteLength: 128,
+    audioKind: 'ogg',
+    sourceUrl: '/workspace/Workflows/audio/theme.ogg',
+  })
+})

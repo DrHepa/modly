@@ -57,6 +57,21 @@ test('legacyOutputToArtifactRef adapts scene manifest file outputs without coerc
   })
 })
 
+test('legacyOutputToArtifactRef adapts audio file outputs without coercing them to binary mesh semantics', () => {
+  const audio = legacyOutputToArtifactRef(
+    { filePath: '/workspace/audio/theme.wav', outputType: 'audio' },
+    { artifactId: 'artifact-audio', versionId: 'version-audio' },
+  )
+
+  assert.deepEqual(audio, {
+    id: 'artifact-audio',
+    kind: 'audio',
+    uri: '/workspace/audio/theme.wav',
+    versionId: 'version-audio',
+    legacy: { filePath: '/workspace/audio/theme.wav', outputType: 'audio' },
+  })
+})
+
 test('legacyOutputToArtifactRef adapts text outputs and ignores empty legacy outputs', () => {
   const text = legacyOutputToArtifactRef(
     { text: 'A small robot', outputType: 'text' },
@@ -110,6 +125,20 @@ test('artifactRefToLegacyOutput reconstructs manifest-backed scene outputs when 
   assert.deepEqual(artifactRefToLegacyOutput(ref), {
     filePath: '/workspace/worlds/hero.scene.json',
     outputType: 'scene',
+  })
+})
+
+test('artifactRefToLegacyOutput reconstructs audio outputs when legacy payload is absent', () => {
+  const ref: ArtifactRef = {
+    id: 'artifact-audio',
+    kind: 'audio',
+    uri: '/workspace/audio/theme.wav',
+    versionId: 'version-audio',
+  }
+
+  assert.deepEqual(artifactRefToLegacyOutput(ref), {
+    filePath: '/workspace/audio/theme.wav',
+    outputType: 'audio',
   })
 })
 

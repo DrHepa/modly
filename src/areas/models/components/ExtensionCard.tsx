@@ -188,6 +188,7 @@ export function ExtensionCard({
             const visibleRuntimeActions = (runtimeReadiness?.actions ?? []).filter((action) => (
               action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
             ))
+            const runtimeReadinessCheckFailed = !runtimeReadiness?.stale && (runtimeReadiness?.machine_code === 'checking_failed' || runtimeReadiness?.machine_code === 'check_failed')
             return (
               <div
                 key={node.id}
@@ -201,7 +202,7 @@ export function ExtensionCard({
                     )}
                   </span>
                   <IOBadge node={node} />
-                  {isModel && runtimeLabel && (
+                  {isModel && runtimeLabel && !runtimeReadinessCheckFailed && (
                     <span role="status" aria-label={`Runtime: ${runtimeLabel}`} className="text-[10px] text-zinc-300">
                       Runtime: <span>{runtimeLabel}</span>
                     </span>

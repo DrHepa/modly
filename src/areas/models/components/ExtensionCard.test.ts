@@ -161,13 +161,74 @@ test('ExtensionCard treats unsupported runtime readiness as absent for legacy no
   assert.doesNotMatch(hfHtml, />Checking failed</)
 })
 
-test('ExtensionCard shows non-blocking checking-failed readiness without starting install flows', async () => {
+test('ExtensionCard treats checking-failed readiness as non-blocking for functional no-HF nodes', async () => {
   const html = await renderCard({
     'modly-codex-image-extension/text-to-image': createReadiness('checking_failed', 'Checking failed'),
   })
 
-  assert.match(html, />Checking failed</)
+  assert.match(html, />Ready</)
+  assert.doesNotMatch(html, />Checking failed</)
   assert.doesNotMatch(html, />Download</)
+})
+
+test('ExtensionCard keeps weight downloads available when runtime readiness checking fails before weights are installed', async () => {
+  const html = await renderCard({
+    'modly-codex-image-extension/text-to-image': createReadiness('checking_failed', 'Checking failed'),
+  }, 'acme/model-weights')
+
+  assert.match(html, />Download</)
+  assert.doesNotMatch(html, />Checking failed</)
+})
+
+test('ExtensionCard keeps downloaded model nodes ready when runtime readiness checking fails', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'modly-codex-image-extension',
+        name: 'Codex',
+        trusted: true,
+        builtin: true,
+        nodes: [{
+          id: 'text-to-image',
+          name: 'Text to Image',
+          input: 'text',
+          output: 'image',
+          paramsSchema: [],
+          hfRepo: 'acme/model-weights',
+        }],
+      },
+      installedIds: [],
+      downloading: {},
+      ownershipStateById: {
+        'modly-codex-image-extension/text-to-image': {
+          capabilityId: 'modly-codex-image-extension/text-to-image',
+          bundleId: 'modly-codex-image-extension',
+          weightOwnerId: 'modly-codex-image-extension/text-to-image',
+          legacyPaths: ['modly-codex-image-extension/text-to-image'],
+          downloaded: true,
+          isOwnerDownloading: false,
+          installDisabled: true,
+          deleteDisabled: false,
+          ownerPeerCapabilityIds: [],
+          badges: [],
+          warning: null,
+        },
+      },
+      runtimeReadinessById: {
+        'modly-codex-image-extension/text-to-image': createReadiness('checking_failed', 'Checking failed'),
+      },
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, />Text to Image</)
+    assert.doesNotMatch(html, />Checking failed</)
+    assert.doesNotMatch(html, />Download</)
+  } finally {
+    await cleanup()
+  }
 })
 
 test('ExtensionCard static markup renders readiness label and actions without inline details diagnostics', async () => {

@@ -161,6 +161,8 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
             const hasWeights    = !!node.hfRepo
             const ownershipState = ownershipStateById?.[fullId]
             const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
+            const runtimeReadinessCheckFailed = runtimeReadiness?.machine_code === 'checking_failed' || runtimeReadiness?.machine_code === 'check_failed'
+            const showRuntimeReadinessAsStatus = Boolean(runtimeLabel && !runtimeReadinessCheckFailed && (!hasWeights || installed))
             const dlInfo        = downloading[fullId]
             const isDownloading = dlInfo !== undefined
             const ownerDownloading = ownershipState?.isOwnerDownloading ?? false
@@ -192,7 +194,7 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
 
                 {/* Status (only for nodes that need model weights) */}
                 <div className="flex-1 min-w-0">
-                  {runtimeLabel ? (
+                  {showRuntimeReadinessAsStatus ? (
                     <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800/50 border border-zinc-700/40">
                       <span className="text-[10px] font-semibold text-zinc-300">{runtimeLabel}</span>
                     </div>

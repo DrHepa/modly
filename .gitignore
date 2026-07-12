@@ -23,6 +23,11 @@ tools/modly-cli/__pycache__/
 
 # Local generated image outputs
 api/generated_images/
+/api/output/
+/api/Workflows/asset3d-runtime-workflow-adapter/
+
+# Local Asset3D dataset (preserved locally, never committed)
+/api/Workflows/asset3d-dataset/
 
 # Logs
 *.log

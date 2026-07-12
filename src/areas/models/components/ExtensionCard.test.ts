@@ -149,6 +149,43 @@ test('ExtensionCard preserves no-HF and HF download behavior when readiness is a
   assert.doesNotMatch(hfHtml, />Ready</)
 })
 
+test('ExtensionCard treats HTTPS plans as owned assets without optimistic installed-id fallback', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'gaussiangpt',
+        name: 'GaussianGPT',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'none',
+          output: 'scene',
+          paramsSchema: [],
+          httpsDownloads: [{
+            url: 'https://example.com/gaussiangpt.safetensors',
+            filename: 'gaussiangpt.safetensors',
+            sizeBytes: 42,
+            sha256: 'a'.repeat(64),
+          }],
+        }],
+      },
+      installedIds: ['gaussiangpt/generate'],
+      downloading: {},
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, />Download</)
+    assert.doesNotMatch(html, />Ready</)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('ExtensionCard treats unsupported runtime readiness as absent for legacy no-HF and HF nodes', async () => {
   const unsupported = createReadiness('unsupported_contract', 'Checking failed')
 
@@ -226,6 +263,54 @@ test('ExtensionCard keeps downloaded model nodes ready when runtime readiness ch
     assert.match(html, />Text to Image</)
     assert.doesNotMatch(html, />Checking failed</)
     assert.doesNotMatch(html, />Download</)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('ExtensionCard shows persisted structured asset failure with retry for hf_downloads nodes', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'cube3d',
+        name: 'Cube3D',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'text',
+          output: 'mesh',
+          paramsSchema: [],
+          hfDownloads: [{
+            repoId: 'owner/model',
+            revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+            targetSubdir: 'cube3d',
+            files: [{ path: 'model.pt' }],
+          }],
+        }],
+      },
+      installedIds: [],
+      downloading: {},
+      downloadFailures: {
+        'cube3d/generate': {
+          code: 'hash_mismatch',
+          stage: 'verify',
+          message: 'Downloaded file failed verification',
+          file: 'cube3d/model.pt',
+          retryable: true,
+        },
+      },
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, />Retry</)
+    assert.match(html, /verify: Downloaded file failed verification/)
+    assert.match(html, /cube3d\/model\.pt/)
+    assert.doesNotMatch(html, />Ready</)
   } finally {
     await cleanup()
   }
@@ -358,4 +443,53 @@ test('ExtensionCard renders disabled readiness actions but not full readiness de
   assert.doesNotMatch(html, /platform_supported/)
   assert.doesNotMatch(html, /linux-arm64/)
   assert.doesNotMatch(html, /\/home\/user\/bin\/codex/)
+})
+
+test('ExtensionCard preserves permanent download failures without rendering a Retry action', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'cube3d',
+        name: 'Cube3D',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'text',
+          output: 'mesh',
+          paramsSchema: [],
+          hfDownloads: [{
+            repoId: 'owner/model',
+            revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+            targetSubdir: 'cube3d',
+            files: [{ path: 'model.pt' }],
+          }],
+        }],
+      },
+      installedIds: [],
+      downloading: {},
+      downloadFailures: {
+        'cube3d/generate': {
+          code: 'invalid_manifest',
+          stage: 'manifest',
+          message: 'Model manifest is permanently invalid',
+          retryable: false,
+        },
+      },
+      onInstall: () => {
+        throw new Error('permanent failures must not dispatch install')
+      },
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, /manifest: Model manifest is permanently invalid/)
+    assert.match(html, />Download unavailable</)
+    assert.doesNotMatch(html, />Retry</)
+    assert.doesNotMatch(html, /Download cube3d|Download Generate weights/)
+  } finally {
+    await cleanup()
+  }
 })

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { AnyExtension, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
+import type { AnyExtension, ModelDownloadFailure, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
@@ -17,7 +17,8 @@ type RuntimeReadinessModalState = {
 interface Props {
   ext:              AnyExtension
   installedIds:     string[]
-  downloading:      Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>
+  downloading:      Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>
+  downloadFailures?: Record<string, ModelDownloadFailure>
   ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   runtimeReadinessById?: Record<string, RuntimeReadiness | undefined>
   loadError?:       string
@@ -37,7 +38,7 @@ export function ExtensionCard({
   const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
   const { total, done, installing, hasAvailable } = extInstallSummary(ext, installedIds, downloading)
 
-export function ExtensionCard({ ext, installedIds, downloading, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, downloadFailures, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
   const [runtimeModal, setRuntimeModal] = useState<RuntimeReadinessModalState | null>(null)
@@ -158,9 +159,10 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
             const visibleRuntimeActions = (runtimeReadiness?.actions ?? []).filter((action) => (
               action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
             ))
-            const hasWeights    = !!node.hfRepo
+            const hasHttpsDownloads = Boolean(node.httpsDownloads?.length)
+            const hasWeights    = Boolean(hasHttpsDownloads || node.hfDownloads?.length || node.hfRepo)
             const ownershipState = ownershipStateById?.[fullId]
-            const installed     = !hasWeights || ownershipState?.downloaded || installedIds.includes(fullId)
+            const installed     = !hasWeights || ownershipState?.downloaded || (!hasHttpsDownloads && installedIds.includes(fullId))
             const runtimeReadinessCheckFailed = runtimeReadiness?.machine_code === 'checking_failed' || runtimeReadiness?.machine_code === 'check_failed'
             const showRuntimeReadinessAsStatus = Boolean(runtimeLabel && !runtimeReadinessCheckFailed && (!hasWeights || installed))
             const dlInfo        = downloading[fullId]
@@ -170,6 +172,9 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
             const dlFile        = dlInfo?.file?.split('/').pop()
             const dlFileIndex   = dlInfo?.fileIndex
             const dlTotalFiles  = dlInfo?.totalFiles
+            const dlRepoIndex   = dlInfo?.repoIndex
+            const dlTotalRepos  = dlInfo?.totalRepos
+            const downloadFailure = downloadFailures?.[fullId]
             const installDisabled = Boolean(disabled || ownershipState?.installDisabled)
             const deleteDisabled = Boolean(disabled || ownershipState?.deleteDisabled)
             const deleteTitle = ownershipState?.warning ?? (disabled ? 'Cannot delete while another action is in progress' : 'Remove owner-scoped model weights')
@@ -212,7 +217,7 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                           {dlFile ?? 'Downloading…'}
                         </span>
                         <span className="text-[10px] font-mono text-zinc-400 shrink-0 ml-1">
-                          {dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ${dlPercent}%` : `${dlPercent}%`}
+                          {`${dlRepoIndex && dlTotalRepos ? `R${dlRepoIndex}/${dlTotalRepos} · ` : ''}${dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ` : ''}${dlPercent}%`}
                         </span>
                       </div>
                       <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
@@ -257,7 +262,7 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                           {dlFile ?? 'Downloading…'}
                         </span>
                         <span className="text-[10px] font-mono text-zinc-400 shrink-0 ml-1">
-                          {dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ${dlPercent}%` : `${dlPercent}%`}
+                          {`${dlRepoIndex && dlTotalRepos ? `R${dlRepoIndex}/${dlTotalRepos} · ` : ''}${dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ` : ''}${dlPercent}%`}
                         </span>
                       </div>
                       <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
@@ -271,6 +276,13 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                     <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-sky-950/30 border border-sky-800/30">
                       <div className="w-2 h-2 rounded-full border border-sky-400/40 border-t-sky-200 animate-spin shrink-0" />
                       <span className="text-[10px] font-semibold text-sky-300 truncate">Shared download in progress</span>
+                    </div>
+                  ) : downloadFailure?.retryable === false ? (
+                    <div
+                      aria-label="Download unavailable"
+                      className="w-full flex items-center justify-center px-2 py-1 rounded-lg border bg-red-950/20 border-red-800/30 text-[10px] font-semibold text-red-300"
+                    >
+                      Download unavailable
                     </div>
                   ) : (
                     <button
@@ -288,11 +300,29 @@ export function ExtensionCard({ ext, installedIds, downloading, ownershipStateBy
                         <polyline points="7 10 12 15 17 10"/>
                         <line x1="12" y1="15" x2="12" y2="3"/>
                       </svg>
-                      Download
+                      {downloadFailure ? 'Retry' : 'Download'}
                     </button>
                   )}
                 </div>
                 </div>
+
+                {downloadFailure && !isDownloading && !installed && (
+                  <div role="alert" className="flex items-start gap-1.5 px-2.5 py-2 rounded-lg bg-red-950/30 border border-red-800/30">
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0 mt-px">
+                      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                    </svg>
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-semibold text-red-300">
+                        {downloadFailure.stage}: {downloadFailure.message}
+                      </p>
+                      {downloadFailure.file && (
+                        <p className="text-[9px] text-red-400/80 truncate" title={downloadFailure.file}>
+                          {downloadFailure.file}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {runtimeLabel && visibleRuntimeActions.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 pl-0.5">

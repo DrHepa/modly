@@ -1,4 +1,4 @@
-import { ipcMain, BrowserWindow, dialog, app, shell } from 'electron'
+import { ipcMain, BrowserWindow, dialog, app, shell, type IpcMainInvokeEvent } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { dirname, join } from 'path'
 import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp } from 'fs/promises'
@@ -9,6 +9,9 @@ import {
   isModelDownloaded,
   listDownloadedModels,
   downloadModelFromHF,
+  downloadModelAssetsFromHF,
+  downloadModelAssetsFromHttps,
+  ModelAssetDownloadError,
 } from './model-downloader'
 import {
   createOwnerScopedDeletePlan,
@@ -35,7 +38,7 @@ import type { ProcessInput, WorldsSceneManifestWriteRequest, WorldsSceneManifest
 import { runProcessExtensionWithDeps } from './run-process-handler'
 import { installGitHubExtensionRepo } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
-import { assertSafeExtensionId, resolveExtensionPathWithinRoot } from './extension-path-guard'
+import { assertSafeExtensionId, assertSafeOwnershipSegment, resolveExtensionPathWithinRoot } from './extension-path-guard'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 
@@ -237,6 +240,45 @@ runpy.run_path(setup_py, run_name="__main__")
   })
 }
 
+function parseCanonicalModelDownloadPayload(payload: unknown): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Model asset download payload must be an object containing only modelId')
+  }
+
+  const fields = Object.keys(payload)
+  if (fields.length !== 1 || fields[0] !== 'modelId') {
+    throw new Error('Model asset download payload must contain only modelId')
+  }
+
+  const modelId = (payload as Record<string, unknown>).modelId
+  if (typeof modelId !== 'string') {
+    throw new Error('Model asset download modelId must be a string')
+  }
+
+  const segments = modelId.split('/')
+  if (segments.length !== 2) {
+    throw new Error('Model asset download modelId must contain exactly two segments')
+  }
+
+  const extensionId = assertSafeOwnershipSegment(
+    segments[0],
+    'Model asset download extension segment',
+  )
+  const nodeId = assertSafeOwnershipSegment(
+    segments[1],
+    'Model asset download node segment',
+  )
+  return `${extensionId}/${nodeId}`
+}
+
+function modelAssetDownloadResult(error: unknown) {
+  return {
+    success: false,
+    error: error instanceof Error ? error.message : String(error),
+    ...(error instanceof ModelAssetDownloadError ? { failure: error.failure } : {}),
+  }
+}
+
 function createFallbackOwnership(modelId: string): ModelOwnershipDescriptor {
   const [bundleId = modelId] = modelId.split('/')
   return {
@@ -286,50 +328,51 @@ async function resolveOwnershipContext(userData: string, capabilityId: string) {
 }
 
 export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
-  // Reconcile leftovers of interrupted installs. No install can be in flight
-  // this early in the app's life, so anything matching is stale:
-  //  - staging dirs → discard (never the only copy of anything)
-  //  - extension dir still carrying the incomplete marker + a backup exists
-  //    → the install crashed mid-setup: put the previous version back
-  //  - backup dirs → restore if the extension folder is gone, else discard
-  void (async () => {
+  const activeDownloads = new Map<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>()
+
+  const handleStructuredModelAssetDownload = async (
+    event: IpcMainInvokeEvent,
+    payload: unknown,
+    downloader: typeof downloadModelAssetsFromHF,
+  ) => {
+    let modelId: string
     try {
-      const extensionsDir = getSettings(app.getPath('userData')).extensionsDir
-      const entries = await readdir(extensionsDir, { withFileTypes: true })
-      const names   = entries.map((e) => e.name)
+      modelId = parseCanonicalModelDownloadPayload(payload)
+    } catch (error) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'invalid_model_id',
+        stage: 'request',
+        message: error instanceof Error ? error.message : 'Invalid model asset download modelId',
+        retryable: false,
+      }))
+    }
 
-      await Promise.allSettled(
-        names
-          .filter((n) => n.startsWith(EXT_STAGING_PREFIX))
-          .map((n) => rmWithRetry(join(extensionsDir, n), 'ext-cleanup')),
-      )
+    if (activeDownloads.has(modelId)) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'download_in_progress',
+        stage: 'request',
+        message: `Model asset download is already in progress for ${modelId}`,
+        retryable: false,
+      }))
+    }
 
-      // Newest backup first, so the most recent good version wins a restore
-      const backups = names.filter((n) => n.startsWith(EXT_BACKUP_PREFIX)).sort().reverse()
-      for (const name of backups) {
-        const backupPath = join(extensionsDir, name)
-        const parsed = parseExtensionBackupName(name)
-        if (!parsed) { await rmWithRetry(backupPath, 'ext-cleanup'); continue }
+    activeDownloads.set(modelId, { percent: 0, status: 'preparing' })
+    try {
+      await downloader(modelId, (progress) => {
+        activeDownloads.set(modelId, progress)
+        event.sender.send(
+          'model:downloadProgress',
+          mapDownloadProgressToCapability(modelId, progress),
+        )
+      })
+      return { success: true }
+    } catch (error) {
+      return modelAssetDownloadResult(error)
+    } finally {
+      activeDownloads.delete(modelId)
+    }
+  }
 
-        const destDir        = join(extensionsDir, parsed.extensionId)
-        const destIncomplete = existsSync(join(destDir, EXT_INCOMPLETE_MARKER))
-        if (existsSync(destDir) && !destIncomplete) {
-          // Install completed; only the backup's own cleanup had failed
-          await rmWithRetry(backupPath, 'ext-cleanup')
-          continue
-        }
-        // Crash mid-swap or mid-setup: this backup is the last good copy
-        if (destIncomplete) {
-          const removed = await rmWithRetry(destDir, 'ext-restore')
-          if (!removed.ok) continue   // keep the backup; retried next launch
-        }
-        const restored = await renameWithRetry(backupPath, destDir, 'ext-restore')
-        if (restored.ok) logger.info(`[ext-restore] restored "${parsed.extensionId}" from ${name}`)
-      }
-    } catch { /* best-effort; extensionsDir may not exist yet */ }
-  })()
-
-  const activeDownloads = new Map<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>()
   // Logging from renderer
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
   ipcMain.handle('log:getPath', () => join(app.getPath('userData'), 'logs', 'modly.log'))
@@ -531,7 +574,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       // Unload failed (model may not be loaded) — still attempt deletion
     }
     try {
-      await deleteOwnedModelPaths(deletePlan.targets)
+      await deleteOwnedModelPaths(modelsDir, deletePlan.targets)
       return { success: true, warning: deletePlan.warning } as { success: boolean; error?: string }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -578,16 +621,43 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const userData = app.getPath('userData')
     const modelsDir = getSettings(userData).modelsDir
     const { ownership } = await resolveOwnershipContext(userData, modelId)
-    return isOwnedModelDownloaded(modelsDir, ownership) || isModelDownloaded(modelsDir, modelId)
+    const ownedDownloaded = isOwnedModelDownloaded(modelsDir, ownership)
+    return ownership.httpsDownloads?.length || ownership.hfDownloads?.length
+      ? ownedDownloaded
+      : ownedDownloaded || isModelDownloaded(modelsDir, modelId)
   })
 
   ipcMain.handle('model:activeDownloads', () =>
     [...activeDownloads.entries()].map(([modelId, progress]) => ({ modelId, ...progress }))
   )
 
+  ipcMain.handle('model:downloadAssets', (event, payload: unknown) => (
+    handleStructuredModelAssetDownload(
+      event,
+      payload,
+      downloadModelAssetsFromHF,
+    )
+  ))
+
+  ipcMain.handle('model:downloadHttpsAssets', (event, payload: unknown) => (
+    handleStructuredModelAssetDownload(
+      event,
+      payload,
+      downloadModelAssetsFromHttps,
+    )
+  ))
+
   ipcMain.handle('model:download', async (event, { repoId, modelId, skipPrefixes }: { repoId: string; modelId: string; skipPrefixes?: string[] }) => {
     const userData = app.getPath('userData')
     const { ownership } = await resolveOwnershipContext(userData, modelId)
+    if (activeDownloads.has(modelId)) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'download_in_progress',
+        stage: 'request',
+        message: `Model asset download is already in progress for ${modelId}`,
+        retryable: false,
+      }))
+    }
     try {
       activeDownloads.set(modelId, { percent: 0 })
       await downloadModelFromHF(repoId, ownership.weightOwnerId, (progress) => {
@@ -959,7 +1029,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
       await rmAsync(extPath, { recursive: true, force: true })
       for (const cleanupPlan of cleanupPlans) {
-        await deleteOwnedModelPaths(cleanupPlan.targets)
+        await deleteOwnedModelPaths(getSettings(userData).modelsDir, cleanupPlan.targets)
       }
       // Hot-reload Python so it stops using the deleted model extension
       try {

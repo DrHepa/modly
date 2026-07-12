@@ -55,12 +55,14 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
       listDownloaded: () => ipcRenderer.invoke('model:listDownloaded'),
       isDownloaded:   (modelId: string) => ipcRenderer.invoke('model:isDownloaded', modelId),
       download:       (repoId: string, modelId: string, skipPrefixes?: string[]) => ipcRenderer.invoke('model:download', { repoId, modelId, skipPrefixes }),
-      delete:         (modelId: string) => ipcRenderer.invoke('model:delete', modelId),
+      downloadAssets:      (modelId: string) => ipcRenderer.invoke('model:downloadAssets', { modelId }),
+      downloadHttpsAssets: (modelId: string) => ipcRenderer.invoke('model:downloadHttpsAssets', { modelId }),
+      delete:              (modelId: string) => ipcRenderer.invoke('model:delete', modelId),
       unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
       runtimeReadiness: (modelIds: string[]): Promise<RuntimeReadinessResponse> => ipcRenderer.invoke('model:runtimeReadiness', modelIds) as Promise<RuntimeReadinessResponse>,
       runtimeReadinessAction: (action: RuntimeReadinessAction): Promise<RuntimeReadinessActionResult> => ipcRenderer.invoke('model:runtimeReadinessAction', action) as Promise<RuntimeReadinessActionResult>,
-      onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => { ipcRenderer.on('model:downloadProgress', (_event, data) => cb(data as { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string })) },
+      onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }) => void) => { ipcRenderer.on('model:downloadProgress', (_event, data) => cb(data as { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string })) },
       offProgress:    () => ipcRenderer.removeAllListeners('model:downloadProgress')
     },
     app: {

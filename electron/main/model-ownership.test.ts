@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -10,6 +11,7 @@ const {
   createOwnerScopedDeletePlan,
   createExtensionUninstallCleanupPlan,
   deleteOwnedModelPaths,
+  getCanonicalModelPath,
   isOwnedModelDownloaded,
   listDownloadedModelCapabilities,
   mapDownloadProgressToCapability,
@@ -100,6 +102,70 @@ test('parseExtensionManifest derives owner-aware metadata for bundled model node
       legacyPaths: ['image-bundle/flux-schnell'],
     },
   ])
+})
+
+test('hf_downloads ownership readiness requires every declared asset', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const extension = parseExtensionManifest({
+      id: 'cube3d',
+      type: 'model',
+      nodes: [{
+        id: 'generate',
+        name: 'Generate',
+        input: 'text',
+        output: 'mesh',
+        hf_repo: 'owner/model',
+        hf_downloads: [{
+          repo_id: 'owner/model',
+          revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+          target_subdir: 'cube3d',
+          files: [{ path: 'config.json' }, { path: 'model.pt' }],
+        }],
+      }],
+    }, 'cube3d', new Set(), false)
+
+    const ownership = resolveModelOwnership([extension], 'cube3d/generate')
+    assert.ok(ownership)
+    const target = join(modelsDir, 'cube3d', 'generate', 'cube3d')
+    await mkdir(target, { recursive: true })
+    await writeFile(join(target, 'config.json'), '{}')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    await writeFile(join(target, 'model.pt'), 'weights')
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+  })
+})
+
+test('hf_downloads ownership readiness verifies declared SHA-256 and keeps no-hash files compatible', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const sha256 = (value: string) => createHash('sha256').update(value).digest('hex')
+    const ownership = {
+      capabilityId: 'cube3d/generate',
+      bundleId: 'cube3d',
+      weightOwnerId: 'cube3d/generate',
+      sharedOwner: false,
+      legacyPaths: ['cube3d/generate'],
+      hfDownloads: [{
+        repoId: 'owner/model',
+        revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+        targetSubdir: 'cube3d',
+        files: [
+          { path: 'config.json' },
+          { path: 'model.pt', sha256: sha256('expected') },
+        ],
+      }],
+    }
+    const target = join(modelsDir, 'cube3d', 'generate', 'cube3d')
+    await mkdir(target, { recursive: true })
+    await writeFile(join(target, 'config.json'), '{}')
+    await writeFile(join(target, 'model.pt'), 'wrong')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    await writeFile(join(target, 'model.pt'), 'expected')
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+  })
 })
 
 test('parseExtensionManifest preserves process port labels while keeping handle names', () => {
@@ -227,7 +293,7 @@ test('deleteOwnedModelPaths removes canonical and legacy owner paths for the fin
     const plan = createOwnerScopedDeletePlan(modelsDir, ownership, [])
 
     assert.equal(plan.mode, 'delete')
-    await deleteOwnedModelPaths(plan.targets)
+    await deleteOwnedModelPaths(modelsDir, plan.targets)
 
     assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
   })
@@ -341,7 +407,355 @@ test('bundled fixture keeps legacy-only shared payloads ready until the last sib
       join(modelsDir, 'image-bundle', 'sdxl-base'),
     ])
 
-    await deleteOwnedModelPaths(finalDelete.targets)
+    await deleteOwnedModelPaths(modelsDir, finalDelete.targets)
     assert.equal(isOwnedModelDownloaded(modelsDir, sd15Ownership), false)
+  })
+})
+
+test('ownership paths reject traversal before construction or deletion', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = {
+      capabilityId: 'safe-extension/generate',
+      bundleId: 'safe-extension',
+      weightOwnerId: '../outside',
+      sharedOwner: false,
+      legacyPaths: ['safe-extension/generate'],
+    }
+
+    assert.throws(
+      () => getCanonicalModelPath(modelsDir, ownership),
+      /exactly one extension and one owner segment|path separators|invalid/i,
+    )
+
+    const plan = createOwnerScopedDeletePlan(modelsDir, ownership, [])
+    assert.equal(plan.mode, 'blocked')
+    assert.deepEqual(plan.targets, [])
+    assert.match(plan.warning ?? '', /unsafe model ownership path/i)
+
+    await assert.rejects(
+      deleteOwnedModelPaths(modelsDir, [join(modelsDir, '..', 'outside')]),
+      /escapes the canonical models directory|symbolic link|filesystem alias/i,
+    )
+  })
+})
+
+test('symlinked ownership parents cannot become ready or delete outside modelsDir', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const outsideRoot = join(modelsDir, '..', 'outside-owner')
+    const outsideOwner = join(outsideRoot, 'owner')
+    const outsideMarker = join(outsideOwner, 'marker.bin')
+    await mkdir(outsideOwner, { recursive: true })
+    await writeFile(outsideMarker, 'preserve')
+    await symlink(outsideRoot, join(modelsDir, 'escape'), 'dir')
+
+    const ownership = {
+      capabilityId: 'escape/owner',
+      bundleId: 'escape',
+      weightOwnerId: 'escape/owner',
+      sharedOwner: false,
+      legacyPaths: ['escape/owner'],
+    }
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+    assert.equal(resolveShowInFolderPath(modelsDir, ownership), null)
+
+    const plan = createOwnerScopedDeletePlan(modelsDir, ownership, [])
+    assert.equal(plan.mode, 'blocked')
+    assert.deepEqual(plan.targets, [])
+
+    await assert.rejects(
+      deleteOwnedModelPaths(modelsDir, [join(modelsDir, 'escape', 'owner')]),
+      /escapes the canonical models directory|symbolic link|filesystem alias/i,
+    )
+    assert.equal(readFileSync(outsideMarker, 'utf-8'), 'preserve')
+  })
+})
+
+test('hf_downloads readiness rejects asset symlinks that resolve outside the owner', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownerPath = join(modelsDir, 'cube3d', 'generate')
+    const assetDir = join(ownerPath, 'cube3d')
+    const outsideAsset = join(modelsDir, '..', 'outside-model.pt')
+    await mkdir(assetDir, { recursive: true })
+    await writeFile(outsideAsset, 'external weights')
+    await symlink(outsideAsset, join(assetDir, 'model.pt'), 'file')
+
+    const ownership = {
+      capabilityId: 'cube3d/generate',
+      bundleId: 'cube3d',
+      weightOwnerId: 'cube3d/generate',
+      sharedOwner: false,
+      legacyPaths: ['cube3d/generate'],
+      hfDownloads: [{
+        repoId: 'owner/model',
+        revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+        targetSubdir: 'cube3d',
+        files: [{ path: 'model.pt' }],
+      }],
+    }
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+  })
+})
+
+test('in-root extension and owner aliases cannot cross ownership boundaries', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const victimOwner = join(modelsDir, 'victim', 'owner')
+    const victimMarker = join(victimOwner, 'weights.bin')
+    await mkdir(victimOwner, { recursive: true })
+    await writeFile(victimMarker, 'victim')
+
+    await symlink(join(modelsDir, 'victim'), join(modelsDir, 'evil-extension'), 'dir')
+    const extensionAliasOwnership = {
+      capabilityId: 'evil-extension/owner',
+      bundleId: 'evil-extension',
+      weightOwnerId: 'evil-extension/owner',
+      sharedOwner: false,
+      legacyPaths: ['evil-extension/owner'],
+    }
+
+    assert.equal(
+      isOwnedModelDownloaded(modelsDir, extensionAliasOwnership),
+      false,
+    )
+    const extensionPlan = createOwnerScopedDeletePlan(
+      modelsDir,
+      extensionAliasOwnership,
+      [],
+    )
+    assert.equal(extensionPlan.mode, 'blocked')
+    assert.deepEqual(extensionPlan.targets, [])
+    await assert.rejects(
+      deleteOwnedModelPaths(
+        modelsDir,
+        [join(modelsDir, 'evil-extension', 'owner')],
+      ),
+      /symbolic link|filesystem alias/i,
+    )
+    assert.equal(readFileSync(victimMarker, 'utf-8'), 'victim')
+
+    const evilOwnerRoot = join(modelsDir, 'evil-owner')
+    await mkdir(evilOwnerRoot, { recursive: true })
+    await symlink(victimOwner, join(evilOwnerRoot, 'owner'), 'dir')
+    const ownerAliasOwnership = {
+      capabilityId: 'evil-owner/owner',
+      bundleId: 'evil-owner',
+      weightOwnerId: 'evil-owner/owner',
+      sharedOwner: false,
+      legacyPaths: ['evil-owner/owner'],
+    }
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownerAliasOwnership), false)
+    const ownerPlan = createOwnerScopedDeletePlan(
+      modelsDir,
+      ownerAliasOwnership,
+      [],
+    )
+    assert.equal(ownerPlan.mode, 'blocked')
+    assert.deepEqual(ownerPlan.targets, [])
+    await assert.rejects(
+      deleteOwnedModelPaths(
+        modelsDir,
+        [join(modelsDir, 'evil-owner', 'owner')],
+      ),
+      /symbolic link|filesystem alias/i,
+    )
+    assert.equal(readFileSync(victimMarker, 'utf-8'), 'victim')
+  })
+})
+
+test('configured modelsDir may itself be a symlink without allowing child aliases', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const configuredModelsDir = join(modelsDir, '..', 'configured-models')
+    await symlink(modelsDir, configuredModelsDir, 'dir')
+
+    const ownerPath = join(modelsDir, 'safe-extension', 'owner')
+    await mkdir(ownerPath, { recursive: true })
+    await writeFile(join(ownerPath, 'weights.bin'), 'ready')
+    const ownership = {
+      capabilityId: 'safe-extension/owner',
+      bundleId: 'safe-extension',
+      weightOwnerId: 'safe-extension/owner',
+      sharedOwner: false,
+      legacyPaths: ['safe-extension/owner'],
+    }
+
+    assert.equal(isOwnedModelDownloaded(configuredModelsDir, ownership), true)
+    assert.equal(
+      resolveShowInFolderPath(configuredModelsDir, ownership),
+      ownerPath,
+    )
+    const plan = createOwnerScopedDeletePlan(
+      configuredModelsDir,
+      ownership,
+      [],
+    )
+    assert.equal(plan.mode, 'delete')
+    assert.deepEqual(plan.targets, [ownerPath])
+  })
+})
+
+const {
+  expectedHttpsMarkerAssets,
+  httpsPlanSha256,
+} = await import(new URL('./https-download-manifest.ts', import.meta.url).href)
+
+const HTTPS_PLAN = [
+  {
+    url: 'https://assets.example/weights.bin',
+    filename: 'weights.bin',
+    sizeBytes: 5,
+    sha256: createHash('sha256').update(Buffer.alloc(5, 1)).digest('hex'),
+  },
+  {
+    url: 'https://assets.example/config.json',
+    filename: 'config.json',
+    sizeBytes: 2,
+    sha256: createHash('sha256').update(Buffer.alloc(2, 2)).digest('hex'),
+  },
+]
+
+const HTTPS_MANIFEST_PLAN = HTTPS_PLAN.map((asset) => ({
+  url: asset.url,
+  filename: asset.filename,
+  size_bytes: asset.sizeBytes,
+  sha256: asset.sha256,
+}))
+
+function createHttpsOwnership() {
+  const extension = parseExtensionManifest(
+    {
+      id: 'gaussiangpt',
+      type: 'model',
+      nodes: [{
+        id: 'vfront',
+        input: 'none',
+        output: 'mesh',
+        https_downloads: HTTPS_MANIFEST_PLAN,
+      }],
+    },
+    'gaussiangpt',
+    new Set(),
+    false,
+  )
+
+  const ownership = resolveModelOwnership([extension], 'gaussiangpt/vfront')
+  assert.ok(ownership)
+  return ownership
+}
+
+function validHttpsReadyMarker() {
+  return {
+    schema_version: 1,
+    kind: 'modly.https-assets.ready',
+    model_id: 'gaussiangpt/vfront',
+    plan_sha256: httpsPlanSha256(HTTPS_PLAN),
+    assets: expectedHttpsMarkerAssets(HTTPS_PLAN),
+    verified_at: '2026-07-11T12:00:00Z',
+  }
+}
+
+async function prepareHttpsOwner(modelsDir: string) {
+  const ownerPath = join(modelsDir, 'gaussiangpt', 'vfront')
+  const metadataPath = join(ownerPath, '.modly')
+
+  await mkdir(metadataPath, { recursive: true })
+  await writeFile(join(ownerPath, 'weights.bin'), Buffer.alloc(5, 1))
+  await writeFile(join(ownerPath, 'config.json'), Buffer.alloc(2, 2))
+
+  return {
+    ownerPath,
+    markerPath: join(metadataPath, 'https-assets-ready.json'),
+  }
+}
+
+test('HTTPS ownership readiness accepts the exact marker and ordered asset inventory', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = createHttpsOwnership()
+    const { markerPath } = await prepareHttpsOwner(modelsDir)
+
+    await writeFile(markerPath, JSON.stringify(validHttpsReadyMarker()))
+
+    assert.deepEqual(ownership.httpsDownloads, HTTPS_PLAN)
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+  })
+})
+
+test('HTTPS ownership readiness rejects wrong model, order, hash, schema, and file size', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = createHttpsOwnership()
+    const { ownerPath, markerPath } = await prepareHttpsOwner(modelsDir)
+    const validMarker = validHttpsReadyMarker()
+
+    const invalidMarkers = [
+      {
+        ...validMarker,
+        model_id: 'gaussiangpt/both',
+      },
+      {
+        ...validMarker,
+        plan_sha256: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      },
+      {
+        ...validMarker,
+        assets: [...validMarker.assets].reverse(),
+      },
+      {
+        ...validMarker,
+        verified_at: '2026-07-11T14:00:00+02:00',
+      },
+      {
+        ...validMarker,
+        unexpected: true,
+      },
+    ]
+
+    for (const marker of invalidMarkers) {
+      await writeFile(markerPath, JSON.stringify(marker))
+      assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+    }
+
+    await writeFile(markerPath, JSON.stringify(validMarker))
+    await writeFile(join(ownerPath, 'weights.bin'), Buffer.alloc(4))
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+  })
+})
+
+test('HTTPS ownership readiness detects same-size tampering after marker publish', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = createHttpsOwnership()
+    const { ownerPath, markerPath } = await prepareHttpsOwner(modelsDir)
+
+    await writeFile(markerPath, JSON.stringify(validHttpsReadyMarker()))
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+
+    await writeFile(join(ownerPath, 'weights.bin'), Buffer.alloc(5, 9))
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+  })
+})
+
+test('HTTPS ownership readiness rejects symlinked assets and readiness markers', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = createHttpsOwnership()
+    const { ownerPath, markerPath } = await prepareHttpsOwner(modelsDir)
+    const weightsPath = join(ownerPath, 'weights.bin')
+    const weightsTargetPath = join(ownerPath, 'weights-target.bin')
+
+    await writeFile(markerPath, JSON.stringify(validHttpsReadyMarker()))
+    await rm(weightsPath)
+    await writeFile(weightsTargetPath, Buffer.alloc(5))
+    await symlink('weights-target.bin', weightsPath, 'file')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    await rm(weightsPath)
+    await writeFile(weightsPath, Buffer.alloc(5))
+
+    const markerTargetPath = join(ownerPath, '.modly', 'marker-target.json')
+    await rm(markerPath)
+    await writeFile(markerTargetPath, JSON.stringify(validHttpsReadyMarker()))
+    await symlink('marker-target.json', markerPath, 'file')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
   })
 })

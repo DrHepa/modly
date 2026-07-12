@@ -6,6 +6,9 @@ import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getSettings } from './settings-store.ts'
 import { app } from 'electron'
+import { buildHttpsDownloadAssetsRequest, buildManifestAssetDownloadRequest, ModelAssetDownloadError, normalizeDownloadEvent } from './model-download-events.ts'
+export { ModelAssetDownloadError }
+export type { ModelDownloadFailure } from './model-download-events.ts'
 export {
   getCanonicalModelPath,
   getLegacyModelPaths,
@@ -21,6 +24,8 @@ export interface DownloadProgress {
   file?: string
   fileIndex?: number
   totalFiles?: number
+  repoIndex?: number
+  totalRepos?: number
   status?: string
   bytesDownloaded?: number
   totalBytes?: number
@@ -116,6 +121,104 @@ export function listDownloadedModels(modelsDir: string): { id: string; name: str
   } catch {
     return []
   }
+}
+
+type StructuredAssetDownloadRequest = ReturnType<typeof buildManifestAssetDownloadRequest>
+
+async function consumeStructuredModelAssetDownload(
+  request: StructuredAssetDownloadRequest,
+  onProgress: ProgressCallback,
+): Promise<void> {
+  const { net } = require('electron')
+  const res = await net.fetch(request.url, { headers: request.headers })
+
+  if (!res.ok) {
+    throw new ModelAssetDownloadError({
+      code: 'http_error',
+      stage: 'request',
+      message: `Manifest asset download failed with HTTP ${res.status}`,
+      retryable: res.status >= 500 || res.status === 429,
+    })
+  }
+  if (!res.body) {
+    throw new ModelAssetDownloadError({
+      code: 'missing_stream',
+      stage: 'request',
+      message: 'Manifest asset download returned no response stream',
+      retryable: true,
+    })
+  }
+
+  const decoder = new TextDecoder()
+  const reader = res.body.getReader()
+  let buffer = ''
+  let completed = false
+
+  const consumeLine = (line: string): void => {
+    if (!line.startsWith('data: ')) return
+    let payload: unknown
+    try {
+      payload = JSON.parse(line.slice(6))
+    } catch {
+      return
+    }
+
+    const event = normalizeDownloadEvent(payload)
+    if (event.failure) throw new ModelAssetDownloadError(event.failure)
+    if (!event.progress) return
+    onProgress(event.progress)
+    if (event.progress.percent === 100 && event.progress.status === 'done') completed = true
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) consumeLine(line)
+  }
+
+  buffer += decoder.decode()
+  if (buffer) consumeLine(buffer)
+  if (!completed) {
+    throw new ModelAssetDownloadError({
+      code: 'incomplete_stream',
+      stage: 'download',
+      message: 'Manifest asset download ended before completion',
+      retryable: true,
+    })
+  }
+}
+
+/**
+ * Download the exact hf_downloads plan resolved by the Python registry.
+ * The renderer provides only the canonical capability id; repositories,
+ * revisions, target directories and files remain manifest-owned.
+ */
+export async function downloadModelAssetsFromHF(
+  modelId: string,
+  onProgress: ProgressCallback,
+): Promise<void> {
+  const hfToken = getSettings(app.getPath('userData')).hfToken
+  return consumeStructuredModelAssetDownload(
+    buildManifestAssetDownloadRequest(PYTHON_API_URL, modelId, hfToken),
+    onProgress,
+  )
+}
+
+/**
+ * Download the exact https_downloads plan resolved by the Python registry.
+ * URLs, filenames, sizes and hashes remain manifest-owned.
+ */
+export async function downloadModelAssetsFromHttps(
+  modelId: string,
+  onProgress: ProgressCallback,
+): Promise<void> {
+  return consumeStructuredModelAssetDownload(
+    buildHttpsDownloadAssetsRequest(PYTHON_API_URL, modelId),
+    onProgress,
+  )
 }
 
 /**

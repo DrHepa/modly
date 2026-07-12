@@ -1,11 +1,67 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import type { AnyExtension, RuntimeReadinessAction } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { formatModelName } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
-import type { ExtensionNode } from './components/ExtensionCard'
 import { collectModelOwnershipMetadata, deriveModelOwnershipState } from './modelOwnershipState'
+
+const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
+
+type ModelDownloadApi = {
+  download: (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<ModelDownloadResult>
+  downloadAssets: (modelId: string) => Promise<ModelDownloadResult>
+  downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
+}
+
+export function requestModelNodeDownload(
+  node: ExtensionNode,
+  fullId: string,
+  modelApi: ModelDownloadApi,
+): Promise<ModelDownloadResult> {
+  if (node.httpsDownloads?.length) return modelApi.downloadHttpsAssets(fullId)
+  if (node.hfDownloads?.length) return modelApi.downloadAssets(fullId)
+  if (node.hfRepo) return modelApi.download(node.hfRepo, fullId, node.hfSkipPrefixes)
+  return Promise.resolve({
+    success: false,
+    error: 'Model node does not declare downloadable assets.',
+    failure: {
+      code: 'assets_not_declared',
+      stage: 'validate',
+      message: 'Model node does not declare downloadable assets.',
+      retryable: false,
+    },
+  })
+}
+
+function loadPersistedDownloadFailures(): Record<string, ModelDownloadFailure> {
+  if (typeof window === 'undefined' || !window.localStorage) return {}
+  try {
+    const value = JSON.parse(window.localStorage.getItem(MODEL_DOWNLOAD_FAILURES_STORAGE_KEY) ?? '{}')
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, ModelDownloadFailure>
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+export function pruneStaleDownloadFailures(
+  failures: Record<string, ModelDownloadFailure>,
+  modelExtensions: readonly AnyExtension[],
+): Record<string, ModelDownloadFailure> {
+  const applicableCapabilityIds = new Set(
+    modelExtensions
+      .filter((extension): extension is Extract<AnyExtension, { type: 'model' }> => extension.type === 'model')
+      .flatMap((extension) => extension.nodes
+        .filter((node) => node.httpsDownloads?.length || node.hfDownloads?.length || node.hfRepo)
+        .map((node) => node.capabilityId ?? `${extension.id}/${node.id}`)),
+  )
+
+  return Object.fromEntries(
+    Object.entries(failures).filter(([capabilityId]) => applicableCapabilityIds.has(capabilityId)),
+  )
+}
 
 type InstallBannerTone = 'success' | 'warning' | 'error'
 
@@ -155,7 +211,8 @@ export default function ModelsPage(): JSX.Element {
   )
 
   // Model weight state (needed for node install status + uninstall cleanup)
-  const [downloading, setDownloading] = useState<Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number }>>({})
+  const [downloading, setDownloading] = useState<Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>>({})
+  const [downloadFailures, setDownloadFailures] = useState<Record<string, ModelDownloadFailure>>(loadPersistedDownloadFailures)
 
   // Uninstall modal state
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
@@ -200,11 +257,29 @@ export default function ModelsPage(): JSX.Element {
 
   useEffect(() => {
     loadExtensions()
-    window.electron.model.onProgress(({ capabilityId, modelId, percent, file, fileIndex, totalFiles }) => {
+    window.electron.model.onProgress(({
+      capabilityId,
+      modelId,
+      percent,
+      file,
+      fileIndex,
+      totalFiles,
+      repoIndex,
+      totalRepos,
+      status,
+    }) => {
       const id = capabilityId ?? modelId
       if (!id) return
-      setDownloading((prev) => ({ ...prev, [id]: { percent, file, fileIndex, totalFiles } }))
+      setDownloading((prev) => ({
+        ...prev,
+        [id]: { percent, file, fileIndex, totalFiles, repoIndex, totalRepos, status },
+      }))
       if (percent === 100) {
+        setDownloadFailures((prev) => {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
         refreshModelOwnership().then(() => {
           setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
         })
@@ -212,6 +287,25 @@ export default function ModelsPage(): JSX.Element {
     })
     return () => window.electron.model.offProgress()
   }, [loadExtensions, refreshModelOwnership])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.localStorage) return
+    try {
+      window.localStorage.setItem(
+        MODEL_DOWNLOAD_FAILURES_STORAGE_KEY,
+        JSON.stringify(downloadFailures),
+      )
+    } catch {
+      // Download failures still remain visible for the current page lifetime.
+    }
+  }, [downloadFailures])
+
+  useEffect(() => {
+    setDownloadFailures((prev) => {
+      const next = pruneStaleDownloadFailures(prev, modelExtensions)
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next
+    })
+  }, [modelExtensions])
 
   useEffect(() => {
     const modelIds = modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
@@ -679,6 +773,7 @@ export default function ModelsPage(): JSX.Element {
                 ext={ext}
                 installedIds={installedVariantIds}
                 downloading={downloading}
+                downloadFailures={downloadFailures}
                 ownershipStateById={ownershipStateById}
                 runtimeReadinessById={runtimeReadinessById}
                 disabled={extensionActionsDisabled}
@@ -686,14 +781,38 @@ export default function ModelsPage(): JSX.Element {
                   loadErrors[ext.id] ??
                   ext.nodes.map((n) => loadErrors[`${ext.id}/${n.id}`]).find(Boolean)
                 }
-                onInstall={(node: ExtensionNode, fullId: string) => {
-                  if (!node.hfRepo) return
-                  setDownloading((prev) => ({ ...prev, [fullId]: { percent: 0 } }))
-                  window.electron.model.download(node.hfRepo!, fullId, node.hfSkipPrefixes).then((result: { success: boolean }) => {
-                    if (!result.success) {
-                      setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
-                    }
+                onInstall={async (node: ExtensionNode, fullId: string) => {
+                  setDownloadFailures((prev) => {
+                    const next = { ...prev }
+                    delete next[fullId]
+                    return next
                   })
+                  setDownloading((prev) => ({
+                    ...prev,
+                    [fullId]: { percent: 0, status: 'preparing' },
+                  }))
+
+                  const result = await requestModelNodeDownload(
+                    node,
+                    fullId,
+                    window.electron.model,
+                  )
+                  if (!result.success) {
+                    setDownloading((prev) => {
+                      const next = { ...prev }
+                      delete next[fullId]
+                      return next
+                    })
+                    setDownloadFailures((prev) => ({
+                      ...prev,
+                      [fullId]: result.failure ?? {
+                        code: 'download_failed',
+                        stage: 'download',
+                        message: result.error ?? 'Model asset download failed.',
+                        retryable: true,
+                      },
+                    }))
+                  }
                 }}
                 onUninstallNode={async (fullId: string) => {
                   await window.electron.model.delete(fullId)

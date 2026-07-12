@@ -1000,8 +1000,9 @@ async function executeExtensionNode(
     ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
     updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
   }
-  if (url && workflow.edges.some((edge) => edge.source === node.id && nodeMap.get(edge.target)?.type === 'addToWorldsNode')) {
-    addWorkflowOutputUrlToWorlds(url)
+  const worldsUrl = output?.filePath ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
+  if (worldsUrl && workflow.edges.some((edge) => edge.source === node.id && nodeMap.get(edge.target)?.type === 'addToWorldsNode')) {
+    await addWorkflowOutputUrlToWorlds(worldsUrl, outputType)
   }
 }
 
@@ -1028,7 +1029,7 @@ function descendantWaits(rootId: string, ctx: RunContext): Set<string> {
  * to Scene) gets no immediate push during execution, so the display has to be
  * driven here, when the user continues that branch.
  */
-function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
+async function pushBranchSceneMesh(ctx: RunContext, waitId: string): Promise<void> {
   for (const node of ctx.ordered) {
     if (!isSceneOutput(node.type) && node.type !== 'addToWorldsNode') continue
     const owners = nearestUpstreamWaits(node.id, ctx.workflow.edges, ctx.nodeMap)
@@ -1038,10 +1039,12 @@ function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
     if (node.type === 'addToWorldsNode' && ctx.nodeMap.get(inEdge.source)?.type === 'extensionNode') continue
     const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
     const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
-    const url = isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
+    const url = node.type === 'addToWorldsNode' && sourceOutput?.filePath
+      ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir)
+      : isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
     if (url) {
       if (node.type === 'addToWorldsNode') {
-        addWorkflowOutputUrlToWorlds(url)
+        await addWorkflowOutputUrlToWorlds(url, sourceOutput?.outputType)
       } else {
         ctx.lastSceneMesh = url
         updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
@@ -1726,7 +1729,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         }
       })
 
-      const finishBranch = (next: WaitState, err?: string): void => {
+      const finishBranch = async (next: WaitState, err?: string): Promise<void> => {
         if (!isCurrentContext(ctx)) return
         const newWaitStates = { ...get().waitStates, [waitId]: next }
         // Unblock nested Waits whose parent branch just finished, and push this
@@ -1739,7 +1742,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
               newWaitStates[w] = 'pending'
             }
           }
-          pushBranchSceneMesh(ctx, waitId)
+          await pushBranchSceneMesh(ctx, waitId)
+          if (!isCurrentContext(ctx)) return
           syncCheckpoints(ctx)
         }
         // A failed branch can never feed its descendants — surface them as error
@@ -1780,9 +1784,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           await executeExtensionNode(node, ctx, (updater) => { if (isCurrentContext(ctx)) setRunState(updater) })
           if (!isCurrentContext(ctx)) return
         }
-        finishBranch('done')
+        await finishBranch('done')
       } catch (err) {
-        finishBranch('error', String(err))
+        await finishBranch('error', String(err))
       }
     },
 

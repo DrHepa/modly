@@ -161,7 +161,7 @@ test('updateWorldSceneItemTransforms applies batched updates without mutating un
   ])
 })
 
-test('collision placement helpers add, anchor, update, and remove scene-level world zones', () => {
+test('legacy collision zone helpers remain deterministic while active UI migrates to collision surfaces', () => {
   const hero = { ...item('hero'), transform: { position: [4, 1, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
   const base = { ...item('base', 'Workflows/base.glb'), role: 'base-scene' as const, transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
 

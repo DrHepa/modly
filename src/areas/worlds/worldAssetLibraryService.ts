@@ -15,7 +15,7 @@ import { listAssetLibraryEntries, readAssetLibraryEntry, openAssetLibraryEntry }
 import { projectAssetLibraryEntry } from '../generate/assetLibraryProjection.ts'
 import { isSafeViewerWorkspaceRelativePath } from '../generate/viewerAssetTarget.ts'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Gaussian PLY' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
   | (WorkspaceAssetLibraryEntry & {
@@ -75,6 +75,9 @@ export async function openWorldAssetLibraryRenderable(request: AssetLibraryOpenR
 
 export function projectWorldAssetLibraryListResult(result: AssetLibraryListResult, apiUrl: string): WorldAssetLibraryListResult {
   if (result.success !== true) return result
+  if (!Array.isArray(result.entries)) {
+    return { success: false, error: 'Workspace asset-library returned an invalid entries payload.' }
+  }
   return {
     success: true,
     assets: result.entries.filter(isWorldLibraryCandidate).map((entry) => projectWorldAssetLibraryEntry(entry, apiUrl)),
@@ -95,12 +98,14 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
   let renderable: WorldRenderable
   if (!isSafeViewerWorkspaceRelativePath(entry.workspacePath) || entry.state === 'unsafe') {
     renderable = { openable: false, reason: 'unsafe' }
+  } else if (extension === '.ply' && entry.plyKind === 'gaussian') {
+    renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl, plyKind: entry.plyKind })
   } else if (entry.state !== 'ready' || (extension === '.ply' && entry.plyHeader?.status !== 'complete')) {
     renderable = { openable: false, reason: 'unavailable' }
   } else if (['.glb', '.gltf'].includes(extension) && projectAssetLibraryEntry(entry).openTarget.kind !== 'self') {
     renderable = { openable: false, reason: 'unavailable' }
   } else {
-    renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl, header: entry.plyHeader?.status === 'complete' ? entry.plyHeader.content : undefined })
+    renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl, plyKind: entry.plyKind, header: entry.plyHeader?.status === 'complete' ? entry.plyHeader.content : undefined })
   }
   const name = resolveName(entry)
   const baseEntry = {
@@ -186,6 +191,8 @@ function describeRenderableType(renderable: Extract<WorldRenderable, { openable:
       return 'PLY mesh'
     case 'ply-points':
       return 'PLY points'
+    case 'gaussian-ply':
+      return 'Gaussian PLY'
   }
 }
 

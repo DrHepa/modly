@@ -32,13 +32,13 @@ export function WorldsMouseLookCameraControls({ inputScopeRef, orbitControlsRef,
     const canvas = gl.domElement
 
     const syncOrbitTargetToLookDirection = () => {
-      const controls = orbitControlsRef.current
-      if (!controls) return
-      camera.getWorldDirection(lookDirection)
-      const distance = Math.max(camera.position.distanceTo(controls.target), 0.1)
-      controls.target.copy(lookTarget.copy(camera.position).addScaledVector(lookDirection, distance))
-      controls.update()
-    }
+        const controls = orbitControlsRef.current
+        if (!controls) return
+        camera.getWorldDirection(lookDirection)
+        const distance = Math.max(camera.position.distanceTo(controls.target), 0.1)
+        controls.target.copy(lookTarget.copy(camera.position).addScaledVector(lookDirection, distance))
+        controls.update()
+      }
 
     const handlePointerDown = (event: PointerEvent) => {
       if (!enabled) return

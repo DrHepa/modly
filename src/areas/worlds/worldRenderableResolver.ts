@@ -1,5 +1,6 @@
 import { classifyPlyHeader } from './plyClassification.ts'
 import { isSafeViewerWorkspaceRelativePath } from '../generate/viewerAssetTarget.ts'
+import type { PlyKind } from '../../shared/ply/plyHeaderClassification.ts'
 
 export type WorldAssetKind = 'glb' | 'gltf' | 'ply-mesh' | 'ply-points' | 'gaussian-ply' | 'spz'
 export type WorldSceneItemRole = 'asset' | 'base-scene'
@@ -15,7 +16,7 @@ export interface WorldSceneItem {
   id: string
   workspacePath: string
   url: string
-  kind: Exclude<WorldAssetKind, 'gaussian-ply' | 'spz'>
+  kind: Exclude<WorldAssetKind, 'spz'>
   role: WorldSceneItemRole
   visible: boolean
   animation?: WorldSceneItemAnimationBinding
@@ -54,10 +55,19 @@ export type WorldRenderable =
   | { openable: true; item: WorldSceneItem }
   | { openable: false; reason: WorldUnsupportedReason }
 
+export const WORLDS_EXPERIMENTAL_FEATURES = {
+  gaussianPly: false,
+} as const
+
+export function isWorldsGaussianPlyEnabled(): boolean {
+  return WORLDS_EXPERIMENTAL_FEATURES.gaussianPly
+}
+
 export interface WorldRenderableInput {
   workspacePath: string
   url?: string
   apiUrl?: string
+  plyKind?: PlyKind
   header?: string
 }
 
@@ -109,12 +119,18 @@ export function resolveWorldRenderable(input: WorldRenderableInput): WorldRender
     return { openable: true, item: createSceneItem(workspacePath, extension.slice(1) as 'glb' | 'gltf', url) }
   }
   if (extension === '.ply') {
-    // Headerless pure resolver candidates remain possible; the library adapter
-    // separately requires fresh, complete host evidence before using this path.
     const classification = input.header !== undefined ? classifyPlyHeader(input.header) : undefined
     if (classification?.kind === 'invalid') return { openable: false, reason: 'unavailable' }
-    if (classification?.kind === 'gaussian') return { openable: false, reason: 'unsupported-gaussian-ply' }
-    const kind = classification?.kind === 'standard-points' ? 'ply-points' : 'ply-mesh'
+    const resolvedPlyKind = classification
+      ? classification.kind === 'gaussian' ? 'gaussian'
+        : classification.kind === 'standard-points' ? 'points' : 'mesh'
+      : input.plyKind
+    if (resolvedPlyKind === 'gaussian') {
+      if (!isWorldsGaussianPlyEnabled()) return { openable: false, reason: 'unsupported-gaussian-ply' }
+      return { openable: true, item: createSceneItem(workspacePath, 'gaussian-ply', url) }
+    }
+    if (resolvedPlyKind === 'unknown') return { openable: false, reason: 'unavailable' }
+    const kind = resolvedPlyKind === 'points' ? 'ply-points' : 'ply-mesh'
     return { openable: true, item: createSceneItem(workspacePath, kind, url) }
   }
 

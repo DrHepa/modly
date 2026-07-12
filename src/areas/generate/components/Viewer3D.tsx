@@ -68,6 +68,34 @@ type RigStats = {
   jointCount: number
 }
 
+type ViewerGeometryStats = {
+  vertices: number
+  triangles: number
+}
+
+export function collectViewer3DSceneStats(scene: THREE.Object3D): ViewerGeometryStats {
+  let vertices = 0
+  let triangles = 0
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
+
+    const positionCount = child.geometry.getAttribute('position')?.count ?? 0
+    vertices += positionCount
+
+    if (child instanceof THREE.Mesh) {
+      triangles += child.geometry.index
+        ? child.geometry.index.count / 3
+        : positionCount / 3
+    }
+  })
+
+  return {
+    vertices: Math.round(vertices),
+    triangles: Math.round(triangles),
+  }
+}
+
 type JointMarker = {
   bone: THREE.Bone
   boneId?: RigBoneId
@@ -577,7 +605,7 @@ interface MeshModelProps {
   selected: boolean
   animationPlaying: boolean
   poseOwnerRef: MutableRefObject<THREE.Object3D | null>
-  onStats: (stats: { vertices: number; triangles: number }) => void
+  onStats: (stats: ViewerGeometryStats) => void
   onSelect: (partId: string | null) => void
   onAnimationControlsReady?: (scene: THREE.Object3D, controls: Viewer3DAnimationControls | null) => void
   onObject: (object: THREE.Object3D | null) => void
@@ -708,7 +736,7 @@ function SceneMeshModel({
     const geometries = new Set<THREE.BufferGeometry>()
     const materials = new Set<THREE.Material>()
     scene.traverse((child) => {
-      if (!(child instanceof THREE.Mesh)) return
+      if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
       geometries.add(child.geometry)
       const meshMaterials = Array.isArray(child.material) ? child.material : [child.material]
       meshMaterials.forEach((material) => materials.add(material))
@@ -749,21 +777,8 @@ function SceneMeshModel({
     box.getCenter(center)
     scene.position.set(-center.x, -box.min.y, -center.z)
 
-    // Compute stats
-    let vertices = 0
-    let triangles = 0
-    scene.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        vertices += child.geometry.attributes.position?.count ?? 0
-        triangles += child.geometry.index
-          ? child.geometry.index.count / 3
-          : (child.geometry.attributes.position?.count ?? 0) / 3
-      }
-    })
-    const roundedTriangles = Math.round(triangles)
-    onStats({ vertices: Math.round(vertices), triangles: roundedTriangles })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute on scene change only; onStats is a stable callback
-  }, [scene])
+    onStats(collectViewer3DSceneStats(scene))
+  }, [scene, onStats])
 
   // Thumbnail capture (kept for future use)
   useEffect(() => {

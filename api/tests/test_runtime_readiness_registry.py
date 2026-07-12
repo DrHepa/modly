@@ -296,6 +296,10 @@ def test_registry_marks_models_without_readiness_as_unsupported_contract():
 def test_extension_process_sends_runtime_readiness_action_with_bounded_timeout(monkeypatch):
     process = ExtensionProcess.__new__(ExtensionProcess)
     process.MODEL_ID = "runtime-ext/text-to-image"
+    process.model_id = "runtime-ext/text-to-image"
+    process.model_dir = None
+    process.hf_downloads = []
+    process.https_downloads = []
     process._queue = queue.Queue()
     sent: list[dict] = []
     recv_timeouts: list[float | None] = []

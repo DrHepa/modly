@@ -1,18 +1,23 @@
 import asyncio
 import json
-import time
 import os
-import socket
-import threading
-from pathlib import Path
+import re
 from typing import Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from services.generator_registry import generator_registry, MODELS_DIR
+from services.hf_download_assets import (
+    HfDownloadManifestError,
+    resolve_confined_owner_dir,
+    stream_hf_asset_downloads,
+)
+from services.https_download_assets import (
+    HttpsDownloadManifestError,
+    stream_https_asset_downloads,
+)
 
 router = APIRouter(tags=["model"])
+_SAFE_MODEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class DownloadPaused(Exception):
@@ -72,10 +77,12 @@ async def model_runtime_readiness(model_ids: str):
 
 
 def _is_safe_canonical_model_id(model_id: str) -> bool:
-    if model_id.startswith("/") or ".." in model_id.split("/"):
+    if not isinstance(model_id, str) or not model_id:
         return False
     parts = model_id.split("/")
-    return len(parts) >= 2 and all(parts)
+    return len(parts) == 2 and all(
+        _SAFE_MODEL_SEGMENT_RE.fullmatch(part) for part in parts
+    )
 
 
 @router.get("/params")
@@ -125,18 +132,91 @@ async def unload_model(model_id: str):
         return {"unloaded": True}  # already not loaded, that's fine
 
 
-@router.post("/hf-download/pause")
-async def pause_hf_download(model_id: str):
-    control = _download_control(model_id)
-    control["pause"].set()
-    return {"paused": True}
+def _bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    scheme, separator, credential = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer" and credential.strip():
+        return credential.strip()
+    return None
 
 
-@router.post("/hf-download/cancel")
-async def cancel_hf_download(model_id: str):
-    control = _download_control(model_id)
-    control["cancel"].set()
-    return {"cancelled": True}
+@router.get("/hf-download-assets")
+async def hf_download_assets(
+    model_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Stream a manifest-owned, pinned and allowlisted asset plan via SSE."""
+    if not _is_safe_canonical_model_id(model_id):
+        raise HTTPException(400, f"Invalid model ID: {model_id}")
+
+    try:
+        plan = generator_registry.get_hf_download_plan(model_id)
+        if not plan:
+            raise HTTPException(409, "Model does not declare hf_downloads assets")
+        owner_dir = resolve_confined_owner_dir(
+            MODELS_DIR,
+            generator_registry.canonical_model_dir(model_id),
+        )
+    except KeyError as error:
+        raise HTTPException(404, f"Unknown model ID: {model_id}") from error
+    except HfDownloadManifestError as error:
+        raise HTTPException(422, str(error)) from error
+
+    token = (
+        _bearer_token(authorization)
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HF_TOKEN")
+        or None
+    )
+
+    async def stream():
+        async for event in stream_hf_asset_downloads(owner_dir, plan, token=token):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@router.get("/https-download-assets")
+async def https_download_assets(model_id: str):
+    """Stream a model node's exact manifest-owned HTTPS asset plan via SSE."""
+    if not _is_safe_canonical_model_id(model_id):
+        raise HTTPException(400, f"Invalid model ID: {model_id}")
+
+    try:
+        plan = generator_registry.get_https_download_plan(model_id)
+        if not plan:
+            raise HTTPException(
+                409,
+                "Model does not declare https_downloads assets",
+            )
+        owner_dir = resolve_confined_owner_dir(
+            MODELS_DIR,
+            generator_registry.canonical_model_dir(model_id),
+        )
+    except KeyError as error:
+        raise HTTPException(
+            404,
+            f"Unknown model ID: {model_id}",
+        ) from error
+    except (
+        HttpsDownloadManifestError,
+        HfDownloadManifestError,
+    ) as error:
+        raise HTTPException(422, str(error)) from error
+
+    async def stream():
+        async for event in stream_https_asset_downloads(
+            owner_dir,
+            model_id,
+            plan,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+    )
 
 
 @router.get("/hf-download")

@@ -6,6 +6,9 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from services.hf_download_assets import hf_download_assets_ready
+from services.https_download_assets import https_download_assets_ready
+
 
 class GenerationCancelled(Exception):
     """Raised by generators when a cancel_event is set mid-generation."""
@@ -49,7 +52,11 @@ class BaseGenerator(ABC):
         self.outputs_dir       = outputs_dir
         self._model            = None
         # Injected by the registry from the manifest
+        self.model_id:         str  = self.MODEL_ID
+        self.input:            str  = "image"
         self.hf_repo:          str  = ""
+        self.hf_downloads:      list = []
+        self.https_downloads:   list = []
         self.hf_skip_prefixes: list = []
         self.download_check:   str  = ""   # relative path to check in model_dir
         self._params_schema:   list = []   # params declared in the manifest
@@ -65,6 +72,14 @@ class BaseGenerator(ABC):
         otherwise checks that model_dir exists and is non-empty.
         Can be overridden in generator.py for custom logic.
         """
+        if self.https_downloads:
+            return https_download_assets_ready(
+                self.model_dir,
+                self.model_id,
+                self.https_downloads,
+            )
+        if self.hf_downloads:
+            return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
             return (self.model_dir / self.download_check).exists()
         return self.model_dir.exists() and any(self.model_dir.iterdir())
@@ -147,6 +162,16 @@ class BaseGenerator(ABC):
         Used as a fallback when is_downloaded() returns False.
         Extensions can override this method for custom logic.
         """
+        if self.https_downloads:
+            raise RuntimeError(
+                f"[{self.model_id}] Manifest-owned https_downloads assets "
+                "must be installed from the Models UI before loading this model."
+            )
+        if self.hf_downloads:
+            raise RuntimeError(
+                f"[{self.MODEL_ID}] Manifest-owned hf_downloads assets must be "
+                "installed from the Models UI before loading this model."
+            )
         if not self.hf_repo:
             raise RuntimeError(
                 f"[{self.MODEL_ID}] Cannot download: hf_repo not configured. "

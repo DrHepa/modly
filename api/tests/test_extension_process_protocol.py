@@ -8,6 +8,63 @@ from services.extension_process import (
 )
 
 
+def _start_extension_process_with_ready_schema(monkeypatch, tmp_path, manifest, ready_schema):
+    process = ExtensionProcess(tmp_path, manifest)
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+
+    class FakePopen:
+        pid = 123
+        stdout = None
+        stderr = None
+        stdin = None
+
+    class NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("services.extension_process._venv_python", lambda _ext_dir: python)
+    monkeypatch.setattr("services.extension_process.subprocess.Popen", lambda *args, **kwargs: FakePopen())
+    monkeypatch.setattr("services.extension_process.threading.Thread", NoopThread)
+    monkeypatch.setattr(process, "_recv", lambda timeout=None: {
+        "type": "ready",
+        "params_schema": ready_schema,
+    })
+
+    process._start()
+    return process
+
+
+def test_extension_process_keeps_node_manifest_params_schema_over_generic_runner_schema(monkeypatch, tmp_path):
+    scene_schema = [{"id": "mesh_footprint_ratio_threshold", "default": 12}]
+    process = _start_extension_process_with_ready_schema(
+        monkeypatch,
+        tmp_path,
+        {
+            "id": "dreamcube/generate-scene",
+            "params_schema": scene_schema,
+        },
+        [{"id": "output_format", "default": "equirect_rgb_png"}],
+    )
+
+    assert process.params_schema() == scene_schema
+
+
+def test_extension_process_uses_runner_params_schema_when_manifest_omits_it(monkeypatch, tmp_path):
+    runtime_schema = [{"id": "dynamic_option", "default": True}]
+    process = _start_extension_process_with_ready_schema(
+        monkeypatch,
+        tmp_path,
+        {"id": "legacy/generate"},
+        runtime_schema,
+    )
+
+    assert process.params_schema() == runtime_schema
+
+
 def test_extension_process_load_ignores_queued_runtime_readiness_before_loaded(monkeypatch, tmp_path):
     process = ExtensionProcess(tmp_path, {"id": "hunyuan3d-part/decompose-mesh"})
     sent: list[dict] = []
@@ -115,6 +172,53 @@ def test_extension_process_generate_ignores_stale_runtime_readiness_before_done(
 
     assert sent[0]["action"] == "generate"
     assert output_path == Path(tmp_path / "mesh.glb")
+
+
+def test_extension_process_propagates_https_plan_and_gates_readiness_before_start(
+    monkeypatch,
+    tmp_path,
+):
+    import hashlib
+
+    from services.extension_process import ExtensionProcess
+
+    payload = b"model"
+    plan = [{
+        "url": "https://assets.example.com/model.bin",
+        "filename": "model.bin",
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }]
+    process = ExtensionProcess(
+        tmp_path / "extension",
+        {
+            "id": "demo/generate",
+            "name": "Demo",
+            "input": "none",
+            "https_downloads": plan,
+        },
+    )
+    process.model_dir = tmp_path / "models" / "demo" / "generate"
+    process.model_dir.mkdir(parents=True)
+
+    def unexpected_start():
+        raise AssertionError("asset readiness must not start the subprocess")
+
+    monkeypatch.setattr(process, "_ensure_started", unexpected_start)
+
+    assert process.model_id == "demo/generate"
+    assert process.input == "none"
+    assert process.https_downloads == plan
+    assert process.is_downloaded() is False
+    assert process.readiness_status() == {
+        "ok": False,
+        "machine_code": "assets_not_ready",
+        "label_hint": "Install model assets",
+        "reason": (
+            "demo/generate requires its exact HTTPS asset plan. "
+            "Install or repair the assets from the Models UI."
+        ),
+    }
 
 
 def test_extension_process_serializes_readiness_and_load_requests(monkeypatch, tmp_path):

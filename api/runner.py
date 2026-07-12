@@ -143,8 +143,12 @@ def main() -> None:
     # so its last component matches the node id.
     node, model_dir = resolve_runner_context(manifest)
     gen = GenClass(model_dir, WORKSPACE_DIR)
+    gen.model_id         = model_id
     gen.node_id          = node.get("id", "")
+    gen.input            = node.get("input") or manifest.get("input", "image")
     gen.hf_repo          = manifest.get("hf_repo", "")          or node.get("hf_repo", "")
+    gen.hf_downloads      = manifest.get("hf_downloads", [])      or node.get("hf_downloads", [])
+    gen.https_downloads   = manifest.get("https_downloads", [])   or node.get("https_downloads", [])
     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", []) or node.get("hf_skip_prefixes", [])
     gen.download_check   = manifest.get("download_check", "")   or node.get("download_check", "")
     gen._params_schema   = manifest.get("params_schema", [])    or node.get("params_schema", [])

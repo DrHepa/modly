@@ -63,6 +63,34 @@ type RigStats = {
   jointCount: number
 }
 
+type ViewerGeometryStats = {
+  vertices: number
+  triangles: number
+}
+
+export function collectViewer3DSceneStats(scene: THREE.Object3D): ViewerGeometryStats {
+  let vertices = 0
+  let triangles = 0
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
+
+    const positionCount = child.geometry.getAttribute('position')?.count ?? 0
+    vertices += positionCount
+
+    if (child instanceof THREE.Mesh) {
+      triangles += child.geometry.index
+        ? child.geometry.index.count / 3
+        : positionCount / 3
+    }
+  })
+
+  return {
+    vertices: Math.round(vertices),
+    triangles: Math.round(triangles),
+  }
+}
+
 type JointMarker = {
   bone: THREE.Bone
   boneId?: RigBoneId
@@ -421,7 +449,7 @@ interface MeshModelProps {
   rigSourceWorkspacePath?: string
   viewMode: ViewMode
   animationPlaying: boolean
-  onStats: (stats: { vertices: number; triangles: number }) => void
+  onStats: (stats: ViewerGeometryStats) => void
   editMode: boolean
   sceneParts: readonly ScenePart[]
   onSelect: (partId: string | null) => void
@@ -540,14 +568,14 @@ function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, ed
         useGLTF.clear(url)
       }
       scene.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
+        if (child instanceof THREE.Mesh || child instanceof THREE.Points) {
           child.geometry.dispose()
           const materials = Array.isArray(child.material) ? child.material : [child.material]
           materials.forEach((m: THREE.Material) => m.dispose())
         }
       })
     }
-  }, [loaderType, scene, url])
+  }, [url, scene])
 
   // Compute BVH on all geometries for fast raycasting (O(log N) vs O(N)).
   // Also force DoubleSide on every material so faces with inverted normals
@@ -582,21 +610,8 @@ function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, ed
     box.getCenter(center)
     scene.position.set(-center.x, -box.min.y, -center.z)
 
-    // Compute stats
-    let vertices = 0
-    let triangles = 0
-    scene.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        vertices += child.geometry.attributes.position?.count ?? 0
-        triangles += child.geometry.index
-          ? child.geometry.index.count / 3
-          : (child.geometry.attributes.position?.count ?? 0) / 3
-      }
-    })
-    const roundedTriangles = Math.round(triangles)
-    onStats({ vertices: Math.round(vertices), triangles: roundedTriangles })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute on scene change only; onStats is a stable callback
-  }, [scene])
+    onStats(collectViewer3DSceneStats(scene))
+  }, [scene, onStats])
 
   // Thumbnail capture (kept for future use)
   useEffect(() => {

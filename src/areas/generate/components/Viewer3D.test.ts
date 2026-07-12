@@ -86,6 +86,51 @@ async function loadViewer3DModule() {
   }
 }
 
+test('Viewer3D scene stats count point vertices without triangles and preserve mesh triangle counts', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const scene = new THREE.Scene()
+
+    const pointGeometry = new THREE.BufferGeometry()
+    pointGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+      0, 0, 0,
+      1, 0, 0,
+      0, 1, 0,
+      0, 0, 1,
+    ], 3))
+    scene.add(new THREE.Points(pointGeometry, new THREE.PointsMaterial()))
+
+    const indexedMeshGeometry = new THREE.BufferGeometry()
+    indexedMeshGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+      0, 0, 0,
+      1, 0, 0,
+      1, 1, 0,
+      0, 1, 0,
+    ], 3))
+    indexedMeshGeometry.setIndex([0, 1, 2, 0, 2, 3])
+    scene.add(new THREE.Mesh(indexedMeshGeometry, new THREE.MeshBasicMaterial()))
+
+    const nonIndexedMeshGeometry = new THREE.BufferGeometry()
+    nonIndexedMeshGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+      0, 0, 0,
+      1, 0, 0,
+      0, 1, 0,
+      1, 0, 0,
+      1, 1, 0,
+      0, 1, 0,
+    ], 3))
+    scene.add(new THREE.Mesh(nonIndexedMeshGeometry, new THREE.MeshBasicMaterial()))
+
+    assert.deepEqual(module.collectViewer3DSceneStats(scene), {
+      vertices: 14,
+      triangles: 4,
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
 test('resolveViewer3DPresentation marks workflow checkpoints as temporary and not deletable', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 

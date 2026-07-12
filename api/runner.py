@@ -253,6 +253,10 @@ def main() -> None:
     gen.node_id = node.get("id", "")
     gen.shared_model_dirs = dict(_SHARED_MODEL_DIRS)
     _apply_manifest_metadata(gen, manifest, node)
+    gen.model_id = model_id
+    gen.input = node.get("input") or manifest.get("input", "image")
+    gen.hf_downloads = node.get("hf_downloads") or manifest.get("hf_downloads", [])
+    gen.https_downloads = node.get("https_downloads") or manifest.get("https_downloads", [])
 
     # Active cancel events keyed by request id
     _cancel: dict[str, threading.Event] = {}

@@ -21,6 +21,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
+from services.hf_download_assets import hf_download_assets_ready
+from services.https_download_assets import https_download_assets_ready
+
 _RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 _MISSING_MODULE_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
 _AUTO_REPAIR_PACKAGE_MAP = {
@@ -73,13 +76,17 @@ class ExtensionProcess:
         self._readiness_timeout = _RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS
 
         # Mirrors BaseGenerator attributes used by the registry
+        self.input            = manifest.get("input", "image")
         self.hf_repo          = manifest.get("hf_repo", "")
+        self.hf_downloads      = manifest.get("hf_downloads", [])
+        self.https_downloads   = manifest.get("https_downloads", [])
         self.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
         self.download_check   = manifest.get("download_check", "")
         self._params_schema   = manifest.get("params_schema", [])
 
         # Public metadata
         self.MODEL_ID     = manifest.get("id", "")
+        self.model_id     = self.MODEL_ID
         self.DISPLAY_NAME = manifest.get("name", "")
         self.VRAM_GB      = manifest.get("vram_gb", 0)
 
@@ -173,8 +180,8 @@ class ExtensionProcess:
             # Wait for ready — runner sends params_schema in this message
             msg = self._recv(timeout=None)
             if msg.get("type") == "ready":
-                # Override params_schema with what the generator class actually declares
-                if msg.get("params_schema"):
+                # Use runtime schema only when the node manifest does not declare one.
+                if msg.get("params_schema") and not self._params_schema:
                     self._params_schema = msg["params_schema"]
 
                 print(f"[ExtensionProcess] {self.MODEL_ID} subprocess started (pid {self._proc.pid})")
@@ -330,6 +337,14 @@ class ExtensionProcess:
     # ------------------------------------------------------------------ #
 
     def is_downloaded(self) -> bool:
+        if self.https_downloads:
+            return https_download_assets_ready(
+                self.model_dir,
+                self.model_id,
+                self.https_downloads,
+            )
+        if self.hf_downloads:
+            return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
             return (self.model_dir / self.download_check).exists()
         return self.model_dir.exists() and any(self.model_dir.iterdir())
@@ -510,6 +525,21 @@ class ExtensionProcess:
 
     def readiness_status(self) -> dict:
         """Probe an already-running worker without preventing normal model use."""
+        if self.https_downloads and not https_download_assets_ready(
+            self.model_dir,
+            self.model_id,
+            self.https_downloads,
+        ):
+            return {
+                "ok": False,
+                "machine_code": "assets_not_ready",
+                "label_hint": "Install model assets",
+                "reason": (
+                    f"{self.model_id} requires its exact HTTPS asset plan. "
+                    "Install or repair the assets from the Models UI."
+                ),
+            }
+
         with self._invocation_lock:
             proc = self._proc
             if proc is None or proc.poll() is not None:

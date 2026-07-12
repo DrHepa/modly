@@ -41,6 +41,8 @@ from services.model_sources import (
     safe_source_id,
     weight_group_sources_are_downloaded,
 )
+from services.hf_download_assets import validate_hf_downloads, hf_download_assets_ready
+from services.https_download_assets import validate_https_downloads, https_download_assets_ready
 
 # ------------------------------------------------------------------ #
 # Global paths
@@ -71,6 +73,23 @@ print(f"[Registry] EXTENSIONS_DIR = {EXTENSIONS_DIR or '(not set)'}")
 
 # Optional read-only diagnostics have a bounded budget independent of model load.
 _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
+_MODEL_INPUT_KINDS = frozenset({
+    "image",
+    "text",
+    "mesh",
+    "scene",
+    "audio",
+    "video",
+    "none",
+})
+
+
+def validate_model_input(value, context: str = "input") -> str:
+    """Validate the invocation input declared by one model node."""
+    if not isinstance(value, str) or value not in _MODEL_INPUT_KINDS:
+        expected = ", ".join(sorted(_MODEL_INPUT_KINDS))
+        raise ValueError(f"{context} must be one of: {expected}")
+    return value
 
 
 def is_within_workspace(resolved_path: Path) -> bool:
@@ -237,6 +256,7 @@ class _LegacyGeneratorProxy:
             for name in (
                 "hf_repo", "hf_skip_prefixes", "download_check", "_params_schema",
                 "MODEL_ID", "MODEL_NODE_ID",
+                "model_id", "input", "hf_downloads", "https_downloads",
             ):
                 setattr(replacement, name, getattr(target, name))
             replacement.shared_model_dirs = shared_model_dirs
@@ -676,6 +696,11 @@ def _discover_extensions(
                         "node_id":          node["id"],
                         "name":             node.get("name", node["id"]),
                         "hf_repo":          node.get("hf_repo", ""),
+                        "hf_downloads":       validate_hf_downloads(
+                            node["hf_downloads"],
+                            context="{}/{}.hf_downloads".format(ext_id, node["id"]),
+                        ) if "hf_downloads" in node else [],
+                        "https_downloads":  node.get("https_downloads", []),
                         "download_check":   node.get("download_check", ""),
                         "hf_skip_prefixes": node.get("hf_skip_prefixes", []),
                         "hf_include_prefixes": node.get("hf_include_prefixes", []),
@@ -784,9 +809,55 @@ class GeneratorRegistry:
         )
         self._errors.update(discovery_errors)
 
+        model_ids_by_owner: Dict[str, list[str]] = {}
+        for discovered_model_id, (_, discovered_manifest, _, _) in extensions.items():
+            bundle_id = (
+                discovered_manifest.get("bundle_id")
+                or discovered_model_id.split("/", 1)[0]
+            )
+            owner_id = (
+                discovered_manifest.get("weight_owner_id")
+                or discovered_manifest.get("id")
+                or discovered_model_id
+            )
+            owner_key = f"{bundle_id}/{owner_id}"
+            model_ids_by_owner.setdefault(owner_key, []).append(discovered_model_id)
+
         for model_id, entry in extensions.items():
             cls, manifest, ext_dir, legacy_context = entry
             try:
+                manifest["input"] = validate_model_input(
+                    manifest.get("input", "image"),
+                    context=f"{model_id}.input",
+                )
+
+                raw_https_downloads = manifest.get("https_downloads", [])
+                if raw_https_downloads:
+                    bundle_id = (
+                        manifest.get("bundle_id")
+                        or model_id.split("/", 1)[0]
+                    )
+                    owner_id = manifest.get("weight_owner_id") or manifest.get("id")
+                    owner_key = f"{bundle_id}/{owner_id}"
+                    owner_model_ids = model_ids_by_owner.get(owner_key, [model_id])
+                    if len(owner_model_ids) > 1:
+                        raise ValueError(
+                            "Model '{}' declares https_downloads but weight owner '{}' "
+                            "is shared by multiple model IDs: {}. HTTPS readiness markers "
+                            "embed the full model ID, so HTTPS plans require a node-specific "
+                            "weight owner.".format(
+                                model_id,
+                                owner_id,
+                                ", ".join(sorted(owner_model_ids)),
+                            )
+                        )
+                    manifest["https_downloads"] = validate_https_downloads(
+                        raw_https_downloads,
+                        context=f"{model_id}.https_downloads",
+                    )
+                else:
+                    manifest["https_downloads"] = []
+
                 if cls is None:
                     # Subprocess mode: venv must exist
                     if not _venv_python(ext_dir).is_file():
@@ -812,7 +883,11 @@ class GeneratorRegistry:
                         self._legacy_imports,
                         legacy_context,
                     )
+                    gen.model_id = model_id
+                    gen.input = manifest["input"]
                     gen.hf_repo          = manifest.get("hf_repo", "")
+                    gen.hf_downloads      = manifest.get("hf_downloads", [])
+                    gen.https_downloads   = manifest.get("https_downloads", [])
                     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
                     gen.download_check   = manifest.get("download_check", "")
                     gen._params_schema   = manifest.get("params_schema", [])
@@ -949,6 +1024,12 @@ class GeneratorRegistry:
             if not gen.is_loaded():
                 self._invalidate_runtime_readiness(model_id)
                 if not downloaded:
+                    if getattr(gen, "https_downloads", []):
+                        raise RuntimeError(
+                            f"[{model_id}] Manifest-owned https_downloads "
+                            "assets must be installed from the Models UI before "
+                            "loading this model."
+                        )
                     if isinstance(gen, ExtensionProcess):
                         # Let the subprocess handle its own download logic during
                         # load() — some extensions (e.g. mv-adapter) need custom
@@ -971,6 +1052,7 @@ class GeneratorRegistry:
         return {
             "id": model_id,
             "name": manifest.get("name", gen.DISPLAY_NAME),
+            "input": self.get_model_input(model_id),
             "downloaded": self._is_downloaded(model_id, gen),
             "loaded": gen.is_loaded(),
         }
@@ -1014,6 +1096,32 @@ class GeneratorRegistry:
         if model_id not in self._manifests:
             raise KeyError(f"No manifest for model ID: '{model_id}'")
         return self._manifests[model_id]
+
+    def get_hf_download_plan(self, model_id: str) -> list[dict]:
+        """Returns the validated manifest-owned asset plan for a canonical model ID."""
+        manifest = self.get_manifest(model_id)
+        plan = manifest.get("hf_downloads", [])
+        return validate_hf_downloads(
+            plan,
+            context="{}.hf_downloads".format(model_id),
+        ) if plan else []
+
+    def get_https_download_plan(self, model_id: str) -> list[dict]:
+        """Return the exact HTTPS asset plan owned by a canonical model ID."""
+        manifest = self.get_manifest(model_id)
+        plan = manifest.get("https_downloads", [])
+        return validate_https_downloads(
+            plan,
+            context=f"{model_id}.https_downloads",
+        ) if plan else []
+
+    def get_model_input(self, model_id: str) -> str:
+        """Return the validated invocation input for a canonical model ID."""
+        manifest = self.get_manifest(model_id)
+        return validate_model_input(
+            manifest.get("input", "image"),
+            context=f"{model_id}.input",
+        )
 
     def switch_model(self, model_id: str) -> None:
         """Switches the active model. Unloads the previous one if different."""
@@ -1081,7 +1189,13 @@ class GeneratorRegistry:
             for group in manifest.get("weight_groups", [])
         )
         if "model_sources" in manifest or manifest.get("weight_groups"):
-            return private_ready and shared_ready
+            hf_plan = manifest.get("hf_downloads", [])
+            https_plan = manifest.get("https_downloads", [])
+            structured_ready = (
+                (not hf_plan or hf_download_assets_ready(model_dir, hf_plan))
+                and (not https_plan or https_download_assets_ready(model_dir, model_id, https_plan))
+            )
+            return private_ready and shared_ready and structured_ready
         return gen.is_downloaded()
 
     def active_status(self) -> dict:
@@ -1103,6 +1217,7 @@ class GeneratorRegistry:
                 "vram_gb":     manifest.get("vram_gb", gen.VRAM_GB),
                 "hf_repo":     manifest.get("hf_repo", ""),
                 "tags":        manifest.get("tags", []),
+                "input":       self.get_model_input(model_id),
                 "downloaded":  self._is_downloaded(model_id, gen),
                 "loaded":      gen.is_loaded(),
                 "active":      model_id == active_id,

@@ -17,7 +17,11 @@ function createNode(id: string, type: WFNode['type'], data: WFNode['data'] = { e
   }
 }
 
-function createProcessExtension(inputs?: WorkflowExtension['inputs']): WorkflowExtension {
+type ProcessWorkflowExtension = Extract<WorkflowExtension, { type: 'process' }>
+type ModelWorkflowExtension = Extract<WorkflowExtension, { type: 'model' }>
+type ProcessWorkflowExtensionOverrides = Partial<Omit<ProcessWorkflowExtension, 'type'>>
+
+function createProcessExtension(inputs?: ProcessWorkflowExtension['inputs']): ProcessWorkflowExtension {
   return {
     id: 'ext/refiner',
     extensionId: 'ext',
@@ -35,8 +39,26 @@ function createProcessExtension(inputs?: WorkflowExtension['inputs']): WorkflowE
   }
 }
 
+function createModelExtension(overrides: Partial<Omit<ModelWorkflowExtension, 'type'>> = {}): ModelWorkflowExtension {
+  return {
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    extensionName: 'GaussianGPT',
+    extensionAuthor: 'Tests',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    description: 'Generates without external inputs',
+    input: 'none',
+    output: 'scene',
+    params: [],
+    builtin: false,
+    type: 'model',
+    ...overrides,
+  }
+}
 
-function createVideoProcessExtension(): WorkflowExtension {
+
+function createVideoProcessExtension(): ProcessWorkflowExtension {
   return {
     ...createProcessExtension(),
     id: 'ext/video-producer',
@@ -48,7 +70,7 @@ function createVideoProcessExtension(): WorkflowExtension {
   }
 }
 
-function createSceneProcessExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+function createSceneProcessExtension(overrides: ProcessWorkflowExtensionOverrides = {}): ProcessWorkflowExtension {
   return {
     ...createProcessExtension([{ name: 'input_scene', type: 'scene' }]),
     id: 'ext/scene-consumer',
@@ -93,6 +115,28 @@ test('rejects connect-time type mismatches with port metadata', () => {
     portName: 'reference_image',
     expectedType: 'image',
     actualType: 'mesh',
+    sourceNodeId: 'source-node',
+  })
+})
+
+test('rejects incoming edges into inputless model nodes at connect time', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'gaussiangpt/generate', enabled: true, params: {} })
+  const source = createNode('source-node', 'imageNode')
+
+  const issue = validateProcessConnection({
+    connection: createConnection(),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [createModelExtension()],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'connect',
+    code: 'inputless-target',
+    message: 'This node declares input "none" and cannot accept incoming edges. Remove the connection and run it as a source node.',
+    targetNodeId: 'target-node',
+    targetHandle: null,
+    portName: null,
     sourceNodeId: 'source-node',
   })
 })
@@ -151,6 +195,28 @@ test('detects missing required ports before run with clear metadata', () => {
     targetHandle: 'coarse_mesh',
     portName: 'coarse_mesh',
     expectedType: 'mesh',
+  })
+})
+
+test('detects persisted stale incoming edges into inputless model nodes before run', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'gaussiangpt/generate', enabled: true, params: {} })
+  const source = createNode('source-node', 'imageNode')
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [source, target],
+    edges: [{ id: 'edge-stale', source: 'source-node', target: 'target-node' }],
+    allExtensions: [createModelExtension()],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'run',
+    code: 'inputless-target',
+    message: 'This node declares input "none" and cannot accept incoming edges. Remove the connection and run it as a source node.',
+    targetNodeId: 'target-node',
+    targetHandle: null,
+    portName: null,
+    sourceNodeId: 'source-node',
+    edgeIds: ['edge-stale'],
   })
 })
 

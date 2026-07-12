@@ -30,3 +30,17 @@ test('runtime workflow entrypoints use workflowRunStore instead of useWorkflowRu
   assert.match(workflowRunStoreSource, /resolveWorkflowDispatch\(/)
   assert.doesNotMatch(workflowRunStoreSource, /useWorkflowRunner/)
 })
+
+
+test('inputless model nodes expose no target socket and skip predecessor fallback', async () => {
+  const extensionNodeSource = await readWorkflowFile('nodes/ExtensionNode.tsx')
+  const runStoreSource = await readWorkflowFile('workflowRunStore.ts')
+
+  assert.match(extensionNodeSource, /ext\?\.input === 'none'\s*\? \[\]/)
+  assert.match(extensionNodeSource, /ext\?\.input !== 'none'/)
+  assert.match(runStoreSource, /export function shouldUsePreviousNodeFallback[\s\S]*return input !== 'none'/)
+  assert.match(runStoreSource, /else if \(shouldUsePreviousNodeFallback\(ext\.input\)\)/)
+  assert.match(runStoreSource, /request\.kind === 'none'[\s\S]*'\/generate\/from-none'/)
+  assert.match(runStoreSource, /actualOutput: st\.output_kind/)
+  assert.doesNotMatch(runStoreSource, /from-none[\s\S]{0,300}(?:readFileBase64|FormData)/)
+})

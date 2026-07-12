@@ -10,7 +10,7 @@ type ResolveLegacyGenerationRequestArgs = {
   modelExtensions: ModelExtension[]
 }
 
-function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): 'image' | 'text' {
+function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): 'none' | 'image' | 'text' {
   const extension = modelExtensions.find((candidate) => candidate.id === modelId)
   const input = extension?.nodes[0]?.input
 
@@ -18,7 +18,7 @@ function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): 
     throw new Error(`Missing generation input metadata for model ${modelId}`)
   }
 
-  if (input === 'image' || input === 'text') {
+  if (input === 'none' || input === 'image' || input === 'text') {
     return input
   }
 
@@ -32,6 +32,10 @@ export function resolveLegacyGenerationRequest({
   modelExtensions,
 }: ResolveLegacyGenerationRequestArgs): GenerationSubmitRequest {
   const input = resolveModelInput(generationOptions.modelId, modelExtensions)
+
+  if (input === 'none') {
+    return { kind: 'none' }
+  }
 
   if (input === 'text') {
     return {

@@ -1,11 +1,11 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ExtensionWorkflowNode, ParamSchema, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, ProcessPort } from '@shared/types/electron.d'
 import type { ArtifactKind } from '@shared/types/artifacts.ts'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
 
-export interface WorkflowExtension {
+interface WorkflowExtensionBase {
   id:              string   // "ext_id/node_id"
   extensionId:     string   // "ext_id" (for IPC calls)
   extensionName:   string   // display name of the parent extension
@@ -13,17 +13,35 @@ export interface WorkflowExtension {
   nodeId:          string   // "node_id"
   name:            string
   description:     string
-  input:           ArtifactKind
   output:          ArtifactKind
   inputs?:         ProcessPort[]
   params:          ParamSchema[]
   builtin:         boolean
-  type:            'model' | 'process' | 'utility'
   workflowNodeType?: string
   component?:       ExtensionWorkflowNode['component']
   capabilityId?:    string
   singleton?:       boolean
 }
+
+type ModelWorkflowExtension = WorkflowExtensionBase & {
+  type: 'model'
+  input: ModelInputKind
+}
+
+type ProcessWorkflowExtension = WorkflowExtensionBase & {
+  type: 'process'
+  input: ArtifactKind
+}
+
+type UtilityWorkflowExtension = WorkflowExtensionBase & {
+  type: 'utility'
+  input: ArtifactKind
+}
+
+export type WorkflowExtension =
+  | ModelWorkflowExtension
+  | ProcessWorkflowExtension
+  | UtilityWorkflowExtension
 
 const WORKFLOW_UTILITY_NODE_COMPONENT_TYPES: Record<ExtensionWorkflowNode['component'], string> = {
   'video-preview': PREVIEW_VIDEO_NODE_TYPE,

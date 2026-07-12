@@ -1,10 +1,10 @@
-import type { ProcessPort } from '../../shared/types/electron.d'
+import type { ModelInputKind, ProcessPort } from '../../shared/types/electron.d'
 import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 
 type ArtifactType = ArtifactKind
 
 type ProcessPortOwner = {
-  input?: ArtifactType
+  input?: ModelInputKind
   inputs?: ProcessPort[]
 }
 
@@ -36,7 +36,7 @@ export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessT
     }))
   }
 
-  if (!owner.input) return []
+  if (!owner.input || owner.input === 'none') return []
 
   return [{
     name: null,

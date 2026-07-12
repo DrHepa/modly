@@ -41,3 +41,17 @@ test('resolveWorkflowEdgeTargetColor keeps mesh outputs targeting scene nodes pu
 test('video preview node uses the video handle color as target color', () => {
   assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'previewVideoNode' }), PROCESS_PORT_HANDLE_COLOR.video)
 })
+
+
+test('resolveWorkflowEdgeTargetColor gives inputless model targets the neutral no-port color', () => {
+  const color = resolveWorkflowEdgeTargetColor({
+    targetNodeType: 'extensionNode',
+    targetExtension: { input: 'none' },
+    targetHandle: null,
+  })
+
+  assert.equal(color, '#52525b')
+  assert.notEqual(color, PROCESS_PORT_HANDLE_COLOR.image)
+  assert.notEqual(color, PROCESS_PORT_HANDLE_COLOR.mesh)
+  assert.notEqual(color, PROCESS_PORT_HANDLE_COLOR.scene)
+})

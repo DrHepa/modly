@@ -12,7 +12,7 @@ const baseOptions: GenerationOptions = {
   modelParams: {},
 }
 
-function createModelExtension(input: 'image' | 'text' | 'mesh'): ModelExtension {
+function createModelExtension(input: 'none' | 'image' | 'text' | 'mesh' | 'scene'): ModelExtension {
   return {
     id: 'vendor/model',
     type: 'model',
@@ -63,6 +63,22 @@ test('resolveLegacyGenerationRequest resolves text requests from model metadata 
   })
 })
 
+
+
+test('resolveLegacyGenerationRequest resolves inputless models before image validation', () => {
+  const request = resolveLegacyGenerationRequest({
+    imagePath: null,
+    selectedImageData: Buffer.from('must-not-be-read').toString('base64'),
+    generationOptions: {
+      ...baseOptions,
+      modelParams: { seed: 23 },
+    },
+    modelExtensions: [createModelExtension('none')],
+  })
+
+  assert.deepEqual(request, { kind: 'none' })
+})
+
 test('resolveLegacyGenerationRequest throws a clear error when model metadata cannot resolve a supported input', () => {
   assert.throws(
     () => resolveLegacyGenerationRequest({
@@ -72,6 +88,16 @@ test('resolveLegacyGenerationRequest throws a clear error when model metadata ca
       modelExtensions: [createModelExtension('mesh')],
     }),
     { message: 'Unsupported generation input for model vendor/model: mesh' },
+  )
+
+  assert.throws(
+    () => resolveLegacyGenerationRequest({
+      imagePath: '/tmp/source.png',
+      selectedImageData: null,
+      generationOptions: baseOptions,
+      modelExtensions: [createModelExtension('scene')],
+    }),
+    { message: 'Unsupported generation input for model vendor/model: scene' },
   )
 
   assert.throws(

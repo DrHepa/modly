@@ -473,6 +473,17 @@ function clearCurrentJobCheckpointMetadata(): void {
 
 type ModelGenerationRequest =
   | {
+      kind: 'none'
+      payload: {
+        model_id: string
+        collection: string
+        remesh: string
+        enable_texture: boolean
+        texture_resolution: number
+        params: Record<string, unknown>
+      }
+    }
+  | {
       kind: 'image'
       imagePath: string
       imageData?: string
@@ -620,6 +631,24 @@ function resolveModelMeshRouting(args: {
   }
 }
 
+export function shouldUsePreviousNodeFallback(input: WorkflowExtension['input']): boolean {
+  return input !== 'none'
+}
+
+function resolveModelNodeOutputKind(args: {
+  declaredOutput?: ArtifactRef['kind']
+  actualOutput?: ArtifactRef['kind']
+  extensionId: string
+}): ArtifactRef['kind'] | undefined {
+  if (args.actualOutput === undefined) return args.declaredOutput
+  if (args.declaredOutput !== undefined && args.declaredOutput !== args.actualOutput) {
+    throw new Error(
+      `Model ${args.extensionId} declared output "${args.declaredOutput}" but generated "${args.actualOutput}". Update the manifest output or fix the generator output contract.`,
+    )
+  }
+  return args.actualOutput
+}
+
 export function buildModelGenerationRequest(args: {
   ext: WorkflowExtension
   node: WFNode
@@ -647,11 +676,26 @@ export function buildModelGenerationRequest(args: {
     workspaceDir,
   } = args
 
-  if (ext.input === undefined) {
+  const input: unknown = Reflect.get(ext, 'input')
+  if (input === undefined) {
     throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
   }
 
-  if (ext.input === 'text') {
+  if (input === 'none') {
+    return {
+      kind: 'none',
+      payload: {
+        model_id: node.data.extensionId ?? '',
+        collection: 'Workflows',
+        remesh: 'none',
+        enable_texture: false,
+        texture_resolution: 1024,
+        params: nodeParams,
+      },
+    }
+  }
+
+  if (input === 'text') {
     const promptParam = typeof nodeParams.prompt === 'string' ? nodeParams.prompt : undefined
     const isAnimateRiggedMesh = ext.nodeId === 'animate-rigged-mesh' || ext.id.includes('animate-rigged-mesh')
     const nodeOwnParams = node.data.params && typeof node.data.params === 'object' ? node.data.params : {}
@@ -685,7 +729,7 @@ export function buildModelGenerationRequest(args: {
     }
   }
 
-  if (ext.input === 'scene') {
+  if (input === 'scene') {
     const activeScenePath = nodeInputPath
     if (!activeScenePath) {
       throw new Error(`Missing required scene input for extension ${ext.id}`)
@@ -702,8 +746,8 @@ export function buildModelGenerationRequest(args: {
     }
   }
 
-  if (ext.input !== 'image') {
-    throw new Error(`Unsupported workflow capability input for extension ${ext.id}: ${String(ext.input)}`)
+  if (input !== 'image') {
+    throw new Error(`Unsupported workflow capability input for extension ${ext.id}: ${String(input)}`)
   }
 
   const activeImagePath = nodeInputPath ?? selectedImagePath
@@ -1513,6 +1557,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
+        if (ext.input === 'none' && incomingEdges.length > 0) {
+          throw new Error(
+            `Model ${ext.id} declares input "none" and cannot accept incoming edges. Remove incoming edges and run it as a source node.`,
+          )
+        }
         const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
         const artifactProvenance = {
           workflowId: workflow.id,
@@ -1561,8 +1610,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
             if (src.text !== undefined)           nodeInputText     = src.text
           }
-        } else {
-          // Single-input
+        } else if (shouldUsePreviousNodeFallback(ext.input)) {
+          // Single-input. Inputless model sources never consume edges or prior outputs.
           for (const edge of incomingEdges) {
             const src = nodeOutputs.get(edge.source)
             if (src?.filePath !== undefined) nodeInputPath = src.filePath
@@ -1626,16 +1675,18 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
           set((s) => ({ runState: { ...s.runState, blockProgress: 5, blockStep: 'Submitting to model…' } }))
 
-          const { data } = await (request.kind === 'scene'
-            ? client.post<{ job_id: string }>('/generate/from-scene', {
+          const { data } = await (request.kind === 'none'
+            ? client.post<{ job_id: string }>('/generate/from-none', request.payload)
+            : request.kind === 'scene'
+              ? client.post<{ job_id: string }>('/generate/from-scene', {
               scene_path: request.scenePath,
               model_id: node.data.extensionId ?? '',
               collection: 'Workflows',
               remesh: 'none',
               enable_texture: false,
               texture_resolution: 1024,
-              params: request.params,
-            })
+                params: request.params,
+              })
             : request.kind === 'image'
               ? (async () => {
                 const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
@@ -1667,12 +1718,18 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             await new Promise((r) => setTimeout(r, 1200))
 
             const { data: st } = await client.get<{
-              status: string; progress?: number; step?: string; output_url?: string; error?: string
+              status: string; progress?: number; step?: string; output_url?: string; output_kind?: ArtifactRef['kind']; error?: string
             }>(`/generate/status/${_activeJobId.current}`)
 
             if (st.status === 'done' && st.output_url) {
+              const outputType = resolveModelNodeOutputKind({
+                declaredOutput: ext.output,
+                actualOutput: st.output_kind,
+                extensionId: ext.id,
+              })
               const rel = st.output_url.replace(/^\/workspace\//, '')
               nodeInputPath = `${workspaceDir}/${rel}`
+              nodeOutputs.set(`${node.id}::__actual_output_kind__`, { outputType })
               _activeJobId.current = null
               set((s) => ({ runState: { ...s.runState, blockProgress: 100, blockStep: 'Generation complete' } }))
               break
@@ -1712,7 +1769,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         }
 
         // Store output with type for downstream routing
-        const outputType = ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
+        const actualOutputType = nodeOutputs.get(`${node.id}::__actual_output_kind__`)?.outputType
+        nodeOutputs.delete(`${node.id}::__actual_output_kind__`)
+        const outputType = actualOutputType ?? ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
         const nodeOutput = { filePath: nodeInputPath, text: nodeInputText, outputType }
         nodeOutputs.set(node.id, nodeOutput)
         rememberArtifactOutput(node.id, nodeOutput, artifactProvenance)

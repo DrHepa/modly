@@ -77,3 +77,67 @@ test('generateFromImage keeps multipart payload and does not read disk when imag
   assert.equal(calls[0].data.get('params'), JSON.stringify({ seed: 7 }))
   assert.equal(calls[0].data.get('image') instanceof File, true)
 })
+
+
+test('submitGeneration posts inputless models as JSON without reading an image', async () => {
+  const calls: Array<{ path: string; data: unknown; config: unknown }> = []
+  let readFileCalls = 0
+  const controller = new AbortController()
+  const api = createGenerationApi({
+    client: {
+      async post(path: string, data?: unknown, config?: unknown) {
+        calls.push({ path, data, config })
+        return { data: { job_id: 'job-none-1' } }
+      },
+      async get() {
+        throw new Error('Unexpected get call')
+      },
+    } as unknown as ApiClientMock,
+    readFileBase64: async () => {
+      readFileCalls += 1
+      throw new Error('readFileBase64 must not be called for inputless requests')
+    },
+  })
+
+  const result = await api.submitGeneration({ kind: 'none' }, options, controller.signal)
+
+  assert.deepEqual(result, { jobId: 'job-none-1' })
+  assert.equal(readFileCalls, 0)
+  assert.deepEqual(calls, [{
+    path: '/generate/from-none',
+    data: {
+      model_id: 'text/model',
+      remesh: 'triangle',
+      enable_texture: true,
+      texture_resolution: 2048,
+      params: { seed: 7 },
+    },
+    config: { signal: controller.signal },
+  }])
+})
+
+test('pollJobStatus maps backend output_kind alongside output_url', async () => {
+  const api = createGenerationApi({
+    client: {
+      async post() {
+        throw new Error('Unexpected post call')
+      },
+      async get(path: string) {
+        assert.equal(path, '/generate/status/job-scene-1')
+        return { data: { status: 'done', progress: 100, output_url: '/workspace/scene.json', output_kind: 'scene' } }
+      },
+    } as unknown as ApiClientMock,
+    readFileBase64: async () => {
+      throw new Error('Unexpected readFileBase64 call')
+    },
+  })
+
+  assert.deepEqual(await api.pollJobStatus('job-scene-1'), {
+    status: 'done',
+    progress: 100,
+    output_url: '/workspace/scene.json',
+    output_kind: 'scene',
+    outputUrl: '/workspace/scene.json',
+    outputKind: 'scene',
+  })
+})

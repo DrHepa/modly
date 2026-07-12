@@ -17,8 +17,8 @@ import {
 } from '@xyflow/react'
 import { useWorkflowsStore, NODE_TYPES_WITHOUT_TARGET, NODE_TYPES_WITHOUT_SOURCE, FOLDER_COLORS } from '@shared/stores/workflowsStore'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import { useAppStore } from '@shared/stores/appStore'
-import type { Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
+import { useNavStore } from '@shared/stores/navStore'
+import type { ModelInputKind, Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions, resolveWorkflowUtilityNodeType } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
@@ -53,7 +53,8 @@ const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFE
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
-const IO_STYLES: Record<ArtifactKind, string> = {
+const IO_STYLES: Record<ModelInputKind, string> = {
+  none:   'bg-zinc-800/60 text-zinc-400 border-zinc-700/60',
   image: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',
   scene: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
@@ -62,7 +63,7 @@ const IO_STYLES: Record<ArtifactKind, string> = {
   video: 'bg-rose-500/15 text-rose-400 border-rose-500/25',
 }
 
-function IoBadge({ type }: { type: ArtifactKind }) {
+function IoBadge({ type }: { type: ModelInputKind }) {
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type]}`}>
       {type}

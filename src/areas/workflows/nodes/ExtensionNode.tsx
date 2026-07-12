@@ -43,7 +43,10 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     .find((e) => e.id === data.extensionId)
 
   const isTerminal = ext?.id === 'mesh-exporter'
-  const targetPorts = getProcessTargetPorts({ input: ext?.input ?? 'image', inputs: ext?.inputs })
+  const legacyInput = ext?.input === 'none' ? undefined : ext?.input
+  const targetPorts = ext?.input === 'none'
+    ? []
+    : getProcessTargetPorts({ input: legacyInput ?? 'image', inputs: ext?.inputs })
   const hasNamedTargetPorts = targetPorts.length > 1 || targetPorts.some((port) => !port.isLegacy)
   const outputColor = PROCESS_PORT_HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams = (ext?.params.length ?? 0) > 0
@@ -98,15 +101,19 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
             )}
           </div>
         ) : (
-          <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
-            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-              {ext?.input ?? '—'}
-            </span>
+          <div ref={ioRowRef} className={`flex items-center px-3 py-2 ${ext?.input === 'none' ? 'justify-end' : 'justify-between'}`}>
+            {ext?.input !== 'none' && (
+              <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                {ext?.input ?? '—'}
+              </span>
+            )}
             {!isTerminal && (
               <>
-                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
-                  <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
-                </svg>
+                {ext?.input !== 'none' && (
+                  <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
+                    <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+                  </svg>
+                )}
                 <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
                   {ext?.output ?? '—'}
                 </span>

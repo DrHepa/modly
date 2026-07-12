@@ -1,4 +1,5 @@
 import type { ArtifactRef } from './artifacts.ts'
+import type { PlyKind } from '../ply/plyHeaderClassification.ts'
 
 export const ASSET_CAPABILITIES = [
   'mesh',
@@ -54,6 +55,7 @@ export interface AssetLibraryEntry {
   manifest?: AssetLibraryManifestRef
   createdAt?: string
   updatedAt?: string
+  plyKind?: PlyKind
   previewKind: AssetLibraryPreviewKind
   plyHeader?: AssetLibraryPlyHeader
   warnings: string[]
@@ -81,6 +83,7 @@ export type AssetLibraryPreviewPayload =
       binaryKind: string
       byteLength: number
       message: string
+      plyKind?: PlyKind
     }
   | {
       kind: 'none'

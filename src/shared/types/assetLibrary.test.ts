@@ -66,6 +66,7 @@ test('AssetLibraryEntry contracts keep manifest and source-link metadata explici
       schema: 'modly.generated-world.v1',
       title: 'Hero World',
     },
+    plyKind: 'mesh',
     source: {
       relation: 'manifest-source',
       workspacePath: 'Workflows/checkpoints/hero.glb',

@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds, deriveModelOwnershipState } from './modelOwnershipState'
 import { useNavStore } from '@shared/stores/navStore'
-import type { AnyExtension, ModelExtension, SharedWeightGroupState, RuntimeReadinessAction } from '@shared/types/electron.d'
+import type { AnyExtension, ModelExtension, SharedWeightGroupState, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { deleteModelsThenUninstallExtension, formatModelName, installModelAndRefresh, installModelQueue } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import type { ExtensionNode } from './components/ExtensionCard'
@@ -26,6 +26,64 @@ const SORTS: { id: SortId; label: string }[] = [
   { id: 'name', label: 'Name (A–Z)' },
   { id: 'type', label: 'Type' },
 ]
+
+const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
+
+type ModelDownloadApi = {
+  download: (modelId: string, variantId?: string) => Promise<ModelDownloadResult & { paused?: boolean; cancelled?: boolean }>
+  downloadAssets: (modelId: string) => Promise<ModelDownloadResult>
+  downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
+}
+
+export function requestModelNodeDownload(
+  node: ExtensionNode,
+  fullId: string,
+  modelApi: ModelDownloadApi,
+  variantId?: string,
+): Promise<ModelDownloadResult & { paused?: boolean; cancelled?: boolean }> {
+  if (node.httpsDownloads?.length) return modelApi.downloadHttpsAssets(fullId)
+  if (node.hfDownloads?.length) return modelApi.downloadAssets(fullId)
+  if (nodeHasManagedWeights(node)) return modelApi.download(fullId, variantId)
+  return Promise.resolve({
+    success: false,
+    error: 'Model node does not declare downloadable assets.',
+    failure: {
+      code: 'assets_not_declared',
+      stage: 'validate',
+      message: 'Model node does not declare downloadable assets.',
+      retryable: false,
+    },
+  })
+}
+
+function loadPersistedDownloadFailures(): Record<string, ModelDownloadFailure> {
+  if (typeof window === 'undefined' || !window.localStorage) return {}
+  try {
+    const value = JSON.parse(window.localStorage.getItem(MODEL_DOWNLOAD_FAILURES_STORAGE_KEY) ?? '{}')
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, ModelDownloadFailure>
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+export function pruneStaleDownloadFailures(
+  failures: Record<string, ModelDownloadFailure>,
+  modelExtensions: readonly AnyExtension[],
+): Record<string, ModelDownloadFailure> {
+  const applicableCapabilityIds = new Set(
+    modelExtensions
+      .filter((extension): extension is Extract<AnyExtension, { type: 'model' }> => extension.type === 'model')
+      .flatMap((extension) => extension.nodes
+        .filter(nodeHasManagedWeights)
+        .map((node) => node.capabilityId ?? `${extension.id}/${node.id}`)),
+  )
+
+  return Object.fromEntries(
+    Object.entries(failures).filter(([capabilityId]) => applicableCapabilityIds.has(capabilityId)),
+  )
+}
 
 type InstallBannerTone = 'success' | 'warning' | 'error'
 
@@ -189,6 +247,7 @@ export default function ModelsPage(): JSX.Element {
       .map((capability) => capability.weightOwnerId))
     return deriveModelOwnershipState(metadata, new Set(collectReadyOwnerIds(metadata, installedNodeIds)), downloadingOwners, new Set(installedNodeIds))
   }, [modelExtensions, installedNodeIds, downloading])
+  const [downloadFailures, setDownloadFailures] = useState<Record<string, ModelDownloadFailure>>(loadPersistedDownloadFailures)
 
   // Uninstall modal state
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
@@ -255,7 +314,13 @@ export default function ModelsPage(): JSX.Element {
       if (active.length > 0) {
         setDownloading((prev) => {
           const next = { ...prev }
-          for (const { modelId, ...progress } of active) if (!next[modelId]) next[modelId] = progress
+          for (const { modelId, ...progress } of active) {
+            const node = exts.flatMap((ext) => ext.nodes.map((node) => ({ fullId: `${ext.id}/${node.id}`, node })))
+              .find((candidate) => candidate.fullId === modelId)?.node
+            if (!next[modelId]) next[modelId] = {
+              ...progress, supportsPauseCancel: !Boolean(node?.hfDownloads?.length || node?.httpsDownloads?.length),
+            }
+          }
           return next
         })
       }
@@ -264,7 +329,13 @@ export default function ModelsPage(): JSX.Element {
     window.electron.model.onWeightsChanged(() => {
       void refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
     })
-    window.electron.model.onProgress(({ modelId: id, variantId, percent, file, fileIndex, totalFiles, status, bytesDownloaded, totalBytes, stalledSeconds, paused, cancelled }) => {
+    window.electron.model.onProgress(({ capabilityId, modelId, variantId, percent, file, fileIndex, totalFiles, repoIndex, totalRepos, status, bytesDownloaded, totalBytes, stalledSeconds, paused, cancelled }) => {
+      const id = capabilityId ?? modelId
+      if (!id) return
+      const node = useExtensionsStore.getState().modelExtensions
+        .flatMap((ext) => ext.nodes.map((node) => ({ fullId: node.capabilityId ?? `${ext.id}/${node.id}`, node })))
+        .find((candidate) => candidate.fullId === id)?.node
+      const supportsPauseCancel = node ? !Boolean(node.hfDownloads?.length || node.httpsDownloads?.length) : undefined
       if (cancelled) {
         setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
         return
@@ -278,16 +349,22 @@ export default function ModelsPage(): JSX.Element {
             file: file ?? current?.file,
             fileIndex: fileIndex ?? current?.fileIndex,
             totalFiles: totalFiles ?? current?.totalFiles,
+            repoIndex: repoIndex ?? current?.repoIndex,
+            totalRepos: totalRepos ?? current?.totalRepos,
             status,
             bytesDownloaded: bytesDownloaded ?? current?.bytesDownloaded,
             totalBytes: totalBytes ?? current?.totalBytes,
             stalledSeconds: stalledSeconds ?? current?.stalledSeconds,
             paused,
+            supportsPauseCancel: supportsPauseCancel ?? current?.supportsPauseCancel,
             variantId: variantId ?? current?.variantId,
           },
         }
       })
       if (percent === 100) {
+        setDownloadFailures((prev) => {
+          const next = { ...prev }; delete next[id]; return next
+        })
         const exts = useExtensionsStore.getState().modelExtensions
         refreshInstalledIds(exts).then(() => {
           setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
@@ -300,6 +377,25 @@ export default function ModelsPage(): JSX.Element {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- register the progress listener once on mount
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.localStorage) return
+    try {
+      window.localStorage.setItem(
+        MODEL_DOWNLOAD_FAILURES_STORAGE_KEY,
+        JSON.stringify(downloadFailures),
+      )
+    } catch {
+      // Download failures still remain visible for the current page lifetime.
+    }
+  }, [downloadFailures])
+
+  useEffect(() => {
+    setDownloadFailures((prev) => {
+      const next = pruneStaleDownloadFailures(prev, modelExtensions)
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next
+    })
+  }, [modelExtensions])
 
   useEffect(() => {
     const modelIds = modelExtensions.flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
@@ -327,20 +423,33 @@ export default function ModelsPage(): JSX.Element {
 
   async function handleInstallNode(node: ExtensionNode, fullId: string, variantId?: string) {
     if (!nodeHasManagedWeights(node)) return { success: true }
-    setDownloading((prev) => ({ ...prev, [fullId]: { ...(prev[fullId] ?? { percent: 0 }), variantId, paused: false, status: 'Starting…' } }))
+    setDownloadFailures((prev) => { const next = { ...prev }; delete next[fullId]; return next })
+    setDownloading((prev) => ({ ...prev, [fullId]: { ...(prev[fullId] ?? { percent: 0 }), variantId, paused: false, supportsPauseCancel: !Boolean(node.hfDownloads?.length || node.httpsDownloads?.length), status: 'Starting…' } }))
     try {
+      let downloadResult: ModelDownloadResult = { success: false }
       const result = await installModelAndRefresh(
-        () => window.electron.model.download(fullId, variantId),
+        async () => {
+          const requested = await requestModelNodeDownload(node, fullId, window.electron.model, variantId)
+          downloadResult = requested
+          return requested
+        },
         () => refreshInstalledIds(useExtensionsStore.getState().modelExtensions),
       )
       if (!result.success && !result.paused && !result.cancelled) {
         setGhErr(result.error ?? 'Download failed')
+        setDownloadFailures((prev) => ({ ...prev, [fullId]: downloadResult?.failure ?? {
+          code: 'download_failed', stage: 'download',
+          message: result.error ?? 'Model asset download failed.', retryable: true,
+        } }))
       }
       if (!result.paused) setDownloading((prev) => { const next = { ...prev }; delete next[fullId]; return next })
       return result
     } catch (err) {
       const error = String(err)
       setGhErr(error)
+      setDownloadFailures((prev) => ({ ...prev, [fullId]: {
+        code: 'download_failed', stage: 'download', message: error, retryable: true,
+      } }))
       setDownloading((prev) => { const next = { ...prev }; delete next[fullId]; return next })
       return { success: false, error }
     }
@@ -529,6 +638,7 @@ export default function ModelsPage(): JSX.Element {
     onRuntimeReadinessAction: dispatchRuntimeReadinessAction,
     installedIds: installedNodeIds,
     downloading,
+    downloadFailures,
     disabled: isBusy,
     onInstall: handleInstallNode,
     onInstallAll: handleInstallAll,

@@ -1,6 +1,6 @@
 import type { ProcessInput } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
-import { ipcMain, BrowserWindow, Notification, dialog, app, shell } from 'electron'
+import { ipcMain, BrowserWindow, Notification, dialog, app, shell, type IpcMainInvokeEvent } from 'electron'
 import { installGitHubExtensionRepo } from './github-extension-install'
 import { autoUpdater } from 'electron-updater'
 import { basename, dirname, join } from 'path'
@@ -16,6 +16,9 @@ import {
   downloadModelFromHF,
   downloadModelSourcesFromHF,
   type DownloadProgress,
+  downloadModelAssetsFromHF,
+  downloadModelAssetsFromHttps,
+  ModelAssetDownloadError,
 } from './model-downloader'
 import {
   legacyDownloadSteps,
@@ -37,7 +40,7 @@ import {
   resolveWeightStorageRoot,
   weightStorageHasLocalData,
 } from './model-sources'
-import { listDownloadedModelCapabilities } from './model-ownership'
+import { getCanonicalModelPath, isOwnedModelDownloaded, listDownloadedModelCapabilities, mapDownloadProgressToCapability, resolveModelOwnership, type ModelOwnershipDescriptor } from './model-ownership'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
 import { logger } from './logger'
@@ -52,6 +55,7 @@ import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGat
 import { spawn, execFile } from 'child_process'
 import {
   assertSafeExtensionId,
+  assertSafeOwnershipSegment,
   buildExtensionBackupPath,
   resolveExtensionPathWithinRoot,
 } from './extension-path-guard'
@@ -155,6 +159,79 @@ function runExtensionSetup(
   })
 }
 
+function parseCanonicalModelDownloadPayload(payload: unknown): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Model asset download payload must be an object containing only modelId')
+  }
+
+  const fields = Object.keys(payload)
+  if (fields.length !== 1 || fields[0] !== 'modelId') {
+    throw new Error('Model asset download payload must contain only modelId')
+  }
+
+  const modelId = (payload as Record<string, unknown>).modelId
+  if (typeof modelId !== 'string') {
+    throw new Error('Model asset download modelId must be a string')
+  }
+
+  const segments = modelId.split('/')
+  if (segments.length !== 2) {
+    throw new Error('Model asset download modelId must contain exactly two segments')
+  }
+
+  const extensionId = assertSafeOwnershipSegment(
+    segments[0],
+    'Model asset download extension segment',
+  )
+  const nodeId = assertSafeOwnershipSegment(
+    segments[1],
+    'Model asset download node segment',
+  )
+  return `${extensionId}/${nodeId}`
+}
+
+function modelAssetDownloadResult(error: unknown) {
+  return {
+    success: false,
+    error: error instanceof Error ? error.message : String(error),
+    ...(error instanceof ModelAssetDownloadError ? { failure: error.failure } : {}),
+  }
+}
+
+function createFallbackOwnership(modelId: string): ModelOwnershipDescriptor {
+  const [bundleId = modelId] = modelId.split('/')
+  return {
+    capabilityId: modelId,
+    bundleId,
+    weightOwnerId: modelId,
+    sharedOwner: false,
+    legacyPaths: [modelId],
+  }
+}
+
+async function listModelExtensions(userData: string) {
+  return listVisibleExtensions({
+    builtinDir: getBuiltinExtensionsDir(),
+    userExtensionsDir: getSettings(userData).extensionsDir,
+    trustedRepos: new Set(),
+  })
+}
+
+async function resolveOwnershipContext(userData: string, capabilityId: string) {
+  const extensions = await listModelExtensions(userData)
+  const ownership = resolveModelOwnership(extensions, capabilityId) ?? createFallbackOwnership(capabilityId)
+  const siblingCapabilityIds = extensions
+    .filter((extension) => extension.type === 'model')
+    .flatMap((extension) => extension.nodes.map((node) => node.capabilityId ?? `${extension.id}/${node.id}`))
+    .filter((candidateCapabilityId) => candidateCapabilityId !== capabilityId)
+    .filter((candidateCapabilityId) => {
+      const candidateOwnership = resolveModelOwnership(extensions, candidateCapabilityId)
+      return candidateOwnership?.weightOwnerId === ownership.weightOwnerId
+    })
+
+  return { extensions, ownership, siblingCapabilityIds }
+}
+
 const rmWithRetry = (path: string, label: string) =>
   removeExtensionWithRetry(path, label, logger)
 const renameWithRetry = (from: string, to: string, label: string) =>
@@ -228,6 +305,83 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
   }
   const LOCKED_MODEL_FILES_ERROR = 'Model files are still locked after several attempts. Close any programs using the model and try again.'
+  const handleStructuredModelAssetDownload = async (
+    event: IpcMainInvokeEvent,
+    payload: unknown,
+    downloader: typeof downloadModelAssetsFromHF,
+  ) => {
+    let modelId: string
+    try {
+      modelId = parseCanonicalModelDownloadPayload(payload)
+    } catch (error) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'invalid_model_id',
+        stage: 'request',
+        message: error instanceof Error ? error.message : 'Invalid model asset download modelId',
+        retryable: false,
+      }))
+    }
+
+    if (activeDownloads.has(modelId)) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'download_in_progress',
+        stage: 'request',
+        message: `Model asset download is already in progress for ${modelId}`,
+        retryable: false,
+      }))
+    }
+
+    let targetRoots: string[]
+    let release: () => void
+    try {
+      const extensionId = modelId.split('/')[0]
+      if (activeExtensionInstalls.has(extensionId)) {
+        throw new Error(`Extension "${extensionId}" is being installed or repaired`)
+      }
+      const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      const modelsDir = getSettings(app.getPath('userData')).modelsDir
+      targetRoots = [...new Set([ownership.weightOwnerId, ...ownership.legacyPaths])]
+        .map((id) => resolveModelRoot(modelsDir, id))
+      if (activeDownloads.has(modelId)) {
+        return modelAssetDownloadResult(new ModelAssetDownloadError({
+          code: 'download_in_progress',
+          stage: 'request',
+          message: `Model asset download is already in progress for ${modelId}`,
+          retryable: false,
+        }))
+      }
+      release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
+    } catch (error) {
+      return modelAssetDownloadResult(error)
+    }
+
+    let finish!: () => void
+    const done = new Promise<void>((resolveDone) => { finish = resolveDone })
+    const active: ActiveDownload = {
+      progress: { percent: 0, status: 'preparing' }, done, finish, targetRoots,
+    }
+    activeDownloads.set(modelId, active)
+    interruptedTargets.set(modelId, targetRoots)
+    try {
+      await downloader(modelId, (progress) => {
+        active.progress = progress
+        event.sender.send(
+          'model:downloadProgress',
+          mapDownloadProgressToCapability(modelId, progress),
+        )
+      })
+      interruptedTargets.delete(modelId)
+      return { success: true }
+    } catch (error) {
+      return modelAssetDownloadResult(error)
+    } finally {
+      if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
+      release()
+      active.finish()
+      notifyWeightChange()
+    }
+  }
+
   // Logging from renderer
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
   ipcMain.handle('log:getPath', () => join(app.getPath('userData'), 'logs', 'modly.log'))
@@ -444,14 +598,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
     let targets: string[]
     try {
-      const plan = await resolveModelPlan(modelId)
-      if (ownerPeers(plan).length > 0) {
-        const warning = ownerDeleteWarning(plan)
+      const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      const structured = Boolean(ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
+      const plan = structured ? null : await resolveModelPlan(modelId)
+      const peers = plan ? ownerPeers(plan) : siblingCapabilityIds
+      if (peers.length > 0) {
+        const warning = plan ? ownerDeleteWarning(plan)
+          : `Delete is owner-scoped for '${ownership.weightOwnerId}' and still referenced by: ${peers.join(', ')}`
         return { success: false, error: warning, warning, skipped: true }
       }
       const modelsDir = getSettings(app.getPath('userData')).modelsDir
-      targets = [...new Set(plan.ownership
-        ? [plan.ownership.weightOwnerId, ...plan.ownership.legacyPaths]
+      const owner = plan ? plan.ownership : ownership
+      targets = [...new Set(owner
+        ? [owner.weightOwnerId, ...owner.legacyPaths]
         : [modelId])].map((id) => resolveModelRoot(modelsDir, id))
     } catch (err) {
       return { success: false, error: String(err) }
@@ -517,8 +676,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const modelsDir = getSettings(app.getPath('userData')).modelsDir
     let modelDir: string
     try {
-      const plan = await resolveModelPlan(modelId)
-      modelDir = resolveModelRoot(modelsDir, privateModelStorageId(modelsDir, plan))
+      const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      modelDir = ownership.httpsDownloads?.length || ownership.hfDownloads?.length
+        ? getCanonicalModelPath(modelsDir, ownership)
+        : resolveModelRoot(modelsDir, privateModelStorageId(modelsDir, await resolveModelPlan(modelId)))
     } catch {
       // Preserve exploration of old flat folders even without an installed extension.
       modelDir = modelId.includes('/') ? resolveModelRoot(modelsDir, modelId) : resolveExtensionModelRoot(modelsDir, modelId)
@@ -550,9 +711,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const ready = await Promise.all(models.flatMap((extension) => extension.nodes.map(async (node) => {
       const id = `${extension.id}/${node.id}`
       try {
-        return planDownloaded(settings.modelsDir, await resolveModelPlan(id))
-          ? { id, name: node.name, size_gb: sizes.get(id) ?? 0 }
-          : null
+        const ownership = resolveModelOwnership(models, id)
+        const requiresUpstreamPlan = Boolean(node.hasModelSources || node.weightGroups?.length || node.weightVariants)
+        const downloaded = ownership && (ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
+          ? isOwnedModelDownloaded(settings.modelsDir, ownership)
+            && (!requiresUpstreamPlan || planDownloaded(settings.modelsDir, await resolveModelPlan(id)))
+          : planDownloaded(settings.modelsDir, await resolveModelPlan(id))
+        return downloaded ? { id, name: node.name, size_gb: sizes.get(id) ?? 0 } : null
       } catch { return null }
     })))
     return ready.filter((candidate) => candidate !== null)
@@ -560,7 +725,18 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
     try {
-      return planDownloaded(getSettings(app.getPath('userData')).modelsDir, await resolveModelPlan(modelId))
+      const userData = app.getPath('userData')
+      const { ownership, extensions } = await resolveOwnershipContext(userData, modelId)
+      if (ownership.httpsDownloads?.length || ownership.hfDownloads?.length) {
+        const node = extensions.flatMap((extension) => extension.type === 'model'
+          ? extension.nodes.filter((candidate) => (candidate.capabilityId ?? `${extension.id}/${candidate.id}`) === modelId)
+          : [])[0]
+        const requiresUpstreamPlan = Boolean(node?.hasModelSources || node?.weightGroups?.length || node?.weightVariants)
+        const modelsDir = getSettings(userData).modelsDir
+        return isOwnedModelDownloaded(modelsDir, ownership)
+          && (!requiresUpstreamPlan || planDownloaded(modelsDir, await resolveModelPlan(modelId)))
+      }
+      return planDownloaded(getSettings(userData).modelsDir, await resolveModelPlan(modelId))
     } catch {
       return false
     }
@@ -581,9 +757,11 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('model:hasLocalData', async (_, modelId: string): Promise<boolean> => {
     try {
-      const plan = await resolveModelPlan(modelId)
+      const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      const owner = ownership.httpsDownloads?.length || ownership.hfDownloads?.length
+        ? ownership : (await resolveModelPlan(modelId)).ownership
       const modelsDir = getSettings(app.getPath('userData')).modelsDir
-      const ids = plan.ownership ? [plan.ownership.weightOwnerId, ...plan.ownership.legacyPaths] : [modelId]
+      const ids = owner ? [owner.weightOwnerId, ...owner.legacyPaths] : [modelId]
       return ids.some((id) => modelHasLocalData(modelsDir, id))
     } catch {
       return false
@@ -682,6 +860,22 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('model:activeDownloads', () =>
     [...activeDownloads.entries()].map(([modelId, active]) => ({ capabilityId: modelId, modelId, ...active.progress }))
   )
+
+  ipcMain.handle('model:downloadAssets', (event, payload: unknown) => (
+    handleStructuredModelAssetDownload(
+      event,
+      payload,
+      downloadModelAssetsFromHF,
+    )
+  ))
+
+  ipcMain.handle('model:downloadHttpsAssets', (event, payload: unknown) => (
+    handleStructuredModelAssetDownload(
+      event,
+      payload,
+      downloadModelAssetsFromHttps,
+    )
+  ))
 
   ipcMain.handle('model:download', async (
     event,

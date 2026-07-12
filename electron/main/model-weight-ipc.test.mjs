@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 
 const require = createRequire(import.meta.url)
@@ -14,13 +15,20 @@ function moduleFromCode(code, dependencies = require) {
   return module.exports
 }
 function loadModule(path) {
-  return moduleFromCode(buildSync({ entryPoints: [resolve(path)], bundle: true, platform: 'node', format: 'cjs', write: false }).outputFiles[0].text)
+  return moduleFromCode(buildSync({
+    entryPoints: [resolve(path)], bundle: true, platform: 'node', format: 'cjs', write: false,
+    // Bundled main-process modules share this directory; keep createRequire's base URL.
+    define: { 'import.meta.url': JSON.stringify(pathToFileURL(resolve(path)).href) },
+  }).outputFiles[0].text)
 }
 const realSources = loadModule('electron/main/model-sources.ts')
 const realPlan = loadModule('electron/main/model-download-plan.ts')
 const realGuard = loadModule('electron/main/extension-path-guard.ts')
 const realOperations = loadModule('electron/main/model-weight-operations.ts')
+const realOwnership = loadModule('electron/main/model-ownership.ts')
+const realCapabilities = loadModule('electron/main/automation-capabilities.ts')
 const ipcCode = transformSync(readFileSync('electron/main/ipc-handlers.ts', 'utf8'), { loader: 'ts', format: 'cjs' }).code
+const downloaderCode = transformSync(readFileSync('electron/main/model-downloader.ts', 'utf8'), { loader: 'ts', format: 'cjs' }).code
 const source = { id: 'weights', provider: 'huggingface', repo_id: 'org/base', destination: '.', checks: ['weights.bin'] }
 function deferred() {
   let resolve
@@ -55,7 +63,8 @@ function fixture(t) {
       get: (...args) => hooks.listModels(...args),
       isAxiosError: (err) => Boolean(err?.isAxiosError),
     }
-    if (name === './automation-capabilities') return { activeExtensionInstalls: new Set() }
+    if (name === './automation-capabilities') return { ...realCapabilities, activeExtensionInstalls: new Set() }
+    if (name === './model-ownership') return realOwnership
     if (name === './model-sources') return realSources
     if (name === './model-download-plan') return realPlan
     if (name === './extension-path-guard') return realGuard
@@ -64,12 +73,14 @@ function fixture(t) {
     if (name === './builtin-sync') return { getBuiltinExtensionsDir: () => join(root, 'builtin') }
     if (name === './python-bridge') return { API_BASE_URL: 'http://test' }
     if (name === './model-downloader') return {
+      ...downloader,
       downloadModelSourcesFromHF: async (...args) => { calls.push(args[0]); await hooks.download(...args) },
     }
     if (name === './extension-install-recovery') return { rmWithRetry: async (dir) => { removed.push(dir); rmSync(dir, { recursive: true, force: true }); return { ok: true } } }
     if (name.startsWith('./') || name === 'electron-updater') return stub
     return require(name)
   }
+  const downloader = moduleFromCode(downloaderCode, deps)
   moduleFromCode(ipcCode, deps).setupIpcHandlers({}, () => ({ webContents: { send: (...event) => events.push(event) } }))
   const event = { sender: { send: (...args) => events.push(args) } }
   const invoke = (name, ...args) => handlers.get(`model:${name}`)(event, ...args)
@@ -325,5 +336,82 @@ for (const [label, owners] of [
     assert.deepEqual(unloaded, [])
     assert.deepEqual(f.removed, [])
     assert.deepEqual(f.calls, [])
+  })
+}
+
+
+const structuredHfAssets = [{
+  repo_id: 'org/assets', revision: 'a'.repeat(40), target_subdir: 'assets', files: [{ path: 'model.pt' }],
+}]
+
+async function assertDownloadedNode(f, expected) {
+  assert.equal(await f.invoke('isDownloaded', 'demo/a'), expected)
+  const downloaded = await f.invoke('listDownloaded')
+  assert.equal(downloaded.some((model) => model.id === 'demo/a'), expected)
+}
+
+test('mixed structured assets require every declared private source and shared group before reporting downloaded', async (t) => {
+  const f = fixture(t)
+  writeFileSync(join(f.settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({
+    id: 'demo', type: 'model', weight_groups: [{ id: 'base', model_sources: [{ ...source, checks: ['base.bin'] }] }],
+    nodes: [{
+      id: 'a', weight_owner_id: 'owner', hf_downloads: structuredHfAssets,
+      model_sources: [{ ...source, checks: ['private.bin'] }], weight_groups: ['base'],
+    }],
+  }))
+  const owner = join(f.settings.modelsDir, 'demo/owner')
+  mkdirSync(join(owner, 'assets'), { recursive: true })
+  writeFileSync(join(owner, 'assets/model.pt'), 'structured-ready')
+  await assertDownloadedNode(f, false)
+
+  writeFileSync(join(owner, 'private.bin'), 'private-ready')
+  await assertDownloadedNode(f, false)
+
+  const shared = join(f.settings.modelsDir, 'demo/_shared/base')
+  mkdirSync(shared, { recursive: true })
+  writeFileSync(join(shared, 'base.bin'), 'shared-ready')
+  await assertDownloadedNode(f, true)
+
+  rmSync(join(owner, 'private.bin'))
+  await assertDownloadedNode(f, false)
+  writeFileSync(join(owner, 'private.bin'), 'private-ready')
+  rmSync(join(owner, 'assets/model.pt'))
+  await assertDownloadedNode(f, false)
+})
+
+test('mixed structured assets preserve the existing upstream weight-variant readiness requirement', async (t) => {
+  const f = fixture(t)
+  writeFileSync(join(f.settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({
+    id: 'demo', type: 'model', nodes: [{
+      id: 'a', weight_owner_id: 'owner', hf_repo: 'org/base', hf_downloads: structuredHfAssets,
+      params_schema: [{ id: 'quant', type: 'select', default: 'Q4', options: ['Q4'] }],
+      weight_variants: { param: 'quant', default: 'Q4', options: [{ id: 'Q4', include_prefixes: ['q4/'], checks: ['q4/weights.bin'] }] },
+    }],
+  }))
+  const owner = join(f.settings.modelsDir, 'demo/owner')
+  mkdirSync(join(owner, 'assets'), { recursive: true })
+  writeFileSync(join(owner, 'assets/model.pt'), 'structured-ready')
+  await assertDownloadedNode(f, false)
+
+  mkdirSync(join(owner, 'q4'), { recursive: true })
+  writeFileSync(join(owner, 'q4/weights.bin'), 'variant-ready')
+  await assertDownloadedNode(f, true)
+  rmSync(join(owner, 'assets/model.pt'))
+  await assertDownloadedNode(f, false)
+})
+
+for (const legacyMetadata of [{}, { hf_repo: 'org/fallback', download_check: 'legacy.bin' }]) {
+  test(`structured-only readiness does not require legacy fallback files (hf_repo=${Boolean(legacyMetadata.hf_repo)})`, async (t) => {
+    const f = fixture(t)
+    writeFileSync(join(f.settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({
+      id: 'demo', type: 'model', nodes: [{ id: 'a', hf_downloads: structuredHfAssets, ...legacyMetadata }],
+    }))
+    const owner = join(f.settings.modelsDir, 'demo/a')
+    mkdirSync(join(owner, 'assets'), { recursive: true })
+    writeFileSync(join(owner, 'assets/model.pt'), 'structured-ready')
+    await assertDownloadedNode(f, true)
+    assert.equal(existsSync(join(owner, 'legacy.bin')), false)
+    rmSync(join(owner, 'assets/model.pt'))
+    await assertDownloadedNode(f, false)
   })
 }

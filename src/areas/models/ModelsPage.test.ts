@@ -222,6 +222,116 @@ test('ModelsPage actual install handler keeps complete failure visible with the 
   assert.equal(state.ghErr, 'setup failed')
 })
 
+test('ModelsPage routes structured asset plans to their owned endpoints and preserves legacy HF downloads', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const calls: string[] = []
+    const modelApi = {
+      download: async (modelId: string, variantId?: string) => {
+        calls.push(`legacy:${modelId}:${variantId ?? 'default'}`)
+        return { success: true }
+      },
+      downloadAssets: async (modelId: string) => {
+        calls.push(`assets:${modelId}`)
+        return { success: true }
+      },
+      downloadHttpsAssets: async (modelId: string) => {
+        calls.push(`https-assets:${modelId}`)
+        return { success: true }
+      },
+    }
+
+    await module.requestModelNodeDownload({
+      id: 'generate',
+      name: 'Generate',
+      input: 'none',
+      output: 'scene',
+      paramsSchema: [],
+      hfRepo: 'owner/must-not-fallback',
+      httpsDownloads: [{
+        url: 'https://example.com/gaussiangpt.safetensors',
+        filename: 'gaussiangpt.safetensors',
+        sizeBytes: 42,
+        sha256: 'a'.repeat(64),
+      }],
+    }, 'gaussiangpt/generate', modelApi)
+
+    await module.requestModelNodeDownload({
+      id: 'generate',
+      name: 'Generate',
+      input: 'text',
+      output: 'mesh',
+      paramsSchema: [],
+      hfRepo: 'owner/legacy',
+      hfDownloads: [{
+        repoId: 'owner/model',
+        revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+        targetSubdir: 'cube3d',
+        files: [{ path: 'model.pt' }],
+      }],
+    }, 'cube3d/generate', modelApi)
+
+    await module.requestModelNodeDownload({
+      id: 'legacy',
+      name: 'Legacy',
+      input: 'image',
+      output: 'mesh',
+      paramsSchema: [],
+      hfRepo: 'owner/legacy',
+    }, 'legacy/generate', modelApi)
+
+    assert.deepEqual(calls, [
+      'https-assets:gaussiangpt/generate',
+      'assets:cube3d/generate',
+      'legacy:legacy/generate:default',
+    ])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('ModelsPage prunes persisted failures when the model is gone or no longer downloadable', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const failures = {
+      'keep/generate': {
+        code: 'hash_mismatch',
+        stage: 'verify',
+        message: 'keep me',
+        retryable: true,
+      },
+      'drop/generate': {
+        code: 'download_failed',
+        stage: 'download',
+        message: 'drop me',
+        retryable: true,
+      },
+    }
+    const extensions = [{
+      type: 'model',
+      id: 'keep',
+      name: 'Keep',
+      trusted: true,
+      builtin: false,
+      nodes: [{
+        id: 'generate',
+        name: 'Generate',
+        input: 'none',
+        output: 'mesh',
+        paramsSchema: [],
+        hfRepo: 'owner/model',
+        capabilityId: 'keep/generate',
+      }],
+    }]
+
+    assert.deepEqual(module.pruneStaleDownloadFailures(failures, extensions), {
+      'keep/generate': failures['keep/generate'],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
 test('ModelsPage runtime readiness dispatcher uses the validated Electron action path only after explicit dispatch', async () => {
   const { module, cleanup } = await loadModelsPageModule()
   try {
@@ -256,6 +366,36 @@ test('ModelsPage runtime readiness dispatcher uses the validated Electron action
       'result:true',
     ])
     assert.deepEqual(result, { success: true })
+  } finally {
+    await cleanup()
+  }
+})
+
+
+test('ModelsPage uses the declared window.electron model API at the download call site', async () => {
+  const source = await readFile(modelsPageEntry, 'utf8')
+
+  assert.match(source, /requestModelNodeDownload\([\s\S]*window\.electron\.model/)
+  assert.doesNotMatch(source, /window\.electronAPI/)
+})
+
+
+test('ModelsPage preserves model-owned source, shared group and variant download identities', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const calls: unknown[][] = []
+    const modelApi = {
+      download: async (...args: unknown[]) => { calls.push(args); return { success: true } },
+      downloadAssets: async () => { throw new Error('Upstream sources are not pinned asset plans') },
+      downloadHttpsAssets: async () => { throw new Error('Upstream sources are not HTTPS asset plans') },
+    }
+    const node = { id: 'generate', name: 'Generate', input: 'image', output: 'mesh', paramsSchema: [] }
+    await module.requestModelNodeDownload({ ...node, hasModelSources: true }, 'sources/generate', modelApi)
+    await module.requestModelNodeDownload({ ...node, weightGroups: ['base'] }, 'groups/generate', modelApi)
+    await module.requestModelNodeDownload({ ...node, hfRepo: 'owner/repo' }, 'variants/generate', modelApi, 'small')
+    assert.deepEqual(calls, [
+      ['sources/generate', undefined], ['groups/generate', undefined], ['variants/generate', 'small'],
+    ])
   } finally {
     await cleanup()
   }

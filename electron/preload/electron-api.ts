@@ -187,6 +187,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         file?: string
         fileIndex?: number
         totalFiles?: number
+        repoIndex?: number
+        totalRepos?: number
         status?: string
         bytesDownloaded?: number
         totalBytes?: number
@@ -202,6 +204,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
           file?: string
           fileIndex?: number
           totalFiles?: number
+          repoIndex?: number
+          totalRepos?: number
           status?: string
           bytesDownloaded?: number
           totalBytes?: number
@@ -213,6 +217,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       offProgress:    () => ipcRenderer.removeAllListeners('model:downloadProgress'),
       onWeightsChanged: (cb: () => void) => ipcRenderer.on('model:weightsChanged', cb),
       offWeightsChanged: () => ipcRenderer.removeAllListeners('model:weightsChanged'),
+      downloadAssets:      (modelId: string) => ipcRenderer.invoke('model:downloadAssets', { modelId }),
+      downloadHttpsAssets: (modelId: string) => ipcRenderer.invoke('model:downloadHttpsAssets', { modelId }),
     },
 
     // App metadata

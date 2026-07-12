@@ -11,7 +11,7 @@ export interface ModelOwnershipCapabilityState extends ModelOwnershipMetadata {
 }
 
 function isOwnershipNode(node: ExtensionNode): node is ExtensionNode & ModelOwnershipMetadata {
-  return Boolean((node.hfRepo || node.hasModelSources || node.weightGroups?.length) && node.capabilityId && node.bundleId && node.weightOwnerId && node.legacyPaths)
+  return Boolean((node.hfRepo || node.hfDownloads?.length || node.httpsDownloads?.length || node.hasModelSources || node.weightGroups?.length) && node.capabilityId && node.bundleId && node.weightOwnerId && node.legacyPaths)
 }
 
 export function collectModelOwnershipMetadata(extensions: readonly ModelExtension[]): ModelOwnershipMetadata[] {
@@ -21,6 +21,8 @@ export function collectModelOwnershipMetadata(extensions: readonly ModelExtensio
     weightOwnerId: node.weightOwnerId,
     sharedOwner: node.sharedOwner ?? false,
     legacyPaths: [...node.legacyPaths],
+    ...(node.hfDownloads ? { hfDownloads: node.hfDownloads } : {}),
+    ...(node.httpsDownloads ? { httpsDownloads: node.httpsDownloads } : {}),
   })))
 }
 

@@ -153,6 +153,43 @@ test('ExtensionCard preserves no-HF and HF download behavior when readiness is a
   assert.doesNotMatch(hfHtml, />Ready</)
 })
 
+test('ExtensionCard treats HTTPS plans as owned assets without optimistic installed-id fallback', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'gaussiangpt',
+        name: 'GaussianGPT',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'none',
+          output: 'scene',
+          paramsSchema: [],
+          httpsDownloads: [{
+            url: 'https://example.com/gaussiangpt.safetensors',
+            filename: 'gaussiangpt.safetensors',
+            sizeBytes: 42,
+            sha256: 'a'.repeat(64),
+          }],
+        }],
+      },
+      installedIds: ['gaussiangpt/generate'],
+      downloading: {},
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, />Download</)
+    assert.doesNotMatch(html, />Ready</)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('ExtensionCard treats unsupported runtime readiness as absent for legacy no-HF and HF nodes', async () => {
   const unsupported = createReadiness('unsupported_contract', 'Checking failed')
 
@@ -256,6 +293,54 @@ test('ExtensionCard keeps downloaded model nodes ready when runtime readiness ch
     assert.match(html, />Text to Image</)
     assert.doesNotMatch(html, />Checking failed</)
     assert.doesNotMatch(html, />Install</)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('ExtensionCard shows persisted structured asset failure with retry for hf_downloads nodes', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'cube3d',
+        name: 'Cube3D',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'text',
+          output: 'mesh',
+          paramsSchema: [],
+          hfDownloads: [{
+            repoId: 'owner/model',
+            revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+            targetSubdir: 'cube3d',
+            files: [{ path: 'model.pt' }],
+          }],
+        }],
+      },
+      installedIds: [],
+      downloading: {},
+      downloadFailures: {
+        'cube3d/generate': {
+          code: 'hash_mismatch',
+          stage: 'verify',
+          message: 'Downloaded file failed verification',
+          file: 'cube3d/model.pt',
+          retryable: true,
+        },
+      },
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, />Retry</)
+    assert.match(html, /verify: Downloaded file failed verification/)
+    assert.match(html, /cube3d\/model\.pt/)
+    assert.doesNotMatch(html, />Ready</)
   } finally {
     await cleanup()
   }
@@ -683,4 +768,63 @@ test('ExtensionCard keeps pause resume and cancel controls while runtime success
     assert.match(html, /Cancel download/)
     assert.doesNotMatch(html, /Runtime:|Install all/)
   }
+})
+
+test('ExtensionCard preserves permanent download failures without rendering a Retry action', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const html = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ext: {
+        type: 'model',
+        id: 'cube3d',
+        name: 'Cube3D',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'text',
+          output: 'mesh',
+          paramsSchema: [],
+          hfDownloads: [{
+            repoId: 'owner/model',
+            revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+            targetSubdir: 'cube3d',
+            files: [{ path: 'model.pt' }],
+          }],
+        }],
+      },
+      installedIds: [],
+      downloading: {},
+      downloadFailures: {
+        'cube3d/generate': {
+          code: 'invalid_manifest',
+          stage: 'manifest',
+          message: 'Model manifest is permanently invalid',
+          retryable: false,
+        },
+      },
+      onInstall: () => {
+        throw new Error('permanent failures must not dispatch install')
+      },
+      onUninstall: () => undefined,
+    }))
+
+    assert.match(html, /manifest: Model manifest is permanently invalid/)
+    assert.match(html, />Download unavailable</)
+    assert.doesNotMatch(html, />Retry</)
+    assert.doesNotMatch(html, /Download cube3d|Download Generate weights/)
+  } finally {
+    await cleanup()
+  }
+})
+
+
+test('ExtensionCard does not advertise legacy pause or cancel controls for structured asset endpoints', async () => {
+  const html = await renderCard({}, undefined, {
+    hfDownloads: [{ repoId: 'owner/model', revision: 'a'.repeat(40), targetSubdir: 'assets', files: [{ path: 'model.pt' }] }],
+  }, { downloading: { 'modly-codex-image-extension/text-to-image': { percent: 25, file: 'assets/model.pt', fileIndex: 2, totalFiles: 4, repoIndex: 1, totalRepos: 3 } } })
+  assert.match(html, /R1\/3 · 2\/4 · 25%/)
+  assert.match(html, /model\.pt/)
+  assert.doesNotMatch(html, /Pause download|Resume download|Cancel download/)
 })

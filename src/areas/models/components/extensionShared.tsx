@@ -7,11 +7,14 @@ export interface DownloadInfo {
   file?: string
   fileIndex?: number
   totalFiles?: number
+  repoIndex?: number
+  totalRepos?: number
   status?: string
   bytesDownloaded?: number
   totalBytes?: number
   stalledSeconds?: number
   paused?: boolean
+  supportsPauseCancel?: boolean
   variantId?: string   // set when the download targets one weight variant of the node
 }
 
@@ -24,7 +27,7 @@ export type NodeUiState =
   | { kind: 'installed' }
 
 export function nodeHasManagedWeights(node: ExtensionNode): boolean {
-  return Boolean(node.hfRepo || node.hasModelSources || node.weightGroups?.length)
+  return Boolean(node.hfRepo || node.hfDownloads?.length || node.httpsDownloads?.length || node.hasModelSources || node.weightGroups?.length)
 }
 
 export function getNodeState(
@@ -182,11 +185,16 @@ export function NodeInstallControl({ state, disabled, onInstall, onPause, onResu
               style={{ width: `${dl.percent}%` }}
             />
           </span>
+          {dl.supportsPauseCancel === false && dl.file && (
+            <span className="text-[10px] text-zinc-500 truncate max-w-[100px]" title={dl.file}>{dl.file.split('/').pop()}</span>
+          )}
           <span className={`font-mono text-[10px] ${paused ? 'text-zinc-500' : 'text-accent-light'}`}>
-            {paused ? 'Paused' : `${dl.percent}%`}
+            {paused ? 'Paused' : dl.supportsPauseCancel === false
+              ? `${dl.repoIndex && dl.totalRepos ? `R${dl.repoIndex}/${dl.totalRepos} · ` : ''}${dl.fileIndex && dl.totalFiles ? `${dl.fileIndex}/${dl.totalFiles} · ` : ''}${dl.percent}%`
+              : `${dl.percent}%`}
           </span>
         </span>
-        <button
+        {dl.supportsPauseCancel !== false && <button
           onClick={(e) => { e.stopPropagation(); paused ? onResume() : onPause() }}
           title={paused ? 'Resume download' : 'Pause download'}
           className="p-1 rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
@@ -196,8 +204,8 @@ export function NodeInstallControl({ state, disabled, onInstall, onPause, onResu
           ) : (
             <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
           )}
-        </button>
-        <button
+        </button>}
+        {dl.supportsPauseCancel !== false && <button
           onClick={(e) => { e.stopPropagation(); onCancel() }}
           title="Cancel download"
           className="p-1 rounded-md text-zinc-500 hover:text-red-400 hover:bg-red-950/40 transition-colors"
@@ -205,7 +213,7 @@ export function NodeInstallControl({ state, disabled, onInstall, onPause, onResu
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
             <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
           </svg>
-        </button>
+        </button>}
       </span>
     )
   }

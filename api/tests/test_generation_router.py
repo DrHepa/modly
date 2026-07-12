@@ -56,6 +56,9 @@ class _FakeRegistry:
     def get_manifest(self, model_id: str) -> dict:
         return {"output": "mesh"}
 
+    def get_model_input(self, model_id: str) -> str:
+        return "image"
+
     def switch_model(self, model_id: str) -> None:
         pass
 

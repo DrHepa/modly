@@ -186,6 +186,18 @@ def create_from_text_job(
     )
 
 
+def create_from_none_job(
+    background_tasks: BackgroundTasks,
+    params: dict,
+    collection: str = "Default",
+    output_kind: str = "mesh",
+    model_id: Optional[str] = None,
+) -> JobStatus:
+    return create_generation_job(
+        background_tasks, b"", params, collection, output_kind, model_id,
+    )
+
+
 def get_job(job_id: str) -> Optional[JobStatus]:
     return _jobs.get(job_id)
 
@@ -244,6 +256,40 @@ def validate_model_id(model_id: str) -> dict:
         raise HTTPException(400, str(exc))
 
 
+def require_model_id(model_id: str) -> str:
+    canonical_model_id = model_id.strip()
+    if not canonical_model_id:
+        raise HTTPException(400, "model_id is required")
+
+    validate_model_id(canonical_model_id)
+    return canonical_model_id
+
+
+def require_model_input(model_id: str, expected_input: str) -> str:
+    """Require one canonical model to match an endpoint's input contract."""
+    canonical_model_id = require_model_id(model_id)
+
+    try:
+        declared_input = generator_registry.get_model_input(canonical_model_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if declared_input != expected_input:
+        raise HTTPException(
+            400,
+            (
+                f"Model '{canonical_model_id}' expects input '{declared_input}' but "
+                f"this endpoint received '{expected_input}'."
+            ),
+        )
+
+    return canonical_model_id
+
+
+def validate_model_input(model_id: str, expected_input: str) -> None:
+    require_model_input(model_id, expected_input)
+
+
 def parse_params_object(params: Optional[str], *, strict: bool) -> dict:
     if params in (None, ""):
         return {}
@@ -296,6 +342,32 @@ def build_scene_candidate(output_path: Optional[Path], collection: str = "Defaul
         output_url=output_url,
         display_name=output_path.name,
     )
+
+
+def is_scene_manifest_path(output_path: Path) -> bool:
+    if output_path.suffix.lower() != ".json":
+        return False
+
+    try:
+        manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    return isinstance(manifest, dict) and manifest.get("schema") == "modly.scene-manifest.v1"
+
+
+def detect_output_kind(output_path: Optional[Path]) -> Optional[str]:
+    if output_path is None:
+        return None
+
+    suffix = output_path.suffix.lower()
+    if suffix == ".json" and is_scene_manifest_path(output_path):
+        return "scene"
+
+    if suffix in {".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"}:
+        return "mesh"
+
+    return None
 
 
 async def _run_generation(
@@ -474,6 +546,7 @@ def _run_generation_impl(
             job.progress = 100
             _completed_at[job_id] = time.monotonic()
             job.output_url = output_url
+            job.output_kind = detect_output_kind(output_path)
             job.scene_candidate = scene_candidate
             _log_job_progress(job)
 

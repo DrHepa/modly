@@ -37,6 +37,9 @@ class _FakeRegistry:
     def get_manifest(self, model_id: str) -> dict:
         return {"output": "mesh"}
 
+    def get_model_input(self, model_id: str) -> str:
+        return "image"
+
     def switch_model(self, model_id: str) -> None:
         pass
 
@@ -139,6 +142,7 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
             def assert_weight_variant_installed(self, params, model_id=None): pass
             def get_generator(self, model_id): return self.generators[model_id]
             def get_manifest(self, model_id): return {"output": "mesh"}
+            def get_model_input(self, model_id): return "image"
             def model_status(self, model_id):
                 gen = self.generators[model_id]
                 return {"name": model_id, "downloaded": True, "loaded": gen.loaded}

@@ -3,6 +3,7 @@ from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Background
 import services.generator_registry as registry
 from schemas.generation import (
     GenerateFromArtifactRequest,
+    GenerateFromNoneRequest,
     GenerateFromSceneRequest,
     GenerateFromTextRequest,
 )
@@ -11,6 +12,7 @@ from services.generation_jobs import (
     VALID_REMESH_MODES,
     cancel_job as cancel_generation_job,
     create_from_image_job,
+    create_from_none_job,
     create_from_text_job,
     create_generation_job,
     get_job_status,
@@ -18,6 +20,7 @@ from services.generation_jobs import (
     sanitize_collection,
     validate_image_upload,
     validate_model_id,
+    require_model_input,
 )
 
 router = APIRouter(tags=["generation"])
@@ -40,6 +43,7 @@ async def generate_from_image(
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
 
     collection = sanitize_collection(collection)
+    model_id = require_model_input(model_id, "image")
     manifest = validate_model_id(model_id)
     model_params = parse_params_object(params, strict=False)
     image_bytes = await image.read()
@@ -63,7 +67,8 @@ async def generate_from_text(payload: GenerateFromTextRequest, background_tasks:
         raise HTTPException(400, "prompt is required")
     if payload.remesh not in VALID_REMESH_MODES:
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
-    manifest = validate_model_id(payload.model_id)
+    model_id = require_model_input(payload.model_id, "text")
+    manifest = validate_model_id(model_id)
     full_params = {
         "remesh": payload.remesh,
         "enable_texture": payload.enable_texture,
@@ -72,7 +77,7 @@ async def generate_from_text(payload: GenerateFromTextRequest, background_tasks:
     }
     job = create_from_text_job(
         background_tasks, prompt, full_params, payload.collection,
-        manifest.get("output", "mesh"), payload.model_id,
+        manifest.get("output", "mesh"), model_id,
     )
     return {"job_id": job.job_id}
 
@@ -102,6 +107,35 @@ async def generate_from_artifact(
     job = create_generation_job(
         background_tasks, artifact, params, request.collection,
         manifest.get("output", "mesh"), request.model_id,
+    )
+    return {"job_id": job.job_id}
+
+
+@router.post("/from-none")
+async def generate_from_none(
+    payload: GenerateFromNoneRequest,
+    background_tasks: BackgroundTasks,
+):
+    if payload.remesh not in ("quad", "triangle", "none"):
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+
+    collection = sanitize_collection(payload.collection)
+    model_id = require_model_input(payload.model_id, "none")
+    manifest = validate_model_id(model_id)
+
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+    }
+
+    job = create_from_none_job(
+        background_tasks,
+        full_params,
+        collection,
+        manifest.get("output", "mesh"),
+        model_id,
     )
     return {"job_id": job.job_id}
 

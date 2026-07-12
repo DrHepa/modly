@@ -15,6 +15,7 @@ class JobProgress(BaseModel):
     progress: int = 0
     step: Optional[str] = None
     output_url: Optional[str] = None
+    output_kind: Optional[Literal["mesh", "scene"]] = None
     error: Optional[str] = None
     scene_candidate: Optional[SceneCandidate] = None
 
@@ -43,6 +44,15 @@ class GenerateFromArtifactRequest(BaseModel):
     input_path: str
     model_id: str
     collection: str = "Workflows"
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateFromNoneRequest(BaseModel):
+    model_id: str
+    collection: str = "Default"
+    remesh: str = "quad"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
     params: dict[str, Any] = Field(default_factory=dict)
 
 

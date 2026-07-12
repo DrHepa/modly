@@ -3,6 +3,9 @@ import { useAppStore, type GenerationOptions } from '../stores/appStore.ts'
 
 export type GenerationSubmitRequest =
   | {
+    kind: 'none'
+  }
+  | {
     kind: 'image'
     imagePath: string
     imageData?: string
@@ -52,6 +55,23 @@ export function createGenerationApi({ client, readFileBase64 }: CreateGeneration
     return { jobId: data.job_id }
   }
 
+  async function generateFromNone(
+    options: GenerationOptions,
+    signal?: AbortSignal,
+  ): Promise<{ jobId: string }> {
+    const { data } = await client.post<{ job_id: string }>('/generate/from-none', {
+      model_id: options.modelId,
+      remesh: options.remesh,
+      enable_texture: options.enableTexture,
+      texture_resolution: options.textureResolution,
+      params: options.modelParams,
+    }, {
+      signal,
+    })
+
+    return { jobId: data.job_id }
+  }
+
   async function generateFromText(
     prompt: string,
     options: GenerationOptions,
@@ -82,6 +102,9 @@ export function createGenerationApi({ client, readFileBase64 }: CreateGeneration
       }, { signal })
       return { jobId: data.job_id }
     }
+    if (request.kind === 'none') {
+      return generateFromNone(options, signal)
+    }
     if (request.kind === 'text') {
       return generateFromText(request.prompt, options, signal)
     }
@@ -94,10 +117,11 @@ export function createGenerationApi({ client, readFileBase64 }: CreateGeneration
     progress: number
     step?: string
     outputUrl?: string
+    outputKind?: 'mesh' | 'scene'
     error?: string
   }> {
     const { data } = await client.get(`/generate/status/${jobId}`)
-    return { ...data, outputUrl: data.output_url }
+    return { ...data, outputUrl: data.output_url, outputKind: data.output_kind }
   }
 
   async function getModelStatus(): Promise<{
@@ -185,7 +209,7 @@ export function createGenerationApi({ client, readFileBase64 }: CreateGeneration
     return { url: data.url }
   }
 
-  return { generateFromImage, generateFromText, submitGeneration, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh, transformMesh }
+  return { generateFromNone, generateFromImage, generateFromText, submitGeneration, pollJobStatus, cancelJob, getModelStatus, getAllModelsStatus, downloadModel, optimizeMesh, smoothMesh, importMesh, transformMesh }
 }
 
 export function useApi() {

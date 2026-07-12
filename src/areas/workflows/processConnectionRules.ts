@@ -9,7 +9,7 @@ import { resolveDataSource } from './nodeBehaviors.ts'
 type ArtifactType = string
 
 type ProcessRulePhase = 'connect' | 'run'
-type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port'
+type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target'
 
 export type ProcessConnectionRuleIssue = {
   phase: ProcessRulePhase
@@ -76,6 +76,13 @@ function getPortAwareTargetExtension(node: WFNode | undefined, allExtensions: Wo
 }
 
 function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): ProcessConnectionRuleIssue {
+  if (issue.code === 'inputless-target') {
+    return {
+      ...issue,
+      message: 'This node declares input "none" and cannot accept incoming edges. Remove the connection and run it as a source node.',
+    }
+  }
+
   if (issue.code === 'type-mismatch') {
     return {
       ...issue,
@@ -102,6 +109,18 @@ export function validateProcessConnection({ connection, nodes, edges, allExtensi
   const targetNode = getNodeById(nodes, connection.target)
   if (!targetNode) return null
 
+  const targetExtension = getExtensionForNode(targetNode, allExtensions)
+  if (targetExtension?.input === 'none') {
+    return createIssue({
+      phase: 'connect',
+      code: 'inputless-target',
+      targetNodeId: targetNode.id,
+      targetHandle: connection.targetHandle ?? null,
+      portName: null,
+      sourceNodeId: connection.source ?? undefined,
+    })
+  }
+
   const previewTargetKind = previewNodeTargetArtifactKind(targetNode.type)
   if (previewTargetKind) {
     const actualType = resolveNodeOutputType(getNodeById(nodes, connection.source), allExtensions)
@@ -120,14 +139,14 @@ export function validateProcessConnection({ connection, nodes, edges, allExtensi
     return null
   }
 
-  const targetExtension = getPortAwareTargetExtension(targetNode, allExtensions)
-  if (!targetExtension) return null
+  const portAwareTargetExtension = getPortAwareTargetExtension(targetNode, allExtensions)
+  if (!portAwareTargetExtension) return null
 
-  const targetPort = getProcessTargetPort(targetExtension, connection.targetHandle)
+  const targetPort = getProcessTargetPort(portAwareTargetExtension, connection.targetHandle)
   if (!targetPort) return null
 
   const duplicateEdges = edges.filter((edge) => edge.target === targetNode.id
-    && getProcessTargetPort(targetExtension, edge.targetHandle)?.name === targetPort.name)
+    && getProcessTargetPort(portAwareTargetExtension, edge.targetHandle)?.name === targetPort.name)
   if (duplicateEdges.length > 0) {
     return createIssue({
       phase: 'connect',
@@ -176,6 +195,22 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions, target
         })
       }
       continue
+    }
+
+    const targetExtension = getExtensionForNode(node, allExtensions)
+    if (targetExtension?.input === 'none') {
+      const illegalEdges = edges.filter((edge) => edge.target === node.id)
+      if (illegalEdges.length > 0) {
+        return createIssue({
+          phase: 'run',
+          code: 'inputless-target',
+          targetNodeId: node.id,
+          targetHandle: illegalEdges[0]?.targetHandle ?? null,
+          portName: null,
+          sourceNodeId: illegalEdges[0]?.source,
+          edgeIds: illegalEdges.map((edge) => edge.id),
+        })
+      }
     }
 
     const extension = getPortAwareTargetExtension(node, allExtensions)

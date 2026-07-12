@@ -19,7 +19,6 @@ export const PROCESS_PORT_HANDLE_COLOR: Record<string, string> = {
   mesh: '#a78bfa',
   scene: '#f472b6',
   text: '#fbbf24',
-  audio: '#f472b6',
   video: '#fb7185',
 }
 
@@ -33,6 +32,7 @@ export function getPositionalInputTypes(owner: ProcessPortOwner): string[] | und
 }
 
 export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessTargetPort[] {
+  if (owner.input === 'none') return []
   if (hasNamedProcessInputs(owner.inputs)) {
     return owner.inputs.map((port) => ({
       name: port.name,

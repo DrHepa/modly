@@ -73,6 +73,8 @@ function findWhileContainerAt(nodes: FlowNode<WFNodeData>[], pos: { x: number; y
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
 const IO_STYLES: Record<string, string> = {
+  none: 'bg-zinc-800/60 text-zinc-400 border-zinc-700/60',
+  video: 'bg-rose-500/15 text-rose-400 border-rose-500/25',
   audio: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
   image: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',

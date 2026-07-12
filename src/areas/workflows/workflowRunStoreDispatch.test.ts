@@ -29,17 +29,20 @@ type RunProcessCall = {
 // Execute the current store, preserving upstream alias imports, with only its
 // host boundaries replaced. No HTTP, Electron, filesystem reads or model runs.
 const storeBundle = (await build({
-  entryPoints: [fileURLToPath(new URL('./workflowRunStore.ts', import.meta.url))],
+  stdin: { contents: "export * from './workflowRunStore.ts'; export { useWorldsSceneStore } from '../worlds/worldsSceneStore.ts'", resolveDir: fileURLToPath(new URL('.', import.meta.url)), sourcefile: 'dispatch-fixture.ts', loader: 'ts' },
   bundle: true, platform: 'node', format: 'cjs', write: false,
   plugins: [{ name: 'inert-dispatch-adapters', setup(builder) {
-    builder.onResolve({ filter: /^(axios|@shared\/stores\/appStore|@shared\/utils\/notification)$/ }, (args) => ({ path: args.path, namespace: 'inert' }))
+    builder.onResolve({ filter: /^(axios|@shared\/stores\/appStore|\.\.\/\.\.\/shared\/stores\/appStore\.ts|@shared\/utils\/notification)$/ }, (args) => ({ path: args.path, namespace: 'inert' }))
     builder.onLoad({ filter: /.*/, namespace: 'inert' }, ({ path: id }) => ({ loader: 'ts', contents: id === 'axios'
       ? 'export default { create: () => globalThis.fixture.client }'
-      : id.endsWith('appStore') ? 'export const useAppStore = { getState: () => globalThis.fixture.app }'
+      : /appStore(?:\.ts)?$/.test(id) ? 'export const useAppStore = { getState: () => globalThis.fixture.app }'
       : 'export const showCompletionNotification = () => {}; export const showErrorNotification = () => {}' }))
   } }],
 })).outputFiles[0].text
 
+let buildModelGenerationRequest: typeof import('./workflowRunStore').buildModelGenerationRequest
+let shouldUsePreviousNodeFallback: typeof import('./workflowRunStore').shouldUsePreviousNodeFallback
+let useWorldsSceneStore: typeof import('../worlds/worldsSceneStore.ts').useWorldsSceneStore
 let useWorkflowRunStore: WorkflowRunStore
 let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
@@ -157,14 +160,17 @@ beforeEach(() => {
       return processResult ? processResult(runProcessCalls.at(-1)!) : { success: true, result: { filePath: '/workspace/output/process.glb' } }
     } },
   } }
-  const module = { exports: {} as { useWorkflowRunStore: WorkflowRunStore } }
+  const module = { exports: {} as { useWorkflowRunStore: WorkflowRunStore; buildModelGenerationRequest: typeof buildModelGenerationRequest; shouldUsePreviousNodeFallback: typeof shouldUsePreviousNodeFallback; useWorldsSceneStore: typeof useWorldsSceneStore } }
   vm.runInNewContext(storeBundle, {
     module, exports: module.exports, require: createRequire(import.meta.url), fixture, window,
-    process, console, crypto, Blob, FormData, atob,
+    process, console, crypto, Blob, FormData, atob, URL, fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
     // Polling delay is inert; each client is a bounded in-memory fixture.
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay === 5000 ? delay : 0), clearTimeout, TextDecoder,
   })
   useWorkflowRunStore = module.exports.useWorkflowRunStore
+  buildModelGenerationRequest = module.exports.buildModelGenerationRequest
+  shouldUsePreviousNodeFallback = module.exports.shouldUsePreviousNodeFallback
+  useWorldsSceneStore = module.exports.useWorldsSceneStore
 })
 
 function createExtensionNode(extensionId: string): WFNode {
@@ -3310,3 +3316,339 @@ for (const name of ['__proto__', 'constructor', 'toString', 'normal']) {
     assert.ok(useWorkflowRunStore.getState().runState.error?.includes(`Required port "${name}" is missing.`))
   })
 }
+
+test('buildModelGenerationRequest creates a payload-only request for inputless model sources', () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    input: 'none',
+    output: 'scene',
+  })
+  const node = createExtensionNode(ext.id)
+  node.data.params = { seed: 17, num_points: 32768 }
+
+  const request = buildModelGenerationRequest({
+    ext,
+    node,
+    nodeParams: node.data.params,
+    selectedImagePath: '/tmp/must-not-be-used.png',
+    selectedImageData: Buffer.from('must-not-be-used').toString('base64'),
+    workspaceDir: '/workspace',
+  })
+
+  assert.deepEqual(JSON.parse(JSON.stringify(request)), {
+    kind: 'none',
+    payload: {
+      model_id: 'gaussiangpt/generate',
+      collection: 'Workflows',
+      remesh: 'none',
+      enable_texture: false,
+      texture_resolution: 1024,
+      params: { seed: 17, num_points: 32768 },
+    },
+  })
+})
+
+test('workflowRunStore runs an inputless model as a source through generate/from-none', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'scene',
+    params: [{ id: 'seed', label: 'Seed', type: 'int', default: 0 }],
+  })
+  const node = createExtensionNode(ext.id)
+  node.data.params = { seed: 23 }
+  const workflow: Workflow = {
+    id: 'workflow-inputless-source',
+    name: 'Inputless source',
+    description: '',
+    nodes: [node],
+    edges: [],
+    createdAt: '2026-07-11T00:00:00.000Z',
+    updatedAt: '2026-07-11T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: unknown }> = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+      if (path === '/generate/from-none') return { data: { job_id: 'job-gaussiangpt-none' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-gaussiangpt-none')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/gaussiangpt/scene-manifest.json' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(postCalls, [{
+    path: '/generate/from-none',
+    data: {
+      model_id: 'gaussiangpt/generate',
+      collection: 'Workflows',
+      remesh: 'none',
+      enable_texture: false,
+      texture_resolution: 1024,
+      params: { seed: 23 },
+    },
+  }])
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/Workflows/gaussiangpt/scene-manifest.json')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts[node.id]?.kind, 'scene')
+})
+
+
+test('workflowRunStore never falls back from an unrelated prior output into an inputless model', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'scene',
+    params: [{ id: 'seed', label: 'Seed', type: 'int', default: 0 }],
+  })
+  const noneNode = createExtensionNode(ext.id)
+  noneNode.data.params = { seed: 31 }
+  const workflow: Workflow = {
+    id: 'workflow-inputless-after-unrelated-output',
+    name: 'Inputless after unrelated output',
+    description: '',
+    nodes: [
+      createNode('unrelated-image', 'imageNode', {
+        enabled: true,
+        params: { filePath: '/workspace/unrelated/source.png' },
+      }),
+      noneNode,
+    ],
+    edges: [],
+    createdAt: '2026-07-11T00:00:00.000Z',
+    updatedAt: '2026-07-11T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: unknown }> = []
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) })
+      if (path === '/generate/from-none') return { data: { job_id: 'job-none-no-fallback' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-none-no-fallback')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/no-fallback/scene-manifest.json' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(postCalls, [{
+    path: '/generate/from-none',
+    data: {
+      model_id: 'gaussiangpt/generate',
+      collection: 'Workflows',
+      remesh: 'none',
+      enable_texture: false,
+      texture_resolution: 1024,
+      params: { seed: 31 },
+    },
+  }])
+  assert.deepEqual(Object.keys(postCalls[0].data as Record<string, unknown>).sort(), [
+    'collection',
+    'enable_texture',
+    'model_id',
+    'params',
+    'remesh',
+    'texture_resolution',
+  ])
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+
+test('shouldUsePreviousNodeFallback disables positional fallback only for inputless models', () => {
+  assert.equal(shouldUsePreviousNodeFallback('none'), false)
+  assert.equal(shouldUsePreviousNodeFallback('image'), true)
+  assert.equal(shouldUsePreviousNodeFallback('text'), true)
+  assert.equal(shouldUsePreviousNodeFallback('scene'), true)
+})
+
+test('workflowRunStore fails stale incoming edges into inputless models with an actionable runtime error', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'scene',
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-inputless-stale-edge',
+    name: 'Inputless stale edge',
+    description: '',
+    nodes: [
+      createNode('image-source', 'imageNode', { enabled: true, params: { filePath: '/workspace/input.png' } }),
+      createNode('none-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    ],
+    edges: [{ id: 'edge-illegal', source: 'image-source', target: 'none-node' }],
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z',
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /declares input "none" and cannot accept incoming edges/i)
+})
+
+test('workflowRunStore fails when actual generation output kind mismatches the declared model output and does not route it', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'mesh',
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-output-kind-mismatch',
+    name: 'Output kind mismatch',
+    description: '',
+    nodes: [
+      createNode('model-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+      createNode('worlds-node', 'addToWorldsNode', { enabled: true, params: {} }),
+    ],
+    edges: [{ id: 'edge-worlds', source: 'model-node', target: 'worlds-node' }],
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z',
+  }
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-none') return { data: { job_id: 'job-kind-mismatch' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-kind-mismatch')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated/scene-manifest.json', output_kind: 'scene' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /declared output "mesh" but generated "scene"/i)
+  assert.deepEqual(Array.from(useWorldsSceneStore.getState().sceneItems), [])
+})
+
+test('workflowRunStore falls back to declared output when generation status omits actual output kind', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'mesh',
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-output-kind-fallback',
+    name: 'Output kind fallback',
+    description: '',
+    nodes: [createNode('model-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} })],
+    edges: [],
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z',
+  }
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-none') return { data: { job_id: 'job-kind-fallback' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-kind-fallback')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'mesh')
+})
+
+test('workflowRunStore uses actual scene output kind for Add to Worlds scene routing', async () => {
+  const ext = createWorkflowExtension({
+    id: 'gaussiangpt/generate',
+    extensionId: 'gaussiangpt',
+    nodeId: 'generate',
+    name: 'GaussianGPT',
+    input: 'none',
+    output: 'scene',
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-scene-worlds-routing',
+    name: 'Scene worlds routing',
+    description: '',
+    nodes: [
+      createNode('model-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+      createNode('worlds-node', 'addToWorldsNode', { enabled: true, params: {} }),
+    ],
+    edges: [{ id: 'edge-worlds', source: 'model-node', target: 'worlds-node' }],
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z',
+  }
+  const originalFetch = globalThis.fetch
+
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => JSON.stringify({
+      schema: 'modly.scene-manifest.v1',
+      sceneRoot: '.',
+      generator: 'modly.worlds',
+      version: 1,
+      createdAt: '2026-07-12T00:00:00.000Z',
+      assets: [{
+        id: 'base',
+        role: 'base-scene',
+        workspacePath: 'Workflows/generated/base.glb',
+        kind: 'glb',
+        visible: true,
+        transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      }],
+    }),
+  } as Response)) as typeof fetch
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-none') return { data: { job_id: 'job-scene-worlds' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-scene-worlds')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated/scene-manifest.json', output_kind: 'scene' } }
+    },
+  }
+
+  try {
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'scene')
+  assert.deepEqual(Array.from(useWorldsSceneStore.getState().sceneItems, (item) => item.id), ['base'])
+})

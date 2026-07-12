@@ -1,10 +1,10 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
-import type { ExtensionWorkflowNode, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
 
-export interface WorkflowExtension {
+interface WorkflowExtensionBase {
   id:              string   // "ext_id/node_id"
   extensionId:     string   // "ext_id" (for IPC calls)
   extensionName:   string   // display name of the parent extension
@@ -25,6 +25,26 @@ export interface WorkflowExtension {
   capabilityId?:    string
   singleton?:       boolean
 }
+
+type ModelWorkflowExtension = WorkflowExtensionBase & {
+  type: 'model'
+  input: ModelInputKind
+}
+
+type ProcessWorkflowExtension = WorkflowExtensionBase & {
+  type: 'process'
+  input: string
+}
+
+type UtilityWorkflowExtension = WorkflowExtensionBase & {
+  type: 'utility'
+  input: string
+}
+
+export type WorkflowExtension =
+  | ModelWorkflowExtension
+  | ProcessWorkflowExtension
+  | UtilityWorkflowExtension
 
 const WORKFLOW_UTILITY_NODE_COMPONENT_TYPES: Record<ExtensionWorkflowNode['component'], string> = {
   'video-preview': PREVIEW_VIDEO_NODE_TYPE,

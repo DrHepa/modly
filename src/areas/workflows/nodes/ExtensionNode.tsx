@@ -47,7 +47,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const ext = allExtensions.find((e) => e.id === data.extensionId)
   const openExtension = useNavStore((s) => s.openExtension)
 
-  const inputs = getProcessTargetPorts(ext ?? { input: 'image' })
+  const inputs = ext?.input === 'none' ? [] : getProcessTargetPorts(ext ?? { input: 'image' })
   const isMulti = inputs.length > 1 || inputs.some((port) => !port.isLegacy)
   const isTerminal  = ext?.id === 'mesh-exporter'
   const outputColor = HANDLE_COLOR[ext?.output ?? 'mesh']
@@ -104,15 +104,19 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     </div>
   ) : (
     // Single-input layout (existing behavior)
-    <div ref={(el) => { if (el) handleRefs.current[0] = el }} className="flex items-center justify-between px-3 py-2">
+    <div ref={(el) => { if (el) handleRefs.current[0] = el }} className={`flex items-center px-3 py-2 ${ext?.input === 'none' ? 'justify-end' : 'justify-between'}`}>
+      {ext?.input !== 'none' && (
       <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
         {ext?.input ?? '—'}
       </span>
+      )}
       {!isTerminal && (
         <>
+          {ext?.input !== 'none' && (
           <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
             <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
           </svg>
+          )}
           <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
             {ext?.output ?? '—'}
           </span>
@@ -144,12 +148,14 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     </>
   ) : (
     <>
+      {ext?.input !== 'none' && (
       <Handle
         id="input-0"
         type="target"
         position={Position.Left}
         style={{ background: HANDLE_COLOR[ext?.input ?? 'image'], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}
       />
+      )}
       {!isTerminal && (
         <Handle
           id="output"

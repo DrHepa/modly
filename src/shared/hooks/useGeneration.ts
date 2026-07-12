@@ -18,6 +18,7 @@ function resolveModelInput(modelId: string, modelExtensions: ModelExtension[]): 
     .find(({ extension, node }) => `${extension.id}/${node.id}` === modelId)?.node
     ?? modelExtensions.find((extension) => extension.id === modelId && extension.nodes.length === 1)?.nodes[0]
   let input = node?.input
+  if (input === 'none') return input
   if (node?.inputs?.length) {
     // Positional artifact slots must not fall back to a scalar text declaration.
     if (node.inputs.every((kind) => kind === 'text')) input = 'text'
@@ -38,6 +39,10 @@ export function resolveLegacyGenerationRequest({
   modelExtensions,
 }: ResolveLegacyGenerationRequestArgs): GenerationSubmitRequest {
   const input = resolveModelInput(generationOptions.modelId, modelExtensions)
+
+  if (input === 'none') {
+    return { kind: 'none' }
+  }
 
   if (input === 'text') {
     return {

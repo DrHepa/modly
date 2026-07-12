@@ -13,7 +13,7 @@ const baseOptions: GenerationOptions = {
   modelParams: {},
 }
 
-function createModelExtension(input: 'image' | 'text' | 'mesh'): ModelExtension {
+function createModelExtension(input: 'none' | 'image' | 'text' | 'mesh' | 'scene'): ModelExtension {
   return {
     id: 'vendor/model',
     type: 'model',
@@ -62,6 +62,22 @@ test('resolveLegacyGenerationRequest resolves text requests from model metadata 
     kind: 'text',
     prompt: 'A stone castle',
   })
+})
+
+
+
+test('resolveLegacyGenerationRequest resolves inputless models before image validation', () => {
+  const request = resolveLegacyGenerationRequest({
+    imagePath: null,
+    selectedImageData: Buffer.from('must-not-be-read').toString('base64'),
+    generationOptions: {
+      ...baseOptions,
+      modelParams: { seed: 23 },
+    },
+    modelExtensions: [createModelExtension('none')],
+  })
+
+  assert.deepEqual(request, { kind: 'none' })
 })
 
 test('resolveLegacyGenerationRequest retains legacy modalities and diagnoses missing metadata', () => {

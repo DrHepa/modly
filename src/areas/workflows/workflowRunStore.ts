@@ -421,6 +421,97 @@ function checkpointFeedsHumanoid(ctx: RunContext, waitId: string): boolean {
   })
 }
 
+type ModelGenerationRequest =
+  | {
+      kind: 'none'
+      payload: {
+        model_id: string
+        collection: string
+        remesh: string
+        enable_texture: boolean
+        texture_resolution: number
+        params: Record<string, unknown>
+      }
+    }
+  | {
+      kind: 'image'
+      imagePath: string
+      imageData?: string
+      params: Record<string, unknown>
+    }
+  | {
+      kind: 'text'
+      payload: {
+        prompt: string
+        model_id: string
+        collection: string
+        remesh: string
+        enable_texture: boolean
+        texture_resolution: number
+        params: Record<string, unknown>
+      }
+    }
+  | {
+      kind: 'scene'
+      scenePath: string
+      params: Record<string, unknown>
+    }
+
+export function shouldUsePreviousNodeFallback(input: WorkflowExtension['input']): boolean {
+  return input !== 'none'
+}
+
+function resolveModelNodeOutputKind(args: {
+  declaredOutput?: string
+  actualOutput?: ArtifactRef['kind']
+  extensionId: string
+}): string | undefined {
+  if (args.actualOutput === undefined) return args.declaredOutput
+  if (args.declaredOutput !== undefined && args.declaredOutput !== args.actualOutput) {
+    throw new Error(
+      `Model ${args.extensionId} declared output "${args.declaredOutput}" but generated "${args.actualOutput}". Update the manifest output or fix the generator output contract.`,
+    )
+  }
+  return args.actualOutput
+}
+
+export function buildModelGenerationRequest(args: {
+  ext: WorkflowExtension
+  node: WFNode
+  nodeParams: Record<string, unknown>
+  nodeInputPath?: string
+  nodeInputText?: string
+  nodeInputMeshPath?: string
+  routedMeshParams?: Record<string, string>
+  routedSideParams?: Record<string, string>
+  selectedImagePath?: string
+  selectedImageData?: string
+  workspaceDir: string
+}): ModelGenerationRequest {
+  const { ext, node, nodeParams } = args
+
+  const input: unknown = Reflect.get(ext, 'input')
+  if (input === undefined) {
+    throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
+  }
+
+  if (input === 'none') {
+    return {
+      kind: 'none',
+      payload: {
+        model_id: node.data.extensionId ?? '',
+        collection: 'Workflows',
+        remesh: 'none',
+        enable_texture: false,
+        texture_resolution: 1024,
+        params: nodeParams,
+      },
+    }
+  }
+
+  throw new Error(`Model ${ext.id} does not declare input "none"`)
+}
+
 function humanoidWorkspacePath(filePath: string | undefined, workspaceDir: string): string | undefined {
   if (!filePath) return undefined
   const relative = normalizeWorkflowPath(filePath, workspaceDir).replace(/^\/workspace\//, '')
@@ -690,7 +781,11 @@ async function executeExtensionNode(
   const extraImagePaths: string[] = []
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
-  const positionalInputs = ext && getPositionalInputTypes(ext)
+  const isInputless = mode === 'model' && ext.input === 'none'
+  if (isInputless && incomingEdges.length > 0) {
+    throw new Error(`Model ${ext.id} declares input "none" and cannot accept incoming edges. Remove incoming edges and run it as a source node.`)
+  }
+  const positionalInputs = !isInputless ? getPositionalInputTypes(ext) : undefined
   const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
   const scenePositional = mode === 'process' && !hasNamedInputs
     && (ext.input === 'scene' || positionalInputs?.includes('scene'))
@@ -741,7 +836,7 @@ async function executeExtensionNode(
     nodeInputPath     = slots.nodeInputPath
     nodeInputMeshPath = slots.nodeInputMeshPath
     extraImagePaths.push(...slots.extraImagePaths)
-  } else {
+  } else if (shouldUsePreviousNodeFallback(ext.input)) {
     for (const edge of incomingEdges) {
       const src = resolveSource(edge.source)
       if (src?.filePath !== undefined) nodeInputPath = src.filePath
@@ -750,12 +845,13 @@ async function executeExtensionNode(
     }
   }
 
+  let actualOutputType: string | undefined
   if (mode === 'model') {
     if (!ext.input && !positionalInputs?.length) throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
-    const namedModelInputs = hasNamedProcessInputs(ext.inputs) ? ext.inputs : []
+    const namedModelInputs = !isInputless && hasNamedProcessInputs(ext.inputs) ? ext.inputs : []
     const meshPorts = namedModelInputs.filter((port) => port.type === 'mesh')
     const meshPaths = new Map<string, string>()
     for (const edge of incomingEdges) {
@@ -779,17 +875,17 @@ async function executeExtensionNode(
         if (src?.text !== undefined && (!src.outputType || src.outputType === 'text')) nodeInputText = src.text
       }
     }
-    const activeImagePath = (isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
+    const activeImagePath = (isInputless || isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
+    if (!isInputless && !isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
     }
 
     let blob: Blob | undefined
     let fname = 'image.png'
-    if (!isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
+    if (!isInputless && !isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
       fname = 'placeholder.png'
       blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else if (!isTextInput && !isSceneInput) {
+    } else if (!isInputless && !isTextInput && !isSceneInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
@@ -824,7 +920,11 @@ async function executeExtensionNode(
 
     setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
     let submission: { data: { job_id: string } }
-    if (isSceneInput) {
+    if (isInputless) {
+      const request = buildModelGenerationRequest({ ext, node, nodeParams: effectiveParams, workspaceDir })
+      if (request.kind === 'none') submission = await client.post('/generate/from-none', request.payload)
+      else throw new Error('Expected inputless model request')
+    } else if (isSceneInput) {
       const normalized = nodeInputScenePath!.replace(/\\/g, '/')
       const inputPath = normalized.startsWith(`${workspaceDir}/`)
         ? normalized.slice(workspaceDir.length + 1)
@@ -904,11 +1004,12 @@ async function executeExtensionNode(
       assertCurrentContext(ctx)
 
       const { data: st } = await client.get<{
-        status: string; progress?: number; step?: string; output_url?: string; error?: string
+        status: string; progress?: number; step?: string; output_url?: string; output_kind?: ArtifactRef['kind']; error?: string
       }>(`/generate/status/${backendJobId}`)
 
       assertCurrentContext(ctx)
       if (st.status === 'done' && st.output_url) {
+        actualOutputType = resolveModelNodeOutputKind({ declaredOutput: ext.output, actualOutput: st.output_kind, extensionId: ext.id })
         const rel = st.output_url.replace(/^\/workspace\//, '')
         nodeInputPath = `${workspaceDir}/${rel}`
         _activeJobId.current = null
@@ -987,7 +1088,7 @@ async function executeExtensionNode(
     setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Done' }))
   }
 
-  const outputType = ext.output
+  const outputType = actualOutputType ?? ext.output
   nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
 
   recordNodeArtifact(ctx, node.id, {

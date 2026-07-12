@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, relative, resolve as resolvePath } from 
 import type { ArtifactRegistryReadResult, ArtifactRegistryWriteResult, ArtifactSidecar, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, MotionRetargetSidecarReadResult, MotionRetargetSidecarV1, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, RigMetaSidecarReadResult, RigRenameSidecarV1, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorkspaceArtifactDownloadResult } from '../../src/shared/types/electron.d'
 import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
 import type { AssetCapability, AssetEntryState, AssetLibraryEntry, AssetLibraryListResult, AssetLibraryManifestCapability, AssetLibraryManifestRef, AssetLibraryOpenResult, AssetLibraryPreviewKind, AssetLibraryPreviewPayload, AssetLibraryReadResult, AssetLibrarySourceLink, AssetLibrarySourceScope } from '../../src/shared/types/assetLibrary.ts'
+import { classifyPlyHeader, type PlyKind } from '../../src/shared/ply/plyHeaderClassification.ts'
 
 const SIDECAR_SUFFIX = '.artifact.json'
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
@@ -41,11 +42,14 @@ const ASSET_LIBRARY_MANIFEST_SCHEMA_CAPABILITIES: Record<string, AssetLibraryMan
   'modly.generated-world.v1': 'generated-world',
   'modly.scene-manifest.v1': 'scene-manifest',
 }
+const PLY_HEADER_READ_LIMIT_BYTES = 64 * 1024
+const PLY_HEADER_READ_CHUNK_BYTES = 4096
 
 export interface AssetLibraryClassificationCandidate {
   workspacePath: string
   artifactKind?: ArtifactKind
   previewKind?: AssetLibraryPreviewKind
+  plyKind?: PlyKind
   evidence?: {
     rigMeta?: boolean
     humanoidDraft?: boolean
@@ -283,6 +287,10 @@ export function classifyAssetLibraryCandidate(candidate: AssetLibraryClassificat
 
   if (evidence.intrinsicMotionFile) {
     return { capability: 'animation-motion', state: 'ready' }
+  }
+
+  if (candidate.plyKind === 'gaussian' || candidate.plyKind === 'unknown') {
+    return { capability: undefined, state: 'unknown-metadata' }
   }
 
   if (candidate.artifactKind === 'mesh' || meshCandidate) {
@@ -765,11 +773,15 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
   const humanoidDraftState = previewKind === '3d-model' ? await readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath: workspacePath }) : null
   const humanoidPromotionState = previewKind === '3d-model' ? await readHumanoidPromotionSidecar({ workspaceDir, meshWorkspacePath: workspacePath }) : null
   const intrinsicEvidence = await readIntrinsicAssetLibraryEvidence(workspaceDir, workspacePath, previewKind)
+  const plyKind = resolveWorkspaceArtifactExtension(workspacePath) === 'ply'
+    ? await readWorkspacePlyKind({ workspaceDir, workspacePath })
+    : undefined
 
   const classification = classifyAssetLibraryCandidate({
     workspacePath,
     artifactKind: extractAssetLibraryArtifactKind(metadata),
     previewKind,
+    ...(plyKind ? { plyKind } : {}),
     evidence: {
       rigMeta: rigMetaState?.success === true && rigMetaState.status === 'found',
       humanoidDraft: humanoidDraftState?.success === true && humanoidDraftState.status !== 'not-found',
@@ -822,6 +834,7 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     ...(extractAssetLibraryProvenance(metadata) ? { provenance: extractAssetLibraryProvenance(metadata) } : {}),
     ...(source ? { source } : {}),
     ...(manifest ? { manifest } : {}),
+    ...(plyKind ? { plyKind } : {}),
     previewKind,
     warnings: [...new Set(warnings)],
   }
@@ -870,9 +883,42 @@ function mapWorkspaceArtifactPreviewToLibraryPayload(result: Extract<WorkspaceAr
       binaryKind: result.binaryKind,
       byteLength: result.byteLength,
       message: result.message,
+      ...(result.plyKind ? { plyKind: result.plyKind } : {}),
     }
   }
   return { kind: 'none' }
+}
+
+export async function readWorkspacePlyKind(request: WorkspaceArtifactPreviewServiceRequest): Promise<PlyKind> {
+  const normalized = normalizeWorkspaceArtifactPath(request.workspaceDir, request.workspacePath)
+  if (resolveWorkspaceArtifactExtension(normalized.workspacePath) !== 'ply') return 'unknown'
+
+  const handle = await open(normalized.absolutePath, 'r')
+
+  try {
+    let totalBytes = 0
+    let headerBuffer = Buffer.alloc(0)
+
+    while (totalBytes < PLY_HEADER_READ_LIMIT_BYTES) {
+      const remainingBytes = PLY_HEADER_READ_LIMIT_BYTES - totalBytes
+      const chunk = Buffer.alloc(Math.min(PLY_HEADER_READ_CHUNK_BYTES, remainingBytes))
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, totalBytes)
+      if (bytesRead <= 0) return 'unknown'
+
+      totalBytes += bytesRead
+      headerBuffer = Buffer.concat([headerBuffer, chunk.subarray(0, bytesRead)])
+
+      const headerText = headerBuffer.toString('latin1')
+      const endHeaderIndex = headerText.toLowerCase().indexOf('end_header')
+      if (endHeaderIndex === -1) continue
+
+      return classifyPlyHeader(headerText.slice(0, endHeaderIndex + 'end_header'.length)).plyKind
+    }
+
+    return 'unknown'
+  } finally {
+    await handle.close()
+  }
 }
 
 export async function listWorkspaceAssetLibrary(request: WorkspaceAssetLibraryListServiceRequest): Promise<AssetLibraryListResult> {
@@ -2719,6 +2765,7 @@ export async function previewWorkspaceArtifact(request: WorkspaceArtifactPreview
     }
 
     if (!isWorkspaceArtifactTextPreviewExtension(extension)) {
+      const plyKind = extension === 'ply' ? await readWorkspacePlyKind(request) : undefined
       return {
         success: true,
         status: 'binary',
@@ -2729,6 +2776,7 @@ export async function previewWorkspaceArtifact(request: WorkspaceArtifactPreview
         message: extension === 'npz'
           ? 'Binary preview is unavailable for NPZ artifacts. Download the file to inspect it locally.'
           : 'Binary preview is unavailable for this artifact. Download the file to inspect it locally.',
+        ...(plyKind ? { plyKind } : {}),
       }
     }
 

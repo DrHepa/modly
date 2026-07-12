@@ -4,6 +4,7 @@ Runs locally within the Electron app to provide AI inference endpoints.
 """
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,7 +60,28 @@ app.include_router(agent.router)
 @app.get("/workspace/{full_path:path}")
 async def serve_workspace_file(full_path: str):
     import services.generator_registry as reg
-    file_path = reg.WORKSPACE_DIR / full_path
+
+    file_path = resolve_workspace_request_path(reg.WORKSPACE_DIR, full_path)
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(str(file_path))
+
+
+def resolve_workspace_request_path(workspace_dir: Path, full_path: str) -> Path:
+    candidate = full_path.replace("\\", "/").strip()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    pure_path = PurePosixPath(candidate)
+    if pure_path.is_absolute() or any(part in ("", ".", "..") for part in pure_path.parts):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    workspace_root = workspace_dir.resolve()
+    resolved_path = (workspace_root / Path(*pure_path.parts)).resolve()
+
+    try:
+        resolved_path.relative_to(workspace_root)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="File not found") from error
+
+    return resolved_path

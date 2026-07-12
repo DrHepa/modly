@@ -537,8 +537,13 @@ test('classifies asset library entries by capability evidence instead of file ex
     },
     {
       name: 'mesh from sidecar-free ply',
-      input: { workspacePath: 'Workflows/generated/mystery.ply', previewKind: 'binary' },
+      input: { workspacePath: 'Workflows/generated/mystery.ply', previewKind: 'binary', plyKind: 'mesh' },
       expected: { capability: 'mesh', state: 'ready' },
+    },
+    {
+      name: 'gaussian ply stays indexed but not classified as a mesh capability',
+      input: { workspacePath: 'Workflows/generated/point_cloud_1499.ply', previewKind: 'binary', plyKind: 'gaussian' },
+      expected: { capability: undefined, state: 'unknown-metadata' },
     },
     {
       name: 'audio stays indexed as unknown metadata instead of being dropped',
@@ -661,7 +666,8 @@ test('lists workspace asset library entries with projected registry metadata, si
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.gltf'), '{"asset":{"version":"2.0"}}', 'utf-8')
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.obj'), 'o hero\nv 0 0 0\n', 'utf-8')
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.stl'), 'solid hero\nendsolid hero\n', 'utf-8')
-    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nend_header\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nelement vertex 3\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'point-cloud.ply'), 'ply\nformat binary_little_endian 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n', 'utf-8')
     await writeFile(path.join(workspaceDir, 'notes', 'readme.md'), '# hello', 'utf-8')
 
     await writeFile(
@@ -850,7 +856,6 @@ test('lists workspace asset library entries with projected registry metadata, si
     for (const workspacePath of [
       'Workflows/generated/mystery.obj',
       'Workflows/generated/mystery.stl',
-      'Workflows/generated/mystery.ply',
     ]) {
       const expectedName = path.basename(workspacePath)
       assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get(workspacePath)), {
@@ -864,6 +869,29 @@ test('lists workspace asset library entries with projected registry metadata, si
         warnings: [],
       })
     }
+
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/mystery.ply')), {
+      id: 'Workflows/generated/mystery.ply',
+      workspacePath: 'Workflows/generated/mystery.ply',
+      displayName: 'mystery.ply',
+      sourceScope: 'workflows',
+      capability: 'mesh',
+      state: 'ready',
+      plyKind: 'mesh',
+      previewKind: 'binary',
+      warnings: [],
+    })
+
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/point-cloud.ply')), {
+      id: 'Workflows/generated/point-cloud.ply',
+      workspacePath: 'Workflows/generated/point-cloud.ply',
+      displayName: 'point-cloud.ply',
+      sourceScope: 'workflows',
+      state: 'unknown-metadata',
+      plyKind: 'gaussian',
+      previewKind: 'binary',
+      warnings: [],
+    })
 
     assert.equal(byPath.has('notes/readme.md'), false)
   })
@@ -1058,7 +1086,8 @@ test('reads and opens workspace asset library entries through the safe library b
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.gltf'), '{"asset":{"version":"2.0"}}', 'utf-8')
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.obj'), 'o hero\nv 0 0 0\n', 'utf-8')
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.stl'), 'solid hero\nendsolid hero\n', 'utf-8')
-    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nend_header\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.ply'), 'ply\nformat ascii 1.0\nelement vertex 3\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n', 'utf-8')
+    await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'gaussian.ply'), 'ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float scale_0\nproperty float rot_0\nend_header\n', 'utf-8')
 
     const openReadyResult = await openWorkspaceAssetLibraryEntry({
       workspaceDir,
@@ -1083,6 +1112,13 @@ test('reads and opens workspace asset library entries through the safe library b
       assert.equal(openMeshResult.entry.capability, 'mesh')
       assert.equal(openMeshResult.entry.state, 'ready')
     }
+
+    const gaussianResult = await openWorkspaceAssetLibraryEntry({
+      workspaceDir,
+      workspacePath: 'Workflows/generated/gaussian.ply',
+    })
+    assert.equal(gaussianResult.success, false)
+    assert.match(gaussianResult.error ?? '', /ready supported asset/i)
   })
 })
 
@@ -1256,6 +1292,47 @@ test('workspace artifact preview classifies NPZ as binary and GLB as Viewer3D-ow
       workspacePath: 'Workflows/kimodo/run-1/animated.glb',
       displayName: 'animated.glb',
       viewerKind: 'glb',
+    })
+  })
+})
+
+test('bounded workspace PLY classification identifies mesh, points, gaussian, binary headers, and fails closed on missing or oversized headers', async () => {
+  await withTempWorkspace(async (workspaceDir) => {
+    await mkdir(path.join(workspaceDir, 'Workflows/ply'), { recursive: true })
+    const meshPath = path.join(workspaceDir, 'Workflows/ply/mesh.ply')
+    const pointsPath = path.join(workspaceDir, 'Workflows/ply/points.ply')
+    const gaussianPath = path.join(workspaceDir, 'Workflows/ply/gaussian.ply')
+    const binaryHeaderPath = path.join(workspaceDir, 'Workflows/ply/binary-header.ply')
+    const missingHeaderPath = path.join(workspaceDir, 'Workflows/ply/missing-header.ply')
+    const oversizedHeaderPath = path.join(workspaceDir, 'Workflows/ply/oversized-header.ply')
+
+    await writeFile(meshPath, 'ply\nformat ascii 1.0\nelement vertex 3\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n')
+    await writeFile(pointsPath, 'ply\nformat ascii 1.0\nelement vertex 3\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n0 0 0\n')
+    await writeFile(gaussianPath, 'ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n')
+    await writeFile(binaryHeaderPath, Buffer.concat([
+      Buffer.from('ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n', 'latin1'),
+      Buffer.from([0x00, 0x01, 0x02, 0x03]),
+    ]))
+    await writeFile(missingHeaderPath, 'ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\n')
+    await writeFile(oversizedHeaderPath, `ply\n${'comment x\n'.repeat(7000)}`)
+
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/mesh.ply' }) ?? 'missing', 'mesh')
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/points.ply' }) ?? 'missing', 'points')
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/gaussian.ply' }) ?? 'missing', 'gaussian')
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/binary-header.ply' }) ?? 'missing', 'points')
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/missing-header.ply' }) ?? 'missing', 'unknown')
+    assert.equal(await artifactRegistryService.readWorkspacePlyKind?.({ workspaceDir, workspacePath: 'Workflows/ply/oversized-header.ply' }) ?? 'missing', 'unknown')
+
+    const gaussianPreview = await previewWorkspaceArtifact({ workspaceDir, workspacePath: 'Workflows/ply/gaussian.ply' })
+    assert.deepEqual(gaussianPreview, {
+      success: true,
+      status: 'binary',
+      workspacePath: 'Workflows/ply/gaussian.ply',
+      displayName: 'gaussian.ply',
+      byteLength: (await stat(gaussianPath)).size,
+      binaryKind: 'ply',
+      message: 'Binary preview is unavailable for this artifact. Download the file to inspect it locally.',
+      plyKind: 'gaussian',
     })
   })
 })

@@ -214,12 +214,21 @@ export async function validateInstallCandidates({ repoDir: _repoDir, sourceRepo,
     }
     seenIds.add(candidate.id)
 
+    const manifest = {
+      ...candidate.manifest,
+      source: canonicalizeGitHubRepoUrl(sourceRepo),
+    }
+
+    parseExtensionManifest(
+      manifest,
+      candidate.id,
+      new Set(),
+      false,
+    )
+
     return {
       ...candidate,
-      manifest: {
-        ...candidate.manifest,
-        source: canonicalizeGitHubRepoUrl(sourceRepo),
-      },
+      manifest,
     }
   })
 

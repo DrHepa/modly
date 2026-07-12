@@ -47,15 +47,54 @@ import type {
 // ─── Extension types ──────────────────────────────────────────────────────────
 
 export type WorkflowNodeComponent = 'video-preview'
+export type ModelInputKind = ArtifactKind | 'none'
 
-export interface ExtensionNode {
+export interface HfDownloadFile {
+  path: string
+  sha256?: string
+}
+
+export interface HfDownloadDescriptor {
+  repoId: string
+  revision: string
+  targetSubdir: string
+  files: HfDownloadFile[]
+}
+
+export interface HttpsDownloadAsset {
+  url: string
+  filename: string
+  sizeBytes: number
+  sha256: string
+}
+
+export interface ModelDownloadFailure {
+  code: string
+  stage: string
+  message: string
+  repoId?: string
+  file?: string
+  retryable: boolean
+}
+
+export interface ModelDownloadResult {
+  success: boolean
+  error?: string
+  failure?: ModelDownloadFailure
+}
+
+export interface ExtensionNode<
+  TInput extends ModelInputKind = ModelInputKind,
+> {
   id:               string
   name:             string
-  input:            ArtifactKind
+  input:            TInput
   output:           ArtifactKind
   inputs?:          ProcessPort[]
   paramsSchema:     RawParamSchema[]
   hfRepo?:          string
+  hfDownloads?:     HfDownloadDescriptor[]
+  httpsDownloads?:  HttpsDownloadAsset[]
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
   capabilityId?:    string
@@ -102,6 +141,8 @@ export interface ModelOwnershipMetadata {
   weightOwnerId: string
   sharedOwner: boolean
   legacyPaths: string[]
+  hfDownloads?: HfDownloadDescriptor[]
+  httpsDownloads?: HttpsDownloadAsset[]
 }
 
 export interface ProcessPort {
@@ -128,8 +169,7 @@ export interface ModelExtension {
   trusted:      boolean
   builtin:      boolean
   source?:      string
-  localPath?:   string
-  nodes:        ExtensionNode[]
+  nodes:        ExtensionNode<ModelInputKind>[]
   workflowNodes?: ExtensionWorkflowNode[]
 }
 
@@ -231,7 +271,7 @@ export interface ProcessExtension {
   source?:      string
   localPath?:   string
   entry:        string
-  nodes:        ExtensionNode[]
+  nodes:        ExtensionNode<ArtifactKind>[]
   workflowNodes?: ExtensionWorkflowNode[]
 }
 
@@ -925,6 +965,7 @@ export interface AutomationModelCapability {
   source: 'backend-runtime'
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -1066,12 +1107,14 @@ declare global {
         listDownloaded: () => Promise<{ id: string; name: string; size_gb: number }[]>
         isDownloaded:   (modelId: string) => Promise<boolean>
         download:       (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<{ success: boolean; error?: string }>
-        delete:         (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
+        downloadAssets:      (modelId: string) => Promise<ModelDownloadResult>
+        downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
+        delete:              (modelId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
         runtimeReadiness: (modelIds: string[]) => Promise<RuntimeReadinessResponse>
         runtimeReadinessAction: (action: RuntimeReadinessAction) => Promise<RuntimeReadinessActionResult>
-        onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; status?: string }) => void) => void
+        onProgress:     (cb: (data: { capabilityId: string; modelId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }) => void) => void
         offProgress:    () => void
       }
       app: {

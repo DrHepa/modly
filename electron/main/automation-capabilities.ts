@@ -4,6 +4,14 @@ import { readFile, readdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
 import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
+import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest.ts'
+import {
+  normalizeHttpsDownloads,
+  type HttpsDownloadAsset,
+} from './https-download-manifest.ts'
+import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
+
+export type ModelInputKind = ArtifactKind | 'none'
 
 type AutomationCapabilityError = {
   source: 'backend-runtime' | 'electron-manifest'
@@ -18,6 +26,7 @@ type AutomationModelCapability = {
   source: 'backend-runtime'
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -117,6 +126,7 @@ export type AutomationCapabilitiesResponse = {
 type BackendModelStatus = {
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -198,12 +208,14 @@ export type ParsedManifest = {
   nodes?: {
     id: string
     name?: string
-    input?: ArtifactKind
+    input?: ModelInputKind
     output?: ArtifactKind
     inputs?: Array<ProcessPort | ProcessPortType>
     input_contract?: LegacyProcessPortContract[]
     params_schema?: unknown[]
     hf_repo?: string
+    hf_downloads?: unknown
+    https_downloads?: unknown
     download_check?: string
     hf_skip_prefixes?: string[]
     weight_owner_id?: string
@@ -221,14 +233,18 @@ export type ParsedManifest = {
   }[]
 }
 
-export type ListedExtensionNode = {
+export type ListedExtensionNode<
+  TInput extends ModelInputKind = ModelInputKind,
+> = {
   id: string
   name: string
-  input: ArtifactKind
+  input: TInput
   output: ArtifactKind
   inputs?: ProcessPort[]
   paramsSchema: unknown[]
   hfRepo?: string
+  hfDownloads?: HfDownloadDescriptor[]
+  httpsDownloads?: HttpsDownloadAsset[]
   downloadCheck?: string
   hfSkipPrefixes?: string[]
   capabilityId?: string
@@ -295,6 +311,10 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
 
 function isProcessPortType(value: unknown): value is ProcessPortType {
   return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+}
+
+function isModelInputKind(value: unknown): value is ModelInputKind {
+  return value === 'none' || isProcessPortType(value)
 }
 
 function isWorkflowNodeComponent(value: unknown): value is WorkflowNodeComponent {
@@ -371,7 +391,9 @@ function normalizeProcessPorts(
     .filter((input): input is ProcessPort => Boolean(input))
 }
 
-type ListedExtensionCommon = {
+type ListedExtensionCommon<
+  TInput extends ModelInputKind,
+> = {
   id: string
   name: string
   version?: string
@@ -380,15 +402,15 @@ type ListedExtensionCommon = {
   trusted: boolean
   builtin: boolean
   source?: string
-  nodes: ListedExtensionNode[]
+  nodes: ListedExtensionNode<TInput>[]
   workflowNodes?: ListedWorkflowNode[]
 }
 
-export type ListedModelExtension = ListedExtensionCommon & {
+export type ListedModelExtension = ListedExtensionCommon<ModelInputKind> & {
   type: 'model'
 }
 
-export type ListedProcessExtension = ListedExtensionCommon & {
+export type ListedProcessExtension = ListedExtensionCommon<ArtifactKind> & {
   type: 'process'
   entry: string
 }
@@ -414,7 +436,7 @@ export type CanonicalProcessTarget = {
   nodeId: string
   manifest: ParsedManifest
   extension: ListedProcessExtension
-  node: ListedExtensionNode
+  node: ListedExtensionNode<ArtifactKind>
   entry: string
   extDir: string
 }
@@ -436,13 +458,43 @@ function isTrustedSource(source: string | undefined, trustedRepos: Set<string>):
   return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
 }
 
+function normalizeExtensionNodeInput(
+  value: ModelInputKind | undefined,
+  extensionType: 'model' | 'process',
+  context: string,
+): ModelInputKind {
+  if (value !== undefined && !isModelInputKind(value)) {
+    throw new Error(
+      context + " must be one of: image, text, mesh, scene, audio, video, none",
+    )
+  }
+
+  if (value === 'none') {
+    if (extensionType === 'process') {
+      throw new Error(
+        context + " may use 'none' only for model extension nodes",
+      )
+    }
+    return 'none'
+  }
+
+  return value ?? 'image'
+}
+
 export function parseExtensionManifest(
   parsed: ParsedManifest,
   fallbackId: string,
   trustedRepos: Set<string>,
   builtin = false,
 ): ListedExtension {
-  const extensionId = parsed.id ?? fallbackId
+  const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
+  const extensionType = parsed.type === 'process' ? 'process' : 'model'
+  for (const node of parsed.nodes ?? []) {
+    assertSafeOwnershipSegment(node.id, 'Manifest node id')
+    if (node.weight_owner_id !== undefined) {
+      assertSafeOwnershipSegment(node.weight_owner_id, 'Manifest weight_owner_id')
+    }
+  }
   const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
 
   const common = {
@@ -474,7 +526,24 @@ export function parseExtensionManifest(
     const ownerId = node.weight_owner_id ?? node.id
     const weightOwnerId = `${extensionId}/${ownerId}`
     const legacyPaths = [...(legacyPathsByOwner.get(weightOwnerId) ?? [capabilityId])]
-    const hasModelAssets = Boolean(node.hf_repo || node.download_check || node.weight_owner_id)
+    const hfDownloads = normalizeHfDownloads(node.hf_downloads, `${capabilityId}.hf_downloads`)
+    const httpsDownloads = normalizeHttpsDownloads(
+      node.https_downloads,
+      capabilityId + '.https_downloads',
+    )
+    if (httpsDownloads && legacyPaths.length > 1) {
+      throw new Error(
+        capabilityId
+        + '.https_downloads requires a dedicated weight owner; structured HTTPS plans cannot share an owner',
+      )
+    }
+    const hasModelAssets = Boolean(
+      httpsDownloads
+      || hfDownloads
+      || node.hf_repo
+      || node.download_check
+      || node.weight_owner_id
+    )
     const modelOwnership = parsed.type !== 'process' || hasModelAssets
       ? {
           capabilityId,
@@ -492,11 +561,17 @@ export function parseExtensionManifest(
     return {
       id: node.id,
       name: node.name ?? node.id,
-      input: node.input ?? 'image' as const,
+      input: normalizeExtensionNodeInput(
+        node.input,
+        extensionType,
+        capabilityId + '.input',
+      ),
       output: node.output ?? 'mesh' as const,
       ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
       paramsSchema: node.params_schema ?? [],
       hfRepo: node.hf_repo,
+      ...(hfDownloads ? { hfDownloads } : {}),
+      ...(httpsDownloads ? { httpsDownloads } : {}),
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
       ...automationMetadata,
@@ -505,10 +580,19 @@ export function parseExtensionManifest(
   })
 
   if (parsed.type === 'process') {
-    return { ...common, type: 'process', entry: parsed.entry ?? 'processor.js', nodes }
+    return {
+      ...common,
+      type: 'process',
+      entry: parsed.entry ?? 'processor.js',
+      nodes: nodes as ListedExtensionNode<ArtifactKind>[],
+    }
   }
 
-  return { ...common, type: 'model', nodes }
+  return {
+    ...common,
+    type: 'model',
+    nodes: nodes as ListedExtensionNode<ModelInputKind>[],
+  }
 }
 
 async function readExtensionManifest(dir: string, extensionDirName: string): Promise<ParsedManifest | null> {
@@ -867,6 +951,7 @@ export async function getBackendModels(): Promise<{
           source: 'backend-runtime',
           id: status.id,
           name: status.name,
+          input: status.input,
           description: status.description,
           version: status.version,
           hf_repo: status.hf_repo,

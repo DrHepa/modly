@@ -1735,7 +1735,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         if (norm?.startsWith(workspaceDir)) {
           const outputUrl = `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
           if (workflow.edges.some((e) => e.source === node.id && addToWorldsNodeIds.has(e.target))) {
-            addWorkflowOutputUrlToWorlds(outputUrl)
+            await addWorkflowOutputUrlToWorlds(outputUrl, outputType)
           }
         }
       }

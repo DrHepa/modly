@@ -24,7 +24,7 @@ function stubViewerPlugin(): Plugin {
         contents: `
           import React from 'react'
           export function WorldsViewer(props) {
-            return <section aria-label="Worlds 3D canvas" data-items={props.items.length} data-selected={props.selectedItemId || ''} data-unsupported={(props.unsupportedItems || []).length}>Worlds canvas</section>
+            return <section aria-label="Worlds 3D canvas" data-items={props.items.length} data-selected={props.selectedItemId || ''} data-unsupported={(props.unsupportedItems || []).length} data-initial-view={(props.initialView?.position || []).join(',')}>Worlds canvas</section>
           }
           export default WorldsViewer
         `,
@@ -111,11 +111,13 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       selectedAssetId: 'fuse',
       selectedSceneItemId: 'world:Workflows/fuse.ply',
       selectedSceneItemIds: ['world:Workflows/fuse.ply'],
+      pendingSurfacePlacementItemId: null,
       collisionEditMode: false,
-      selectedCollisionZoneId: null,
+      selectedCollisionSurfaceId: null,
       transformMode: null,
       sceneItems: [asset('fuse', 'Fuse simplified').item],
-      collisionZones: [],
+      collisionSurfaces: [],
+      initialView: { position: [8, 5, 12], target: [0, 1, 0] },
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
@@ -137,13 +139,15 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onTransformSceneItems: () => undefined,
-      onAddCollisionZone: () => undefined,
+      onAddCollisionSurface: () => undefined,
       onCollisionEditModeChange: () => undefined,
-      onSelectCollisionZone: () => undefined,
-      onTransformCollisionZone: () => undefined,
-      onRemoveCollisionZone: () => undefined,
+      onSelectCollisionSurface: () => undefined,
+      onTransformCollisionSurface: () => undefined,
+      onRemoveCollisionSurface: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
+      onCommitPendingSurfacePlacement: () => undefined,
+      onClearPendingSurfacePlacement: () => undefined,
       onOpenSelected: () => undefined,
       onSaveScene: () => undefined,
       onImportScene: () => undefined,
@@ -156,6 +160,7 @@ test('WorldsPageView renders a dominant integrated canvas with compact selector 
     assert.match(markup, /Save scene/)
     assert.match(markup, /Import scene/)
     assert.match(markup, /z-20/)
+    assert.match(markup, /data-initial-view="8,5,12"/)
     assert.match(markup, /data-items="1"/)
     assert.doesNotMatch(markup, /<aside|page card|boxed|Metadata|Inspector|Raw|Schema|Provenance|Details/i)
   } finally {
@@ -173,11 +178,12 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       selectedAssetId: null,
       selectedSceneItemId: null,
       selectedSceneItemIds: [],
+      pendingSurfacePlacementItemId: null,
       collisionEditMode: false,
-      selectedCollisionZoneId: null,
+      selectedCollisionSurfaceId: null,
       transformMode: null,
       sceneItems: [],
-      collisionZones: [],
+      collisionSurfaces: [],
       unsupportedItems: [],
       loadingAssets: false,
       openingAsset: false,
@@ -199,13 +205,15 @@ test('WorldsPageView keeps empty guidance minimal and selector closed by default
       onTransformModeChange: () => undefined,
       onTransformSceneItem: () => undefined,
       onTransformSceneItems: () => undefined,
-      onAddCollisionZone: () => undefined,
+      onAddCollisionSurface: () => undefined,
       onCollisionEditModeChange: () => undefined,
-      onSelectCollisionZone: () => undefined,
-      onTransformCollisionZone: () => undefined,
-      onRemoveCollisionZone: () => undefined,
+      onSelectCollisionSurface: () => undefined,
+      onTransformCollisionSurface: () => undefined,
+      onRemoveCollisionSurface: () => undefined,
       onRemoveSceneItem: () => undefined,
       onToggleBaseSceneItem: () => undefined,
+      onCommitPendingSurfacePlacement: () => undefined,
+      onClearPendingSurfacePlacement: () => undefined,
       onOpenSelected: () => undefined,
       onSaveScene: () => undefined,
       onImportScene: () => undefined,
@@ -226,6 +234,17 @@ test('WorldsPage does not automatically close the selector after opening an asse
   const source = await readFile(pageEntry, 'utf8')
 
   assert.doesNotMatch(source, /setUnsupportedItems\(\[\]\)\s*setSelectorOpen\(false\)/)
+})
+
+test('WorldsPage normalizes malformed asset-library assets payloads before any .some access', async () => {
+  const { module, cleanup } = await loadPageModule()
+
+  try {
+    assert.equal(module.normalizeWorldAssetLibraryAssets(undefined), null)
+    assert.deepEqual(module.normalizeWorldAssetLibraryAssets([]), [])
+  } finally {
+    await cleanup()
+  }
 })
 
 test('WorldsPage appends opened assets with unique scene ids, deterministic offsets, and selects the newest item', async () => {
@@ -267,6 +286,9 @@ test('WorldsPage places new assets relative to existing base worlds using transf
     assert.deepEqual(module.appendWorldSceneItem([base], prop).sceneItems[1].transform.position, [11.75, 0, -4])
     assert.deepEqual(module.appendWorldSceneItem([base, secondBase], prop).sceneItems[2].transform.position, [13.75, 0, -2])
     assert.deepEqual(module.appendWorldSceneItem([base], prop, { sceneItemAnchors: { [base.id]: [40, 2, -20] } }).sceneItems[1].transform.position, [41.75, 2, -20])
+    assert.equal(module.shouldPendingWorldsSurfacePlacement([base], prop), true)
+    assert.equal(module.shouldPendingWorldsSurfacePlacement([base], { ...prop, role: 'base-scene' }), false)
+    assert.equal(module.shouldPendingWorldsSurfacePlacement([prop], prop), false)
     assert.deepEqual(module.toggleWorldSceneItemBaseRole([prop], prop.id)[0].role, 'base-scene')
     assert.deepEqual(module.toggleWorldSceneItemBaseRole([{ ...prop, role: 'base-scene' }], prop.id)[0].role, 'asset')
   } finally {
@@ -366,76 +388,56 @@ test('WorldsPage exposes a batched multi-item transform callback through the vie
   assert.match(source, /selectedSceneItemIds: state\.selectedSceneItemIds/)
 })
 
-test('WorldsPage keeps collision edit state separate from scene selection and wires collision helpers through the viewer contract', async () => {
+test('WorldsPage keeps collision edit state separate from scene selection and wires collision surface helpers through the viewer contract', async () => {
   const { module, cleanup } = await loadPageModule()
   const source = await readFile(pageEntry, 'utf8')
 
   try {
     const hero = asset('hero', 'Hero').item
-    assert.deepEqual(module.resolveWorldCollisionZonePlacementAnchor([], [hero], { selectedSceneItemId: hero.id }), [0, 0, 0])
+    assert.deepEqual(module.resolveWorldCollisionSurfacePlacementTransform([], [hero], { selectedSceneItemId: hero.id }), {
+      position: [0, 0, 0],
+    })
     assert.equal(source.includes('collisionEditMode = useWorldsSceneStore((state) => state.collisionEditMode)'), true)
-    assert.equal(source.includes('selectedCollisionZoneId = useWorldsSceneStore((state) => state.selectedCollisionZoneId)'), true)
-    assert.equal(source.includes('collisionZones = useWorldsSceneStore((state) => state.collisionZones)'), true)
-    assert.equal(source.includes('addWorldCollisionZone'), true)
-    assert.equal(source.includes('updateWorldCollisionZoneTransform'), true)
-    assert.equal(source.includes('removeWorldCollisionZone'), true)
-    assert.equal(source.includes('onAddCollisionZone={onAddCollisionZone}'), true)
+    assert.equal(source.includes('selectedCollisionSurfaceId = useWorldsSceneStore((state) => state.selectedCollisionSurfaceId)'), true)
+    assert.equal(source.includes('collisionSurfaces = useWorldsSceneStore((state) => state.collisionSurfaces)'), true)
+    assert.equal(source.includes('addWorldCollisionSurface'), true)
+    assert.equal(source.includes('updateWorldCollisionSurfaceTransform'), true)
+    assert.equal(source.includes('removeWorldCollisionSurface'), true)
+    assert.equal(source.includes('onAddCollisionSurface={onAddCollisionSurface}'), true)
     assert.equal(source.includes('onCollisionEditModeChange={onCollisionEditModeChange}'), true)
     assert.equal(source.includes('setCollisionEditMode(true)'), true)
-    assert.equal(source.includes('onSelectCollisionZone={setSelectedCollisionZoneId}'), true)
-    assert.equal(source.includes('collisionZones: updateWorldCollisionZoneTransform(state.collisionZones, zoneId, transform)'), true)
+    assert.equal(source.includes('onSelectCollisionSurface={setSelectedCollisionSurfaceId}'), true)
+    assert.equal(source.includes('collisionSurfaces: updateWorldCollisionSurfaceTransform(state.collisionSurfaces, surfaceId, transform)'), true)
   } finally {
     await cleanup()
   }
 })
 
-test('WorldsPage creates preset collision zones enabled by default and selects the new zone id', async () => {
-  const { module, cleanup } = await loadPageModule()
+test('WorldsPage adds preset collision surfaces, enters edit mode, and selects the new surface id', async () => {
+  const source = await readFile(pageEntry, 'utf8')
+  const toolbarSource = await readFile(toolbarEntry, 'utf8')
 
-  try {
-    assert.deepEqual(module.addWorldCollisionZone([], 'blocker', { anchorPosition: [1, 2, 3] }), {
-      collisionZones: [{
-        id: 'collision-box-1',
-        label: 'Blocker 1',
-        shape: 'box',
-        preset: 'blocker',
-        transform: {
-          position: [1, 2, 3],
-          rotation: [0, 0, 0],
-          scale: [1.2, 1.2, 1.2],
-        },
-      }],
-      selectedCollisionZoneId: 'collision-box-1',
-    })
-
-    assert.deepEqual(module.addWorldCollisionZone([], 'wall', { anchorPosition: [0, 0, 0] }), {
-      collisionZones: [{
-        id: 'collision-box-1',
-        label: 'Wall 1',
-        shape: 'box',
-        preset: 'wall',
-        transform: {
-          position: [0, 0, 0],
-          rotation: [0, 0, 0],
-          scale: [2.4, 2.4, 0.2],
-        },
-      }],
-      selectedCollisionZoneId: 'collision-box-1',
-    })
-  } finally {
-    await cleanup()
-  }
+  assert.equal(source.includes('const next = addWorldCollisionSurface(state.collisionSurfaces, preset,'), true)
+  assert.equal(source.includes('setCollisionEditMode(true)'), true)
+  assert.equal(source.includes('setSelectedCollisionSurfaceId(next.selectedSurfaceId)'), true)
+  assert.equal(toolbarSource.includes("{ value: 'rectangle', label: 'Rectangle' }"), true)
+  assert.equal(toolbarSource.includes("{ value: 'square', label: 'Square' }"), true)
+  assert.equal(toolbarSource.includes("{ value: 'triangle', label: 'Triangle' }"), true)
+  assert.equal(toolbarSource.includes("{ value: 'wall', label: 'Wall' }"), true)
+  assert.equal(toolbarSource.includes("{ value: 'floor', label: 'Floor' }"), true)
+  assert.equal(toolbarSource.includes("{ value: 'ramp', label: 'Ramp' }"), true)
 })
 
 test('Worlds scene store can switch the active item without collapsing an existing multi-selection', () => {
   const store = useWorldsSceneStore.getState()
   useWorldsSceneStore.setState({
     sceneItems: [asset('a', 'A').item, asset('b', 'B').item],
-    collisionZones: [],
+    collisionSurfaces: [],
     selectedSceneItemId: 'world:b',
     selectedSceneItemIds: ['world:a', 'world:b'],
+    pendingSurfacePlacementItemId: null,
     collisionEditMode: false,
-    selectedCollisionZoneId: null,
+    selectedCollisionSurfaceId: null,
     transformMode: 'translate',
     sceneItemAnchors: {},
   })
@@ -447,32 +449,36 @@ test('Worlds scene store can switch the active item without collapsing an existi
   } finally {
     useWorldsSceneStore.setState({
       sceneItems: [],
-      collisionZones: [],
+      collisionSurfaces: [],
       selectedSceneItemId: null,
       selectedSceneItemIds: [],
+      pendingSurfacePlacementItemId: null,
       collisionEditMode: false,
-      selectedCollisionZoneId: null,
+      selectedCollisionSurfaceId: null,
       transformMode: null,
       sceneItemAnchors: {},
     })
   }
 })
 
-test('Worlds scene store clears the selected collision zone when an asset becomes active', () => {
+test('Worlds scene store clears the selected collision surface when an asset becomes active', () => {
   const store = useWorldsSceneStore.getState()
   useWorldsSceneStore.setState({
     sceneItems: [asset('a', 'A').item, asset('b', 'B').item],
-    collisionZones: [{
-      id: 'zone-1',
-      label: 'Zone 1',
-      shape: 'box',
-      preset: 'blocker',
+    collisionSurfaces: [{
+      id: 'surface-1',
+      label: 'Surface 1',
+      shape: 'rect',
+      preset: 'rectangle',
+      sidedness: 'double',
+      geometry: { halfWidth: 1, halfHeight: 1 },
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
     }],
     selectedSceneItemId: null,
     selectedSceneItemIds: [],
+    pendingSurfacePlacementItemId: null,
     collisionEditMode: true,
-    selectedCollisionZoneId: 'zone-1',
+    selectedCollisionSurfaceId: 'surface-1',
     transformMode: 'translate',
     sceneItemAnchors: {},
   })
@@ -481,46 +487,150 @@ test('Worlds scene store clears the selected collision zone when an asset become
     store.setSelectedSceneItemId('world:a')
     assert.equal(useWorldsSceneStore.getState().selectedSceneItemId, 'world:a')
     assert.deepEqual(useWorldsSceneStore.getState().selectedSceneItemIds, ['world:a'])
-    assert.equal(useWorldsSceneStore.getState().selectedCollisionZoneId, null)
+    assert.equal(useWorldsSceneStore.getState().selectedCollisionSurfaceId, null)
     assert.equal(useWorldsSceneStore.getState().collisionEditMode, true)
   } finally {
     useWorldsSceneStore.setState({
       sceneItems: [],
-      collisionZones: [],
+      collisionSurfaces: [],
       selectedSceneItemId: null,
       selectedSceneItemIds: [],
+      pendingSurfacePlacementItemId: null,
       collisionEditMode: false,
-      selectedCollisionZoneId: null,
+      selectedCollisionSurfaceId: null,
       transformMode: null,
       sceneItemAnchors: {},
     })
   }
 })
 
-test('WorldsTransformToolbar falls back to asset transforms when collision edit mode is visible but no zone is selected', async () => {
+test('Worlds scene store keeps pending placement transient, clears removals, and page import/add flows wire pending callbacks', async () => {
+  const source = await readFile(pageEntry, 'utf8')
+  const store = useWorldsSceneStore.getState()
+  const base = { ...asset('base', 'Base').item, role: 'base-scene' as const }
+  const pending = asset('pending', 'Pending').item
+
+  useWorldsSceneStore.setState({
+    sceneItems: [base, pending],
+    collisionSurfaces: [],
+    selectedSceneItemId: pending.id,
+    selectedSceneItemIds: [pending.id],
+    pendingSurfacePlacementItemId: null,
+    collisionEditMode: false,
+    selectedCollisionSurfaceId: null,
+    transformMode: null,
+    sceneItemAnchors: {},
+  })
+
+  try {
+    store.setPendingSurfacePlacementItemId(pending.id)
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, pending.id)
+
+    store.clearPendingSurfacePlacementItemId()
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, null)
+
+    store.setPendingSurfacePlacementItemId(pending.id)
+    store.setScene({
+      sceneItems: [base],
+      collisionSurfaces: [],
+      selectedSceneItemId: base.id,
+      selectedSceneItemIds: [base.id],
+    })
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, null)
+
+    assert.equal(source.includes('pendingSurfacePlacementItemId={pendingSurfacePlacementItemId}'), true)
+    assert.equal(source.includes('onCommitPendingSurfacePlacement={onCommitPendingSurfacePlacement}'), true)
+    assert.equal(source.includes('onClearPendingSurfacePlacement={onClearPendingSurfacePlacement}'), true)
+    assert.equal(source.includes('pendingSurfacePlacementItemId: shouldPendingWorldsSurfacePlacement(sceneState.sceneItems, result.asset.item)'), true)
+    assert.equal(source.includes('pendingSurfacePlacementItemId: shouldPendingWorldsSurfacePlacement(sceneState.sceneItems, asset.linkedItem)'), true)
+    assert.equal(source.includes('pendingSurfacePlacementItemId: null'), true)
+  } finally {
+    useWorldsSceneStore.setState({
+      sceneItems: [],
+      collisionSurfaces: [],
+      selectedSceneItemId: null,
+      selectedSceneItemIds: [],
+      pendingSurfacePlacementItemId: null,
+      collisionEditMode: false,
+      selectedCollisionSurfaceId: null,
+      transformMode: null,
+      sceneItemAnchors: {},
+    })
+  }
+})
+
+test('Worlds scene store never keeps a base-scene item pending for surface placement', () => {
+  const store = useWorldsSceneStore.getState()
+  const base = { ...asset('base', 'Base').item, role: 'base-scene' as const }
+  const prop = asset('prop', 'Prop').item
+
+  useWorldsSceneStore.setState({
+    sceneItems: [base, prop],
+    collisionSurfaces: [],
+    selectedSceneItemId: prop.id,
+    selectedSceneItemIds: [prop.id],
+    pendingSurfacePlacementItemId: null,
+    collisionEditMode: false,
+    selectedCollisionSurfaceId: null,
+    transformMode: null,
+    sceneItemAnchors: {},
+  })
+
+  try {
+    store.setPendingSurfacePlacementItemId(base.id)
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, null)
+
+    store.setPendingSurfacePlacementItemId(prop.id)
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, prop.id)
+
+    store.setScene({
+      sceneItems: [{ ...base, role: 'asset' }, { ...prop, role: 'base-scene' }],
+      collisionSurfaces: [],
+      selectedSceneItemId: prop.id,
+      selectedSceneItemIds: [prop.id],
+    })
+    assert.equal(useWorldsSceneStore.getState().pendingSurfacePlacementItemId, null)
+  } finally {
+    useWorldsSceneStore.setState({
+      sceneItems: [],
+      collisionSurfaces: [],
+      selectedSceneItemId: null,
+      selectedSceneItemIds: [],
+      pendingSurfacePlacementItemId: null,
+      collisionEditMode: false,
+      selectedCollisionSurfaceId: null,
+      transformMode: null,
+      sceneItemAnchors: {},
+    })
+  }
+})
+
+test('WorldsTransformToolbar falls back to asset transforms when collision edit mode is visible but no surface is selected', async () => {
   const { module, cleanup } = await loadToolbarModule()
 
   try {
     assert.equal(module.resolveWorldsTransformToolbarTarget({
       collisionEditMode: true,
       selectedItem: asset('asset', 'Asset').item,
-      selectedCollisionZone: null,
+      selectedCollisionSurface: null,
     }), 'asset')
     assert.equal(module.resolveWorldsTransformToolbarTarget({
       collisionEditMode: true,
       selectedItem: asset('asset', 'Asset').item,
-      selectedCollisionZone: {
-        id: 'zone-1',
-        label: 'Zone 1',
-        shape: 'box',
-        preset: 'blocker',
+      selectedCollisionSurface: {
+        id: 'surface-1',
+        label: 'Surface 1',
+        shape: 'rect',
+        preset: 'rectangle',
+        sidedness: 'double',
+        geometry: { halfWidth: 1, halfHeight: 1 },
         transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
       },
-    }), 'collision-zone')
+    }), 'collision-surface')
     assert.equal(module.resolveWorldsTransformToolbarTarget({
       collisionEditMode: true,
       selectedItem: null,
-      selectedCollisionZone: null,
+      selectedCollisionSurface: null,
     }), 'none')
   } finally {
     await cleanup()
@@ -553,6 +663,16 @@ test('Worlds scene store normalizes multi-selection to visible scene items and p
     [visible.id],
   )
   assert.deepEqual(normalizeWorldsSelectedSceneItemIds([visible], visible.id, []), [visible.id])
+})
+
+test('WorldsPage carries imported manifest initial views into the viewer and preserved scene saves', async () => {
+  const source = await readFile(pageEntry, 'utf8')
+
+  assert.equal(source.includes('const initialView = useWorldsSceneStore((state) => state.initialView)'), true)
+  assert.equal(source.includes('initialView: parsed.manifest.initialView ?? null'), true)
+  assert.equal(source.includes('initialView={initialView ?? undefined}'), true)
+  assert.equal(source.includes('initialView: sceneState.initialView ?? undefined'), true)
+  assert.doesNotMatch(source, /setSceneInitialView|sceneInitialView/)
 })
 
 test('WorldsPage keeps composed scene state in the Worlds store for tab navigation and rapid asset opens', async () => {

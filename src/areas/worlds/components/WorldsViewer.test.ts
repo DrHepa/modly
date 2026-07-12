@@ -10,6 +10,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import * as THREE from 'three'
 
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import { normalizeWorldSceneCollisionSurfaces } from '../worldCameraNavigation.ts'
+import { createWorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const worldsRoot = path.join(projectRoot, 'src/areas/worlds')
@@ -244,6 +246,39 @@ test('WorldsViewer routes GLB and GLTF scene items through the GLTF render targe
   }
 })
 
+test('WorldsViewer keeps Gaussian PLY experimental, disabled by default, and lazily loaded', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  try {
+    const gaussianItem = item('gaussian-ply', 'workflows/gaussian.ply')
+
+    assert.deepEqual(module.getWorldSceneItemRenderTarget(gaussianItem), {
+      workspacePath: 'workflows/gaussian.ply',
+      kind: 'gaussian-ply',
+      loader: 'gaussian-ply',
+      primitive: 'gaussian-splats',
+      cameraFit: 'bounds',
+      visibleDescription: 'Gaussian PLY splats',
+    })
+    assert.deepEqual(module.describeWorldsViewerScene([gaussianItem]).renderTargets, [{
+      workspacePath: 'workflows/gaussian.ply',
+      kind: 'gaussian-ply',
+      loader: 'gaussian-ply',
+      primitive: 'gaussian-splats',
+      cameraFit: 'bounds',
+      visibleDescription: 'Gaussian PLY splats',
+    }])
+    assert.equal(viewerSource.includes("import { WorldsGaussianPlyObject } from './WorldsGaussianPlyObject.tsx'"), false)
+    assert.equal(viewerSource.includes("const module = await import('./WorldsGaussianPlyObject.tsx')"), true)
+    assert.equal(viewerSource.includes("item.kind === 'gaussian-ply'"), true)
+    assert.equal(viewerSource.includes('isWorldsGaussianPlyEnabled'), true)
+    assert.equal(viewerSource.includes('if (!isWorldsGaussianPlyEnabled()) return null'), true)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('WorldsViewer keeps camera navigation state local with pan zoom look and keyboard controls', async () => {
   const { source, module, cleanup } = await loadViewerModule()
   const viewerSource = await readFile(viewerEntry, 'utf8')
@@ -257,6 +292,7 @@ test('WorldsViewer keeps camera navigation state local with pan zoom look and ke
     assert.equal(viewerSource.includes('useState(() => createWorldsCameraState())'), true)
     assert.equal(source.includes('WorldsKeyboardCameraControls'), true)
     assert.equal(source.includes('WorldsMouseLookCameraControls'), true)
+    assert.equal(source.includes('WorldsCameraCollisionController'), false)
     assert.equal(source.includes('WorldsFlyCameraControls'), false)
     assert.equal(viewerSource.includes("enabled={cameraState.mode === 'orbit'}"), false)
     assert.equal(viewerSource.includes("enabled={cameraState.mode === 'fly'}"), false)
@@ -265,6 +301,10 @@ test('WorldsViewer keeps camera navigation state local with pan zoom look and ke
     assert.equal(viewerSource.includes('makeDefault'), true)
     assert.equal(viewerSource.includes('enableDamping'), true)
     assert.equal(viewerSource.includes('enableRotate={WORLD_VIEWER_ORBIT_CONTROLS.enableRotate}'), true)
+    assert.equal(viewerSource.includes('cameraCollisionSyncRef'), false)
+    assert.equal(viewerSource.includes('<WorldsCameraCollisionController'), false)
+    assert.equal(viewerSource.indexOf('<OrbitControls') < viewerSource.indexOf('<WorldsKeyboardCameraControls'), true)
+    assert.equal(viewerSource.indexOf('<WorldsKeyboardCameraControls') < viewerSource.indexOf('<WorldsMouseLookCameraControls'), true)
     assert.equal(viewerSource.includes('WorldSceneItem') && viewerSource.includes('cameraState:'), false)
   } finally {
     await cleanup()
@@ -300,17 +340,20 @@ test('WorldsKeyboardCameraControls uses scoped key refs, useFrame movement, and 
     assert.equal(keyboardControlsSource.includes('useFrame('), true)
     assert.equal(keyboardControlsSource.includes('shouldHandleWorldCameraKeyInput'), true)
     assert.equal(keyboardControlsSource.includes('updateWorldsMovementKeys'), true)
-    assert.equal(keyboardControlsSource.includes('deriveWorldsMovementVector'), true)
+    assert.equal(keyboardControlsSource.includes('applyWorldsKeyboardCameraPose'), true)
     assert.equal(keyboardControlsSource.includes("isWorldCameraRotationKey(code: string): code is 'KeyQ' | 'KeyE'"), true)
     assert.equal(keyboardControlsSource.includes("rotationKeysRef.current = updateWorldsRotationKeys(rotationKeysRef.current, event.code, true)"), true)
-    assert.equal(keyboardControlsSource.includes('rotateWorldsCameraYawTarget'), true)
-    assert.equal(keyboardControlsSource.includes('camera.getWorldDirection(lookDirectionVector)'), true)
-    assert.equal(keyboardControlsSource.includes('orbitControlsRef.current.target.copy(rotateWorldsCameraYawTarget({'), true)
+    assert.equal(keyboardControlsSource.includes('rotateWorldsCameraYawTarget'), false)
+    assert.equal(keyboardControlsSource.includes('camera.getWorldDirection(lookDirectionVector)'), false)
+    assert.equal(keyboardControlsSource.includes('applyWorldsKeyboardCameraPose({'), true)
     assert.equal(keyboardControlsSource.includes('camera.position.copy(orbitControlsRef.current.target).add('), false)
     assert.equal(keyboardControlsSource.includes('orbitOffsetVector.copy(camera.position).sub(orbitControlsRef.current.target)'), false)
     assert.equal(keyboardControlsSource.includes('activeElement: document.activeElement'), true)
-    assert.equal(keyboardControlsSource.includes('orbitControlsRef.current?.target.add(scaledMovementVector)'), true)
-    assert.equal(keyboardControlsSource.includes('orbitControlsRef.current?.update()'), true)
+    assert.equal(keyboardControlsSource.includes('resolveWorldCollisionProbeTranslation({'), false)
+    assert.equal(keyboardControlsSource.includes('camera.position.set(nextPose.cameraPosition.x'), true)
+    assert.equal(keyboardControlsSource.includes('controls.target.set(nextPose.target.x'), true)
+    assert.equal(keyboardControlsSource.includes('controls.update()'), true)
+    assert.equal(keyboardControlsSource.includes('poseSyncRef?.current?.syncCurrentPose()'), false)
     assert.equal(viewerSource.includes('ref={orbitControlsRef}'), true)
     assert.equal(viewerSource.includes('enabled={cameraState.mode === \'fly\'}'), false)
     assert.equal(viewerSource.includes('enabled={!cameraState.pointerLocked}'), false)
@@ -344,6 +387,7 @@ test('WorldsMouseLookCameraControls handles only left-drag look without pointer 
     assert.equal(mouseLookControlsSource.includes('if (dragDistance < LOOK_DRAG_START_THRESHOLD_PX) return'), true)
     assert.equal(mouseLookControlsSource.includes('camera.quaternion.setFromEuler'), true)
     assert.equal(mouseLookControlsSource.includes('controls.target.copy'), true)
+    assert.equal(mouseLookControlsSource.includes('poseSyncRef?.current?.syncCurrentPose()'), false)
     assert.equal(mouseLookControlsSource.includes('WORLD_CAMERA_LOOK_PITCH_LIMIT'), true)
     assert.equal(viewerSource.includes('enableRotate: false'), true)
     assert.equal(viewerSource.includes('<WorldsMouseLookCameraControls'), true)
@@ -391,22 +435,21 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     })
     assert.equal(viewerSource.includes('WorldsTransformToolbar'), true)
     assert.equal(viewerSource.includes('items={visibleItems}'), true)
-    assert.equal(viewerSource.includes('collisionZones={collisionZones}'), true)
+    assert.equal(viewerSource.includes('const resolvedCollisionSurfaces = useMemo('), true)
+    assert.equal(viewerSource.includes('collisionSurfaces={resolvedCollisionSurfaces}'), true)
     assert.equal(viewerSource.includes('collisionEditMode={collisionEditMode}'), true)
-    assert.equal(viewerSource.includes('selectedCollisionZoneId={selectedCollisionZoneId}'), true)
-    assert.equal(viewerSource.includes('selectedItemIds={selectedItemIds}'), true)
-    assert.equal(viewerSource.includes('onAddCollisionZone={onAddCollisionZone}'), true)
+    assert.equal(viewerSource.includes('selectedCollisionSurfaceId={selectedCollisionSurfaceId}'), true)
+    assert.equal(viewerSource.includes('selectedItemIds={normalizedSelectedItemIds}'), true)
+    assert.equal(viewerSource.includes('onAddCollisionSurface={onAddCollisionSurface}'), true)
     assert.equal(viewerSource.includes('onCollisionEditModeChange={onCollisionEditModeChange}'), true)
-    assert.equal(viewerSource.includes('onSelectCollisionZone={onSelectCollisionZone}'), true)
-    assert.equal(viewerSource.includes('const selectCollisionZoneFromCanvas = useCallback((zoneId: string | null) => {'), true)
-    assert.equal(viewerSource.includes('onSelectCollisionZone(zoneId)'), true)
-    assert.equal(viewerSource.includes('function WorldCollisionZoneLayer({'), true)
-    assert.equal(viewerSource.includes('rotation={zone.transform.rotation}'), true)
-    assert.equal(viewerSource.includes('onTransformCollisionZone,'), true)
-    assert.equal(viewerSource.includes('onTransformCollisionZone(zone.id, {'), true)
+    assert.equal(viewerSource.includes('onSelectCollisionSurface={onSelectCollisionSurface}'), true)
+    assert.equal(viewerSource.includes('const selectCollisionSurfaceFromCanvas = useCallback((surfaceId: string | null) => {'), true)
+    assert.equal(viewerSource.includes('onSelectCollisionSurface(surfaceId)'), true)
+    assert.equal(viewerSource.includes('WorldCollisionSurfaceLayer'), true)
+    assert.equal(viewerSource.includes('onTransformSurface={onTransformCollisionSurface}'), true)
     assert.equal(viewerSource.includes('const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id))'), true)
     assert.equal(viewerSource.includes('onRemoveItem={onRemoveItem}'), true)
-    assert.equal(viewerSource.includes('onRemoveCollisionZone={onRemoveCollisionZone}'), true)
+    assert.equal(viewerSource.includes('onRemoveCollisionSurface={onRemoveCollisionSurface}'), true)
     assert.equal(viewerSource.includes('onToggleBaseSceneItem={onToggleBaseSceneItem}'), true)
     assert.equal(viewerSource.includes('onSceneItemAnchorChange={onSceneItemAnchorChange}'), true)
     assert.equal(viewerSource.includes('setFocusRequest'), true)
@@ -419,17 +462,26 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('Date.now() < suppressSelectionUntilRef.current'), true)
     assert.equal(viewerSource.includes('selectedItems={selectedItems}'), true)
     assert.equal(viewerSource.includes('onTransformItems={onTransformItems}'), true)
-    assert.equal(viewerSource.includes('onTransformCollisionZone={onTransformCollisionZone}'), true)
+    assert.equal(viewerSource.includes('onTransformCollisionSurface = () => undefined'), true)
     assert.equal(viewerSource.includes('createWorldSceneSelectionTransformUpdates'), true)
-    assert.equal(viewerSource.includes('const transformSnapshotRef = useRef<WorldSceneTransformSnapshot[] | null>(null)'), true)
-    assert.equal(viewerSource.includes('transformSnapshotRef.current = selectedItems.map((item) => ({'), true)
+    assert.equal(viewerSource.includes('const dragSessionRef = useRef<{'), true)
+    assert.equal(viewerSource.includes('lastValidTransforms: WorldSceneItemTransformUpdate[]'), true)
+    assert.equal(viewerSource.includes('localBoundsByItemId: Map<string, WorldsCollisionBounds | null>'), true)
+    assert.equal(viewerSource.includes('const sceneItemLocalBoundsRef = useRef(new Map<string, WorldsCollisionBounds | null>())'), true)
+    assert.equal(viewerSource.includes("import { resolveWorldsSurfacePlacement } from '../worldsSurfacePlacement.ts'"), true)
+    assert.equal(viewerSource.includes('export function resolveWorldsTransformPreview({'), true)
     assert.equal(viewerSource.includes('export function isWorldsBatchTransformSnapshot(snapshot: WorldSceneTransformSnapshot[] | null)'), true)
     assert.equal(viewerSource.includes('if (!shouldResetWorldsTransformSnapshot(draggingRef.current)) return'), true)
-    assert.equal(viewerSource.includes('if (!isWorldsBatchTransformSnapshot(snapshot))'), true)
-    assert.equal(viewerSource.includes('onTransformItems(createWorldSceneSelectionTransformUpdates({'), true)
+    assert.equal(viewerSource.includes('collisionSafe: true'), true)
+    assert.equal(viewerSource.includes('collisionSafe: false'), true)
+    assert.equal(viewerSource.includes('session.lastValidTransforms = preview.updates.map(cloneTransformUpdate)'), true)
     assert.equal(viewerSource.includes('takeSnapshot()'), true)
     assert.equal(viewerSource.includes('onDragEndSelectionBlock={handleTransformDragEnd}'), true)
     assert.equal(viewerSource.includes('onDragEndSelectionBlock()'), true)
+    assert.equal(viewerSource.includes('previewTransform()'), true)
+    assert.equal(viewerSource.includes('commitTransform()'), true)
+    assert.equal(viewerSource.includes('collisionSurfaces={resolvedCollisionSurfaces}'), true)
+    assert.equal(viewerSource.includes('collisionSurfaces: [...collisionSurfaces]'), true)
     assert.equal(viewerSource.includes('resolveWorldsSceneItemIdFromIntersections'), true)
     assert.equal(viewerSource.includes('onDoubleClick={handleDoubleClick}'), true)
     assert.equal(viewerSource.includes('<SceneFocusController'), true)
@@ -442,7 +494,7 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('autoClear={false}'), false)
     assert.equal(viewerSource.includes('WorldsSelectionSilhouette'), true)
     assert.equal(viewerSource.includes('selectedSceneObjects.secondaryObjects.map'), true)
-    assert.equal(viewerSource.includes('resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, selectedItemIds, selectedItemId)'), true)
+    assert.equal(viewerSource.includes('resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, normalizedSelectedItemIds, selectedItemId)'), true)
     assert.equal(viewerSource.includes('WORLD_SELECTION_SECONDARY_SILHOUETTE_COLOR'), true)
     assert.equal(viewerSource.includes('WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR'), true)
     assert.equal(viewerSource.includes('THREE.BackSide'), true)
@@ -458,11 +510,7 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('material.side = THREE.DoubleSide'), true)
     assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
-    assert.equal(viewerSource.includes('WorldCollisionZoneLayer'), true)
-    assert.equal(viewerSource.includes('worldsCollisionZone'), true)
-    assert.equal(viewerSource.includes('onClick={(event) => {'), true)
-    assert.equal(viewerSource.includes('event.stopPropagation()'), true)
-    assert.equal(viewerSource.includes('onSelectCollisionZone(zone.id)'), true)
+    assert.equal(viewerSource.includes('worldsCollisionSurface'), true)
     assert.equal(viewerSource.includes('onSelect()'), false)
     assert.equal(viewerSource.includes('calculateWorldsSelectionBounds'), true)
     assert.equal(viewerSource.includes('measureWorldsObjectBounds'), true)
@@ -492,6 +540,401 @@ test('WorldsViewer keeps batch transform snapshots alive during drag and only ba
   } finally {
     await cleanup()
   }
+})
+
+test('WorldsViewer resolves floor wall and ramp previews through planar surface placement', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const floor = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('floor', {
+      id: 'floor',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const floorPreview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0.7, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0, 0.7, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: floor,
+    })
+
+    assert.equal(floorPreview.valid, true)
+    assert.equal(floorPreview.reason, 'snapped')
+    assert.equal(floorPreview.snappedSurfaceId, 'floor')
+    assert.equal(floorPreview.collisionSafe, true)
+    assert.ok(Math.abs(floorPreview.updates[0]!.transform.position[1] - 0.5001) < 5e-4)
+
+    const wall = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('wall', {
+      id: 'wall',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const wallPreview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0, -0.75], rotation: [0, 0.25, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0, 0, -0.75], rotation: [0, 0.25, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: wall,
+    })
+
+    assert.equal(wallPreview.valid, true)
+    assert.equal(wallPreview.reason, 'snapped')
+    assert.equal(wallPreview.snappedSurfaceId, 'wall')
+    assert.ok(wallPreview.updates[0]!.transform.position[2] > -0.76)
+    assert.ok(wallPreview.updates[0]!.transform.position[2] < -0.45)
+    assert.equal(wallPreview.updates[0]?.transform.rotation[1], 0.25)
+
+    const ramp = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('ramp', {
+      id: 'ramp',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const rampPreview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 1, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0, 1, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: ramp,
+    })
+
+    assert.equal(rampPreview.valid, true)
+    assert.equal(rampPreview.reason, 'snapped')
+    assert.equal(rampPreview.snappedSurfaceId, 'ramp')
+    assert.ok(Math.abs(rampPreview.correctionDelta[1]) > 0.05)
+    assert.ok(Math.abs(rampPreview.correctionDelta[2]) > 0.05)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer snaps translate previews to base-scene mesh support within drag threshold', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const active = item('glb', 'active.glb')
+    active.id = 'active'
+    const base = item('glb', 'base.glb')
+    base.id = 'base'
+    base.role = 'base-scene'
+    const preview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: [],
+      sceneItems: [active, base],
+      sceneObjects: new Map([
+        ['base', createRootWithMesh(createTriangleMesh([
+          [0, 0, 0],
+          [2, 0, 0],
+          [0, 0, 2],
+        ]))],
+      ]),
+    })
+
+    assert.equal(preview.valid, true)
+    assert.equal(preview.reason, 'snapped')
+    assert.ok(Math.abs(preview.updates[0]!.transform.position[1] - 0.5001) < 5e-4)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer keeps translate previews unchanged when base support exceeds the drag snap threshold', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const active = item('glb', 'active.glb')
+    active.id = 'active'
+    const base = item('glb', 'base.glb')
+    base.id = 'base'
+    base.role = 'base-scene'
+    const preview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0.25, 1.2, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0.25, 1.2, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: [],
+      sceneItems: [active, base],
+      sceneObjects: new Map([
+        ['base', createRootWithMesh(createTriangleMesh([
+          [0, 0, 0],
+          [2, 0, 0],
+          [0, 0, 2],
+        ]))],
+      ]),
+    })
+
+    assert.equal(preview.valid, true)
+    assert.equal(preview.reason, 'free')
+    assert.deepEqual(preview.updates[0]!.transform.position, [0.25, 1.2, 0.25])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer applies one shared base-scene correction during multi-select translate and preserves offsets', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const active = item('glb', 'active.glb')
+    active.id = 'active'
+    const secondary = item('glb', 'secondary.glb')
+    secondary.id = 'secondary'
+    const base = item('glb', 'base.glb')
+    base.id = 'base'
+    base.role = 'base-scene'
+    const preview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [
+        { itemId: 'active', transform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+        { itemId: 'secondary', transform: { position: [1.75, 0.87, 0.25], rotation: [0, 0.3, 0], scale: [1, 1, 1] } },
+      ],
+      activeTransform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+        ['secondary', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: [],
+      sceneItems: [active, secondary, base],
+      sceneObjects: new Map([
+        ['base', createRootWithMesh(createTriangleMesh([
+          [0, 0, 0],
+          [3, 0, 0],
+          [0, 0, 3],
+        ]))],
+      ]),
+    })
+
+    assert.equal(preview.valid, true)
+    assert.equal(preview.reason, 'snapped')
+    assert.deepEqual([
+      Number((preview.updates[1]!.transform.position[0] - preview.updates[0]!.transform.position[0]).toFixed(4)),
+      Number((preview.updates[1]!.transform.position[1] - preview.updates[0]!.transform.position[1]).toFixed(4)),
+      Number((preview.updates[1]!.transform.position[2] - preview.updates[0]!.transform.position[2]).toFixed(4)),
+    ], [1.5, 0.25, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer keeps authored blockers authoritative and skips base support for rotate scale or missing base meshes', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const floor = item('glb', 'base.glb')
+    floor.id = 'base'
+    floor.role = 'base-scene'
+    const active = item('glb', 'active.glb')
+    active.id = 'active'
+    const wall = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('wall', {
+      id: 'wall',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+
+    const blockedTranslate = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0.62, -1], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0, 0.62, 1], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: wall,
+      sceneItems: [active, floor],
+      sceneObjects: new Map([
+        ['base', createRootWithMesh(createTriangleMesh([
+          [0, 0, 0],
+          [3, 0, 0],
+          [0, 0, 3],
+        ]))],
+      ]),
+    })
+    assert.equal(blockedTranslate.reason, 'blocked')
+    assert.ok(Math.abs(blockedTranslate.updates[0]!.transform.position[2] + 0.5001) < 5e-4)
+
+    const rotatePreview = module.resolveWorldsTransformPreview({
+      mode: 'rotate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0.25, 0.62, 0.25], rotation: [0, 0.4, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: [],
+      sceneItems: [active, floor],
+      sceneObjects: new Map([
+        ['base', createRootWithMesh(createTriangleMesh([
+          [0, 0, 0],
+          [2, 0, 0],
+          [0, 0, 2],
+        ]))],
+      ]),
+    })
+    assert.deepEqual(rotatePreview.updates[0]!.transform.position, [0.25, 0.62, 0.25])
+
+    const noBasePreview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0.25, 0.62, 0.25], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: [],
+      sceneItems: [active],
+      sceneObjects: new Map(),
+    })
+    assert.deepEqual(noBasePreview.updates[0]!.transform.position, [0.25, 0.62, 0.25])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer blocks unsafe translate rotate and scale previews while preserving the last valid pose', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const wall = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('wall', {
+      id: 'wall',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const translatePreview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0, -1], rotation: [0, 0, 0], scale: [1, 1, 1] } }],
+      activeTransform: { position: [0, 0, 1], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: wall,
+    })
+    assert.equal(translatePreview.valid, true)
+    assert.equal(translatePreview.reason, 'blocked')
+    assert.ok(Math.abs(translatePreview.updates[0]!.transform.position[2] + 0.5001) < 5e-4)
+
+    const rotatePreview = module.resolveWorldsTransformPreview({
+      mode: 'rotate',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0, -0.35], rotation: [0, 0, 0], scale: [1, 1, 0.2] } }],
+      activeTransform: { position: [0, 0, -0.35], rotation: [0, Math.PI / 4, 0], scale: [1, 1, 0.2] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -1, y: -0.5, z: -0.2 }, max: { x: 1, y: 0.5, z: 0.2 } }],
+      ]),
+      collisionSurfaces: wall,
+    })
+    assert.equal(rotatePreview.valid, false)
+    assert.equal(rotatePreview.reason, 'blocked')
+    assert.deepEqual(rotatePreview.updates[0]?.transform.rotation, [0, 0, 0])
+    assert.equal(rotatePreview.snappedZoneId, null)
+
+    const blockedScalePreview = module.resolveWorldsTransformPreview({
+      mode: 'scale',
+      activeItemId: 'active',
+      snapshot: [{ itemId: 'active', transform: { position: [0, 0, -0.4], rotation: [0, 0, 0], scale: [1, 1, 0.2] } }],
+      activeTransform: { position: [0, 0, -0.4], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: wall,
+    })
+    assert.equal(blockedScalePreview.valid, false)
+    assert.equal(blockedScalePreview.reason, 'blocked')
+    assert.deepEqual(blockedScalePreview.updates[0]?.transform.scale, [1, 1, 0.2])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer keeps multi-select previews on one shared resolved transform set', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const wall = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('wall', {
+      id: 'wall',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const preview = module.resolveWorldsTransformPreview({
+      mode: 'translate',
+      activeItemId: 'active',
+      snapshot: [
+        { itemId: 'active', transform: { position: [0, 0, -1], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+        { itemId: 'secondary', transform: { position: [1.5, 0.25, -1], rotation: [0, 0.3, 0], scale: [1, 1, 1] } },
+      ],
+      activeTransform: { position: [0.5, 0, 1], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      localBoundsByItemId: new Map([
+        ['active', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+        ['secondary', { min: { x: -0.5, y: -0.5, z: -0.5 }, max: { x: 0.5, y: 0.5, z: 0.5 } }],
+      ]),
+      collisionSurfaces: wall,
+    })
+
+    assert.equal(preview.valid, true)
+    assert.equal(preview.reason, 'blocked')
+    assert.deepEqual(preview.updates.map((entry: { itemId: string }) => entry.itemId), ['active', 'secondary'])
+    assert.deepEqual([
+      Number((preview.updates[1]!.transform.position[0] - preview.updates[0]!.transform.position[0]).toFixed(4)),
+      Number((preview.updates[1]!.transform.position[1] - preview.updates[0]!.transform.position[1]).toFixed(4)),
+      Number((preview.updates[1]!.transform.position[2] - preview.updates[0]!.transform.position[2]).toFixed(4)),
+    ], [1.5, 0.25, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer falls back deterministically when bounds are missing instead of freezing preview', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const wall = normalizeWorldSceneCollisionSurfaces([createWorldCollisionSurfacePreset('wall', {
+      id: 'wall',
+      rectGeometry: { halfWidth: 4, halfHeight: 4 },
+    })!])
+    const preview = module.resolveWorldsTransformPreview({
+      mode: 'scale',
+      activeItemId: 'active',
+      snapshot: [
+        { itemId: 'active', transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+        { itemId: 'secondary', transform: { position: [2, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } },
+      ],
+      activeTransform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [2, 1, 1] },
+      localBoundsByItemId: new Map(),
+      collisionSurfaces: wall,
+    })
+
+    assert.equal(preview.valid, true)
+    assert.equal(preview.reason, 'free')
+    assert.equal(preview.collisionSafe, false)
+    assert.deepEqual(preview.updates[1]?.transform.position, [4, 0, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer commits parent callbacks only on mouse up and never during object-change preview', async () => {
+  const viewerSource = await readFile(viewerEntry, 'utf8')
+
+  assert.equal(viewerSource.includes('onObjectChange={() => {\n        previewTransform()\n      }}'), true)
+  assert.equal(viewerSource.includes('onObjectChange={() => {\n        previewTransform()\n        commitTransform()'), false)
+  assert.equal(viewerSource.includes('onMouseUp={() => {\n        draggingRef.current = false\n        onDragEndSelectionBlock()\n        commitTransform()\n        onBoundsChange()\n        dragSessionRef.current = null\n      }}'), true)
+  assert.equal(viewerSource.includes('resolveWorldsPendingSurfacePlacementDecision'), true)
+  assert.equal(viewerSource.includes('onCommitPendingSurfacePlacement(pendingItemId, decision.transform)'), true)
+  assert.equal(viewerSource.includes('onClearPendingSurfacePlacement()'), true)
+  assert.equal(viewerSource.includes('Pending placement'), false)
 })
 
 test('WorldsViewer resolves active and secondary scene objects for multi-select feedback without duplicating the active item', async () => {
@@ -609,9 +1052,23 @@ test('WorldsViewer suppresses the immediate post-transform selection event witho
   assert.equal(viewerSource.includes('const WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS = 180'), true)
   assert.equal(viewerSource.includes('if (Date.now() < suppressSelectionUntilRef.current) return'), true)
   assert.equal(viewerSource.includes('suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS'), true)
-  assert.equal(viewerSource.includes('selectCollisionZoneFromCanvas'), true)
+  assert.equal(viewerSource.includes('selectCollisionSurfaceFromCanvas'), true)
   assert.equal(viewerSource.includes('if (transformMode) return'), false)
 })
+
+function createRootWithMesh(mesh: THREE.Object3D): THREE.Group {
+  const root = new THREE.Group()
+  root.add(mesh)
+  root.updateWorldMatrix(true, true)
+  return root
+}
+
+function createTriangleMesh(vertices: [[number, number, number], [number, number, number], [number, number, number]]): THREE.Mesh {
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices.flat(), 3))
+  geometry.computeVertexNormals()
+  return new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }))
+}
 
 test('WorldsViewer focus helper frames selected bounds instead of preserving the old camera distance', async () => {
   const { module, cleanup } = await loadViewerModule()
@@ -660,45 +1117,263 @@ test('WorldsViewer focus helper frames selected bounds instead of preserving the
   }
 })
 
-test('WorldsViewer fits bounds only on scene load or intentional reset', async () => {
+test('WorldsViewer focus helper keeps the object center as target and stops at a collision-safe camera position', async () => {
   const { module, cleanup } = await loadViewerModule()
-  const viewerSource = await readFile(viewerEntry, 'utf8')
 
   try {
-    assert.deepEqual(module.createWorldsSceneFitKey([item('ply-mesh', 'mesh.ply'), item('glb', 'scene.glb')]), 'world:mesh.ply:mesh.ply|world:scene.glb:scene.glb')
-    assert.deepEqual(module.createWorldsSceneFitKey([{ ...item('ply-mesh', 'hidden.ply'), visible: false }, item('gltf', 'visible.gltf')]), 'world:visible.gltf:visible.gltf')
-    assert.equal(viewerSource.includes('<Bounds fit clip observe'), false)
-    assert.equal(viewerSource.includes('<Bounds margin={1.25}>'), true)
-    assert.equal(viewerSource.includes('cameraFitSnapshotRef'), true)
-    assert.equal(viewerSource.includes('resetToken={cameraState.resetToken}'), true)
-    assert.equal(viewerSource.includes('cameraFitSnapshotRef={cameraFitSnapshotRef}'), true)
-    assert.equal(viewerSource.includes('bounds.refresh()'), true)
-    assert.equal(viewerSource.includes('bounds.getSize()'), true)
-    assert.equal(viewerSource.includes('WORLDS_DEFAULT_CAMERA_POSITION'), true)
-    assert.equal(viewerSource.includes('const shouldApplyInitialFit = cameraFitSnapshotRef.current === null'), true)
-    assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = snapshot'), true)
-    assert.equal(viewerSource.includes('if (shouldApplyInitialFit) applySnapshot(snapshot)'), true)
-    assert.equal(viewerSource.includes('controls.target.copy(snapshot.target)'), true)
-    assert.equal(viewerSource.includes('controls.saveState?.()'), true)
-    assert.equal(viewerSource.includes('refresh().clip().fit()'), false)
-    assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems, cameraState.resetToken)'), false)
-    assert.equal(viewerSource.includes('createWorldsSceneFitKey(visibleItems)'), true)
-    assert.equal(viewerSource.includes('fallback={<HtmlStatus message="Loading world asset…" />}'), false)
-    assert.equal(viewerSource.includes('<Suspense fallback={null}>'), true)
-    assert.equal(viewerSource.includes('<WorldSceneItemObject'), true)
+    const target = new THREE.Group()
+    target.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial()))
+    target.updateWorldMatrix(true, true)
+
+    const surface = createWorldCollisionSurfacePreset('rectangle', {
+      id: 'focus-wall',
+      transform: { position: [5.7, 0, 0], rotation: [0, 0, -Math.PI / 2], scale: [4, 1, 4] },
+    })
+    assert.ok(surface)
+    const collisionSurfaces = normalizeWorldSceneCollisionSurfaces([surface!])
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    camera.position.set(10, 0, 0)
+    const orbitTarget = new THREE.Vector3(0, 0, 0)
+
+    const focused = module.focusWorldsCameraOnObject(camera, {
+      target: orbitTarget,
+      maxDistance: 500,
+      update: () => undefined,
+    }, target, collisionSurfaces)
+
+    assert.equal(focused, true)
+    assert.deepEqual(orbitTarget.toArray(), [0, 0, 0])
+    assert.ok(camera.position.x > 5.69)
+    assert.ok(camera.position.x < 10)
   } finally {
     await cleanup()
   }
 })
 
-test('WorldsViewer keeps collision zones out of normal render targets, bounds selection, and camera fit contracts', async () => {
+test('WorldsViewer creates stable fit keys from visible scene descriptors', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.deepEqual(module.createWorldsSceneFitKey([item('ply-mesh', 'mesh.ply'), item('glb', 'scene.glb')]), 'world:mesh.ply:mesh.ply|world:scene.glb:scene.glb')
+    assert.deepEqual(module.createWorldsSceneFitKey([{ ...item('ply-mesh', 'hidden.ply'), visible: false }, item('gltf', 'visible.gltf')]), 'world:visible.gltf:visible.gltf')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer applies an explicit initial view and reset restores the same bounded camera snapshot', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const bounds = {
+      center: new THREE.Vector3(0, 1, 0),
+      size: new THREE.Vector3(20, 10, 8),
+      distance: 24,
+    }
+    const initialView = {
+      position: [8, 5, 12],
+      target: [1, 2, 3],
+      up: [0, 0, 1],
+    }
+    const snapshot = module.createWorldsInitialViewCameraFitSnapshot(initialView, bounds)
+
+    assert.deepEqual(snapshot.position.toArray(), initialView.position)
+    assert.deepEqual(snapshot.target.toArray(), initialView.target)
+    assert.deepEqual(snapshot.up.toArray(), initialView.up)
+    assert.ok(snapshot.near > 0)
+    assert.ok(snapshot.far > snapshot.near)
+    assert.ok(snapshot.maxDistance >= snapshot.position.distanceTo(snapshot.target) * 2)
+    assert.deepEqual(
+      module.createWorldsInitialViewCameraFitSnapshot({
+        position: [4, 3, 2],
+        target: [0, 0, 0],
+      }, bounds).up.toArray(),
+      [0, 1, 0],
+    )
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    const controls = {
+      target: new THREE.Vector3(),
+      maxDistance: 500,
+      updateCalls: 0,
+      saveCalls: 0,
+      update() { this.updateCalls += 1 },
+      saveState() { this.saveCalls += 1 },
+    }
+
+    module.applyWorldsCameraFitSnapshot(camera, controls, snapshot)
+    assert.deepEqual(camera.position.toArray(), initialView.position)
+    assert.deepEqual(camera.up.toArray(), initialView.up)
+    assert.deepEqual(controls.target.toArray(), initialView.target)
+    assert.equal(camera.near, snapshot.near)
+    assert.equal(camera.far, snapshot.far)
+    assert.equal(controls.maxDistance, snapshot.maxDistance)
+
+    camera.position.set(-20, -20, -20)
+    camera.up.set(0, 1, 0)
+    controls.target.set(9, 9, 9)
+    module.applyWorldsCameraFitSnapshot(camera, controls, snapshot)
+
+    assert.deepEqual(camera.position.toArray(), initialView.position)
+    assert.deepEqual(camera.up.toArray(), initialView.up)
+    assert.deepEqual(controls.target.toArray(), initialView.target)
+    assert.equal(controls.updateCalls, 2)
+    assert.equal(controls.saveCalls, 2)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer refreshes loaded-scene camera limits without moving the explicit pose', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const initialView = {
+      position: [8, 5, 12],
+      target: [1, 2, 3],
+      up: [0, 0, 1],
+    }
+    const initialSnapshot = module.createWorldsInitialViewCameraFitSnapshot(initialView, {
+      center: new THREE.Vector3(0, 0, 0),
+      size: new THREE.Vector3(1, 1, 1),
+      distance: 2,
+    })
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    const controls = {
+      target: new THREE.Vector3(),
+      maxDistance: 500,
+      update: () => undefined,
+      saveState: () => undefined,
+    }
+
+    module.applyWorldsCameraFitSnapshot(camera, controls, initialSnapshot)
+    const poseBeforeLoad = {
+      position: camera.position.toArray(),
+      up: camera.up.toArray(),
+      target: controls.target.toArray(),
+      quaternion: camera.quaternion.toArray(),
+    }
+    const refreshedSnapshot = module.refreshWorldsCameraFitSnapshotLimits(camera, controls, initialSnapshot, {
+      center: new THREE.Vector3(0, 10, 0),
+      size: new THREE.Vector3(120, 80, 60),
+      distance: 160,
+    })
+
+    assert.deepEqual(camera.position.toArray(), poseBeforeLoad.position)
+    assert.deepEqual(camera.up.toArray(), poseBeforeLoad.up)
+    assert.deepEqual(controls.target.toArray(), poseBeforeLoad.target)
+    assert.deepEqual(camera.quaternion.toArray(), poseBeforeLoad.quaternion)
+    assert.deepEqual(refreshedSnapshot.position.toArray(), initialView.position)
+    assert.deepEqual(refreshedSnapshot.target.toArray(), initialView.target)
+    assert.ok(refreshedSnapshot.far > initialSnapshot.far)
+    assert.ok(refreshedSnapshot.maxDistance > initialSnapshot.maxDistance)
+    assert.equal(camera.near, refreshedSnapshot.near)
+    assert.equal(camera.far, refreshedSnapshot.far)
+    assert.equal(controls.maxDistance, refreshedSnapshot.maxDistance)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer reset reapplies the stored collision-resolved snapshot from either current side', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const surface = createWorldCollisionSurfacePreset('rectangle', {
+      id: 'reset-blocker',
+      transform: { position: [0, 0, 0], rotation: [-Math.PI / 2, 0, 0], scale: [4, 1, 4] },
+    })
+    assert.ok(surface)
+    const collisionSurfaces = normalizeWorldSceneCollisionSurfaces([surface!])
+    const desiredSnapshot = {
+      position: new THREE.Vector3(0, 0, 0),
+      target: new THREE.Vector3(0, 0, -2),
+      up: new THREE.Vector3(0, 1, 0),
+      near: 0.01,
+      far: 500,
+      maxDistance: 50,
+    }
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    camera.position.set(4, 0, 0)
+    const controls = {
+      target: new THREE.Vector3(),
+      maxDistance: 500,
+      update: () => undefined,
+      saveState: () => undefined,
+    }
+
+    const storedSnapshot = module.resolveAndApplyWorldsCameraFitSnapshot(camera, controls, desiredSnapshot, collisionSurfaces)
+    assert.ok(Math.abs(storedSnapshot.position.z) > 0.19)
+    assert.deepEqual(camera.position.toArray(), storedSnapshot.position.toArray())
+
+    camera.position.set(-4, 0, 0)
+    controls.target.set(9, 9, 9)
+    module.applyWorldsCameraFitSnapshot(camera, controls, storedSnapshot)
+
+    assert.deepEqual(camera.position.toArray(), storedSnapshot.position.toArray())
+    assert.deepEqual(controls.target.toArray(), storedSnapshot.target.toArray())
+    const resolvedFromCurrentSide = module.createCollisionSafeWorldsCameraFitSnapshot(
+      desiredSnapshot,
+      new THREE.Vector3(-4, 0, 0),
+      collisionSurfaces,
+    )
+    assert.ok(Math.abs(resolvedFromCurrentSide.position.z) > 0.19)
+    assert.deepEqual(resolvedFromCurrentSide.position.toArray(), storedSnapshot.position.toArray())
+  } finally {
+    await cleanup()
+  }
+})
+
+
+test('WorldsViewer collision-safe fit snapshots stay unchanged without blockers and depenetrate deterministically inside blockers', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const snapshot = {
+      position: new THREE.Vector3(2.4, 1.8, 2.8),
+      target: new THREE.Vector3(0, 0, 0),
+      up: new THREE.Vector3(0, 1, 0),
+      near: 0.01,
+      far: 500,
+      maxDistance: 50,
+    }
+    const unchanged = module.createCollisionSafeWorldsCameraFitSnapshot(snapshot, new THREE.Vector3(8, 8, 8), [])
+    assert.deepEqual(unchanged.position.toArray(), [2.4, 1.8, 2.8])
+    assert.deepEqual(unchanged.target.toArray(), [0, 0, 0])
+
+    const surface = createWorldCollisionSurfacePreset('rectangle', {
+      id: 'reset-blocker',
+      transform: { position: [0, 0, 0], rotation: [-Math.PI / 2, 0, 0], scale: [4, 1, 4] },
+    })
+    assert.ok(surface)
+    const collisionSurfaces = normalizeWorldSceneCollisionSurfaces([surface!])
+    const blockedSnapshot = {
+      ...snapshot,
+      position: new THREE.Vector3(0, 0, 0),
+    }
+
+    const resolvedA = module.createCollisionSafeWorldsCameraFitSnapshot(blockedSnapshot, new THREE.Vector3(0, 0, 0), collisionSurfaces)
+    const resolvedB = module.createCollisionSafeWorldsCameraFitSnapshot(blockedSnapshot, new THREE.Vector3(0, 0, 0), collisionSurfaces)
+
+    assert.ok(Math.abs(Math.abs(resolvedA.position.z) - 0.2001) < 2e-3)
+    assert.deepEqual(resolvedA.position.toArray(), resolvedB.position.toArray())
+    assert.deepEqual(resolvedA.target.toArray(), [0, 0, 0])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer keeps collision surfaces out of normal render targets, bounds selection, and box-era contracts', async () => {
   const { module, cleanup } = await loadViewerModule()
   const viewerSource = await readFile(viewerEntry, 'utf8')
 
   try {
-    assert.equal(viewerSource.includes('if (object.userData.worldsCollisionZone === true) return'), true)
+    assert.equal(viewerSource.includes('if (object.userData.worldsCollisionSurface === true) return'), true)
     assert.equal(viewerSource.includes('collisionEditMode ? ('), true)
-    assert.equal(viewerSource.includes('<WorldCollisionZoneLayer'), true)
+    assert.equal(viewerSource.includes('<WorldCollisionSurfaceLayer'), true)
+    assert.equal(viewerSource.includes('<WorldCollisionZoneLayer'), false)
+    assert.equal(viewerSource.includes('worldsPlacementCollision'), false)
+    assert.equal(viewerSource.includes('worldsSurfacePlacement'), true)
     assert.deepEqual(module.describeWorldsViewerScene([{
       ...item('ply-mesh', 'mesh.ply'),
       collision: { enabled: true, zones: [{ id: 'zone-1', shape: 'box', offset: [0, 0, 0], size: [1, 1, 1] }] },
@@ -717,18 +1392,19 @@ test('WorldsViewer keeps collision zones out of normal render targets, bounds se
   }
 })
 
-test('WorldsViewer routes collision zone gizmos through the same drag suppression path as asset gizmos', async () => {
+test('WorldsViewer routes collision surface gizmos through the same drag suppression path as asset gizmos', async () => {
   const viewerSource = await readFile(viewerEntry, 'utf8')
 
   assert.equal(viewerSource.includes('draggingRef={transformDraggingRef}'), true)
-  assert.equal(viewerSource.includes('onSelectCollisionZone={selectCollisionZoneFromCanvas}'), true)
+  assert.equal(viewerSource.includes('onSelectSurface={selectCollisionSurfaceFromCanvas}'), true)
   assert.equal(viewerSource.includes('onDragEndSelectionBlock={handleTransformDragEnd}'), true)
   assert.equal(viewerSource.includes('draggingRef.current = true'), true)
   assert.equal(viewerSource.includes('draggingRef.current = false'), true)
-  assert.equal(viewerSource.includes('selectedObject && transformMode && !selectedCollisionZoneId'), true)
-  assert.equal(viewerSource.includes('!(collisionEditMode && selectedCollisionZoneId)'), false)
-  assert.equal(viewerSource.includes('{selected && zoneObject && transformMode ? ('), true)
-  assert.equal(viewerSource.includes('object={zoneObject}'), true)
+  assert.equal(viewerSource.includes('selectedObject && transformMode && !selectedCollisionSurfaceId'), true)
+  assert.equal(viewerSource.includes('collisionEditMode={collisionEditMode}'), true)
+  assert.equal(viewerSource.includes('!(collisionEditMode && selectedCollisionSurfaceId)'), false)
+  assert.equal(viewerSource.includes('{selected && zoneObject && transformMode ? ('), false)
+  assert.equal(viewerSource.includes('object={zoneObject}'), false)
 })
 
 test('WorldsCameraOverlay exposes compact accessible speed reset and help controls without mode UI', async () => {
@@ -798,13 +1474,13 @@ test('WorldsTransformToolbar clarifies that multi-select transforms use the acti
 
   assert.equal(toolbarSource.includes('transforms use the active item as the pivot'), true)
   assert.equal(toolbarSource.includes('only the active item gets transform controls'), false)
-  assert.equal(toolbarSource.includes('Add collision zone'), true)
+  assert.equal(toolbarSource.includes('Add collision surface'), true)
   assert.equal(toolbarSource.includes('Add box'), false)
   assert.equal(toolbarSource.includes('Wall'), true)
-  assert.equal(toolbarSource.includes('Blocker'), true)
-  assert.equal(toolbarSource.includes('Floor zone'), true)
-  assert.equal(toolbarSource.includes('World collision zones use the same move, rotate, and scale gizmo as scene assets.'), true)
-  assert.equal(toolbarSource.includes('Remove zone'), true)
+  assert.equal(toolbarSource.includes('Triangle'), true)
+  assert.equal(toolbarSource.includes('Floor'), true)
+  assert.equal(toolbarSource.includes('World collision surfaces use the same move, rotate, and scale gizmo as scene assets.'), true)
+  assert.equal(toolbarSource.includes('Remove surface'), true)
 })
 
 test('production Worlds modules keep a static boundary from Generate Viewer3D implementations', async () => {

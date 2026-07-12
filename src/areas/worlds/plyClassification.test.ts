@@ -15,7 +15,7 @@ test('classifies colored indexed PLY fixtures as vertex-color mesh geometry', as
   const source = await readFile(path.join(fixturesDir, 'colored-mesh.ply'), 'utf8')
   const geometry = new PLYLoader().parse(new TextEncoder().encode(source).buffer)
 
-  assert.deepEqual(classifyPlyHeader(source), { kind: 'standard-mesh', hasFaces: true, hasVertexColors: true })
+  assert.deepEqual(classifyPlyHeader(source), { plyKind: 'mesh', hasFaces: true, hasVertexColors: true })
   assert.deepEqual(classifyPlyGeometry(geometry), { kind: 'mesh', hasVertexColors: true })
   assert.equal(geometry.index?.count, 3)
   assert.equal(geometry.getAttribute('color')?.count, 3)
@@ -25,7 +25,7 @@ test('classifies colored non-indexed PLY fixtures as vertex-color points geometr
   const source = await readFile(path.join(fixturesDir, 'colored-points.ply'), 'utf8')
   const geometry = new PLYLoader().parse(new TextEncoder().encode(source).buffer)
 
-  assert.deepEqual(classifyPlyHeader(source), { kind: 'standard-points', hasFaces: false, hasVertexColors: true })
+  assert.deepEqual(classifyPlyHeader(source), { plyKind: 'points', hasFaces: false, hasVertexColors: true })
   assert.deepEqual(classifyPlyGeometry(geometry), { kind: 'points', hasVertexColors: true })
   assert.equal(geometry.index, null)
   assert.equal(geometry.getAttribute('color')?.count, 3)
@@ -45,5 +45,5 @@ property float rot_0
 end_header
 `
 
-  assert.deepEqual(classifyPlyHeader(header), { kind: 'gaussian', hasFaces: false, hasVertexColors: false })
+  assert.deepEqual(classifyPlyHeader(header), { plyKind: 'gaussian', hasFaces: false, hasVertexColors: false })
 })

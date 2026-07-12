@@ -1,26 +1,54 @@
 import { create } from 'zustand'
 
+import type { SceneArtifactManifestInitialView } from '../../shared/types/artifacts.ts'
 import type { WorldsTransformMode } from './components/WorldsTransformToolbar.tsx'
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
-import type { WorldCollisionZone } from './worldsCollisionZones.ts'
+import type { WorldCollisionSurface } from './worldsCollisionSurfaces.ts'
+import { normalizeWorldCollisionSurface } from './worldsCollisionSurfaces.ts'
 
 export interface WorldsSceneState {
   sceneItems: WorldSceneItem[]
-  collisionZones: WorldCollisionZone[]
+  collisionSurfaces: WorldCollisionSurface[]
+  initialView: SceneArtifactManifestInitialView | null
   selectedSceneItemId: string | null
   selectedSceneItemIds: string[]
+  pendingSurfacePlacementItemId: string | null
   collisionEditMode: boolean
-  selectedCollisionZoneId: string | null
+  selectedCollisionSurfaceId: string | null
   transformMode: WorldsTransformMode | null
   sceneItemAnchors: Record<string, [number, number, number]>
-  setScene: (scene: Pick<WorldsSceneState, 'sceneItems' | 'collisionZones' | 'selectedSceneItemId'> & Partial<Pick<WorldsSceneState, 'selectedSceneItemIds'>>) => void
+  setScene: (scene: Pick<WorldsSceneState, 'sceneItems' | 'collisionSurfaces' | 'selectedSceneItemId'> & Partial<Pick<WorldsSceneState, 'initialView' | 'selectedSceneItemIds' | 'selectedCollisionSurfaceId' | 'pendingSurfacePlacementItemId'>>) => void
   setSelectedSceneItemId: (itemId: string | null, options?: { preserveSelection?: boolean }) => void
   toggleSelectedSceneItemId: (itemId: string) => void
   setCollisionEditMode: (enabled: boolean) => void
-  setSelectedCollisionZoneId: (zoneId: string | null) => void
+  setSelectedCollisionSurfaceId: (surfaceId: string | null) => void
   setTransformMode: (mode: WorldsTransformMode | null) => void
+  setPendingSurfacePlacementItemId: (itemId: string | null) => void
+  clearPendingSurfacePlacementItemId: () => void
   setSceneItemAnchor: (itemId: string, anchor: [number, number, number] | null) => void
   clearTransformMode: () => void
+}
+
+function resolveValidPendingSurfacePlacementItemId(
+  sceneItems: WorldSceneItem[],
+  pendingItemId: string | null | undefined,
+): string | null {
+  if (!pendingItemId) return null
+  const item = sceneItems.find((sceneItem) => sceneItem.id === pendingItemId)
+  if (!item || item.role === 'base-scene') return null
+  return pendingItemId
+}
+
+function normalizeWorldCollisionSurfaces(surfaces: WorldCollisionSurface[]): WorldCollisionSurface[] {
+  const normalized: WorldCollisionSurface[] = []
+  const seenIds = new Set<string>()
+  for (const surface of surfaces) {
+    const nextSurface = normalizeWorldCollisionSurface(surface)
+    if (!nextSurface || seenIds.has(nextSurface.id)) continue
+    seenIds.add(nextSurface.id)
+    normalized.push(nextSurface)
+  }
+  return normalized
 }
 
 export function normalizeWorldsSelectedSceneItemIds(
@@ -57,14 +85,17 @@ export function toggleWorldsSelectedSceneItem(
 
 export const useWorldsSceneStore = create<WorldsSceneState>((set) => ({
   sceneItems: [],
-  collisionZones: [],
+  collisionSurfaces: [],
+  initialView: null,
   selectedSceneItemId: null,
   selectedSceneItemIds: [],
+  pendingSurfacePlacementItemId: null,
   collisionEditMode: false,
-  selectedCollisionZoneId: null,
+  selectedCollisionSurfaceId: null,
   transformMode: null,
   sceneItemAnchors: {},
   setScene: (scene) => set((state) => {
+    const collisionSurfaces = normalizeWorldCollisionSurfaces(scene.collisionSurfaces)
     const selectedSceneItemIds = normalizeWorldsSelectedSceneItemIds(
       scene.sceneItems,
       scene.selectedSceneItemId,
@@ -73,13 +104,26 @@ export const useWorldsSceneStore = create<WorldsSceneState>((set) => ({
     const selectedSceneItemId = scene.selectedSceneItemId && selectedSceneItemIds.includes(scene.selectedSceneItemId)
       ? scene.selectedSceneItemId
       : selectedSceneItemIds.at(-1) ?? null
+    const selectedCollisionSurfaceId = scene.selectedCollisionSurfaceId
+      ? collisionSurfaces.some((surface) => surface.id === scene.selectedCollisionSurfaceId) ? scene.selectedCollisionSurfaceId : null
+      : state.selectedCollisionSurfaceId && collisionSurfaces.some((surface) => surface.id === state.selectedCollisionSurfaceId)
+        ? state.selectedCollisionSurfaceId
+        : null
+    const pendingSurfacePlacementItemId = resolveValidPendingSurfacePlacementItemId(
+      scene.sceneItems,
+      scene.pendingSurfacePlacementItemId !== undefined
+      ? scene.pendingSurfacePlacementItemId
+      : state.pendingSurfacePlacementItemId,
+    )
 
     return {
       sceneItems: scene.sceneItems,
-      collisionZones: scene.collisionZones,
+      collisionSurfaces,
+      initialView: scene.initialView === undefined ? state.initialView : scene.initialView,
       selectedSceneItemId,
       selectedSceneItemIds,
-      selectedCollisionZoneId: state.selectedCollisionZoneId,
+      pendingSurfacePlacementItemId,
+      selectedCollisionSurfaceId,
       transformMode: state.transformMode,
     }
   }),
@@ -88,20 +132,24 @@ export const useWorldsSceneStore = create<WorldsSceneState>((set) => ({
       selectedSceneItemIds: itemId && options?.preserveSelection && state.selectedSceneItemIds.includes(itemId)
         ? state.selectedSceneItemIds
         : itemId ? [itemId] : [],
-    selectedCollisionZoneId: itemId ? null : state.selectedCollisionZoneId,
+    selectedCollisionSurfaceId: itemId ? null : state.selectedCollisionSurfaceId,
     transformMode: state.transformMode,
   })),
   toggleSelectedSceneItemId: (itemId) => set((state) => {
     const nextSelection = toggleWorldsSelectedSceneItem(state.selectedSceneItemIds, state.selectedSceneItemId, itemId)
     return {
       ...nextSelection,
-      selectedCollisionZoneId: null,
+      selectedCollisionSurfaceId: null,
       transformMode: state.transformMode,
     }
   }),
   setCollisionEditMode: (enabled) => set({ collisionEditMode: enabled }),
-  setSelectedCollisionZoneId: (zoneId) => set({ selectedCollisionZoneId: zoneId }),
+  setSelectedCollisionSurfaceId: (surfaceId) => set({ selectedCollisionSurfaceId: surfaceId }),
   setTransformMode: (mode) => set({ transformMode: mode }),
+  setPendingSurfacePlacementItemId: (itemId) => set((state) => ({
+    pendingSurfacePlacementItemId: resolveValidPendingSurfacePlacementItemId(state.sceneItems, itemId),
+  })),
+  clearPendingSurfacePlacementItemId: () => set({ pendingSurfacePlacementItemId: null }),
   setSceneItemAnchor: (itemId, anchor) => set((state) => {
     const current = state.sceneItemAnchors[itemId]
     if (anchor && current && current.every((value, index) => value === anchor[index])) return state

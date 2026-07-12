@@ -29,6 +29,10 @@ export interface AddWorldCollisionZoneOptions {
   anchorPosition?: [number, number, number]
 }
 
+export function shouldPendingWorldsSurfacePlacement(sceneItems: WorldSceneItem[], item: WorldSceneItem): boolean {
+  return item.role !== 'base-scene' && sceneItems.some((sceneItem) => sceneItem.visible && sceneItem.role === 'base-scene')
+}
+
 export function appendWorldSceneItem(
   sceneItems: WorldSceneItem[],
   item: WorldSceneItem,

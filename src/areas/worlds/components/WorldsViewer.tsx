@@ -1,4 +1,4 @@
-import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
+import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
 import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
 import { Bounds, GizmoHelper, GizmoViewport, Html, OrbitControls, TransformControls, useBounds, useGLTF } from '@react-three/drei'
 import { EffectComposer, Outline, Select, Selection } from '@react-three/postprocessing'
@@ -7,10 +7,10 @@ import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import { clone as cloneSkeletonScene } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh'
 import type { PoseClipSidecarV1 } from '../../../shared/types/electron.d.ts'
+import type { SceneArtifactManifestInitialView } from '../../../shared/types/artifacts.ts'
 
 import { classifyPlyGeometry } from '../plyClassification.ts'
-import { createWorldsCameraState } from '../worldCameraNavigation.ts'
-import type { WorldSceneItem } from '../worldRenderableResolver.ts'
+import { isWorldsGaussianPlyEnabled, type WorldSceneItem } from '../worldRenderableResolver.ts'
 import { createWorldSceneSelectionTransformUpdates, type WorldSceneItemTransformUpdate, type WorldSceneTransformSnapshot } from '../worldsScenePlacement.ts'
 import {
   applyWorldsPoseClipAtTime,
@@ -18,11 +18,27 @@ import {
   takeWorldsPoseClipSnapshot,
   type WorldsPoseClipBoneSnapshot,
 } from '../worldsPoseClipPlayback.ts'
+import type { WorldsCollisionBounds } from '../worldsCollisionMath.ts'
+import { calculateWorldsObjectLocalBounds } from '../worldsObjectBounds.ts'
+import {
+  normalizeWorldSceneCollisionSurfaces,
+  WORLD_CAMERA_COLLISION_HALF_EXTENTS,
+  createWorldsCameraState,
+} from '../worldCameraNavigation.ts'
+import type { WorldsResolvedCollisionSurface } from '../worldsSurfaceMath.ts'
+import { resolveWorldSurfaceProbeTranslation } from '../worldsSurfaceNavigation.ts'
+import { resolveWorldsSurfacePlacement } from '../worldsSurfacePlacement.ts'
+import {
+  resolveWorldsBaseSceneSupportPlacement,
+  resolveWorldsPendingSurfacePlacementDecision,
+  WORLDS_DRAG_BASE_SUPPORT_MAX_CORRECTION,
+} from '../worldsBaseSceneSupport.ts'
 import { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
 import { WorldsKeyboardCameraControls, type WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.tsx'
 import { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
 import WorldsTransformToolbar, { type WorldsTransformMode } from './WorldsTransformToolbar.tsx'
-import type { WorldCollisionZone, WorldCollisionZonePreset } from '../worldsCollisionZones.ts'
+import WorldCollisionSurfaceLayer from './WorldCollisionSurfaceLayer.tsx'
+import type { WorldCollisionSurface, WorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree as any
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree as any
@@ -32,6 +48,11 @@ export { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCamera
 export { WorldsKeyboardCameraControls } from './WorldsKeyboardCameraControls.tsx'
 export { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
 
+const LazyWorldsGaussianPlyObject = lazy(async () => {
+  const module = await import('./WorldsGaussianPlyObject.tsx')
+  return { default: module.WorldsGaussianPlyObject }
+})
+
 export type WorldsViewerUnsupportedItem = {
   workspacePath: string
   reason: 'unsupported-spz' | 'unsupported-gaussian-ply' | 'unsupported-extension' | 'unsafe' | 'unavailable'
@@ -39,25 +60,29 @@ export type WorldsViewerUnsupportedItem = {
 
 export interface WorldsViewerProps {
   items: WorldSceneItem[]
-  collisionZones?: WorldCollisionZone[]
+  initialView?: SceneArtifactManifestInitialView
+  collisionSurfaces?: WorldCollisionSurface[]
   unsupportedItems?: WorldsViewerUnsupportedItem[]
   selectedItemId?: string | null
   selectedItemIds?: string[]
+  pendingSurfacePlacementItemId?: string | null
   collisionEditMode?: boolean
-  selectedCollisionZoneId?: string | null
+  selectedCollisionSurfaceId?: string | null
   transformMode?: WorldsTransformMode | null
   onSelectItem?: (itemId: string | null, options?: { toggle?: boolean }) => void
-  onAddCollisionZone?: (preset?: WorldCollisionZonePreset) => void
+  onAddCollisionSurface?: (preset?: WorldCollisionSurfacePreset) => void
   onCollisionEditModeChange?: (enabled: boolean) => void
-  onSelectCollisionZone?: (zoneId: string | null) => void
+  onSelectCollisionSurface?: (surfaceId: string | null) => void
   onTransformModeChange?: (mode: WorldsTransformMode | null) => void
   onTransformItem?: (itemId: string, transform: WorldSceneItem['transform']) => void
   onTransformItems?: (updates: WorldSceneItemTransformUpdate[]) => void
-  onTransformCollisionZone?: (zoneId: string, transform: WorldCollisionZone['transform']) => void
-  onRemoveCollisionZone?: (zoneId: string | null) => void
+  onTransformCollisionSurface?: (surfaceId: string, transform: WorldCollisionSurface['transform']) => void
+  onRemoveCollisionSurface?: (surfaceId: string | null) => void
   onRemoveItem?: (itemId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
   onSceneItemAnchorChange?: (itemId: string, anchor: [number, number, number] | null) => void
+  onCommitPendingSurfacePlacement?: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onClearPendingSurfacePlacement?: () => void
   onAnimationMetadata?: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
 }
 
@@ -118,17 +143,27 @@ const WORLD_SELECTION_SECONDARY_SILHOUETTE_SCALE = 1.008
 const WORLDS_CAMERA_HELP_TEXT = 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space up · Shift down · Q/E yaw'
 const WORLDS_DEFAULT_CAMERA_POSITION = new THREE.Vector3(2.4, 1.8, 2.8)
 const WORLDS_DEFAULT_CAMERA_TARGET = new THREE.Vector3(0, 0, 0)
+const WORLDS_DEFAULT_CAMERA_UP = new THREE.Vector3(0, 1, 0)
+const WORLDS_MIN_CAMERA_NEAR = 0.01
 const WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS = 180
 const worldsFitDirection = new THREE.Vector3()
 const worldsFitPosition = new THREE.Vector3()
 const worldsFocusSize = new THREE.Vector3()
+const worldsResolvedCameraPosition = new THREE.Vector3()
 
-type WorldsCameraFitSnapshot = {
+export type WorldsCameraFitSnapshot = {
   position: THREE.Vector3
   target: THREE.Vector3
+  up: THREE.Vector3
   near: number
   far: number
   maxDistance: number
+}
+
+export type WorldsCameraBounds = {
+  center: THREE.Vector3
+  size: THREE.Vector3
+  distance: number
 }
 
 export function isWorldsBatchTransformSnapshot(snapshot: WorldSceneTransformSnapshot[] | null): snapshot is WorldSceneTransformSnapshot[] {
@@ -142,10 +177,10 @@ export function shouldResetWorldsTransformSnapshot(isDragging: boolean): boolean
 export type WorldSceneItemRenderTarget = {
   workspacePath: string
   kind: WorldSceneItem['kind']
-  loader: 'ply' | 'gltf'
-  primitive: 'mesh' | 'points' | 'scene'
+  loader: 'ply' | 'gltf' | 'gaussian-ply'
+  primitive: 'mesh' | 'points' | 'scene' | 'gaussian-splats'
   cameraFit: 'bounds'
-  visibleDescription: 'PLY mesh geometry' | 'PLY point cloud geometry' | 'GLB/GLTF model scene'
+  visibleDescription: 'PLY mesh geometry' | 'PLY point cloud geometry' | 'Gaussian PLY splats' | 'GLB/GLTF model scene'
 }
 
 type WorldsMeasuredBounds = {
@@ -155,38 +190,56 @@ type WorldsMeasuredBounds = {
 
 export function WorldsViewer({
   items,
-  collisionZones = [],
+  initialView,
+  collisionSurfaces = [],
   unsupportedItems = [],
   selectedItemId = null,
   selectedItemIds = [],
+  pendingSurfacePlacementItemId = null,
   collisionEditMode = false,
-  selectedCollisionZoneId = null,
+  selectedCollisionSurfaceId = null,
   transformMode = null,
   onSelectItem = () => undefined,
-  onAddCollisionZone = () => undefined,
+  onAddCollisionSurface = () => undefined,
   onCollisionEditModeChange = () => undefined,
-  onSelectCollisionZone = () => undefined,
+  onSelectCollisionSurface = () => undefined,
   onTransformModeChange = () => undefined,
   onTransformItem = () => undefined,
   onTransformItems = () => undefined,
-  onTransformCollisionZone = () => undefined,
-  onRemoveCollisionZone = () => undefined,
+  onTransformCollisionSurface = () => undefined,
+  onRemoveCollisionSurface = () => undefined,
   onRemoveItem = () => undefined,
   onToggleBaseSceneItem = () => undefined,
   onSceneItemAnchorChange = () => undefined,
+  onCommitPendingSurfacePlacement = () => undefined,
+  onClearPendingSurfacePlacement = () => undefined,
   onAnimationMetadata = () => undefined,
 }: WorldsViewerProps): JSX.Element {
+  const normalizedSelectedItemIds = useMemo(
+    () => Array.isArray(selectedItemIds) ? selectedItemIds.filter((itemId): itemId is string => typeof itemId === 'string' && itemId.length > 0) : [],
+    [selectedItemIds],
+  )
+  const normalizedCollisionSurfaces = useMemo(
+    () => Array.isArray(collisionSurfaces) ? collisionSurfaces : [],
+    [collisionSurfaces],
+  )
+  const resolvedCollisionSurfaces = useMemo(
+    () => normalizeWorldSceneCollisionSurfaces(normalizedCollisionSurfaces),
+    [normalizedCollisionSurfaces],
+  )
   const inputScopeRef = useRef<HTMLElement>(null)
   const orbitControlsRef = useRef<WorldsOrbitControlsHandle | null>(null)
   const cameraFitSnapshotRef = useRef<WorldsCameraFitSnapshot | null>(null)
   const [cameraState, setCameraState] = useState(() => createWorldsCameraState())
   const visibleItems = useMemo(() => items.filter((item) => item.visible), [items])
   const sceneFitKey = useMemo(() => createWorldsSceneFitKey(visibleItems), [visibleItems])
-  const description = describeWorldsViewerScene(items, unsupportedItems, selectedItemId, selectedItemIds)
+  const description = describeWorldsViewerScene(items, unsupportedItems, selectedItemId, normalizedSelectedItemIds)
   const sceneObjectsRef = useRef(new Map<string, THREE.Object3D>())
+  const sceneItemLocalBoundsRef = useRef(new Map<string, WorldsCollisionBounds | null>())
   const transformDraggingRef = useRef(false)
   const suppressSelectionUntilRef = useRef(0)
   const [sceneObjectVersion, setSceneObjectVersion] = useState(0)
+  const [sceneLoadRevision, setSceneLoadRevision] = useState(0)
   const playbackRef = useRef<WorldsPlaybackRef>({ playing: false, timeSeconds: 0, durationSeconds: 0 })
   const playbackScrubRef = useRef<HTMLInputElement>(null)
   const playbackTimeLabelRef = useRef<HTMLSpanElement>(null)
@@ -196,19 +249,19 @@ export function WorldsViewer({
   const [focusRequest, setFocusRequest] = useState<{ itemId: string; token: number } | null>(null)
   const [selectedBoundsVersion, setSelectedBoundsVersion] = useState(0)
   const selectedObject = useMemo(() => selectedItemId ? sceneObjectsRef.current.get(selectedItemId) ?? null : null, [sceneObjectVersion, selectedItemId])
-  const selectedItemIdSet = useMemo(() => new Set(selectedItemIds), [selectedItemIds])
+  const selectedItemIdSet = useMemo(() => new Set(normalizedSelectedItemIds), [normalizedSelectedItemIds])
   const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id)), [selectedItemIdSet, visibleItems])
-  const selectedSceneObjects = useMemo(() => resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, selectedItemIds, selectedItemId), [sceneObjectVersion, selectedItemId, selectedItemIds])
+  const selectedSceneObjects = useMemo(() => resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, normalizedSelectedItemIds, selectedItemId), [sceneObjectVersion, normalizedSelectedItemIds, selectedItemId])
   const selectSceneItemFromCanvas = useCallback((itemId: string | null, options?: { toggle?: boolean }) => {
     if (transformDraggingRef.current) return
     if (Date.now() < suppressSelectionUntilRef.current) return
     onSelectItem(itemId, options)
   }, [onSelectItem])
-  const selectCollisionZoneFromCanvas = useCallback((zoneId: string | null) => {
+  const selectCollisionSurfaceFromCanvas = useCallback((surfaceId: string | null) => {
     if (transformDraggingRef.current) return
     if (Date.now() < suppressSelectionUntilRef.current) return
-    onSelectCollisionZone(zoneId)
-  }, [onSelectCollisionZone])
+    onSelectCollisionSurface(surfaceId)
+  }, [onSelectCollisionSurface])
   const handleTransformDragEnd = useCallback(() => {
     suppressSelectionUntilRef.current = Date.now() + WORLDS_TRANSFORM_SELECTION_SUPPRESSION_MS
   }, [])
@@ -218,9 +271,20 @@ export function WorldsViewer({
   const invalidateSelectedBounds = useCallback(() => {
     setSelectedBoundsVersion((version) => version + 1)
   }, [])
+  const cacheSceneItemLocalBounds = useCallback((itemId: string, bounds: WorldsCollisionBounds | null) => {
+    if (bounds) {
+      sceneItemLocalBoundsRef.current.set(itemId, cloneCollisionBounds(bounds))
+      setSceneLoadRevision((revision) => revision + 1)
+    } else {
+      sceneItemLocalBoundsRef.current.delete(itemId)
+    }
+  }, [])
   const registerSceneObject = useCallback((itemId: string, object: THREE.Object3D | null) => {
     if (object) sceneObjectsRef.current.set(itemId, object)
-    else sceneObjectsRef.current.delete(itemId)
+    else {
+      sceneObjectsRef.current.delete(itemId)
+      sceneItemLocalBoundsRef.current.delete(itemId)
+    }
     setSceneObjectVersion((version) => version + 1)
   }, [])
 
@@ -245,11 +309,11 @@ export function WorldsViewer({
   const handleCanvasPointerMissed = useCallback((event: { ctrlKey?: boolean } | undefined) => {
     if (!shouldWorldsPointerMissClearSelection(event)) return
     if (collisionEditMode) {
-      selectCollisionZoneFromCanvas(null)
+      selectCollisionSurfaceFromCanvas(null)
       return
     }
     selectSceneItemFromCanvas(null)
-  }, [collisionEditMode, selectCollisionZoneFromCanvas, selectSceneItemFromCanvas])
+  }, [collisionEditMode, selectCollisionSurfaceFromCanvas, selectSceneItemFromCanvas])
 
   return (
     <section
@@ -271,19 +335,19 @@ export function WorldsViewer({
       />
         <WorldsTransformToolbar
           items={visibleItems}
-          collisionZones={collisionZones}
+          collisionSurfaces={normalizedCollisionSurfaces}
           selectedItemId={selectedItemId}
-          selectedItemIds={selectedItemIds}
+          selectedItemIds={normalizedSelectedItemIds}
           collisionEditMode={collisionEditMode}
-          selectedCollisionZoneId={selectedCollisionZoneId}
+          selectedCollisionSurfaceId={selectedCollisionSurfaceId}
           mode={transformMode}
           onSelectItem={onSelectItem}
-          onAddCollisionZone={onAddCollisionZone}
+          onAddCollisionSurface={onAddCollisionSurface}
           onCollisionEditModeChange={onCollisionEditModeChange}
-          onSelectCollisionZone={onSelectCollisionZone}
+          onSelectCollisionSurface={onSelectCollisionSurface}
           onModeChange={onTransformModeChange}
           onRemoveItem={onRemoveItem}
-          onRemoveCollisionZone={onRemoveCollisionZone}
+          onRemoveCollisionSurface={onRemoveCollisionSurface}
           onToggleBaseSceneItem={onToggleBaseSceneItem}
         />
       <WorldsPlaybackControls
@@ -311,7 +375,7 @@ export function WorldsViewer({
         <directionalLight position={[4, 6, 4]} intensity={1.2} />
         <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
         <Bounds margin={1.25}>
-          <Selection enabled={selectedItemIds.length > 0}>
+          <Selection enabled={normalizedSelectedItemIds.length > 0}>
             <EffectComposer
               multisampling={WORLD_SELECTION_OUTLINE_MULTISAMPLING}
               resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}
@@ -335,6 +399,7 @@ export function WorldsViewer({
                     onSelectItem={selectSceneItemFromCanvas}
                     onFocusItem={focusSceneItemFromCanvas}
                     onRegisterObject={registerSceneObject}
+                    onLocalBoundsChange={cacheSceneItemLocalBounds}
                     onSceneItemAnchorChange={onSceneItemAnchorChange}
                     onAnimationMetadata={onAnimationMetadata}
                   />
@@ -342,14 +407,15 @@ export function WorldsViewer({
               </WorldSceneItemErrorBoundary>
             ))}
             {collisionEditMode ? (
-              <WorldCollisionZoneLayer
-                collisionZones={collisionZones}
-                selectedCollisionZoneId={selectedCollisionZoneId}
+              <WorldCollisionSurfaceLayer
+                editMode={collisionEditMode}
+                surfaces={normalizedCollisionSurfaces}
+                selectedSurfaceId={selectedCollisionSurfaceId}
                 transformMode={transformMode}
                 draggingRef={transformDraggingRef}
-                onSelectCollisionZone={selectCollisionZoneFromCanvas}
-                onDragEndSelectionBlock={handleTransformDragEnd}
-                onTransformCollisionZone={onTransformCollisionZone}
+                onSelectSurface={selectCollisionSurfaceFromCanvas}
+                onTransformDragEndSelectionBlock={handleTransformDragEnd}
+                onTransformSurface={onTransformCollisionSurface}
               />
             ) : null}
           </Selection>
@@ -372,30 +438,49 @@ export function WorldsViewer({
               renderOrder={2}
             />
           ) : null}
-          {selectedObject && transformMode && !selectedCollisionZoneId ? (
+          {selectedObject && transformMode && !selectedCollisionSurfaceId ? (
             <WorldsTransformControls
               object={selectedObject}
               mode={transformMode}
               selectedItemId={selectedItemId}
               selectedItems={selectedItems}
+              sceneItems={visibleItems}
+              collisionSurfaces={resolvedCollisionSurfaces}
               draggingRef={transformDraggingRef}
+              sceneObjectsRef={sceneObjectsRef}
+              localBoundsRef={sceneItemLocalBoundsRef}
               onDragEndSelectionBlock={handleTransformDragEnd}
               onBoundsChange={invalidateSelectedBounds}
               onTransformItem={onTransformItem}
               onTransformItems={onTransformItems}
             />
           ) : null}
-          <SceneFitController
-            fitKey={sceneFitKey}
-            resetToken={cameraState.resetToken}
-            orbitControlsRef={orbitControlsRef}
-            cameraFitSnapshotRef={cameraFitSnapshotRef}
-          />
-          <SceneFocusController
-            focusRequest={focusRequest}
-            orbitControlsRef={orbitControlsRef}
-            sceneObjectsRef={sceneObjectsRef}
-          />
+            <SceneFitController
+              initialView={initialView}
+              fitKey={sceneFitKey}
+              loadRevision={sceneLoadRevision}
+              resetToken={cameraState.resetToken}
+              orbitControlsRef={orbitControlsRef}
+              cameraFitSnapshotRef={cameraFitSnapshotRef}
+              collisionSurfaces={resolvedCollisionSurfaces}
+            />
+            <SceneFocusController
+              focusRequest={focusRequest}
+              orbitControlsRef={orbitControlsRef}
+              sceneObjectsRef={sceneObjectsRef}
+              collisionSurfaces={resolvedCollisionSurfaces}
+            />
+            <WorldsPendingSurfacePlacementController
+              pendingItemId={pendingSurfacePlacementItemId}
+              sceneItems={visibleItems}
+              selectedItemIds={normalizedSelectedItemIds}
+              sceneObjectsRef={sceneObjectsRef}
+              localBoundsRef={sceneItemLocalBoundsRef}
+              sceneObjectVersion={sceneObjectVersion}
+              sceneLoadRevision={sceneLoadRevision}
+              onCommitPendingSurfacePlacement={onCommitPendingSurfacePlacement}
+              onClearPendingSurfacePlacement={onClearPendingSurfacePlacement}
+            />
         </Bounds>
         <OrbitControls
           ref={orbitControlsRef}
@@ -415,13 +500,16 @@ export function WorldsViewer({
           rotateSpeed={WORLD_VIEWER_ORBIT_CONTROLS.rotateSpeed}
         />
         <WorldsKeyboardCameraControls
-          items={visibleItems}
-          collisionZones={collisionZones}
+          collisionSurfaces={resolvedCollisionSurfaces}
           speed={cameraState.speed}
           inputScopeRef={inputScopeRef}
           orbitControlsRef={orbitControlsRef}
         />
-        <WorldsMouseLookCameraControls inputScopeRef={inputScopeRef} orbitControlsRef={orbitControlsRef} enabled={!transformMode && !transformDraggingRef.current} />
+        <WorldsMouseLookCameraControls
+          inputScopeRef={inputScopeRef}
+          orbitControlsRef={orbitControlsRef}
+          enabled={!transformMode && !transformDraggingRef.current}
+        />
         <WorldsPlaybackFrameController playbackRef={playbackRef} scrubRef={playbackScrubRef} timeLabelRef={playbackTimeLabelRef} />
         <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
           <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="#f4f4f5" />
@@ -557,6 +645,17 @@ export function createWorldsSceneFitKey(items: WorldSceneItem[]): string {
 }
 
 export function getWorldSceneItemRenderTarget(item: WorldSceneItem): WorldSceneItemRenderTarget {
+  if (item.kind === 'gaussian-ply') {
+    return {
+      workspacePath: item.workspacePath,
+      kind: item.kind,
+      loader: 'gaussian-ply',
+      primitive: 'gaussian-splats',
+      cameraFit: 'bounds',
+      visibleDescription: 'Gaussian PLY splats',
+    }
+  }
+
   if (item.kind === 'ply-points') {
     return {
       workspacePath: item.workspacePath,
@@ -652,6 +751,7 @@ function WorldSceneItemObject({
   onSelectItem,
   onFocusItem,
   onRegisterObject,
+  onLocalBoundsChange,
   onSceneItemAnchorChange,
   onAnimationMetadata,
 }: {
@@ -662,6 +762,7 @@ function WorldSceneItemObject({
   onSelectItem: (itemId: string | null, options?: { toggle?: boolean }) => void
   onFocusItem: (itemId: string) => void
   onRegisterObject: (itemId: string, object: THREE.Object3D | null) => void
+  onLocalBoundsChange: (itemId: string, bounds: WorldsCollisionBounds | null) => void
   onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
   onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
 }): JSX.Element | null {
@@ -700,15 +801,25 @@ function WorldSceneItemObject({
   useEffect(() => {
     onRegisterObject(item.id, groupRef.current)
     invalidateBounds()
-    return () => onRegisterObject(item.id, null)
-  }, [invalidateBounds, item.id, onRegisterObject])
+    return () => {
+      onLocalBoundsChange(item.id, null)
+      onRegisterObject(item.id, null)
+    }
+  }, [invalidateBounds, item.id, onLocalBoundsChange, onRegisterObject])
 
   useEffect(() => {
     return () => {
       lastAnchorRef.current = null
+      onLocalBoundsChange(item.id, null)
       onSceneItemAnchorChange(item.id, null)
     }
-  }, [item.id, onSceneItemAnchorChange])
+  }, [item.id, onLocalBoundsChange, onSceneItemAnchorChange])
+
+  useEffect(() => {
+    const group = groupRef.current
+    if (!group) return
+    onLocalBoundsChange(item.id, calculateWorldsObjectLocalBounds(group))
+  }, [contentVersion, item.id, onLocalBoundsChange])
 
   useEffect(() => {
     updateAnchor()
@@ -771,7 +882,7 @@ export function resolveWorldsSceneItemIdFromObject(object: THREE.Object3D | null
   while (current) {
     if (current.userData.worldsSelectionHitbox === true) return null
     if (current.userData.worldsSelectionSilhouette === true) return null
-    if (current.userData.worldsCollisionZone === true) return null
+    if (current.userData.worldsCollisionSurface === true) return null
     const itemId = current.userData.worldsSceneItemId
     if (typeof itemId === 'string' && itemId.length > 0) return itemId
     current = current.parent
@@ -812,7 +923,14 @@ export function measureWorldsObjectBounds(
   target.traverse((object) => {
     if (object.userData.worldsSelectionHitbox === true) return
     if (object.userData.worldsSelectionSilhouette === true) return
-    if (object.userData.worldsCollisionZone === true) return
+    if (object.userData.worldsCollisionSurface === true) return
+
+    const customBounds = object.userData.worldsObjectBounds
+    if (customBounds instanceof THREE.Box3 && !customBounds.isEmpty()) {
+      childBounds.copy(customBounds).applyMatrix4(object.matrixWorld)
+      bounds.union(childBounds)
+      hasBounds = true
+    }
 
     const geometry = (object as THREE.Mesh | THREE.Points).geometry
     if (!geometry) return
@@ -837,6 +955,207 @@ export function measureWorldsObjectBounds(
 
 export function calculateWorldsSelectionBounds(target: THREE.Object3D): { center: THREE.Vector3; size: THREE.Vector3 } | null {
   return measureWorldsObjectBounds(target, new THREE.Box3(), new THREE.Box3(), new THREE.Vector3(), new THREE.Vector3())
+}
+
+export interface WorldsTransformPreviewResolution {
+  correctionDelta: [number, number, number]
+  reason: 'free' | 'snapped' | 'blocked' | 'invalid-candidate'
+  snappedPreset: null
+  snappedSurfaceId: string | null
+  snappedZoneId: null
+  collisionSafe: boolean
+  updates: WorldSceneItemTransformUpdate[]
+  valid: boolean
+}
+
+export function resolveWorldsTransformPreview({
+  mode,
+  activeItemId,
+  snapshot,
+  activeTransform,
+  localBoundsByItemId,
+  collisionSurfaces = [],
+  sceneItems = [],
+  sceneObjects,
+}: {
+  mode: WorldsTransformMode
+  activeItemId: string
+  snapshot: WorldSceneTransformSnapshot[]
+  activeTransform: WorldSceneItem['transform']
+  localBoundsByItemId: ReadonlyMap<string, WorldsCollisionBounds | null | undefined>
+  collisionSurfaces?: readonly WorldsResolvedCollisionSurface[]
+  sceneItems?: readonly WorldSceneItem[]
+  sceneObjects?: ReadonlyMap<string, THREE.Object3D>
+}): WorldsTransformPreviewResolution {
+  const baseUpdates = isWorldsBatchTransformSnapshot(snapshot)
+    ? createWorldSceneSelectionTransformUpdates({
+      mode,
+      activeItemId,
+      snapshot,
+      activeTransform,
+    })
+    : [{ itemId: activeItemId, transform: cloneWorldSceneTransform(activeTransform) }]
+
+  const placementItems = snapshot.map((entry) => ({
+    id: entry.itemId,
+    localBounds: localBoundsByItemId.get(entry.itemId),
+    startTransform: cloneWorldSceneTransform(entry.transform),
+  }))
+
+  if (collisionSurfaces.length === 0) {
+    const preview = {
+      correctionDelta: [0, 0, 0],
+      reason: 'free',
+      snappedPreset: null,
+      snappedSurfaceId: null,
+      snappedZoneId: null,
+      collisionSafe: true,
+      updates: baseUpdates.map(cloneTransformUpdate),
+      valid: true,
+    }
+    if (mode !== 'translate' || !sceneObjects || sceneItems.length === 0) return preview
+
+    const baseSupport = resolveWorldsBaseSceneSupportPlacement({
+      anchorItemId: activeItemId,
+      items: placementItems,
+      desiredTransforms: preview.updates.map((entry) => ({ id: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })),
+      sceneItems,
+      sceneObjects,
+      ignoredItemIds: snapshot.map((entry) => entry.itemId),
+      maxCorrection: WORLDS_DRAG_BASE_SUPPORT_MAX_CORRECTION,
+    })
+    if (baseSupport.status !== 'applied') return preview
+
+    return {
+      ...preview,
+      correctionDelta: [...baseSupport.correctionDelta],
+      reason: 'snapped',
+      updates: baseSupport.updates.map(cloneTransformUpdate),
+    }
+  }
+
+  const desiredTransforms = baseUpdates.map((entry) => ({
+    id: entry.itemId,
+    transform: cloneWorldSceneTransform(entry.transform),
+  }))
+
+  if (!placementItems.every((entry) => !!entry.localBounds)) {
+    return {
+      correctionDelta: [0, 0, 0],
+      reason: 'free',
+      snappedPreset: null,
+      snappedSurfaceId: null,
+      snappedZoneId: null,
+      collisionSafe: false,
+      updates: baseUpdates.map(cloneTransformUpdate),
+      valid: true,
+    }
+  }
+
+  const resolved = resolveWorldsSurfacePlacement({
+    mode,
+    items: placementItems,
+    desiredTransforms,
+    surfaces: collisionSurfaces,
+  })
+
+  const preview = {
+    correctionDelta: resolved.acceptedTranslationDelta ?? [0, 0, 0],
+    reason: resolved.reason,
+    snappedPreset: null,
+    snappedSurfaceId: resolved.snappedSurfaceId,
+    snappedZoneId: null,
+    collisionSafe: resolved.reason !== 'invalid-candidate',
+    updates: resolved.resolvedTransforms.map((entry) => ({
+      itemId: entry.id,
+      transform: cloneWorldSceneTransform(entry.transform),
+    })),
+    valid: resolved.valid,
+  }
+
+  if (mode !== 'translate' || !preview.valid || !sceneObjects || sceneItems.length === 0) return preview
+
+  const baseSupport = resolveWorldsBaseSceneSupportPlacement({
+    anchorItemId: activeItemId,
+    items: placementItems,
+    desiredTransforms: preview.updates.map((entry) => ({ id: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })),
+    sceneItems,
+    sceneObjects,
+    ignoredItemIds: snapshot.map((entry) => entry.itemId),
+    maxCorrection: WORLDS_DRAG_BASE_SUPPORT_MAX_CORRECTION,
+  })
+  if (baseSupport.status !== 'applied') return preview
+
+  return {
+    ...preview,
+    correctionDelta: [
+      preview.correctionDelta[0] + baseSupport.correctionDelta[0],
+      preview.correctionDelta[1] + baseSupport.correctionDelta[1],
+      preview.correctionDelta[2] + baseSupport.correctionDelta[2],
+    ],
+    reason: preview.reason === 'blocked' ? 'blocked' : 'snapped',
+    updates: baseSupport.updates.map(cloneTransformUpdate),
+  }
+}
+
+function WorldsPendingSurfacePlacementController({
+  pendingItemId,
+  sceneItems,
+  selectedItemIds,
+  sceneObjectsRef,
+  localBoundsRef,
+  sceneObjectVersion,
+  sceneLoadRevision,
+  onCommitPendingSurfacePlacement,
+  onClearPendingSurfacePlacement,
+}: {
+  pendingItemId: string | null
+  sceneItems: readonly WorldSceneItem[]
+  selectedItemIds: readonly string[]
+  sceneObjectsRef: MutableRefObject<Map<string, THREE.Object3D>>
+  localBoundsRef: MutableRefObject<Map<string, WorldsCollisionBounds | null>>
+  sceneObjectVersion: number
+  sceneLoadRevision: number
+  onCommitPendingSurfacePlacement: (itemId: string, transform: WorldSceneItem['transform']) => void
+  onClearPendingSurfacePlacement: () => void
+}): null {
+  const handledPendingItemIdRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!pendingItemId) {
+      handledPendingItemIdRef.current = null
+      return
+    }
+    if (handledPendingItemIdRef.current === pendingItemId) return
+
+    const decision = resolveWorldsPendingSurfacePlacementDecision({
+      pendingItemId,
+      sceneItems,
+      sceneObjects: sceneObjectsRef.current,
+      localBoundsByItemId: localBoundsRef.current,
+      selectedItemIds,
+    })
+    if (decision.status === 'wait') return
+
+    handledPendingItemIdRef.current = pendingItemId
+    if (decision.status === 'commit') {
+      onCommitPendingSurfacePlacement(pendingItemId, decision.transform)
+      return
+    }
+    onClearPendingSurfacePlacement()
+  }, [
+    pendingItemId,
+    sceneItems,
+    sceneLoadRevision,
+    sceneObjectVersion,
+    localBoundsRef,
+    onClearPendingSurfacePlacement,
+    onCommitPendingSurfacePlacement,
+    sceneObjectsRef,
+    selectedItemIds,
+  ])
+
+  return null
 }
 
 function WorldsSelectionHitbox({
@@ -905,107 +1224,11 @@ function WorldsSelectionHitbox({
   )
 }
 
-function WorldCollisionZoneLayer({
-  collisionZones,
-  selectedCollisionZoneId,
-  transformMode,
-  draggingRef,
-  onSelectCollisionZone,
-  onDragEndSelectionBlock,
-  onTransformCollisionZone,
-}: {
-  collisionZones: WorldCollisionZone[]
-  selectedCollisionZoneId: string | null
-  transformMode: WorldsTransformMode | null
-  draggingRef: RefObject<boolean>
-  onSelectCollisionZone: (zoneId: string | null) => void
-  onDragEndSelectionBlock: () => void
-  onTransformCollisionZone: (zoneId: string, transform: WorldCollisionZone['transform']) => void
-}): JSX.Element | null {
-  if (collisionZones.length === 0) return null
-
-  return (
-    <>
-      {collisionZones.map((zone) => (
-        <WorldCollisionZoneObject
-          key={zone.id}
-          zone={zone}
-          selected={selectedCollisionZoneId === zone.id}
-          transformMode={transformMode}
-          draggingRef={draggingRef}
-          onSelectCollisionZone={onSelectCollisionZone}
-          onDragEndSelectionBlock={onDragEndSelectionBlock}
-          onTransformCollisionZone={onTransformCollisionZone}
-        />
-      ))}
-    </>
-  )
-}
-
-function WorldCollisionZoneObject({
-  zone,
-  selected,
-  transformMode,
-  draggingRef,
-  onSelectCollisionZone,
-  onDragEndSelectionBlock,
-  onTransformCollisionZone,
-}: {
-  zone: WorldCollisionZone
-  selected: boolean
-  transformMode: WorldsTransformMode | null
-  draggingRef: RefObject<boolean>
-  onSelectCollisionZone: (zoneId: string | null) => void
-  onDragEndSelectionBlock: () => void
-  onTransformCollisionZone: (zoneId: string, transform: WorldCollisionZone['transform']) => void
-}): JSX.Element {
-  const [zoneObject, setZoneObject] = useState<THREE.Mesh | null>(null)
-  const syncZone = useCallback(() => {
-    if (!zoneObject) return
-    onTransformCollisionZone(zone.id, {
-      position: zoneObject.position.toArray() as [number, number, number],
-      rotation: [zoneObject.rotation.x, zoneObject.rotation.y, zoneObject.rotation.z],
-      scale: zoneObject.scale.toArray().map((component) => Math.max(component, 0.05)) as [number, number, number],
-    })
-  }, [onTransformCollisionZone, zone.id, zoneObject])
-
-  return (
-    <>
-      <mesh
-        ref={setZoneObject}
-        userData={{ worldsCollisionZone: true }}
-        position={zone.transform.position}
-        rotation={zone.transform.rotation}
-        scale={zone.transform.scale}
-        onClick={(event) => {
-          event.stopPropagation()
-          onSelectCollisionZone(zone.id)
-        }}
-      >
-        <boxGeometry args={[1, 1, 1]} />
-        <meshBasicMaterial color={selected ? '#38bdf8' : '#f59e0b'} wireframe transparent opacity={selected ? 0.85 : 0.55} depthWrite={false} />
-      </mesh>
-      {selected && zoneObject && transformMode ? (
-        <TransformControls
-          object={zoneObject}
-          mode={transformMode}
-          space="local"
-          onMouseDown={() => {
-            draggingRef.current = true
-          }}
-          onMouseUp={() => {
-            draggingRef.current = false
-            onDragEndSelectionBlock()
-            syncZone()
-          }}
-          onObjectChange={syncZone}
-        />
-      ) : null}
-    </>
-  )
-}
-
 function WorldSceneItemGeometry({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element | null {
+  if (item.kind === 'gaussian-ply') {
+    if (!isWorldsGaussianPlyEnabled()) return null
+    return <LazyWorldsGaussianPlyObject itemId={item.id} url={item.url} onBoundsChange={onBoundsChange} />
+  }
   if (item.kind === 'ply-mesh' || item.kind === 'ply-points') {
     return <PlySceneObject item={item} onBoundsChange={onBoundsChange} />
   }
@@ -1238,7 +1461,11 @@ function WorldsTransformControls({
   mode,
   selectedItemId,
   selectedItems,
+  sceneItems,
+  collisionSurfaces,
   draggingRef,
+  sceneObjectsRef,
+  localBoundsRef,
   onDragEndSelectionBlock,
   onBoundsChange,
   onTransformItem,
@@ -1248,13 +1475,22 @@ function WorldsTransformControls({
   mode: WorldsTransformMode
   selectedItemId: string | null
   selectedItems: WorldSceneItem[]
+  sceneItems: readonly WorldSceneItem[]
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
   draggingRef: RefObject<boolean>
+  sceneObjectsRef: MutableRefObject<Map<string, THREE.Object3D>>
+  localBoundsRef: MutableRefObject<Map<string, WorldsCollisionBounds | null>>
   onDragEndSelectionBlock: () => void
   onBoundsChange: () => void
   onTransformItem: (itemId: string, transform: WorldSceneItem['transform']) => void
   onTransformItems: (updates: WorldSceneItemTransformUpdate[]) => void
 }): JSX.Element | null {
-  const transformSnapshotRef = useRef<WorldSceneTransformSnapshot[] | null>(null)
+  const dragSessionRef = useRef<{
+    collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
+    lastValidTransforms: WorldSceneItemTransformUpdate[]
+    localBoundsByItemId: Map<string, WorldsCollisionBounds | null>
+    snapshot: WorldSceneTransformSnapshot[]
+  } | null>(null)
 
   const createActiveTransform = useCallback((): WorldSceneItem['transform'] => ({
     position: object.position.toArray() as [number, number, number],
@@ -1263,39 +1499,94 @@ function WorldsTransformControls({
   }), [object])
 
   const takeSnapshot = useCallback(() => {
-    transformSnapshotRef.current = selectedItems.map((item) => ({
-      itemId: item.id,
-      transform: item.id === selectedItemId
-        ? createActiveTransform()
-        : {
-          position: [...item.transform.position],
-          rotation: [...item.transform.rotation],
-          scale: [...item.transform.scale],
-        },
-    }))
-  }, [createActiveTransform, selectedItemId, selectedItems])
+    const snapshot = selectedItems.map((item) => {
+      const selectedObject = sceneObjectsRef.current.get(item.id)
+      return {
+        itemId: item.id,
+        transform: selectedObject ? readWorldSceneTransformFromObject(selectedObject) : cloneWorldSceneTransform(item.transform),
+      }
+    })
+    const localBoundsByItemId = new Map<string, WorldsCollisionBounds | null>()
+    for (const entry of snapshot) {
+      const cachedBounds = localBoundsRef.current.get(entry.itemId)
+      if (cachedBounds) {
+        localBoundsByItemId.set(entry.itemId, cloneCollisionBounds(cachedBounds))
+        continue
+      }
+
+      const selectedObject = sceneObjectsRef.current.get(entry.itemId)
+      const measuredBounds = selectedObject ? calculateWorldsObjectLocalBounds(selectedObject) : null
+      localBoundsByItemId.set(entry.itemId, measuredBounds ? cloneCollisionBounds(measuredBounds) : null)
+      if (measuredBounds) localBoundsRef.current.set(entry.itemId, cloneCollisionBounds(measuredBounds))
+    }
+
+    dragSessionRef.current = {
+      collisionSurfaces: [...collisionSurfaces],
+      lastValidTransforms: snapshot.map((entry) => ({ itemId: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })),
+      localBoundsByItemId,
+      snapshot,
+    }
+  }, [collisionSurfaces, localBoundsRef, sceneObjectsRef, selectedItems])
 
   useEffect(() => {
     if (!shouldResetWorldsTransformSnapshot(draggingRef.current)) return
-    transformSnapshotRef.current = null
+    dragSessionRef.current = null
   }, [draggingRef, mode, object, selectedItemId, selectedItems])
 
-  const syncTransform = useCallback(() => {
-    if (!selectedItemId) return
-    const activeTransform = createActiveTransform()
-    const snapshot = transformSnapshotRef.current
-    if (!isWorldsBatchTransformSnapshot(snapshot)) {
-      onTransformItem(selectedItemId, activeTransform)
+  const restorePreviewTransforms = useCallback((updates: readonly WorldSceneItemTransformUpdate[]) => {
+    applyWorldSceneTransformUpdatesToObjects(sceneObjectsRef.current, updates)
+  }, [sceneObjectsRef])
+
+  const resolvePreview = useCallback((): WorldsTransformPreviewResolution | null => {
+    if (!selectedItemId) return null
+    if (!dragSessionRef.current) takeSnapshot()
+    const session = dragSessionRef.current
+    if (!session) return null
+
+    return resolveWorldsTransformPreview({
+      mode,
+      activeItemId: selectedItemId,
+      snapshot: session.snapshot,
+      activeTransform: createActiveTransform(),
+      localBoundsByItemId: session.localBoundsByItemId,
+      collisionSurfaces: session.collisionSurfaces,
+      sceneItems,
+      sceneObjects: sceneObjectsRef.current,
+    })
+  }, [createActiveTransform, mode, sceneItems, sceneObjectsRef, selectedItemId, takeSnapshot])
+
+  const previewTransform = useCallback(() => {
+    const preview = resolvePreview()
+    const session = dragSessionRef.current
+    if (!preview || !session) return
+    if (!preview.valid) {
+      restorePreviewTransforms(session.lastValidTransforms)
       return
     }
 
-    onTransformItems(createWorldSceneSelectionTransformUpdates({
-      mode,
-      activeItemId: selectedItemId,
-      snapshot,
-      activeTransform,
-    }))
-  }, [createActiveTransform, mode, onTransformItem, onTransformItems, selectedItemId])
+    restorePreviewTransforms(preview.updates)
+    session.lastValidTransforms = preview.updates.map(cloneTransformUpdate)
+  }, [resolvePreview, restorePreviewTransforms])
+
+  const commitTransform = useCallback(() => {
+    if (!selectedItemId) return
+    const session = dragSessionRef.current
+    if (!session) return
+    const preview = resolvePreview()
+    const committedUpdates = preview?.valid
+      ? preview.updates
+      : session.lastValidTransforms.length > 0
+        ? session.lastValidTransforms
+        : session.snapshot.map((entry) => ({ itemId: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) }))
+    restorePreviewTransforms(committedUpdates)
+
+    if (committedUpdates.length <= 1) {
+      onTransformItem(selectedItemId, cloneWorldSceneTransform(committedUpdates[0]?.transform ?? createActiveTransform()))
+      return
+    }
+
+    onTransformItems(committedUpdates.map(cloneTransformUpdate))
+  }, [createActiveTransform, onTransformItem, onTransformItems, resolvePreview, restorePreviewTransforms, selectedItemId])
 
   if (!selectedItemId) return null
 
@@ -1310,72 +1601,238 @@ function WorldsTransformControls({
       onMouseUp={() => {
         draggingRef.current = false
         onDragEndSelectionBlock()
-        syncTransform()
+        commitTransform()
         onBoundsChange()
-        transformSnapshotRef.current = null
+        dragSessionRef.current = null
       }}
       onObjectChange={() => {
-        if (!transformSnapshotRef.current) takeSnapshot()
-        syncTransform()
-        onBoundsChange()
+        previewTransform()
       }}
     />
   )
 }
 
+export function deriveWorldsCameraLimitsFromBounds(
+  bounds: WorldsCameraBounds,
+  position: THREE.Vector3,
+  target: THREE.Vector3,
+): Pick<WorldsCameraFitSnapshot, 'near' | 'far' | 'maxDistance'> {
+  const sizeLength = bounds.size.length()
+  const sceneRadius = Math.max(
+    Number.isFinite(sizeLength) ? sizeLength * 0.5 : 0,
+    WORLD_VIEWER_ORBIT_CONTROLS.minDistance,
+  )
+  const fallbackDistance = Math.max(sceneRadius * 2, WORLDS_DEFAULT_CAMERA_POSITION.length())
+  const sceneDistance = Number.isFinite(bounds.distance) && bounds.distance > 0
+    ? bounds.distance
+    : fallbackDistance
+  const cameraToCenter = position.distanceTo(bounds.center)
+  const safeCameraToCenter = Number.isFinite(cameraToCenter) ? cameraToCenter : sceneDistance
+  const viewDistance = position.distanceTo(target)
+  const safeViewDistance = Number.isFinite(viewDistance) ? viewDistance : sceneDistance
+  const nearestSceneDistance = Math.max(safeCameraToCenter - sceneRadius, 0)
+  const near = Math.max(
+    WORLDS_MIN_CAMERA_NEAR,
+    Math.min(
+      sceneDistance / 100,
+      nearestSceneDistance > 0 ? nearestSceneDistance / 10 : WORLDS_MIN_CAMERA_NEAR,
+    ),
+  )
+
+  return {
+    near,
+    far: Math.max(
+      near * 100,
+      sceneDistance * 100,
+      safeCameraToCenter + sceneRadius * 2,
+      safeViewDistance * 2,
+    ),
+    maxDistance: Math.max(
+      WORLD_VIEWER_ORBIT_CONTROLS.minDistance,
+      sceneDistance * 10,
+      safeViewDistance * 2,
+    ),
+  }
+}
+
+export function createWorldsInitialViewCameraFitSnapshot(
+  initialView: SceneArtifactManifestInitialView,
+  bounds: WorldsCameraBounds,
+): WorldsCameraFitSnapshot {
+  const position = new THREE.Vector3().fromArray(initialView.position)
+  const target = new THREE.Vector3().fromArray(initialView.target)
+  const up = initialView.up
+    ? new THREE.Vector3().fromArray(initialView.up)
+    : WORLDS_DEFAULT_CAMERA_UP.clone()
+
+  return {
+    position,
+    target,
+    up,
+    ...deriveWorldsCameraLimitsFromBounds(bounds, position, target),
+  }
+}
+
+export function createWorldsBoundsCameraFitSnapshot(
+  bounds: WorldsCameraBounds,
+  cameraUp: THREE.Vector3 = WORLDS_DEFAULT_CAMERA_UP,
+): WorldsCameraFitSnapshot {
+  const safeDistance = Number.isFinite(bounds.distance) && bounds.distance > 0
+    ? bounds.distance
+    : WORLDS_DEFAULT_CAMERA_POSITION.length()
+  worldsFitDirection.copy(WORLDS_DEFAULT_CAMERA_POSITION).sub(WORLDS_DEFAULT_CAMERA_TARGET).normalize()
+  const target = bounds.center.clone()
+  const position = worldsFitPosition.copy(target).addScaledVector(worldsFitDirection, safeDistance).clone()
+
+  return {
+    position,
+    target,
+    up: cameraUp.clone(),
+    ...deriveWorldsCameraLimitsFromBounds(bounds, position, target),
+  }
+}
+
+export function applyWorldsCameraFitLimits(
+  camera: THREE.Camera,
+  controls: WorldsOrbitControlsHandle | null,
+  snapshot: WorldsCameraFitSnapshot,
+): void {
+  if (
+    'near' in camera
+    && 'far' in camera
+    && typeof (camera as { updateProjectionMatrix?: unknown }).updateProjectionMatrix === 'function'
+  ) {
+    const clippingCamera = camera as THREE.PerspectiveCamera | THREE.OrthographicCamera
+    clippingCamera.near = snapshot.near
+    clippingCamera.far = snapshot.far
+    clippingCamera.updateProjectionMatrix()
+  }
+  if (controls) controls.maxDistance = snapshot.maxDistance
+}
+
+export function applyWorldsCameraFitSnapshot(
+  camera: THREE.Camera,
+  controls: WorldsOrbitControlsHandle | null,
+  snapshot: WorldsCameraFitSnapshot,
+): WorldsCameraFitSnapshot {
+  camera.position.copy(snapshot.position)
+  camera.up.copy(snapshot.up)
+  camera.lookAt(snapshot.target)
+  applyWorldsCameraFitLimits(camera, controls, snapshot)
+  camera.updateMatrixWorld()
+
+  if (controls) {
+    controls.target.copy(snapshot.target)
+    controls.update()
+    controls.saveState?.()
+  }
+
+  return snapshot
+}
+
+export function resolveAndApplyWorldsCameraFitSnapshot(
+  camera: THREE.Camera,
+  controls: WorldsOrbitControlsHandle | null,
+  snapshot: WorldsCameraFitSnapshot,
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[] = [],
+): WorldsCameraFitSnapshot {
+  const collisionSafeSnapshot = createCollisionSafeWorldsCameraFitSnapshot(snapshot, camera.position, collisionSurfaces)
+  return applyWorldsCameraFitSnapshot(camera, controls, collisionSafeSnapshot)
+}
+
+export function refreshWorldsCameraFitSnapshotLimits(
+  camera: THREE.Camera,
+  controls: WorldsOrbitControlsHandle | null,
+  snapshot: WorldsCameraFitSnapshot,
+  bounds: WorldsCameraBounds,
+): WorldsCameraFitSnapshot {
+  const refreshedSnapshot = {
+    position: snapshot.position.clone(),
+    target: snapshot.target.clone(),
+    up: snapshot.up.clone(),
+    ...deriveWorldsCameraLimitsFromBounds(bounds, snapshot.position, snapshot.target),
+  }
+  applyWorldsCameraFitLimits(camera, controls, refreshedSnapshot)
+  return refreshedSnapshot
+}
+
 function SceneFitController({
+  initialView,
   fitKey,
+  loadRevision,
   resetToken,
   orbitControlsRef,
   cameraFitSnapshotRef,
+  collisionSurfaces,
 }: {
+  initialView?: SceneArtifactManifestInitialView
   fitKey: string
+  loadRevision: number
   resetToken: number
   orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
-  cameraFitSnapshotRef: RefObject<WorldsCameraFitSnapshot | null>
+  cameraFitSnapshotRef: MutableRefObject<WorldsCameraFitSnapshot | null>
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
 }): null {
   const bounds = useBounds()
   const { camera } = useThree()
-
-  const applySnapshot = (snapshot: WorldsCameraFitSnapshot) => {
-    camera.position.copy(snapshot.position)
-    camera.near = snapshot.near
-    camera.far = snapshot.far
-    camera.updateProjectionMatrix()
-    camera.updateMatrixWorld()
-
-    const controls = orbitControlsRef.current
-    if (controls) {
-      controls.target.copy(snapshot.target)
-      controls.maxDistance = snapshot.maxDistance
-      controls.update()
-      controls.saveState?.()
-    }
-  }
+  const observedInitialViewRef = useRef(false)
+  const previousInitialViewRef = useRef<SceneArtifactManifestInitialView | undefined>(undefined)
+  const observedLoadRevisionRef = useRef(loadRevision)
 
   useEffect(() => {
     const shouldApplyInitialFit = cameraFitSnapshotRef.current === null
+    const initialViewChanged = observedInitialViewRef.current
+      && previousInitialViewRef.current !== initialView
     bounds.refresh()
-    const { center, distance } = bounds.getSize()
-    const safeDistance = Number.isFinite(distance) && distance > 0 ? distance : WORLDS_DEFAULT_CAMERA_POSITION.length()
-    worldsFitDirection.copy(WORLDS_DEFAULT_CAMERA_POSITION).sub(WORLDS_DEFAULT_CAMERA_TARGET).normalize()
-    const snapshot = {
-      position: worldsFitPosition.copy(center).addScaledVector(worldsFitDirection, safeDistance).clone(),
-      target: center.clone(),
-      near: safeDistance / 100,
-      far: safeDistance * 100,
-      maxDistance: safeDistance * 10,
+    const measuredBounds = bounds.getSize()
+    const desiredSnapshot = initialView
+      ? createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
+      : createWorldsBoundsCameraFitSnapshot(measuredBounds, camera.up)
+
+    if (shouldApplyInitialFit || initialViewChanged) {
+        cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
+          camera,
+          orbitControlsRef.current,
+          desiredSnapshot,
+          collisionSurfaces,
+        )
+      } else {
+        const collisionOrigin = cameraFitSnapshotRef.current?.position ?? camera.position
+        const resolvedSnapshot = createCollisionSafeWorldsCameraFitSnapshot(
+          desiredSnapshot,
+          collisionOrigin,
+          collisionSurfaces,
+        )
+      cameraFitSnapshotRef.current = resolvedSnapshot
+      applyWorldsCameraFitLimits(camera, orbitControlsRef.current, resolvedSnapshot)
     }
-    cameraFitSnapshotRef.current = snapshot
-    if (shouldApplyInitialFit) applySnapshot(snapshot)
-  }, [bounds, cameraFitSnapshotRef, fitKey])
+
+    previousInitialViewRef.current = initialView
+    observedInitialViewRef.current = true
+  }, [bounds, camera, cameraFitSnapshotRef, collisionSurfaces, fitKey, initialView, orbitControlsRef])
+
+  useEffect(() => {
+    const previousLoadRevision = observedLoadRevisionRef.current
+    observedLoadRevisionRef.current = loadRevision
+    if (!initialView || loadRevision === previousLoadRevision) return
+
+    const snapshot = cameraFitSnapshotRef.current
+    if (!snapshot) return
+    bounds.refresh()
+    cameraFitSnapshotRef.current = refreshWorldsCameraFitSnapshotLimits(
+      camera,
+      orbitControlsRef.current,
+      snapshot,
+      bounds.getSize(),
+    )
+  }, [bounds, camera, cameraFitSnapshotRef, initialView, loadRevision, orbitControlsRef])
 
   useEffect(() => {
     if (resetToken === 0) return
     const snapshot = cameraFitSnapshotRef.current
     if (!snapshot) return
-    applySnapshot(snapshot)
-  }, [cameraFitSnapshotRef, resetToken])
+    applyWorldsCameraFitSnapshot(camera, orbitControlsRef.current, snapshot)
+  }, [camera, cameraFitSnapshotRef, orbitControlsRef, resetToken])
 
   return null
 }
@@ -1384,10 +1841,12 @@ function SceneFocusController({
   focusRequest,
   orbitControlsRef,
   sceneObjectsRef,
+  collisionSurfaces,
 }: {
   focusRequest: { itemId: string; token: number } | null
   orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
   sceneObjectsRef: MutableRefObject<Map<string, THREE.Object3D>>
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
 }): null {
   const { camera } = useThree()
 
@@ -1396,13 +1855,18 @@ function SceneFocusController({
     const object = sceneObjectsRef.current.get(focusRequest.itemId)
     const controls = orbitControlsRef.current
     if (!object || !controls) return
-    focusWorldsCameraOnObject(camera, controls, object)
-  }, [camera, focusRequest, orbitControlsRef, sceneObjectsRef])
+    focusWorldsCameraOnObject(camera, controls, object, collisionSurfaces)
+  }, [camera, collisionSurfaces, focusRequest, orbitControlsRef, sceneObjectsRef])
 
   return null
 }
 
-export function focusWorldsCameraOnObject(camera: THREE.Camera, controls: WorldsOrbitControlsHandle, target: THREE.Object3D): boolean {
+export function focusWorldsCameraOnObject(
+  camera: THREE.Camera,
+  controls: WorldsOrbitControlsHandle,
+  target: THREE.Object3D,
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[] = [],
+): boolean {
   const bounds = calculateWorldsSelectionBounds(target)
   if (!bounds) return false
 
@@ -1426,11 +1890,99 @@ export function focusWorldsCameraOnObject(camera: THREE.Camera, controls: Worlds
   }
 
   distance = THREE.MathUtils.clamp(distance, WORLD_VIEWER_ORBIT_CONTROLS.minDistance, WORLD_VIEWER_ORBIT_CONTROLS.maxDistance)
-  camera.position.copy(bounds.center).addScaledVector(worldsFitDirection, distance)
+  const desiredPosition = worldsFitPosition.copy(bounds.center).addScaledVector(worldsFitDirection, distance)
+  camera.position.copy(resolveWorldsCameraPositionWithSurfaces(camera.position, desiredPosition, collisionSurfaces))
   controls.target.copy(bounds.center)
   camera.updateMatrixWorld()
   controls.update()
   return true
+}
+
+export function createCollisionSafeWorldsCameraFitSnapshot(
+  snapshot: WorldsCameraFitSnapshot,
+  currentPosition: THREE.Vector3,
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[],
+): WorldsCameraFitSnapshot {
+  if (collisionSurfaces.length === 0) return snapshot
+  return {
+    ...snapshot,
+    position: resolveWorldsCameraPositionWithSurfaces(currentPosition, snapshot.position, collisionSurfaces),
+  }
+}
+
+export function resolveWorldsCameraPositionWithSurfaces(
+  currentPosition: THREE.Vector3,
+  desiredPosition: THREE.Vector3,
+  collisionSurfaces: readonly WorldsResolvedCollisionSurface[],
+): THREE.Vector3 {
+  if (collisionSurfaces.length === 0) return desiredPosition.clone()
+  const resolution = resolveWorldSurfaceProbeTranslation({
+    position: surfaceVectorFromThree(currentPosition),
+    delta: {
+      x: desiredPosition.x - currentPosition.x,
+      y: desiredPosition.y - currentPosition.y,
+      z: desiredPosition.z - currentPosition.z,
+    },
+    probeHalfExtents: WORLD_CAMERA_COLLISION_HALF_EXTENTS,
+    surfaces: collisionSurfaces,
+  })
+  return setThreeFromSurfaceVector(worldsResolvedCameraPosition.clone(), resolution.position)
+}
+
+function applyWorldSceneTransformUpdatesToObjects(
+  sceneObjects: ReadonlyMap<string, THREE.Object3D>,
+  updates: readonly WorldSceneItemTransformUpdate[],
+): void {
+  for (const update of updates) {
+    const target = sceneObjects.get(update.itemId)
+    if (!target) continue
+    applyWorldSceneTransformToObject(target, update.transform)
+  }
+}
+
+function applyWorldSceneTransformToObject(target: THREE.Object3D, transform: WorldSceneItem['transform']): void {
+  target.position.fromArray(transform.position)
+  target.rotation.set(transform.rotation[0], transform.rotation[1], transform.rotation[2], 'XYZ')
+  target.scale.fromArray(transform.scale)
+  target.updateMatrixWorld(true)
+}
+
+function readWorldSceneTransformFromObject(target: THREE.Object3D): WorldSceneItem['transform'] {
+  return {
+    position: target.position.toArray() as [number, number, number],
+    rotation: [target.rotation.x, target.rotation.y, target.rotation.z],
+    scale: target.scale.toArray() as [number, number, number],
+  }
+}
+
+function cloneWorldSceneTransform(transform: WorldSceneItem['transform']): WorldSceneItem['transform'] {
+  return {
+    position: [...transform.position],
+    rotation: [...transform.rotation],
+    scale: [...transform.scale],
+  }
+}
+
+function cloneTransformUpdate(update: WorldSceneItemTransformUpdate): WorldSceneItemTransformUpdate {
+  return {
+    itemId: update.itemId,
+    transform: cloneWorldSceneTransform(update.transform),
+  }
+}
+
+function cloneCollisionBounds(bounds: WorldsCollisionBounds): WorldsCollisionBounds {
+  return {
+    min: { x: bounds.min.x, y: bounds.min.y, z: bounds.min.z },
+    max: { x: bounds.max.x, y: bounds.max.y, z: bounds.max.z },
+  }
+}
+
+function surfaceVectorFromThree(vector: THREE.Vector3): WorldsResolvedCollisionSurface['origin'] {
+  return { x: vector.x, y: vector.y, z: vector.z }
+}
+
+function setThreeFromSurfaceVector(target: THREE.Vector3, vector: WorldsResolvedCollisionSurface['origin']): THREE.Vector3 {
+  return target.set(vector.x, vector.y, vector.z)
 }
 
 class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element }, { message: string | null }> {

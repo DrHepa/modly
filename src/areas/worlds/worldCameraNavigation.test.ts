@@ -4,9 +4,11 @@ import path from 'node:path'
 import test from 'node:test'
 
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import { createWorldCollisionSurfacePreset } from './worldsCollisionSurfaces.ts'
 import {
-  buildWorldSceneCollisionAabbs,
+  applyWorldsKeyboardCameraPose,
   DEFAULT_WORLDS_CAMERA_STATE,
+  WORLD_CAMERA_COLLISION_HALF_EXTENTS,
   WORLD_CAMERA_LOOK_PITCH_LIMIT,
   WORLD_CAMERA_SPEED_PRESETS,
   clampWorldsCameraSpeed,
@@ -20,6 +22,7 @@ import {
   shouldIgnoreWorldCameraKeyTarget,
   updateWorldsMovementKeys,
 } from './worldCameraNavigation.ts'
+import { normalizeWorldSceneCollisionSurfaces } from './worldCameraNavigation.ts'
 
 const navigationSourcePath = path.join(import.meta.dirname, 'worldCameraNavigation.ts')
 
@@ -153,6 +156,122 @@ test('yaw helper falls back to camera look direction when target is at camera po
   assert.ok(Math.abs(yawedTarget.z - 5) < 1e-9)
 })
 
+test('keyboard pose helper restores A and D as pure strafing without yaw drift', () => {
+  const basePose = {
+    cameraPosition: { x: 0, y: 1, z: 5 },
+    target: { x: 0, y: 1, z: 0 },
+    speed: 2,
+    deltaSeconds: 0.5,
+  }
+
+  const strafeLeft = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    keys: { left: true },
+  })
+  const strafeRight = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    keys: { right: true },
+  })
+
+  assert.deepEqual(strafeLeft.cameraPosition, { x: -1, y: 1, z: 5 })
+  assert.deepEqual(strafeLeft.target, { x: -1, y: 1, z: 0 })
+  assert.deepEqual(strafeRight.cameraPosition, { x: 1, y: 1, z: 5 })
+  assert.deepEqual(strafeRight.target, { x: 1, y: 1, z: 0 })
+})
+
+test('keyboard pose helper restores Q and E as in-place yaw that preserves camera position', () => {
+  const basePose = {
+    cameraPosition: { x: 0, y: 1, z: 5 },
+    target: { x: 0, y: 1, z: 0 },
+    keys: {},
+    speed: 2,
+    deltaSeconds: 0.5,
+  }
+
+  const yawLeft = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    yawDirection: Math.PI / 2,
+  })
+  const yawRight = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    yawDirection: -Math.PI / 2,
+  })
+
+  assert.deepEqual(yawLeft.cameraPosition, basePose.cameraPosition)
+  assert.deepEqual(yawRight.cameraPosition, basePose.cameraPosition)
+  assert.ok(Math.abs(yawLeft.target.x + 5) < 1e-9)
+  assert.ok(Math.abs(yawLeft.target.y - 1) < 1e-9)
+  assert.ok(Math.abs(yawLeft.target.z - 5) < 1e-9)
+  assert.ok(Math.abs(yawRight.target.x - 5) < 1e-9)
+  assert.ok(Math.abs(yawRight.target.y - 1) < 1e-9)
+  assert.ok(Math.abs(yawRight.target.z - 5) < 1e-9)
+})
+
+test('keyboard pose helper restores Space and Shift as vertical translation of camera and target together', () => {
+  const basePose = {
+    cameraPosition: { x: 2, y: 1, z: 5 },
+    target: { x: 3, y: 2, z: 0 },
+    speed: 4,
+    deltaSeconds: 0.25,
+  }
+  const originalLookVector = {
+    x: basePose.target.x - basePose.cameraPosition.x,
+    y: basePose.target.y - basePose.cameraPosition.y,
+    z: basePose.target.z - basePose.cameraPosition.z,
+  }
+
+  const moveUp = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    keys: { up: true },
+  })
+  const moveDown = applyWorldsKeyboardCameraPose({
+    ...basePose,
+    keys: { down: true },
+  })
+
+  assert.equal(moveUp.cameraPosition.y - basePose.cameraPosition.y, 1)
+  assert.equal(moveUp.target.y - basePose.target.y, 1)
+  assert.equal(moveDown.cameraPosition.y - basePose.cameraPosition.y, -1)
+  assert.equal(moveDown.target.y - basePose.target.y, -1)
+  assert.deepEqual({
+    x: moveUp.target.x - moveUp.cameraPosition.x,
+    y: moveUp.target.y - moveUp.cameraPosition.y,
+    z: moveUp.target.z - moveUp.cameraPosition.z,
+  }, originalLookVector)
+  assert.deepEqual({
+    x: moveDown.target.x - moveDown.cameraPosition.x,
+    y: moveDown.target.y - moveDown.cameraPosition.y,
+    z: moveDown.target.z - moveDown.cameraPosition.z,
+  }, originalLookVector)
+})
+
+test('keyboard pose helper stays smooth across repeated frames without mediator reinterpretation', () => {
+  let pose = {
+    cameraPosition: { x: 0, y: 1, z: 5 },
+    target: { x: 0, y: 1, z: 0 },
+  }
+
+  for (let index = 0; index < 5; index += 1) {
+    const nextPose = applyWorldsKeyboardCameraPose({
+      ...pose,
+      keys: { left: true, forward: true },
+      speed: 2,
+      deltaSeconds: 0.25,
+    })
+    assert.ok(Math.abs((nextPose.cameraPosition.x - pose.cameraPosition.x) + Math.SQRT1_2 / 2) < 1e-9)
+    assert.ok(Math.abs((nextPose.cameraPosition.z - pose.cameraPosition.z) + Math.SQRT1_2 / 2) < 1e-9)
+    const lookVector = {
+      x: nextPose.target.x - nextPose.cameraPosition.x,
+      y: nextPose.target.y - nextPose.cameraPosition.y,
+      z: nextPose.target.z - nextPose.cameraPosition.z,
+    }
+    assert.ok(Math.abs(lookVector.x) < 1e-9)
+    assert.ok(Math.abs(lookVector.y) < 1e-9)
+    assert.ok(Math.abs(lookVector.z + 5) < 1e-9)
+    pose = nextPose
+  }
+})
+
 test('keyboard guard ignores editable controls, selectors, dialogs, and contenteditable targets', () => {
   assert.equal(shouldIgnoreWorldCameraKeyTarget({ tagName: 'INPUT' }), true)
   assert.equal(shouldIgnoreWorldCameraKeyTarget({ tagName: 'select' }), true)
@@ -202,37 +321,65 @@ test('camera state stays viewer-local and separate from world scene item asset d
   assert.deepEqual(sceneItem.transform, { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] })
 })
 
-test('collision helpers build transformed world AABBs from scene-level world collision zones', () => {
-  const collisions = buildWorldSceneCollisionAabbs([{
-    id: 'zone-1',
-    shape: 'box',
-    transform: { position: [10, 0, 0], rotation: [0, Math.PI / 2, 0], scale: [4, 2, 2] },
-  }])
+test('collision helpers normalize world collision surfaces for active keyboard navigation', () => {
+  const rect = createWorldCollisionSurfacePreset('wall', { id: 'wall-1' })
+  const tri = createWorldCollisionSurfacePreset('triangle', { id: 'tri-1' })
+  assert.ok(rect)
+  assert.ok(tri)
 
-  assert.equal(collisions.length, 1)
-  assert.equal(collisions[0]?.itemId, null)
-  assert.equal(collisions[0]?.zoneId, 'zone-1')
-  assert.deepEqual(collisions[0]?.min, { x: 9, y: -1, z: -2 })
-  assert.ok(collisions[0])
-  assert.ok(Math.abs(collisions[0]!.max.x - 11) < 1e-9)
-  assert.ok(Math.abs(collisions[0]!.max.y - 1) < 1e-9)
-  assert.ok(Math.abs(collisions[0]!.max.z - 2) < 1e-9)
+  const collisions = normalizeWorldSceneCollisionSurfaces([rect!, tri!])
+
+  assert.equal(collisions.length, 2)
+  assert.equal(collisions[0]?.id, 'wall-1')
+  assert.equal(collisions[1]?.id, 'tri-1')
 })
 
-test('collision helpers block direct penetration and allow axis slide for keyboard movement', () => {
-  const collisions = [{
-    itemId: 'world:block',
-    zoneId: 'zone-1',
-    min: { x: -0.5, y: -0.5, z: -0.5 },
-    max: { x: 0.5, y: 0.5, z: 0.5 },
-  }]
+test('collision helpers use the surface solver for keyboard movement without changing the direct movement semantics', () => {
+  const wall = createWorldCollisionSurfacePreset('wall', { id: 'wall' })
+  assert.ok(wall)
+  const collisions = normalizeWorldSceneCollisionSurfaces([wall!])
 
-  assert.deepEqual(
-    resolveWorldCameraCollisionMovement({ x: -1, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, collisions),
-    { x: 0, y: 0, z: 0 },
+  const unblocked = resolveWorldCameraCollisionMovement(
+    { x: 1.7, y: 0, z: 1.7 },
+    { x: 0.2, y: 0, z: 0 },
+    collisions,
   )
-  assert.deepEqual(
-    resolveWorldCameraCollisionMovement({ x: -1, y: 0, z: -0.7 }, { x: 1, y: 0, z: 1 }, collisions),
-    { x: 0, y: 0, z: 1 },
+  const blocked = resolveWorldCameraCollisionMovement(
+    { x: 0, y: 0, z: -1 },
+    { x: 0, y: 0, z: 2 },
+    collisions,
   )
+
+  assert.deepEqual(unblocked, { x: 0.2, y: 0, z: 0 })
+  assert.equal(blocked.x, 0)
+  assert.equal(blocked.y, 0)
+  assert.ok(blocked.z > 0.79)
+  assert.ok(blocked.z < 0.81)
+})
+
+test('keyboard pose helper uses collision surfaces to clamp forward motion at walls', () => {
+  const wall = createWorldCollisionSurfacePreset('wall', { id: 'wall' })
+  assert.ok(wall)
+  const collisionSurfaces = normalizeWorldSceneCollisionSurfaces([wall!])
+
+  const pose = applyWorldsKeyboardCameraPose({
+    cameraPosition: { x: 0, y: 0, z: -1 },
+    target: { x: 0, y: 0, z: -3 },
+    keys: { backward: true },
+    speed: 4,
+    deltaSeconds: 0.5,
+    collisionSurfaces,
+    collisionHalfExtents: WORLD_CAMERA_COLLISION_HALF_EXTENTS,
+  })
+
+  assert.ok(pose.cameraPosition.z < -0.19)
+  assert.ok(pose.cameraPosition.z > -0.21)
+  assert.ok(pose.target.z < -2.19)
+})
+
+test('camera navigation source keeps right-drag pan and wheel on original OrbitControls without a collision mediator', async () => {
+  const source = await readFile(navigationSourcePath, 'utf8')
+
+  assert.equal(source.includes('collisionZones'), false)
+  assert.equal(source.includes('buildWorldSceneCollisionAabbs'), false)
 })

@@ -1,4 +1,5 @@
 import { classifyPlyHeader } from './plyClassification.ts'
+import type { PlyKind } from '../../shared/ply/plyHeaderClassification.ts'
 
 export type WorldAssetKind = 'glb' | 'gltf' | 'ply-mesh' | 'ply-points' | 'gaussian-ply' | 'spz'
 export type WorldSceneItemRole = 'asset' | 'base-scene'
@@ -14,7 +15,7 @@ export interface WorldSceneItem {
   id: string
   workspacePath: string
   url: string
-  kind: Exclude<WorldAssetKind, 'gaussian-ply' | 'spz'>
+  kind: Exclude<WorldAssetKind, 'spz'>
   role: WorldSceneItemRole
   visible: boolean
   animation?: WorldSceneItemAnimationBinding
@@ -53,10 +54,19 @@ export type WorldRenderable =
   | { openable: true; item: WorldSceneItem }
   | { openable: false; reason: WorldUnsupportedReason }
 
+export const WORLDS_EXPERIMENTAL_FEATURES = {
+  gaussianPly: false,
+} as const
+
+export function isWorldsGaussianPlyEnabled(): boolean {
+  return WORLDS_EXPERIMENTAL_FEATURES.gaussianPly
+}
+
 export interface WorldRenderableInput {
   workspacePath: string
   url?: string
   apiUrl?: string
+  plyKind?: PlyKind
   header?: string
 }
 
@@ -106,9 +116,13 @@ export function resolveWorldRenderable(input: WorldRenderableInput): WorldRender
     return { openable: true, item: createSceneItem(workspacePath, extension.slice(1) as 'glb' | 'gltf', input) }
   }
   if (extension === '.ply') {
-    const classification = input.header ? classifyPlyHeader(input.header) : undefined
-    if (classification?.kind === 'gaussian') return { openable: false, reason: 'unsupported-gaussian-ply' }
-    const kind = classification?.kind === 'standard-points' ? 'ply-points' : 'ply-mesh'
+    const resolvedPlyKind = input.plyKind ?? (input.header ? classifyPlyHeader(input.header).plyKind : undefined)
+    if (resolvedPlyKind === 'gaussian') {
+      if (!isWorldsGaussianPlyEnabled()) return { openable: false, reason: 'unsupported-gaussian-ply' }
+      return { openable: true, item: createSceneItem(workspacePath, 'gaussian-ply', input) }
+    }
+    if (resolvedPlyKind === 'unknown') return { openable: false, reason: 'unavailable' }
+    const kind = resolvedPlyKind === 'points' ? 'ply-points' : 'ply-mesh'
     return { openable: true, item: createSceneItem(workspacePath, kind, input) }
   }
 

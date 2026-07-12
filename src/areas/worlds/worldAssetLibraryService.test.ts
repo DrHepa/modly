@@ -35,7 +35,8 @@ function installLibraryWindow(stubs: {
                     sourceScope: 'workflows',
                     capability: 'generated-world',
                     state: 'ready',
-                    previewKind: '3d-model',
+                    plyKind: 'mesh',
+                    previewKind: 'binary',
                     warnings: [],
                     provenance: { graphId: 'hidden' },
                   },
@@ -46,16 +47,17 @@ function installLibraryWindow(stubs: {
                     sourceScope: 'exports',
                     capability: 'mesh',
                     state: 'ready',
+                    plyKind: 'mesh',
                     previewKind: '3d-model',
                     warnings: [],
                   },
                   {
                     id: 'gaussian',
-                    workspacePath: 'Workflows/worldmirror/result/point_cloud_1499.spz',
+                    workspacePath: 'Workflows/worldmirror/result/point_cloud_1499.ply',
                     displayName: 'Gaussian splat',
                     sourceScope: 'workflows',
-                    capability: 'generated-world',
-                    state: 'ready',
+                    state: 'unknown-metadata',
+                    plyKind: 'gaussian',
                     previewKind: 'binary',
                     warnings: ['hidden detail'],
                   },
@@ -104,7 +106,7 @@ function installLibraryWindow(stubs: {
                   sourceScope: 'workflows',
                   capability: 'generated-world',
                   state: 'ready',
-                  previewKind: '3d-model',
+                  ...(request.workspacePath.endsWith('.ply') ? { plyKind: 'mesh' as const, previewKind: 'binary' as const } : { previewKind: '3d-model' as const }),
                   warnings: [],
                   provenance: { graphId: 'hidden' },
                 },
@@ -138,7 +140,7 @@ test('world asset library service lists shared-contract workspace renderables ac
   assert.deepEqual(result.assets.map((asset) => ({ id: asset.id, sourceScope: asset.sourceScope, capability: asset.capability, displayName: asset.displayName, openable: asset.openable })), [
     { id: 'world-mesh', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Fuse simplified', openable: true },
     { id: 'export-mesh', sourceScope: 'exports', capability: 'mesh', displayName: 'Hero export', openable: true },
-    { id: 'gaussian', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Gaussian splat', openable: false },
+    { id: 'gaussian', sourceScope: 'workflows', capability: undefined, displayName: 'Gaussian splat', openable: false },
     { id: 'saved-scene', sourceScope: 'exports', capability: 'scene-manifest', displayName: 'Saved scene', openable: true },
     { id: 'walk-motion', sourceScope: 'workflows', capability: 'animation-motion', displayName: 'Walk motion', openable: true },
     { id: 'unsafe', sourceScope: 'workflows', capability: 'mesh', displayName: '../outside/hero.glb', openable: false },
@@ -157,8 +159,14 @@ test('world asset library service lists shared-contract workspace renderables ac
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
     })
   }
-  assert.equal(result.assets[2].openable, false)
-  if (result.assets[2].openable === false) assert.equal(result.assets[2].reason, 'unsupported-spz')
+  const gaussian = result.assets[2]
+  assert.equal(gaussian.openable, false)
+  assert.equal(gaussian.workspacePath, 'Workflows/worldmirror/result/point_cloud_1499.ply')
+  assert.equal(gaussian.plyKind, 'gaussian')
+  if (gaussian.openable === false) {
+    assert.equal(gaussian.type, 'Unsupported')
+    assert.equal(gaussian.reason, 'unsupported-gaussian-ply')
+  }
   assert.equal(result.assets[3].openable, true)
   if (result.assets[3].openable === true) assert.equal('sceneManifest' in result.assets[3], true)
   assert.equal(result.assets[4].openable, true)
@@ -173,6 +181,27 @@ test('world asset library service lists shared-contract workspace renderables ac
   }
   assert.deepEqual(result.assets[0].warnings, [])
   assert.deepEqual(result.assets[2].warnings, ['hidden detail'])
+})
+
+test('world asset library service fails safely when IPC success payload omits entries', async () => {
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      electron: {
+        workspace: {
+          library: {
+            list: async () => ({ success: true }),
+          },
+        },
+      },
+    },
+  })
+
+  const result = await listWorldAssetLibraryRenderables(API_URL)
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Workspace asset-library returned an invalid entries payload.',
+  })
 })
 
 test('world asset library service opens safe Workflows renderables and rejects unsafe requests before preload', async () => {

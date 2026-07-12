@@ -1,32 +1,35 @@
 import { useState, type ReactNode } from 'react'
 
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
-import type { WorldCollisionZone, WorldCollisionZonePreset } from '../worldsCollisionZones.ts'
+import type { WorldCollisionSurface, WorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
 
 export type WorldsTransformMode = 'translate' | 'rotate' | 'scale'
 
 interface WorldsTransformToolbarProps {
   items?: WorldSceneItem[]
-  collisionZones?: WorldCollisionZone[]
+  collisionSurfaces?: WorldCollisionSurface[]
   selectedItemId: string | null
   selectedItemIds?: string[]
   collisionEditMode?: boolean
-  selectedCollisionZoneId?: string | null
+  selectedCollisionSurfaceId?: string | null
   mode: WorldsTransformMode | null
   onSelectItem?: (itemId: string | null, options?: { preserveSelection?: boolean }) => void
   onModeChange: (mode: WorldsTransformMode | null) => void
   onRemoveItem?: (itemId: string | null) => void
-  onRemoveCollisionZone?: (zoneId: string | null) => void
+  onRemoveCollisionSurface?: (surfaceId: string | null) => void
   onToggleBaseSceneItem?: (itemId: string | null) => void
-  onAddCollisionZone?: (preset?: WorldCollisionZonePreset) => void
+  onAddCollisionSurface?: (preset?: WorldCollisionSurfacePreset) => void
   onCollisionEditModeChange?: (enabled: boolean) => void
-  onSelectCollisionZone?: (zoneId: string | null) => void
+  onSelectCollisionSurface?: (surfaceId: string | null) => void
 }
 
-const COLLISION_ZONE_PRESETS: { value: WorldCollisionZonePreset; label: string }[] = [
+const COLLISION_SURFACE_PRESETS: { value: WorldCollisionSurfacePreset; label: string }[] = [
+  { value: 'rectangle', label: 'Rectangle' },
+  { value: 'square', label: 'Square' },
+  { value: 'triangle', label: 'Triangle' },
   { value: 'wall', label: 'Wall' },
-  { value: 'blocker', label: 'Blocker' },
-  { value: 'floor-zone', label: 'Floor zone' },
+  { value: 'floor', label: 'Floor' },
+  { value: 'ramp', label: 'Ramp' },
 ]
 
 const TRANSFORM_MODES: { mode: WorldsTransformMode; label: string; icon: ReactNode }[] = [
@@ -69,33 +72,33 @@ const TRANSFORM_MODES: { mode: WorldsTransformMode; label: string; icon: ReactNo
 
 export function WorldsTransformToolbar({
   items = [],
-  collisionZones = [],
+  collisionSurfaces = [],
   selectedItemId,
   selectedItemIds = [],
   collisionEditMode = false,
-  selectedCollisionZoneId = null,
+  selectedCollisionSurfaceId = null,
   mode,
   onSelectItem = () => undefined,
   onModeChange,
   onRemoveItem = () => undefined,
-  onRemoveCollisionZone = () => undefined,
+  onRemoveCollisionSurface = () => undefined,
   onToggleBaseSceneItem = () => undefined,
-  onAddCollisionZone = () => undefined,
+  onAddCollisionSurface = () => undefined,
   onCollisionEditModeChange = () => undefined,
-  onSelectCollisionZone = () => undefined,
+  onSelectCollisionSurface = () => undefined,
 }: WorldsTransformToolbarProps): JSX.Element | null {
   const visibleItems = items.filter((item) => item.visible)
-  const [collisionPreset, setCollisionPreset] = useState<WorldCollisionZonePreset>('blocker')
-  if (visibleItems.length === 0 && collisionZones.length === 0) return null
+  const [collisionPreset, setCollisionPreset] = useState<WorldCollisionSurfacePreset>('rectangle')
+  if (visibleItems.length === 0 && collisionSurfaces.length === 0) return null
 
   const selectedItem = selectedItemId ? visibleItems.find((item) => item.id === selectedItemId) ?? null : null
   const selectedItemCount = selectedItemIds.length
-  const selectedCollisionZone = selectedCollisionZoneId ? collisionZones.find((zone) => zone.id === selectedCollisionZoneId) ?? null : null
-  const hasCollisionZones = collisionZones.length > 0
+  const selectedCollisionSurface = selectedCollisionSurfaceId ? collisionSurfaces.find((surface) => surface.id === selectedCollisionSurfaceId) ?? null : null
+  const hasCollisionSurfaces = collisionSurfaces.length > 0
   const activeTarget = resolveWorldsTransformToolbarTarget({
     collisionEditMode,
     selectedItem,
-    selectedCollisionZone,
+    selectedCollisionSurface,
   })
 
   return (
@@ -138,71 +141,71 @@ export function WorldsTransformToolbar({
       </button>
 
       <div className="flex items-center gap-1">
-        <label className="sr-only" htmlFor="worlds-collision-preset">Collision zone preset</label>
+        <label className="sr-only" htmlFor="worlds-collision-preset">Collision surface preset</label>
         <select
           id="worlds-collision-preset"
           value={collisionPreset}
-          aria-label="Collision zone preset"
-          onChange={(event) => setCollisionPreset(event.currentTarget.value as WorldCollisionZonePreset)}
+          aria-label="Collision surface preset"
+          onChange={(event) => setCollisionPreset(event.currentTarget.value as WorldCollisionSurfacePreset)}
           className="min-w-0 flex-1 rounded-lg border border-zinc-700/70 bg-zinc-900/90 px-2 py-1.5 text-[10px] font-semibold text-zinc-100 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {COLLISION_ZONE_PRESETS.map((preset) => (
+          {COLLISION_SURFACE_PRESETS.map((preset) => (
             <option key={preset.value} value={preset.value}>{preset.label}</option>
           ))}
         </select>
         <button
           type="button"
-          title="Add a world collision zone"
-          aria-label="Add collision zone"
-          onClick={() => onAddCollisionZone(collisionPreset)}
+          title="Add a world collision surface"
+          aria-label="Add collision surface"
+          onClick={() => onAddCollisionSurface(collisionPreset)}
           className="rounded-lg border border-zinc-700/70 px-2 py-1.5 text-[10px] font-semibold text-zinc-200 transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          Add collision zone
+          Add collision surface
         </button>
         <button
           type="button"
-          title={hasCollisionZones ? 'Show world collision zones' : 'Add a collision zone to edit collisions'}
-          aria-label="Edit collision zones"
+          title={hasCollisionSurfaces ? 'Show world collision surfaces' : 'Add a collision surface to edit collisions'}
+          aria-label="Edit collision surfaces"
           aria-pressed={collisionEditMode}
-          disabled={!hasCollisionZones}
+          disabled={!hasCollisionSurfaces}
           onClick={() => onCollisionEditModeChange(!collisionEditMode)}
           className={`rounded-lg px-2 py-1.5 text-[10px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 ${
             collisionEditMode ? 'bg-violet-600 text-white' : 'bg-zinc-900/70 text-zinc-300 hover:bg-zinc-800'
           }`}
         >
-          Edit zones
+          Edit surfaces
         </button>
       </div>
 
-      {hasCollisionZones ? (
+      {hasCollisionSurfaces ? (
         <div className="flex flex-col gap-1">
           <label className="flex flex-col gap-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-zinc-500">
-            Collision zone
+            Collision surface
             <select
-              value={selectedCollisionZoneId ?? ''}
-              aria-label="Select collision zone"
+              value={selectedCollisionSurfaceId ?? ''}
+              aria-label="Select collision surface"
               disabled={!collisionEditMode}
-              onChange={(event) => onSelectCollisionZone(event.currentTarget.value || null)}
+              onChange={(event) => onSelectCollisionSurface(event.currentTarget.value || null)}
               className="w-56 rounded-xl border border-zinc-700/70 bg-zinc-900/90 px-2.5 py-2 text-xs font-medium normal-case tracking-normal text-zinc-100 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <option value="">Select zone…</option>
-              {collisionZones.map((zone, index) => (
-                <option key={zone.id} value={zone.id}>{zone.label ?? `Zone ${index + 1}`}</option>
+              <option value="">Select surface…</option>
+              {collisionSurfaces.map((surface, index) => (
+                <option key={surface.id} value={surface.id}>{surface.label ?? `Surface ${index + 1}`}</option>
               ))}
             </select>
           </label>
-          {collisionEditMode ? <p className="text-[10px] text-zinc-400">World collision zones use the same move, rotate, and scale gizmo as scene assets.</p> : null}
+          {collisionEditMode ? <p className="text-[10px] text-zinc-400">World collision surfaces use the same move, rotate, and scale gizmo as scene assets.</p> : null}
         </div>
       ) : null}
 
       <div className="flex items-center gap-1">
         {TRANSFORM_MODES.map((entry) => {
           const hasTransformTarget = activeTarget !== 'none'
-          const title = activeTarget === 'collision-zone'
-            ? `${entry.label.replace('asset', 'collision zone')}`
+          const title = activeTarget === 'collision-surface'
+            ? `${entry.label.replace('asset', 'collision surface')}`
             : activeTarget === 'asset'
               ? entry.label
-              : 'Select an asset or collision zone to transform'
+              : 'Select an asset or collision surface to transform'
           return (
             <button
               key={entry.mode}
@@ -222,20 +225,20 @@ export function WorldsTransformToolbar({
         })}
         <button
           type="button"
-          title={activeTarget === 'collision-zone'
-            ? 'Remove selected collision zone'
+          title={activeTarget === 'collision-surface'
+            ? 'Remove selected collision surface'
             : activeTarget === 'asset'
               ? 'Remove selected asset from scene'
-              : 'Select an asset or collision zone to remove'}
-          aria-label={activeTarget === 'collision-zone' ? 'Remove selected collision zone' : 'Remove selected asset'}
+              : 'Select an asset or collision surface to remove'}
+          aria-label={activeTarget === 'collision-surface' ? 'Remove selected collision surface' : 'Remove selected asset'}
           disabled={activeTarget === 'none'}
           onClick={() => {
-            if (activeTarget === 'collision-zone') onRemoveCollisionZone(selectedCollisionZoneId)
+            if (activeTarget === 'collision-surface') onRemoveCollisionSurface(selectedCollisionSurfaceId)
             else if (activeTarget === 'asset') onRemoveItem(selectedItemId)
           }}
           className="ml-1 flex h-8 items-center justify-center rounded-lg border border-red-500/20 px-2 text-xs font-semibold text-red-200 transition-colors hover:border-red-400/50 hover:bg-red-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-red-500/20 disabled:hover:bg-transparent"
         >
-          {activeTarget === 'collision-zone' ? 'Remove zone' : 'Remove'}
+          {activeTarget === 'collision-surface' ? 'Remove surface' : 'Remove'}
         </button>
       </div>
     </div>
@@ -245,13 +248,13 @@ export function WorldsTransformToolbar({
 export function resolveWorldsTransformToolbarTarget({
   collisionEditMode,
   selectedItem,
-  selectedCollisionZone,
+  selectedCollisionSurface,
 }: {
   collisionEditMode: boolean
   selectedItem: WorldSceneItem | null
-  selectedCollisionZone: WorldCollisionZone | null
-}): 'collision-zone' | 'asset' | 'none' {
-  if (collisionEditMode && selectedCollisionZone) return 'collision-zone'
+  selectedCollisionSurface: WorldCollisionSurface | null
+}): 'collision-surface' | 'asset' | 'none' {
+  if (collisionEditMode && selectedCollisionSurface) return 'collision-surface'
   if (selectedItem) return 'asset'
   return 'none'
 }

@@ -71,13 +71,14 @@ test('WorldMirror result bundle falls back to fuse_post when simplified mesh is 
   assert.equal(result.item.kind, 'ply-mesh')
 })
 
-test('resolver defers spz and Gaussian PLY instead of pretending they are standard renderables', () => {
+test('resolver keeps spz unsupported but opens known Gaussian PLY as a native Worlds item', () => {
   assert.deepEqual(resolveWorldRenderable({ workspacePath: 'Workflows/run/point_cloud_1499.spz' }), {
     openable: false,
     reason: 'unsupported-spz',
   })
 
-  assert.deepEqual(resolveWorldRenderable({ workspacePath: 'Workflows/run/point_cloud_1499.ply', header: GAUSSIAN_HEADER }), {
+  const gaussian = resolveWorldRenderable({ workspacePath: 'Workflows/run/point_cloud_1499.ply', plyKind: 'gaussian' })
+  assert.deepEqual(gaussian, {
     openable: false,
     reason: 'unsupported-gaussian-ply',
   })
@@ -143,5 +144,12 @@ test('resolver preserves explicit remote urls but resolves workspace paths throu
   assert.deepEqual(resolveWorldRenderable({ workspacePath: '%2e%2e/outside/foo.ply', apiUrl }), {
     openable: false,
     reason: 'unsafe',
+  })
+})
+
+test('resolver fails closed for explicitly unknown PLY classification', () => {
+  assert.deepEqual(resolveWorldRenderable({ workspacePath: 'Workflows/run/broken.ply', plyKind: 'unknown' }), {
+    openable: false,
+    reason: 'unavailable',
   })
 })

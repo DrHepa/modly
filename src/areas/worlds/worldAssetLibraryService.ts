@@ -14,7 +14,7 @@ import {
 
 const UNSAFE_WORKSPACE_PATH_ERROR = 'World asset library service requires a safe workspace-relative path.'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Gaussian PLY' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
   | (WorkspaceAssetLibraryEntry & {
@@ -78,6 +78,9 @@ export function openWorldAssetLibraryRenderable(request: AssetLibraryOpenRequest
 
 export function projectWorldAssetLibraryListResult(result: AssetLibraryListResult, apiUrl: string): WorldAssetLibraryListResult {
   if (result.success !== true) return result
+  if (!Array.isArray(result.entries)) {
+    return { success: false, error: 'Workspace asset-library returned an invalid entries payload.' }
+  }
   return {
     success: true,
     assets: result.entries.filter(isWorldLibraryCandidate).map((entry) => projectWorldAssetLibraryEntry(entry, apiUrl)),
@@ -111,10 +114,10 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
   }
 
   if (entry.capability === 'animation-motion') {
-    const sourceWorkspacePath = entry.source?.relation === 'sidecar-source' ? entry.source.workspacePath : undefined
-    const safeSidecarPath = isSafeWorkspacePath(entry.workspacePath)
-    const safeSourcePath = typeof sourceWorkspacePath === 'string' && isSafeWorkspacePath(sourceWorkspacePath)
-    const linkedRenderable = safeSourcePath ? resolveWorldRenderable({ workspacePath: sourceWorkspacePath, apiUrl }) : null
+      const sourceWorkspacePath = entry.source?.relation === 'sidecar-source' ? entry.source.workspacePath : undefined
+      const safeSidecarPath = isSafeWorkspacePath(entry.workspacePath)
+      const safeSourcePath = typeof sourceWorkspacePath === 'string' && isSafeWorkspacePath(sourceWorkspacePath)
+      const linkedRenderable = safeSourcePath ? resolveWorldRenderable({ workspacePath: sourceWorkspacePath, apiUrl }) : null
 
     if (safeSidecarPath && safeSourcePath && sourceWorkspacePath && linkedRenderable?.openable === true) {
       return {
@@ -141,7 +144,7 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     }
   }
 
-  const renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl })
+  const renderable = resolveWorldRenderable({ workspacePath: entry.workspacePath, apiUrl, plyKind: entry.plyKind })
 
   if (renderable.openable) {
     return {
@@ -179,6 +182,8 @@ function describeRenderableType(renderable: Extract<WorldRenderable, { openable:
       return 'PLY mesh'
     case 'ply-points':
       return 'PLY points'
+    case 'gaussian-ply':
+      return 'Gaussian PLY'
   }
 }
 

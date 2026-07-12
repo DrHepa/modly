@@ -57,10 +57,17 @@ export interface SceneArtifactManifestPreview {
   video?: string
 }
 
+export interface SceneArtifactManifestInitialView {
+  position: [number, number, number]
+  target: [number, number, number]
+  up?: [number, number, number]
+}
+
 export interface SceneArtifactManifestV1 {
   schema: 'modly.scene-manifest.v1'
   sceneRoot: string
   preview?: SceneArtifactManifestPreview
+  initialView?: SceneArtifactManifestInitialView
   assets: unknown[]
 }
 

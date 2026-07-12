@@ -105,6 +105,183 @@ def test_generate_from_text_rejects_missing_or_blank_prompt_without_creating_job
     assert api_modules["generation_jobs"]._jobs == {}
 
 
+def test_generate_from_none_requires_none_model_and_passes_exact_empty_bytes(
+    client,
+    api_modules,
+    monkeypatch,
+):
+    assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "none"
+    captured: dict[str, object] = {}
+    original_generate = api_modules["fake_generator"].generate
+
+    def capture_generate(
+        image_bytes: bytes,
+        params: dict,
+        progress_cb=None,
+        cancel_event=None,
+    ):
+        captured["image_bytes"] = image_bytes
+        captured["params"] = dict(params)
+        return original_generate(
+            image_bytes,
+            params,
+            progress_cb,
+            cancel_event,
+        )
+
+    monkeypatch.setattr(
+        api_modules["fake_generator"],
+        "generate",
+        capture_generate,
+    )
+
+    response = client.post(
+        "/generate/from-none",
+        json={
+            "model_id": api_modules["valid_model_id"],
+            "collection": "NoneRuns",
+            "remesh": "none",
+            "enable_texture": False,
+            "texture_resolution": 1024,
+            "params": {
+                "seed": 7,
+                "filename": "none-output.glb",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    status_response = client.get(
+        f"/generate/status/{response.json()['job_id']}"
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "done"
+    assert captured == {
+        "image_bytes": b"",
+        "params": {
+            "remesh": "none",
+            "enable_texture": False,
+            "texture_resolution": 1024,
+            "seed": 7,
+            "filename": "none-output.glb",
+        },
+    }
+
+
+def test_generate_from_none_rejects_non_none_model_without_creating_job(
+    client,
+    api_modules,
+):
+    assert_backend_ready(client)
+
+    response = client.post(
+        "/generate/from-none",
+        json={
+            "model_id": api_modules["valid_model_id"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Model 'demo/fake' expects input 'image' but this endpoint received 'none'."
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_modules, image_upload):
+    assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "image"
+
+    image_response = client.post(
+        "/generate/from-image",
+        files={"image": image_upload},
+        data={"model_id": api_modules["valid_model_id"]},
+    )
+    assert image_response.status_code == 200
+
+    text_mismatch = client.post(
+        "/generate/from-text",
+        json={"prompt": "hello", "model_id": api_modules["valid_model_id"]},
+    )
+    assert text_mismatch.status_code == 400
+    assert text_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'image' but this endpoint received 'text'."
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "text"
+    text_response = client.post(
+        "/generate/from-text",
+        json={"prompt": "hello", "model_id": api_modules["valid_model_id"]},
+    )
+    assert text_response.status_code == 200
+
+    image_mismatch = client.post(
+        "/generate/from-image",
+        files={"image": image_upload},
+        data={"model_id": api_modules["valid_model_id"]},
+    )
+    assert image_mismatch.status_code == 400
+    assert image_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'text' but this endpoint received 'image'."
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "scene"
+    scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero.scene.json"
+    scene_manifest.parent.mkdir(parents=True, exist_ok=True)
+    scene_manifest.write_text(json.dumps({
+        "schema": "modly.scene-manifest.v1",
+        "sceneRoot": "Worlds/hero",
+        "assets": [],
+    }), encoding="utf-8")
+
+    scene_response = client.post(
+        "/generate/from-scene",
+        json={"scene_path": "Worlds/hero.scene.json", "model_id": api_modules["valid_model_id"]},
+    )
+    assert scene_response.status_code == 200
+
+    none_mismatch = client.post(
+        "/generate/from-none",
+        json={"model_id": api_modules["valid_model_id"]},
+    )
+    assert none_mismatch.status_code == 400
+    assert none_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'scene' but this endpoint received 'none'."
+
+
+def test_generate_from_image_accepts_legacy_missing_input_metadata(client, api_modules, image_upload):
+    assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("input", None)
+
+    response = client.post(
+        "/generate/from-image",
+        files={"image": image_upload},
+        data={"model_id": api_modules["valid_model_id"]},
+    )
+
+    assert response.status_code == 200
+
+
+def test_generate_routes_reject_blank_model_id_before_job_creation(client, api_modules, image_upload):
+    assert_backend_ready(client)
+
+    image_response = client.post(
+        "/generate/from-image",
+        files={"image": image_upload},
+        data={"model_id": "   "},
+    )
+    assert image_response.status_code == 400
+    assert image_response.json()["detail"] == "model_id is required"
+
+    none_response = client.post(
+        "/generate/from-none",
+        json={"model_id": "   "},
+    )
+    assert none_response.status_code == 400
+    assert none_response.json()["detail"] == "model_id is required"
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
 def test_generate_from_scene_validates_workspace_relative_scene_manifest_and_creates_job(client, api_modules, monkeypatch):
     assert_backend_ready(client)
 
@@ -267,6 +444,15 @@ def test_build_scene_candidate_keeps_mesh_outputs_as_mesh(api_modules):
         "output_url": "/workspace/Meshes/hero.glb",
         "display_name": "hero.glb",
     }
+
+
+def test_detect_output_kind_returns_none_for_unknown_outputs(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    opaque_output = api_modules["workspace_dir"] / "Meshes" / "opaque.bin"
+    opaque_output.parent.mkdir(parents=True, exist_ok=True)
+    opaque_output.write_bytes(b"opaque")
+
+    assert generation_jobs.detect_output_kind(opaque_output) is None
 
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry
@@ -432,6 +618,7 @@ def test_run_generation_logs_progress_done_and_error_without_changing_contracts_
             "progress": 100,
             "step": "Writing mesh",
             "output_url": "/workspace/Legacy/secret-output.glb",
+            "output_kind": "mesh",
             "error": None,
             "scene_candidate": {
                 "kind": "mesh",
@@ -472,4 +659,26 @@ def test_run_generation_logs_progress_done_and_error_without_changing_contracts_
     captured = capsys.readouterr()
     terminal_output = captured.out + captured.err
     assert "sensitive failure detail" not in terminal_output
+
+
+def test_run_generation_leaves_output_kind_empty_when_backend_cannot_determine_it(api_modules, monkeypatch):
+    generation_jobs = api_modules["generation_jobs"]
+
+    def generate_unknown_output(image_bytes: bytes, params: dict, progress_cb=None, cancel_event=None):
+        output_path = api_modules["workspace_dir"] / "Legacy" / "opaque-output.bin"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"opaque")
+        return output_path
+
+    monkeypatch.setattr(api_modules["fake_generator"], "generate", generate_unknown_output)
+
+    async def exercise_unknown_output_kind():
+        job = generation_jobs.create_job()
+        await generation_jobs._run_generation(job.job_id, image_bytes=b"png", params={}, collection="Legacy")
+        status = generation_jobs.get_job_status(job.job_id)
+        assert status.output_kind is None
+        assert status.scene_candidate is not None
+        assert status.scene_candidate.kind == "mesh"
+
+    asyncio.run(exercise_unknown_output_kind())
     assert "Traceback" not in terminal_output

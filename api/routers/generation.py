@@ -1,19 +1,24 @@
 import re as _re
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
-from schemas.generation import GenerateFromSceneRequest, GenerateFromTextRequest
+from schemas.generation import (
+    GenerateFromNoneRequest,
+    GenerateFromSceneRequest,
+    GenerateFromTextRequest,
+)
 from services.generator_registry import generator_registry
 from services.generation_jobs import (
     cancel_job as cancel_generation_job,
     create_from_image_job,
+    create_from_none_job,
     create_from_scene_job,
     create_from_text_job,
     get_job_status,
     parse_params_object,
+    require_model_input,
     resolve_validated_scene_manifest_path,
     validate_image_upload,
     validate_scene_manifest_path,
-    validate_model_id,
 )
 
 router = APIRouter(tags=["generation"])
@@ -45,7 +50,7 @@ async def generate_from_image(
     # Sanitize collection name: strip, forbid path separators and special chars
     collection = sanitize_collection_name(collection)
 
-    validate_model_id(model_id)
+    model_id = require_model_input(model_id, "image")
 
     generator_registry.switch_model(model_id)
 
@@ -77,9 +82,9 @@ async def generate_from_text(
 
     collection = sanitize_collection_name(payload.collection)
 
-    validate_model_id(payload.model_id)
+    model_id = require_model_input(payload.model_id, "text")
 
-    generator_registry.switch_model(payload.model_id)
+    generator_registry.switch_model(model_id)
 
     full_params = {
         "remesh": payload.remesh,
@@ -92,6 +97,33 @@ async def generate_from_text(
     return {"job_id": job.job_id}
 
 
+@router.post("/from-none")
+async def generate_from_none(
+    payload: GenerateFromNoneRequest,
+    background_tasks: BackgroundTasks,
+):
+    if payload.remesh not in ("quad", "triangle", "none"):
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+
+    collection = sanitize_collection_name(payload.collection)
+    model_id = require_model_input(payload.model_id, "none")
+    generator_registry.switch_model(model_id)
+
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+    }
+
+    job = create_from_none_job(
+        background_tasks,
+        full_params,
+        collection,
+    )
+    return {"job_id": job.job_id}
+
+
 @router.post("/from-scene")
 async def generate_from_scene(
     payload: GenerateFromSceneRequest,
@@ -101,8 +133,7 @@ async def generate_from_scene(
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
 
     collection = sanitize_collection_name(payload.collection)
-    model_id = payload.model_id.strip()
-    validate_model_id(model_id)
+    model_id = require_model_input(payload.model_id, "scene")
     scene_path = validate_scene_manifest_path(payload.scene_path)
     scene_manifest_path = resolve_validated_scene_manifest_path(scene_path)
 

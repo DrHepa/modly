@@ -25,6 +25,7 @@ class WorkflowRunStatus(JobProgress):
             progress=job.progress,
             step=job.step,
             output_url=job.output_url,
+            output_kind=job.output_kind,
             error=job.error,
             scene_candidate=job.scene_candidate,
         )

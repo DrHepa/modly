@@ -15,6 +15,14 @@ import { parseExtensionRegistrationPendingName } from './extension-install-recov
 
 // Shared with the installer so every discovery surface hides in-flight replacements.
 export const activeExtensionInstalls = new Set<string>()
+import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest.ts'
+import {
+  normalizeHttpsDownloads,
+  type HttpsDownloadAsset,
+} from './https-download-manifest.ts'
+import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
+
+export type ModelInputKind = string
 
 type AutomationCapabilityError = {
   source: 'backend-runtime' | 'electron-manifest'
@@ -29,6 +37,7 @@ type AutomationModelCapability = {
   source: 'backend-runtime'
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -130,6 +139,7 @@ export type AutomationCapabilitiesResponse = {
 type BackendModelStatus = {
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -220,6 +230,8 @@ export type ParsedManifest = {
     params_schema?:    unknown[]
     param_defaults?:   Record<string, unknown>
     hf_repo?:          string
+    hf_downloads?:     unknown
+    https_downloads?:  unknown
     download_check?:   string
     hf_skip_prefixes?: string[]
     hf_include_prefixes?: string[]
@@ -241,7 +253,8 @@ export type ParsedManifest = {
   }[]
 }
 
-export type ListedExtensionNode = ReturnType<typeof parseExtensionManifest>['nodes'][number]
+export type ListedExtensionNode<TInput extends ModelInputKind = ModelInputKind> =
+  ReturnType<typeof parseExtensionManifest>['nodes'][number] & { input: TInput }
 
 function normalizeProcessPorts(
   inputs: string[] | ProcessPort[] | undefined,
@@ -325,6 +338,10 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
 
 function isProcessPortType(value: unknown): value is ProcessPortType {
   return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+}
+
+function isModelInputKind(value: unknown): value is ModelInputKind {
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 function isWorkflowNodeComponent(value: unknown): value is WorkflowNodeComponent {
@@ -413,8 +430,43 @@ function isTrustedSource(source: string | undefined, trustedRepos: Set<string>):
   return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
 }
 
-export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
-  const extensionId = parsed.id ?? fallbackId
+function normalizeExtensionNodeInput(
+  value: string | undefined,
+  extensionType: 'model' | 'process',
+  context: string,
+): ModelInputKind {
+  if (value !== undefined && !isModelInputKind(value)) {
+    throw new Error(
+      context + " must be a non-empty string",
+    )
+  }
+
+  if (value === 'none') {
+    if (extensionType === 'process') {
+      throw new Error(
+        context + " may use 'none' only for model extension nodes",
+      )
+    }
+    return 'none'
+  }
+
+  return value ?? 'image'
+}
+
+export function parseExtensionManifest(
+  parsed: ParsedManifest,
+  fallbackId: string,
+  trustedRepos: Set<string>,
+  builtin = false,
+) {
+  const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
+  const extensionType = parsed.type === 'process' ? 'process' : 'model'
+  for (const node of parsed.nodes ?? []) {
+    assertSafeOwnershipSegment(node.id, 'Manifest node id')
+    if (node.weight_owner_id !== undefined) {
+      assertSafeOwnershipSegment(node.weight_owner_id, 'Manifest weight_owner_id')
+    }
+  }
   const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
   const common = {
     id:          parsed.id          ?? fallbackId,
@@ -438,7 +490,7 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
   if (weightGroups || parsed.nodes?.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
     validateModelNodeIds(parsed.nodes ?? [])
   }
-  const ownership = parsed.type === 'process' ? [] : describeModelOwnership(common.id, parsed.nodes ?? [])
+  const ownership = describeModelOwnership(common.id, parsed.nodes ?? [])
   const nodes = (parsed.nodes ?? []).map((n, index) => {
     const declaredInputs = Array.isArray(n.inputs) ? n.inputs : [n.input ?? 'image']
     const output = n.output ?? 'mesh'
@@ -468,20 +520,31 @@ export function parseExtensionManifest(parsed: ParsedManifest, fallbackId: strin
         `manifest.json: model node "${nodeId}" must use model_sources for private weights when weight_groups are declared`,
       )
     }
+    const capabilityId = `${extensionId}/${n.id}`
+    const hfDownloads = normalizeHfDownloads(n.hf_downloads, `${capabilityId}.hf_downloads`)
+    const httpsDownloads = normalizeHttpsDownloads(n.https_downloads, `${capabilityId}.https_downloads`)
+    if (httpsDownloads && ownership[index].sharedOwner) {
+      throw new Error(
+        capabilityId + '.https_downloads requires a dedicated weight owner; structured HTTPS plans cannot share an owner',
+      )
+    }
+    const hasModelAssets = Boolean(httpsDownloads || hfDownloads || n.hf_repo || n.download_check || n.weight_owner_id)
     return {
-      ...ownership[index],
+      ...(parsed.type !== 'process' || hasModelAssets ? ownership[index] : {}),
       ...(parsed.type === 'process' || n.automation
         ? { automation: normalizeCapabilityAutomationMetadata(n.automation) }
         : {}),
       id:             nodeId,
       name:           n.name ?? n.id,
-      input:          n.input  ?? 'image' as const,
+      input:          normalizeExtensionNodeInput(n.input, extensionType, `${capabilityId}.input`),
       inputs:         normalizeProcessPorts(n.inputs, n.input_contract),
       inputLabels:    n.input_labels,
       output:         n.output ?? 'mesh'  as const,
       paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
       paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
       hfRepo:         n.hf_repo,
+      ...(hfDownloads ? { hfDownloads } : {}),
+      ...(httpsDownloads ? { httpsDownloads } : {}),
       downloadCheck:  n.download_check,
       hfSkipPrefixes: n.hf_skip_prefixes,
       hfIncludePrefixes: n.hf_include_prefixes,
@@ -763,6 +826,7 @@ export async function getBackendModels(): Promise<{
           source: 'backend-runtime',
           id: status.id,
           name: status.name,
+          input: status.input,
           description: status.description,
           version: status.version,
           hf_repo: status.hf_repo,

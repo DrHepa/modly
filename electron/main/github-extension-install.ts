@@ -251,7 +251,9 @@ export async function validateInstallCandidates({ repoDir, sourceRepo, discovery
     if (roots.some((other) => confinedPath(other, root) || confinedPath(root, other))) throw new Error('Install candidate roots overlap')
     roots.push(root)
     await validateSourceTree(candidate.sourceDir)
-    candidates.push({ ...candidate, id, manifest: { ...candidate.manifest, id, source: canonicalizeGitHubRepoUrl(sourceRepo) } })
+    const manifest = { ...candidate.manifest, id, source: canonicalizeGitHubRepoUrl(sourceRepo) }
+    parseExtensionManifest(manifest, id, new Set(), false)
+    candidates.push({ ...candidate, id, manifest })
   }
   return { mode: discovery.mode, candidates, sourceRepo: canonicalizeGitHubRepoUrl(sourceRepo), reloadCount: 1 }
 }

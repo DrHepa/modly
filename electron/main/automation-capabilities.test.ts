@@ -414,3 +414,125 @@ test('parsed named ports reach the actual PROCESS consumer only through exact ha
     }), { nodeId: 'compose' })
   }
 })
+
+test('parseExtensionManifest rejects unsafe ownership identifiers while preserving legitimate ids', () => {
+  const parse = (id: string, nodeId: string, ownerId?: string) => parseExtensionManifest(
+    {
+      id,
+      type: 'model',
+      nodes: [{
+        id: nodeId,
+        input: 'text',
+        output: 'mesh',
+        ...(ownerId === undefined ? {} : { weight_owner_id: ownerId }),
+      }],
+    },
+    'safe-extension',
+    new Set(),
+    false,
+  )
+
+  const valid = parse('image_model.v2', 'Generate_V2', 'shared-weights.v1')
+  assert.equal(valid.id, 'image_model.v2')
+  assert.equal(valid.nodes[0].capabilityId, 'image_model.v2/Generate_V2')
+  assert.equal(valid.nodes[0].weightOwnerId, 'image_model.v2/shared-weights.v1')
+
+  for (const [id, nodeId, ownerId] of [
+    ['../escape', 'generate', undefined],
+    ['safe-extension', '..', undefined],
+    ['safe-extension', 'nested/node', undefined],
+    ['safe-extension', 'generate', '../outside'],
+    ['safe-extension', 'generate', '..\\outside'],
+    ['safe-extension', 'generate', 'bad\u0000owner'],
+  ] as Array<[string, string, string | undefined]>) {
+    assert.throws(
+      () => parse(id, nodeId, ownerId),
+      /invalid|absolute path|path separators|control characters|must match/i,
+    )
+  }
+})
+
+test('parseExtensionManifest rejects structured HTTPS plans on shared weight owners', () => {
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'gaussiangpt',
+        type: 'model',
+        nodes: [
+          {
+            id: 'vfront',
+            input: 'none',
+            output: 'mesh',
+            weight_owner_id: 'shared-weights',
+            https_downloads: [{
+              url: 'https://assets.example/vfront.bin',
+              filename: 'vfront.bin',
+              size_bytes: 5,
+              sha256: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            }],
+          },
+          {
+            id: 'both',
+            input: 'none',
+            output: 'mesh',
+            weight_owner_id: 'shared-weights',
+          },
+        ],
+      },
+      'gaussiangpt',
+      new Set(),
+      false,
+    ),
+    /https_downloads requires a dedicated weight owner/i,
+  )
+})
+
+test('parseExtensionManifest validates input shape while preserving custom metadata', () => {
+  for (const input of [null, 42, false, [], {}, '', '   ']) {
+    assert.throws(
+      () => parseExtensionManifest(
+        {
+          id: 'broken-model',
+          type: 'model',
+          nodes: [{ id: 'generate', input: input as never, output: 'mesh' }],
+        },
+        'broken-model',
+        new Set(),
+        false,
+      ),
+      /must be a non-empty string/i,
+    )
+  }
+
+  for (const type of ['model', 'process'] as const) {
+    for (const input of ['capture', 'custom-input']) {
+      const parsed = parseExtensionManifest(
+        { id: 'custom-model', type, nodes: [{ id: 'generate', input, output: 'video' }] },
+        'custom-model', new Set(), false,
+      )
+      assert.equal(parsed.nodes[0].input, input)
+    }
+    const legacy = parseExtensionManifest(
+      { id: 'legacy-model', type, nodes: [{ id: 'generate', output: 'mesh' }] },
+      'legacy-model', new Set(), false,
+    )
+    assert.equal(legacy.nodes[0].input, 'image')
+  }
+})
+
+test('parseExtensionManifest rejects input none on process extensions', () => {
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'broken-process',
+        type: 'process',
+        entry: 'processor.js',
+        nodes: [{ id: 'optimize', input: 'none', output: 'mesh' }],
+      },
+      'broken-process',
+      new Set(),
+      false,
+    ),
+    /may use 'none' only for model extension nodes/i,
+  )
+})

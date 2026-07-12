@@ -40,17 +40,56 @@ export {}
 // ─── Extension types ──────────────────────────────────────────────────────────
 
 export type WorkflowNodeComponent = 'video-preview'
+export type ModelInputKind = string
 
-export interface ExtensionNode {
+export interface HfDownloadFile {
+  path: string
+  sha256?: string
+}
+
+export interface HfDownloadDescriptor {
+  repoId: string
+  revision: string
+  targetSubdir: string
+  files: HfDownloadFile[]
+}
+
+export interface HttpsDownloadAsset {
+  url: string
+  filename: string
+  sizeBytes: number
+  sha256: string
+}
+
+export interface ModelDownloadFailure {
+  code: string
+  stage: string
+  message: string
+  repoId?: string
+  file?: string
+  retryable: boolean
+}
+
+export interface ModelDownloadResult {
+  success: boolean
+  error?: string
+  failure?: ModelDownloadFailure
+}
+
+export interface ExtensionNode<
+  TInput extends ModelInputKind = ModelInputKind,
+> {
   id:               string
   name:             string
-  input:            string
+  input:            TInput
   inputs?:          string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
   output:           string
   paramsSchema:     RawParamSchema[]
   paramDefaults?:   Record<string, boolean | number | string>
   hfRepo?:          string
+  hfDownloads?:     HfDownloadDescriptor[]
+  httpsDownloads?:  HttpsDownloadAsset[]
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
   capabilityId?:    string
@@ -101,6 +140,8 @@ export interface ModelOwnershipMetadata {
   weightOwnerId: string
   sharedOwner: boolean
   legacyPaths: string[]
+  hfDownloads?: HfDownloadDescriptor[]
+  httpsDownloads?: HttpsDownloadAsset[]
 }
 
 export interface WeightVariantsInfo {
@@ -957,6 +998,7 @@ export interface AutomationModelCapability {
   source: 'backend-runtime'
   id: string
   name: string
+  input?: ModelInputKind
   description?: string
   version?: string
   hf_repo?: string
@@ -1123,6 +1165,8 @@ declare global {
         /** Installed variant ids, or null when the node's install state could not be read */
         installedWeightVariants: (modelId: string) => Promise<string[] | null>
         deleteWeightVariant: (modelId: string, variantId: string) => Promise<{ success: boolean; error?: string }>
+        downloadAssets:      (modelId: string) => Promise<ModelDownloadResult>
+        downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>
         runtimeReadiness: (modelIds: string[]) => Promise<RuntimeReadinessResponse>
@@ -1135,6 +1179,8 @@ declare global {
           file?: string
           fileIndex?: number
           totalFiles?: number
+          repoIndex?: number
+          totalRepos?: number
           status?: string
           bytesDownloaded?: number
           totalBytes?: number

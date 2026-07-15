@@ -91,7 +91,7 @@ type WorkflowNodeComponent = 'video-preview'
 type LegacyProcessPortContract = {
   name?: string
   label?: string
-  type?: ProcessPortType
+  type?: ProcessPortType | 'json'
   required?: boolean
 }
 
@@ -313,6 +313,11 @@ function isProcessPortType(value: unknown): value is ProcessPortType {
   return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
 }
 
+function normalizeLegacyArtifactKind(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  return value.toLowerCase() === 'json' ? 'scene' : value
+}
+
 function isModelInputKind(value: unknown): value is ModelInputKind {
   return value === 'none' || isProcessPortType(value)
 }
@@ -355,7 +360,8 @@ function normalizeLegacyProcessPort(
   inputType: ProcessPortType,
   contract: LegacyProcessPortContract | undefined,
 ): ProcessPort {
-  const contractType = isProcessPortType(contract?.type) ? contract.type : undefined
+  const normalizedContractType = normalizeLegacyArtifactKind(contract?.type)
+  const contractType = isProcessPortType(normalizedContractType) ? normalizedContractType : undefined
   const type = contractType === inputType ? contractType : inputType
   const fallbackName = contract?.name?.trim() || type
   const fallbackLabel = contract?.label?.trim()
@@ -377,18 +383,51 @@ function normalizeProcessPorts(
   return inputs
     .map((input, index) => {
       if (typeof input === 'string') {
-        if (!isProcessPortType(input)) return undefined
-        return normalizeLegacyProcessPort(input, inputContract?.[index])
+        const normalizedInput = normalizeLegacyArtifactKind(input)
+        if (!isProcessPortType(normalizedInput)) return undefined
+        return normalizeLegacyProcessPort(normalizedInput, inputContract?.[index])
       }
+
+      const normalizedType = normalizeLegacyArtifactKind(input.type)
+      if (!isProcessPortType(normalizedType)) return undefined
 
       return {
         name: input.name,
         ...(input.label ? { label: input.label } : {}),
-        type: input.type,
+        type: normalizedType,
         required: input.required ?? true,
       }
     })
     .filter((input): input is ProcessPort => Boolean(input))
+}
+
+function normalizeListedExtensionFallback(extensionDirName: string, isBuiltin: boolean): ListedModelExtension {
+  return {
+    type: 'model',
+    id: extensionDirName,
+    name: extensionDirName,
+    trusted: isBuiltin,
+    builtin: isBuiltin,
+    nodes: [],
+  }
+}
+
+function buildManifestInvalidError(
+  extensionDirName: string,
+  manifestFile: string,
+  error: unknown,
+): AutomationCapabilityError {
+  return {
+    source: 'electron-manifest',
+    code: 'PROCESS_DISCOVERY_MANIFEST_INVALID',
+    message: `Failed to parse ${manifestFile} for extension '${extensionDirName}'.`,
+    retryable: false,
+    context: {
+      extension_id: extensionDirName,
+      manifest_file: manifestFile,
+      error: error instanceof Error ? error.message : String(error),
+    },
+  }
 }
 
 type ListedExtensionCommon<
@@ -463,13 +502,15 @@ function normalizeExtensionNodeInput(
   extensionType: 'model' | 'process',
   context: string,
 ): ModelInputKind {
-  if (value !== undefined && !isModelInputKind(value)) {
+  const normalizedValue = normalizeLegacyArtifactKind(value)
+
+  if (normalizedValue !== undefined && !isModelInputKind(normalizedValue)) {
     throw new Error(
       context + " must be one of: image, text, mesh, scene, audio, video, none",
     )
   }
 
-  if (value === 'none') {
+  if (normalizedValue === 'none') {
     if (extensionType === 'process') {
       throw new Error(
         context + " may use 'none' only for model extension nodes",
@@ -478,7 +519,7 @@ function normalizeExtensionNodeInput(
     return 'none'
   }
 
-  return value ?? 'image'
+  return normalizedValue ?? 'image'
 }
 
 export function parseExtensionManifest(
@@ -566,7 +607,7 @@ export function parseExtensionManifest(
         extensionType,
         capabilityId + '.input',
       ),
-      output: node.output ?? 'mesh' as const,
+      output: isProcessPortType(normalizeLegacyArtifactKind(node.output)) ? normalizeLegacyArtifactKind(node.output) as ArtifactKind : 'mesh' as const,
       ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
       paramsSchema: node.params_schema ?? [],
       hfRepo: node.hf_repo,
@@ -614,7 +655,7 @@ async function readExtensionManifest(dir: string, extensionDirName: string): Pro
 async function readExtensionManifestDetailed(
   dir: string,
   extensionDirName: string,
-): Promise<{ manifest: ParsedManifest | null; errors: AutomationCapabilityError[] }> {
+): Promise<{ manifest: ParsedManifest | null; manifestFile: string | null; errors: AutomationCapabilityError[] }> {
   const errors: AutomationCapabilityError[] = []
 
   for (const manifestFile of ['manifest.json', 'package.json']) {
@@ -623,23 +664,13 @@ async function readExtensionManifestDetailed(
 
     try {
       const raw = await readFile(manifestPath, 'utf-8')
-      return { manifest: JSON.parse(raw) as ParsedManifest, errors }
+      return { manifest: JSON.parse(raw) as ParsedManifest, manifestFile, errors }
     } catch (error) {
-      errors.push({
-        source: 'electron-manifest',
-        code: 'PROCESS_DISCOVERY_MANIFEST_INVALID',
-        message: `Failed to parse ${manifestFile} for extension '${extensionDirName}'.`,
-        retryable: false,
-        context: {
-          extension_id: extensionDirName,
-          manifest_file: manifestFile,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      })
+      errors.push(buildManifestInvalidError(extensionDirName, manifestFile, error))
     }
   }
 
-  return { manifest: null, errors }
+  return { manifest: null, manifestFile: null, errors }
 }
 
 export async function readExtensionsFromDir(
@@ -655,19 +686,16 @@ export async function readExtensionsFromDir(
 
     return Promise.all(
       directories.map(async (entry) => {
-        const fallback: ListedModelExtension = {
-          type: 'model',
-          id: entry.name,
-          name: entry.name,
-          trusted: isBuiltin,
-          builtin: isBuiltin,
-          nodes: [],
-        }
+        const fallback = normalizeListedExtensionFallback(entry.name, isBuiltin)
 
         const manifest = await readExtensionManifest(dir, entry.name)
         if (!manifest) return fallback
 
-        return parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+        try {
+          return parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+        } catch {
+          return fallback
+        }
       }),
     )
   } catch {
@@ -704,7 +732,7 @@ export async function listVisibleExtensionsDetailed(options: {
   }
 }
 
-async function readExtensionsFromDirDetailed(
+export async function readExtensionsFromDirDetailed(
   dir: string,
   isBuiltin: boolean,
   trustedRepos: Set<string>,
@@ -716,24 +744,25 @@ async function readExtensionsFromDirDetailed(
     const directories = entries.filter((entry) => entry.isDirectory())
     const results = await Promise.all(
       directories.map(async (entry) => {
-        const fallback: ListedModelExtension = {
-          type: 'model',
-          id: entry.name,
-          name: entry.name,
-          trusted: isBuiltin,
-          builtin: isBuiltin,
-          nodes: [],
-        }
+        const fallback = normalizeListedExtensionFallback(entry.name, isBuiltin)
 
-        const { manifest, errors } = await readExtensionManifestDetailed(dir, entry.name)
+        const { manifest, manifestFile, errors } = await readExtensionManifestDetailed(dir, entry.name)
         if (!manifest) {
           return { extension: fallback as ListedExtension, errors }
         }
 
-        return {
-          extension: parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin),
-          errors,
+        try {
+          return {
+            extension: parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin),
+            errors,
+          }
+        } catch (error) {
+          return {
+            extension: fallback as ListedExtension,
+            errors: [...errors, buildManifestInvalidError(entry.name, manifestFile ?? 'manifest.json', error)],
+          }
         }
+
       }),
     )
 
@@ -760,7 +789,7 @@ async function readExtensionsFromDirDetailed(
   }
 }
 
-async function readResolvedExtensionsFromDirDetailed(
+export async function readResolvedExtensionsFromDirDetailed(
   dir: string,
   isBuiltin: boolean,
   trustedRepos: Set<string>,
@@ -772,23 +801,33 @@ async function readResolvedExtensionsFromDirDetailed(
     const directories = entries.filter((entry) => entry.isDirectory())
     const results = await Promise.all(
       directories.map(async (entry) => {
-        const fallback: ListedModelExtension = {
-          type: 'model',
-          id: entry.name,
-          name: entry.name,
-          trusted: isBuiltin,
-          builtin: isBuiltin,
-          nodes: [],
+        const fallback = normalizeListedExtensionFallback(entry.name, isBuiltin)
+
+        const { manifest, manifestFile, errors } = await readExtensionManifestDetailed(dir, entry.name)
+        let extension: ListedExtension = fallback
+        let resolvedManifest: ParsedManifest | null = manifest
+
+        if (manifest) {
+          try {
+            extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+          } catch (error) {
+            resolvedManifest = null
+            return {
+              resolved: {
+                extension: fallback,
+                extDir: resolvePath(dir, entry.name),
+                manifest: null,
+              } satisfies ResolvedListedExtension,
+              errors: [...errors, buildManifestInvalidError(entry.name, manifestFile ?? 'manifest.json', error)],
+            }
+          }
         }
 
-        const { manifest, errors } = await readExtensionManifestDetailed(dir, entry.name)
         return {
           resolved: {
-            extension: manifest
-              ? parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
-              : fallback,
+            extension,
             extDir: resolvePath(dir, entry.name),
-            manifest,
+            manifest: resolvedManifest,
           } satisfies ResolvedListedExtension,
           errors,
         }

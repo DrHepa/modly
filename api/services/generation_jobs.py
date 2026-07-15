@@ -22,6 +22,10 @@ _last_logged_snapshots: Dict[str, Tuple[str, int, Optional[str]]] = {}
 _log_lock = threading.Lock()
 _generation_logger = logging.getLogger("modly.generation.jobs")
 SCENE_MANIFEST_SCHEMA = "modly.scene-manifest.v1"
+IMAGE_OUTPUT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
+MESH_OUTPUT_SUFFIXES = frozenset({".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"})
+VIDEO_OUTPUT_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi"})
+AUDIO_OUTPUT_SUFFIXES = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"})
 
 
 def _log_job_progress(job: JobStatus) -> bool:
@@ -320,8 +324,17 @@ def detect_output_kind(output_path: Optional[Path]) -> Optional[str]:
     if suffix == ".json" and is_scene_manifest_path(output_path):
         return "scene"
 
-    if suffix in {".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"}:
+    if suffix in MESH_OUTPUT_SUFFIXES:
         return "mesh"
+
+    if suffix in IMAGE_OUTPUT_SUFFIXES:
+        return "image"
+
+    if suffix in VIDEO_OUTPUT_SUFFIXES:
+        return "video"
+
+    if suffix in AUDIO_OUTPUT_SUFFIXES:
+        return "audio"
 
     return None
 

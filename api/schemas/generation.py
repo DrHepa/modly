@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class SceneCandidate(BaseModel):
-    kind: Literal["mesh", "scene"]
+    kind: Literal["mesh", "scene", "image", "audio", "video"]
     workspace_path: str
     output_url: str
     display_name: str
@@ -15,7 +15,7 @@ class JobProgress(BaseModel):
     progress: int = 0
     step: Optional[str] = None
     output_url: Optional[str] = None
-    output_kind: Optional[Literal["mesh", "scene"]] = None
+    output_kind: Optional[Literal["mesh", "scene", "image", "audio", "video"]] = None
     error: Optional[str] = None
     scene_candidate: Optional[SceneCandidate] = None
 

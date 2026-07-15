@@ -60,8 +60,15 @@ _MODEL_INPUT_KINDS = frozenset({
 })
 
 
+def normalize_model_input(value):
+    if isinstance(value, str) and value.lower() == "json":
+        return "scene"
+    return value
+
+
 def validate_model_input(value, context: str = "input") -> str:
     """Validate the invocation input declared by one model node."""
+    value = normalize_model_input(value)
     if not isinstance(value, str) or value not in _MODEL_INPUT_KINDS:
         expected = ", ".join(sorted(_MODEL_INPUT_KINDS))
         raise ValueError(f"{context} must be one of: {expected}")
@@ -168,9 +175,8 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         "https_downloads":  node.get("https_downloads", []),
                         "download_check":   node.get("download_check", ""),
                         "hf_skip_prefixes": node.get("hf_skip_prefixes", []),
-                        "hf_include_prefixes": node.get("hf_include_prefixes", []),
-                        "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
-                        "input":            node.get("input", "image"),
+                        "params_schema":    node.get("params_schema", []),
+                        "input":            normalize_model_input(node.get("input", "image")),
                         "output":           node.get("output", "mesh"),
                         "weight_owner_id":  weight_owner_id,
                         "shared_owner":     len(legacy_paths) > 1,

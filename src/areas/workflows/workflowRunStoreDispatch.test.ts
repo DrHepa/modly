@@ -3551,6 +3551,48 @@ test('workflowRunStore falls back to declared output when generation status omit
   assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'mesh')
 })
 
+test('workflowRunStore preserves hard output-kind enforcement while accepting declared image outputs', async () => {
+  const ext = createWorkflowExtension({
+    id: 'dreamcube/generate-image',
+    extensionId: 'dreamcube',
+    nodeId: 'generate-image',
+    name: 'DreamCube Image',
+    input: 'none',
+    output: 'image',
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-image-output-kind',
+    name: 'Image output kind',
+    description: '',
+    nodes: [createNode('model-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} })],
+    edges: [],
+    createdAt: '2026-07-12T00:00:00.000Z',
+    updatedAt: '2026-07-12T00:00:00.000Z',
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-none') return { data: { job_id: 'job-image-output-kind' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-image-output-kind')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.png', output_kind: 'image' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'image')
+})
+
 test('workflowRunStore uses actual scene output kind for Add to Worlds scene routing', async () => {
   const ext = createWorkflowExtension({
     id: 'gaussiangpt/generate',

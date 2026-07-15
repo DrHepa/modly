@@ -110,7 +110,7 @@ export function createGenerationApi({ client, readFileBase64 }: CreateGeneration
     progress: number
     step?: string
     outputUrl?: string
-    outputKind?: 'mesh' | 'scene'
+    outputKind?: 'mesh' | 'scene' | 'image' | 'audio' | 'video'
     error?: string
   }> {
     const { data } = await client.get(`/generate/status/${jobId}`)

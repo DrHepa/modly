@@ -454,6 +454,49 @@ def test_detect_output_kind_returns_none_for_unknown_outputs(api_modules):
 
     assert generation_jobs.detect_output_kind(opaque_output) is None
 
+
+def test_detect_output_kind_classifies_common_image_audio_and_video_outputs(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    workspace_dir = api_modules["workspace_dir"]
+
+    image_output = workspace_dir / "Outputs" / "preview.PNG"
+    image_output.parent.mkdir(parents=True, exist_ok=True)
+    image_output.write_bytes(b"png")
+
+    audio_output = workspace_dir / "Outputs" / "voice.wav"
+    audio_output.write_bytes(b"wav")
+
+    video_output = workspace_dir / "Outputs" / "turntable.webm"
+    video_output.write_bytes(b"webm")
+
+    assert generation_jobs.detect_output_kind(image_output) == "image"
+    assert generation_jobs.detect_output_kind(audio_output) == "audio"
+    assert generation_jobs.detect_output_kind(video_output) == "video"
+
+
+def test_build_scene_candidate_preserves_image_output_kind(api_modules):
+    generation_jobs = api_modules["generation_jobs"]
+    image_output = api_modules["workspace_dir"] / "Renders" / "preview.webp"
+    image_output.parent.mkdir(parents=True, exist_ok=True)
+    image_output.write_bytes(b"webp")
+
+    candidate = generation_jobs.build_scene_candidate(image_output)
+
+    assert candidate is not None
+    assert candidate.model_dump() == {
+        "kind": "image",
+        "workspace_path": "Renders/preview.webp",
+        "output_url": "/workspace/Renders/preview.webp",
+        "display_name": "preview.webp",
+    }
+
+
+def test_validate_model_input_normalizes_legacy_json_to_scene():
+    from services.generator_registry import normalize_model_input, validate_model_input
+
+    assert normalize_model_input("JSON") == "scene"
+    assert validate_model_input("json", context="demo/fake.input") == "scene"
+
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry
     from services.generators.base import GenerationCancelled

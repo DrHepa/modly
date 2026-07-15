@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import test from 'node:test'
+import { tmpdir } from 'node:os'
 
 const {
   getUiOnlyNodes,
   parseExtensionManifest,
+  readExtensionsFromDir,
+  readExtensionsFromDirDetailed,
+  readResolvedExtensionsFromDirDetailed,
 } = await import(new URL('./automation-capabilities.ts', import.meta.url).href)
 
 type UiOnlyNodeForTest = {
@@ -347,5 +353,82 @@ test('parseExtensionManifest rejects input none on process extensions', () => {
       false,
     ),
     /may use 'none' only for model extension nodes/i,
+  )
+})
+
+test('parseExtensionManifest normalizes legacy json ports to scene without widening artifact kinds', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'dreamcube-scenes',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [{
+        id: 'generate-scene',
+        input: 'JSON' as never,
+        output: 'json' as never,
+        inputs: ['Json' as never],
+        input_contract: [{ name: 'scene_doc', label: 'Scene Doc', type: 'JSON', required: true }],
+      }],
+    },
+    'dreamcube-scenes',
+    new Set(),
+    false,
+  )
+
+  assert.equal(extension.type, 'process')
+  assert.equal(extension.nodes[0].input, 'scene')
+  assert.equal(extension.nodes[0].output, 'scene')
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'scene_doc', label: 'Scene Doc', type: 'scene', required: true },
+  ])
+})
+
+test('extension discovery preserves valid siblings when one manifest fails semantic parsing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-automation-capabilities-'))
+  const validDir = join(root, 'valid-ext')
+  const invalidDir = join(root, 'invalid-ext')
+
+  await mkdir(validDir)
+  await mkdir(invalidDir)
+  await writeFile(join(validDir, 'manifest.json'), JSON.stringify({
+    id: 'valid-ext',
+    type: 'process',
+    entry: 'processor.js',
+    nodes: [{ id: 'generate', input: 'image', output: 'image' }],
+  }), 'utf-8')
+  await writeFile(join(invalidDir, 'manifest.json'), JSON.stringify({
+    id: 'invalid-ext',
+    type: 'process',
+    entry: 'processor.js',
+    nodes: [{ id: 'broken', input: 'invalid-kind', output: 'mesh' }],
+  }), 'utf-8')
+
+  const listed = await readExtensionsFromDir(root, false, new Set())
+  assert.equal(listed.length, 2)
+  assert.equal(listed.find((extension) => extension.id === 'valid-ext')?.type, 'process')
+  assert.deepEqual(listed.find((extension) => extension.id === 'invalid-ext'), {
+    type: 'model',
+    id: 'invalid-ext',
+    name: 'invalid-ext',
+    trusted: false,
+    builtin: false,
+    nodes: [],
+  })
+
+  const detailed = await readExtensionsFromDirDetailed(root, false, new Set())
+  assert.equal(detailed.extensions.find((extension) => extension.id === 'valid-ext')?.type, 'process')
+  assert.match(
+    detailed.errors.find((error) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
+    /failed to parse manifest\.json/i,
+  )
+
+  const resolved = await readResolvedExtensionsFromDirDetailed(root, false, new Set())
+  const resolvedValid = resolved.extensions.find((entry) => entry.extension.id === 'valid-ext')
+  const resolvedInvalid = resolved.extensions.find((entry) => entry.extension.id === 'invalid-ext')
+  assert.equal(resolvedValid?.extension.type, 'process')
+  assert.equal(resolvedInvalid?.manifest, null)
+  assert.match(
+    resolved.errors.find((error) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
+    /failed to parse manifest\.json/i,
   )
 })

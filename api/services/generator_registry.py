@@ -75,8 +75,15 @@ print(f"[Registry] EXTENSIONS_DIR = {EXTENSIONS_DIR or '(not set)'}")
 _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
 
 
+def normalize_model_input(value):
+    if isinstance(value, str) and value.lower() == "json":
+        return "scene"
+    return value
+
+
 def validate_model_input(value, context: str = "input") -> str:
-    """Validate flexible primary-input metadata without rewriting its modality."""
+    """Validate flexible primary-input metadata with legacy JSON compatibility."""
+    value = normalize_model_input(value)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
     return value
@@ -695,7 +702,7 @@ def _discover_extensions(
                         "hf_skip_prefixes": node.get("hf_skip_prefixes", []),
                         "hf_include_prefixes": node.get("hf_include_prefixes", []),
                         "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
-                        "input":            node.get("input", "image"),
+                        "input":            normalize_model_input(node.get("input", "image")),
                         "inputs":           node.get("inputs"),
                         "output":           node.get("output", "mesh"),
                         "weight_groups":    [group_by_id[group_id] for group_id in group_ids],

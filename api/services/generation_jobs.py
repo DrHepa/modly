@@ -44,6 +44,10 @@ _pinned_generation_executor = ThreadPoolExecutor(
 )
 
 _JOB_TTL = 1800  # purge terminal jobs after 30 minutes
+IMAGE_OUTPUT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
+MESH_OUTPUT_SUFFIXES = frozenset({".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"})
+VIDEO_OUTPUT_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi"})
+AUDIO_OUTPUT_SUFFIXES = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"})
 
 
 def _log_job_progress(job: JobStatus) -> bool:
@@ -339,7 +343,7 @@ def build_scene_candidate(output_path: Optional[Path], collection: str = "Defaul
 
     output_url = build_output_url(output_path, collection)
     return SceneCandidate(
-        kind="mesh",
+        kind=detect_output_kind(output_path) or "mesh",
         workspace_path=workspace_path,
         output_url=output_url,
         display_name=output_path.name,
@@ -366,8 +370,17 @@ def detect_output_kind(output_path: Optional[Path]) -> Optional[str]:
     if suffix == ".json" and is_scene_manifest_path(output_path):
         return "scene"
 
-    if suffix in {".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"}:
+    if suffix in MESH_OUTPUT_SUFFIXES:
         return "mesh"
+
+    if suffix in IMAGE_OUTPUT_SUFFIXES:
+        return "image"
+
+    if suffix in VIDEO_OUTPUT_SUFFIXES:
+        return "video"
+
+    if suffix in AUDIO_OUTPUT_SUFFIXES:
+        return "audio"
 
     return None
 

@@ -262,24 +262,25 @@ function normalizeProcessPorts(
 ): string[] | ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return inputs
   if (inputs.every((input): input is string => typeof input === 'string')) {
+    const normalizedInputs = inputs.map((input) => normalizeLegacyArtifactKind(input))
     // Naming changes routing authority: opt in only when every slot is unambiguous.
-    if (!Array.isArray(inputContract) || inputContract.length !== inputs.length) return [...inputs]
+    if (!Array.isArray(inputContract) || inputContract.length !== inputs.length) return [...normalizedInputs]
     const names = new Set<string>()
     const ports: ProcessPort[] = []
-    for (const [index, type] of inputs.entries()) {
+    for (const [index, type] of normalizedInputs.entries()) {
       const contract = inputContract[index]
       if (!contract || typeof contract !== 'object' || Array.isArray(contract)
         || typeof contract.name !== 'string'
-        || (contract.required != null && typeof contract.required !== 'boolean')) return [...inputs]
+        || (contract.required != null && typeof contract.required !== 'boolean')) return [...normalizedInputs]
       const name = contract.name.trim()
-      if (!name || names.has(name)) return [...inputs]
+      if (!name || names.has(name)) return [...normalizedInputs]
       names.add(name)
       const label = typeof contract.label === 'string' ? contract.label.trim() : ''
       ports.push({ name, ...(label ? { label } : {}), type, required: contract.required ?? true })
     }
     return ports
   }
-  return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
+  return (inputs as ProcessPort[]).map((input) => ({ ...input, type: normalizeLegacyArtifactKind(input.type), required: input.required ?? true }))
 }
 
 export type ListedWorkflowNode = {
@@ -338,6 +339,13 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
 
 function isProcessPortType(value: unknown): value is ProcessPortType {
   return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+}
+
+function normalizeLegacyArtifactKind(value: string): string
+function normalizeLegacyArtifactKind(value: unknown): unknown
+function normalizeLegacyArtifactKind(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  return value.toLowerCase() === 'json' ? 'scene' : value
 }
 
 function isModelInputKind(value: unknown): value is ModelInputKind {
@@ -435,13 +443,15 @@ function normalizeExtensionNodeInput(
   extensionType: 'model' | 'process',
   context: string,
 ): ModelInputKind {
-  if (value !== undefined && !isModelInputKind(value)) {
+  const normalizedValue = normalizeLegacyArtifactKind(value)
+
+  if (normalizedValue !== undefined && !isModelInputKind(normalizedValue)) {
     throw new Error(
       context + " must be a non-empty string",
     )
   }
 
-  if (value === 'none') {
+  if (normalizedValue === 'none') {
     if (extensionType === 'process') {
       throw new Error(
         context + " may use 'none' only for model extension nodes",
@@ -450,7 +460,7 @@ function normalizeExtensionNodeInput(
     return 'none'
   }
 
-  return value ?? 'image'
+  return normalizedValue ?? 'image'
 }
 
 export function parseExtensionManifest(
@@ -539,7 +549,7 @@ export function parseExtensionManifest(
       input:          normalizeExtensionNodeInput(n.input, extensionType, `${capabilityId}.input`),
       inputs:         normalizeProcessPorts(n.inputs, n.input_contract),
       inputLabels:    n.input_labels,
-      output:         n.output ?? 'mesh'  as const,
+      output:         normalizeLegacyArtifactKind(n.output ?? 'mesh'),
       paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
       paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
       hfRepo:         n.hf_repo,
@@ -595,6 +605,15 @@ export async function readExtensionsFromDir(
   return result.extensions.map((resolved) => resolved.extension)
 }
 
+export async function readExtensionsFromDirDetailed(
+  dir: string,
+  isBuiltin: boolean,
+  trustedRepos: Set<string>,
+): Promise<ListedExtensionsResult> {
+  const result = await readResolvedExtensionsFromDirDetailed(dir, isBuiltin, trustedRepos)
+  return { extensions: result.extensions.map((resolved) => resolved.extension), errors: result.errors }
+}
+
 export async function listVisibleExtensions(options: ExtensionDiscoveryOptions): Promise<ListedExtension[]> {
   return (await listVisibleExtensionsDetailed(options)).extensions
 }
@@ -604,7 +623,7 @@ export async function listVisibleExtensionsDetailed(options: ExtensionDiscoveryO
   return { extensions: result.extensions.map((resolved) => resolved.extension), errors: result.errors }
 }
 
-async function readResolvedExtensionsFromDirDetailed(
+export async function readResolvedExtensionsFromDirDetailed(
   dir: string,
   isBuiltin: boolean,
   trustedRepos: Set<string>,

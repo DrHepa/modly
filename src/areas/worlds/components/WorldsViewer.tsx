@@ -1,6 +1,6 @@
 import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
 import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
-import { Bounds, GizmoHelper, GizmoViewport, Html, OrbitControls, TransformControls, useBounds, useGLTF } from '@react-three/drei'
+import { Bounds, Environment, GizmoHelper, GizmoViewport, Html, Lightformer, OrbitControls, TransformControls, useBounds, useGLTF } from '@react-three/drei'
 import { EffectComposer, Outline, Select, Selection } from '@react-three/postprocessing'
 import * as THREE from 'three'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
@@ -366,13 +366,25 @@ export function WorldsViewer({
       <Canvas
         camera={{ position: [2.4, 1.8, 2.8], fov: 45, near: 0.01, far: 500 }}
         dpr={[1, 1]}
-        gl={{ antialias: true, alpha: false }}
+        gl={{
+          antialias: true,
+          alpha: false,
+          outputColorSpace: THREE.SRGBColorSpace,
+          toneMapping: THREE.NeutralToneMapping,
+          toneMappingExposure: 1.8,
+        }}
         className="h-full w-full bg-[#18181b]"
         onPointerMissed={handleCanvasPointerMissed}
       >
         <color attach="background" args={['#18181b']} />
-        <ambientLight intensity={0.65} />
-        <directionalLight position={[4, 6, 4]} intensity={1.2} />
+        <ambientLight intensity={0.3} />
+        <Environment background={false}>
+          <Lightformer intensity={2} position={[0, 4, 4]} scale={8} />
+          <Lightformer intensity={0.5} position={[-4, 2, -4]} scale={6} />
+          <Lightformer intensity={0.3} position={[4, 1, -4]} scale={6} />
+        </Environment>
+        <directionalLight position={[5, 8, 5]} color="#ffffff" intensity={1.5} />
+        <directionalLight position={[-4, 2, -4]} color="#ffffff" intensity={0.6} />
         <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
         <Bounds margin={1.25}>
           <Selection enabled={normalizedSelectedItemIds.length > 0}>

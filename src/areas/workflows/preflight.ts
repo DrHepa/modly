@@ -1,6 +1,7 @@
 import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
+import { normalizeExtensionInputPorts } from '@shared/utils/inputPorts'
 
 type DataType = 'image' | 'text' | 'mesh' | 'audio'
 
@@ -120,7 +121,65 @@ export function validateWorkflowPreflight(
     }
 
     const incomingEdges = workflow.edges.filter((edge) => edge.target === node.id)
-    const requiredTypes = [...new Set((ext.inputs ?? [ext.input]) as DataType[])]
+    const normalizedInputs = normalizeExtensionInputPorts(ext)
+
+    for (const issue of normalizedInputs.issues) {
+      pushIssue(issues, {
+        key: `${node.id}:ports:${issue}`,
+        nodeId: node.id,
+        message: `${ext.name}: ${issue}`,
+      })
+    }
+    if (normalizedInputs.issues.length > 0) continue
+
+    if (normalizedInputs.mode === 'named-v1') {
+      const byHandle = new Map(normalizedInputs.ports.map((port) => [port.handle, port]))
+      const edgesByHandle = new Map<string, typeof incomingEdges>()
+      for (const edge of incomingEdges) {
+        if (!edge.targetHandle || !byHandle.has(edge.targetHandle)) {
+          pushIssue(issues, {
+            key: `${node.id}:unknown-port:${edge.id}`,
+            nodeId: node.id,
+            message: `${ext.name} has an incoming connection to unknown input port "${edge.targetHandle ?? 'default'}". Reconnect it to a named port.`,
+          })
+          continue
+        }
+        const list = edgesByHandle.get(edge.targetHandle) ?? []
+        list.push(edge)
+        edgesByHandle.set(edge.targetHandle, list)
+      }
+
+      for (const port of normalizedInputs.ports) {
+        const portEdges = edgesByHandle.get(port.handle) ?? []
+        if (portEdges.length > 1) {
+          pushIssue(issues, {
+            key: `${node.id}:cardinality:${port.handle}`,
+            nodeId: node.id,
+            message: `${ext.name} input port "${port.name}" accepts one connection, but has ${portEdges.length}.`,
+          })
+        }
+        if (port.required && portEdges.length === 0) {
+          pushIssue(issues, {
+            key: `${node.id}:missing:${port.handle}`,
+            nodeId: node.id,
+            message: `${ext.name} needs an incoming ${formatType(port.type)} connection for "${port.name}".`,
+          })
+        }
+        for (const edge of portEdges) {
+          const sourceNode = nodeMap.get(edge.source)
+          const sourceType = outputTypes.get(edge.source)
+          if (!sourceNode || !sourceType || sourceType === port.type) continue
+          pushIssue(issues, {
+            key: `${node.id}:type:${edge.id}`,
+            nodeId: node.id,
+            message: `${ext.name} input "${port.name}" expects ${formatType(port.type)}, but ${nodeLabel(sourceNode, allExtensions)} outputs ${formatType(sourceType)}.`,
+          })
+        }
+      }
+      continue
+    }
+
+    const requiredTypes = [...new Set(normalizedInputs.ports.map((port) => port.type))]
 
     for (const requiredType of requiredTypes) {
       const hasMatchingInput = incomingEdges.some((edge) => outputTypes.get(edge.source) === requiredType)

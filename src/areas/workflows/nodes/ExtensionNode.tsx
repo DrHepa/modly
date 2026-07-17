@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useLayoutEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useLayoutEffect, useState } from 'react'
 import { Handle, Position, useReactFlow } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
 import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
+import { normalizeExtensionInputPorts } from '@shared/utils/inputPorts'
 import { useWorkflowRunStore } from '../workflowRunStore'
 import BaseNode from './BaseNode'
 
@@ -160,33 +161,35 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const { updateNodeData } = useReactFlow()
   const running = useWorkflowRunStore((s) => s.activeNodeId === id)
 
-  // Refs for handle alignment — support up to 2 inputs
-  const ioRowRef  = useRef<HTMLDivElement>(null)
-  const ioRow2Ref = useRef<HTMLDivElement>(null)
-  const [handleTop,  setHandleTop]  = useState('50%')
-  const [handle2Top, setHandle2Top] = useState('50%')
+  const ioRowRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const [handleTops, setHandleTops] = useState<Record<string, string>>({})
 
   const { modelExtensions, processExtensions } = useExtensionsStore()
-  const allExtensions = buildAllWorkflowExtensions(modelExtensions, processExtensions)
-  const ext = allExtensions.find((e) => e.id === data.extensionId)
+  const allExtensions = useMemo(
+    () => buildAllWorkflowExtensions(modelExtensions, processExtensions),
+    [modelExtensions, processExtensions],
+  )
+  const ext = useMemo(
+    () => allExtensions.find((extension) => extension.id === data.extensionId),
+    [allExtensions, data.extensionId],
+  )
 
-  const inputs      = ext?.inputs  // defined → multi-input mode
-  const isMulti     = inputs && inputs.length > 1
+  const normalizedInputs = useMemo(() => normalizeExtensionInputPorts(ext), [ext])
+  const inputs      = normalizedInputs.ports
+  const isMulti     = inputs.length > 1 || normalizedInputs.mode === 'named-v1'
   const isTerminal  = ext?.id === 'mesh-exporter'
   const outputColor = HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams   = (ext?.params.length ?? 0) > 0
 
   // Align handles with their respective IO rows after mount
   useLayoutEffect(() => {
-    if (ioRowRef.current) {
-      const center = ioRowRef.current.offsetTop + ioRowRef.current.offsetHeight / 2
-      setHandleTop(`${center}px`)
+    const next: Record<string, string> = {}
+    for (const port of inputs) {
+      const row = ioRowRefs.current[port.handle]
+      if (row) next[port.handle] = `${row.offsetTop + row.offsetHeight / 2}px`
     }
-    if (ioRow2Ref.current) {
-      const center = ioRow2Ref.current.offsetTop + ioRow2Ref.current.offsetHeight / 2
-      setHandle2Top(`${center}px`)
-    }
-  }, [isMulti])
+    setHandleTops(next)
+  }, [inputs])
 
   const patchParam = useCallback((key: string, val: number | string) => {
     const params = { ...data.params, [key]: val }
@@ -209,32 +212,33 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const ioSubheader = isMulti ? (
     // Multi-input layout: one row per input, output on first row
     <div className="flex flex-col divide-y divide-zinc-800/40">
-      <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
-        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputs[0]] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-          {ext?.inputLabels?.[0] ?? inputs[0]}
-        </span>
-        {!isTerminal && (
-          <>
-            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
-              <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
-            </svg>
-            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-              {ext?.output ?? '—'}
-            </span>
-          </>
-        )}
-      </div>
-      <div ref={ioRow2Ref} className="flex items-center px-3 py-2">
-        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputs[1]] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-          {ext?.inputLabels?.[1] ?? inputs[1]}
-        </span>
-      </div>
+      {inputs.map((port, index) => (
+        <div
+          key={port.handle}
+          ref={(el) => { ioRowRefs.current[port.handle] = el }}
+          className={`flex items-center px-3 py-2 ${index === 0 ? 'justify-between' : ''}`}
+        >
+          <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[port.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+            {port.label}
+          </span>
+          {index === 0 && !isTerminal && (
+            <>
+              <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
+                <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+              </svg>
+              <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                {ext?.output ?? '—'}
+              </span>
+            </>
+          )}
+        </div>
+      ))}
     </div>
   ) : (
     // Single-input layout (existing behavior)
-    <div ref={ioRowRef} className="flex items-center justify-between px-3 py-2">
-      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.input ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-        {ext?.input ?? '—'}
+    <div ref={(el) => { ioRowRefs.current[inputs[0]?.handle ?? 'input-0'] = el }} className="flex items-center justify-between px-3 py-2">
+      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[inputs[0]?.type ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+        {inputs[0]?.label ?? '—'}
       </span>
       {!isTerminal && (
         <>
@@ -252,29 +256,22 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   // ── Handles ──────────────────────────────────────────────────────────────
   const handlesEl = (
     <>
-      {/* Primary input handle */}
-      <Handle
-        id="input-0"
-        type="target"
-        position={Position.Left}
-        style={{ background: HANDLE_COLOR[isMulti ? inputs[0] : (ext?.input ?? 'image')], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
-      />
-      {/* Secondary input handle (multi-input only) */}
-      {isMulti && (
+      {inputs.map((port) => (
         <Handle
-          id="input-1"
+          key={port.handle}
+          id={port.handle}
           type="target"
           position={Position.Left}
-          style={{ background: HANDLE_COLOR[inputs[1]], width: 14, height: 14, border: '2.5px solid #18181b', top: handle2Top }}
+          style={{ background: HANDLE_COLOR[port.type], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[port.handle] ?? '50%' }}
         />
-      )}
+      ))}
       {/* Output handle */}
       {!isTerminal && (
         <Handle
           id="output"
           type="source"
           position={Position.Right}
-          style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
+          style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[inputs[0]?.handle ?? 'input-0'] ?? '50%' }}
         />
       )}
     </>

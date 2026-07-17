@@ -126,6 +126,8 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
                         "input":            node.get("input", "image"),
                         "output":           node.get("output", "mesh"),
+                        "io_contract":      node.get("io_contract", manifest.get("io_contract")),
+                        "input_ports":      node.get("input_ports", manifest.get("input_ports", [])),
                     }
                     full_id = f"{ext_id}/{node['id']}"
                     result[full_id] = (cls_or_None, node_manifest, ext_dir)

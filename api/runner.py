@@ -99,10 +99,40 @@ def _resolve_ready_schema(GenClass, node: dict, manifest: dict) -> list:
 
 
 def _apply_manifest_metadata(gen, manifest: dict, node: dict) -> None:
+    node_id = node.get("id")
+    if isinstance(node_id, str) and node_id:
+        gen.node_id = node_id
     gen.hf_repo = node.get("hf_repo") or manifest.get("hf_repo", "")
     gen.hf_skip_prefixes = node.get("hf_skip_prefixes") or manifest.get("hf_skip_prefixes", [])
     gen.download_check = node.get("download_check") or manifest.get("download_check", "")
     gen._params_schema = node.get("params_schema") or manifest.get("params_schema", [])
+    gen.io_contract = node.get("io_contract") or manifest.get("io_contract")
+    gen.input_ports = node.get("input_ports") or manifest.get("input_ports", [])
+
+
+def _decode_named_images(msg: dict) -> dict[str, bytes]:
+    if msg.get("io_contract") != "named-v1":
+        raise RuntimeError("generate_v2 requires io_contract named-v1")
+    image_names = msg.get("image_names")
+    images_b64 = msg.get("images_b64")
+    if not isinstance(image_names, list) or not isinstance(images_b64, dict):
+        raise RuntimeError("generate_v2 requires image_names list and images_b64 object")
+
+    named_images: dict[str, bytes] = {}
+    for name in image_names:
+        if name not in images_b64:
+            raise RuntimeError(f"generate_v2 missing image payload for input port '{name}'")
+        named_images[name] = base64.b64decode(images_b64[name])
+    return named_images
+
+
+def _require_generate_v2(gen) -> None:
+    if not callable(getattr(gen, "generate_v2", None)):
+        raise RuntimeError(
+            f"{gen.__class__.__name__} does not implement "
+            "generate_v2(named_images, params, progress_cb, cancel_event), "
+            "which is required for multiple named image inputs."
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -171,6 +201,33 @@ def main() -> None:
                     send({"type": "done", "id": rid, "output_path": str(output_path)})
                 except Exception as exc:
                     # Detect GenerationCancelled by name to avoid import issues
+                    if type(exc).__name__ == "GenerationCancelled":
+                        send({"type": "cancelled", "id": rid})
+                    else:
+                        send({"type": "error", "id": rid,
+                              "message": str(exc),
+                              "traceback": traceback.format_exc()})
+                finally:
+                    _cancel.pop(rid, None)
+
+            # ---- generate_v2 -----------------------------------------
+            elif action == "generate_v2":
+                cancel_evt = threading.Event()
+                _cancel[rid] = cancel_evt
+                params = msg.get("params", {})
+                if msg.get("outputs_dir"):
+                    gen.outputs_dir = Path(msg["outputs_dir"])
+                    gen.outputs_dir.mkdir(parents=True, exist_ok=True)
+
+                def progress_cb(pct: int, step: str = "") -> None:
+                    send({"type": "progress", "id": rid, "pct": pct, "step": step})
+
+                try:
+                    _require_generate_v2(gen)
+                    named_images = _decode_named_images(msg)
+                    output_path = gen.generate_v2(named_images, params, progress_cb, cancel_evt)
+                    send({"type": "done", "id": rid, "output_path": str(output_path)})
+                except Exception as exc:
                     if type(exc).__name__ == "GenerationCancelled":
                         send({"type": "cancelled", "id": rid})
                     else:

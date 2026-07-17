@@ -2,6 +2,7 @@ import { getBezierPath, useReactFlow, useEdges } from '@xyflow/react'
 import type { EdgeProps } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
+import { getInputPortByHandle } from '@shared/utils/inputPorts'
 
 const HANDLE_COLOR: Record<string, string> = {
   audio: '#34d399',
@@ -37,13 +38,7 @@ export default function WorkflowEdge({
 
   // For multi-input nodes pick the color of the specific connected handle
   const targetExt = allExtensions.find((e) => e.id === targetNode?.data?.extensionId)
-  const targetInputType = (() => {
-    if (targetExt?.inputs && targetExt.inputs.length > 1 && targetHandle) {
-      const idx = parseInt(targetHandle.replace('input-', ''), 10)
-      return targetExt.inputs[isNaN(idx) ? 0 : idx] ?? targetExt.input
-    }
-    return targetExt?.input
-  })()
+  const targetInputType = getInputPortByHandle(targetExt, targetHandle)?.type ?? targetExt?.input
 
   const targetColor = targetNode?.type === 'outputNode'
     ? HANDLE_COLOR.mesh

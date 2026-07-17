@@ -4,6 +4,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { getWorkflowExtension } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import { normalizeExtensionInputPorts, type NormalizedInputPort } from '@shared/utils/inputPorts'
 import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -45,6 +46,7 @@ function flushResume(): void {
 }
 
 interface NodeOutput { filePath?: string; text?: string; outputType?: string }
+interface NamedImageInput { port: NormalizedInputPort; filePath: string }
 
 function isSceneMeshOutput(output: NodeOutput | undefined): output is NodeOutput & { filePath: string } {
   return output?.outputType === 'mesh' && typeof output.filePath === 'string'
@@ -311,10 +313,44 @@ async function executeExtensionNode(
   // Per-slot texts for multi-text-input nodes (e.g. positive/negative prompts).
   // Indexed by target handle: input-0 → texts[0], input-1 → texts[1].
   const nodeInputTexts: (string | undefined)[] = []
+  const namedImageInputs = new Map<string, NamedImageInput>()
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
+  const normalizedInputs = normalizeExtensionInputPorts(ext)
+  if (normalizedInputs.issues.length > 0) {
+    throw new Error(`${ext?.name ?? 'Extension'} has invalid input ports: ${normalizedInputs.issues.join(' ')}`)
+  }
 
-  if (ext?.inputs && ext.inputs.length > 1) {
+  if (normalizedInputs.mode === 'named-v1') {
+    const byHandle = new Map(normalizedInputs.ports.map((port) => [port.handle, port]))
+    const seenHandles = new Set<string>()
+    for (const edge of incomingEdges) {
+      const port = edge.targetHandle ? byHandle.get(edge.targetHandle) : undefined
+      if (!port) throw new Error(`${ext?.name ?? 'Extension'} received a connection for unknown input port "${edge.targetHandle ?? 'default'}"`)
+      if (seenHandles.has(port.handle)) throw new Error(`${ext?.name ?? 'Extension'} input port "${port.name}" accepts only one connection`)
+      seenHandles.add(port.handle)
+
+      const src = resolveSource(edge.source)
+      if (!src) continue
+      if (src.outputType !== port.type) {
+        throw new Error(`${ext?.name ?? 'Extension'} input "${port.name}" expects ${port.type}, but received ${src.outputType ?? 'unknown'}`)
+      }
+      if (port.type === 'mesh')        nodeInputMeshPath = src.filePath
+      else if (port.type === 'image') {
+        nodeInputPath = src.filePath
+        if (src.filePath) namedImageInputs.set(port.handle, { port, filePath: src.filePath })
+      } else if (src.filePath !== undefined) nodeInputPath = src.filePath
+      if (src.text !== undefined && src.text.trim().length > 0) {
+        nodeInputText = src.text
+        nodeInputTexts[port.index] = src.text
+      }
+    }
+    for (const port of normalizedInputs.ports) {
+      if (port.required && !seenHandles.has(port.handle)) {
+        throw new Error(`${ext?.name ?? 'Extension'} needs an incoming ${port.type} connection for "${port.name}"`)
+      }
+    }
+  } else if (normalizedInputs.ports.length > 1) {
     for (const edge of incomingEdges) {
       const src = resolveSource(edge.source)
       if (!src) continue
@@ -338,21 +374,25 @@ async function executeExtensionNode(
   const isModelNode = ext?.type === 'model'
 
   if (isModelNode) {
-    const isTextInput = ext?.inputs ? ext.inputs.every((i) => i === 'text') : ext?.input === 'text'
+    const isNamedImageModel = normalizedInputs.mode === 'named-v1' && normalizedInputs.ports.some((port) => port.type === 'image')
+    const isTextInput = normalizedInputs.ports.every((port) => port.type === 'text')
     const activeImagePath = isTextInput ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isTextInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
+    if (isNamedImageModel && namedImageInputs.size === 0) {
+      throw new Error(`${ext?.name ?? 'Model'} needs at least one connected named image input`)
+    }
+    if (!isNamedImageModel && !isTextInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
     }
 
-    let blob: Blob
-    let fname: string
-    if (isTextInput || (selectedImageData && nodeInputPath === undefined)) {
+    let blob: Blob | undefined
+    let fname: string | undefined
+    if (!isNamedImageModel && (isTextInput || (selectedImageData && nodeInputPath === undefined))) {
       const base64 = selectedImageData && nodeInputPath === undefined
         ? selectedImageData
         : 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' // 1x1 transparent PNG
       fname = 'placeholder.png'
       blob = new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else {
+    } else if (!isNamedImageModel) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
       blob = new Blob([bytes], { type: 'image/png' })
@@ -377,7 +417,25 @@ async function executeExtensionNode(
     const effectiveParams = { ...schemaDefaults, ...liveParams }
 
     const fd = new FormData()
-    fd.append('image', blob, fname)
+    const orderedNamedImages = normalizedInputs.ports
+      .map((port) => namedImageInputs.get(port.handle))
+      .filter((entry): entry is NamedImageInput => !!entry)
+    if (isNamedImageModel) {
+      if (orderedNamedImages.length === 1 && orderedNamedImages[0].port.primary) {
+        const base64 = await window.electron.fs.readFileBase64(orderedNamedImages[0].filePath)
+        const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+        fd.append('image', new Blob([bytes], { type: 'image/png' }), orderedNamedImages[0].filePath.split(/[\\/]/).pop() ?? 'image.png')
+      } else {
+        for (const entry of orderedNamedImages) {
+          const base64 = await window.electron.fs.readFileBase64(entry.filePath)
+          const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+          fd.append('images', new Blob([bytes], { type: 'image/png' }), entry.filePath.split(/[\\/]/).pop() ?? `${entry.port.name}.png`)
+          fd.append('image_names', entry.port.name)
+        }
+      }
+    } else {
+      fd.append('image', blob as Blob, fname)
+    }
     fd.append('model_id', node.data.extensionId ?? '')
     fd.append('collection', 'Workflows')
     fd.append('remesh', 'none')
@@ -388,7 +446,10 @@ async function executeExtensionNode(
     setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
 
     const { data } = await client.post<{ job_id: string }>(
-      '/generate/from-image', fd,
+      isNamedImageModel && !(orderedNamedImages.length === 1 && orderedNamedImages[0].port.primary)
+        ? '/generate/from-images'
+        : '/generate/from-image',
+      fd,
       { headers: { 'Content-Type': 'multipart/form-data' } },
     )
     _activeJobId.current = data.job_id

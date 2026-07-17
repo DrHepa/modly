@@ -18,6 +18,9 @@ function loadModule() {
     platform: 'node',
     format: 'cjs',
     write: false,
+    alias: {
+      '@shared/utils/inputPorts': resolve('src/shared/utils/inputPorts.ts'),
+    },
   })
   writeFileSync(outfile, result.outputFiles[0].text, 'utf8')
   return require(outfile)
@@ -130,4 +133,51 @@ test('multi-input extension requires every declared input type', () => {
   // image satisfied, text still missing
   assert.ok(!issues.some((i) => i.key === 'proc:missing:image'))
   assert.ok(issues.some((i) => i.key === 'proc:missing:text'))
+})
+
+test('named-v1 extension validates handles, required ports, duplicates, and types', () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const extensions = [ext({
+    io_contract: 'named-v1',
+    input_ports: [
+      { name: 'primary', type: 'image', required: true },
+      { name: 'mask', type: 'image', required: false },
+      { name: 'detail', type: 'image', required: true },
+    ],
+  })]
+  const workflow = wf(
+    [
+      imageNode('img'),
+      textNode('txt'),
+      { id: 'proc', type: 'extensionNode', position: { x: 0, y: 0 }, data: { extensionId: 'pack/process-node' } },
+    ],
+    [
+      { id: 'e1', source: 'img', target: 'proc', targetHandle: 'primary' },
+      { id: 'e2', source: 'txt', target: 'proc', targetHandle: 'primary' },
+      { id: 'e3', source: 'img', target: 'proc', targetHandle: 'ghost' },
+    ],
+  )
+
+  const issues = validateWorkflowPreflight(workflow, extensions)
+  assert.ok(issues.some((i) => i.key === 'proc:cardinality:primary'))
+  assert.ok(issues.some((i) => i.key === 'proc:missing:detail'))
+  assert.ok(issues.some((i) => i.key === 'proc:type:e2' && /input "primary" expects image/.test(i.message)))
+  assert.ok(issues.some((i) => i.key === 'proc:unknown-port:e3'))
+})
+
+test('named-v1 optional disconnected ports are allowed and declaration order is canonical', () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const extensions = [ext({
+    io_contract: 'named-v1',
+    input_ports: [
+      { name: 'reference', type: 'image', required: false },
+      { name: 'subject', type: 'image', required: true },
+    ],
+  })]
+  const workflow = wf(
+    [imageNode('img'), { id: 'proc', type: 'extensionNode', position: { x: 0, y: 0 }, data: { extensionId: 'pack/process-node' } }],
+    [{ id: 'e1', source: 'img', target: 'proc', targetHandle: 'subject' }],
+  )
+
+  assert.deepEqual(validateWorkflowPreflight(workflow, extensions), [])
 })

@@ -1,4 +1,5 @@
 import type { AnyExtension, ExtensionNode } from '@shared/types/electron.d'
+import { normalizeExtensionInputPorts } from '@shared/utils/inputPorts'
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -77,11 +78,11 @@ export function TypePill({ type }: { type: 'model' | 'process' }): JSX.Element {
 }
 
 export function IOBadge({ node }: { node: ExtensionNode }): JSX.Element {
-  const inputs = node.inputs?.length ? node.inputs : [node.input]
+  const inputs = normalizeExtensionInputPorts(node).ports
   return (
     <span className="flex items-center gap-1 font-mono text-[10px] text-zinc-600 shrink-0">
-      {inputs.map((inp, i) => (
-        <span key={i} className="px-1.5 py-0.5 rounded-[5px] bg-white/5 text-zinc-400">{inp}</span>
+      {inputs.map((inp) => (
+        <span key={inp.handle} className="px-1.5 py-0.5 rounded-[5px] bg-white/5 text-zinc-400">{inp.label}</span>
       ))}
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-zinc-600 shrink-0">
         <path d="M5 12h13M13 6l6 6-6 6" />

@@ -8,6 +8,7 @@ Interface is intentionally compatible with direct BaseGenerator usage
 so GeneratorRegistry can treat both transparently.
 """
 import base64
+from collections import OrderedDict
 import json
 import os
 import platform
@@ -56,6 +57,8 @@ class ExtensionProcess:
         self.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
         self.download_check   = manifest.get("download_check", "")
         self._params_schema   = manifest.get("params_schema", [])
+        self.io_contract      = manifest.get("io_contract")
+        self.input_ports      = manifest.get("input_ports", [])
 
         # Public metadata
         self.MODEL_ID     = manifest.get("id", "")
@@ -340,6 +343,98 @@ class ExtensionProcess:
 
             if msg is None:
                 raise RuntimeError(f"[{self.MODEL_ID}] Subprocess died during generation")
+
+            if msg.get("id") != req_id:
+                continue
+
+            t = msg.get("type")
+
+            if t == "progress":
+                if progress_cb:
+                    progress_cb(msg.get("pct", 0), msg.get("step", ""))
+
+            elif t == "done":
+                return Path(msg["output_path"])
+
+            elif t == "error":
+                raise RuntimeError(msg.get("traceback") or msg.get("message", "Unknown error"))
+
+            elif t == "cancelled":
+                raise GenerationCancelled()
+
+            elif t == "log":
+                print(f"[{self.MODEL_ID}] {msg.get('message', '')}", file=sys.stderr)
+
+    def generate_v2(
+        self,
+        named_images: dict[str, bytes],
+        params: dict,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Path:
+        """
+        Named input-port generation protocol.
+
+        stdout remains NDJSON-only; logs still go through stderr/log messages.
+        """
+        from services.generators.base import GenerationCancelled
+
+        req_id = str(uuid.uuid4())
+        image_names = list(named_images.keys())
+        images_b64 = OrderedDict(
+            (name, base64.b64encode(named_images[name]).decode())
+            for name in image_names
+        )
+        self._send({
+            "action":      "generate_v2",
+            "id":          req_id,
+            "io_contract": "named-v1",
+            "image_names": image_names,
+            "images_b64":  images_b64,
+            "params":      params,
+            "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+        })
+
+        CANCEL_GRACE_SECONDS = 3.0
+
+        cancel_sent_at: Optional[float] = None
+        while True:
+            if cancel_event and cancel_event.is_set():
+                if cancel_sent_at is None:
+                    try:
+                        self._send({"action": "cancel", "id": req_id})
+                    except Exception:
+                        pass
+                    import time
+                    cancel_sent_at = time.monotonic()
+                else:
+                    import time
+                    if time.monotonic() - cancel_sent_at >= CANCEL_GRACE_SECONDS:
+                        try:
+                            if self._proc and self._proc.poll() is None:
+                                self._proc.kill()
+                                self._proc.wait(timeout=5.0)
+                        except Exception:
+                            pass
+                        self._loaded = False
+                        self._proc   = None
+                        print(
+                            f"[ExtensionProcess] {self.MODEL_ID} subprocess killed "
+                            f"after {CANCEL_GRACE_SECONDS}s grace; model will reload on next run",
+                            file=sys.stderr,
+                        )
+                        raise GenerationCancelled()
+
+            try:
+                msg = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if msg is None:
+                raise RuntimeError(f"[{self.MODEL_ID}] Subprocess died during generation")
+
+            if msg.get("id") != req_id:
+                continue
 
             t = msg.get("type")
 

@@ -2,6 +2,7 @@ import io
 import platform
 import queue
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 
 from services.extension_process import ExtensionProcess, _venv_python
@@ -25,6 +26,94 @@ class ExtensionProcessTests(unittest.TestCase):
 
         self.assertFalse(old_queue.empty())
         self.assertTrue(new_queue.empty())
+
+    def test_generate_v2_sends_named_images_in_order(self) -> None:
+        proc = _make_proc()
+        sent = []
+        proc.outputs_dir = Path("/tmp/out")
+
+        def send(msg):
+            sent.append(msg)
+            proc._queue.put({"type": "done", "id": msg["id"], "output_path": "/tmp/out/model.glb"})
+
+        proc._send = send  # type: ignore[method-assign]
+
+        result = proc.generate_v2(
+            OrderedDict([("front", b"front"), ("side", b"side")]),
+            {"quality": "draft"},
+        )
+
+        self.assertEqual(result, Path("/tmp/out/model.glb"))
+        self.assertEqual(sent[0]["action"], "generate_v2")
+        self.assertEqual(sent[0]["io_contract"], "named-v1")
+        self.assertEqual(sent[0]["image_names"], ["front", "side"])
+        self.assertEqual(list(sent[0]["images_b64"].keys()), ["front", "side"])
+
+    def test_generate_v2_ignores_stale_id_before_correct_done(self) -> None:
+        proc = _make_proc()
+        proc.outputs_dir = Path("/tmp/out")
+        progress = []
+
+        def send(msg):
+            proc._queue.put({"type": "progress", "id": "stale", "pct": 90, "step": "stale"})
+            proc._queue.put({"type": "done", "id": "stale", "output_path": "/tmp/out/stale.glb"})
+            proc._queue.put({"type": "progress", "id": msg["id"], "pct": 25, "step": "correct"})
+            proc._queue.put({"type": "done", "id": msg["id"], "output_path": "/tmp/out/correct.glb"})
+
+        proc._send = send  # type: ignore[method-assign]
+
+        result = proc.generate_v2(
+            OrderedDict([("front", b"front"), ("side", b"side")]),
+            {},
+            progress_cb=lambda pct, step: progress.append((pct, step)),
+        )
+
+        self.assertEqual(result, Path("/tmp/out/correct.glb"))
+        self.assertEqual(progress, [(25, "correct")])
+
+    def test_generate_ignores_idless_messages_before_correct_done(self) -> None:
+        proc = _make_proc()
+        proc.outputs_dir = Path("/tmp/out")
+        progress = []
+
+        def send(msg):
+            proc._queue.put({"type": "progress", "pct": 90, "step": "idless"})
+            proc._queue.put({"type": "done", "output_path": "/tmp/out/idless.glb"})
+            proc._queue.put({"type": "progress", "id": msg["id"], "pct": 25, "step": "correct"})
+            proc._queue.put({"type": "done", "id": msg["id"], "output_path": "/tmp/out/correct.glb"})
+
+        proc._send = send  # type: ignore[method-assign]
+
+        result = proc.generate(
+            b"image",
+            {},
+            progress_cb=lambda pct, step: progress.append((pct, step)),
+        )
+
+        self.assertEqual(result, Path("/tmp/out/correct.glb"))
+        self.assertEqual(progress, [(25, "correct")])
+
+    def test_generate_v2_ignores_idless_messages_before_correct_done(self) -> None:
+        proc = _make_proc()
+        proc.outputs_dir = Path("/tmp/out")
+        progress = []
+
+        def send(msg):
+            proc._queue.put({"type": "progress", "pct": 90, "step": "idless"})
+            proc._queue.put({"type": "done", "output_path": "/tmp/out/idless.glb"})
+            proc._queue.put({"type": "progress", "id": msg["id"], "pct": 25, "step": "correct"})
+            proc._queue.put({"type": "done", "id": msg["id"], "output_path": "/tmp/out/correct.glb"})
+
+        proc._send = send  # type: ignore[method-assign]
+
+        result = proc.generate_v2(
+            OrderedDict([("front", b"front"), ("side", b"side")]),
+            {},
+            progress_cb=lambda pct, step: progress.append((pct, step)),
+        )
+
+        self.assertEqual(result, Path("/tmp/out/correct.glb"))
+        self.assertEqual(progress, [(25, "correct")])
 
 
 class VenvPythonTests(unittest.TestCase):

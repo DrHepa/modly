@@ -17,6 +17,8 @@ export interface ExtensionNode {
   input:            'image' | 'text' | 'mesh' | 'audio'
   inputs?:          ('image' | 'text' | 'mesh' | 'audio')[]   // multi-input nodes; overrides input when set
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
+  io_contract?:     string
+  input_ports?:     ExtensionInputPortDescriptor[]
   output:           'image' | 'text' | 'mesh' | 'audio'
   paramsSchema:     ParamSchema[]
   paramDefaults?:   Record<string, number | string>
@@ -24,6 +26,13 @@ export interface ExtensionNode {
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
   hfIncludePrefixes?: string[]
+}
+
+export interface ExtensionInputPortDescriptor {
+  name:      string
+  type:      'image' | 'text' | 'mesh' | 'audio'
+  label?:    string
+  required?: boolean
 }
 
 export interface ModelExtension {

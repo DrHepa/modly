@@ -1,6 +1,6 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ParamSchema } from '@shared/types/electron.d'
+import type { ExtensionInputPortDescriptor, ParamSchema } from '@shared/types/electron.d'
 
 export interface WorkflowExtension {
   id:              string   // "ext_id/node_id"
@@ -13,6 +13,8 @@ export interface WorkflowExtension {
   input:           'image' | 'text' | 'mesh' | 'audio'
   inputs?:         ('image' | 'text' | 'mesh' | 'audio')[]   // multi-input; overrides input when set
   inputLabels?:    string[]                                  // display labels per input slot
+  io_contract?:    string
+  input_ports?:    ExtensionInputPortDescriptor[]
   output:          'image' | 'text' | 'mesh' | 'audio'
   params:          ParamSchema[]
   builtin:         boolean
@@ -50,6 +52,8 @@ export function buildAllWorkflowExtensions(
         input:           node.input,
         inputs:          node.inputs,
         inputLabels:     node.inputLabels,
+        io_contract:     node.io_contract,
+        input_ports:     node.input_ports,
         output:          node.output,
         params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
         builtin:         ext.builtin,
@@ -71,6 +75,8 @@ export function buildAllWorkflowExtensions(
         input:           node.input,
         inputs:          node.inputs,
         inputLabels:     node.inputLabels,
+        io_contract:     node.io_contract,
+        input_ports:     node.input_ports,
         output:          node.output,
         params:          applyParamDefaults(node.paramsSchema as ParamSchema[], node.paramDefaults),
         builtin:         ext.builtin,

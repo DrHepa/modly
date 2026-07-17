@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 
@@ -9,3 +9,4 @@ class JobStatus(BaseModel):
     step: Optional[str] = None    # Human-readable current step
     output_url: Optional[str] = None
     error: Optional[str] = None
+    input_ports: Optional[List[str]] = None

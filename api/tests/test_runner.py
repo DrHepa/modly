@@ -15,6 +15,8 @@ os.environ.setdefault("EXTENSION_DIR", _tmp_ext_dir)
 
 runner = importlib.import_module("runner")
 _apply_manifest_metadata = runner._apply_manifest_metadata
+_decode_named_images = runner._decode_named_images
+_require_generate_v2 = runner._require_generate_v2
 _resolve_ready_schema = runner._resolve_ready_schema
 _select_node = runner._select_node
 
@@ -67,6 +69,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(gen.download_check, "node/file")
         self.assertEqual(gen._params_schema, [{"id": "node"}])
 
+    def test_apply_manifest_metadata_sets_selected_node_identity(self) -> None:
+        gen = type("Gen", (), {"node_id": "default"})()
+        manifest = {"nodes": [{"id": "other"}, {"id": "pi3x"}]}
+        node = _select_node(manifest, str(Path("/tmp/ext/pi3x")))
+
+        _apply_manifest_metadata(gen, manifest, node)
+
+        self.assertEqual(gen.node_id, "pi3x")
+
+    def test_apply_manifest_metadata_preserves_default_without_node_id(self) -> None:
+        gen = type("Gen", (), {"node_id": "default"})()
+
+        _apply_manifest_metadata(gen, {}, {})
+
+        self.assertEqual(gen.node_id, "default")
+
     def test_apply_manifest_metadata_falls_back_to_manifest_when_node_empty(self) -> None:
         gen = type("Gen", (), {})()
         manifest = {
@@ -82,6 +100,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(gen.hf_skip_prefixes, ["top/"])
         self.assertEqual(gen.download_check, "top/file")
         self.assertEqual(gen._params_schema, [{"id": "top"}])
+
+    def test_apply_manifest_metadata_preserves_named_io_contract(self) -> None:
+        gen = type("Gen", (), {})()
+        manifest = {"io_contract": "legacy", "input_ports": []}
+        node = {
+            "io_contract": "named-v1",
+            "input_ports": [
+                {"name": "front", "type": "image"},
+                {"name": "side", "type": "image"},
+            ],
+        }
+
+        _apply_manifest_metadata(gen, manifest, node)
+
+        self.assertEqual(gen.io_contract, "named-v1")
+        self.assertEqual([p["name"] for p in gen.input_ports], ["front", "side"])
 
 
 class SelectNodeTests(unittest.TestCase):
@@ -152,6 +186,38 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(written.endswith("\n"))
         self.assertEqual(written.count("\n"), 1)
         self.assertEqual(json.loads(written), {"type": "ready", "params_schema": []})
+
+
+class GenerateV2ProtocolTests(unittest.TestCase):
+    def test_decode_named_images_preserves_image_names_order(self) -> None:
+        msg = {
+            "io_contract": "named-v1",
+            "image_names": ["front", "side"],
+            "images_b64": {
+                "side": "c2lkZQ==",
+                "front": "ZnJvbnQ=",
+            },
+        }
+
+        named_images = _decode_named_images(msg)
+
+        self.assertEqual(list(named_images.keys()), ["front", "side"])
+        self.assertEqual(named_images["front"], b"front")
+        self.assertEqual(named_images["side"], b"side")
+
+    def test_missing_generate_v2_fails_actionably(self) -> None:
+        class LegacyGen:
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "generate_v2"):
+            _require_generate_v2(LegacyGen())
+
+    def test_present_generate_v2_is_accepted(self) -> None:
+        class NamedGen:
+            def generate_v2(self, named_images, params, progress_cb, cancel_event):
+                return None
+
+        _require_generate_v2(NamedGen())
 
 
 if __name__ == "__main__":

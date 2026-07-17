@@ -22,6 +22,7 @@ import { buildAllWorkflowExtensions } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
 import { useWorkflowRunStore } from './workflowRunStore'
 import { validateWorkflowPreflight } from './preflight'
+import { getInputPortByHandle, getPrimaryInputHandle } from '@shared/utils/inputPorts'
 import ExtensionNode    from './nodes/ExtensionNode'
 import ImageNode        from './nodes/ImageNode'
 import TextNode         from './nodes/TextNode'
@@ -713,11 +714,7 @@ function getNodeInputType(
   if (node.type === 'outputNode')  return 'mesh'
   if (node.type === 'previewNode') return 'image'
   const ext = allExts.find((e) => e.id === (node.data as WFNodeData)?.extensionId)
-  if (ext?.inputs && ext.inputs.length > 1 && targetHandle) {
-    const idx = parseInt(targetHandle.replace('input-', ''), 10)
-    return ext.inputs[isNaN(idx) ? 0 : idx] ?? ext.input
-  }
-  return ext?.input
+  return getInputPortByHandle(ext, targetHandle)?.type ?? ext?.input
 }
 
 // ─── Workflow canvas (inner, requires ReactFlowProvider) ──────────────────────
@@ -1059,8 +1056,9 @@ function WorkflowCanvasInner({
       // source — those have no matching handle and would orphan the edge.
       const canWire = isSource ? !NODE_TYPES_WITHOUT_TARGET.has(type) : !NODE_TYPES_WITHOUT_SOURCE.has(type)
       if (canWire) {
+        const newExt = isExt ? allExtensions.find((e) => e.id === extensionId) : undefined
         const edge = isSource
-          ? { id: newId(), source: pending.nodeId, sourceHandle: pending.handleId ?? undefined, target: newNodeId, targetHandle: isExt ? 'input-0' : undefined }
+          ? { id: newId(), source: pending.nodeId, sourceHandle: pending.handleId ?? undefined, target: newNodeId, targetHandle: isExt ? getPrimaryInputHandle(newExt) : undefined }
           : { id: newId(), source: newNodeId, sourceHandle: isExt ? 'output' : undefined, target: pending.nodeId, targetHandle: pending.handleId ?? undefined }
         setEdges((eds) => addEdge({ ...edge, ...DEFAULT_EDGE_OPTS }, eds))
       }
@@ -1069,7 +1067,7 @@ function WorkflowCanvasInner({
     pendingConnectionRef.current = null
     setPendingDropPos(null)
     setPaletteOpen(false)
-  }, [screenToFlowPosition, setNodes, setEdges, pendingDropPos])
+  }, [screenToFlowPosition, setNodes, setEdges, pendingDropPos, allExtensions])
 
   // When a While container is deleted (button or keyboard), detach its children
   // to absolute coordinates so they don't get orphaned to the canvas origin.

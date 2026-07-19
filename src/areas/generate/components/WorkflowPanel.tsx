@@ -36,6 +36,10 @@ const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdg
 const toWorkflowNodes = (nodes: FlowNode[]): WFNode[] => nodes as unknown as WFNode[]
 const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TYPE_COLOR: Record<string, string> = {
@@ -903,8 +907,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
       n.id === nodeId ? { ...n, data: { ...n.data, ...patch } } : n,
     ))
     // Push params live so a paused/looping run uses the latest values on the next node start.
-    if (patch.params) {
-      useWorkflowRunStore.getState().setLiveNodeParams(nodeId, patch.params as Record<string, unknown>)
+    if (isRecord(patch.params)) {
+      useWorkflowRunStore.getState().setLiveNodeParams(nodeId, patch.params)
     }
   }, [setNodes])
 

@@ -1457,7 +1457,7 @@ interface WorkflowRunStore {
   run:         (workflow: Workflow, allExtensions: WorkflowExtension[], overrideImageData?: string) => Promise<void>
   cancel:      () => void
   reset:       () => void
-  continueRun: (waitId: string, options?: CheckpointContinueOptions) => Promise<void>
+  continueRun: (waitId: string | { waitId: string }, options?: CheckpointContinueOptions) => Promise<void>
   /** While container: resume past the loop (Continue) */
   continueWhile: () => void
   /** While container: resume and re-run the loop body once more (Retry) */
@@ -1651,6 +1651,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       _activeJobId.current = null
       set({ executionId: runId, checkpoints: {}, activeCheckpointNodeId: null, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {} })
       _cancel.current = false
+      _retry.current = false
       _pauseRequested.current = false
       // Seed live params from the snapshot; UI edits during the run override these.
       _liveParams.current = new Map(workflow.nodes.map((n) => [n.id, { ...(n.data.params ?? {}) }]))
@@ -1994,7 +1995,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       }
     },
 
-    async continueRun(waitId, options) {
+    async continueRun(request, options) {
+      const waitId = typeof request === 'string' ? request : request.waitId
       const state = get()
       if (state.runningBranchId !== null || state.runState.status === 'running') return
       // Only runnable Waits: blocked (parent not done) and running are not.
@@ -2179,6 +2181,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       if (ctx) updateOwnedJob(ctx, { outputUrl: undefined, previewKind: undefined, step: undefined })
       ++executionEpoch
       _cancel.current = true
+      _retry.current = false
       _pauseRequested.current = false
       flushResume()   // unblock a manual While pause so the run can tear down
       if (_activeJobId.current) {
@@ -2196,6 +2199,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       if (ctx) updateOwnedJob(ctx, { outputUrl: undefined, previewKind: undefined, step: undefined })
       ++executionEpoch
       _cancel.current = true
+      _retry.current = false
       _pauseRequested.current = false
       flushResume()
       _ctx.current = null

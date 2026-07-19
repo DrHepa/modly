@@ -47,5 +47,5 @@ export function useWaitButton(nodeId: string): WaitButtonModel {
     waitState === 'pending' ? 'Workflow paused — click Continue to run this branch.' :
     'Pauses the workflow until you click Continue.'
 
-  return { waitState, canContinue, isRunning, label, buttonClass, statusText, onContinue: () => continueRun(nodeId) }
+  return { waitState, canContinue, isRunning, label, buttonClass, statusText, onContinue: () => continueRun({ waitId: nodeId }) }
 }

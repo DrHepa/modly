@@ -63,8 +63,8 @@ const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFE
 function findWhileContainerAt(nodes: FlowNode<WFNodeData>[], pos: { x: number; y: number }): FlowNode<WFNodeData> | undefined {
   return nodes.find((n) => {
     if (!isContainerType(n.type)) return false
-    const gw = (n.measured?.width  ?? n.width  ?? (n.style?.width  as number)) || 0
-    const gh = (n.measured?.height ?? n.height ?? (n.style?.height as number)) || 0
+    const gw = (n.measured?.width  ?? n.width  ?? (typeof n.style?.width === 'number' ? n.style.width : 0)) || 0
+    const gh = (n.measured?.height ?? n.height ?? (typeof n.style?.height === 'number' ? n.style.height : 0)) || 0
     return pos.x >= n.position.x && pos.x <= n.position.x + gw
         && pos.y >= n.position.y && pos.y <= n.position.y + gh
   })

@@ -30,6 +30,14 @@ export function openAssetLibraryEntry(request: AssetLibraryOpenRequest): Promise
   return getWorkspaceLibraryApi().open(request).then(projectAssetLibraryOpenResult)
 }
 
+export function getDefaultAssetLibraryService() {
+  return {
+    list: listAssetLibraryEntries,
+    read: readAssetLibraryEntry,
+    open: openAssetLibraryEntry,
+  }
+}
+
 function createUnsafeWorkspacePathError(request: AssetLibraryReadRequest): Error | undefined {
   if (!isSafeViewerWorkspaceRelativePath(request.workspacePath)) {
     return new Error(UNSAFE_WORKSPACE_PATH_ERROR)

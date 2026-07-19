@@ -13,10 +13,10 @@ import {
   type AssetLibrarySortMode,
   type GenerateOpenPanel,
 } from './assetLibraryUi.ts'
-import { projectAssetLibraryEntry, resolveAssetLibraryOpenTarget, type ProjectedAssetLibraryEntry } from './assetLibraryProjection.ts'
+import { projectAssetLibraryEntry, type RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 import type { AssetLibraryEntry } from '../../shared/types/assetLibrary.ts'
 
-function entry(overrides: Partial<AssetLibraryEntry> = {}): ProjectedAssetLibraryEntry {
+function entry(overrides: Partial<AssetLibraryEntry> = {}): RendererAssetLibraryEntry {
   const base: AssetLibraryEntry = {
     id: 'library:Workflows/hero.glb',
     workspacePath: 'Workflows/hero.glb',
@@ -26,14 +26,13 @@ function entry(overrides: Partial<AssetLibraryEntry> = {}): ProjectedAssetLibrar
     state: 'ready',
     previewKind: '3d-model',
     warnings: [],
-    openable: true,
     createdAt: '2026-06-16T10:00:00.000Z',
     ...overrides,
   }
   return projectAssetLibraryEntry(base)
 }
 
-function groupPaths(entries: ProjectedAssetLibraryEntry[], search = '', sortMode: AssetLibrarySortMode = 'type'): string[] {
+function groupPaths(entries: RendererAssetLibraryEntry[], search = '', sortMode: AssetLibrarySortMode = 'type'): string[] {
   return filterAssetLibraryScopeGroups(entries, search, sortMode).flatMap((scopeGroup) => (
     scopeGroup.entryGroups.flatMap((group) => group.entries.map((item) => item.workspacePath))
   ))
@@ -44,7 +43,7 @@ test('organizes visible library assets by scope and capability with collapsible 
     entry({ id: 'workflow-mesh', workspacePath: 'Workflows/run/hero.glb', displayName: 'hero.glb', sourceScope: 'workflows', capability: 'mesh' }),
     entry({ id: 'export-rig', workspacePath: 'Exports/rig/hero-rig.gltf', displayName: 'hero-rig.gltf', sourceScope: 'exports', capability: 'rigged-mesh' }),
     entry({ id: 'hidden-cache', workspacePath: 'Workflows/run/cache/internal.glb', displayName: 'internal.glb', sourceScope: 'workflows' }),
-    entry({ id: 'unsupported', workspacePath: 'Exports/readme.txt', displayName: 'readme.txt', sourceScope: 'exports', state: 'unsupported', openable: false }),
+    entry({ id: 'unsupported', workspacePath: 'Exports/readme.txt', displayName: 'readme.txt', sourceScope: 'exports', state: 'unsupported' }),
   ]
 
   const groups = filterAssetLibraryScopeGroups(entries, '', 'type')
@@ -63,8 +62,8 @@ test('searches workspace assets by name path capability scope source and manifes
     entry({ id: 'b', workspacePath: 'Workflows/run/zebra.glb', displayName: 'zebra.glb', sourceScope: 'workflows', capability: 'mesh', createdAt: '2026-06-15T10:00:00.000Z' }),
     entry({ id: 'a', workspacePath: 'Exports/rig/alpha.gltf', displayName: 'alpha.gltf', sourceScope: 'exports', capability: 'rigged-mesh', createdAt: '2026-06-16T10:00:00.000Z' }),
     entry({
-      id: 'c', workspacePath: 'Exports/motion/walk.json', displayName: 'walk.json', sourceScope: 'exports', capability: 'animation-motion', openable: false, previewKind: 'text',
-      source: { workspacePath: 'Workflows/run/zebra.glb', displayName: 'zebra.glb' },
+      id: 'c', workspacePath: 'Exports/motion/walk.json', displayName: 'walk.json', sourceScope: 'exports', capability: 'animation-motion', previewKind: 'text',
+      source: { relation: 'sidecar-source', workspacePath: 'Workflows/run/zebra.glb' },
       manifest: { workspacePath: 'Exports/motion/walk.scene.json', capability: 'scene-manifest' },
     }),
   ]
@@ -78,7 +77,7 @@ test('searches workspace assets by name path capability scope source and manifes
 
 test('opens only safe glb and gltf entries through existing Generate job and history state', () => {
   const glb = entry({ workspacePath: 'Workflows/run/hero.glb', displayName: 'hero.glb' })
-  const ply = entry({ workspacePath: 'Exports/scan.ply', displayName: 'scan.ply', openable: false, nonOpenableReason: 'Only .glb/.gltf workspace assets are openable in this release.' })
+  const ply = entry({ workspacePath: 'Exports/scan.ply', displayName: 'scan.ply', previewKind: 'binary' })
 
   assert.equal(isAssetLibraryEntryOpenable(glb), true)
   assert.equal(isAssetLibraryEntryOpenable(ply), false)
@@ -86,11 +85,12 @@ test('opens only safe glb and gltf entries through existing Generate job and his
   assert.equal(describeAssetLibraryOpenability(ply), 'Only .glb/.gltf workspace assets are openable in this release.')
   assert.deepEqual(buildAssetLibraryOpenRequest(glb), { workspacePath: 'Workflows/run/hero.glb' })
 
-  const target = resolveAssetLibraryOpenTarget(glb)
+  const target = glb.openTarget
   assert.equal(target.kind, 'self')
   if (target.kind !== 'self') throw new Error('expected self target')
 
   const selection = createAssetLibraryOpenJob(glb, target, 1718546400000)
+  assert(selection)
   assert.equal(selection.historyUrl, '/workspace/Workflows/run/hero.glb')
   assert.equal(selection.job.status, 'done')
   assert.equal(selection.job.outputUrl, '/workspace/Workflows/run/hero.glb')
@@ -105,8 +105,7 @@ test('builds linked-source open requests and import jobs for safe sidecars', () 
     displayName: 'hero.landmarks.v1.json',
     capability: 'landmarks-sidecar',
     previewKind: 'text',
-    openable: false,
-    source: { workspacePath: 'Workflows/run/hero.glb', displayName: 'hero.glb' },
+    source: { relation: 'sidecar-source', workspacePath: 'Workflows/run/hero.glb' },
   })
 
   assert.equal(isAssetLibraryEntryOpenable(sidecar), true)
@@ -116,7 +115,7 @@ test('builds linked-source open requests and import jobs for safe sidecars', () 
     sourceWorkspacePath: 'Workflows/run/hero.glb',
   })
 
-  const target = resolveAssetLibraryOpenTarget(sidecar)
+  const target = sidecar.openTarget
   assert.equal(target.kind, 'linked-source')
   if (target.kind !== 'linked-source') throw new Error('expected linked source target')
   const selection = createAssetLibraryOpenJob(sidecar, target, 1718546400001)

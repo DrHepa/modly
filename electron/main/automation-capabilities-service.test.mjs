@@ -322,6 +322,44 @@ test('buildAutomationCapabilities keeps backend_ready=true on partial model para
   })
 })
 
+test('buildAutomationCapabilities preserves backend model input only when defined', async () => {
+  await withTempExtensions(async ({ builtinDir, userExtensionsDir }) => {
+    const originalGet = axios.get
+    axios.get = async (url, config = {}) => {
+      if (url.endsWith('/health')) return { data: { ok: true } }
+      if (url.endsWith('/model/all')) {
+        return {
+          data: [
+            { id: 'model-without-input', name: 'Model Without Input' },
+            { id: 'model-with-input', name: 'Model With Input', input: 'scene' },
+          ],
+        }
+      }
+      if (url.endsWith('/model/params')) {
+        if (config.params?.model_id === 'model-without-input') return { data: [] }
+        if (config.params?.model_id === 'model-with-input') return { data: [] }
+      }
+
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+
+    try {
+      const response = await buildAutomationCapabilities({
+        builtinDir,
+        userExtensionsDir,
+        trustedRepos: new Set(),
+      })
+
+      assert.equal(response.backend_ready, true)
+      assert.equal(response.models.length, 2)
+      assert.equal(Object.hasOwn(response.models[0], 'input'), false)
+      assert.equal(response.models[1]?.input, 'scene')
+    } finally {
+      axios.get = originalGet
+    }
+  })
+})
+
 test('parseExtensionManifest preserves legacy process nodes without inputs[]', () => {
   const extension = parseExtensionManifest(
     {

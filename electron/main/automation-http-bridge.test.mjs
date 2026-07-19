@@ -130,7 +130,14 @@ test('AutomationHttpBridge returns 500 for unexpected bridge errors', async () =
   try {
     const response = await requestJson(AUTOMATION_HTTP_BRIDGE_PATH, undefined, bridge)
     assert.equal(response.status, 500)
-    assert.deepEqual(await response.json(), { error: 'Internal Server Error' })
+    assert.match(response.headers.get('content-type') ?? '', /^application\/json/)
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: 'PROCESS_EXECUTION_FAILED',
+        message: 'Internal server error.',
+        retryable: false,
+      },
+    })
     assert.equal(loggerMessages.length, 1)
     assert.match(loggerMessages[0] ?? '', /Automation HTTP bridge request failed:/)
   } finally {

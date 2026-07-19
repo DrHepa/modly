@@ -16,6 +16,23 @@ type UiOnlyNodeForTest = {
   id: string
 }
 
+type NamedPortForTest = {
+  name: string
+}
+
+type ExtensionForTest = {
+  id: string
+}
+
+type ExtensionDiscoveryErrorForTest = {
+  context?: { extension_id?: string }
+  message: string
+}
+
+type ResolvedExtensionForTest = {
+  extension: ExtensionForTest
+}
+
 test('parseExtensionManifest preserves legacy process nodes with default non-interactive automation metadata', () => {
   const extension = parseExtensionManifest(
     {
@@ -88,6 +105,242 @@ test('parseExtensionManifest falls back to stable typed ports for legacy string 
     { name: 'text', type: 'text', required: true },
     { name: 'mesh', type: 'mesh', required: true },
   ])
+})
+
+
+test('parseExtensionManifest exposes inherited named-v1 ports and ignores named outputs for legacy models', () => {
+  const named = parseExtensionManifest(
+    {
+      id: 'sense-depth',
+      type: 'model',
+      io_contract: 'named-v1',
+      nodes: [{
+        id: 'depth-six-view',
+        input: 'image',
+        output: 'image',
+        inputs: [
+          { name: 'front', type: 'image', required: true },
+          { name: 'right', type: 'image', required: false },
+          { name: 'back', type: 'image', required: false },
+          { name: 'left', type: 'image', required: false },
+          { name: 'top', type: 'image', required: false },
+          { name: 'bottom', type: 'image', required: false },
+        ],
+        outputs: [
+          { name: 'front_depth', type: 'image' },
+          { name: 'right_depth', type: 'image' },
+          { name: 'back_depth', type: 'image' },
+          { name: 'left_depth', type: 'image' },
+          { name: 'top_depth', type: 'image' },
+          { name: 'bottom_depth', type: 'image' },
+        ],
+      }],
+    },
+    'sense-depth',
+    new Set(),
+    false,
+  )
+
+  assert.equal(named.type, 'model')
+  assert.equal(named.nodes[0].ioContract, 'named-v1')
+  assert.deepEqual(named.nodes[0].inputs?.map((port: NamedPortForTest) => port.name), [
+    'front', 'right', 'back', 'left', 'top', 'bottom',
+  ])
+  assert.deepEqual(named.nodes[0].outputs?.map((port: NamedPortForTest) => port.name), [
+    'front_depth', 'right_depth', 'back_depth', 'left_depth', 'top_depth', 'bottom_depth',
+  ])
+
+  const legacy = parseExtensionManifest(
+    {
+      id: 'legacy-image-model',
+      type: 'model',
+      nodes: [{
+        id: 'legacy-four-view',
+        input: 'image',
+        output: 'image',
+        inputs: [
+          { name: 'front', type: 'image', required: true },
+          { name: 'left', type: 'image', required: false },
+          { name: 'back', type: 'image', required: false },
+          { name: 'right', type: 'image', required: false },
+        ],
+        outputs: [{ name: 'provisional_named_output', type: 'image' }],
+      }],
+    },
+    'legacy-image-model',
+    new Set(),
+    false,
+  )
+
+  assert.equal(legacy.nodes[0].ioContract, undefined)
+  assert.deepEqual(legacy.nodes[0].outputs, [{ name: 'provisional_named_output', type: 'image', required: true }])
+  assert.deepEqual(legacy.nodes[0].inputs?.map((port: NamedPortForTest) => port.name), [
+    'front', 'left', 'back', 'right',
+  ])
+})
+
+test('parseExtensionManifest defaults omitted named-v1 output required to true', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'default-required-output',
+      type: 'model',
+      io_contract: 'named-v1',
+      nodes: [{
+        id: 'generate',
+        input: 'image',
+        output: 'image',
+        inputs: [{ name: 'source', type: 'image' }],
+        outputs: [{ name: 'result', type: 'image' }],
+      }],
+    },
+    'default-required-output',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].outputs, [
+    { name: 'result', type: 'image', required: true },
+  ])
+})
+
+test('parseExtensionManifest preserves explicit false for named-v1 output required', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'optional-output',
+      type: 'model',
+      io_contract: 'named-v1',
+      nodes: [{
+        id: 'generate',
+        input: 'image',
+        output: 'image',
+        inputs: [{ name: 'source', type: 'image' }],
+        outputs: [{ name: 'preview', type: 'image', required: false }],
+      }],
+    },
+    'optional-output',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].outputs, [
+    { name: 'preview', type: 'image', required: false },
+  ])
+})
+
+test('parseExtensionManifest rejects non-boolean named-v1 output required', () => {
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'invalid-output-required',
+        type: 'model',
+        io_contract: 'named-v1',
+        nodes: [{
+          id: 'generate',
+          input: 'image',
+          output: 'image',
+          inputs: [{ name: 'source', type: 'image' }],
+          outputs: [{ name: 'result', type: 'image', required: 'false' as never }],
+        }],
+      },
+      'invalid-output-required',
+      new Set(),
+      false,
+    ),
+    /outputs\[0\]\.required must be a boolean/i,
+  )
+})
+
+test('parseExtensionManifest rejects malformed named-v1 declarations with actionable errors', () => {
+  const parse = (node: Record<string, unknown>, ioContract = 'named-v1') => parseExtensionManifest(
+    {
+      id: 'invalid-named-model',
+      type: 'model',
+      nodes: [{ id: 'depth', input: 'image', output: 'image', io_contract: ioContract, ...node }],
+    },
+    'invalid-named-model',
+    new Set(),
+    false,
+  )
+
+  assert.throws(
+    () => parse({ inputs: [
+      { name: 'front', type: 'image' },
+      { name: 'front', type: 'image' },
+    ], outputs: [{ name: 'front_depth', type: 'image' }] }),
+    /duplicate port name "front"/i,
+  )
+  assert.deepEqual(
+    parse({
+      inputs: [{ name: 'front', type: 'depth-map' }],
+      outputs: [{ name: 'front_depth', type: 'image' }],
+    }).nodes[0].inputs,
+    [{ name: 'front', type: 'depth-map', required: true }],
+  )
+  assert.throws(
+    () => parse({
+      inputs: [{ name: 'front', type: 'image' }],
+      outputs: [{ name: 'front_depth', type: 'image' }],
+    }, 'positional-v2'),
+    /unsupported io_contract/i,
+  )
+})
+
+test('parseExtensionManifest accepts one sole ordered repeatable image port under named-v1', () => {
+  const extension = parseExtensionManifest({
+    id: 'sense-reconstruct',
+    type: 'model',
+    io_contract: 'named-v1',
+    nodes: [{
+      id: 'reconstruct',
+      input: 'image',
+      output: 'mesh',
+      inputs: [{
+        name: 'images',
+        type: 'image',
+        required: true,
+        multiple: true,
+        min_items: 1,
+        max_items: 10,
+        ordered: true,
+      }],
+      outputs: [{ name: 'point_cloud', type: 'mesh' }],
+    }],
+  }, 'sense-reconstruct', new Set(), false)
+
+  assert.equal(extension.nodes[0].ioContract, 'named-v1')
+  assert.deepEqual(extension.nodes[0].inputs?.[0], {
+    name: 'images', type: 'image', required: true,
+    multiple: true, min_items: 1, max_items: 10, ordered: true,
+  })
+
+  for (const inputs of [
+    [
+      { name: 'images', type: 'image', required: true, multiple: true, ordered: true },
+      { name: 'mask', type: 'image', required: false },
+    ],
+    [{ name: 'images', type: 'image', required: false, multiple: true, ordered: true }],
+    [{ name: 'images', type: 'image', required: true, multiple: true, ordered: false }],
+  ]) {
+    assert.throws(() => parseExtensionManifest({
+      id: 'invalid-repeatable', type: 'model', io_contract: 'named-v1',
+      nodes: [{ id: 'reconstruct', input: 'image', output: 'mesh', inputs: inputs as never, outputs: [{ name: 'point_cloud', type: 'mesh' }] }],
+    }, 'invalid-repeatable', new Set(), false), /sole input|required|ordered/i)
+  }
+})
+
+test('parseExtensionManifest rejects io_contract on process nodes but preserves process outputs[] when present', () => {
+  assert.throws(() => parseExtensionManifest({
+    id: 'bad-process-contract', type: 'process', io_contract: 'named-v1', entry: 'processor.js',
+    nodes: [{ id: 'run', input: 'image', output: 'image' }],
+  }, 'bad-process-contract', new Set(), false), /only for model extension nodes/i)
+
+  const extension = parseExtensionManifest({
+    id: 'bad-process-outputs', type: 'process', entry: 'processor.js',
+    nodes: [{ id: 'run', input: 'image', output: 'image', outputs: [{ name: 'preview', type: 'image' }] }],
+  }, 'bad-process-outputs', new Set(), false)
+
+  assert.equal(extension.type, 'process')
+  assert.deepEqual(extension.nodes[0].outputs, [{ name: 'preview', type: 'image', required: true }])
 })
 
 test('parseExtensionManifest accepts declarative interactive checkpoint and substitution metadata without making it headless', () => {
@@ -356,7 +609,7 @@ test('parseExtensionManifest rejects input none on process extensions', () => {
   )
 })
 
-test('parseExtensionManifest normalizes legacy json ports to scene without widening artifact kinds', () => {
+test('parseExtensionManifest preserves generic json ports instead of normalizing them to scene', () => {
   const extension = parseExtensionManifest(
     {
       id: 'dreamcube-scenes',
@@ -364,8 +617,8 @@ test('parseExtensionManifest normalizes legacy json ports to scene without widen
       entry: 'processor.js',
       nodes: [{
         id: 'generate-scene',
-        input: 'JSON' as never,
-        output: 'json' as never,
+        input: 'image',
+        output: 'mesh',
         inputs: ['Json' as never],
         input_contract: [{ name: 'scene_doc', label: 'Scene Doc', type: 'JSON', required: true }],
       }],
@@ -376,11 +629,32 @@ test('parseExtensionManifest normalizes legacy json ports to scene without widen
   )
 
   assert.equal(extension.type, 'process')
-  assert.equal(extension.nodes[0].input, 'scene')
-  assert.equal(extension.nodes[0].output, 'scene')
   assert.deepEqual(extension.nodes[0].inputs, [
-    { name: 'scene_doc', label: 'Scene Doc', type: 'scene', required: true },
+    { name: 'scene_doc', label: 'Scene Doc', type: 'JSON', required: true },
   ])
+})
+
+test('parseExtensionManifest accepts legacy object ports that use id as the handle alias', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'legacy-id-ports',
+      type: 'process',
+      entry: 'processor.js',
+      nodes: [{
+        id: 'run',
+        input: 'image',
+        output: 'mesh',
+        inputs: [{ id: 'source_image', type: 'image' } as never],
+        outputs: [{ id: 'preview_mesh', type: 'mesh' } as never],
+      }],
+    },
+    'legacy-id-ports',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [{ name: 'source_image', type: 'image', required: true }])
+  assert.deepEqual(extension.nodes[0].outputs, [{ name: 'preview_mesh', type: 'mesh', required: true }])
 })
 
 test('extension discovery preserves valid siblings when one manifest fails semantic parsing', async () => {
@@ -405,8 +679,8 @@ test('extension discovery preserves valid siblings when one manifest fails seman
 
   const listed = await readExtensionsFromDir(root, false, new Set())
   assert.equal(listed.length, 2)
-  assert.equal(listed.find((extension) => extension.id === 'valid-ext')?.type, 'process')
-  assert.deepEqual(listed.find((extension) => extension.id === 'invalid-ext'), {
+  assert.equal(listed.find((extension: ExtensionForTest) => extension.id === 'valid-ext')?.type, 'process')
+  assert.deepEqual(listed.find((extension: ExtensionForTest) => extension.id === 'invalid-ext'), {
     type: 'model',
     id: 'invalid-ext',
     name: 'invalid-ext',
@@ -416,19 +690,19 @@ test('extension discovery preserves valid siblings when one manifest fails seman
   })
 
   const detailed = await readExtensionsFromDirDetailed(root, false, new Set())
-  assert.equal(detailed.extensions.find((extension) => extension.id === 'valid-ext')?.type, 'process')
+  assert.equal(detailed.extensions.find((extension: ExtensionForTest) => extension.id === 'valid-ext')?.type, 'process')
   assert.match(
-    detailed.errors.find((error) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
+    detailed.errors.find((error: ExtensionDiscoveryErrorForTest) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
     /failed to parse manifest\.json/i,
   )
 
   const resolved = await readResolvedExtensionsFromDirDetailed(root, false, new Set())
-  const resolvedValid = resolved.extensions.find((entry) => entry.extension.id === 'valid-ext')
-  const resolvedInvalid = resolved.extensions.find((entry) => entry.extension.id === 'invalid-ext')
+  const resolvedValid = resolved.extensions.find((entry: ResolvedExtensionForTest) => entry.extension.id === 'valid-ext')
+  const resolvedInvalid = resolved.extensions.find((entry: ResolvedExtensionForTest) => entry.extension.id === 'invalid-ext')
   assert.equal(resolvedValid?.extension.type, 'process')
   assert.equal(resolvedInvalid?.manifest, null)
   assert.match(
-    resolved.errors.find((error) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
+    resolved.errors.find((error: ExtensionDiscoveryErrorForTest) => error.context?.extension_id === 'invalid-ext')?.message ?? '',
     /failed to parse manifest\.json/i,
   )
 })

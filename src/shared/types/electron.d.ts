@@ -47,7 +47,8 @@ import type {
 // ─── Extension types ──────────────────────────────────────────────────────────
 
 export type WorkflowNodeComponent = 'video-preview'
-export type ModelInputKind = ArtifactKind | 'none'
+export type ModelInputKind = ArtifactKind | string | 'none'
+export type ExtensionPortKind = ArtifactKind | string
 
 export interface HfDownloadFile {
   path: string
@@ -91,6 +92,8 @@ export interface ExtensionNode<
   input:            TInput
   output:           ArtifactKind
   inputs?:          ProcessPort[]
+  outputs?:         ExtensionOutputPort[]
+  ioContract?:      'named-v1'
   paramsSchema:     RawParamSchema[]
   hfRepo?:          string
   hfDownloads?:     HfDownloadDescriptor[]
@@ -100,6 +103,7 @@ export interface ExtensionNode<
   capabilityId?:    string
   bundleId?:        string
   weightOwnerId?:   string
+  processOwnerId?:  string
   sharedOwner?:     boolean
   legacyPaths?:     string[]
   automation?:      CapabilityAutomationMetadata
@@ -148,7 +152,18 @@ export interface ModelOwnershipMetadata {
 export interface ProcessPort {
   name:     string
   label?:   string
-  type:     ArtifactKind
+  type:     ExtensionPortKind
+  required?: boolean
+  multiple?: true
+  min_items?: number
+  max_items?: number
+  ordered?: true
+}
+
+export interface ExtensionOutputPort {
+  name:   string
+  label?: string
+  type:   ExtensionPortKind
   required?: boolean
 }
 

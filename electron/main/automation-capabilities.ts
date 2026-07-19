@@ -11,7 +11,8 @@ import {
 } from './https-download-manifest.ts'
 import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
 
-export type ModelInputKind = ArtifactKind | 'none'
+export type ModelInputKind = ArtifactKind | string | 'none'
+export type ExtensionPortKind = ArtifactKind | string
 
 type AutomationCapabilityError = {
   source: 'backend-runtime' | 'electron-manifest'
@@ -81,7 +82,18 @@ type CapabilityAutomationMetadata = {
 export type ProcessPort = {
   name: string
   label?: string
-  type: ArtifactKind
+  type: ExtensionPortKind
+  required?: boolean
+  multiple?: true
+  min_items?: number
+  max_items?: number
+  ordered?: true
+}
+
+export type ExtensionOutputPort = {
+  name: string
+  label?: string
+  type: ExtensionPortKind
   required?: boolean
 }
 
@@ -90,8 +102,9 @@ type WorkflowNodeComponent = 'video-preview'
 
 type LegacyProcessPortContract = {
   name?: string
+  id?: string
   label?: string
-  type?: ProcessPortType | 'json'
+  type?: ProcessPortType
   required?: boolean
 }
 
@@ -204,6 +217,7 @@ export type ParsedManifest = {
   source?: string
   generator_class?: string
   type?: 'model' | 'process'
+  io_contract?: string
   entry?: string
   nodes?: {
     id: string
@@ -212,6 +226,8 @@ export type ParsedManifest = {
     output?: ArtifactKind
     inputs?: Array<ProcessPort | ProcessPortType>
     input_contract?: LegacyProcessPortContract[]
+    io_contract?: string
+    outputs?: ExtensionOutputPort[]
     params_schema?: unknown[]
     hf_repo?: string
     hf_downloads?: unknown
@@ -219,6 +235,7 @@ export type ParsedManifest = {
     download_check?: string
     hf_skip_prefixes?: string[]
     weight_owner_id?: string
+    process_owner_id?: string
     automation?: PartialCapabilityAutomationMetadata
   }[]
   workflow_nodes?: {
@@ -241,6 +258,8 @@ export type ListedExtensionNode<
   input: TInput
   output: ArtifactKind
   inputs?: ProcessPort[]
+  outputs?: ExtensionOutputPort[]
+  ioContract?: 'named-v1'
   paramsSchema: unknown[]
   hfRepo?: string
   hfDownloads?: HfDownloadDescriptor[]
@@ -250,6 +269,7 @@ export type ListedExtensionNode<
   capabilityId?: string
   bundleId?: string
   weightOwnerId?: string
+  processOwnerId?: string
   sharedOwner?: boolean
   legacyPaths?: string[]
   automation?: CapabilityAutomationMetadata
@@ -314,8 +334,7 @@ function isProcessPortType(value: unknown): value is ProcessPortType {
 }
 
 function normalizeLegacyArtifactKind(value: unknown): unknown {
-  if (typeof value !== 'string') return value
-  return value.toLowerCase() === 'json' ? 'scene' : value
+  return value
 }
 
 function isModelInputKind(value: unknown): value is ModelInputKind {
@@ -361,9 +380,11 @@ function normalizeLegacyProcessPort(
   contract: LegacyProcessPortContract | undefined,
 ): ProcessPort {
   const normalizedContractType = normalizeLegacyArtifactKind(contract?.type)
-  const contractType = isProcessPortType(normalizedContractType) ? normalizedContractType : undefined
-  const type = contractType === inputType ? contractType : inputType
-  const fallbackName = contract?.name?.trim() || type
+  const contractType = typeof normalizedContractType === 'string' && normalizedContractType.trim().length > 0
+    ? normalizedContractType
+    : undefined
+  const type = contractType ?? inputType
+  const fallbackName = contract?.name?.trim() || contract?.id?.trim() || String(type)
   const fallbackLabel = contract?.label?.trim()
 
   return {
@@ -374,31 +395,159 @@ function normalizeLegacyProcessPort(
   }
 }
 
+const NAMED_MODEL_IO_CONTRACT = 'named-v1' as const
+
+type ModelIoContract = typeof NAMED_MODEL_IO_CONTRACT
+
+function normalizeModelIoContract(
+  value: unknown,
+  extensionType: 'model' | 'process',
+  context: string,
+): ModelIoContract | undefined {
+  if (value === undefined) return undefined
+  if (extensionType !== 'model') {
+    throw new Error(`${context} is supported only for model extension nodes`)
+  }
+  if (value !== NAMED_MODEL_IO_CONTRACT) {
+    throw new Error(`${context} has unsupported io_contract ${JSON.stringify(value)}; expected "${NAMED_MODEL_IO_CONTRACT}"`)
+  }
+  return NAMED_MODEL_IO_CONTRACT
+}
+
+const MAX_REPEATABLE_MODEL_INPUTS = 10
+
+function assertUniquePortNames(ports: Array<{ name: string }>, context: string): void {
+  const seen = new Set<string>()
+  for (const [index, port] of ports.entries()) {
+    if (typeof port.name !== 'string' || !port.name.trim()) {
+      throw new Error(`${context}[${index}].name must be a non-empty string`)
+    }
+    if (seen.has(port.name)) {
+      throw new Error(`${context} contains duplicate port name "${port.name}"`)
+    }
+    seen.add(port.name)
+  }
+}
+
+function assertNamedIoPortNames(ports: Array<{ name: string }>, context: string): void {
+  for (const [index, port] of ports.entries()) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(port.name)) {
+      throw new Error(`${context}[${index}].name is not a valid named-v1 handle`)
+    }
+  }
+}
+
+function requirePortName(
+  value: unknown,
+  context: string,
+  index: number,
+): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${context}[${index}].name must be a non-empty string`)
+  }
+  return value
+}
+
 function normalizeProcessPorts(
   inputs: Array<ProcessPort | ProcessPortType> | undefined,
   inputContract: LegacyProcessPortContract[] | undefined,
+  context: string,
+  allowRepeatable: boolean,
+  strictNamedModel = false,
 ): ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return undefined
 
-  return inputs
+  const ports = inputs
     .map((input, index) => {
       if (typeof input === 'string') {
+        if (strictNamedModel) {
+          throw new Error(`${context}[${index}] must be an object for named-v1`)
+        }
         const normalizedInput = normalizeLegacyArtifactKind(input)
-        if (!isProcessPortType(normalizedInput)) return undefined
+        if (typeof normalizedInput !== 'string' || normalizedInput.trim().length === 0) {
+          if (strictNamedModel) throw new Error(`${context}[${index}].type must be a non-empty string`)
+          return undefined
+        }
         return normalizeLegacyProcessPort(normalizedInput, inputContract?.[index])
       }
 
       const normalizedType = normalizeLegacyArtifactKind(input.type)
-      if (!isProcessPortType(normalizedType)) return undefined
+      if (typeof normalizedType !== 'string' || normalizedType.trim().length === 0) {
+        if (strictNamedModel) throw new Error(`${context}[${index}].type must be a non-empty string`)
+        return undefined
+      }
+      if (strictNamedModel && input.required !== undefined && typeof input.required !== 'boolean') {
+        throw new Error(`${context}[${index}].required must be a boolean`)
+      }
 
-      return {
-        name: input.name,
+      const base = {
+        name: input.name || (input as { id?: string }).id,
         ...(input.label ? { label: input.label } : {}),
         type: normalizedType,
         required: input.required ?? true,
       }
+      if (input.multiple !== true) return base
+      if (!allowRepeatable) {
+        throw new Error(`${context}[${index}] repeatable inputs are supported only for model nodes`)
+      }
+      if (normalizedType !== 'image') {
+        throw new Error(`${context}[${index}] repeatable model inputs must be image ports`)
+      }
+      const minItems = input.min_items ?? 1
+      const maxItems = input.max_items ?? MAX_REPEATABLE_MODEL_INPUTS
+      if (!Number.isInteger(minItems) || minItems < 1) {
+        throw new Error(`${context}[${index}].min_items must be at least 1`)
+      }
+      if (!Number.isInteger(maxItems) || maxItems < minItems || maxItems > MAX_REPEATABLE_MODEL_INPUTS) {
+        throw new Error(`${context}[${index}].max_items must be between min_items and ${MAX_REPEATABLE_MODEL_INPUTS}`)
+      }
+      if (input.ordered !== undefined && input.ordered !== true) {
+        throw new Error(`${context}[${index}].ordered must be true`)
+      }
+      return {
+        ...base,
+        multiple: true as const,
+        min_items: minItems,
+        max_items: maxItems,
+        ordered: true as const,
+      }
     })
     .filter((input): input is ProcessPort => Boolean(input))
+
+  assertUniquePortNames(ports, context)
+  if (strictNamedModel) assertNamedIoPortNames(ports, context)
+  return ports
+}
+
+function normalizeOutputPorts(
+  outputs: ExtensionOutputPort[] | undefined,
+  declaredOutput: ArtifactKind,
+  context: string,
+): ExtensionOutputPort[] | undefined {
+  if (!Array.isArray(outputs) || outputs.length === 0) return undefined
+
+  const ports = outputs.map((output, index) => {
+    if (!output || typeof output !== 'object') {
+      throw new Error(`${context}[${index}] must be an object`)
+    }
+    const normalizedType = normalizeLegacyArtifactKind(output.type)
+    if (typeof normalizedType !== 'string' || normalizedType.trim().length === 0) {
+      throw new Error(`${context}[${index}].type must be a non-empty string`)
+    }
+    if (output.required !== undefined && typeof output.required !== 'boolean') {
+      throw new Error(`${context}[${index}].required must be a boolean`)
+    }
+    const name = requirePortName(output.name || (output as { id?: string }).id, context, index)
+    return {
+      name,
+      ...(output.label ? { label: output.label } : {}),
+      type: normalizedType,
+      required: output.required ?? true,
+    }
+  })
+  assertUniquePortNames(ports, context)
+  assertNamedIoPortNames(ports, context)
+  return ports
 }
 
 function normalizeListedExtensionFallback(extensionDirName: string, isBuiltin: boolean): ListedModelExtension {
@@ -530,10 +679,16 @@ export function parseExtensionManifest(
 ): ListedExtension {
   const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
   const extensionType = parsed.type === 'process' ? 'process' : 'model'
+  if (parsed.io_contract !== undefined) {
+    normalizeModelIoContract(parsed.io_contract, extensionType, `${extensionId}.io_contract`)
+  }
   for (const node of parsed.nodes ?? []) {
     assertSafeOwnershipSegment(node.id, 'Manifest node id')
     if (node.weight_owner_id !== undefined) {
       assertSafeOwnershipSegment(node.weight_owner_id, 'Manifest weight_owner_id')
+    }
+    if (node.process_owner_id !== undefined) {
+      assertSafeOwnershipSegment(node.process_owner_id, 'Manifest process_owner_id')
     }
   }
   const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
@@ -562,10 +717,45 @@ export function parseExtensionManifest(
   }
 
   const nodes = (parsed.nodes ?? []).map((node) => {
-    const normalizedInputs = normalizeProcessPorts(node.inputs, node.input_contract)
     const capabilityId = `${extensionId}/${node.id}`
     const ownerId = node.weight_owner_id ?? node.id
     const weightOwnerId = `${extensionId}/${ownerId}`
+    const processOwnerId = node.process_owner_id ? `${extensionId}/${node.process_owner_id}` : undefined
+    const declaredOutput = isProcessPortType(normalizeLegacyArtifactKind(node.output))
+      ? normalizeLegacyArtifactKind(node.output) as ArtifactKind
+      : 'mesh' as const
+    const ioContract = normalizeModelIoContract(
+      node.io_contract ?? parsed.io_contract,
+      extensionType,
+      `${capabilityId}.io_contract`,
+    )
+    const namedV1 = ioContract === NAMED_MODEL_IO_CONTRACT
+    const normalizedInputs = normalizeProcessPorts(
+      node.inputs,
+      node.input_contract,
+      `${capabilityId}.inputs`,
+      namedV1,
+      namedV1,
+    )
+    const normalizedOutputs = (namedV1 || Array.isArray(node.outputs))
+      ? normalizeOutputPorts(node.outputs, declaredOutput, `${capabilityId}.outputs`)
+      : undefined
+    if (namedV1 && !normalizedOutputs) {
+      throw new Error(`${capabilityId}.outputs must be a non-empty array for named-v1`)
+    }
+    const repeatableInputs = normalizedInputs?.filter((input) => input.multiple === true) ?? []
+    if (repeatableInputs.length > 0) {
+      if (repeatableInputs.length !== 1 || normalizedInputs?.length !== 1) {
+        throw new Error(`${capabilityId}.inputs repeatable image port must be the sole input`)
+      }
+      const repeatable = repeatableInputs[0]
+      if (repeatable.required !== true) {
+        throw new Error(`${capabilityId}.inputs repeatable image port must be required`)
+      }
+      if (repeatable.ordered !== true) {
+        throw new Error(`${capabilityId}.inputs repeatable image port must be ordered`)
+      }
+    }
     const legacyPaths = [...(legacyPathsByOwner.get(weightOwnerId) ?? [capabilityId])]
     const hfDownloads = normalizeHfDownloads(node.hf_downloads, `${capabilityId}.hf_downloads`)
     const httpsDownloads = normalizeHttpsDownloads(
@@ -607,8 +797,11 @@ export function parseExtensionManifest(
         extensionType,
         capabilityId + '.input',
       ),
-      output: isProcessPortType(normalizeLegacyArtifactKind(node.output)) ? normalizeLegacyArtifactKind(node.output) as ArtifactKind : 'mesh' as const,
+      output: declaredOutput,
       ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
+      ...(normalizedOutputs ? { outputs: normalizedOutputs } : {}),
+      ...(ioContract ? { ioContract } : {}),
+      ...(processOwnerId ? { processOwnerId } : {}),
       paramsSchema: node.params_schema ?? [],
       hfRepo: node.hf_repo,
       ...(hfDownloads ? { hfDownloads } : {}),

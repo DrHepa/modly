@@ -1,8 +1,10 @@
 import { ipcMain, BrowserWindow, dialog, app, shell, type IpcMainInvokeEvent } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { dirname, join } from 'path'
-import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp } from 'fs/promises'
-import { existsSync, readdirSync, statSync } from 'fs'
+import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp, symlink, lstat } from 'fs/promises'
+import { existsSync, mkdirSync, readdirSync, statSync } from 'fs'
+import * as os from 'os'
+import { promisify } from 'util'
 import axios from 'axios'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
 import {
@@ -32,7 +34,8 @@ import { getBuiltinExtensionsDir } from './builtin-sync'
 import { listVisibleExtensions } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
-import { spawn } from 'child_process'
+import { spawn, execFile } from 'child_process'
+import { validateInstallManifest } from './extension-install-utils'
 import { fetchTrustedRepos } from './trusted-repos'
 import type { ProcessInput, WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
@@ -40,6 +43,7 @@ import { installGitHubExtensionRepo } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { assertSafeExtensionId, assertSafeOwnershipSegment, resolveExtensionPathWithinRoot } from './extension-path-guard'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
+import { updatesSupported } from './updater'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 
 type WindowGetter = () => BrowserWindow | null
@@ -953,6 +957,69 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
+  function isTrustedSource(source: string | undefined, trustedRepos: Set<string>): boolean {
+    if (!source) return false
+    return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
+  }
+
+  type ParsedManifest = {
+    id?: string; name?: string; displayName?: string; version?: string
+    description?: string; author?: string | { name?: string }
+    source?: string; generator_class?: string
+    type?:  'model' | 'process'
+    entry?: string
+    params_schema?:  unknown[]
+    param_defaults?: Record<string, unknown>
+    nodes?: {
+      id:                string
+      name?:             string
+      input?:            'mesh' | 'image' | 'text' | 'audio'
+      inputs?:           ('mesh' | 'image' | 'text' | 'audio')[]
+      input_labels?:     string[]
+      output?:           'mesh' | 'image' | 'text' | 'audio'
+      params_schema?:    unknown[]
+      param_defaults?:   Record<string, unknown>
+      hf_repo?:          string
+      download_check?:   string
+      hf_skip_prefixes?: string[]
+      hf_include_prefixes?: string[]
+    }[]
+  }
+
+  function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
+    const common = {
+      id:          parsed.id          ?? fallbackId,
+      name:        parsed.displayName ?? parsed.name ?? fallbackId,
+      version:     parsed.version,
+      description: parsed.description,
+      author:      typeof parsed.author === 'string' ? parsed.author : parsed.author?.name,
+      trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
+      source:      parsed.source,
+      builtin,
+    }
+
+    const nodes = (parsed.nodes ?? []).map(n => ({
+      id:             n.id,
+      name:           n.name ?? n.id,
+      input:          n.input  ?? 'image' as const,
+      inputs:         n.inputs,
+      inputLabels:    n.input_labels,
+      output:         n.output ?? 'mesh'  as const,
+      paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
+      paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
+      hfRepo:         n.hf_repo,
+      downloadCheck:  n.download_check,
+      hfSkipPrefixes: n.hf_skip_prefixes,
+      hfIncludePrefixes: n.hf_include_prefixes,
+    }))
+
+    if (parsed.type === 'process') {
+      return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
+    }
+
+    return { ...common, type: 'model' as const, nodes }
+  }
+
   // Extensions — reads user extensions directory + built-in extensions directory
   ipcMain.handle('extensions:list', async () => {
     const userData      = app.getPath('userData')
@@ -1229,7 +1296,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const dir = workflowsDir()
     const result = await listStoredWorkflows(dir)
     if (result.diagnostics.filenameIdMismatches.length > 0 || result.diagnostics.duplicateIds.length > 0 || result.diagnostics.corruptedFiles.length > 0) {
-      logger.warn('Workflow list diagnostics', result.diagnostics)
+      logger.warn(`Workflow list diagnostics: ${JSON.stringify(result.diagnostics)}`)
     }
     return result.workflows
   })

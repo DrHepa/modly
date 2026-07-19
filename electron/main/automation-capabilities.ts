@@ -23,6 +23,7 @@ import {
 import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
 
 export type ModelInputKind = string
+export type ExtensionPortKind = ArtifactKind | string
 
 type AutomationCapabilityError = {
   source: 'backend-runtime' | 'electron-manifest'
@@ -94,7 +95,18 @@ type CapabilityAutomationMetadata = {
 export type ProcessPort = {
   name: string
   label?: string
-  type: string
+  type: ExtensionPortKind
+  required?: boolean
+  multiple?: true
+  min_items?: number
+  max_items?: number
+  ordered?: true
+}
+
+export type ExtensionOutputPort = {
+  name: string
+  label?: string
+  type: ExtensionPortKind
   required?: boolean
 }
 
@@ -103,6 +115,7 @@ type WorkflowNodeComponent = 'video-preview'
 
 type LegacyProcessPortContract = {
   name?: string
+  id?: string
   label?: string
   type?: string
   required?: boolean
@@ -213,6 +226,7 @@ export type ParsedManifest = {
   source?: string; generator_class?: string
   // extension type
   type?:  'model' | 'process'
+  io_contract?: string
   entry?: string
   model_sources?: unknown
   weight_groups?: unknown
@@ -225,6 +239,8 @@ export type ParsedManifest = {
     input?:            string
     inputs?:           string[] | ProcessPort[]
     input_contract?:   LegacyProcessPortContract[]
+    io_contract?:      string
+    outputs?:          ExtensionOutputPort[]
     input_labels?:     string[]
     output?:           string
     params_schema?:    unknown[]
@@ -239,6 +255,7 @@ export type ParsedManifest = {
     weight_groups?: unknown
     weight_variants?: unknown
     weight_owner_id?: string
+    process_owner_id?: string
     automation?: PartialCapabilityAutomationMetadata
   }[]
   workflow_nodes?: {
@@ -280,7 +297,10 @@ function normalizeProcessPorts(
     }
     return ports
   }
-  return (inputs as ProcessPort[]).map((input) => ({ ...input, type: normalizeLegacyArtifactKind(input.type), required: input.required ?? true }))
+  return (inputs as ProcessPort[]).map((input) => {
+    const { id, ...port } = input as ProcessPort & { id?: string }
+    return { ...(input.name ? input : port), name: input.name || id || input.name, type: normalizeLegacyArtifactKind(input.type), required: input.required ?? true }
+  })
 }
 
 export type ListedWorkflowNode = {
@@ -344,8 +364,7 @@ function isProcessPortType(value: unknown): value is ProcessPortType {
 function normalizeLegacyArtifactKind(value: string): string
 function normalizeLegacyArtifactKind(value: unknown): unknown
 function normalizeLegacyArtifactKind(value: unknown): unknown {
-  if (typeof value !== 'string') return value
-  return value.toLowerCase() === 'json' ? 'scene' : value
+  return value
 }
 
 function isModelInputKind(value: unknown): value is ModelInputKind {
@@ -384,6 +403,143 @@ function normalizeWorkflowNodes(
       }
     })
     .filter((node): node is ListedWorkflowNode => Boolean(node))
+}
+
+const NAMED_MODEL_IO_CONTRACT = 'named-v1' as const
+
+type ModelIoContract = typeof NAMED_MODEL_IO_CONTRACT
+
+function normalizeModelIoContract(
+  value: unknown,
+  extensionType: 'model' | 'process',
+  context: string,
+): ModelIoContract | undefined {
+  if (value === undefined) return undefined
+  if (extensionType !== 'model') {
+    throw new Error(`${context} is supported only for model extension nodes`)
+  }
+  if (value !== NAMED_MODEL_IO_CONTRACT) {
+    throw new Error(`${context} has unsupported io_contract ${JSON.stringify(value)}; expected "${NAMED_MODEL_IO_CONTRACT}"`)
+  }
+  return NAMED_MODEL_IO_CONTRACT
+}
+
+const MAX_REPEATABLE_MODEL_INPUTS = 10
+
+function assertUniquePortNames(ports: Array<{ name: string }>, context: string): void {
+  const seen = new Set<string>()
+  for (const [index, port] of ports.entries()) {
+    if (typeof port.name !== 'string' || !port.name.trim()) {
+      throw new Error(`${context}[${index}].name must be a non-empty string`)
+    }
+    if (seen.has(port.name)) {
+      throw new Error(`${context} contains duplicate port name "${port.name}"`)
+    }
+    seen.add(port.name)
+  }
+}
+
+function assertNamedIoPortNames(ports: Array<{ name: string }>, context: string): void {
+  for (const [index, port] of ports.entries()) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(port.name)) {
+      throw new Error(`${context}[${index}].name is not a valid named-v1 handle`)
+    }
+  }
+}
+
+function requirePortName(
+  value: unknown,
+  context: string,
+  index: number,
+): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${context}[${index}].name must be a non-empty string`)
+  }
+  return value
+}
+
+function normalizeNamedModelInputs(
+  inputs: string[] | ProcessPort[] | undefined,
+  context: string,
+): ProcessPort[] | undefined {
+  if (!Array.isArray(inputs) || inputs.length === 0) return undefined
+
+  const ports = inputs.map((input, index) => {
+    if (typeof input === 'string') {
+      throw new Error(`${context}[${index}] must be an object for named-v1`)
+    }
+    const normalizedType = normalizeLegacyArtifactKind(input.type)
+    if (typeof normalizedType !== 'string' || normalizedType.trim().length === 0) {
+      throw new Error(`${context}[${index}].type must be a non-empty string`)
+    }
+    if (input.required !== undefined && typeof input.required !== 'boolean') {
+      throw new Error(`${context}[${index}].required must be a boolean`)
+    }
+
+    const base = {
+      name: requirePortName(input.name || (input as { id?: string }).id, context, index),
+      ...(input.label ? { label: input.label } : {}),
+      type: normalizedType,
+      required: input.required ?? true,
+    }
+    if (input.multiple !== true) return base
+    if (normalizedType !== 'image') {
+      throw new Error(`${context}[${index}] repeatable model inputs must be image ports`)
+    }
+    const minItems = input.min_items ?? 1
+    const maxItems = input.max_items ?? MAX_REPEATABLE_MODEL_INPUTS
+    if (!Number.isInteger(minItems) || minItems < 1) {
+      throw new Error(`${context}[${index}].min_items must be at least 1`)
+    }
+    if (!Number.isInteger(maxItems) || maxItems < minItems || maxItems > MAX_REPEATABLE_MODEL_INPUTS) {
+      throw new Error(`${context}[${index}].max_items must be between min_items and ${MAX_REPEATABLE_MODEL_INPUTS}`)
+    }
+    if (input.ordered !== undefined && input.ordered !== true) {
+      throw new Error(`${context}[${index}].ordered must be true`)
+    }
+    return {
+      ...base,
+      multiple: true as const,
+      min_items: minItems,
+      max_items: maxItems,
+      ordered: true as const,
+    }
+  })
+
+  assertUniquePortNames(ports, context)
+  assertNamedIoPortNames(ports, context)
+  return ports
+}
+
+function normalizeOutputPorts(
+  outputs: ExtensionOutputPort[] | undefined,
+  declaredOutput: string,
+  context: string,
+): ExtensionOutputPort[] | undefined {
+  if (!Array.isArray(outputs) || outputs.length === 0) return undefined
+
+  const ports = outputs.map((output, index) => {
+    if (!output || typeof output !== 'object') {
+      throw new Error(`${context}[${index}] must be an object`)
+    }
+    const normalizedType = normalizeLegacyArtifactKind(output.type)
+    if (typeof normalizedType !== 'string' || normalizedType.trim().length === 0) {
+      throw new Error(`${context}[${index}].type must be a non-empty string`)
+    }
+    if (output.required !== undefined && typeof output.required !== 'boolean') {
+      throw new Error(`${context}[${index}].required must be a boolean`)
+    }
+    const name = requirePortName(output.name || (output as { id?: string }).id, context, index)
+    return {
+      name,
+      ...(output.label ? { label: output.label } : {}),
+      type: normalizedType,
+      required: output.required ?? true,
+    }
+  })
+  assertUniquePortNames(ports, context)
+  assertNamedIoPortNames(ports, context)
+  return ports
 }
 
 type InstallationState = {
@@ -471,10 +627,16 @@ export function parseExtensionManifest(
 ) {
   const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
   const extensionType = parsed.type === 'process' ? 'process' : 'model'
+  if (parsed.io_contract !== undefined) {
+    normalizeModelIoContract(parsed.io_contract, extensionType, `${extensionId}.io_contract`)
+  }
   for (const node of parsed.nodes ?? []) {
     assertSafeOwnershipSegment(node.id, 'Manifest node id')
     if (node.weight_owner_id !== undefined) {
       assertSafeOwnershipSegment(node.weight_owner_id, 'Manifest weight_owner_id')
+    }
+    if (node.process_owner_id !== undefined) {
+      assertSafeOwnershipSegment(node.process_owner_id, 'Manifest process_owner_id')
     }
   }
   const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
@@ -502,6 +664,37 @@ export function parseExtensionManifest(
   }
   const ownership = describeModelOwnership(common.id, parsed.nodes ?? [])
   const nodes = (parsed.nodes ?? []).map((n, index) => {
+    const ioContract = normalizeModelIoContract(
+      n.io_contract ?? parsed.io_contract,
+      extensionType,
+      `${extensionId}/${n.id}.io_contract`,
+    )
+    const namedV1 = ioContract === NAMED_MODEL_IO_CONTRACT
+    const normalizedInputs = namedV1
+      ? normalizeNamedModelInputs(n.inputs, `${extensionId}/${n.id}.inputs`)
+      : normalizeProcessPorts(n.inputs, n.input_contract)
+    const normalizedOutputs = (namedV1 || Array.isArray(n.outputs))
+      ? normalizeOutputPorts(n.outputs, normalizeLegacyArtifactKind(n.output ?? 'mesh'), `${extensionId}/${n.id}.outputs`)
+      : undefined
+    const processOwnerId = n.process_owner_id ? `${extensionId}/${n.process_owner_id}` : undefined
+    if (namedV1 && !normalizedOutputs) {
+      throw new Error(`${extensionId}/${n.id}.outputs must be a non-empty array for named-v1`)
+    }
+    const repeatableInputs = namedV1
+      ? normalizedInputs?.filter((input): input is ProcessPort => typeof input !== 'string' && input.multiple === true) ?? []
+      : []
+    if (repeatableInputs.length > 0) {
+      if (repeatableInputs.length !== 1 || normalizedInputs?.length !== 1) {
+        throw new Error(`${extensionId}/${n.id}.inputs repeatable image port must be the sole input`)
+      }
+      const repeatable = repeatableInputs[0]
+      if (repeatable.required !== true) {
+        throw new Error(`${extensionId}/${n.id}.inputs repeatable image port must be required`)
+      }
+      if (repeatable.ordered !== true) {
+        throw new Error(`${extensionId}/${n.id}.inputs repeatable image port must be ordered`)
+      }
+    }
     const declaredInputs = Array.isArray(n.inputs) ? n.inputs : [n.input ?? 'image']
     const output = n.output ?? 'mesh'
     assertSupportedSceneNodeShape(parsed.type === 'process' ? 'process' : 'model', n, declaredInputs, output)
@@ -547,7 +740,10 @@ export function parseExtensionManifest(
       id:             nodeId,
       name:           n.name ?? n.id,
       input:          normalizeExtensionNodeInput(n.input, extensionType, `${capabilityId}.input`),
-      inputs:         normalizeProcessPorts(n.inputs, n.input_contract),
+      inputs:         normalizedInputs,
+      ...(normalizedOutputs ? { outputs: normalizedOutputs } : {}),
+      ...(ioContract ? { ioContract } : {}),
+      ...(processOwnerId ? { processOwnerId } : {}),
       inputLabels:    n.input_labels,
       output:         normalizeLegacyArtifactKind(n.output ?? 'mesh'),
       paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],

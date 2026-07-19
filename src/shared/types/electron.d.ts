@@ -41,6 +41,7 @@ export {}
 
 export type WorkflowNodeComponent = 'video-preview'
 export type ModelInputKind = string
+export type ExtensionPortKind = ArtifactKind | string
 
 export interface HfDownloadFile {
   path: string
@@ -85,6 +86,8 @@ export interface ExtensionNode<
   inputs?:          string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
   output:           string
+  outputs?:         ExtensionOutputPort[]
+  ioContract?:      'named-v1'
   paramsSchema:     RawParamSchema[]
   paramDefaults?:   Record<string, boolean | number | string>
   hfRepo?:          string
@@ -95,6 +98,7 @@ export interface ExtensionNode<
   capabilityId?:    string
   bundleId?:        string
   weightOwnerId?:   string
+  processOwnerId?:  string
   sharedOwner?:     boolean
   legacyPaths?:     string[]
   hfIncludePrefixes?: string[]
@@ -158,7 +162,18 @@ export interface SharedWeightGroup {
 export interface ProcessPort {
   name:     string
   label?:   string
-  type:     string
+  type:     ExtensionPortKind
+  required?: boolean
+  multiple?: true
+  min_items?: number
+  max_items?: number
+  ordered?: true
+}
+
+export interface ExtensionOutputPort {
+  name:   string
+  label?: string
+  type:   ExtensionPortKind
   required?: boolean
 }
 

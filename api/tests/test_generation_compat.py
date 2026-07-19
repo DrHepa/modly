@@ -712,7 +712,7 @@ def test_run_generation_logs_progress_done_and_error_without_changing_contracts_
     assert "sensitive failure detail" not in terminal_output
 
 
-def test_run_generation_leaves_output_kind_empty_when_backend_cannot_determine_it(api_modules, monkeypatch):
+def test_run_generation_leaves_output_kind_empty_when_backend_cannot_determine_it(api_modules, monkeypatch, capsys):
     generation_jobs = api_modules["generation_jobs"]
 
     def generate_unknown_output(image_bytes: bytes, params: dict, progress_cb=None, cancel_event=None):
@@ -732,4 +732,5 @@ def test_run_generation_leaves_output_kind_empty_when_backend_cannot_determine_i
         assert status.scene_candidate.kind == "mesh"
 
     asyncio.run(exercise_unknown_output_kind())
-    assert "Traceback" not in terminal_output
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err

@@ -1,8 +1,18 @@
 import type { Workflow, WFNode } from '@shared/types/electron.d'
+import type { ArtifactKind } from '@shared/types/artifacts.ts'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
+import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
 
-type DataType = 'image' | 'text' | 'mesh' | 'audio'
+type DataType = ArtifactKind
+
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+
+function asDataType(value: string | undefined): DataType | undefined {
+  return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
+    ? value as DataType
+    : undefined
+}
 
 export interface WorkflowPreflightIssue {
   key: string
@@ -27,10 +37,7 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
 }
 
 function formatType(type: DataType): string {
-  if (type === 'mesh') return 'mesh'
-  if (type === 'image') return 'image'
-  if (type === 'audio') return 'audio'
-  return 'text'
+  return type
 }
 
 function formatRequiredTypes(types: DataType[]): string {
@@ -42,10 +49,12 @@ function formatRequiredTypes(types: DataType[]): string {
 function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): DataType | undefined {
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
-  if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
-  if (node.type === 'previewNode') return 'image'
+  if (node.type === 'sceneNode') return 'scene'
+  if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
+  const previewType = previewNodeTargetArtifactKind(node.type)
+  if (previewType) return previewType
   if (node.type === 'forEachNode') {
-    const mode = (node.data.params?.mode as DataType | undefined) ?? 'image'
+    const mode = asDataType(typeof node.data.params?.mode === 'string' ? node.data.params.mode : undefined) ?? 'image'
     return mode === 'text' || mode === 'mesh' ? mode : 'image'
   }
   if (node.type === 'extensionNode') {
@@ -120,7 +129,9 @@ export function validateWorkflowPreflight(
     }
 
     const incomingEdges = workflow.edges.filter((edge) => edge.target === node.id)
-    const requiredTypes = [...new Set((ext.inputs ?? [ext.input]) as DataType[])]
+    const requiredTypes = [...new Set((ext.inputs ?? [ext.input])
+      .map((input) => asDataType(typeof input === 'string' ? input : input?.type))
+      .filter((input): input is DataType => input !== undefined))]
 
     for (const requiredType of requiredTypes) {
       const hasMatchingInput = incomingEdges.some((edge) => outputTypes.get(edge.source) === requiredType)

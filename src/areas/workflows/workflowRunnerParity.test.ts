@@ -53,3 +53,11 @@ test('named-output model nodes keep an anonymous primary source alias for legacy
   assert.match(source, /isConnectable=\{false\}/)
   assert.match(source, /sourcePorts\.map\(\(port, index\)/)
 })
+
+test('extension node tag classes keep scene and audio styling on distinct keys', async () => {
+  const source = await readWorkflowFile('nodes/ExtensionNode.tsx')
+
+  assert.match(source, /scene:\s*'border-emerald-500\/30 bg-emerald-500\/10 text-emerald-400'/)
+  assert.match(source, /audio:\s*'border-pink-500\/30 bg-pink-500\/10 text-pink-400'/)
+  assert.equal(source.match(/\baudio:\s*'/g)?.length, 1)
+})

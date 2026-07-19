@@ -202,6 +202,10 @@ export interface ModelExtension {
   /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */
   manifestError?: 'missing' | 'invalid' | 'incomplete'
   workflowNodes?: ExtensionWorkflowNode[]
+  /** Folder exists but is not a loadable extension — see manifestError */
+  corrupted?:   boolean
+  /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */
+  manifestError?: 'missing' | 'invalid' | 'incomplete'
 }
 
 export type PickerIntent = 'folder' | 'image' | 'mesh' | 'text'

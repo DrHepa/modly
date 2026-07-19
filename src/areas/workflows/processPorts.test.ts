@@ -3,6 +3,7 @@ import test from 'node:test'
 const {
   getProcessTargetPorts,
   getProcessTargetPort,
+  getExtensionSourcePorts,
   resolveProcessTargetColor,
 } = await import(new URL('./processPorts.ts', import.meta.url).href)
 
@@ -119,4 +120,26 @@ test('resolves video process ports and colors as first-class workflow handles', 
   ])
   assert.equal(resolveProcessTargetColor(videoProcessNode, 'clip'), '#fb7185')
   assert.equal(resolveProcessTargetColor({ input: 'video' }), '#fb7185')
+})
+
+
+test('keeps six arbitrary named model input and output handles intact', () => {
+  const faces = ['front', 'right', 'back', 'left', 'top', 'bottom']
+  const targets = getProcessTargetPorts({
+    input: 'image',
+    inputs: faces.map((name, index) => ({
+      name,
+      type: 'image',
+      required: index === 0,
+    })),
+  })
+  const sources = getExtensionSourcePorts({
+    output: 'image',
+    outputs: faces.map((name) => ({ name: `${name}_depth`, type: 'image' })),
+  })
+
+  assert.deepEqual(targets.map((port: { name: string }) => port.name), faces)
+  assert.deepEqual(sources.map((port: { name: string }) => port.name), faces.map((name) => `${name}_depth`))
+  assert.equal(sources[0].primary, true)
+  assert.equal(sources.slice(1).every((port: { primary: boolean }) => port.primary === false), true)
 })

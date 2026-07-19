@@ -21,8 +21,10 @@ import { useNavStore } from '@shared/stores/navStore'
 import type { ModelInputKind, Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions, resolveWorkflowUtilityNodeType } from './mockExtensions'
 import type { WorkflowExtension } from './mockExtensions'
+import { getProcessTargetPort } from './processPorts'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
+  resolveEffectiveWorkflowIoContract,
   validateProcessConnection,
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
@@ -52,7 +54,7 @@ const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFE
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
-const IO_STYLES: Record<ModelInputKind, string> = {
+const IO_STYLES: Record<string, string> = {
   none:   'bg-zinc-800/60 text-zinc-400 border-zinc-700/60',
   image: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   mesh:  'bg-violet-500/15 text-violet-400 border-violet-500/25',
@@ -64,7 +66,7 @@ const IO_STYLES: Record<ModelInputKind, string> = {
 
 function IoBadge({ type }: { type: ModelInputKind }) {
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type]}`}>
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${IO_STYLES[type] ?? 'bg-zinc-800/60 text-zinc-400 border-zinc-700/60'}`}>
       {type}
     </span>
   )
@@ -74,9 +76,54 @@ function IoBadge({ type }: { type: ModelInputKind }) {
 
 function newId(): string { return crypto.randomUUID() }
 
+function withStableTargetItemIndex(args: {
+  connection: Connection
+  nodes: WFNode[]
+  edges: WFEdge[]
+  allExtensions: WorkflowExtension[]
+}): Connection & Pick<WFEdge, 'targetItemIndex'> {
+  const targetNode = args.nodes.find((node) => node.id === args.connection.target)
+  const extensionId = typeof targetNode?.data.extensionId === 'string' ? targetNode.data.extensionId : ''
+  const extension = args.allExtensions.find((candidate) => candidate.id === extensionId)
+  const supportsNamedPorts = extension?.type !== 'model'
+    || resolveEffectiveWorkflowIoContract(targetNode, extension) === 'named-v1'
+  const port = extension && supportsNamedPorts
+    ? getProcessTargetPort(extension, args.connection.targetHandle)
+    : undefined
+  if (!port?.multiple) return args.connection
+
+  const existing = args.edges.filter((edge) => (
+    edge.target === args.connection.target
+    && edge.targetHandle === port.name
+  ))
+  const highestIndex = existing.reduce(
+    (highest, edge, index) => Math.max(highest, edge.targetItemIndex ?? index),
+    -1,
+  )
+  return { ...args.connection, targetItemIndex: highestIndex + 1 }
+}
+
+
 function workflowSelectionForExtension(extension: WorkflowExtension): { type: string; extensionId?: string } {
   const utilityNodeType = resolveWorkflowUtilityNodeType(extension)
   return utilityNodeType ? { type: utilityNodeType } : { type: 'extensionNode', extensionId: extension.id }
+}
+
+function createWorkflowExtensionNode(args: {
+  id: string
+  extensionId: string
+  position: WFNode['position']
+  allExtensions: WorkflowExtension[]
+}): WFNode {
+  const node = createHydratedExtensionWorkflowNode(args)
+  const extension = args.allExtensions.find((candidate) => candidate.id === args.extensionId)
+  const ioContract = resolveEffectiveWorkflowIoContract(node, extension)
+  if (extension?.type !== 'model' || ioContract !== 'named-v1') return node
+
+  return {
+    ...node,
+    data: { ...node.data, ioContract },
+  }
 }
 
 function setWorkflowExtensionDragData(event: DragEvent, extension: WorkflowExtension): void {
@@ -915,8 +962,14 @@ function WorkflowCanvasInner({
 
     if (issue) setConnectionIssue(issue)
 
+    const indexedConnection = withStableTargetItemIndex({
+      connection,
+      nodes: nextNodes,
+      edges: toWorkflowEdges(edges),
+      allExtensions,
+    })
     setConnectionIssue(null)
-    setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
+    setEdges((eds) => addEdge({ ...indexedConnection, ...DEFAULT_EDGE_OPTS }, eds))
     return true
   }, [nodes, edges, allExtensions, setEdges])
 
@@ -967,7 +1020,7 @@ function WorkflowCanvasInner({
 
     const extensionId = e.dataTransfer.getData(DRAG_KEY)
     if (!extensionId) return
-    setNodes((nds) => [...nds, createHydratedExtensionWorkflowNode({
+    setNodes((nds) => [...nds, createWorkflowExtensionNode({
       id: newId(),
       extensionId,
       position,
@@ -1067,7 +1120,7 @@ function WorkflowCanvasInner({
     )
     const newNodeId = newId()
     const newNode = type === 'extensionNode' && extensionId
-      ? createHydratedExtensionWorkflowNode({ id: newNodeId, extensionId, position, allExtensions })
+      ? createWorkflowExtensionNode({ id: newNodeId, extensionId, position, allExtensions })
       : { ...createBuiltinWorkflowNode(type, position, extensionId), id: newNodeId }
     const nextNodes = toWorkflowNodes([...nodes, newNode])
     setNodes((nds) => [...nds, newNode])

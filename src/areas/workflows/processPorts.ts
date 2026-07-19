@@ -1,11 +1,20 @@
-import type { ModelInputKind, ProcessPort } from '../../shared/types/electron.d'
+import type {
+  ExtensionOutputPort,
+  ModelInputKind,
+  ProcessPort,
+} from '../../shared/types/electron.d'
 import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 
-type ArtifactType = ArtifactKind
+type ArtifactType = ProcessPort['type']
 
 type ProcessPortOwner = {
   input?: ModelInputKind
   inputs?: ProcessPort[]
+}
+
+type ExtensionOutputOwner = {
+  output?: ArtifactKind
+  outputs?: ExtensionOutputPort[]
 }
 
 export type ResolvedProcessTargetPort = {
@@ -14,9 +23,21 @@ export type ResolvedProcessTargetPort = {
   type: ArtifactType
   required: boolean
   isLegacy: boolean
+  multiple?: true
+  minItems?: number
+  maxItems?: number
+  ordered?: true
 }
 
-export const PROCESS_PORT_HANDLE_COLOR: Record<ArtifactType, string> = {
+export type ResolvedExtensionSourcePort = {
+  name: string | null
+  label?: string
+  type: ArtifactType
+  isLegacy: boolean
+  primary: boolean
+}
+
+export const PROCESS_PORT_HANDLE_COLOR: Record<string, string> = {
   image: '#38bdf8',
   mesh: '#a78bfa',
   scene: '#34d399',
@@ -33,6 +54,12 @@ export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessT
       type: port.type,
       required: port.required ?? true,
       isLegacy: false,
+      ...(port.multiple === true ? {
+        multiple: true as const,
+        minItems: port.min_items ?? 1,
+        maxItems: port.max_items ?? 10,
+        ordered: true as const,
+      } : {}),
     }))
   }
 
@@ -57,7 +84,29 @@ export function getProcessTargetPort(owner: ProcessPortOwner, targetHandle?: str
   return ports.find((port) => port.name === targetHandle)
 }
 
+export function getExtensionSourcePorts(owner: ExtensionOutputOwner): ResolvedExtensionSourcePort[] {
+  if (Array.isArray(owner.outputs) && owner.outputs.length > 0) {
+    return owner.outputs.map((port, index) => ({
+      name: port.name,
+      ...(port.label ? { label: port.label } : {}),
+      type: port.type,
+      isLegacy: false,
+      primary: index === 0,
+    }))
+  }
+
+  if (!owner.output) return []
+  return [{ name: null, type: owner.output, isLegacy: true, primary: true }]
+}
+
+export function getExtensionSourcePort(owner: ExtensionOutputOwner, sourceHandle?: string | null): ResolvedExtensionSourcePort | undefined {
+  const ports = getExtensionSourcePorts(owner)
+  if (ports.length === 0) return undefined
+  if (!sourceHandle) return ports.find((port) => port.primary)
+  return ports.find((port) => port.name === sourceHandle)
+}
+
 export function resolveProcessTargetColor(owner: ProcessPortOwner, targetHandle?: string | null): string {
   const port = getProcessTargetPort(owner, targetHandle)
-  return port ? PROCESS_PORT_HANDLE_COLOR[port.type] : '#52525b'
+  return port ? (PROCESS_PORT_HANDLE_COLOR[port.type] ?? '#52525b') : '#52525b'
 }

@@ -45,3 +45,11 @@ test('inputless model nodes expose no target socket and skip predecessor fallbac
   assert.match(runStoreSource, /actualOutput: st\.output_kind/)
   assert.doesNotMatch(runStoreSource, /from-none[\s\S]{0,300}(?:readFileBase64|FormData)/)
 })
+
+
+test('named-output model nodes keep an anonymous primary source alias for legacy edges', async () => {
+  const source = await readWorkflowFile('nodes/ExtensionNode.tsx')
+  assert.match(source, /key="__primary-source-alias"/)
+  assert.match(source, /isConnectable=\{false\}/)
+  assert.match(source, /sourcePorts\.map\(\(port, index\)/)
+})

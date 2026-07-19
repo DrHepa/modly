@@ -4,7 +4,10 @@ import test from 'node:test'
 import type { WorkflowExtension } from './mockExtensions.ts'
 import { hydrateWorkflowNodeParams } from './workflowNodeParams.ts'
 
-function createWorkflowExtension(overrides: Partial<WorkflowExtension>): WorkflowExtension {
+type ModelWorkflowExtension = Extract<WorkflowExtension, { type: 'model' }>
+type ProcessWorkflowExtension = Extract<WorkflowExtension, { type: 'process' }>
+
+function createModelWorkflowExtension(overrides: Partial<ModelWorkflowExtension> = {}): ModelWorkflowExtension {
   return {
     id: 'ext/image-to-mesh',
     extensionId: 'ext',
@@ -22,9 +25,26 @@ function createWorkflowExtension(overrides: Partial<WorkflowExtension>): Workflo
   }
 }
 
+function createProcessWorkflowExtension(overrides: Partial<ProcessWorkflowExtension> = {}): ProcessWorkflowExtension {
+  return {
+    id: 'ext/image-to-mesh',
+    extensionId: 'ext',
+    extensionName: 'Extension',
+    extensionAuthor: 'Tests',
+    nodeId: 'image-to-mesh',
+    name: 'Image To Mesh',
+    description: 'Test extension',
+    input: 'image',
+    output: 'mesh',
+    params: [],
+    builtin: false,
+    type: 'process',
+    ...overrides,
+  }
+}
+
 test('hydrates missing supported defaults for model nodes without mutating the input params', () => {
-  const ext = createWorkflowExtension({
-    type: 'model',
+  const ext = createModelWorkflowExtension({
     params: [
       { id: 'prompt', label: 'Prompt', type: 'string', default: 'refine' },
       { id: 'steps', label: 'Steps', type: 'int', default: 30 },
@@ -45,10 +65,9 @@ test('hydrates missing supported defaults for model nodes without mutating the i
 })
 
 test('hydrates missing supported defaults for process nodes', () => {
-  const ext = createWorkflowExtension({
+  const ext = createProcessWorkflowExtension({
     id: 'ext/upscale',
     nodeId: 'upscale',
-    type: 'process',
     params: [
       { id: 'scale', label: 'Scale', type: 'float', default: 1.5 },
       { id: 'mode', label: 'Mode', type: 'select', default: 'sharp', options: [{ value: 'sharp', label: 'Sharp' }] },
@@ -64,7 +83,7 @@ test('hydrates missing supported defaults for process nodes', () => {
 })
 
 test('preserves explicit falsy overrides instead of replacing them with defaults', () => {
-  const ext = createWorkflowExtension({
+  const ext = createModelWorkflowExtension({
     params: [
       { id: 'enabled', label: 'Enabled', type: 'boolean', default: true },
       { id: 'seed', label: 'Seed', type: 'int', default: 99 },
@@ -86,7 +105,7 @@ test('preserves explicit falsy overrides instead of replacing them with defaults
 })
 
 test('ignores unsupported params when deriving defaults', () => {
-  const ext = createWorkflowExtension({
+  const ext = createModelWorkflowExtension({
     params: [
       { id: 'advanced', label: 'Advanced', type: 'unsupported', default: '', reason: 'Unsupported param descriptor type: json', rawType: 'json' },
       { id: 'quality', label: 'Quality', type: 'select', default: 'high', options: [{ value: 'high', label: 'High' }] },

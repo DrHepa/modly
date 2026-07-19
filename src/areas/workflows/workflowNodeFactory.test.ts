@@ -6,7 +6,10 @@ import type { WFNode } from '@shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions.ts'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory.ts'
 
-function createWorkflowExtension(overrides: Partial<WorkflowExtension>): WorkflowExtension {
+type ModelWorkflowExtension = Extract<WorkflowExtension, { type: 'model' }>
+type ProcessWorkflowExtension = Extract<WorkflowExtension, { type: 'process' }>
+
+function createModelWorkflowExtension(overrides: Partial<ModelWorkflowExtension> = {}): ModelWorkflowExtension {
   return {
     id: 'ext/image-to-mesh',
     extensionId: 'ext',
@@ -24,12 +27,29 @@ function createWorkflowExtension(overrides: Partial<WorkflowExtension>): Workflo
   }
 }
 
+function createProcessWorkflowExtension(overrides: Partial<ProcessWorkflowExtension> = {}): ProcessWorkflowExtension {
+  return {
+    id: 'ext/image-to-mesh',
+    extensionId: 'ext',
+    extensionName: 'Extension',
+    extensionAuthor: 'Tests',
+    nodeId: 'image-to-mesh',
+    name: 'Image To Mesh',
+    description: 'Test extension',
+    input: 'image',
+    output: 'mesh',
+    params: [],
+    builtin: false,
+    type: 'process',
+    ...overrides,
+  }
+}
+
 test('creates process extension nodes with hydrated params for drag and drop flows', () => {
   const allExtensions = [
-    createWorkflowExtension({
+    createProcessWorkflowExtension({
       id: 'ext/upscale',
       nodeId: 'upscale',
-      type: 'process',
       params: [
         { id: 'scale', label: 'Scale', type: 'float', default: 1.5 },
         { id: 'mode', label: 'Mode', type: 'select', default: 'sharp', options: [{ value: 'sharp', label: 'Sharp' }] },
@@ -61,10 +81,9 @@ test('creates process extension nodes with hydrated params for drag and drop flo
 
 test('creates model extension nodes with hydrated params for palette flows', () => {
   const allExtensions = [
-    createWorkflowExtension({
+    createModelWorkflowExtension({
       id: 'ext/flux',
       nodeId: 'flux',
-      type: 'model',
       params: [
         { id: 'prompt', label: 'Prompt', type: 'string', default: 'cinematic' },
         { id: 'seed', label: 'Seed', type: 'int', default: 7 },

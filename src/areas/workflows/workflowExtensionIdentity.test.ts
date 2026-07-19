@@ -124,3 +124,31 @@ test('buildAllWorkflowExtensions exposes singleton utility workflow nodes from e
     ],
   )
 })
+
+
+test('buildAllWorkflowExtensions propagates named-v1 only for model nodes', () => {
+  const [processExtension, modelExtension] = buildAllWorkflowExtensions(
+    [{
+      id: 'named-model', name: 'Named Model', author: 'Tests', builtin: false,
+      nodes: [{
+        id: 'analyze', name: 'Analyze', input: 'image', output: 'image',
+        inputs: [{ name: 'image', type: 'image' }],
+        outputs: [{ name: 'result', type: 'image' }], ioContract: 'named-v1', paramsSchema: [],
+      }],
+    }],
+    [{
+      id: 'legacy-process', name: 'Legacy Process', author: 'Tests', builtin: false, entry: 'processor.js',
+      nodes: [{
+        id: 'run', name: 'Run', input: 'image', output: 'image',
+        outputs: [{ name: 'must-not-propagate', type: 'image' }], paramsSchema: [],
+      }],
+    }],
+  )
+
+  assert.equal(processExtension.type, 'process')
+  assert.equal(processExtension.outputs, undefined)
+  assert.equal(processExtension.ioContract, undefined)
+  assert.equal(modelExtension.type, 'model')
+  assert.equal(modelExtension.ioContract, 'named-v1')
+  assert.deepEqual(modelExtension.outputs, [{ name: 'result', type: 'image' }])
+})

@@ -4,7 +4,7 @@ import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
 import type { ParamSchema } from '../mockExtensions'
 import type { WFNodeData } from '@shared/types/electron.d'
-import { getProcessTargetPorts, PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
+import { getExtensionSourcePorts, getProcessTargetPorts, PROCESS_PORT_HANDLE_COLOR } from '../processPorts'
 import { useWorkflowRunStore } from '../workflowRunStore'
 import AdvancedOptionsSection from '../components/AdvancedOptionsSection'
 import WorkflowParamControl from '../components/WorkflowParamControl'
@@ -48,7 +48,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     ? []
     : getProcessTargetPorts({ input: legacyInput ?? 'image', inputs: ext?.inputs })
   const hasNamedTargetPorts = targetPorts.length > 1 || targetPorts.some((port) => !port.isLegacy)
-  const outputColor = PROCESS_PORT_HANDLE_COLOR[ext?.output ?? 'mesh']
+  const sourcePorts = isTerminal ? [] : getExtensionSourcePorts({ output: ext?.output, outputs: ext?.type === 'model' ? ext.outputs : undefined })
+  const hasNamedSourcePorts = sourcePorts.some((port) => !port.isLegacy)
   const hasParams = (ext?.params.length ?? 0) > 0
   const paramSections = partitionAdvancedParams(ext?.params ?? [])
 
@@ -76,7 +77,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       collapsible={hasParams}
       minWidth={200}
       subheader={
-        hasNamedTargetPorts ? (
+        hasNamedTargetPorts || hasNamedSourcePorts ? (
           <div ref={ioRowRef} className="flex items-start justify-between gap-3 px-3 py-2">
             <div className="min-w-0 flex-1 flex flex-col gap-1">
               {targetPorts.map((port) => (
@@ -85,18 +86,24 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
                     {port.type}
                   </span>
                   <span className="text-[9px] text-zinc-400 truncate">{port.label ?? port.name ?? 'input'}</span>
-                  {!port.required && <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>}
+                  {port.multiple ? (
+                    <span className="text-[8px] uppercase tracking-wide text-zinc-600">{port.minItems ?? 1}–{port.maxItems ?? 10} ordered</span>
+                  ) : !port.required ? (
+                    <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>
+                  ) : null}
                 </div>
               ))}
             </div>
             {!isTerminal && (
-              <div className="flex shrink-0 items-center gap-1.5 self-start pt-0.5">
-                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
-                  <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
-                </svg>
-                <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[ext?.output ?? ''] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
-                  {ext?.output ?? '—'}
-                </span>
+              <div className="flex shrink-0 flex-col items-end gap-1 self-start pt-0.5">
+                {sourcePorts.map((port) => (
+                  <div key={port.name ?? '__legacy-source'} className="flex items-center justify-end gap-1.5 min-w-0">
+                    {!port.isLegacy && <span className="text-[9px] text-zinc-400 truncate">{port.label ?? port.name}</span>}
+                    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[port.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                      {port.type}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </div>
@@ -129,6 +136,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
             {...(port.name ? { id: port.name } : {})}
             type="target"
             position={Position.Left}
+            isConnectable={!port.multiple || (port.maxItems ?? 10) > 0}
             style={{
               background: PROCESS_PORT_HANDLE_COLOR[port.type],
               width: 14,
@@ -138,13 +146,39 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
             }}
           />
         ))}
-        {!isTerminal && (
+        {hasNamedSourcePorts && sourcePorts[0] && (
           <Handle
+            key="__primary-source-alias"
             type="source"
             position={Position.Right}
-            style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTop }}
+            isConnectable={false}
+            aria-label="Primary output compatibility handle"
+            style={{
+              background: PROCESS_PORT_HANDLE_COLOR[sourcePorts[0].type],
+              width: 8,
+              height: 8,
+              border: '2px solid #18181b',
+              top: handleTop,
+              opacity: 0,
+              pointerEvents: 'none',
+            }}
           />
         )}
+        {sourcePorts.map((port, index) => (
+          <Handle
+            key={port.name ?? '__legacy-source'}
+            {...(port.name ? { id: port.name } : {})}
+            type="source"
+            position={Position.Right}
+            style={{
+              background: PROCESS_PORT_HANDLE_COLOR[port.type],
+              width: 14,
+              height: 14,
+              border: '2.5px solid #18181b',
+              top: hasNamedSourcePorts ? `${((index + 1) / (sourcePorts.length + 1)) * 100}%` : handleTop,
+            }}
+          />
+        ))}
       </>}
     >
       {hasParams && (

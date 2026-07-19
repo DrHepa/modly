@@ -1,6 +1,6 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionOutputPort, ExtensionWorkflowNode, ModelInputKind, ParamSchema, ProcessPort } from '@shared/types/electron.d'
 import type { ArtifactKind } from '@shared/types/artifacts.ts'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
@@ -15,6 +15,9 @@ interface WorkflowExtensionBase {
   description:     string
   output:          ArtifactKind
   inputs?:         ProcessPort[]
+  outputs?:        ExtensionOutputPort[]
+  ioContract?:      'named-v1'
+  processOwnerId?: string
   params:          ParamSchema[]
   builtin:         boolean
   workflowNodeType?: string
@@ -92,6 +95,12 @@ export function normalizeWorkflowProcessInputs(inputs?: ProcessPort[]): ProcessP
     ...(input.label ? { label: input.label } : {}),
     type: input.type,
     required: input.required ?? true,
+    ...(input.multiple === true ? {
+      multiple: true as const,
+      min_items: input.min_items ?? 1,
+      max_items: input.max_items ?? 10,
+      ordered: true as const,
+    } : {}),
   }))
 }
 
@@ -117,6 +126,7 @@ export function buildAllWorkflowExtensions(
         input:           node.input,
         output:          node.output,
         ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
+        ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,
         type:            'process',
@@ -140,7 +150,10 @@ export function buildAllWorkflowExtensions(
         description:     ext.description ?? '',
         input:           node.input,
         output:          node.output,
-        ...(node.inputs ? { inputs: node.inputs } : {}),
+        ...(node.inputs ? { inputs: normalizeWorkflowProcessInputs(node.inputs) } : {}),
+        ...(node.outputs ? { outputs: node.outputs } : {}),
+        ...(node.ioContract ? { ioContract: node.ioContract } : {}),
+        ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,
         type:            'model',

@@ -77,7 +77,7 @@ test('searches workspace assets by name path capability scope source and manifes
 
 test('opens only safe glb and gltf entries through existing Generate job and history state', () => {
   const glb = entry({ workspacePath: 'Workflows/run/hero.glb', displayName: 'hero.glb' })
-  const ply = entry({ workspacePath: 'Exports/scan.ply', displayName: 'scan.ply' })
+  const ply = entry({ workspacePath: 'Exports/scan.ply', displayName: 'scan.ply', previewKind: 'binary' })
 
   assert.equal(isAssetLibraryEntryOpenable(glb), true)
   assert.equal(isAssetLibraryEntryOpenable(ply), false)
@@ -90,10 +90,11 @@ test('opens only safe glb and gltf entries through existing Generate job and his
   if (target.kind !== 'self') throw new Error('expected self target')
 
   const selection = resolveAssetLibraryOpenSelection(glb, 'http://localhost:8000', 1718546400000)
-  assert.equal(selection?.historyUrl, '/workspace/Workflows/run/hero.glb')
-  assert.equal(selection?.job.status, 'done')
-  assert.equal(selection?.job.outputUrl, '/workspace/Workflows/run/hero.glb')
-  assert.equal(selection?.job.originalOutputUrl, '/workspace/Workflows/run/hero.glb')
+  assert(selection)
+  assert.equal(selection.historyUrl, '/workspace/Workflows/run/hero.glb')
+  assert.equal(selection.job.status, 'done')
+  assert.equal(selection.job.outputUrl, '/workspace/Workflows/run/hero.glb')
+  assert.equal(selection.job.originalOutputUrl, '/workspace/Workflows/run/hero.glb')
   assert.equal(resolveOpenPanelAfterLibrarySelection('library' satisfies GenerateOpenPanel), 'library')
 })
 
@@ -108,7 +109,7 @@ test('builds linked-source open requests and import jobs for safe sidecars', () 
   })
 
   assert.equal(isAssetLibraryEntryOpenable(sidecar), true)
-  assert.equal(describeAssetLibraryOpenability(sidecar), 'Generate opens the linked source mesh for this sidecar asset.')
+  assert.equal(describeAssetLibraryOpenability(sidecar), 'Ready to open linked source hero.glb in Generate.')
   assert.deepEqual(buildAssetLibraryOpenRequest(sidecar), {
     workspacePath: 'Workflows/run/hero.landmarks.v1.json',
     sourceWorkspacePath: 'Workflows/run/hero.glb',

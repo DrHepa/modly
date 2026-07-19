@@ -1,11 +1,13 @@
 import type { GenerationJob } from '../../shared/stores/appStore'
 import { buildSceneImportGenerationJob } from './sceneImportAutomation.ts'
 import { resolveViewerAssetTargetFromLibraryEntry, type ViewerAssetTarget } from './viewerAssetTarget.ts'
-import type { AssetLibraryOpenRequest } from '../../shared/types/assetLibrary'
-import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
+import type { AssetLibraryOpenRequest, AssetLibrarySourceLink } from '../../shared/types/assetLibrary'
+import type { RendererAssetLibraryEntry, RendererAssetLibraryOpenTargetReason } from './assetLibraryProjection.ts'
 
 export type GenerateOpenPanel = 'export' | 'decimate' | 'smooth' | 'import' | 'library' | 'light' | null
 export type AssetLibrarySortMode = 'type' | 'name' | 'date'
+
+const WORKSPACE_URL_PREFIX = '/workspace/'
 
 export interface AssetLibraryEntryGroup {
   capability: RendererAssetLibraryEntry['capability']
@@ -73,9 +75,14 @@ export function toggleAssetLibrarySectionKey(currentKeys: string[], sectionKey: 
 }
 
 export function buildAssetLibraryOpenRequest(entry: RendererAssetLibraryEntry): AssetLibraryOpenRequest {
-  return {
-    workspacePath: entry.workspacePath,
-    ...(entry.openTarget.kind === 'linked-source' ? { sourceWorkspacePath: entry.openTarget.workspacePath } : {}),
+  const target = entry.openTarget
+  switch (target.kind) {
+    case 'linked-source':
+      return { workspacePath: entry.workspacePath, sourceWorkspacePath: target.workspacePath }
+    case 'self':
+      return { workspacePath: target.workspacePath }
+    case 'unavailable':
+      throw new Error(`Cannot build asset-library open request for unavailable target: ${target.reason}`)
   }
 }
 
@@ -87,29 +94,20 @@ export function describeAssetLibraryOpenability(entry: RendererAssetLibraryEntry
   if (entry.state === 'unknown-metadata') return 'Missing metadata prevents a safe open in Generate.'
   if (entry.state === 'unsupported') return 'This asset is tracked in the library but is not supported in Generate.'
   if (entry.state === 'unsafe') return 'This asset was rejected because its workspace path is unsafe.'
-
-  switch (entry.openTarget.kind) {
+  const target = entry.openTarget
+  switch (target.kind) {
+    case 'linked-source':
+      return `Ready to open linked source ${resolveAssetLibrarySourceLabel(entry.source) ?? target.workspacePath} in Generate.`
     case 'self':
       return 'Ready to open this asset directly in Generate.'
-    case 'linked-source':
-      return 'Generate opens the linked source mesh for this sidecar asset.'
     case 'unavailable':
-      switch (entry.openTarget.reason) {
-        case 'capability-not-viewable':
-          if (entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
-            return 'This asset is tracked as a mesh in the library, but this format cannot open directly in Generate yet.'
-          }
-          return 'This capability is tracked in the library but cannot open in Generate yet.'
-        case 'missing-source-link':
-          return 'This asset needs a valid source mesh before it can open in Generate.'
-        case 'missing-capability':
-          return 'This asset is missing a supported capability classification.'
-        case 'unsafe-entry':
-          return 'This asset was rejected because its workspace path is unsafe.'
-        case 'state-not-openable':
-        default:
-          return 'This asset is not openable in Generate.'
+      if (target.reason === 'capability-not-viewable') {
+        if (entry.capability === 'mesh' || entry.capability === 'rigged-mesh') {
+          return 'This asset is tracked as a mesh in the library, but this format cannot open directly in Generate yet.'
+        }
+        return 'This capability is tracked in the library but cannot open in Generate yet.'
       }
+      return describeUnavailableAssetLibraryReason(target.reason)
   }
 }
 
@@ -125,45 +123,41 @@ export function filterAssetLibraryScopeGroups(
   const normalizedSearchQuery = normalizeAssetLibrarySearchQuery(searchQuery)
   const visibleEntries = filterVisibleAssetLibraryEntries(entries)
 
-  return ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS
-    .map((scopeSection): AssetLibrarySourceScopeGroup | null => {
+  return ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS.flatMap((scopeSection): AssetLibrarySourceScopeGroup[] => {
       const scopeEntries = visibleEntries.filter((entry) => entry.sourceScope === scopeSection.sourceScope)
       const scopeMatches = normalizedSearchQuery.length > 0 && matchesAssetLibrarySearch(scopeSection.label, normalizedSearchQuery)
 
-      const entryGroups = ASSET_LIBRARY_CAPABILITY_SECTIONS
-        .map((capabilitySection): AssetLibraryEntryGroup | null => {
+      const entryGroups = ASSET_LIBRARY_CAPABILITY_SECTIONS.flatMap((capabilitySection): AssetLibraryEntryGroup[] => {
           const capabilityEntries = scopeEntries.filter((entry) => entry.capability === capabilitySection.capability)
-          if (capabilityEntries.length === 0) return null
+          if (capabilityEntries.length === 0) return []
 
           const capabilityMatches = scopeMatches || (normalizedSearchQuery.length > 0 && matchesAssetLibrarySearch(capabilitySection.label, normalizedSearchQuery))
           const visibleCapabilityEntries = !normalizedSearchQuery || capabilityMatches
             ? capabilityEntries
             : capabilityEntries.filter((entry) => matchesAssetLibraryEntrySearch(entry, normalizedSearchQuery))
 
-          if (visibleCapabilityEntries.length === 0) return null
+          if (visibleCapabilityEntries.length === 0) return []
 
-          return {
+          return [{
             capability: capabilitySection.capability,
             capabilityLabel: capabilitySection.label,
             sectionKey: `capability:${scopeSection.sourceScope}:${capabilitySection.capability}`,
             entries: sortAssetLibraryEntries(visibleCapabilityEntries, sortMode),
-          }
+          }]
         })
-        .filter((group): group is AssetLibraryEntryGroup => group !== null)
 
       const sortedEntryGroups = sortMode === 'type'
         ? entryGroups
         : [...entryGroups].sort((left, right) => compareAssetLibraryEntryGroups(left, right, sortMode))
 
-      if (sortedEntryGroups.length === 0) return null
-      return {
+      if (sortedEntryGroups.length === 0) return []
+      return [{
         sourceScope: scopeSection.sourceScope,
         sourceScopeLabel: scopeSection.label,
         sectionKey: `scope:${scopeSection.sourceScope}`,
         entryGroups: sortedEntryGroups,
-      }
+      }]
     })
-    .filter((group): group is AssetLibrarySourceScopeGroup => group !== null)
 }
 
 export function resolveAssetLibraryOpenSelection(
@@ -174,7 +168,7 @@ export function resolveAssetLibraryOpenSelection(
   const target = resolveViewerAssetTargetFromLibraryEntry(entry, apiUrl)
   if (target.kind !== 'final') return null
 
-  const historyUrl = target.workspacePath ? `/workspace/${target.workspacePath.split('/').map(encodeURIComponent).join('/')}` : target.modelUrl
+  const historyUrl = target.workspacePath ? `${WORKSPACE_URL_PREFIX}${target.workspacePath.split('/').map(encodeURIComponent).join('/')}` : target.modelUrl
   return {
     historyUrl,
     target,
@@ -253,6 +247,7 @@ function matchesAssetLibraryEntrySearch(entry: RendererAssetLibraryEntry, normal
     entry.displayName,
     entry.workspacePath,
     entry.source?.workspacePath,
+    resolveAssetLibrarySourceLabel(entry.source),
     entry.manifest?.workspacePath,
     entry.capability,
     entry.sourceScope,
@@ -269,4 +264,32 @@ function matchesAssetLibrarySearch(value: string, normalizedSearchQuery: string)
 function hasInternalAssetLibraryDirectory(workspacePath: string): boolean {
   const segments = workspacePath.replace(/\\/g, '/').trim().split('/').filter(Boolean)
   return segments.slice(1, -1).some((segment) => segment.startsWith('.') || ASSET_LIBRARY_INTERNAL_DIRECTORY_NAMES.has(segment.toLocaleLowerCase()))
+}
+
+function describeUnavailableAssetLibraryReason(reason: RendererAssetLibraryOpenTargetReason): string {
+  switch (reason) {
+    case 'missing-capability':
+      return 'Missing capability metadata prevents a safe open in Generate.'
+    case 'missing-source-link':
+      return 'Missing source link prevents a safe open in Generate.'
+    case 'capability-not-viewable':
+      return 'This asset type cannot be opened directly in Generate.'
+    case 'state-not-openable':
+      return 'This asset is not ready to open in Generate.'
+    case 'unsafe-entry':
+      return 'This asset was rejected because its workspace path is unsafe.'
+  }
+
+  return assertNever(reason)
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled asset library open-target reason: ${value}`)
+}
+
+function resolveAssetLibrarySourceLabel(source: AssetLibrarySourceLink | undefined): string | undefined {
+  const workspacePath = source?.workspacePath?.replace(/\\/g, '/').trim()
+  if (!workspacePath) return undefined
+  const segments = workspacePath.split('/').filter(Boolean)
+  return segments.at(-1) ?? workspacePath
 }

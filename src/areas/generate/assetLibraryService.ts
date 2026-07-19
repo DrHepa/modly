@@ -41,6 +41,14 @@ export async function openAssetLibraryEntry(request: AssetLibraryOpenRequest): P
   return projectAssetLibraryOpenResult(result as AssetLibraryOpenResult)
 }
 
+export function getDefaultAssetLibraryService() {
+  return {
+    list: listAssetLibraryEntries,
+    read: readAssetLibraryEntry,
+    open: openAssetLibraryEntry,
+  }
+}
+
 function assertRequest(request: AssetLibraryReadRequest): void {
   if (!isRecord(request) || !isSafeViewerWorkspaceRelativePath(request.workspacePath)
     || (request.sourceWorkspacePath !== undefined && !isSafeViewerWorkspaceRelativePath(request.sourceWorkspacePath))) {

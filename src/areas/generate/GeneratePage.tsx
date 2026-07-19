@@ -1,21 +1,21 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 import type { GenerationJob, LightSettings, PointLight } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { ColorPicker } from '@shared/components/ui'
+import { AssetLibraryPopover as SharedAssetLibraryPopover, AssetLibraryToggleButton } from '@shared/components/WorkspaceAssetLibrary.tsx'
+export { AssetLibraryToggleButton } from '@shared/components/WorkspaceAssetLibrary.tsx'
 import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
-import { listAssetLibraryEntries, openAssetLibraryEntry } from './assetLibraryService.ts'
+import { getDefaultAssetLibraryService } from './assetLibraryService.ts'
 import { buildOrcaSlicerDeepLink, canOpenInOrcaSlicer } from './orcaSlicerLink'
 import type { RendererAssetLibraryEntry } from './assetLibraryProjection.ts'
 import {
-  ASSET_LIBRARY_SORT_OPTIONS,
   buildAssetLibraryOpenRequest,
   resolveAssetLibraryOpenSelection,
   describeAssetLibraryOpenability,
-  filterAssetLibraryScopeGroups,
   getDefaultAssetLibraryCollapsedSectionKeys,
   isAssetLibraryEntryOpenable,
   resolveOpenPanelAfterLibrarySelection,
@@ -435,38 +435,6 @@ function SmoothPopover({
 // Workspace library popover
 // ---------------------------------------------------------------------------
 
-export function AssetLibraryToggleButton({
-  open,
-  disabled,
-  onToggle,
-}: {
-  open: boolean
-  disabled: boolean
-  onToggle: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      disabled={disabled}
-      aria-haspopup="dialog"
-      aria-expanded={open}
-      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium border transition-colors disabled:opacity-50 disabled:pointer-events-none
-        ${open
-          ? 'bg-zinc-700 border-zinc-600 text-zinc-200'
-          : 'bg-zinc-800 border-zinc-700/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600'
-        }`}
-    >
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden="true">
-        <path d="M4 6h16" />
-        <path d="M4 12h16" />
-        <path d="M4 18h10" />
-      </svg>
-      Library
-    </button>
-  )
-}
-
 export function AssetLibraryPopover({
   entries,
   selectedEntryId,
@@ -500,168 +468,26 @@ export function AssetLibraryPopover({
   onRefresh: () => void
   onClose: () => void
 }) {
-  const scopeGroups = filterAssetLibraryScopeGroups(entries, searchQuery, sortMode)
-  const visibleEntryIds = new Set(scopeGroups.flatMap((scopeGroup) => scopeGroup.entryGroups.flatMap((group) => group.entries.map((entry) => entry.id))))
-  const selectedEntry = selectedEntryId && visibleEntryIds.has(selectedEntryId)
-    ? entries.find((entry) => entry.id === selectedEntryId) ?? null
-    : null
-  const normalizedSearchQuery = searchQuery.trim()
-  const openDisabled = !selectedEntry || !isAssetLibraryEntryOpenable(selectedEntry) || loading || opening
-  const selectedMessage = selectedEntry
-    ? describeAssetLibraryOpenability(selectedEntry)
-    : scopeGroups.length === 0 && normalizedSearchQuery
-      ? `No workspace assets match “${normalizedSearchQuery}”.`
-      : 'Select an asset to open it in Generate.'
-
   return (
-    <div
-      role="dialog"
-      aria-label="Workspace library"
-      className="absolute top-full left-0 mt-1 z-50 w-[320px] max-w-[calc(100vw-2rem)] bg-zinc-900 border border-zinc-700/60 rounded-xl p-3 flex flex-col gap-3 shadow-xl"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <div>
-          <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Workspace library</p>
-          <p className="text-xs text-zinc-300">Select a workspace asset and open the supported source in Generate.</p>
-        </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="px-2 py-1 text-[11px] text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors"
-        >
-          Close library
-        </button>
-      </div>
-
-      <button
-        type="button"
-        onClick={onRefresh}
-        disabled={loading || opening}
-        className="self-start px-2.5 py-1.5 text-[11px] text-zinc-300 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:pointer-events-none rounded-lg transition-colors"
-      >
-        Refresh assets
-      </button>
-
-      <div className="flex items-end gap-2">
-        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-          <label htmlFor="asset-library-search" className="text-[11px] text-zinc-300">Search workspace assets</label>
-          <input
-            id="asset-library-search"
-            type="search"
-            value={searchQuery}
-            onChange={(event) => onSearchQueryChange(event.target.value)}
-            placeholder="Search by name, path, scope, or capability"
-            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 w-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-          />
-        </div>
-        <div className="flex w-24 shrink-0 flex-col gap-1.5">
-          <label htmlFor="asset-library-sort" className="text-[11px] text-zinc-300">Sort</label>
-          <select
-            id="asset-library-sort"
-            value={sortMode}
-            onChange={(event) => onSortModeChange?.(event.target.value as AssetLibrarySortMode)}
-            className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-          >
-            {ASSET_LIBRARY_SORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {loading ? (
-        <p role="status" className="text-xs text-zinc-400">Loading workspace assets…</p>
-      ) : scopeGroups.length === 0 && !normalizedSearchQuery ? (
-        <p role="status" className="text-xs text-zinc-500">No workspace assets are indexed yet.</p>
-      ) : scopeGroups.length === 0 ? (
-        <p role="status" className="text-xs text-zinc-500">{`No workspace assets match “${normalizedSearchQuery}”.`}</p>
-      ) : (
-        <div role="list" aria-label="Workspace library assets" className="max-h-64 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/40">
-          {scopeGroups.map((scopeGroup) => {
-            const scopeExpanded = !collapsedSectionKeys.includes(scopeGroup.sectionKey)
-            const scopeRegionId = `asset-library-${scopeGroup.sectionKey.replace(/[^a-z0-9-]+/gi, '-')}`
-            return (
-              <section key={scopeGroup.sectionKey} role="group" aria-label={`Source scope ${scopeGroup.sourceScopeLabel}`} className="border-b border-zinc-800 last:border-b-0">
-                <button
-                  type="button"
-                  aria-label={`Toggle ${scopeGroup.sourceScopeLabel} assets`}
-                  aria-expanded={scopeExpanded}
-                  aria-controls={scopeRegionId}
-                  onClick={() => onToggleSection(scopeGroup.sectionKey)}
-                  className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-                >
-                  <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-300">{scopeGroup.sourceScopeLabel}</span>
-                  <span className="text-[10px] text-zinc-500">{scopeExpanded ? 'Hide' : 'Show'}</span>
-                </button>
-                {scopeExpanded && (
-                  <div id={scopeRegionId}>
-                    {scopeGroup.entryGroups.map((group) => {
-                      const capabilityExpanded = !collapsedSectionKeys.includes(group.sectionKey)
-                      const capabilityRegionId = `asset-library-${group.sectionKey.replace(/[^a-z0-9-]+/gi, '-')}`
-                      return (
-                        <section key={group.sectionKey} role="group" aria-label={`Capability category ${group.capabilityLabel}`} className="border-t border-zinc-800 first:border-t-0">
-                          <button
-                            type="button"
-                            aria-label={`Toggle ${group.capabilityLabel} assets in ${scopeGroup.sourceScopeLabel}`}
-                            aria-expanded={capabilityExpanded}
-                            aria-controls={capabilityRegionId}
-                            onClick={() => onToggleSection(group.sectionKey)}
-                            className="flex w-full items-center justify-between gap-2 px-4 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
-                          >
-                            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-400">{group.capabilityLabel}</span>
-                            <span className="text-[10px] text-zinc-500">{capabilityExpanded ? 'Hide' : 'Show'}</span>
-                          </button>
-                          {capabilityExpanded && (
-                            <div id={capabilityRegionId}>
-                              {group.entries.map((entry) => {
-                                const selected = entry.id === selectedEntryId
-                                return (
-                                  <button
-                                    key={entry.id}
-                                    type="button"
-                                    role="listitem"
-                                    aria-pressed={selected}
-                                    aria-label={`Select library asset ${entry.displayName}`}
-                                    onClick={() => onSelectEntry(entry.id)}
-                                    className={`w-full text-left px-4 py-2 border-t border-zinc-800 first:border-t-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400
-                                      ${selected ? 'bg-violet-500/10 text-zinc-100' : 'text-zinc-300 hover:bg-zinc-800/80'}`}
-                                  >
-                                    <div className="flex items-center justify-between gap-2">
-                                      <span className="text-xs font-medium">{entry.displayName}</span>
-                                      <span className="text-[10px] uppercase tracking-wider text-zinc-500">{entry.capability ?? entry.state.replace(/-/g, ' ')}</span>
-                                    </div>
-                                    <p className="mt-1 truncate text-[10px] text-zinc-500">{entry.workspacePath}</p>
-                                  </button>
-                                )
-                              })}
-                            </div>
-                          )}
-                        </section>
-                      )
-                    })}
-                  </div>
-                )}
-              </section>
-            )
-          })}
-        </div>
-      )}
-
-      <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-        <p className="text-[11px] text-zinc-400">{selectedMessage}</p>
-        {error && <p role="alert" className="mt-2 text-[11px] text-amber-300">{error}</p>}
-      </div>
-
-      <button
-        type="button"
-        onClick={onOpenSelected}
-        disabled={openDisabled}
-        aria-label="Open selected asset"
-        className="px-3 py-2 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs rounded-lg transition-colors font-medium"
-      >
-        {opening ? 'Opening…' : 'Open selected asset'}
-      </button>
-    </div>
+    <SharedAssetLibraryPopover<RendererAssetLibraryEntry>
+      entries={entries}
+      selectedEntryId={selectedEntryId}
+      loading={loading}
+      opening={opening}
+      error={error}
+      searchQuery={searchQuery}
+      sortMode={sortMode}
+      collapsedSectionKeys={collapsedSectionKeys}
+      onSelectEntry={onSelectEntry}
+      onSearchQueryChange={onSearchQueryChange}
+      onSortModeChange={onSortModeChange}
+      onToggleSection={onToggleSection}
+      onOpenSelected={onOpenSelected}
+      onRefresh={onRefresh}
+      onClose={onClose}
+      isEntryOpenable={isAssetLibraryEntryOpenable}
+      describeEntryOpenability={describeAssetLibraryOpenability}
+    />
   )
 }
 
@@ -711,6 +537,7 @@ export default function GeneratePage(): JSX.Element {
   const canUndo = useAppStore((s) => s.historyIndex > 0)
   const canRedo = useAppStore((s) => s.historyIndex < s.meshHistory.length - 1)
   const { optimizeMesh, smoothMesh, importMesh } = useApi()
+  const assetLibraryService = useMemo(() => getDefaultAssetLibraryService(), [])
   const libraryEpoch = useRef(0)
   const libraryWorkspace = useRef<string | null>(null)
   const librarySelection = useRef(librarySelectedEntryId)
@@ -863,7 +690,7 @@ export default function GeneratePage(): JSX.Element {
     setLibraryError(null)
     try {
       const workspace = await readLibraryWorkspace()
-      const result = await listAssetLibraryEntries()
+      const result = await assetLibraryService.list()
       const currentWorkspace = await readLibraryWorkspace()
       if (epoch !== libraryEpoch.current) return
       if (workspace !== currentWorkspace) throw new Error('Workspace changed; refresh the asset library.')
@@ -901,7 +728,7 @@ export default function GeneratePage(): JSX.Element {
       const workspace = await readLibraryWorkspace()
       if (!isCurrent()) return
       if (workspace !== libraryWorkspace.current) throw new Error('Workspace changed; refresh the asset library.')
-      const result = await openAssetLibraryEntry(buildAssetLibraryOpenRequest(selectedEntry))
+      const result = await assetLibraryService.open(buildAssetLibraryOpenRequest(selectedEntry))
       const currentWorkspace = await readLibraryWorkspace()
       if (!isCurrent()) return
       if (workspace !== currentWorkspace) throw new Error('Workspace changed; refresh the asset library.')

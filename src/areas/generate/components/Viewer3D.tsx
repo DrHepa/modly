@@ -16,7 +16,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree as any
 THREE.Mesh.prototype.raycast = acceleratedRaycast
 import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
-import { useAppStore } from '@shared/stores/appStore'
+import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
+import type { LightSettings, PointLight } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
 import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
 import { RigEditorPanel, type RigEditorHumanoidReviewProps } from './RigEditorPanel'
@@ -48,8 +49,6 @@ import { sameCheckpointOwner, type CheckpointOwner } from '../../workflows/workf
 import type { ArtifactRef } from '../../../shared/types/artifacts'
 import { useWorkflowRunStore } from '../../workflows/workflowRunStore'
 import type { LandmarkId, LandmarkPoint } from '../../workflows/landmarks'
-import type { LightSettings, PointLight } from '@shared/stores/appStore'
-import { DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult } from '../../../shared/types/electron.d'
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale'
@@ -1460,6 +1459,59 @@ function EmptyState(): JSX.Element {
   )
 }
 
+function isViewer3DSplatWorkspacePath(workspacePath: string | undefined): workspacePath is string {
+  return Boolean(
+    workspacePath
+    && isSafeViewerWorkspaceRelativePath(workspacePath)
+    && /\.(ply|splat)$/i.test(workspacePath),
+  )
+}
+
+function encodeViewer3DWorkspacePath(workspacePath: string): string {
+  return workspacePath.split('/').map((segment) => encodeURIComponent(segment)).join('/')
+}
+
+function resolveViewer3DSplatWorkspacePath(target: ViewerAssetTarget, modelUrl: string | null, apiUrl: string, workspaceDir?: string): string | undefined {
+  if (!modelUrl || modelUrl.includes('#')) return undefined
+
+  let candidate: string | undefined
+  try {
+    const parsed = new URL(modelUrl, apiUrl || 'http://localhost')
+    if (parsed.username || parsed.password || (/^https?:\/\//.test(modelUrl)
+      && (!apiUrl || parsed.origin !== new URL(apiUrl).origin))) return undefined
+    // Preserve the visible source's raw path before URL normalization erases traversal.
+    const rawPath = /^https?:\/\//.test(modelUrl)
+      ? modelUrl.match(/^https?:\/\/[^/?#]+(\/[^?#]*)?(?:\?[^#]*)?$/)?.[1]
+      : modelUrl.split('?', 1)[0]
+    if (rawPath?.startsWith('/workspace/')) {
+      const encoded = rawPath.slice('/workspace/'.length)
+      if (encoded.split('/').some(segment => !segment || segment === '.' || segment === '..') || /%(?:2e|2f|5c|00|25)/i.test(encoded)) return undefined
+      candidate = decodeURIComponent(encoded)
+    } else if (rawPath === '/optimize/serve-file' && parsed.searchParams.getAll('path').length === 1) {
+      const path = parsed.searchParams.get('path') ?? undefined
+      candidate = isViewer3DSplatWorkspacePath(path) ? path
+        : resolveViewerWorkspacePathFromAbsoluteValue(path, { workspaceDir })
+    }
+  } catch {
+    return undefined
+  }
+
+  if (!isViewer3DSplatWorkspacePath(candidate)) return undefined
+  // Optional target metadata corroborates, rather than replaces, the displayed source.
+  return target.kind === 'none' || target.workspacePath === undefined || target.workspacePath === candidate ? candidate : undefined
+}
+
+function resolveViewer3DSplatUrl(apiUrl: string, workspacePath: string | undefined, modelUrl: string | null): string | null {
+  if (!workspacePath) return modelUrl && /\.splat(?:$|[?#])/i.test(modelUrl) ? modelUrl : null
+  if (/\.ply$/i.test(workspacePath)) {
+    return `${apiUrl}/optimize/ply-to-splat?path=${encodeURIComponent(workspacePath)}`
+  }
+  if (/\.splat$/i.test(workspacePath)) {
+    return `${apiUrl}/workspace/${encodeViewer3DWorkspacePath(workspacePath)}`
+  }
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // Viewer3D
 // ---------------------------------------------------------------------------
@@ -2728,6 +2780,9 @@ function createViewer3DKimodoFallbackArtifact(args: {
 }): KimodoMotionArtifact {
   const runtimeStatus = readViewer3DMetadataString(args.metadata, 'runtime_status') ?? readViewer3DMetadataString(args.metadata, 'runtimeStatus')
   const retargetStatus = readViewer3DMetadataString(args.metadata, 'retarget_status') ?? readViewer3DMetadataString(args.metadata, 'retargetStatus')
+  const solverStatus = readViewer3DMetadataString(args.metadata, 'solver_status') ?? readViewer3DMetadataString(args.metadata, 'solverStatus')
+  const basisStatus = readViewer3DMetadataString(args.metadata, 'basis_status') ?? readViewer3DMetadataString(args.metadata, 'basisStatus')
+  const rootMotionStatus = readViewer3DMetadataString(args.metadata, 'root_motion_status') ?? readViewer3DMetadataString(args.metadata, 'rootMotionStatus')
   const animationMappingStatus = readViewer3DMetadataString(args.metadata, 'animation_mapping_status') ?? readViewer3DMetadataString(args.metadata, 'animationMappingStatus')
   const visualQualityStatus = readViewer3DMetadataString(args.metadata, 'visual_quality_status') ?? readViewer3DMetadataString(args.metadata, 'visualQualityStatus')
   const warningsValue = args.metadata.warnings
@@ -2752,9 +2807,9 @@ function createViewer3DKimodoFallbackArtifact(args: {
     diagnostics: {
       runtimeStatus: runtimeStatus ?? null,
       retargetStatus: retargetStatus ?? null,
-      solverStatus: readViewer3DMetadataString(args.metadata, 'solver_status') ?? null,
-      basisStatus: readViewer3DMetadataString(args.metadata, 'basis_status') ?? null,
-      rootMotionStatus: readViewer3DMetadataString(args.metadata, 'root_motion_status') ?? null,
+      solverStatus: solverStatus ?? null,
+      basisStatus: basisStatus ?? null,
+      rootMotionStatus: rootMotionStatus ?? null,
       animationMappingStatus: animationMappingStatus ?? null,
       stabilizationStatus: readViewer3DMetadataString(args.metadata, 'stabilization_status') ?? null,
       visualQualityStatus: visualQualityStatus ?? null,
@@ -4704,8 +4759,9 @@ export default function Viewer3D({
     if (controls) animationControlsRef.current = { scene, controls }
     else if (animationControlsRef.current?.scene === scene) animationControlsRef.current = null
   }, [])
-  const outputUrl = currentJob?.outputUrl ?? ''
-  const isSplat = /\.(ply|splat)(?:[?#]|$)/i.test(outputUrl)
+  const splatWorkspacePath = resolveViewer3DSplatWorkspacePath(viewerTarget, modelUrl, apiUrl, workspaceDir)
+  const isSplat = Boolean(splatWorkspacePath) || /\.(ply|splat)(?:[?#]|$)/i.test(modelUrl ?? '')
+  const splatUrl = resolveViewer3DSplatUrl(apiUrl, splatWorkspacePath, modelUrl)
   const rigSourceWorkspacePath = resolveViewer3DWorkspaceMeshPathFromUrl(modelUrl, apiUrl, workspaceDir)
   const modelRef = useRef(modelUrl)
   modelRef.current = isSplat ? null : modelUrl
@@ -4722,8 +4778,6 @@ export default function Viewer3D({
   const hasAnimations = !!modelUrl && !isSplat && animationSource?.url === modelUrl && animationSource.available
   const animationPlaying = hasAnimations && playingUrl === modelUrl
   const hasRig = !!modelUrl && !isSplat && rigSource?.url === modelUrl && rigSource.stats.hasRig
-  const splatUrl = outputUrl.startsWith('/workspace/')
-    ? `${apiUrl}/optimize/ply-to-splat?path=${encodeURIComponent(outputUrl.slice('/workspace/'.length))}` : modelUrl
   const [loadedSource, sourceRef, setLoadedSource] = useCurrentState<LoadedScene | null>(() => null)
   const liveSource = loadedSource?.url === modelUrl && !isSplat ? loadedSource : null
   const isLive = useCallback((source: LoadedScene | null): source is LoadedScene =>
@@ -4732,13 +4786,13 @@ export default function Viewer3D({
     const reader = window.electron?.settings?.get
     const paths = [checkpoint?.substitutionPoint?.inputArtifact.uri, checkpoint?.substitutionPoint?.inputArtifact.legacy?.filePath]
     const needsRoot = viewerPresentation.modelUrl?.includes('/optimize/serve-file?') || paths.some(path => path && !path.startsWith('/workspace/') && (path.startsWith('/') || /^[A-Za-z]:/.test(path)))
-    if (!reader || workspaceDir || !needsRoot || !liveSource || liveSource.binding.summary.hasRig) return
+    if (!reader || workspaceDir || !needsRoot || (!isSplat && (!liveSource || liveSource.binding.summary.hasRig))) return
     let cancelled = false
     Promise.resolve().then(() => reader()).then(settings => {
       if (!cancelled && motionContextRef.current === motionContext && window.electron?.settings?.get === reader) setWorkspaceRoot({ context: motionContext, path: settings.workspaceDir })
     }).catch(() => undefined)
     return () => { cancelled = true }
-  }, [motionContext, liveSource, workspaceDir])
+  }, [motionContext, liveSource, workspaceDir, isSplat])
   const poseSessionRef = useRef<PoseClipPreviewSession | null>(null)
   const poseOwnerRef = useRef<THREE.Object3D | null>(null)
   const [rigEditorState, rigStateRef, setRigEditorState] = useCurrentState(createViewer3DRigEditorState)

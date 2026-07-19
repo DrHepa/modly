@@ -46,6 +46,9 @@ def test_generate_routes_remain_backward_compatible(client, api_modules, image_u
 
 def test_generate_from_text_creates_job_with_status_and_cancel_parity(client, api_modules):
     assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "text"
 
     create_response = client.post(
         "/generate/from-text",
@@ -284,6 +287,9 @@ def test_generate_routes_reject_blank_model_id_before_job_creation(client, api_m
 
 def test_generate_from_scene_validates_workspace_relative_scene_manifest_and_creates_job(client, api_modules, monkeypatch):
     assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "scene"
 
     scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero.scene.json"
     scene_manifest.parent.mkdir(parents=True)
@@ -346,6 +352,9 @@ def test_generate_from_scene_validates_workspace_relative_scene_manifest_and_cre
 
 def test_generate_from_scene_rejects_absolute_traversal_and_invalid_manifest_paths(client, api_modules):
     assert_backend_ready(client)
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "scene"
 
     absolute_response = client.post(
         "/generate/from-scene",
@@ -491,11 +500,10 @@ def test_build_scene_candidate_preserves_image_output_kind(api_modules):
     }
 
 
-def test_validate_model_input_normalizes_legacy_json_to_scene():
-    from services.generator_registry import normalize_model_input, validate_model_input
+def test_validate_model_input_preserves_generic_json_kind():
+    from services.generator_registry import normalize_model_input
 
-    assert normalize_model_input("JSON") == "scene"
-    assert validate_model_input("json", context="demo/fake.input") == "scene"
+    assert normalize_model_input("JSON") == "JSON"
 
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry

@@ -61,8 +61,6 @@ _MODEL_INPUT_KINDS = frozenset({
 
 
 def normalize_model_input(value):
-    if isinstance(value, str) and value.lower() == "json":
-        return "scene"
     return value
 
 

@@ -1909,7 +1909,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const dir = workflowsDir()
     const result = await listStoredWorkflows(dir)
     if (result.diagnostics.filenameIdMismatches.length > 0 || result.diagnostics.duplicateIds.length > 0 || result.diagnostics.corruptedFiles.length > 0) {
-      logger.warn('Workflow list diagnostics', result.diagnostics)
+      logger.warn(`Workflow list diagnostics: ${JSON.stringify(result.diagnostics)}`)
     }
     return result.workflows
   })

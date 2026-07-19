@@ -5,9 +5,16 @@ import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
-import { isPreviewNodeType } from './nodes/previewNodeShared'
+import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
 
 type DataType = string
+
+function asDataType(value: string | undefined): DataType | undefined {
+  // Extension ports are open strings; "none" declares an inputless source.
+  return typeof value === 'string' && value.length > 0 && value !== 'none'
+    ? value
+    : undefined
+}
 
 export interface WorkflowPreflightIssue {
   key: string
@@ -35,10 +42,6 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
 }
 
 function formatType(type: DataType): string {
-  if (type === 'scene') return 'scene'
-  if (type === 'mesh') return 'mesh'
-  if (type === 'image') return 'image'
-  if (type === 'audio') return 'audio'
   return type
 }
 
@@ -51,11 +54,11 @@ function formatRequiredTypes(types: DataType[]): string {
 function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): DataType | undefined {
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
-  if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
+  if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'imagePreviewNode') return 'image'
   if (node.type === 'forEachNode') {
-    const mode = (node.data.params?.mode as DataType | undefined) ?? 'image'
+    const mode = asDataType(typeof node.data.params?.mode === 'string' ? node.data.params.mode : undefined) ?? 'image'
     return mode === 'text' || mode === 'mesh' ? mode : 'image'
   }
   if (node.type === 'extensionNode') {
@@ -88,7 +91,8 @@ export function validateWorkflowPreflight(
   }
 
   for (const node of workflow.nodes) {
-    if (isPreviewNodeType(node.type)) {
+    const previewType = previewNodeTargetArtifactKind(node.type)
+    if (previewType) {
       for (const edge of workflow.edges) {
         if (edge.source === node.id) {
           pushIssue(issues, {
@@ -97,10 +101,10 @@ export function validateWorkflowPreflight(
           })
         }
         const sourceType = outputTypes.get(edge.source)
-        if (edge.target === node.id && sourceType && sourceType !== 'image') {
+        if (edge.target === node.id && sourceType && sourceType !== previewType) {
           pushIssue(issues, {
             key: `${node.id}:type:${edge.id}`, nodeId: node.id,
-            message: `${nodeLabel(node, allExtensions)} expects an image, but received ${formatType(sourceType)}.`,
+            message: `${nodeLabel(node, allExtensions)} expects ${previewType === 'image' ? 'an' : 'a'} ${formatType(previewType)}, but received ${formatType(sourceType)}.`,
           })
         }
       }
@@ -169,7 +173,9 @@ export function validateWorkflowPreflight(
     }
 
     const incomingEdges = workflow.edges.filter((edge) => edge.target === node.id)
-    const requiredTypes = [...new Set((ext.inputs ?? [ext.input]) as DataType[])]
+    const requiredTypes = [...new Set((ext.inputs ?? [ext.input])
+      .map((input) => asDataType(typeof input === 'string' ? input : input?.type))
+      .filter((input): input is DataType => input !== undefined))]
     // A main text prompt can replace one text input, not multiple required ports
     // or a text auxiliary on an image/mesh model. Keep all other wiring checks.
     const positional = getPositionalInputTypes(ext)
@@ -192,7 +198,7 @@ export function validateWorkflowPreflight(
     for (const edge of incomingEdges) {
       const sourceNode = nodeMap.get(edge.source)
       const sourceType = outputTypes.get(edge.source)
-      if (!sourceNode || !sourceType || requiredTypes.includes(sourceType)) continue
+      if (!sourceNode || !sourceType || requiredTypes.length === 0 || requiredTypes.includes(sourceType)) continue
       pushIssue(issues, {
         key: `${node.id}:type:${edge.id}`,
         nodeId: node.id,

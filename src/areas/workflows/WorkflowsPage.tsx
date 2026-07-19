@@ -17,6 +17,7 @@ import {
 } from '@xyflow/react'
 import { useWorkflowsStore, NODE_TYPES_WITHOUT_TARGET, NODE_TYPES_WITHOUT_SOURCE, FOLDER_COLORS } from '@shared/stores/workflowsStore'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
+import { useAppStore } from '@shared/stores/appStore'
 import { useNavStore } from '@shared/stores/navStore'
 import type { ModelInputKind, Workflow, WFNode, WFEdge, WFNodeData } from '@shared/types/electron.d'
 import { buildAllWorkflowExtensions, resolveWorkflowUtilityNodeType } from './mockExtensions'
@@ -28,6 +29,7 @@ import {
   validateProcessConnection,
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
+import { validateWorkflowPreflight } from './preflight'
 import { useWorkflowRunStore } from './workflowRunStore'
 import WorkflowEdge     from './nodes/WorkflowEdge'
 import {
@@ -43,6 +45,8 @@ import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 const DRAG_KEY      = 'modly/extension-id'
 const DRAG_NODE_KEY = 'modly/node-type'
 const NODE_TYPES = WORKFLOW_NODE_TYPES
+const CONTAINER_TYPES = new Set(['whileNode'])
+const isContainerType = (type: string | undefined): boolean => !!type && CONTAINER_TYPES.has(type)
 const EDGE_TYPES = { workflowEdge: WorkflowEdge }
 
 const DEFAULT_EDGE_OPTS = { type: 'workflowEdge' }
@@ -51,6 +55,18 @@ const toFlowNodes = (nodes: WFNode[]): FlowNode<WFNodeData>[] => nodes as unknow
 const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
 const toWorkflowNodes = (nodes: FlowNode<WFNodeData>[]): WFNode[] => nodes as unknown as WFNode[]
 const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
+
+function findWhileContainerAt(nodes: FlowNode<WFNodeData>[], pos: { x: number; y: number }): FlowNode<WFNodeData> | undefined {
+  return nodes.find((node) => {
+    if (!isContainerType(node.type)) return false
+    const width = (node.measured?.width ?? node.width ?? (typeof node.style?.width === 'number' ? node.style.width : 0)) || 0
+    const height = (node.measured?.height ?? node.height ?? (typeof node.style?.height === 'number' ? node.style.height : 0)) || 0
+    return pos.x >= node.position.x && pos.x <= node.position.x + width
+      && pos.y >= node.position.y && pos.y <= node.position.y + height
+  })
+}
+
+const _nodeClipboard: { current: { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[]; pastes: number } | null } = { current: null }
 
 // ─── IO badge ─────────────────────────────────────────────────────────────────
 
@@ -886,7 +902,7 @@ function WorkflowCanvasInner({
 
       if (!skipPushRef.current) {
         const next = historyRef.current.slice(0, histIdxRef.current + 1)
-        next.push({ nodes, edges })
+        next.push({ nodes, edges, name })
         if (next.length > 50) next.shift()
         historyRef.current = next
         const newIdx = next.length - 1
@@ -897,7 +913,7 @@ function WorkflowCanvasInner({
     }, 500)
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current) }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- debounce on editable state; latest workflow/onSave read in the timeout
-  }, [nodes, edges])
+  }, [nodes, edges, name])
 
   const preflightIssues = useMemo(() => {
     const draft: Workflow = {
@@ -932,6 +948,7 @@ function WorkflowCanvasInner({
     skipPushRef.current = true
     setNodes(snap.nodes)
     setEdges(snap.edges)
+    setName(snap.name)
     histIdxRef.current = newIdx
     setHistIdx(newIdx)
   }, [setNodes, setEdges])
@@ -944,6 +961,7 @@ function WorkflowCanvasInner({
     skipPushRef.current = true
     setNodes(snap.nodes)
     setEdges(snap.edges)
+    setName(snap.name)
     histIdxRef.current = newIdx
     setHistIdx(newIdx)
   }, [setNodes, setEdges])
@@ -1088,7 +1106,7 @@ function WorkflowCanvasInner({
         clip.pastes += 1
         const offset = 32 * clip.pastes
         const idMap = new Map(clip.nodes.map((n) => [n.id, newId()]))
-        const pasted: Node[] = clip.nodes.map((n) => {
+        const pasted: FlowNode<WFNodeData>[] = clip.nodes.map((n) => {
           const keepParent = n.parentId != null && idMap.has(n.parentId)
           return {
             ...structuredClone(n),
@@ -1100,7 +1118,7 @@ function WorkflowCanvasInner({
             selected: true,
           }
         })
-        const pastedEdges: Edge[] = clip.edges.map((ed) => ({
+        const pastedEdges: FlowEdge[] = clip.edges.map((ed) => ({
           ...structuredClone(ed),
           id:     `e-${newId()}`,
           source: idMap.get(ed.source)!,
@@ -1145,7 +1163,7 @@ function WorkflowCanvasInner({
 
   // When a While container is deleted (button or keyboard), detach its children
   // to absolute coordinates so they don't get orphaned to the canvas origin.
-  const onNodesDelete = useCallback((deleted: Node[]) => {
+  const onNodesDelete = useCallback((deleted: FlowNode<WFNodeData>[]) => {
     const removedContainers = deleted.filter((n) => isContainerType(n.type))
     if (removedContainers.length === 0) return
     setNodes((nds) => nds.map((n) => {
@@ -1158,7 +1176,7 @@ function WorkflowCanvasInner({
 
   // When a node is dropped, attach/detach it to a While container based on overlap.
   // Children get a parentId + parent-relative position (no extent, so they can be dragged back out).
-  const onNodeDragStop = useCallback((_e: unknown, dragged: Node) => {
+  const onNodeDragStop = useCallback((_e: unknown, dragged: FlowNode<WFNodeData>) => {
     if (isContainerType(dragged.type)) return
     setNodes((nds) => {
       const containers = nds.filter((n) => isContainerType(n.type))
@@ -1181,7 +1199,7 @@ function WorkflowCanvasInner({
       const newParentId = container?.id
       if (newParentId === dragged.parentId) return nds   // no change
 
-      const next: Node[] = nds.map((n) => {
+      const next: FlowNode<WFNodeData>[] = nds.map((n) => {
         if (n.id !== dragged.id) return n
         if (container) {
           // parentId (no extent) → child moves with the container but can still be dragged out
@@ -1207,10 +1225,14 @@ function WorkflowCanvasInner({
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
+    if (preflightIssues.length > 0) {
+      showToast(preflightIssues[0].message)
+      return
+    }
     const wf: Workflow = { ...workflow, name, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     onSave(wf)
     runWorkflow(wf, allExtensions)
-  }, [workflow, name, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel])
+  }, [workflow, name, nodes, edges, onSave, allExtensions, isRunning, runWorkflow, cancel, preflightIssues, showToast])
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">

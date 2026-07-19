@@ -6,6 +6,7 @@ import {
 } from '@xyflow/react'
 // ReactFlowProvider wraps EmbeddedCanvas so useReactFlow() works in param rows
 import { useWorkflowsStore }   from '@shared/stores/workflowsStore'
+import { useAppStore }         from '@shared/stores/appStore'
 import { useExtensionsStore }  from '@shared/stores/extensionsStore'
 import { useNavStore }         from '@shared/stores/navStore'
 import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
@@ -37,6 +38,10 @@ const toFlowNodes = (nodes: WFNode[]): FlowNode[] => nodes as unknown as FlowNod
 const toFlowEdges = (edges: WFEdge[]): FlowEdge[] => edges as unknown as FlowEdge[]
 const toWorkflowNodes = (nodes: FlowNode[]): WFNode[] => nodes as unknown as WFNode[]
 const toWorkflowEdges = (edges: FlowEdge[]): WFEdge[] => edges as unknown as WFEdge[]
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -889,6 +894,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   const [edges] = useEdgesState(toFlowEdges(workflow.edges))
   const { updateNodeData }               = useReactFlow()
   const { navigate }                     = useNavStore()
+  const currentMeshUrl                   = useAppStore((s) => s.currentJob?.outputUrl)
+  const showToast                        = useAppStore((s) => s.showToast)
 
   // Direct patch into controlled nodes state — no React Flow store dependency
   const patchNode = useCallback<PatchFn>((nodeId, patch) => {
@@ -896,8 +903,8 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
       n.id === nodeId ? { ...n, data: { ...n.data, ...patch } } : n,
     ))
     // Push params live so a paused/looping run uses the latest values on the next node start.
-    if (patch.params) {
-      useWorkflowRunStore.getState().setLiveNodeParams(nodeId, patch.params as Record<string, unknown>)
+    if (isRecord(patch.params)) {
+      useWorkflowRunStore.getState().setLiveNodeParams(nodeId, patch.params)
     }
   }, [setNodes])
 
@@ -934,7 +941,18 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     && (n.data as { showInGenerate?: boolean }).showInGenerate === true,
   )
 
+  const preflightIssues = useMemo(() => {
+    const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
+    return validateWorkflowPreflight(wf, allExtensions, { currentMeshUrl })
+  }, [workflow, nodes, edges, allExtensions, currentMeshUrl])
+
+  const firstPreflightIssue = preflightIssues[0]?.message ?? null
+
   const handleGenerate = useCallback(() => {
+    if (firstPreflightIssue) {
+      showToast(firstPreflightIssue)
+      return
+    }
     const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
     run(wf, allExtensions)
   }, [firstPreflightIssue, nodes, edges, workflow, allExtensions, run, showToast])

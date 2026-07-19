@@ -19,6 +19,7 @@ import {
   getWorkflowNodeOutputKey,
   resolveWorkflowEdgeOutput,
 } from './processExecution.ts'
+import { isBranchStarter } from './nodeBehaviors.ts'
 import { resolveWorkflowDispatch } from './workflowDispatch.ts'
 import { resolveEffectiveWorkflowIoContract } from './processConnectionRules.ts'
 import { hydrateWorkflowNodeParams } from './workflowNodeParams.ts'
@@ -75,8 +76,36 @@ const _cancel      = { current: false }
 const _activeJobId = { current: null as string | null }
 // While container (manual mode) pause/resume — set by continueWhile()/retryWhile().
 const _resume      = { current: null as (() => void) | null }
+const _retry       = { current: false }
+const _pauseRequested = { current: false }
 const _resumeOptions = { current: undefined as WorkflowContinueOptions | undefined }
 const _pendingReplacement = { current: undefined as ArtifactRef | undefined }
+const _liveParams  = { current: new Map<string, Record<string, unknown>>() }
+const _activeWaitNodeId = { current: null as string | null }
+
+type WorkflowLoopProgress = { current: number; total: number | null }
+
+const FOR_EACH_MODES: Record<string, { exts: string[]; outputType: 'image' | 'text' | 'mesh' }> = {
+  image: { exts: ['png', 'jpg', 'jpeg', 'webp'], outputType: 'image' },
+  text:  { exts: ['txt', 'md', 'prompt'], outputType: 'text' },
+  mesh:  { exts: ['glb', 'gltf', 'obj', 'stl', 'ply', 'fbx'], outputType: 'mesh' },
+}
+
+interface WorkflowLoopInfo {
+  whileId: string
+  kind: 'while' | 'forEach'
+  firstIdx: number
+  lastIdx: number
+  bodyIds: Set<string>
+  iterations: number | null
+}
+
+interface WhileBounds {
+  x: number
+  y: number
+  w: number
+  h: number
+}
 
 type LandmarkSidecarStatus = 'not_started' | 'pending-write' | 'error'
 
@@ -112,6 +141,67 @@ function flushResume(): boolean {
   _resume.current = null
   fn()
   return true
+}
+
+function iteratorConfig(node: WFNode): { exts: string[]; outputType: 'image' | 'text' | 'mesh' } {
+  return FOR_EACH_MODES[(node.data.params?.mode as string) ?? 'image'] ?? FOR_EACH_MODES.image
+}
+
+function isIterator(type: string | undefined): boolean {
+  return type === 'forEachNode'
+}
+
+function nodeSize(node: WFNode): { w: number; h: number } {
+  const measured = (node as WFNode & { measured?: { width?: number; height?: number } }).measured
+  const styleWidth = node.style?.width
+  const styleHeight = node.style?.height
+  return {
+    w: measured?.width ?? node.width ?? (typeof styleWidth === 'number' ? styleWidth : 200),
+    h: measured?.height ?? node.height ?? (typeof styleHeight === 'number' ? styleHeight : 80),
+  }
+}
+
+function whileBounds(node: WFNode): WhileBounds {
+  const size = nodeSize(node)
+  return { x: node.position.x, y: node.position.y, w: size.w, h: size.h }
+}
+
+function isInsideWhile(node: WFNode, whileId: string, bounds: WhileBounds): boolean {
+  if (node.parentId === whileId) return true
+  if (node.parentId) return false
+  const size = nodeSize(node)
+  const cx = node.position.x + size.w / 2
+  const cy = node.position.y + size.h / 2
+  return cx >= bounds.x && cx <= bounds.x + bounds.w && cy >= bounds.y && cy <= bounds.y + bounds.h
+}
+
+async function listIteratorFiles(dir: string, exts: string[]): Promise<string[]> {
+  const names = await window.electron.fs.listFiles(dir, exts)
+  const normalizedDir = dir.replace(/\\/g, '/').replace(/\/+$/, '')
+  return names.map((name) => `${normalizedDir}/${name}`)
+}
+
+async function readTextFile(filePath: string): Promise<string> {
+  const base64 = await window.electron.fs.readFileBase64(filePath)
+  return new TextDecoder('utf-8').decode(Uint8Array.from(atob(base64), (char) => char.charCodeAt(0)))
+}
+
+function reachableExecutable(startId: string, edges: WFEdge[], nodeMap: Map<string, WFNode>, executableNodeIds: Set<string>): Set<string> {
+  const body = new Set<string>([startId])
+  const stack = [startId]
+  const seen = new Set<string>([startId])
+  while (stack.length > 0) {
+    const id = stack.pop()!
+    for (const edge of edges) {
+      if (edge.source !== id || seen.has(edge.target)) continue
+      seen.add(edge.target)
+      const target = nodeMap.get(edge.target)
+      if (!target || isBranchStarter(target.type)) continue
+      if (executableNodeIds.has(edge.target)) body.add(edge.target)
+      stack.push(edge.target)
+    }
+  }
+  return body
 }
 
 function clearPendingCheckpointState(): void {
@@ -1026,11 +1116,19 @@ export interface WorkflowRunStore {
   landmarkSession?: WorkflowLandmarkSession
   /** Active Wait-before-Kimodo humanoid review state, when applicable. */
   waitCheckpointReview?: WaitCheckpointReviewState
+  waitStates: Record<string, WaitState>
+  runningBranchId: string | null
+  whileProgress: Record<string, WorkflowLoopProgress>
+  pausedGroup: string[]
 
   run:         (workflow: Workflow, allExtensions: WorkflowExtension[], overrideImageData?: string) => Promise<void>
   cancel:      () => void
   reset:       () => void
-  continueRun: (options?: WorkflowContinueOptions) => void
+  continueRun: (options?: WorkflowContinueOptions & { waitId?: string }) => void
+  continueWhile: () => void
+  retryWhile: () => void
+  pauseWhile: () => void
+  setLiveNodeParams: (nodeId: string, params: Record<string, unknown>) => void
   setPendingReplacement: (replacement: ArtifactRef | undefined) => void
   getPendingReplacement: () => ArtifactRef | undefined
   markLandmark: (point: LandmarkPoint) => void
@@ -1050,18 +1148,97 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
   landmarkSidecars: {},
   landmarkSession: undefined,
   waitCheckpointReview: undefined,
+  waitStates: {},
+  runningBranchId: null,
+  whileProgress: {},
+  pausedGroup: [],
 
   async run(workflow, allExtensions, overrideImageData?) {
     _cancel.current = false
+    _retry.current = false
+    _pauseRequested.current = false
+    _activeWaitNodeId.current = null
     clearPendingCheckpointState()
+    _liveParams.current = new Map(workflow.nodes.map((node) => [node.id, { ...(node.data.params ?? {}) }]))
 
     const appState     = useAppStore.getState()
     const apiUrl       = appState.apiUrl
     const activeGraph  = deriveActiveWorkflowGraph(workflow.nodes, workflow.edges)
     const ordered      = topoSortWorkflowNodes(activeGraph.nodes, activeGraph.edges)
     const execNodes    = ordered.filter((n) =>
-      n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode',
+      n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode' || n.type === 'forEachNode',
     )
+    const executableNodeIds = new Set(execNodes.map((node) => node.id))
+    const activeNodeMap = new Map(activeGraph.nodes.map((node) => [node.id, node]))
+    const waitIds = ordered.filter((node) => node.type === 'waitNode').map((node) => node.id)
+
+    const iteratorFiles = new Map<string, string[]>()
+    for (const node of activeGraph.nodes) {
+      if (!isIterator(node.type)) continue
+      const dir = (node.data.params?.dir as string | undefined)?.trim()
+      if (!dir) {
+        set((state) => ({
+          activeNodeId: node.id,
+          runState: { ...state.runState, status: 'error', error: 'For Each: pick a folder first', blockStep: 'No folder selected' },
+        }))
+        return
+      }
+      try {
+        const files = await listIteratorFiles(dir, iteratorConfig(node).exts)
+        if (files.length === 0) {
+          set((state) => ({
+            activeNodeId: node.id,
+            runState: { ...state.runState, status: 'error', error: `For Each: no matching files in ${dir}`, blockStep: 'Empty folder' },
+          }))
+          return
+        }
+        iteratorFiles.set(node.id, files)
+      } catch (error) {
+        set((state) => ({
+          activeNodeId: node.id,
+          runState: { ...state.runState, status: 'error', error: String(error), blockStep: 'Failed to read folder' },
+        }))
+        return
+      }
+    }
+
+    const loops: WorkflowLoopInfo[] = []
+    const execIndex = new Map(execNodes.map((node, index) => [node.id, index]))
+
+    for (const node of activeGraph.nodes) {
+      if (node.type !== 'whileNode') continue
+      const bounds = whileBounds(node)
+      const indices = execNodes.reduce<number[]>((matches, executable, index) => {
+        if (isInsideWhile(executable, node.id, bounds)) matches.push(index)
+        return matches
+      }, [])
+      if (indices.length === 0) continue
+      const iterations = Number(node.data?.iterations)
+      loops.push({
+        whileId: node.id,
+        kind: 'while',
+        firstIdx: Math.min(...indices),
+        lastIdx: Math.max(...indices),
+        bodyIds: new Set(indices.map((index) => execNodes[index].id)),
+        iterations: Number.isFinite(iterations) && iterations > 0 ? Math.floor(iterations) : null,
+      })
+    }
+
+    for (const [iteratorId, files] of iteratorFiles) {
+      const bodyIds = new Set(
+        [...reachableExecutable(iteratorId, activeGraph.edges, activeNodeMap, executableNodeIds)].filter((id) => execIndex.has(id)),
+      )
+      const indices = [...bodyIds].map((id) => execIndex.get(id)!)
+      if (indices.length === 0) continue
+      loops.push({
+        whileId: iteratorId,
+        kind: 'forEach',
+        firstIdx: Math.min(...indices),
+        lastIdx: Math.max(...indices),
+        bodyIds,
+        iterations: files.length,
+      })
+    }
 
     const selectedImagePath = appState.selectedImagePath ?? ''
     const selectedImageData = overrideImageData ?? appState.selectedImageData ?? undefined
@@ -1077,6 +1254,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       landmarkSidecars: {},
       landmarkSession: undefined,
       waitCheckpointReview: undefined,
+      waitStates: Object.fromEntries(waitIds.map((id) => [id, 'pending' as WaitState])),
+      runningBranchId: null,
+      whileProgress: Object.fromEntries(loops.map((loop) => [loop.whileId, { current: 1, total: loop.iterations }])),
+      pausedGroup: [],
       runState: { status: 'running', blockIndex: 0, blockTotal: execNodes.length, blockProgress: 0, blockStep: 'Starting…' },
     })
 
@@ -1174,74 +1355,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
               rememberArtifactOutput(node.id, output)
             }
           }
-          const workspaceUrl = toWorkspaceUrl(o.filePath, ctx.workspaceDir)
-          if (workspaceUrl) outputUrl = workspaceUrl
-          else outputPath = o.filePath
-        }
-      }
-    }
-
-    set((s) => ({
-      activeNodeId:     null,
-      runningBranchId:  null,
-      whileProgress:    {},
-      pausedGroup:      [],
-      waitStates:       finalWaitStates ?? s.waitStates,
-      nodeImageOutputs: collectImageOutputs(ctx),
-      runState: {
-        status:        'done',
-        blockIndex:    0,
-        blockTotal:    0,
-        blockProgress: 100,
-        blockStep:     'Done',
-        outputUrl,
-        outputPath,
-      },
-    }))
-    useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl })
-  }
-
-  return {
-    runState:         IDLE,
-    activeNodeId:     null,
-    activeWorkflowId: null,
-    nodeImageOutputs: {},
-    waitStates:       {},
-    runningBranchId:  null,
-    whileProgress:    {},
-    pausedGroup:      [],
-
-    async run(workflow, allExtensions, overrideImageData?) {
-      _cancel.current = false
-      _pauseRequested.current = false
-      // Seed live params from the snapshot; UI edits during the run override these.
-      _liveParams.current = new Map(workflow.nodes.map((n) => [n.id, { ...(n.data.params ?? {}) }]))
-
-      const appState = useAppStore.getState()
-      const apiUrl   = appState.apiUrl
-
-      const { preExecExtNodes, branches, waitIds, parentWait, ordered } = identifyBranches(workflow)
-      const branchSteps = waitIds.reduce((acc, w) => acc + (branches.get(w)?.length ?? 0), 0)
-
-      const nodeMap = new Map(workflow.nodes.map((n) => [n.id, n]))
-
-      // ── For Each iterators → resolve their folders up front ────────────────────
-      // The loop count is driven by the folder contents, so the listing must resolve
-      // before the loop table (and its progress totals) below.
-      const iteratorFiles = new Map<string, string[]>()
-      for (const w of workflow.nodes) {
-        if (!isIterator(w.type)) continue
-        const dir = (w.data.params?.dir as string | undefined)?.trim()
-        const fail = (msg: string, step: string): void => {
-          set((s) => ({ runState: { ...s.runState, status: 'error', error: msg, blockStep: step }, activeNodeId: null }))
-        }
-        if (!dir) { fail('For Each: pick a folder first', 'No folder selected'); return }
-        try {
-          const files = await listIteratorFiles(dir, iteratorConfig(w).exts)
-          if (files.length === 0) { fail(`For Each: no matching files in ${dir}`, 'Empty folder'); return }
-          iteratorFiles.set(w.id, files)
-        } catch (err) {
-          fail(String(err), 'Failed to read folder'); return
         }
         if (node.type === 'sceneNode') {
           const scenePath = node.data.params?.path as string | undefined
@@ -1261,17 +1374,130 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         }
       }
 
-      // ── Loop table ─────────────────────────────────────────────────────────────
-      // While containers loop their geometric body N× (or manually). For Each
-      // iterators loop the executable nodes reachable downstream, once per file.
-      // Replays filter by bodyIds membership (not a contiguous range), so unrelated
-      // pre-phase nodes sorting between body members aren't replayed.
-      interface LoopInfo { whileId: string; kind: 'while' | 'forEach'; firstIdx: number; lastIdx: number; bodyIds: Set<string>; iterations: number | null }
-      const loops: LoopInfo[] = []
-      const indexOf = new Map(preExecExtNodes.map((n, i) => [n.id, i]))
+      const loopCounters = new Map(loops.map((loop) => [loop.whileId, loop.iterations]))
+      const activeLoopBody = { current: null as Set<string> | null }
+      let completedSteps = 0
+
+      const bumpWhileProgress = (whileId: string): void => {
+        set((state) => {
+          const previous = state.whileProgress[whileId]
+          return {
+            whileProgress: {
+              ...state.whileProgress,
+              [whileId]: { current: (previous?.current ?? 1) + 1, total: previous?.total ?? null },
+            },
+          }
+        })
+      }
+
+      const handleLoopEnd = async (idx: number): Promise<number | 'cancel' | undefined> => {
+        const forEachLoops = loops.filter((loop) => loop.lastIdx === idx && loop.kind === 'forEach')
+        const whileLoop = loops.find((loop) => loop.lastIdx === idx && loop.kind === 'while')
+
+        if (forEachLoops.length > 0) {
+          const groupBody = new Set<string>()
+          let jumpTo = Number.POSITIVE_INFINITY
+          for (const loop of forEachLoops) {
+            loop.bodyIds.forEach((id) => groupBody.add(id))
+            jumpTo = Math.min(jumpTo, loop.firstIdx)
+          }
+
+          if (_pauseRequested.current) {
+            _pauseRequested.current = false
+            _retry.current = false
+            const groupIds = forEachLoops.map((loop) => loop.whileId)
+            set({ activeNodeId: groupIds[0] ?? null, runningBranchId: groupIds[0] ?? null, pausedGroup: groupIds })
+            set((state) => ({ runState: { ...state.runState, status: 'paused', blockStep: 'Paused — Continue or Retry' } }))
+            await new Promise<void>((resolve) => { _resume.current = resolve })
+            if (_cancel.current) return 'cancel'
+            set({ runningBranchId: null, pausedGroup: [] })
+            set((state) => ({ runState: { ...state.runState, status: 'running' } }))
+            if (_retry.current) {
+              _retry.current = false
+              activeLoopBody.current = groupBody
+              return jumpTo
+            }
+          }
+
+          let anyMore = false
+          for (const loop of forEachLoops) {
+            const remaining = loopCounters.get(loop.whileId)
+            if (remaining != null && remaining > 1) {
+              loopCounters.set(loop.whileId, remaining - 1)
+              bumpWhileProgress(loop.whileId)
+              anyMore = true
+            }
+          }
+          if (anyMore) {
+            set((state) => ({ runState: { ...state.runState, blockStep: 'Next file…' } }))
+            activeLoopBody.current = groupBody
+            return jumpTo
+          }
+          activeLoopBody.current = null
+          return undefined
+        }
+
+        if (!whileLoop) return undefined
+        const remaining = loopCounters.get(whileLoop.whileId)
+
+        if (remaining != null && remaining > 1) {
+          loopCounters.set(whileLoop.whileId, remaining - 1)
+          bumpWhileProgress(whileLoop.whileId)
+          set((state) => ({ runState: { ...state.runState, blockStep: `Looping… ${remaining - 1} left` } }))
+          activeLoopBody.current = whileLoop.bodyIds
+          return whileLoop.firstIdx
+        }
+
+        _retry.current = false
+        set({ activeNodeId: whileLoop.whileId, runningBranchId: whileLoop.whileId })
+        set((state) => ({ runState: { ...state.runState, status: 'paused', blockStep: 'Loop finished — Continue or Retry' } }))
+        await new Promise<void>((resolve) => { _resume.current = resolve })
+        if (_cancel.current) return 'cancel'
+        set({ runningBranchId: null })
+        set((state) => ({ runState: { ...state.runState, status: 'running' } }))
+        if (_retry.current) {
+          _retry.current = false
+          bumpWhileProgress(whileLoop.whileId)
+          activeLoopBody.current = whileLoop.bodyIds
+          return whileLoop.firstIdx
+        }
+        activeLoopBody.current = null
+        return undefined
+      }
+
+      for (let i = 0; i < execNodes.length; i++) {
+        if (_cancel.current) { set({ runState: IDLE, activeNodeId: null }); return }
 
         const node = execNodes[i]
+        const loopBody = activeLoopBody.current
+        if (loopBody !== null && !loopBody.has(node.id)) continue
         const incomingEdges = activeGraph.edges.filter((e) => e.target === node.id)
+
+        if (node.type === 'forEachNode') {
+          const files = iteratorFiles.get(node.id) ?? []
+          const current = useWorkflowRunStore.getState().whileProgress[node.id]?.current ?? 1
+          const path = files[current - 1]
+          if (!path) throw new Error('For Each: no file for this iteration')
+
+          set((state) => ({
+            activeNodeId: node.id,
+            runState: { ...state.runState, blockIndex: completedSteps, blockProgress: 30, blockStep: `Reading ${path.split(/[\\/]/).pop() ?? path}` },
+          }))
+
+          const config = iteratorConfig(node)
+          const output = config.outputType === 'text'
+            ? { text: await readTextFile(path), outputType: 'text' as const }
+            : { filePath: path, outputType: config.outputType }
+          nodeOutputs.set(node.id, output)
+          rememberArtifactOutput(node.id, output)
+          set((state) => ({ runState: { ...state.runState, blockProgress: 100, blockStep: `Loaded ${path.split(/[\\/]/).pop() ?? path}` } }))
+          completedSteps += 1
+
+          const jump = await handleLoopEnd(i)
+          if (jump === 'cancel') { set({ runState: IDLE, activeNodeId: null }); return }
+          if (jump !== undefined) i = jump - 1
+          continue
+        }
 
         // ── Built-in Wait-like checkpoints are not external extensions ─────────────
         // Keep them ahead of workflow dispatch so built-ins with no extensionId do not
@@ -1336,6 +1562,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           }
 
           set((s) => ({
+            waitStates: node.type === 'waitNode' ? { ...s.waitStates, [node.id]: 'pending' } : s.waitStates,
+            runningBranchId: node.type === 'waitNode' ? null : s.runningBranchId,
             runState: {
               ...s.runState,
               status: 'paused',
@@ -1352,6 +1580,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             landmarkSession,
             waitCheckpointReview,
           }))
+          if (node.type === 'waitNode') _activeWaitNodeId.current = node.id
           publishWaitCheckpointPreview({ artifact: inputArtifact, workspaceDir })
           let landmarkSidecarPath: string | undefined
           while (true) {
@@ -1424,6 +1653,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             waitCheckpointHumanoidReviews.delete(node.id)
           }
           set((s) => ({
+            waitStates: node.type === 'waitNode' ? { ...s.waitStates, [node.id]: 'done' } : s.waitStates,
+            runningBranchId: node.type === 'waitNode' ? null : s.runningBranchId,
             runState: {
               ...s.runState,
               status: 'running',
@@ -1435,13 +1666,19 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             landmarkSession: undefined,
             waitCheckpointReview: undefined,
           }))
+          if (node.type === 'waitNode') _activeWaitNodeId.current = null
+          completedSteps += 1
+          const jump = await handleLoopEnd(i)
+          if (jump === 'cancel') { set({ runState: IDLE, activeNodeId: null }); return }
+          if (jump !== undefined) i = jump - 1
           continue
         }
 
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
         const effectiveIoContract = resolveEffectiveWorkflowIoContract(node, ext)
-        const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
+        const liveNodeParams = _liveParams.current.get(node.id)
+        const hydratedParams = hydrateWorkflowNodeParams(ext, liveNodeParams ?? (node.data.params as Record<string, unknown> | undefined))
         const artifactProvenance = {
           workflowId: workflow.id,
           workflowNodeId: node.id,
@@ -1568,54 +1805,54 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             ? client.post<{ job_id: string }>('/generate/from-none', request.payload)
             : request.kind === 'scene'
               ? client.post<{ job_id: string }>('/generate/from-scene', {
-              scene_path: request.scenePath,
-              model_id: node.data.extensionId ?? '',
-              collection: 'Workflows',
-              remesh: 'none',
-              enable_texture: false,
-              texture_resolution: 1024,
+                scene_path: request.scenePath,
+                model_id: node.data.extensionId ?? '',
+                collection: 'Workflows',
+                remesh: 'none',
+                enable_texture: false,
+                texture_resolution: 1024,
                 params: request.params,
               })
-            : request.kind === 'images'
-              ? (async () => {
-                const fd = new FormData()
-                for (const [index, imagePath] of request.imagePaths.entries()) {
-                  const encoded = await window.electron.fs.readFileBase64(imagePath)
-                  const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))
-                  const blob = new Blob([bytes], { type: 'image/png' })
-                  fd.append('images', blob, imagePath.split(/[\\/]/).pop() ?? 'image.png')
-                  fd.append('image_names', request.imageNames[index])
-                }
-                fd.append('model_id', node.data.extensionId ?? '')
-                fd.append('collection', 'Workflows')
-                fd.append('remesh', 'none')
-                fd.append('enable_texture', 'false')
-                fd.append('texture_resolution', '1024')
-                fd.append('params', JSON.stringify(request.params))
-                return client.post<{ job_id: string }>(
-                  '/generate/from-images', fd,
-                  { headers: { 'Content-Type': 'multipart/form-data' } },
-                )
-              })()
-            : request.kind === 'image'
-              ? (async () => {
-                const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
-                const blob  = new Blob([bytes], { type: 'image/png' })
-                const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
-                const fd = new FormData()
-                fd.append('image', blob, fname)
-                fd.append('model_id', node.data.extensionId ?? '')
-                fd.append('collection', 'Workflows')
-                fd.append('remesh', 'none')
-                fd.append('enable_texture', 'false')
-                fd.append('texture_resolution', '1024')
-                fd.append('params', JSON.stringify(request.params))
-                return client.post<{ job_id: string }>(
-                  '/generate/from-image', fd,
-                  { headers: { 'Content-Type': 'multipart/form-data' } },
-                )
-              })()
-              : client.post<{ job_id: string }>('/generate/from-text', request.payload))
+              : request.kind === 'images'
+                ? (async () => {
+                  const fd = new FormData()
+                  for (const [index, imagePath] of request.imagePaths.entries()) {
+                    const encoded = await window.electron.fs.readFileBase64(imagePath)
+                    const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))
+                    const blob = new Blob([bytes], { type: 'image/png' })
+                    fd.append('images', blob, imagePath.split(/[\\/]/).pop() ?? 'image.png')
+                    fd.append('image_names', request.imageNames[index])
+                  }
+                  fd.append('model_id', node.data.extensionId ?? '')
+                  fd.append('collection', 'Workflows')
+                  fd.append('remesh', 'none')
+                  fd.append('enable_texture', 'false')
+                  fd.append('texture_resolution', '1024')
+                  fd.append('params', JSON.stringify(request.params))
+                  return client.post<{ job_id: string }>(
+                    '/generate/from-images', fd,
+                    { headers: { 'Content-Type': 'multipart/form-data' } },
+                  )
+                })()
+                : request.kind === 'image'
+                  ? (async () => {
+                    const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
+                    const blob  = new Blob([bytes], { type: 'image/png' })
+                    const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
+                    const fd = new FormData()
+                    fd.append('image', blob, fname)
+                    fd.append('model_id', node.data.extensionId ?? '')
+                    fd.append('collection', 'Workflows')
+                    fd.append('remesh', 'none')
+                    fd.append('enable_texture', 'false')
+                    fd.append('texture_resolution', '1024')
+                    fd.append('params', JSON.stringify(request.params))
+                    return client.post<{ job_id: string }>(
+                      '/generate/from-image', fd,
+                      { headers: { 'Content-Type': 'multipart/form-data' } },
+                    )
+                  })()
+                  : client.post<{ job_id: string }>('/generate/from-text', request.payload))
           _activeJobId.current = data.job_id
 
           while (true) {
@@ -1770,6 +2007,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             )
           }
         }
+
+        completedSteps += 1
+        const jump = await handleLoopEnd(i)
+        if (jump === 'cancel') { set({ runState: IDLE, activeNodeId: null }); return }
+        if (jump !== undefined) i = jump - 1
       }
 
       // ── Collect media outputs for preview nodes ──────────────────────
@@ -1784,9 +2026,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             if (out.outputType === 'video') videoOutputs[nodeId] = workspaceUrl
           }
         }
-        if (maxIter > 0) loopExtraSteps += (maxIter - 1) * union.size
       }
-      const totalSteps = preExecExtNodes.length + branchSteps + loopExtraSteps
 
       // ── Resolve final output URL ──────────────────────────────────────
       let outputUrl:  string | undefined
@@ -1831,12 +2071,18 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         }
       }
 
+      _activeWaitNodeId.current = null
+
       set((s) => ({
         activeNodeId:     null,
         nodeImageOutputs: imageOutputs,
         nodeVideoOutputs: videoOutputs,
         landmarkSession:  undefined,
         waitCheckpointReview: undefined,
+        runningBranchId: null,
+        pausedGroup: [],
+        whileProgress: {},
+        waitStates: Object.fromEntries(waitIds.map((id) => [id, s.waitStates[id] ?? 'done' as WaitState])),
         runState: {
           status:        'done',
           blockIndex:    execNodes.length > 0 ? execNodes.length - 1 : 0,
@@ -1861,13 +2107,30 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       if (!_cancel.current) {
         clearPendingCheckpointState()
         clearCurrentJobCheckpointMetadata()
-        set((s) => ({ runState: { ...s.runState, status: 'error', substitutionPoint: undefined, error: String(err) }, activeNodeId: null, pendingReplacement: undefined, landmarkSession: undefined, landmarkSidecars: {}, waitCheckpointReview: undefined }))
+        const failedWaitNodeId = _activeWaitNodeId.current
+        _activeWaitNodeId.current = null
+        set((s) => ({
+          runState: { ...s.runState, status: 'error', substitutionPoint: undefined, error: String(err) },
+          activeNodeId: null,
+          pendingReplacement: undefined,
+          landmarkSession: undefined,
+          landmarkSidecars: {},
+          waitCheckpointReview: undefined,
+          runningBranchId: null,
+          pausedGroup: [],
+          whileProgress: {},
+          waitStates: failedWaitNodeId ? { ...s.waitStates, [failedWaitNodeId]: 'error' } : s.waitStates,
+        }))
         useAppStore.getState().updateCurrentJob({ status: 'error', error: String(err) })
       }
-    },
+    }
+  },
 
   cancel() {
     _cancel.current = true
+    _retry.current = false
+    _pauseRequested.current = false
+    _activeWaitNodeId.current = null
     clearPendingCheckpointState()
     flushResume()
     if (_activeJobId.current) {
@@ -1876,18 +2139,23 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       _activeJobId.current = null
     }
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
   },
 
   reset() {
+    _retry.current = false
+    _pauseRequested.current = false
+    _activeWaitNodeId.current = null
     clearPendingCheckpointState()
     clearCurrentJobCheckpointMetadata()
-    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined })
+    set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, pendingReplacement: undefined, nodeImageOutputs: {}, nodeVideoOutputs: {}, nodeArtifacts: {}, artifactLineages: {}, landmarkSidecars: {}, landmarkSession: undefined, waitCheckpointReview: undefined, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
   },
 
   continueRun(options) {
     const state = useWorkflowRunStore.getState()
     const pausedNodeId = state.runState.status === 'paused' ? state.runState.substitutionPoint?.nodeId : undefined
+    const requestedWaitId = options?.waitId
+    if (requestedWaitId && requestedWaitId !== pausedNodeId && requestedWaitId !== state.activeNodeId) return
     if (pausedNodeId && state.activeNodeId === pausedNodeId && state.runState.blockStep === 'Paused — mark required landmarks') {
       if (!state.landmarkSession || state.landmarkSession.nodeId !== pausedNodeId) {
         const message = 'Landmark capture state is not active'
@@ -1908,6 +2176,13 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           : undefined,
       }))
     }
+    if (state.activeNodeId && state.waitStates[state.activeNodeId] !== undefined) {
+      const activeWaitNodeId = state.activeNodeId
+      set((s) => ({
+        waitStates: { ...s.waitStates, [activeWaitNodeId]: 'running' },
+        runningBranchId: activeWaitNodeId,
+      }))
+    }
     _resumeOptions.current = options
     const resumed = flushResume()
     if (!resumed && pausedNodeId) {
@@ -1919,6 +2194,23 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           : undefined,
       }))
     }
+  },
+
+  continueWhile() {
+    flushResume()
+  },
+
+  retryWhile() {
+    _retry.current = true
+    flushResume()
+  },
+
+  pauseWhile() {
+    _pauseRequested.current = true
+  },
+
+  setLiveNodeParams(nodeId, params) {
+    _liveParams.current.set(nodeId, params)
   },
 
   setPendingReplacement(replacement) {

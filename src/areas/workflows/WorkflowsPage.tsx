@@ -1,4 +1,4 @@
-import { getProcessTargetPort, getProcessTargetPorts } from './processPorts'
+import { getExtensionSourcePort, getExtensionSourcePorts, getProcessTargetPort, getProcessTargetPorts } from './processPorts'
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -25,6 +25,7 @@ import type { WorkflowExtension } from './mockExtensions'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
   resolveProcessConnectionSource,
+  resolveEffectiveWorkflowIoContract,
   validateProcessConnection,
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
@@ -96,9 +97,55 @@ function newId(): string { return crypto.randomUUID() }
 // Node clipboard (module-level so Ctrl+C in one workflow tab can be pasted in
 // another — the canvas remounts per tab but the module survives).
 const _nodeClipboard: { current: { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[]; pastes: number } | null } = { current: null }
+
+function withStableTargetItemIndex(args: {
+  connection: Connection
+  nodes: WFNode[]
+  edges: WFEdge[]
+  allExtensions: WorkflowExtension[]
+}): Connection & Pick<WFEdge, 'targetItemIndex'> {
+  const targetNode = args.nodes.find((node) => node.id === args.connection.target)
+  const extensionId = typeof targetNode?.data.extensionId === 'string' ? targetNode.data.extensionId : ''
+  const extension = args.allExtensions.find((candidate) => candidate.id === extensionId)
+  const supportsNamedPorts = extension?.type !== 'model'
+    || resolveEffectiveWorkflowIoContract(targetNode, extension) === 'named-v1'
+  const port = extension && supportsNamedPorts
+    ? getProcessTargetPort(extension, args.connection.targetHandle)
+    : undefined
+  if (!port?.multiple) return args.connection
+
+  const existing = args.edges.filter((edge) => (
+    edge.target === args.connection.target
+    && edge.targetHandle === port.name
+  ))
+  const highestIndex = existing.reduce(
+    (highest, edge, index) => Math.max(highest, edge.targetItemIndex ?? index),
+    -1,
+  )
+  return { ...args.connection, targetItemIndex: highestIndex + 1 }
+}
+
+
 function workflowSelectionForExtension(extension: WorkflowExtension): { type: string; extensionId?: string } {
   const utilityNodeType = resolveWorkflowUtilityNodeType(extension)
   return utilityNodeType ? { type: utilityNodeType } : { type: 'extensionNode', extensionId: extension.id }
+}
+
+function createWorkflowExtensionNode(args: {
+  id: string
+  extensionId: string
+  position: WFNode['position']
+  allExtensions: WorkflowExtension[]
+}): WFNode {
+  const node = createHydratedExtensionWorkflowNode(args)
+  const extension = args.allExtensions.find((candidate) => candidate.id === args.extensionId)
+  const ioContract = resolveEffectiveWorkflowIoContract(node, extension)
+  if (extension?.type !== 'model' || ioContract !== 'named-v1') return node
+
+  return {
+    ...node,
+    data: { ...node.data, ioContract },
+  }
 }
 
 function setWorkflowExtensionDragData(event: DragEvent, extension: WorkflowExtension): void {
@@ -789,14 +836,18 @@ function HelpModal({ onClose }: { onClose: () => void }) {
 
 // ─── Connection type helpers ──────────────────────────────────────────────────
 
-function getNodeOutputType(node: FlowNode<WFNodeData> | undefined, allExts: WorkflowExtension[]): string | undefined {
+function getNodeOutputType(node: FlowNode<WFNodeData> | undefined, allExts: WorkflowExtension[], sourceHandle?: string | null): string | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'meshNode')  return 'mesh'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'textNode')  return 'text'
   if (node.type === 'imagePreviewNode') return 'image'
-  return allExts.find((e) => e.id === (node.data as WFNodeData)?.extensionId)?.output
+  const extension = allExts.find((e) => e.id === node.data.extensionId)
+  if (extension?.type === 'model' && (node.data.ioContract ?? extension.ioContract) === 'named-v1') {
+    return getExtensionSourcePort(extension, sourceHandle)?.type
+  }
+  return extension?.output
 }
 
 function getNodeInputType(
@@ -998,13 +1049,19 @@ function WorkflowCanvasInner({
 
     if (issue) setConnectionIssue(issue)
 
+    const indexedConnection = withStableTargetItemIndex({
+      connection,
+      nodes: nextNodes,
+      edges: toWorkflowEdges(edges),
+      allExtensions,
+    })
     setConnectionIssue(null)
-    setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
+    setEdges((eds) => addEdge({ ...indexedConnection, ...DEFAULT_EDGE_OPTS }, eds))
     return true
   }, [nodes, edges, allExtensions, setEdges])
 
   const isValidConnection = useCallback((connection: FlowEdge | Connection) => {
-    const srcType = getNodeOutputType(getNode(connection.source) as FlowNode<WFNodeData>, allExtensions)
+    const srcType = getNodeOutputType(getNode(connection.source) as FlowNode<WFNodeData>, allExtensions, connection.sourceHandle)
     const tgtType = getNodeInputType(getNode(connection.target) as FlowNode<WFNodeData>, connection.targetHandle, allExtensions)
     if (srcType && tgtType && srcType !== tgtType) return false  // type mismatch (unknown types allowed)
     // Reject connections that would create a cycle: if the target can already
@@ -1086,7 +1143,7 @@ function WorkflowCanvasInner({
       const node: FlowNode<WFNodeData> = {
         id: newId(), type: 'extensionNode',
         position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
-        data: createHydratedExtensionWorkflowNode({ id: '', extensionId, position, allExtensions }).data,
+        data: createWorkflowExtensionNode({ id: '', extensionId, position, allExtensions }).data,
         ...(parent ? { parentId: parent.id } : {}),
       }
       return [...nds, node]
@@ -1190,7 +1247,7 @@ function WorkflowCanvasInner({
       id: newNodeId, type,
       position: parent ? { x: position.x - parent.position.x, y: position.y - parent.position.y } : position,
       data: type === 'extensionNode' && extensionId
-        ? createHydratedExtensionWorkflowNode({ id: newNodeId, extensionId, position, allExtensions }).data
+        ? createWorkflowExtensionNode({ id: newNodeId, extensionId, position, allExtensions }).data
         : createBuiltinWorkflowNode(type, position, extensionId).data,
       ...(isContainer ? { style: { width: 420, height: 240 }, width: 420, height: 240 } : {}),
       ...(parent ? { parentId: parent.id } : {}),
@@ -1205,14 +1262,20 @@ function WorkflowCanvasInner({
       const canWire = isSource ? !NODE_TYPES_WITHOUT_TARGET.has(type) : !NODE_TYPES_WITHOUT_SOURCE.has(type)
       if (canWire) {
         const extension = allExtensions.find((candidate) => candidate.id === extensionId)
-        const sourceType = resolveProcessConnectionSource(pending.nodeId, {
-          nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), allExtensions,
-        }).type ?? getNodeOutputType(getNode(pending.nodeId) as FlowNode<WFNodeData>, allExtensions)
+        const sourceNode = getNode(pending.nodeId) as FlowNode<WFNodeData> | undefined
+        const sourceType = sourceNode?.type === 'extensionNode'
+          ? getNodeOutputType(sourceNode, allExtensions, pending.handleId)
+          : resolveProcessConnectionSource(pending.nodeId, {
+            nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), allExtensions,
+          }).type ?? getNodeOutputType(sourceNode, allExtensions)
         const ports = extension ? getProcessTargetPorts(extension) : []
         const firstPort = ports.find((port) => port.type === sourceType) ?? ports[0]
+        const sourcePorts = extension?.type === 'model' && node.data.ioContract === 'named-v1'
+          ? getExtensionSourcePorts(extension)
+          : []
         const connection: Connection = isSource
           ? { source: pending.nodeId, sourceHandle: pending.handleId ?? null, target: newNodeId, targetHandle: isExt ? (firstPort?.name ?? 'input-0') : null }
-          : { source: newNodeId, sourceHandle: isExt ? 'output' : null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
+          : { source: newNodeId, sourceHandle: isExt ? (sourcePorts[0]?.name ?? 'output') : null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
         appendValidatedEdge(connection, nextNodes)
       }
     }

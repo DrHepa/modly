@@ -1,7 +1,7 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
-import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionOutputPort, ExtensionWorkflowNode, ModelInputKind, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
 
 interface WorkflowExtensionBase {
@@ -16,6 +16,9 @@ interface WorkflowExtensionBase {
   inputs?:         string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:    string[]                                  // display labels per input slot
   output:          string
+  outputs?:        ExtensionOutputPort[]
+  ioContract?:      'named-v1'
+  processOwnerId?: string
   params:          ParamSchema[]
   builtin:         boolean
   type:            'model' | 'process' | 'utility'
@@ -104,7 +107,16 @@ function applyParamDefaults(
 export function normalizeWorkflowProcessInputs(inputs?: string[] | ProcessPort[]): string[] | ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return inputs
   if (inputs.every((input): input is string => typeof input === 'string')) return [...inputs]
-  return (inputs as ProcessPort[]).map((input) => ({ ...input, required: input.required ?? true }))
+  return (inputs as ProcessPort[]).map((input) => ({
+    ...input,
+    required: input.required ?? true,
+    ...(input.multiple === true ? {
+      multiple: true as const,
+      min_items: input.min_items ?? 1,
+      max_items: input.max_items ?? 10,
+      ordered: true as const,
+    } : {}),
+  }))
 }
 
 export function buildAllWorkflowExtensions(
@@ -129,6 +141,7 @@ export function buildAllWorkflowExtensions(
         inputs:          normalizeWorkflowProcessInputs(node.inputs),
         inputLabels:     node.inputLabels,
         output:          node.output,
+        ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          applyParamDefaults(node.paramsSchema, node.paramDefaults),
         builtin:         ext.builtin,
         type:            'process',
@@ -152,9 +165,12 @@ export function buildAllWorkflowExtensions(
         name:            node.name,
         description:     ext.description ?? '',
         input:           node.input,
-        inputs:          node.inputs,
+        inputs:          normalizeWorkflowProcessInputs(node.inputs),
         inputLabels:     node.inputLabels,
         output:          node.output,
+        ...(node.outputs ? { outputs: node.outputs } : {}),
+        ...(node.ioContract ? { ioContract: node.ioContract } : {}),
+        ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          applyParamDefaults(node.paramsSchema, node.paramDefaults),
         builtin:         ext.builtin,
         type:            'model',

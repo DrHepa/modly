@@ -1,8 +1,13 @@
-import type { ProcessPort } from '../../shared/types/electron.d'
+import type { ExtensionOutputPort, ProcessPort } from '../../shared/types/electron.d'
 
 type ProcessPortOwner = {
   input?: string
   inputs?: string[] | ProcessPort[]
+}
+
+type ExtensionOutputOwner = {
+  output?: string
+  outputs?: ExtensionOutputPort[]
 }
 
 export type ResolvedProcessTargetPort = {
@@ -11,6 +16,18 @@ export type ResolvedProcessTargetPort = {
   type: string
   required: boolean
   isLegacy: boolean
+  multiple?: true
+  minItems?: number
+  maxItems?: number
+  ordered?: true
+}
+
+export type ResolvedExtensionSourcePort = {
+  name: string | null
+  label?: string
+  type: string
+  isLegacy: boolean
+  primary: boolean
 }
 
 export const PROCESS_PORT_HANDLE_COLOR: Record<string, string> = {
@@ -40,6 +57,12 @@ export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessT
       type: port.type,
       required: port.required ?? true,
       isLegacy: false,
+      ...(port.multiple === true ? {
+        multiple: true as const,
+        minItems: port.min_items ?? 1,
+        maxItems: port.max_items ?? 10,
+        ordered: true as const,
+      } : {}),
     }))
   }
   if (owner.inputs?.length) {
@@ -60,7 +83,33 @@ export function getProcessTargetPort(owner: ProcessPortOwner, targetHandle?: str
   return ports.find((port) => port.name === (targetHandle || 'input-0'))
 }
 
+export function getExtensionSourcePorts(owner: ExtensionOutputOwner): ResolvedExtensionSourcePort[] {
+  if (Array.isArray(owner.outputs) && owner.outputs.length > 0) {
+    return owner.outputs.map((port, index) => ({
+      name: port.name,
+      ...(port.label ? { label: port.label } : {}),
+      type: port.type,
+      isLegacy: false,
+      primary: index === 0,
+    }))
+  }
+
+  if (!owner.output) return []
+  return [{ name: null, type: owner.output, isLegacy: true, primary: true }]
+}
+
+export function getExtensionSourcePort(owner: ExtensionOutputOwner, sourceHandle?: string | null): ResolvedExtensionSourcePort | undefined {
+  const ports = getExtensionSourcePorts(owner)
+  if (ports.length === 0) return undefined
+  if (!sourceHandle) return ports.find((port) => port.primary)
+  const namedPort = ports.find((port) => port.name === sourceHandle)
+  if (namedPort) return namedPort
+  // Current saved graphs used "output" before named output handles existed.
+  // An explicitly declared output of that name always takes precedence.
+  return sourceHandle === 'output' ? ports.find((port) => port.primary) : undefined
+}
+
 export function resolveProcessTargetColor(owner: ProcessPortOwner, targetHandle?: string | null): string {
   const port = getProcessTargetPort(owner, targetHandle)
-  return (port && PROCESS_PORT_HANDLE_COLOR[port.type]) || '#52525b'
+  return port ? (PROCESS_PORT_HANDLE_COLOR[port.type] ?? '#52525b') : '#52525b'
 }

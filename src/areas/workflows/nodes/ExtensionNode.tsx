@@ -1,4 +1,4 @@
-import { getProcessTargetPorts } from '../processPorts'
+import { getExtensionSourcePorts, getProcessTargetPorts } from '../processPorts'
 import { useCallback, useRef, useLayoutEffect, useState } from 'react'
 import { Handle, Position, useReactFlow } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
@@ -50,6 +50,8 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const inputs = ext?.input === 'none' ? [] : getProcessTargetPorts(ext ?? { input: 'image' })
   const isMulti = inputs.length > 1 || inputs.some((port) => !port.isLegacy)
   const isTerminal  = ext?.id === 'mesh-exporter'
+  const sourcePorts = isTerminal ? [] : getExtensionSourcePorts({ output: ext?.output, outputs: ext?.type === 'model' ? ext.outputs : undefined })
+  const hasNamedSourcePorts = sourcePorts.some((port) => !port.isLegacy)
   const outputColor = HANDLE_COLOR[ext?.output ?? 'mesh']
   const hasParams   = (ext?.params.length ?? 0) > 0
 
@@ -62,7 +64,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
       }
       return '50%'
     }))
-  }, [isMulti, inputs?.length])
+  }, [isMulti, inputs.length, hasNamedSourcePorts, sourcePorts.length])
 
   const patchParam = useCallback((key: string, val: boolean | number | string) => {
     const params = { ...data.params, [key]: val }
@@ -76,7 +78,40 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   const paramSections = partitionAdvancedParams((ext?.params ?? []).filter((param) => isWorkflowParamVisible(param, resolvedParams)))
 
   // ── IO subheader ─────────────────────────────────────────────────────────
-  const ioSubheader = isMulti ? (
+  const ioSubheader = hasNamedSourcePorts ? (
+    <div className="flex flex-col divide-y divide-zinc-800/40">
+      {Array.from({ length: Math.max(inputs.length, sourcePorts.length) }, (_, i) => {
+        const input = inputs[i]
+        const output = sourcePorts[i]
+        return (
+          <div key={i} ref={(el) => { if (el) handleRefs.current[i] = el }} className="flex items-center justify-between gap-3 px-3 py-2">
+            <div className="flex min-w-0 items-center gap-1.5">
+              {input && (
+                <>
+                  <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[input.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                    {ext?.inputLabels?.[i] ?? `${input.label ?? input.name ?? 'input'} (${input.type})`}
+                  </span>
+                  {input.multiple ? (
+                    <span className="text-[8px] uppercase tracking-wide text-zinc-600">{input.minItems ?? 1}–{input.maxItems ?? 10} ordered</span>
+                  ) : !input.required ? (
+                    <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>
+                  ) : null}
+                </>
+              )}
+            </div>
+            {output && (
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="text-[9px] text-zinc-400 truncate">{output.label ?? output.name}</span>
+                <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[output.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
+                  {output.type}
+                </span>
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  ) : isMulti ? (
     // Multi-input layout: one row per input (N, not just 2), output on the first row.
     // Row refs feed the same handleRefs array handlesEl aligns its Handles against.
     <div className="flex flex-col divide-y divide-zinc-800/40">
@@ -89,6 +124,11 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
                 ? `${inputType.label || (typeof inputType.name === 'string' && inputType.name.trim())} (${inputType.type})`
                 : inputType.type)}
           </span>
+          {inputType.multiple ? (
+            <span className="text-[8px] uppercase tracking-wide text-zinc-600">{inputType.minItems ?? 1}–{inputType.maxItems ?? 10} ordered</span>
+          ) : !inputType.required ? (
+            <span className="text-[8px] uppercase tracking-wide text-zinc-600">optional</span>
+          ) : null}
           {i === 0 && !isTerminal && (
             <>
               <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-600 shrink-0">
@@ -126,6 +166,44 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
   )
 
   // ── Handles ──────────────────────────────────────────────────────────────
+  const sourceHandlesEl = hasNamedSourcePorts ? (
+    <>
+      <Handle
+        key="__primary-source-alias"
+        type="source"
+        position={Position.Right}
+        isConnectable={false}
+        aria-label="Primary output compatibility handle"
+        style={{ background: HANDLE_COLOR[sourcePorts[0].type], width: 8, height: 8, border: '2px solid #18181b', top: handleTops[0] ?? '50%', opacity: 0, pointerEvents: 'none' }}
+      />
+      {!sourcePorts.some((port) => port.name === 'output') && (
+        <Handle
+          id="output"
+          type="source"
+          position={Position.Right}
+          isConnectable={false}
+          aria-label="Legacy primary output compatibility handle"
+          style={{ background: HANDLE_COLOR[sourcePorts[0].type], width: 8, height: 8, border: '2px solid #18181b', top: handleTops[0] ?? '50%', opacity: 0, pointerEvents: 'none' }}
+        />
+      )}
+      {sourcePorts.map((port, index) => (
+        <Handle
+          key={port.name ?? '__legacy-source'}
+          {...(port.name ? { id: port.name } : {})}
+          type="source"
+          position={Position.Right}
+          style={{ background: HANDLE_COLOR[port.type], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[index] ?? '50%' }}
+        />
+      ))}
+    </>
+  ) : !isTerminal ? (
+    <Handle
+      id="output"
+      type="source"
+      position={Position.Right}
+      style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}
+    />
+  ) : null
   const handlesEl = isMulti ? (
     <>
       {inputs.map((inputType, i) => (
@@ -134,17 +212,11 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
           id={inputType.name ?? `input-${i}`}
           type="target"
           position={Position.Left}
+          isConnectable={!inputType.multiple || (inputType.maxItems ?? 10) > 0}
           style={{ background: HANDLE_COLOR[inputType.type], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[i] ?? '50%' }}
         />
       ))}
-      {!isTerminal && (
-        <Handle
-          id="output"
-          type="source"
-          position={Position.Right}
-          style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}
-        />
-      )}
+      {sourceHandlesEl}
     </>
   ) : (
     <>
@@ -156,14 +228,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
         style={{ background: HANDLE_COLOR[ext?.input ?? 'image'], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}
       />
       )}
-      {!isTerminal && (
-        <Handle
-          id="output"
-          type="source"
-          position={Position.Right}
-          style={{ background: outputColor, width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}
-        />
-      )}
+      {sourceHandlesEl}
     </>
   )
 

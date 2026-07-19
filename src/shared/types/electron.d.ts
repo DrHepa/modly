@@ -962,6 +962,7 @@ export type EditedSceneArtifactWriteResult =
 
 export interface WFNodeData {
   extensionId?:    string
+  ioContract?:     'named-v1'
   inputType?:      'image' | 'text'
   enabled:         boolean
   showInGenerate?: boolean
@@ -990,6 +991,7 @@ export interface WFEdge {
   target:        string
   sourceHandle?: string | null
   targetHandle?: string | null
+  targetItemIndex?: number
 }
 
 export interface Workflow {

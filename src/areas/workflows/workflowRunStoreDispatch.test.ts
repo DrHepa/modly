@@ -133,6 +133,8 @@ let humanoidDraftReadResult: HumanoidDraftSidecarReadResult
 let humanoidPromotionReadResult: HumanoidPromotionSidecarReadResult
 let rigMetaReadResult: RigMetaSidecarReadResult
 let readerPorts: Partial<Window['electron']['workspace']['artifacts']>
+let warnings: string[]
+
 const humanoidDraftSidecar = Object.freeze({
   schema: 'modly.humanoid-draft.v1',
   version: 1,
@@ -204,6 +206,7 @@ beforeEach(() => {
     readRigMetaSidecar: async (request) => { rigMetaReadCalls.push(request); return rigMetaReadResult },
     writeLandmarkSidecar: (input) => writeSidecar(input),
   }
+  warnings = []
   const fixture = { app: appState, get client() { return axiosClientMock } }
   const window = { electron: {
     settings: { get: async () => settingsGet ? settingsGet() : ({ workspaceDir }) },
@@ -225,7 +228,7 @@ beforeEach(() => {
   const module = { exports: {} as { useWorkflowRunStore: WorkflowRunStore; buildModelGenerationRequest: typeof buildModelGenerationRequest; shouldUsePreviousNodeFallback: typeof shouldUsePreviousNodeFallback; useWorldsSceneStore: typeof useWorldsSceneStore } }
   vm.runInNewContext(storeBundle, {
     module, exports: module.exports, require: createRequire(import.meta.url), fixture, window,
-    process, console, crypto, Blob, FormData, atob, URL, fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
+    process, console: { ...console, warn: (...args: unknown[]) => warnings.push(args.map(String).join(' ')) }, crypto, Blob, FormData, atob, URL, fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
     // Polling delay is inert; each client is a bounded in-memory fixture.
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay === 5000 ? delay : 0), clearTimeout, TextDecoder,
   })
@@ -284,6 +287,32 @@ function createNamedImageModelExtension(overrides: Partial<WorkflowExtension> = 
   })
 }
 
+
+function createNamedV1DepthExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
+  const faceNames = ['front', 'right', 'back', 'left', 'top', 'bottom'] as const
+  const outputs = faceNames.map((name, index) => ({
+    name: `${name}_depth`,
+    type: 'image' as const,
+    ...(index === 0 ? {} : { required: false }),
+  }))
+  return createWorkflowExtension({
+    id: 'sense-depth/depth-six-view',
+    extensionId: 'sense-depth',
+    nodeId: 'depth-six-view',
+    type: 'model',
+    ioContract: 'named-v1',
+    input: 'image',
+    output: 'image',
+    inputs: faceNames.map((name, index) => ({
+      name,
+      type: 'image' as const,
+      required: index === 0,
+    })),
+    outputs,
+    ...overrides,
+  })
+}
+
 function createNode(id: string, type: WFNode['type'], data: WFNode['data'] = { enabled: true, params: {} }): WFNode {
   return {
     id,
@@ -317,7 +346,7 @@ function createWorkflow(node: WFNode): Workflow {
 
 function createMultiInputWorkflow(args: {
   node: WFNode
-  imageSources: Array<{ id: string; filePath: string; targetHandle?: 'front' | 'left' | 'back' | 'right' }>
+  imageSources: Array<{ id: string; filePath: string; targetHandle?: string; targetItemIndex?: number }>
 }): Workflow {
   const nodes = [
     ...args.imageSources.map((source) => createNode(source.id, 'imageNode', { enabled: true, params: { filePath: source.filePath } })),
@@ -330,6 +359,7 @@ function createMultiInputWorkflow(args: {
       source: source.id,
       target: args.node.id,
       targetHandle: source.targetHandle,
+      targetItemIndex: source.targetItemIndex,
     })),
     { id: 'edge-output', source: args.node.id, target: 'output-node' },
   ]
@@ -474,7 +504,52 @@ test('workflowRunStore keeps legacy image-to-mesh model nodes on the model API p
   assert.deepEqual(Object.keys(useWorkflowRunStore.getState().nodeImageOutputs), [])
 })
 
-test('workflowRunStore routes the named front edge as multipart image instead of using the last image edge', async () => {
+test('workflowRunStore routes by actual output kind when it differs from the declared output', async () => {
+  const ext = createWorkflowExtension({
+    id: 'mismatch/output-kind',
+    extensionId: 'mismatch',
+    nodeId: 'output-kind',
+    type: 'model',
+    input: 'none',
+    output: 'mesh',
+  })
+  const workflow: Workflow = {
+    id: 'workflow-output-mismatch',
+    name: 'Output mismatch',
+    description: '',
+    nodes: [
+      createNode('model-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [{ id: 'edge-output', source: 'model-node', target: 'output-node' }],
+    createdAt: '2026-07-17T00:00:00.000Z',
+    updatedAt: '2026-07-17T00:00:00.000Z',
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-output-mismatch' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-output-mismatch')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.png', output_kind: 'image' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.legacy?.outputType, 'image')
+  assert.equal(useWorkflowRunStore.getState().runState.error, undefined)
+})
+
+test('workflowRunStore preserves legacy front routing when the node has no named-v1 marker', async () => {
   const ext = createNamedImageModelExtension()
   const workflow = createMultiInputWorkflow({
     node: createNode('model-node', 'extensionNode', {
@@ -932,6 +1007,696 @@ for (const targetHandle of ['front', undefined] as const) {
     assert.deepEqual(fsReadCalls, ['/images/a.png', '/images/b.png'])
   })
 }
+
+function createNamedOutputRoutingWorkflow(args: {
+  modelExtensionId: string
+  processExtensionId: string
+  imageSources: Array<{ id: string; filePath: string; targetHandle: string }>
+  sourceHandle: string
+}): Workflow {
+  const modelNode = createNode('model-node', 'extensionNode', {
+    extensionId: args.modelExtensionId,
+    ioContract: 'named-v1',
+    enabled: true,
+    params: {},
+  })
+  const processNode = createNode('process-node', 'extensionNode', {
+    extensionId: args.processExtensionId,
+    enabled: true,
+    params: {},
+  })
+  return {
+    id: 'workflow-named-output-routing',
+    name: 'Named output routing',
+    description: '',
+    nodes: [
+      ...args.imageSources.map((source) => createNode(source.id, 'imageNode', {
+        enabled: true,
+        params: { filePath: source.filePath },
+      })),
+      modelNode,
+      processNode,
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      ...args.imageSources.map((source) => ({
+        id: `edge-${source.id}`,
+        source: source.id,
+        target: modelNode.id,
+        targetHandle: source.targetHandle,
+      })),
+      {
+        id: 'edge-selected-model-output',
+        source: modelNode.id,
+        sourceHandle: args.sourceHandle,
+        target: processNode.id,
+      },
+      { id: 'edge-process-output', source: processNode.id, target: 'output-node' },
+    ],
+    createdAt: '2026-07-16T00:00:00.000Z',
+    updatedAt: '2026-07-16T00:00:00.000Z',
+  }
+}
+
+function namedDepthStatusOutputs(...sourceHandles: string[]) {
+  return sourceHandles.map((sourceHandle) => ({
+    source_handle: sourceHandle,
+    kind: 'image' as const,
+    output_url: `/workspace/Workflows/${sourceHandle}.png`,
+    workspace_path: `Workflows/${sourceHandle}.png`,
+  }))
+}
+
+test('workflowRunStore accepts front-only named-v1 completion without fabricating optional outputs', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: { quality: 'high' },
+    }),
+    imageSources: [
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+    ],
+  })
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-named-front-only' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-front-only')
+      return {
+        data: {
+          status: 'done',
+          output_url: '/workspace/Workflows/front_depth.png',
+          output_kind: 'image',
+          outputs: namedDepthStatusOutputs('front_depth'),
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['front'])
+  assert.deepEqual(fsReadCalls, ['/tmp/front.png'])
+  assert.deepEqual(JSON.parse(String(submitted.get('params'))), { quality: 'high' })
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+
+  const artifacts = useWorkflowRunStore.getState().nodeArtifacts
+  assert.equal(artifacts['model-node']?.legacy?.filePath, '/workspace/Workflows/front_depth.png')
+  assert.equal(artifacts['model-node::output::front_depth']?.legacy?.filePath, '/workspace/Workflows/front_depth.png')
+  assert.equal(artifacts['model-node::output::back_depth'], undefined)
+  assert.deepEqual(
+    Object.keys(artifacts).filter((key) => key.startsWith('model-node::output::')),
+    ['model-node::output::front_depth'],
+  )
+})
+
+test('workflowRunStore keeps front plus back outputs ordered and routes the optional back handle downstream', async () => {
+  const ext = createNamedV1DepthExtension()
+  const consumer = createWorkflowExtension({
+    id: 'consumer/use-image',
+    extensionId: 'consumer',
+    nodeId: 'use-image',
+    type: 'process',
+    input: 'image',
+    output: 'mesh',
+  })
+  const workflow = createNamedOutputRoutingWorkflow({
+    modelExtensionId: ext.id,
+    processExtensionId: consumer.id,
+    imageSources: [
+      { id: 'back-source', filePath: '/tmp/back.png', targetHandle: 'back' },
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+    ],
+    sourceHandle: 'back_depth',
+  })
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-named-front-back' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-front-back')
+      return {
+        data: {
+          status: 'done',
+          output_url: '/workspace/Workflows/front_depth.png',
+          output_kind: 'image',
+          outputs: namedDepthStatusOutputs('front_depth', 'back_depth'),
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext, consumer])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['front', 'back'])
+  assert.deepEqual(fsReadCalls, ['/tmp/front.png', '/tmp/back.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(runProcessCalls.length, 1)
+  assert.equal(runProcessCalls[0].extensionId, consumer.extensionId)
+  assert.equal(
+    (runProcessCalls[0].input as { filePath?: string }).filePath,
+    '/workspace/Workflows/back_depth.png',
+  )
+
+  const artifacts = useWorkflowRunStore.getState().nodeArtifacts
+  assert.equal(artifacts['model-node']?.legacy?.filePath, '/workspace/Workflows/front_depth.png')
+  assert.deepEqual(
+    Object.keys(artifacts).filter((key) => key.startsWith('model-node::output::')),
+    ['model-node::output::front_depth', 'model-node::output::back_depth'],
+  )
+})
+
+test('workflowRunStore falls back to the primary output for stale downstream sourceHandle routing', async () => {
+  const ext = createNamedV1DepthExtension()
+  const consumer = createWorkflowExtension({
+    id: 'consumer/use-image',
+    extensionId: 'consumer',
+    nodeId: 'use-image',
+    type: 'process',
+    input: 'image',
+    output: 'mesh',
+  })
+  const workflow = createNamedOutputRoutingWorkflow({
+    modelExtensionId: ext.id,
+    processExtensionId: consumer.id,
+    imageSources: [
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+    ],
+    sourceHandle: 'back_depth',
+  })
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-images')
+      return { data: { job_id: 'job-named-optional-absent' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-optional-absent')
+      return {
+        data: {
+          status: 'done',
+          output_url: '/workspace/Workflows/front_depth.png',
+          output_kind: 'image',
+          outputs: namedDepthStatusOutputs('front_depth'),
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext, consumer])
+
+  assert.equal(runProcessCalls.length, 1)
+  assert.equal((runProcessCalls[0].input as { filePath?: string }).filePath, '/workspace/Workflows/front_depth.png')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node::output::back_depth'], undefined)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore dispatches and persists all six named-v1 outputs in manifest order', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'bottom-source', filePath: '/tmp/bottom.png', targetHandle: 'bottom' },
+      { id: 'left-source', filePath: '/tmp/left.png', targetHandle: 'left' },
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+      { id: 'top-source', filePath: '/tmp/top.png', targetHandle: 'top' },
+      { id: 'back-source', filePath: '/tmp/back.png', targetHandle: 'back' },
+      { id: 'right-source', filePath: '/tmp/right.png', targetHandle: 'right' },
+    ],
+  })
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-named-six' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-six')
+      return {
+        data: {
+          status: 'done',
+          output_url: '/workspace/Workflows/front_depth.png',
+          output_kind: 'image',
+          outputs: ext.outputs?.map((output) => ({
+            source_handle: output.name,
+            kind: output.type,
+            output_url: `/workspace/Workflows/${output.name}.png`,
+            workspace_path: `Workflows/${output.name}.png`,
+          })),
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), [
+    'front', 'right', 'back', 'left', 'top', 'bottom',
+  ])
+  assert.deepEqual(fsReadCalls, [
+    '/tmp/front.png', '/tmp/right.png', '/tmp/back.png',
+    '/tmp/left.png', '/tmp/top.png', '/tmp/bottom.png',
+  ])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(
+    useWorkflowRunStore.getState().nodeArtifacts['model-node']?.legacy?.filePath,
+    '/workspace/Workflows/front_depth.png',
+  )
+  assert.deepEqual(
+    Object.keys(useWorkflowRunStore.getState().nodeArtifacts)
+      .filter((key) => key.startsWith('model-node::output::')),
+    [
+      'model-node::output::front_depth',
+      'model-node::output::right_depth',
+      'model-node::output::back_depth',
+      'model-node::output::left_depth',
+      'model-node::output::top_depth',
+      'model-node::output::bottom_depth',
+    ],
+  )
+})
+
+test('workflowRunStore falls back to the first actual output when a declared named-v1 output is missing', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' },
+    ],
+  })
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-images')
+      return { data: { job_id: 'job-named-missing-front-output' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-missing-front-output')
+      return {
+        data: {
+          status: 'done',
+          output_url: '/workspace/Workflows/back_depth.png',
+          output_kind: 'image',
+          outputs: namedDepthStatusOutputs('back_depth'),
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.legacy?.filePath, '/workspace/Workflows/back_depth.png')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node::output::back_depth']?.legacy?.filePath, '/workspace/Workflows/back_depth.png')
+  assert.match(warnings.join('\n'), /did not generate declared output handle "front_depth"/)
+})
+
+test('workflowRunStore dispatches one repeatable named-v1 port in stable targetItemIndex order', async () => {
+  const ext = createWorkflowExtension({
+    id: 'sense/reconstruct',
+    extensionId: 'sense',
+    nodeId: 'reconstruct',
+    type: 'model',
+    ioContract: 'named-v1',
+    input: 'image',
+    output: 'image',
+    inputs: [{
+      name: 'images',
+      type: 'image',
+      required: true,
+      multiple: true,
+      min_items: 1,
+      max_items: 3,
+      ordered: true,
+    }],
+    outputs: [{ name: 'preview', type: 'image' }],
+  })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'third-source', filePath: '/tmp/third.png', targetHandle: 'images', targetItemIndex: 2 },
+      { id: 'first-source', filePath: '/tmp/first.png', targetHandle: 'images', targetItemIndex: 0 },
+      { id: 'second-source', filePath: '/tmp/second.png', targetHandle: 'images', targetItemIndex: 1 },
+    ],
+  })
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-repeatable-named' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/preview.png',
+        outputs: [{
+          source_handle: 'preview',
+          kind: 'image',
+          output_url: '/workspace/Workflows/preview.png',
+          workspace_path: 'Workflows/preview.png',
+        }],
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['images', 'images', 'images'])
+  assert.deepEqual(fsReadCalls, ['/tmp/first.png', '/tmp/second.png', '/tmp/third.png'])
+})
+
+test('workflowRunStore routes unknown named-v1 input handles to the sole declared port when unambiguous', async () => {
+  const ext = createWorkflowExtension({
+    id: 'sense/reconstruct',
+    extensionId: 'sense',
+    nodeId: 'reconstruct',
+    type: 'model',
+    ioContract: 'named-v1',
+    input: 'image',
+    output: 'image',
+    inputs: [{ name: 'images', type: 'image', required: true, multiple: true }],
+    outputs: [{ name: 'preview', type: 'image' }],
+  })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'unknown-source', filePath: '/tmp/unknown.png', targetHandle: 'profile' },
+    ],
+  })
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-unknown-handle-routed' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/preview.png',
+        outputs: [{
+          source_handle: 'preview',
+          kind: 'image',
+          output_url: '/workspace/Workflows/preview.png',
+          workspace_path: 'Workflows/preview.png',
+        }],
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['images'])
+  assert.deepEqual(fsReadCalls, ['/tmp/unknown.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.match(warnings.join('\n'), /Routing it to the sole declared port "images"/)
+})
+
+test('workflowRunStore uses the latest connected artifact for duplicate non-repeatable named-v1 inputs', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'front-a', filePath: '/tmp/front-a.png', targetHandle: 'front' },
+      { id: 'front-b', filePath: '/tmp/front-b.png', targetHandle: 'front' },
+    ],
+  })
+
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-duplicate-front-latest' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/front_depth.png',
+        outputs: namedDepthStatusOutputs('front_depth'),
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['front'])
+  assert.deepEqual(fsReadCalls, ['/tmp/front-b.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.match(warnings.join('\n'), /Using the latest connected artifact/)
+})
+
+test('workflowRunStore dispatches named-v1 runs even when descriptive required inputs are missing', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [{ id: 'back-source', filePath: '/tmp/back.png', targetHandle: 'back' }],
+  })
+
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-missing-front-still-runs' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/back_depth.png',
+        outputs: namedDepthStatusOutputs('back_depth'),
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['back'])
+  assert.deepEqual(fsReadCalls, ['/tmp/back.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.match(warnings.join('\n'), /below its descriptive minimum \(1\)/)
+})
+
+test('workflowRunStore routes available files through named-v1 type mismatches', async () => {
+  const ext = createNamedV1DepthExtension()
+  const modelNode = createNode('model-node', 'extensionNode', {
+    extensionId: ext.id,
+    ioContract: 'named-v1',
+    enabled: true,
+    params: {},
+  })
+  const workflow: Workflow = {
+    id: 'workflow-named-type-mismatch',
+    name: 'Named Type Mismatch',
+    description: '',
+    nodes: [
+      createNode('mesh-source', 'meshNode', { enabled: true, params: { filePath: '/tmp/front.glb' } }),
+      modelNode,
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-mesh', source: 'mesh-source', target: modelNode.id, targetHandle: 'front' },
+      { id: 'edge-output', source: modelNode.id, target: 'output-node' },
+    ],
+    createdAt: '2026-07-16T00:00:00.000Z',
+    updatedAt: '2026-07-16T00:00:00.000Z',
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  let submitted: FormData | undefined
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-type-mismatch-routed' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/front_depth.png',
+        outputs: namedDepthStatusOutputs('front_depth'),
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['front'])
+  assert.deepEqual(fsReadCalls, ['/tmp/front.glb'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.match(warnings.join('\n'), /expects "image" but received "mesh"/)
+})
+
+test('workflowRunStore dispatches repeatable named-v1 ports even when min_items is unmet', async () => {
+  const ext = createWorkflowExtension({
+    id: 'sense/reconstruct-min-two',
+    extensionId: 'sense',
+    nodeId: 'reconstruct',
+    type: 'model',
+    ioContract: 'named-v1',
+    input: 'image',
+    output: 'image',
+    inputs: [{ name: 'images', type: 'image', required: true, multiple: true, min_items: 2 }],
+    outputs: [{ name: 'preview', type: 'image' }],
+  })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [{ id: 'only-source', filePath: '/tmp/only.png', targetHandle: 'images', targetItemIndex: 0 }],
+  })
+
+  let submitted: FormData | undefined
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-images')
+      submitted = data as FormData
+      return { data: { job_id: 'job-min-items-unmet' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/preview.png',
+        outputs: [{
+          source_handle: 'preview',
+          kind: 'image',
+          output_url: '/workspace/Workflows/preview.png',
+          workspace_path: 'Workflows/preview.png',
+        }],
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.ok(submitted)
+  assert.deepEqual(submitted.getAll('image_names'), ['images'])
+  assert.deepEqual(fsReadCalls, ['/tmp/only.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.match(warnings.join('\n'), /below its descriptive minimum \(2\)/)
+})
 
 test('workflowRunStore dispatches text-capability model nodes through the text generation endpoint without reading image bytes', async () => {
   const ext = createWorkflowExtension({
@@ -3622,7 +4387,105 @@ test('workflowRunStore ignores incoming edges for inputless models and still run
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
-test('workflowRunStore fails when actual generation output kind mismatches the declared model output and does not route it', async () => {
+test('workflowRunStore preserves undeclared named-v1 output handles for downstream routing', async () => {
+  const ext = createNamedV1DepthExtension()
+  const consumer = createWorkflowExtension({
+    id: 'consumer/use-image',
+    extensionId: 'consumer',
+    nodeId: 'use-image',
+    type: 'process',
+    input: 'image',
+    output: 'mesh',
+  })
+  const workflow = createNamedOutputRoutingWorkflow({
+    modelExtensionId: ext.id,
+    processExtensionId: consumer.id,
+    imageSources: [{ id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' }],
+    sourceHandle: 'bonus_depth',
+  })
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-images')
+      return { data: { job_id: 'job-undeclared-output' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/front_depth.png',
+        outputs: namedDepthStatusOutputs('front_depth', 'bonus_depth'),
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext, consumer])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node::output::bonus_depth']?.legacy?.filePath, '/workspace/Workflows/bonus_depth.png')
+  assert.equal((runProcessCalls[0].input as { filePath?: string }).filePath, '/workspace/Workflows/bonus_depth.png')
+  assert.match(warnings.join('\n'), /generated undeclared output handle "bonus_depth"/)
+})
+
+test('workflowRunStore keeps the latest duplicate named-v1 output payload deterministically', async () => {
+  const ext = createNamedV1DepthExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      ioContract: 'named-v1',
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [{ id: 'front-source', filePath: '/tmp/front.png', targetHandle: 'front' }],
+  })
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-images')
+      return { data: { job_id: 'job-duplicate-output' } }
+    },
+    async get() {
+      return { data: {
+        status: 'done',
+        output_kind: 'image',
+        output_url: '/workspace/Workflows/front_depth-latest.png',
+        outputs: [
+          {
+            source_handle: 'front_depth',
+            kind: 'image',
+            output_url: '/workspace/Workflows/front_depth-first.png',
+            workspace_path: 'Workflows/front_depth-first.png',
+          },
+          {
+            source_handle: 'front_depth',
+            kind: 'image',
+            output_url: '/workspace/Workflows/front_depth-latest.png',
+            workspace_path: 'Workflows/front_depth-latest.png',
+          },
+        ],
+      } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.legacy?.filePath, '/workspace/Workflows/front_depth-latest.png')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node::output::front_depth']?.legacy?.filePath, '/workspace/Workflows/front_depth-latest.png')
+  assert.match(warnings.join('\n'), /duplicate output handle "front_depth"/)
+})
+
+test('workflowRunStore accepts actual generation output kind mismatches and routes by the actual kind', async () => {
   const ext = createWorkflowExtension({
     id: 'gaussiangpt/generate',
     extensionId: 'gaussiangpt',
@@ -3645,6 +4508,29 @@ test('workflowRunStore fails when actual generation output kind mismatches the d
     updatedAt: '2026-07-12T00:00:00.000Z',
   }
 
+  const originalFetch = globalThis.fetch
+
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => JSON.stringify({
+      schema: 'modly.scene-manifest.v1',
+      sceneRoot: '.',
+      generator: 'modly.worlds',
+      version: 1,
+      createdAt: '2026-07-12T00:00:00.000Z',
+      assets: [{
+        id: 'base',
+        role: 'base-scene',
+        workspacePath: 'Workflows/generated/base.glb',
+        kind: 'glb',
+        visible: true,
+        transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      }],
+    }),
+  } as Response)) as typeof fetch
+
   axiosClientMock = {
     async post(path: string, data?: unknown) {
       if (path === '/generate/from-none') return { data: { job_id: 'job-kind-mismatch' } }
@@ -3656,11 +4542,16 @@ test('workflowRunStore fails when actual generation output kind mismatches the d
     },
   }
 
-  await useWorkflowRunStore.getState().run(workflow, [ext])
+  try {
+    await useWorkflowRunStore.getState().run(workflow, [ext])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /declared output "mesh" but generated "scene"/i)
-  assert.deepEqual(Array.from(useWorldsSceneStore.getState().sceneItems), [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.legacy?.outputType, 'scene')
+  assert.match(warnings.join('\n'), /declared output "mesh" but generated "scene"/)
+  assert.deepEqual(Array.from(useWorldsSceneStore.getState().sceneItems, (item) => item.id), ['base'])
 })
 
 test('workflowRunStore falls back to declared output when generation status omits actual output kind', async () => {
@@ -3807,4 +4698,137 @@ test('workflowRunStore uses actual scene output kind for Add to Worlds scene rou
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'scene')
   assert.deepEqual(Array.from(useWorldsSceneStore.getState().sceneItems, (item) => item.id), ['base'])
+})
+
+test('workflowRunStore routes named-v1 inputless source models through generate from-none', async () => {
+  const ext = createWorkflowExtension({
+    id: 'named-source/generate-caption',
+    extensionId: 'named-source',
+    nodeId: 'generate-caption',
+    name: 'Named Caption Source',
+    type: 'model',
+    ioContract: 'named-v1',
+    input: 'none',
+    output: 'text',
+    inputs: [],
+    outputs: [{ name: 'caption', type: 'text' }],
+    params: [],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-named-inputless-source',
+    name: 'Named inputless source',
+    description: '',
+    nodes: [createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    })],
+    edges: [],
+    createdAt: '2026-07-16T00:00:00.000Z',
+    updatedAt: '2026-07-16T00:00:00.000Z',
+  }
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  const postPaths: string[] = []
+  axiosClientMock = {
+    async post(path: string) {
+      postPaths.push(path)
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-named-inputless' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-named-inputless')
+      return {
+        data: {
+          status: 'done',
+          output_kind: 'text',
+          text: 'A generated caption',
+          outputs: [{
+            source_handle: 'caption',
+            kind: 'text',
+            text: 'A generated caption',
+          }],
+        },
+      }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(postPaths, ['/generate/from-none'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'text')
+})
+
+
+test('selected secondary mesh retains its exact final identity when the primary shares its path', async () => {
+  const ext = createWorkflowExtension({
+    id: 'probe/generate', extensionId: 'probe', nodeId: 'generate',
+    input: 'none', output: 'mesh', ioContract: 'named-v1', inputs: [],
+    outputs: [{ name: 'primary', type: 'mesh' }, { name: 'selected', type: 'mesh' }],
+  })
+  const workflow: Workflow = {
+    id: 'same-path-probe', name: 'Same-path selected secondary', description: '',
+    createdAt: '2026-10-09T00:00:00Z', updatedAt: '2026-10-09T00:00:00Z',
+    nodes: [
+      createNode('model', 'extensionNode', { enabled: true, extensionId: ext.id, params: {} }),
+      createNode('sink', 'outputNode'),
+    ],
+    edges: [{ id: 'selected-sink', source: 'model', sourceHandle: 'selected', target: 'sink' }],
+  }
+  const calls: string[] = []
+  axiosClientMock = {
+    async post(path: string) {
+      calls.push(path)
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'same-path-probe' } }
+    },
+    async get(path: string) {
+      calls.push(path)
+      assert.equal(path, '/generate/status/same-path-probe')
+      return { data: { status: 'done', output_kind: 'mesh', outputs: [
+        { source_handle: 'primary', kind: 'mesh', workspace_path: 'Workflows/shared.glb' },
+        { source_handle: 'selected', kind: 'mesh', workspace_path: 'Workflows/shared.glb' },
+      ] } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  const state = useWorkflowRunStore.getState()
+  const primary = state.nodeArtifacts.model
+  const declaredPrimary = state.nodeArtifacts['model::output::primary']
+  const selected = state.nodeArtifacts['model::output::selected']
+  const finalArtifact = state.runState.artifact
+  assert.equal(state.runState.status, 'done')
+  assert.equal(state.runState.outputUrl, '/workspace/Workflows/shared.glb')
+  assert.ok(primary)
+  assert.ok(declaredPrimary)
+  assert.ok(selected)
+  assert.ok(finalArtifact)
+  assert.equal(finalArtifact, selected)
+  assert.equal(finalArtifact.id, selected.id)
+  assert.equal(finalArtifact.versionId, selected.versionId)
+  assert.equal(primary.id, `${state.executionId}:model`)
+  assert.equal(primary.versionId, `${state.executionId}:model:1`)
+  assert.equal(declaredPrimary.id, `${state.executionId}:model::output::primary`)
+  assert.equal(declaredPrimary.versionId, `${state.executionId}:model::output::primary:1`)
+  assert.equal(selected.id, `${state.executionId}:model::output::selected`)
+  assert.equal(selected.versionId, `${state.executionId}:model::output::selected:1`)
+  assert.notEqual(primary.id, selected.id)
+  assert.notEqual(primary.versionId, selected.versionId)
+  for (const ref of [primary, declaredPrimary, selected]) {
+    assert.equal(ref.legacy?.filePath, '/workspace/Workflows/shared.glb')
+    assert.equal(ref.legacy?.outputType, 'mesh')
+  }
+  assert.deepEqual(Object.keys(state.nodeArtifacts).sort(), ['model', 'model::output::primary', 'model::output::selected'])
+  assert.deepEqual(Object.keys(state.nodeImageOutputs), [])
+  assert.deepEqual(Object.keys(state.nodeVideoOutputs), [])
+  assert.deepEqual(calls, ['/generate/from-none', '/generate/status/same-path-probe'])
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(runProcessCalls.length, 0)
 })

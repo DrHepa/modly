@@ -18,7 +18,10 @@ test('Add to Worlds is wired as a mesh terminal without changing Add to Scene', 
   assert.match(runStoreSource, /const addToSceneNodeIds = new Set/)
   assert.match(runStoreSource, /const addToWorldsNodeIds = new Set/)
   assert.match(runStoreSource, /const sceneOutputNodeIds = new Set\(\[\.\.\.addToSceneNodeIds, \.\.\.addToWorldsNodeIds\]\)/)
-  assert.match(runStoreSource, /await addWorkflowOutputUrlToWorlds\(outputUrl, outputType\)/)
+  assert.match(
+    runStoreSource,
+    /await addWorkflowOutputUrlToWorlds\(\s*selectedUrl,\s*isArtifactKind\(selectedOutputType\) \? selectedOutputType : undefined,\s*\)/,
+  )
   const worldsOutputSource = await readFile(path.join(workflowsRoot, 'workflowWorldsOutput.ts'), 'utf8')
   assert.match(worldsOutputSource, /useAppStore\.getState\(\)\.apiUrl/)
   assert.match(worldsOutputSource, /libraryApi\.read\(\{ workspacePath \}\)/)

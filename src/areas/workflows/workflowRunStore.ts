@@ -1,4 +1,4 @@
-import { buildProcessExecutionInput } from './processExecution'
+import { buildProcessExecutionInput, getWorkflowNodeOutputKey, resolveWorkflowEdgeOutput, resolveWorkflowEdgeSource } from './processExecution'
 import { getPositionalInputTypes, getProcessTargetPorts, hasNamedProcessInputs } from './processPorts'
 import { create } from 'zustand'
 import axios, { AxiosInstance } from 'axios'
@@ -8,7 +8,8 @@ import { hasUnsupportedSceneShape } from './sceneShape'
 import { resolveSceneSourceManifest } from './workflowSceneSource'
 import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
-import type { WorkflowExtension } from './mockExtensions'
+import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
+import { resolveEffectiveWorkflowIoContract } from './processConnectionRules'
 import type { Workflow, WFNode, WFEdge, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadResult, RigMetaSidecarReadResult } from '@shared/types/electron.d'
 import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
 import { assignSlotFilePaths } from './slotInputs'
@@ -217,6 +218,8 @@ interface RunContext {
   iteratorFiles:      Map<string, string[]>
   /** workspace URL of the most recently pushed scene mesh (last branch the user ran wins) */
   lastSceneMesh?:     string
+  /** Exact artifact selected with lastSceneMesh; physical path equality is not identity. */
+  lastSceneArtifact?: ArtifactRef
 }
 const _ctx = { current: null as RunContext | null }
 
@@ -245,9 +248,35 @@ function recordNodeArtifact(ctx: RunContext, nodeId: string, provenance?: Artifa
   else ctx.nodeArtifacts.delete(nodeId)
 }
 
+function resolveRunEdgeOutput(
+  edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
+  nodeOutputs: Map<string, NodeOutput>,
+  nodes: WFNode[],
+  allExtensions: WorkflowExtension[],
+  edges: WFEdge[] = [],
+): NodeOutput | undefined {
+  const sourceEdge = resolveWorkflowEdgeSource(edge, edges, new Map(nodes.map((node) => [node.id, node])), nodeOutputs)
+  if (!sourceEdge) return undefined
+  const sourceNode = nodes.find((node) => node.id === sourceEdge.source)
+  const extensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
+  const sourceExtension = getWorkflowExtension(extensionId, allExtensions)
+  const effectiveSourceExtension = sourceExtension?.type === 'model'
+    && resolveEffectiveWorkflowIoContract(sourceNode, sourceExtension) !== 'named-v1'
+    ? undefined : sourceExtension
+  return resolveWorkflowEdgeOutput(sourceEdge, nodeOutputs, effectiveSourceExtension)
+}
+
+function runEdgeOutputKey(ctx: RunContext, edge: WFEdge): string | undefined {
+  const sourceEdge = resolveWorkflowEdgeSource(edge, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
+  if (!sourceEdge) return undefined
+  const output = resolveRunEdgeOutput(edge, ctx.nodeOutputs, ctx.workflow.nodes, ctx.allExtensions, ctx.workflow.edges)
+  const namedKey = sourceEdge.sourceHandle ? getWorkflowNodeOutputKey(sourceEdge.source, sourceEdge.sourceHandle) : undefined
+  return namedKey && ctx.nodeOutputs.get(namedKey) === output ? namedKey : sourceEdge.source
+}
+
 function incomingCheckpointSource(ctx: RunContext, nodeId: string): string | undefined {
   const edge = ctx.workflow.edges.find((edge) => edge.target === nodeId)
-  return edge && resolveDataSource(edge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
+  return edge && runEdgeOutputKey(ctx, edge)
 }
 
 function materializeCheckpoint(ctx: RunContext, nodeId: string): WorkflowCheckpoint {
@@ -457,6 +486,190 @@ type ModelGenerationRequest =
       params: Record<string, unknown>
     }
 
+type ModelGeneratedStatusOutput = {
+  source_handle: string
+  kind: ArtifactRef['kind']
+  output_url?: string
+  workspace_path?: string
+  text?: string
+}
+
+type ModelGenerationStatus = {
+  status: string
+  progress?: number
+  step?: string
+  output_url?: string
+  output_kind?: ArtifactRef['kind']
+  text?: string
+  outputs?: ModelGeneratedStatusOutput[]
+  error?: string
+}
+
+function isRequiredModelOutput(output: { name: string; required?: boolean }): boolean {
+  return output.required ?? true
+}
+
+function statusOutputToLegacy(output: ModelGeneratedStatusOutput, workspaceDir: string): NodeOutput {
+  if (output.kind === 'text') {
+    if (output.text === undefined) throw new Error(`Text output "${output.source_handle}" has no text payload`)
+    return { text: output.text, outputType: 'text' }
+  }
+
+  const workspacePath = output.workspace_path
+    ?? (output.output_url?.startsWith('/workspace/') ? output.output_url.slice('/workspace/'.length) : undefined)
+  const normalizedWorkspacePath = workspacePath?.replace(/\\/g, '/')
+  if (!normalizedWorkspacePath || normalizedWorkspacePath.split('/').includes('..')) {
+    throw new Error(`File output "${output.source_handle}" has no safe workspace path`)
+  }
+  return {
+    filePath: `${workspaceDir.replace(/\\/g, '/').replace(/\/$/, '')}/${normalizedWorkspacePath.replace(/^\//, '')}`,
+    outputType: output.kind,
+  }
+}
+
+function resolveNamedModelImageRouting(args: {
+  ext: WorkflowExtension
+  node: WFNode
+  incomingEdges: WFEdge[]
+  nodeOutputs: Map<string, NodeOutput>
+  nodes: WFNode[]
+  allExtensions: WorkflowExtension[]
+  edges: WFEdge[]
+}): { applies: boolean; paths: string[]; names: string[] } {
+  if (args.ext.input !== 'image') {
+    return { applies: false, paths: [], names: [] }
+  }
+  if (resolveEffectiveWorkflowIoContract(args.node, args.ext) !== 'named-v1') {
+    return { applies: false, paths: [], names: [] }
+  }
+
+  const declaredInputs = hasNamedProcessInputs(args.ext.inputs) ? args.ext.inputs : []
+  if (declaredInputs.length === 0) {
+    throw new Error(`Named-v1 model ${args.ext.id} has no declared inputs`)
+  }
+
+  const declaredPorts = getProcessTargetPorts(args.ext)
+  const declaredByName = new Map<string, (typeof declaredPorts)[number]>()
+  for (const port of declaredPorts) {
+    if (port.name === null) continue
+    if (declaredByName.has(port.name)) {
+      console.warn(
+        `Workflow model ${args.ext.id} declares duplicate named-v1 input "${port.name}". Using the first declaration for best-effort routing.`,
+      )
+      continue
+    }
+    if (port.name !== null) declaredByName.set(port.name, port)
+  }
+
+  type RoutedInput = {
+    edge: WFEdge
+    edgeIndex: number
+    output: NodeOutput
+  }
+  const routedByName = new Map<string, RoutedInput[]>()
+
+  const resolveTargetPort = (handle: string | null | undefined) => {
+    if (typeof handle === 'string') {
+      const declaredPort = declaredByName.get(handle)
+      if (declaredPort) return declaredPort
+    }
+    if (declaredPorts.length === 1) {
+      const solePort = declaredPorts[0]
+      console.warn(
+        `Workflow model ${args.ext.id} received named-v1 input "${handle ?? '(missing)'}". Routing it to the sole declared port "${solePort.name}".`,
+      )
+      return solePort
+    }
+    console.warn(
+      `Workflow model ${args.ext.id} received ambiguous named-v1 input "${handle ?? '(missing)'}". Ignoring that edge.`,
+    )
+    return undefined
+  }
+
+  for (const [edgeIndex, edge] of args.incomingEdges.entries()) {
+    const port = resolveTargetPort(edge.targetHandle)
+    if (!port?.name) continue
+
+    const output = resolveRunEdgeOutput(edge, args.nodeOutputs, args.nodes, args.allExtensions, args.edges)
+    if (!output) {
+      console.warn(
+        `Workflow model ${args.ext.id} named-v1 input "${port.name}" has no connected artifact. Ignoring that edge.`,
+      )
+      continue
+    }
+    if (output.outputType !== port.type) {
+      console.warn(
+        `Workflow model ${args.ext.id} named-v1 input "${port.name}" expects "${port.type}" but received "${output.outputType ?? 'unknown'}". Routing by available artifact anyway.`,
+      )
+    }
+
+    const routed = routedByName.get(port.name) ?? []
+    routed.push({ edge, edgeIndex, output })
+    routedByName.set(port.name, routed)
+  }
+
+  const paths: string[] = []
+  const names: string[] = []
+  for (const port of declaredInputs) {
+    const routed = routedByName.get(port.name) ?? []
+    if (port.multiple !== true && routed.length > 1) {
+      console.warn(
+        `Workflow model ${args.ext.id} received multiple named-v1 inputs for "${port.name}". Using the latest connected artifact.`,
+      )
+    }
+
+    const minimum = port.min_items ?? (port.required ? 1 : 0)
+    if (routed.length < minimum) {
+      console.warn(
+        `Workflow model ${args.ext.id} named-v1 input "${port.name}" is below its descriptive minimum (${minimum}). Continuing with available artifacts.`,
+      )
+    }
+    if (port.max_items !== undefined && routed.length > port.max_items) {
+      console.warn(
+        `Workflow model ${args.ext.id} named-v1 input "${port.name}" exceeds its descriptive maximum (${port.max_items}). Continuing with available artifacts.`,
+      )
+    }
+
+    const ordered = port.multiple === true
+      ? [...routed].sort((left, right) => {
+        const leftIndex = Number.isInteger(left.edge.targetItemIndex) && (left.edge.targetItemIndex ?? 0) >= 0
+          ? left.edge.targetItemIndex!
+          : left.edgeIndex
+        const rightIndex = Number.isInteger(right.edge.targetItemIndex) && (right.edge.targetItemIndex ?? 0) >= 0
+          ? right.edge.targetItemIndex!
+          : right.edgeIndex
+        return leftIndex - rightIndex || left.edgeIndex - right.edgeIndex
+      })
+      : routed.slice(-1)
+
+    if (port.multiple === true) {
+      for (const { edge } of routed) {
+        const itemIndex = edge.targetItemIndex
+        if (itemIndex !== undefined && (!Number.isInteger(itemIndex) || itemIndex < 0)) {
+          console.warn(
+            `Workflow model ${args.ext.id} received invalid targetItemIndex for named-v1 input "${port.name}". Falling back to stable edge order.`,
+          )
+          break
+        }
+      }
+    }
+
+    if (port.type !== 'image') continue
+    for (const { output } of ordered) {
+      if (!output.filePath) {
+        console.warn(
+          `Workflow model ${args.ext.id} named-v1 image input "${port.name}" has no file path. Skipping that artifact.`,
+        )
+        continue
+      }
+      paths.push(output.filePath)
+      names.push(port.name)
+    }
+  }
+
+  return { applies: true, paths, names }
+}
+
 export function shouldUsePreviousNodeFallback(input: WorkflowExtension['input']): boolean {
   return input !== 'none'
 }
@@ -466,13 +679,21 @@ function resolveModelNodeOutputKind(args: {
   actualOutput?: ArtifactRef['kind']
   extensionId: string
 }): string | undefined {
-  if (args.actualOutput === undefined) return args.declaredOutput
-  if (args.declaredOutput !== undefined && args.declaredOutput !== args.actualOutput) {
-    throw new Error(
-      `Model ${args.extensionId} declared output "${args.declaredOutput}" but generated "${args.actualOutput}". Update the manifest output or fix the generator output contract.`,
+  if (args.actualOutput !== undefined && args.declaredOutput !== undefined && args.declaredOutput !== args.actualOutput) {
+    console.warn(
+      `Workflow model ${args.extensionId} declared output "${args.declaredOutput}" but generated "${args.actualOutput}". Routing by actual output kind.`,
     )
   }
-  return args.actualOutput
+  return args.actualOutput ?? args.declaredOutput
+}
+
+function isArtifactKind(value: string | undefined): value is ArtifactRef['kind'] {
+  return value === 'image'
+    || value === 'video'
+    || value === 'text'
+    || value === 'mesh'
+    || value === 'scene'
+    || value === 'audio'
 }
 
 export function buildModelGenerationRequest(args: {
@@ -724,6 +945,7 @@ async function executeExtensionNode(
           selectedImagePath, selectedImageData } = ctx
 
   const { ext, mode } = resolveWorkflowDispatch(node, allExtensions)
+  const effectiveIoContract = resolveEffectiveWorkflowIoContract(node, ext)
   if (hasUnsupportedSceneShape(ext)) {
     throw new Error(`${ext.name} uses an unsupported scene input or output declaration`)
   }
@@ -732,10 +954,8 @@ async function executeExtensionNode(
   const rawParams = _liveParams.current.get(node.id) ?? node.data.params ?? {}
   const liveParams = hydrateWorkflowNodeParams(ext, rawParams)
 
-  const resolveSource = (sourceId: string): NodeOutput | undefined => {
-    const realId = resolveDataSource(sourceId, workflow.edges, nodeMap, nodeOutputs)
-    return realId ? nodeOutputs.get(realId) : undefined
-  }
+  const resolveSource = (edge: WFEdge): NodeOutput | undefined =>
+    resolveRunEdgeOutput(edge, nodeOutputs, workflow.nodes, allExtensions, workflow.edges)
 
   let nodeInputPath:     string | undefined
   let nodeInputText:     string | undefined
@@ -754,17 +974,21 @@ async function executeExtensionNode(
   const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
   const scenePositional = mode === 'process' && !hasNamedInputs
     && (ext.input === 'scene' || positionalInputs?.includes('scene'))
-  // This adapter is only the named front/side image MODEL contract, not a
-  // generic named-input ABI and not the named PROCESS transport below.
-  const namedModelImagePorts = mode === 'model' && ext.input === 'image' && hasNamedProcessInputs(ext.inputs)
+  const namedModelImageRouting = mode === 'model'
+    ? resolveNamedModelImageRouting({ ext, node, incomingEdges, nodeOutputs, nodes: workflow.nodes, allExtensions, edges: workflow.edges })
+    : { applies: false, paths: [], names: [] }
+  // Legacy front/side images retain their adapter unless named-v1 is active.
+  const namedModelImagePorts = mode === 'model' && effectiveIoContract !== 'named-v1' && ext.input === 'image' && hasNamedProcessInputs(ext.inputs)
     ? new Set(ext.inputs.filter((port) => port.type === 'image' && ['front', 'left', 'back', 'right'].includes(port.name)).map((port) => port.name))
     : new Set<string>()
   const routedSideParams: Record<string, string> = {}
 
-  if (namedModelImagePorts.size > 0) {
+  if (namedModelImageRouting.applies) {
+    // The ordered named files are submitted below; do not consume selected-image fallback.
+  } else if (namedModelImagePorts.size > 0) {
     let legacyImagePath: string | undefined
     for (const edge of incomingEdges) {
-      const src = resolveSource(edge.source)
+      const src = resolveSource(edge)
       if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
       const handle = edge.targetHandle
       if (src?.outputType !== 'image' || !src.filePath) continue
@@ -786,7 +1010,7 @@ async function executeExtensionNode(
     const inputPaths  = new Array<string | undefined>(inputTypes.length).fill(undefined)
 
     for (const edge of incomingEdges) {
-      const src = resolveSource(edge.source)
+      const src = resolveSource(edge)
       if (!src) continue
       const slotMatch = /^input-(\d+)$/.exec(edge.targetHandle ?? '')
       const slot = slotMatch ? Number(slotMatch[1]) : 0
@@ -803,7 +1027,7 @@ async function executeExtensionNode(
     extraImagePaths.push(...slots.extraImagePaths)
   } else if (shouldUsePreviousNodeFallback(ext.input)) {
     for (const edge of incomingEdges) {
-      const src = resolveSource(edge.source)
+      const src = resolveSource(edge)
       if (src?.filePath !== undefined) nodeInputPath = src.filePath
       if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
       if (src?.outputType === 'scene') nodeInputScenePath = src.filePath
@@ -821,7 +1045,7 @@ async function executeExtensionNode(
     const meshPaths = new Map<string, string>()
     for (const edge of incomingEdges) {
       if (!meshPorts.some((port) => port.name === edge.targetHandle)) continue
-      const src = resolveSource(edge.source)
+      const src = resolveSource(edge)
       if (src?.outputType === 'mesh' && src.filePath?.trim()) meshPaths.set(edge.targetHandle!, src.filePath)
     }
     // A declared prompt port owns its connected text (including blank values).
@@ -831,21 +1055,21 @@ async function executeExtensionNode(
       nodeInputText = undefined
       for (const edge of incomingEdges) {
         if (edge.targetHandle !== promptPort.name) continue
-        const src = resolveSource(edge.source)
+        const src = resolveSource(edge)
         if (src?.text !== undefined && (!src.outputType || src.outputType === 'text')) nodeInputText = src.text
       }
     }
     const activeImagePath = (isInputless || isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isInputless && !isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
+    if (!namedModelImageRouting.applies && !isInputless && !isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
     }
 
     let blob: Blob | undefined
     let fname = 'image.png'
-    if (!isInputless && !isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
+    if (!namedModelImageRouting.applies && !isInputless && !isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
       fname = 'placeholder.png'
       blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else if (!isInputless && !isTextInput && !isSceneInput) {
+    } else if (!namedModelImageRouting.applies && !isInputless && !isTextInput && !isSceneInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
@@ -931,6 +1155,23 @@ async function executeExtensionNode(
         remesh: 'none', enable_texture: false, texture_resolution: 1024,
         params: { ...params, ...extraParams },
       })
+    } else if (namedModelImageRouting.applies) {
+      const fd = new FormData()
+      for (const [index, imagePath] of namedModelImageRouting.paths.entries()) {
+        const encoded = await window.electron.fs.readFileBase64(imagePath)
+        assertCurrentContext(ctx)
+        const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))
+        const blob = new Blob([bytes], { type: 'image/png' })
+        fd.append('images', blob, imagePath.split(/[\\/]/).pop() ?? 'image.png')
+        fd.append('image_names', namedModelImageRouting.names[index])
+      }
+      fd.append('model_id', node.data.extensionId ?? '')
+      fd.append('collection', 'Workflows')
+      fd.append('remesh', 'none')
+      fd.append('enable_texture', 'false')
+      fd.append('texture_resolution', '1024')
+      fd.append('params', JSON.stringify({ ...effectiveParams, ...extraParams }))
+      submission = await client.post('/generate/from-images', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
     } else {
       const fd = new FormData()
       fd.append('image', blob!, fname)
@@ -963,15 +1204,78 @@ async function executeExtensionNode(
       await new Promise((r) => setTimeout(r, 1200))
       assertCurrentContext(ctx)
 
-      const { data: st } = await client.get<{
-        status: string; progress?: number; step?: string; output_url?: string; output_kind?: ArtifactRef['kind']; error?: string
-      }>(`/generate/status/${backendJobId}`)
+      const { data: st } = await client.get<ModelGenerationStatus>(`/generate/status/${backendJobId}`)
 
       assertCurrentContext(ctx)
-      if (st.status === 'done' && st.output_url) {
-        actualOutputType = resolveModelNodeOutputKind({ declaredOutput: ext.output, actualOutput: st.output_kind, extensionId: ext.id })
-        const rel = st.output_url.replace(/^\/workspace\//, '')
-        nodeInputPath = `${workspaceDir}/${rel}`
+      if (st.status === 'done') {
+        let primaryOutput: NodeOutput | undefined
+        if (effectiveIoContract === 'named-v1' && Array.isArray(st.outputs) && st.outputs.length > 0) {
+          const actualOutputs: NodeOutput[] = []
+          const resolvedByHandle = new Map<string, NodeOutput>()
+          for (const output of st.outputs) {
+            if (resolvedByHandle.has(output.source_handle)) {
+              console.warn(
+                `Workflow model ${ext.id} generated duplicate output handle "${output.source_handle}". Using the latest payload.`,
+              )
+            }
+            const declaredPort = ext.outputs?.find((port) => port.name === output.source_handle)
+            if (ext.outputs && !declaredPort) {
+              console.warn(
+                `Workflow model ${ext.id} generated undeclared output handle "${output.source_handle}". Preserving it for downstream routing.`,
+              )
+            }
+            if (declaredPort && declaredPort.type !== output.kind) {
+              console.warn(
+                `Workflow model ${ext.id} output "${output.source_handle}" declared "${declaredPort.type}" but generated "${output.kind}". Routing by actual output kind.`,
+              )
+            }
+            const resolved = statusOutputToLegacy(output, workspaceDir)
+            actualOutputs.push(resolved)
+            resolvedByHandle.set(output.source_handle, resolved)
+            const outputKey = getWorkflowNodeOutputKey(node.id, output.source_handle)
+            nodeOutputs.set(outputKey, resolved)
+            recordNodeArtifact(ctx, outputKey, { workflowId: workflow.id, workflowNodeId: node.id, extensionId: ext.extensionId, extensionNodeId: ext.nodeId })
+          }
+          if (ext.outputs) {
+            for (const declaredPort of ext.outputs) {
+              if (isRequiredModelOutput(declaredPort) && !resolvedByHandle.has(declaredPort.name)) {
+                console.warn(
+                  `Workflow model ${ext.id} did not generate declared output handle "${declaredPort.name}". Falling back to the first actual output.`,
+                )
+              }
+            }
+            primaryOutput = resolvedByHandle.get(ext.outputs[0]?.name ?? '') ?? actualOutputs[0]
+          } else {
+            primaryOutput = actualOutputs[0]
+          }
+        } else {
+          const outputType = resolveModelNodeOutputKind({
+            declaredOutput: ext.output,
+            actualOutput: st.output_kind,
+            extensionId: ext.id,
+          })
+          if (outputType === 'text') {
+            if (st.text === undefined) throw new Error(`Model ${ext.id} completed without text output`)
+            primaryOutput = { text: st.text, outputType }
+          } else if (st.output_url) {
+            const rel = st.output_url.replace(/^\/workspace\//, '')
+            primaryOutput = { filePath: `${workspaceDir}/${rel}`, outputType }
+          }
+          if (primaryOutput && effectiveIoContract === 'named-v1' && ext.outputs?.[0]) {
+            const primaryKey = getWorkflowNodeOutputKey(node.id, ext.outputs[0]?.name ?? '')
+            nodeOutputs.set(primaryKey, primaryOutput)
+            recordNodeArtifact(ctx, primaryKey, { workflowId: workflow.id, workflowNodeId: node.id, extensionId: ext.extensionId, extensionNodeId: ext.nodeId })
+          }
+        }
+        if (!primaryOutput) throw new Error(`Model ${ext.id} completed without an output payload`)
+        const primaryKind = resolveModelNodeOutputKind({
+          declaredOutput: ext.output,
+          actualOutput: primaryOutput.outputType as ArtifactRef['kind'] | undefined,
+          extensionId: ext.id,
+        })
+        nodeInputPath = primaryOutput.filePath
+        nodeInputText = primaryOutput.text
+        actualOutputType = primaryKind
         _activeJobId.current = null
         setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Generation complete' }))
         break
@@ -1053,15 +1357,23 @@ async function executeExtensionNode(
     workflowId: workflow.id, workflowNodeId: node.id,
     extensionId: ext.extensionId, extensionNodeId: ext.nodeId,
   })
-  const output = nodeOutputs.get(node.id)
-  const url = isSceneMeshOutput(output) ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
-  if (url && reachesSceneOutput(node.id, workflow.edges, nodeMap)) {
-    ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
-    updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
-  }
-  const worldsUrl = output?.filePath ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
-  if (worldsUrl && workflow.edges.some((edge) => edge.source === node.id && nodeMap.get(edge.target)?.type === 'addToWorldsNode')) {
-    await addWorkflowOutputUrlToWorlds(worldsUrl, outputType)
+  for (const edge of workflow.edges.filter((candidate) => candidate.source === node.id)) {
+    const targetType = nodeMap.get(edge.target)?.type
+    const selectedOutput = resolveSource(edge)
+    const url = isSceneMeshOutput(selectedOutput) ? toWorkspaceUrl(selectedOutput.filePath, workspaceDir) : undefined
+    if (url && !isBranchStarter(targetType)
+      && (isSceneOutput(targetType) || reachesSceneOutput(edge.target, workflow.edges, nodeMap))) {
+      ctx.lastSceneMesh = url
+      const outputKey = runEdgeOutputKey(ctx, edge)
+      ctx.lastSceneArtifact = outputKey ? ctx.nodeArtifacts.get(outputKey) : undefined
+      updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
+    }
+    const worldsUrl = selectedOutput?.filePath ? toWorkspaceUrl(selectedOutput.filePath, workspaceDir) : undefined
+    if (worldsUrl && targetType === 'addToWorldsNode') {
+      const kind = selectedOutput?.outputType
+      await addWorkflowOutputUrlToWorlds(worldsUrl, isArtifactKind(kind) ? kind : undefined)
+      assertCurrentContext(ctx)
+    }
   }
 }
 
@@ -1096,8 +1408,7 @@ async function pushBranchSceneMesh(ctx: RunContext, waitId: string): Promise<voi
     const inEdge = ctx.workflow.edges.find((e) => e.target === node.id)
     if (!inEdge) continue
     if (node.type === 'addToWorldsNode' && ctx.nodeMap.get(inEdge.source)?.type === 'extensionNode') continue
-    const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap, ctx.nodeOutputs)
-    const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
+    const sourceOutput = resolveRunEdgeOutput(inEdge, ctx.nodeOutputs, ctx.workflow.nodes, ctx.allExtensions, ctx.workflow.edges)
     const url = node.type === 'addToWorldsNode' && sourceOutput?.filePath
       ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir)
       : isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
@@ -1106,6 +1417,8 @@ async function pushBranchSceneMesh(ctx: RunContext, waitId: string): Promise<voi
         await addWorkflowOutputUrlToWorlds(url, sourceOutput?.outputType)
       } else {
         ctx.lastSceneMesh = url
+        const outputKey = runEdgeOutputKey(ctx, inEdge)
+        ctx.lastSceneArtifact = outputKey ? ctx.nodeArtifacts.get(outputKey) : undefined
         updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: url, previewKind: undefined, step: undefined })
       }
     }
@@ -1247,18 +1560,26 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     // viewer, and topo order must not override the user's last action.
     let outputUrl:  string | undefined = ctx.lastSceneMesh
     let outputPath: string | undefined
+    let chosenArtifactRef: ArtifactRef | undefined = ctx.lastSceneMesh ? ctx.lastSceneArtifact : undefined
 
     const lastOutputNode = outputUrl ? undefined : [...ctx.ordered].reverse().find((n) => isSceneOutput(n.type) || n.type === 'addToWorldsNode')
     if (lastOutputNode) {
       for (const edge of ctx.workflow.edges.filter((e) => e.target === lastOutputNode.id)) {
-        const src = ctx.nodeOutputs.get(edge.source)
-        if (isSceneMeshOutput(src)) {
-          outputUrl = toWorkspaceUrl(src.filePath, ctx.workspaceDir)
+        const src = resolveRunEdgeOutput(edge, ctx.nodeOutputs, ctx.workflow.nodes, ctx.allExtensions, ctx.workflow.edges)
+        const key = runEdgeOutputKey(ctx, edge)
+        if (src?.filePath) {
+          chosenArtifactRef = key ? ctx.nodeArtifacts.get(key) : undefined
+          if (src.outputType === 'audio' || src.outputType === 'scene') outputPath = src.filePath
+          else outputUrl = toWorkspaceUrl(src.filePath, ctx.workspaceDir)
+        } else if (src?.text !== undefined) {
+          chosenArtifactRef = key ? ctx.nodeArtifacts.get(key) : undefined
         }
       }
     }
-    if (!outputUrl) {
+    if (!outputUrl && !chosenArtifactRef) {
       for (const [id, o] of ctx.nodeOutputs) {
+        // Named secondaries are selected by their sink edge, never by map insertion order.
+        if (!ctx.nodeMap.has(id)) continue
         // Merely previewing a manual boundary cannot make its input a final result.
         if (ctx.checkpoints.size && !isExecutable(ctx.nodeMap.get(id)!)) continue
         if (o.filePath) {
@@ -1274,8 +1595,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     }
 
     const finalPath = outputUrl ? fromWorkspaceUrl(outputUrl, ctx.workspaceDir) : outputPath
-    const artifact = finalPath ? [...ctx.nodeArtifacts.values()].reverse().find((ref) =>
-      artifactRefToLegacyOutput(ref)?.filePath && runtimeCheckpointOutput(artifactRefToLegacyOutput(ref)!, ctx.workspaceDir).filePath === finalPath) : undefined
+    const artifact = chosenArtifactRef ?? (finalPath ? [...ctx.nodeArtifacts.values()].reverse().find((ref) =>
+      artifactRefToLegacyOutput(ref)?.filePath && runtimeCheckpointOutput(artifactRefToLegacyOutput(ref)!, ctx.workspaceDir).filePath === finalPath) :
+      [...ctx.ordered].reverse().filter((node) => isExecutable(node)).map((node) => ctx.nodeArtifacts.get(node.id)).find((ref) => ref?.kind === 'text'))
     set((s) => ({
       activeCheckpointNodeId: null,
       activeNodeId:     null,

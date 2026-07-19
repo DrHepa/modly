@@ -5,15 +5,17 @@ import type {
   WFNode,
 } from '../../shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions.ts'
-import { getProcessTargetPort, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
+import { getExtensionSourcePort, getProcessTargetPort, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
 import { assignSlotFilePaths, type SlotInputType } from './slotInputs.ts'
 import { resolveDataSource } from './nodeBehaviors.ts'
+import { resolveEffectiveWorkflowIoContract } from './processConnectionRules.ts'
 
 type NodeOutput = {
   filePath?: string
   text?: string
   outputType?: string
 }
+
 
 type BuildProcessExecutionInputArgs = {
   node: WFNode
@@ -24,7 +26,11 @@ type BuildProcessExecutionInputArgs = {
   previousNodeOutput?: NodeOutput
 }
 
-function getNodeOutputType(node: WFNode | undefined, allExtensions: WorkflowExtension[]): NamedProcessInput['type'] | undefined {
+function getNodeOutputType(
+  node: WFNode | undefined,
+  allExtensions: WorkflowExtension[],
+  sourceHandle?: string | null,
+): NamedProcessInput['type'] | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
@@ -35,7 +41,53 @@ function getNodeOutputType(node: WFNode | undefined, allExtensions: WorkflowExte
   if (node.type !== 'extensionNode') return undefined
 
   const extensionId = typeof node.data.extensionId === 'string' ? node.data.extensionId : ''
-  return getWorkflowExtension(extensionId, allExtensions)?.output
+  const extension = getWorkflowExtension(extensionId, allExtensions)
+  if (!extension) return undefined
+  if (extension.type !== 'model') return extension.output
+  return resolveEffectiveWorkflowIoContract(node, extension) === 'named-v1'
+    ? getExtensionSourcePort(extension, sourceHandle)?.type
+    : extension.output
+}
+
+
+export function resolveWorkflowEdgeSource(
+  edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
+  edges: WFEdge[],
+  nodeMap: Map<string, WFNode>,
+  nodeOutputs?: ReadonlyMap<string, unknown>,
+): Pick<WFEdge, 'source' | 'sourceHandle'> | undefined {
+  const sourceId = resolveDataSource(edge.source, edges, nodeMap, nodeOutputs)
+  if (!sourceId) return undefined
+  let sourceEdge = edge
+  const seen = new Set<string>()
+  while (sourceEdge.source !== sourceId && !seen.has(sourceEdge.source)) {
+    seen.add(sourceEdge.source)
+    const parent = edges.find((candidate) => candidate.target === sourceEdge.source)
+    if (!parent) break
+    sourceEdge = parent
+  }
+  return { source: sourceId, sourceHandle: sourceEdge.sourceHandle }
+}
+
+export function getWorkflowNodeOutputKey(nodeId: string, sourceHandle: string): string {
+  return `${nodeId}::output::${sourceHandle}`
+}
+
+export function resolveWorkflowEdgeOutput<T extends NodeOutput>(
+  edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
+  nodeOutputs: Map<string, T>,
+  sourceExtension?: Pick<WorkflowExtension, 'id' | 'type' | 'outputs'>,
+): T | undefined {
+  const modelSourceExtension = sourceExtension?.type === 'model' ? sourceExtension : undefined
+  if (!edge.sourceHandle || !modelSourceExtension?.outputs?.length) return nodeOutputs.get(edge.source)
+
+  const preservedNamedOutput = nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, edge.sourceHandle))
+  if (preservedNamedOutput) return preservedNamedOutput
+
+  const declaredNamedOutput = getExtensionSourcePort(modelSourceExtension, edge.sourceHandle)
+  return (declaredNamedOutput?.name
+    ? nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, declaredNamedOutput.name))
+    : undefined) ?? nodeOutputs.get(edge.source)
 }
 
 function getProcessNodeId(node: WFNode, extension: WorkflowExtension | undefined): string {
@@ -64,19 +116,27 @@ export function buildProcessExecutionInput({
   if (scenePositional) incomingEdges.sort((a, b) =>
     Number((a.targetHandle ?? 'input-0').slice(6)) - Number((b.targetHandle ?? 'input-0').slice(6)))
   const nodeMap = new Map(nodes.map((source) => [source.id, source]))
-  const resolveOutput = (sourceId: string) => {
-    const realId = resolveDataSource(sourceId, edges, nodeMap, nodeOutputs)
-    return realId ? nodeOutputs.get(realId) : undefined
+  const resolveOutput = (edge: WFEdge) => {
+    const sourceEdge = resolveWorkflowEdgeSource(edge, edges, nodeMap, nodeOutputs)
+    if (!sourceEdge) return undefined
+    const sourceNode = nodeMap.get(sourceEdge.source)
+    const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
+    const sourceExtension = getWorkflowExtension(sourceExtensionId, allExtensions)
+    const effectiveExtension = sourceExtension?.type === 'model'
+      && resolveEffectiveWorkflowIoContract(sourceNode, sourceExtension) !== 'named-v1'
+      ? undefined : sourceExtension
+    return resolveWorkflowEdgeOutput(sourceEdge, nodeOutputs, effectiveExtension)
   }
 
   const inputs: Record<string, NamedProcessInput> = {}
   if (hasNamedInputs || scenePositional) for (const edge of incomingEdges) {
     const port = extension && getProcessTargetPort(extension, edge.targetHandle)
     if (!port) continue
-    const sourceNodeId = resolveDataSource(edge.source, edges, nodeMap, nodeOutputs)
-    const output = sourceNodeId ? nodeOutputs.get(sourceNodeId) : undefined
+    const sourceEdge = resolveWorkflowEdgeSource(edge, edges, nodeMap, nodeOutputs)
+    const sourceNodeId = sourceEdge?.source
+    const output = resolveOutput(edge)
     if (!output || (output.filePath === undefined && output.text === undefined)) continue
-    const type = output.outputType ?? getNodeOutputType(nodeMap.get(sourceNodeId!), allExtensions) ?? port.type
+    const type = output.outputType ?? getNodeOutputType(nodeMap.get(sourceNodeId!), allExtensions, sourceEdge?.sourceHandle) ?? port.type
     Object.defineProperty(inputs, port.name ?? 'input-0', { enumerable: true, configurable: true, writable: true, value: {
       type, sourceNodeId: sourceNodeId!,
       ...(output.filePath !== undefined ? { filePath: output.filePath } : {}),
@@ -93,7 +153,7 @@ export function buildProcessExecutionInput({
     if (inputTypes && inputTypes.length > 1) {
       const paths = new Array<string | undefined>(inputTypes.length).fill(undefined)
       for (const edge of incomingEdges) {
-        const output = resolveOutput(edge.source)
+        const output = resolveOutput(edge)
         if (!output) continue
         const match = /^input-(\d+)$/.exec(edge.targetHandle ?? '')
         const slot = match ? Number(match[1]) : 0
@@ -108,7 +168,7 @@ export function buildProcessExecutionInput({
       filePath = slots.nodeInputMeshPath ?? slots.nodeInputPath
     } else {
       for (const edge of incomingEdges) {
-        const sourceOutput = resolveOutput(edge.source)
+        const sourceOutput = resolveOutput(edge)
         if (sourceOutput?.filePath !== undefined) filePath = sourceOutput.filePath
         if (sourceOutput?.text !== undefined) text = sourceOutput.text
       }

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { AnyExtension, ModelDownloadFailure, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
+import { ICONS, TypePill } from './extensionShared'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
 
@@ -24,26 +25,36 @@ interface Props {
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: import('@shared/types/electron.d').ExtensionNode, fullId: string) => void
-  onUninstall:      (extId: string) => void
+  onUninstall?:     (extId: string) => void
   onUninstallNode?: (fullId: string) => void
   onRepaired?:      () => void
   onRuntimeReadinessAction?: (modelId: string, action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string }
+  onInstallAll?:    (ext: AnyExtension) => void
+  onPauseDownload?: (fullId: string) => void
+  onCancelDownload?: (fullId: string) => void
+  onOpen?:          (ext: AnyExtension) => void
 }
 
-export function ExtensionCard({
-  ext, installedIds, downloading, loadError, disabled,
-  onInstall, onInstallAll, onPauseDownload, onCancelDownload, onOpen,
-}: Props): JSX.Element {
-  const isModel = ext.type === 'model'
-  const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
-  const { total, done, installing, hasAvailable } = extInstallSummary(ext, installedIds, downloading)
-
-export function ExtensionCard({ ext, installedIds, downloading, downloadFailures, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, downloadFailures, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction, onOpen }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
   const [runtimeModal, setRuntimeModal] = useState<RuntimeReadinessModalState | null>(null)
+  const isModel = ext.type === 'model'
+  const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
 
-  const badge = TYPE_BADGE[ext.type] ?? TYPE_BADGE.model
+  const handleOpen = (e: React.MouseEvent) => {
+    if (!onOpen) return
+    if ((e.target as HTMLElement).closest('button')) return
+    onOpen(ext)
+  }
+
+  const handleKey = (e: React.KeyboardEvent) => {
+    if (!onOpen) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      onOpen(ext)
+    }
+  }
 
   async function handleRepair() {
     setRepairing(true)
@@ -97,12 +108,12 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
 
   return (
     <div
-      role="button"
-      tabIndex={0}
+      role={onOpen ? 'button' : undefined}
+      tabIndex={onOpen ? 0 : undefined}
       onClick={handleOpen}
       onKeyDown={handleKey}
-      aria-label={`${ext.name} — open details`}
-      className="relative flex flex-col min-h-[218px] p-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 overflow-hidden cursor-pointer transition-all duration-150 hover:bg-zinc-900 hover:border-zinc-700 hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-14px_rgba(0,0,0,0.7)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+      aria-label={onOpen ? `${ext.name} — open details` : undefined}
+      className={`relative flex flex-col min-h-[218px] p-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 overflow-hidden transition-all duration-150 hover:bg-zinc-900 hover:border-zinc-700 hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-14px_rgba(0,0,0,0.7)] ${onOpen ? 'cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent' : ''}`}
     >
       {/* Header */}
       <div className="flex items-start gap-3">

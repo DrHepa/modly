@@ -1,12 +1,50 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import type { AnyExtension, ExtensionNode, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ExtensionInstallResult, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { formatModelName } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
+import { ExtensionDrawer } from './components/ExtensionDrawer'
+import { ICONS } from './components/extensionShared'
 import { collectModelOwnershipMetadata, deriveModelOwnershipState } from './modelOwnershipState'
 
 const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
+
+type FilterId = 'all' | 'process' | 'model' | 'official'
+type SortId = 'name' | 'type'
+
+const FILTERS: Array<{ id: FilterId; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'process', label: 'Processors' },
+  { id: 'model', label: 'Models' },
+  { id: 'official', label: 'Official' },
+]
+
+const SORTS: Array<{ id: SortId; label: string }> = [
+  { id: 'name', label: 'Name' },
+  { id: 'type', label: 'Type' },
+]
+
+type LocalInstallResult = ExtensionInstallResult & { cancelled?: boolean }
+
+type ExtensionsApiWithLocalInstall = {
+  installFromLocal: () => Promise<LocalInstallResult>
+}
+
+type ModelApiWithDownloadControls = {
+  pauseDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
+  cancelDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
+}
+
+function hasLocalInstall(api: unknown): api is ExtensionsApiWithLocalInstall {
+  return typeof api === 'object' && api !== null && 'installFromLocal' in api && typeof api.installFromLocal === 'function'
+}
+
+function hasDownloadControls(api: unknown): api is ModelApiWithDownloadControls {
+  return typeof api === 'object' && api !== null
+    && 'pauseDownload' in api && typeof api.pauseDownload === 'function'
+    && 'cancelDownload' in api && typeof api.cancelDownload === 'function'
+}
 
 type ModelDownloadApi = {
   download: (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<ModelDownloadResult>
@@ -197,7 +235,6 @@ export default function ModelsPage(): JSX.Element {
   const runtimeReadinessById = useExtensionsStore((s) => s.runtimeReadinessById)
   const loadExtensions    = useExtensionsStore((s) => s.loadExtensions)
   const installFromGH     = useExtensionsStore((s) => s.installFromGitHub)
-  const installFromLocal  = useExtensionsStore((s) => s.installFromLocal)
   const uninstallExt      = useExtensionsStore((s) => s.uninstall)
   const reloadExtensions  = useExtensionsStore((s) => s.reload)
   const refreshModelOwnership = useExtensionsStore((s) => s.refreshModelOwnership)
@@ -206,7 +243,10 @@ export default function ModelsPage(): JSX.Element {
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   const allExtensions: AnyExtension[] = useMemo(
-    () => [...modelExtensions, ...processExtensions],
+    () => [...modelExtensions, ...processExtensions].sort((a, b) => {
+      if (a.builtin !== b.builtin) return a.builtin ? -1 : 1
+      return a.name.localeCompare(b.name)
+    }),
     [modelExtensions, processExtensions],
   )
 
@@ -331,15 +371,34 @@ export default function ModelsPage(): JSX.Element {
 
   // ── Node install / download controls ──────────────────────────────────────
 
-  function handleInstallNode(node: ExtensionNode, fullId: string) {
-    if (!node.hfRepo) return
-    setDownloading((prev) => ({ ...prev, [fullId]: { ...(prev[fullId] ?? { percent: 0 }), paused: false, status: 'Starting…' } }))
-    window.electron.model.download(node.hfRepo!, fullId, node.hfSkipPrefixes, node.hfIncludePrefixes).then((result: { success: boolean; paused?: boolean; cancelled?: boolean }) => {
-      if (!result.success && !result.paused && !result.cancelled) {
-        setGhErr('Download failed')
-        setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
-      }
+  async function handleInstallNode(node: ExtensionNode, fullId: string) {
+    setDownloadFailures((prev) => {
+      const next = { ...prev }
+      delete next[fullId]
+      return next
     })
+    setDownloading((prev) => ({
+      ...prev,
+      [fullId]: { ...(prev[fullId] ?? {}), percent: prev[fullId]?.percent ?? 0, status: 'preparing', paused: false },
+    }))
+
+    const result = await requestModelNodeDownload(node, fullId, window.electron.model)
+    if (result.success) return
+
+    setDownloading((prev) => {
+      const next = { ...prev }
+      delete next[fullId]
+      return next
+    })
+    setDownloadFailures((prev) => ({
+      ...prev,
+      [fullId]: result.failure ?? {
+        code: 'download_failed',
+        stage: 'download',
+        message: result.error ?? 'Model asset download failed.',
+        retryable: true,
+      },
+    }))
   }
 
   function handleInstallAll(ext: AnyExtension) {
@@ -354,17 +413,41 @@ export default function ModelsPage(): JSX.Element {
 
   async function handlePauseDownload(fullId: string) {
     setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: { ...prev[fullId], paused: true, status: 'Pausing…' } }) : prev)
-    await window.electron.model.pauseDownload(fullId)
+    if (!hasDownloadControls(window.electron.model)) {
+      setGhErr('Pause is unavailable in this build.')
+      setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: { ...prev[fullId], paused: false, status: prev[fullId].status } }) : prev)
+      return
+    }
+
+    const result = await window.electron.model.pauseDownload(fullId)
+    if (!result.success) {
+      setGhErr(result.error ?? 'Could not pause download.')
+      setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: { ...prev[fullId], paused: false } }) : prev)
+    }
   }
 
   async function handleCancelDownload(fullId: string) {
-    setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
-    await window.electron.model.cancelDownload(fullId)
+    if (!hasDownloadControls(window.electron.model)) {
+      setGhErr('Cancel is unavailable in this build.')
+      return
+    }
+
+    const result = await window.electron.model.cancelDownload(fullId)
+    if (!result.success) {
+      setGhErr(result.error ?? 'Could not cancel download.')
+      return
+    }
+
+    setDownloading((prev) => {
+      const next = { ...prev }
+      delete next[fullId]
+      return next
+    })
   }
 
   async function handleUninstallNode(fullId: string) {
     await window.electron.model.delete(fullId)
-    refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
+    await refreshModelOwnership()
   }
 
   // ── GitHub extension install ───────────────────────────────────────────────
@@ -387,11 +470,17 @@ export default function ModelsPage(): JSX.Element {
   // ── Local extension install ──────────────────────────────────────────
 
   async function handleLocalInstall() {
+    if (!hasLocalInstall(window.electron.extensions)) {
+      setGhErr('Local folder linking is unavailable in this build.')
+      return
+    }
+
     setGhErr(null)
     clearInstall()
-    const result = await installFromLocal()
-    if ('cancelled' in result && result.cancelled) return   // user dismissed dialog
+    const result = await window.electron.extensions.installFromLocal()
+    if (result.cancelled) return
     if (!result.success) setGhErr(result.error ?? 'Installation failed')
+    else await reloadExtensions()
   }
 
   // ── Uninstall extension ──────────────────────────────────────────
@@ -491,11 +580,18 @@ export default function ModelsPage(): JSX.Element {
   const cardHandlers = {
     installedIds: installedVariantIds,
     downloading,
-    disabled: isBusy,
+    downloadFailures,
+    ownershipStateById,
+    runtimeReadinessById,
+    disabled: extensionActionsDisabled,
     onInstall: handleInstallNode,
     onInstallAll: handleInstallAll,
     onPauseDownload: handlePauseDownload,
     onCancelDownload: handleCancelDownload,
+    onUninstallNode: handleUninstallNode,
+    onUninstall: openUninstallModal,
+    onRepaired: reloadExtensions,
+    onRuntimeReadinessAction: dispatchRuntimeReadinessAction,
     onOpen: (ext: AnyExtension) => setSelectedId(ext.id),
   }
 
@@ -529,12 +625,12 @@ export default function ModelsPage(): JSX.Element {
             </svg>
             {showGHForm ? 'Cancel' : 'Install from GitHub'}
           </button>
-          <button
-            onClick={handleLocalInstall}
-            disabled={isInstalling}
-            title="Link a local extension folder"
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-[9px] text-xs font-medium border border-zinc-700/60 bg-white/[0.025] text-zinc-200 hover:bg-white/[0.06] hover:border-zinc-600 transition-colors whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-          >
+              <button
+                onClick={handleLocalInstall}
+                disabled={isInstalling || !hasLocalInstall(window.electron.extensions)}
+                title="Link a local extension folder"
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-[9px] text-xs font-medium border border-zinc-700/60 bg-white/[0.025] text-zinc-200 hover:bg-white/[0.06] hover:border-zinc-600 transition-colors whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
+              >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className="opacity-85">
               <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
             </svg>
@@ -771,56 +867,8 @@ export default function ModelsPage(): JSX.Element {
               <ExtensionCard
                 key={ext.id}
                 ext={ext}
-                installedIds={installedVariantIds}
-                downloading={downloading}
-                downloadFailures={downloadFailures}
-                ownershipStateById={ownershipStateById}
-                runtimeReadinessById={runtimeReadinessById}
-                disabled={extensionActionsDisabled}
-                loadError={
-                  loadErrors[ext.id] ??
-                  ext.nodes.map((n) => loadErrors[`${ext.id}/${n.id}`]).find(Boolean)
-                }
-                onInstall={async (node: ExtensionNode, fullId: string) => {
-                  setDownloadFailures((prev) => {
-                    const next = { ...prev }
-                    delete next[fullId]
-                    return next
-                  })
-                  setDownloading((prev) => ({
-                    ...prev,
-                    [fullId]: { percent: 0, status: 'preparing' },
-                  }))
-
-                  const result = await requestModelNodeDownload(
-                    node,
-                    fullId,
-                    window.electron.model,
-                  )
-                  if (!result.success) {
-                    setDownloading((prev) => {
-                      const next = { ...prev }
-                      delete next[fullId]
-                      return next
-                    })
-                    setDownloadFailures((prev) => ({
-                      ...prev,
-                      [fullId]: result.failure ?? {
-                        code: 'download_failed',
-                        stage: 'download',
-                        message: result.error ?? 'Model asset download failed.',
-                        retryable: true,
-                      },
-                    }))
-                  }
-                }}
-                onUninstallNode={async (fullId: string) => {
-                  await window.electron.model.delete(fullId)
-                  await refreshModelOwnership()
-                }}
-                onUninstall={(extId) => openUninstallModal(extId)}
-                onRepaired={() => reloadExtensions()}
-                onRuntimeReadinessAction={dispatchRuntimeReadinessAction}
+                loadError={extLoadError(ext)}
+                {...cardHandlers}
               />
             ))}
           </div>
@@ -834,7 +882,7 @@ export default function ModelsPage(): JSX.Element {
           installedIds={installedVariantIds}
           downloading={downloading}
           loadError={extLoadError(selectedExt)}
-          disabled={isBusy}
+          disabled={extensionActionsDisabled}
           onInstall={handleInstallNode}
           onInstallAll={handleInstallAll}
           onPauseDownload={handlePauseDownload}

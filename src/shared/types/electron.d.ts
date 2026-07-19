@@ -186,6 +186,10 @@ export interface ModelExtension {
   source?:      string
   nodes:        ExtensionNode<ModelInputKind>[]
   workflowNodes?: ExtensionWorkflowNode[]
+  /** Folder exists but is not a loadable extension — see manifestError */
+  corrupted?:   boolean
+  /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */
+  manifestError?: 'missing' | 'invalid' | 'incomplete'
 }
 
 export type WorkflowPickerIntent = 'image' | 'mesh' | 'directory' | 'save-path' | 'generic-file'
@@ -288,6 +292,10 @@ export interface ProcessExtension {
   entry:        string
   nodes:        ExtensionNode<ArtifactKind>[]
   workflowNodes?: ExtensionWorkflowNode[]
+  /** Folder exists but is not a loadable extension — see manifestError */
+  corrupted?:   boolean
+  /** Why the folder is corrupted: manifest gone, manifest unparseable, or install never completed */
+  manifestError?: 'missing' | 'invalid' | 'incomplete'
 }
 
 export type AnyExtension = ModelExtension | ProcessExtension

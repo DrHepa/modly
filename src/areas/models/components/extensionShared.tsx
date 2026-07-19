@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionNode } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ProcessPort } from '@shared/types/electron.d'
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -77,7 +77,7 @@ export function TypePill({ type }: { type: 'model' | 'process' }): JSX.Element {
 }
 
 export function IOBadge({ node }: { node: ExtensionNode }): JSX.Element {
-  const inputs = node.inputs?.length ? node.inputs : [node.input]
+  const inputs = node.inputs?.length ? node.inputs.map(formatInputBadgeLabel) : [node.input]
   return (
     <span className="flex items-center gap-1 font-mono text-[10px] text-zinc-600 shrink-0">
       {inputs.map((inp, i) => (
@@ -89,6 +89,11 @@ export function IOBadge({ node }: { node: ExtensionNode }): JSX.Element {
       <span className="px-1.5 py-0.5 rounded-[5px] bg-white/5 text-zinc-400">{node.output}</span>
     </span>
   )
+}
+
+function formatInputBadgeLabel(port: ProcessPort): string {
+  const portName = port.label ?? port.name
+  return portName === port.type ? portName : `${portName}:${port.type}`
 }
 
 const LED_TONES = {

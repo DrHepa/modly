@@ -21,6 +21,7 @@ test('runtime workflow entrypoints use workflowRunStore instead of useWorkflowRu
 
   assert.match(workflowPanelSource, /workflowRunStore/)
   assert.doesNotMatch(workflowPanelSource, /useWorkflowRunner/)
+  assert.doesNotMatch(workflowPanelSource, /validateWorkflowProcessRun/)
 
   assert.match(extensionNodeSource, /workflowRunStore/)
   assert.doesNotMatch(extensionNodeSource, /useWorkflowRunner/)
@@ -145,13 +146,21 @@ test('actual store keeps Wait source traversal and audio routing for named and p
   assert.equal(calls[2].input.filePath, '/workspace/result.glb')
 })
 
-test('actual store rejects missing and duplicate required named bindings before IPC', async () => {
+test('actual store rejects missing named data but dispatches duplicate edges without semantic gating', async () => {
   for (const edges of [[], [edge('a', 'run', 'coarse'), edge('b', 'run', 'coarse')]]) {
     const { store, calls } = storeFixture()
     await store.getState().run(workflow([node('a', 'meshNode', { filePath: '/a.glb' }), node('b', 'meshNode', { filePath: '/b.glb' }), node('run', 'extensionNode')], edges), [extension('run', [{ name: 'coarse', type: 'mesh' }])])
-    assert.equal(store.getState().runState.status, 'error')
-    assert.match(store.getState().runState.error, /missing|multiple/)
-    assert.equal(calls.length, 0)
+    if (edges.length === 0) {
+      assert.equal(store.getState().runState.status, 'error')
+      assert.match(store.getState().runState.error, /Required port "coarse" has no input data/)
+      assert.equal(calls.length, 0)
+    } else {
+      assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
+      assert.equal(calls.length, 1)
+      assert.deepEqual(calls[0].input, {
+        nodeId: 'run', inputs: { coarse: { type: 'mesh', sourceNodeId: 'b', filePath: '/b.glb' } },
+      })
+    }
   }
 })
 

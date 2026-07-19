@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { build } from 'esbuild'
@@ -13,6 +14,7 @@ const landmarkOwner: CheckpointOwner = { nodeId: 'landmarks-node', runId: 'run',
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const workflowPanelEntry = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
+const workflowPanelSource = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 
 async function loadWorkflowPanelModule() {
   const result = await build({
@@ -336,7 +338,15 @@ test('WorkflowRunFeedback keeps validation copy and explains unsupported capabil
     isRunning: false,
   })
 
-  assert.match(validationHtml, /Required port &quot;prompt&quot; is missing\./i)
+  assert.equal(validationHtml, '')
+})
+
+test('WorkflowPanel source keeps Generate ungated by semantic run validation', async () => {
+  const source = await readFile(workflowPanelSource, 'utf8')
+
+  assert.doesNotMatch(source, /validateWorkflowProcessRun/)
+  assert.doesNotMatch(source, /hasRunValidationIssue/)
+  assert.match(source, /WorkflowRunFeedback[\s\S]*runState=\{runState\}[\s\S]*runValidationIssue=\{null\}[\s\S]*isRunning=\{isRunning\}/)
 })
 
 test('ArtifactHistoryDisclosure is a collapsed secondary Wait checkpoint entry by default', async () => {
@@ -509,7 +519,6 @@ test('resolveWorkflowRunPrimaryAction exposes enabled Continue for completed pau
       validity: { valid: true, missing: [] },
       canContinue: true,
     } },
-    hasRunValidationIssue: false,
   })
 
   assert.deepEqual(action, {
@@ -537,7 +546,6 @@ test('resolveWorkflowRunPrimaryAction keeps paused incomplete landmarks actionab
       validity: { valid: false, missing: ['left_knee', 'right_knee'] },
       canContinue: false,
     } },
-    hasRunValidationIssue: false,
   })
 
   assert.deepEqual(action, {

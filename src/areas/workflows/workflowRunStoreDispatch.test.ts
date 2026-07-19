@@ -46,6 +46,66 @@ let useWorldsSceneStore: typeof import('../worlds/worldsSceneStore.ts').useWorld
 let useWorkflowRunStore: WorkflowRunStore
 let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
+test('workflowRunStore ignores disabled siblings and still runs an active inputless model', async () => {
+  const activeExt = createWorkflowExtension({
+    id: 'sense/open-image',
+    extensionId: 'sense',
+    nodeId: 'open-image',
+    type: 'model',
+    input: 'none',
+    output: 'image',
+  })
+  const disabledExt = createWorkflowExtension({
+    id: 'disabled/requires-image',
+    extensionId: 'disabled',
+    nodeId: 'requires-image',
+    type: 'model',
+    input: 'image',
+    output: 'mesh',
+    inputs: [{ name: 'image', type: 'image', required: true }],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-disabled-sibling',
+    name: 'Disabled sibling',
+    description: '',
+    nodes: [
+      createNode('active-model', 'extensionNode', { extensionId: activeExt.id, enabled: true, params: {} }),
+      createNode('disabled-model', 'extensionNode', { extensionId: disabledExt.id, enabled: false, params: {} }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-active-output', source: 'active-model', target: 'output-node' },
+      { id: 'edge-disabled-input', source: 'active-model', target: 'disabled-model', targetHandle: 'image' },
+    ],
+    createdAt: '2026-07-17T00:00:00.000Z',
+    updatedAt: '2026-07-17T00:00:00.000Z',
+  }
+  const postCalls: string[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls.push(path)
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-disabled-sibling' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-disabled-sibling')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.png', output_kind: 'image' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [activeExt, disabledExt])
+
+  assert.deepEqual(postCalls, ['/generate/from-none'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(runProcessCalls.length, 0)
+})
+
 let fsReadCalls: string[]
 let iteratorFileNames: string[]
 let workspaceDir: string
@@ -1093,7 +1153,7 @@ test('workflowRunStore blocks Animate Rigged Mesh when node motion prompt is emp
   assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
   assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required motion prompt input for extension kimodo\/animate-rigged-mesh/)
 })
-test('workflowRunStore rejects stale named mesh handles instead of authorizing a single-mesh fallback', async () => {
+test('workflowRunStore ignores stale named mesh handles without authorizing a single-mesh fallback', async () => {
   const ext = createKimodoAnimateExtension()
   const workflow = createTextMeshWorkflow({
     node: createNode('animate-node', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
@@ -1101,13 +1161,15 @@ test('workflowRunStore rejects stale named mesh handles instead of authorizing a
   })
   const posts = captureTextRequests()
   await useWorkflowRunStore.getState().run(workflow, [ext])
-  assert.equal(posts.length, 0)
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
+  assert.equal(posts.length, 1)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  const params = posts[0].params as Record<string, unknown>
+  assert.equal(Object.hasOwn(params, 'rigged_mesh_path'), false)
+  assert.equal(Object.hasOwn(params, 'mesh_path'), false)
   assert.deepEqual(humanoidPromotionReadCalls, [])
 })
 
-test('workflowRunStore blocks animate-rigged-mesh before generation when rigged mesh is missing', async () => {
+test('workflowRunStore still dispatches animate-rigged-mesh when rigged mesh is missing', async () => {
   const ext = createWorkflowExtension({
     id: 'kimodo/animate-rigged-mesh',
     extensionId: 'kimodo-soma-rp',
@@ -1128,29 +1190,43 @@ test('workflowRunStore blocks animate-rigged-mesh before generation when rigged 
     }),
     includeMeshEdge: false,
   })
-  let postCalls = 0
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
   let getCalls = 0
 
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
   axiosClientMock = {
-    async post(path: string) {
-      postCalls += 1
-      throw new Error(`Unexpected axios.post call: ${path}`)
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown> })
+      assert.equal(path, '/generate/from-text')
+      return { data: { job_id: 'job-animate-without-rigged-mesh' } }
     },
     async get(path: string) {
       getCalls += 1
-      throw new Error(`Unexpected axios.get call: ${path}`)
+      assert.equal(path, '/generate/status/job-animate-without-rigged-mesh')
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
     },
   }
 
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
-  assert.equal(postCalls, 0)
-  assert.equal(getCalls, 0)
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.equal(
-    useWorkflowRunStore.getState().runState.error,
-    'Error: Missing required rigged_mesh mesh input for extension kimodo/animate-rigged-mesh',
-  )
+  assert.equal(postCalls.length, 1)
+  assert.equal(getCalls, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      motion_prompt: 'Walk forward',
+    },
+  })
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 for (const [workspace, filePath, expected] of [
@@ -1178,7 +1254,7 @@ for (const [workspace, filePath, expected] of [
 }
 
 for (const wrongKind of [false, true]) {
-  test(`required named mesh uses typed Wait sources before image reads or HTTP (${wrongKind})`, async () => {
+  test(`named mesh only transports typed Wait sources without required-mesh gating (${wrongKind})`, async () => {
     const ext = createNamedTextMeshModelExtension()
     const workflow = createTextMeshWorkflow({ node: createExtensionNode(ext.id) })
     if (wrongKind) workflow.nodes[1].type = 'imageNode'
@@ -1190,26 +1266,32 @@ for (const wrongKind of [false, true]) {
     await useWorkflowRunStore.getState().run(workflow, [ext])
     assert.equal(posts.length, 0)
     await useWorkflowRunStore.getState().continueRun('wait')
-    assert.equal(posts.length, wrongKind ? 0 : 1)
-    assert.equal(useWorkflowRunStore.getState().runState.status, wrongKind ? 'error' : 'done')
-    if (wrongKind) assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
-    else assert.equal((posts[0].params as Record<string, unknown>).rigged_mesh_path, 'rigs/avatar.glb')
+    assert.equal(posts.length, 1)
+    assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+    const params = posts[0].params as Record<string, unknown>
+    if (wrongKind) {
+      assert.equal(Object.hasOwn(params, 'rigged_mesh_path'), false)
+      assert.equal(Object.hasOwn(params, 'mesh_path'), false)
+    } else assert.equal(params.rigged_mesh_path, 'rigs/avatar.glb')
     assert.deepEqual(fsReadCalls, [])
     assert.equal(runProcessCalls.length, 0)
   })
 }
 
-test('omitted required defaults to true and validates mesh before the image MODEL reads its front', async () => {
+test('MODEL reads its front and dispatches without required-mesh metadata gating', async () => {
   const ext = createNamedImageModelExtension({ inputs: [{ name: 'front', type: 'image' }, { name: 'rigged_mesh', type: 'mesh' }] })
   const workflow = createMultiInputWorkflow({ node: createExtensionNode(ext.id), imageSources: [
     { id: 'front', filePath: '/front.png', targetHandle: 'front' },
   ] })
   const posts = captureImageRequests()
   await useWorkflowRunStore.getState().run(workflow, [ext])
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh mesh input/)
-  assert.equal(posts.length, 0)
-  assert.deepEqual(fsReadCalls, [])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(posts.length, 1)
+  assert.equal((posts[0].get('image') as File).name, 'front.png')
+  const params = JSON.parse(String(posts[0].get('params')))
+  assert.equal(Object.hasOwn(params, 'rigged_mesh_path'), false)
+  assert.equal(Object.hasOwn(params, 'mesh_path'), false)
+  assert.deepEqual(fsReadCalls, ['/front.png'])
 })
 
 test('optional mesh and prompt permit omission and retain falsy/unknown parameters', async () => {
@@ -2708,7 +2790,13 @@ for (const route of ['preview', 'wrong-handle', 'competing-mesh', 'unrelated-tex
     else assert.equal(waitCheckpointReviewState(), undefined)
     await useWorkflowRunStore.getState().continueRun('wait-node')
     if (route === 'wrong-handle') {
-      assert.equal(posts.length, 0); assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required rigged_mesh/)
+      assert.equal(posts.length, 1)
+      assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+      const params = posts[0].params as Record<string, unknown>
+      for (const key of ['rigged_mesh_path', 'mesh_path', 'humanoid_input_status', 'humanoid_promotion_sidecar_path']) {
+        assert.equal(Object.hasOwn(params, key), false)
+      }
+      assert.deepEqual(humanoidPromotionReadCalls, [])
     } else {
       const params = posts[0].params as any
       assert.equal(params.humanoid_input_status, route === 'preview' ? 'manual_confirmed' : undefined)
@@ -3312,7 +3400,7 @@ for (const name of ['__proto__', 'constructor', 'toString', 'normal']) {
     await useWorkflowRunStore.getState().run(workflow, [ext])
     assert.equal(runProcessCalls.length, 0)
     assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-    assert.ok(useWorkflowRunStore.getState().runState.error?.includes(`Required port "${name}" is missing.`))
+    assert.ok(useWorkflowRunStore.getState().runState.error?.includes(`Required port "${name}" has no input data.`))
   })
 }
 
@@ -3478,7 +3566,7 @@ test('shouldUsePreviousNodeFallback disables positional fallback only for inputl
   assert.equal(shouldUsePreviousNodeFallback('scene'), true)
 })
 
-test('workflowRunStore fails stale incoming edges into inputless models with an actionable runtime error', async () => {
+test('workflowRunStore ignores incoming edges for inputless models and still runs them as sources', async () => {
   const ext = createWorkflowExtension({
     id: 'gaussiangpt/generate',
     extensionId: 'gaussiangpt',
@@ -3501,10 +3589,25 @@ test('workflowRunStore fails stale incoming edges into inputless models with an 
     updatedAt: '2026-07-12T00:00:00.000Z',
   }
 
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-inputless-ignores-edge' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-inputless-ignores-edge')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.scene.json', output_kind: 'scene' } }
+    },
+  }
+
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /declares input "none" and cannot accept incoming edges/i)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore fails when actual generation output kind mismatches the declared model output and does not route it', async () => {

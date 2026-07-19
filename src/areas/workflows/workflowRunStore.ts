@@ -1,6 +1,5 @@
 import { buildProcessExecutionInput } from './processExecution'
 import { getPositionalInputTypes, getProcessTargetPorts, hasNamedProcessInputs } from './processPorts'
-import { validateWorkflowProcessRun } from './processConnectionRules'
 import { create } from 'zustand'
 import axios, { AxiosInstance } from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
@@ -59,6 +58,7 @@ export interface WorkflowCheckpoint {
   landmarkCapture?: WorkflowLandmarkSession
   landmarkSidecar?: LandmarkSidecarLineageMetadata
 }
+import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from './workflowActiveGraph.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ function isIterator(type: string | undefined): boolean {
 /** True for nodes the runner executes (and can re-run inside a loop body). */
 function isExecutable(node: WFNode): boolean {
   if (isIterator(node.type)) return true
-  return node.type === 'extensionNode' && !!node.data.enabled
+  return node.type === 'extensionNode' && node.data.enabled !== false
 }
 
 /** Absolute, alphabetically-sorted paths of an iterator's files (listFiles sorts). */
@@ -597,38 +597,6 @@ function consumesLandmarks(ext: WorkflowExtension): boolean {
   return [ext.extensionId, ext.nodeId].some((id) => /(?:^|[-_/])(unirig|uni-rig|rig-mesh|rig_mesh)(?:$|[-_/])/.test(id))
 }
 
-// ─── Topological sort (DFS preorder, branch-first) ───────────────────────────
-
-function topoSort(nodes: WFNode[], edges: WFEdge[]): WFNode[] {
-  const nodeMap = new Map(nodes.map((n) => [n.id, n]))
-  const adj     = new Map(nodes.map((n) => [n.id, [] as string[]]))
-  const inDeg   = new Map(nodes.map((n) => [n.id, 0]))
-  for (const e of edges) {
-    if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) continue
-    adj.get(e.source)!.push(e.target)
-    inDeg.set(e.target, (inDeg.get(e.target) ?? 0) + 1)
-  }
-
-  const visited = new Set<string>()
-  const result: WFNode[] = []
-
-  const visit = (id: string): void => {
-    if (visited.has(id)) return
-    for (const e of edges) {
-      if (e.target === id && !visited.has(e.source) && nodeMap.has(e.source)) return
-    }
-    const node = nodeMap.get(id)
-    if (!node) return
-    visited.add(id)
-    result.push(node)
-    for (const childId of adj.get(id) ?? []) visit(childId)
-  }
-
-  for (const node of nodes) if ((inDeg.get(node.id) ?? 0) === 0) visit(node.id)
-  for (const node of nodes) if (!visited.has(node.id)) visit(node.id)
-  return result
-}
-
 // ─── While container geometry ──────────────────────────────────────────────────
 // Body membership can't rely on parentId alone: React Flow only assigns it when a
 // node is dragged into the container, so a While resized around existing nodes (or
@@ -673,7 +641,7 @@ function identifyBranches(workflow: Workflow): {
   parentWait:      Map<string, string | null>
   ordered:         WFNode[]
 } {
-  const ordered = topoSort(workflow.nodes, workflow.edges)
+  const ordered = topoSortWorkflowNodes(workflow.nodes, workflow.edges)
   const nodeMap = new Map(workflow.nodes.map((n) => [n.id, n]))
   const waitIds = ordered.filter((n) => isBranchStarter(n.type)).map((n) => n.id)
 
@@ -782,9 +750,6 @@ async function executeExtensionNode(
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
   const isInputless = mode === 'model' && ext.input === 'none'
-  if (isInputless && incomingEdges.length > 0) {
-    throw new Error(`Model ${ext.id} declares input "none" and cannot accept incoming edges. Remove incoming edges and run it as a source node.`)
-  }
   const positionalInputs = !isInputless ? getPositionalInputTypes(ext) : undefined
   const hasNamedInputs = ext?.type === 'process' && hasNamedProcessInputs(ext.inputs)
   const scenePositional = mode === 'process' && !hasNamedInputs
@@ -858,11 +823,6 @@ async function executeExtensionNode(
       if (!meshPorts.some((port) => port.name === edge.targetHandle)) continue
       const src = resolveSource(edge.source)
       if (src?.outputType === 'mesh' && src.filePath?.trim()) meshPaths.set(edge.targetHandle!, src.filePath)
-    }
-    for (const port of meshPorts) {
-      if (port.required !== false && !meshPaths.has(port.name)) {
-        throw new Error(`Missing required ${port.name} mesh input for extension ${ext.id}`)
-      }
     }
     // A declared prompt port owns its connected text (including blank values).
     // Legacy text models and unrelated named/mixed declarations keep their ABI.
@@ -1050,8 +1010,6 @@ async function executeExtensionNode(
       nodeId: ext.nodeId,
     }
     if (hasNamedInputs || scenePositional) {
-      const issue = validateWorkflowProcessRun({ nodes: workflow.nodes, edges: workflow.edges, allExtensions, targetNodeId: node.id })
-      if (issue) throw new Error(issue.message)
       for (const port of getProcessTargetPorts(ext!)) {
         const name = port.name ?? 'input-0'
         const value = processInput.inputs && Object.hasOwn(processInput.inputs, name) ? processInput.inputs[name] : undefined
@@ -1355,6 +1313,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     pausedGroup:      [],
 
     async run(workflow, allExtensions, overrideImageData?) {
+      const activeGraph = deriveActiveWorkflowGraph(workflow.nodes, workflow.edges)
+      workflow = { ...workflow, ...activeGraph }
       // Snapshot a legitimate Current Mesh before clearing the previous job.
       // A disposable checkpoint preview is not an input to the next workflow.
       const startingJob = useAppStore.getState().currentJob
@@ -1509,8 +1469,9 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
         const nodeOutputs = new Map<string, NodeOutput>()
 
-        // Pre-populate source nodes
+        // Pre-populate only source nodes used by the active graph.
         for (const node of ordered) {
+          if (!workflow.edges.some((edge) => edge.source === node.id)) continue
           if (node.type === 'imageNode') {
             const fp = node.data.params?.filePath as string | undefined
             const resolvedPath = overrideImageData ? undefined : (fp ?? selectedImagePath ?? undefined)

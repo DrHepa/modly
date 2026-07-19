@@ -26,7 +26,6 @@ import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
   resolveProcessConnectionSource,
   validateProcessConnection,
-  validateWorkflowProcessRun,
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
 import { useWorkflowRunStore } from './workflowRunStore'
@@ -987,12 +986,7 @@ function WorkflowCanvasInner({
 
   const canUndo = histIdx > 0
   const canRedo = histIdx < historyRef.current.length - 1
-  const runValidationIssue = useMemo(() => validateWorkflowProcessRun({
-    nodes: toWorkflowNodes(nodes),
-    edges: toWorkflowEdges(edges),
-    allExtensions,
-  }), [nodes, edges, allExtensions])
-  const activeValidationIssue = connectionIssue ?? runValidationIssue
+  const activeValidationIssue = connectionIssue
 
   const appendValidatedEdge = useCallback((connection: Connection, nextNodes = toWorkflowNodes(nodes)) => {
     const issue = validateProcessConnection({
@@ -1002,10 +996,7 @@ function WorkflowCanvasInner({
       allExtensions,
     })
 
-    if (issue) {
-      setConnectionIssue(issue)
-      return false
-    }
+    if (issue) setConnectionIssue(issue)
 
     setConnectionIssue(null)
     setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
@@ -1295,17 +1286,12 @@ function WorkflowCanvasInner({
 
   const handleRun = useCallback(() => {
     if (isRunning) { cancel(); return }
-    if (runValidationIssue) { setConnectionIssue(runValidationIssue); return }
-    if (preflightIssues.length > 0) {
-      showToast(preflightIssues[0].message)
-      return
-    }
     // Drop the pending debounce — this save supersedes it.
     if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; flushSaveRef.current = null }
     const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     saveAndClaim(wf)
     runWorkflow(wf, allExtensions)
-  }, [workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel, preflightIssues, showToast, runValidationIssue])
+  }, [workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel])
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -1382,12 +1368,11 @@ function WorkflowCanvasInner({
           {/* Run / Stop */}
           <button
             onClick={handleRun}
-            disabled={!isRunning && Boolean(runValidationIssue)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors
               ${isRunning
                 ? 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20 hover:border-red-500/50'
                 : 'bg-accent/10 border-accent/30 text-accent-light hover:bg-accent/20 hover:border-accent/50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent/10 disabled:hover:border-accent/30'}`}
-            title={!isRunning && runValidationIssue ? runValidationIssue.message : 'Run workflow'}
+            title="Run workflow"
           >
             {isRunning ? (
               <>

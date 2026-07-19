@@ -12,10 +12,10 @@ import { useNavStore }         from '@shared/stores/navStore'
 import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
 import { useWaitButton } from '@areas/workflows/useWaitButton'
 import { buildAllWorkflowExtensions, getWorkflowExtension } from '@areas/workflows/mockExtensions'
-import { validateWorkflowPreflight } from '@areas/workflows/preflight'
 import { mimeFromPath } from '@areas/workflows/nodes/imageUtils'
 import type { WorkflowExtension } from '@areas/workflows/mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from '@areas/workflows/workflowActiveGraph'
 import WorkflowParamControl from '@areas/workflows/components/WorkflowParamControl'
 import { isWorkflowParamVisible, resolveWorkflowParamValues } from '@areas/workflows/components/workflowParamControlState'
 import { isMissingWeightVariant, withWeightVariantAvailability } from '@shared/utils/weightVariants'
@@ -47,29 +47,6 @@ const TYPE_COLOR: Record<string, string> = {
 const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function topoSortNodes(nodes: Workflow['nodes'], edges: Workflow['edges']): WFNode[] {
-  const nodeMap  = new Map(nodes.map((n) => [n.id, n]))
-  const inDegree = new Map(nodes.map((n) => [n.id, 0]))
-  const adj      = new Map(nodes.map((n) => [n.id, [] as string[]]))
-  for (const e of edges) {
-    if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) continue
-    adj.get(e.source)!.push(e.target)
-    inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1)
-  }
-  const queue  = nodes.filter((n) => (inDegree.get(n.id) ?? 0) === 0)
-  const result: WFNode[] = []
-  while (queue.length > 0) {
-    const node = queue.shift()!
-    result.push(node)
-    for (const neighbor of adj.get(node.id) ?? []) {
-      const deg = (inDegree.get(neighbor) ?? 0) - 1
-      inDegree.set(neighbor, deg)
-      if (deg === 0) queue.push(nodeMap.get(neighbor)!)
-    }
-  }
-  return result
-}
 
 type WorkflowRunErrorCopy = {
   title: string
@@ -179,7 +156,6 @@ export function resolveWorkflowRunPrimaryAction(input: {
   runState: Pick<WorkflowRunState, 'status'>
   checkpoint?: WorkflowPanelCheckpoint
   canContinue: boolean
-  hasRunValidationIssue: boolean
 }): WorkflowRunPrimaryAction {
   const session = input.checkpoint?.landmarkCapture
   if (session && input.checkpoint) {
@@ -189,7 +165,8 @@ export function resolveWorkflowRunPrimaryAction(input: {
   if (input.runState.status === 'running' || input.runState.status === 'paused') {
     return { kind: 'stop', label: 'Stop', disabled: false }
   }
-  return { kind: 'generate', label: 'Generate 3D Model', disabled: input.hasRunValidationIssue }
+
+  return { kind: 'generate', label: 'Generate 3D Model', disabled: false }
 }
 
 export function resolveWorkflowRunLandmarkClearAction(input: {
@@ -234,7 +211,6 @@ export function WorkflowRunFooter({
   landmarkClearAction,
   landmarkError,
   runState,
-  runValidationIssue,
   isRunning,
   onGenerate,
   onCancel,
@@ -245,7 +221,6 @@ export function WorkflowRunFooter({
   landmarkClearAction?: WorkflowRunLandmarkClearAction
   landmarkError?: string
   runState: WorkflowRunState
-  runValidationIssue: { message: string } | null
   isRunning: boolean
   onGenerate: () => void
   onCancel: () => void
@@ -261,7 +236,7 @@ export function WorkflowRunFooter({
 
   return (
     <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
-      <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
+      <WorkflowRunFeedback runState={runState} runValidationIssue={null} isRunning={isRunning} />
       {primaryAction.kind === 'continue-landmarks' && landmarkError && (
         <p role="alert" className="px-2.5 py-1.5 rounded-md bg-red-950/40 border border-red-800/50 text-[10px] text-red-300 leading-relaxed">
           {landmarkError}
@@ -332,7 +307,6 @@ export function resolveWorkflowRunErrorCopy(error?: string): WorkflowRunErrorCop
 
 export function WorkflowRunFeedback({
   runState,
-  runValidationIssue,
   isRunning,
 }: {
   runState: WorkflowRunState
@@ -356,18 +330,6 @@ export function WorkflowRunFeedback({
         </div>
       )
     }
-  }
-
-  if (runValidationIssue && !isRunning) {
-    return (
-      <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-red-950/40 border border-red-800/50">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
-          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-        </svg>
-        <span className="text-[10px] text-red-400 font-medium">{runValidationIssue.message}</span>
-      </div>
-    )
   }
 
   return null
@@ -988,8 +950,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- debounce on editable state; latest workflow read in the timeout
   }, [nodes, edges])
 
-  const currentMeshUrl = useAppStore((s) => s.currentJob?.outputUrl)
-  const showToast = useAppStore((s) => s.showToast)
   const { runState, run, cancel, continueRun, clearLandmarks } = useWorkflowRunStore()
   const checkpoint = useWorkflowRunStore((s) => s.activeCheckpointNodeId ? s.checkpoints[s.activeCheckpointNodeId] : undefined)
   const { canContinue } = useWaitButton(checkpoint?.owner.nodeId ?? '')
@@ -1003,17 +963,15 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- react to run completion; nodes/updateNodeData read at that point
   }, [runState.status, runState.outputUrl])
 
-  const preflightIssues = useMemo(() => {
-    const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
-    return validateWorkflowPreflight(wf, allExtensions, { currentMeshUrl })
-  }, [workflow, nodes, edges, allExtensions, currentMeshUrl])
-
-  const firstPreflightIssue = preflightIssues[0]?.message ?? null
+  const activeGraph = useMemo(() => deriveActiveWorkflowGraph(
+    toWorkflowNodes(nodes),
+    toWorkflowEdges(edges),
+  ), [nodes, edges])
 
   // Ordered nodes for params list — only those marked showInGenerate
   const sortedNodes = useMemo(
-    () => topoSortNodes(toWorkflowNodes(nodes), toWorkflowEdges(edges)),
-    [nodes, edges],
+    () => topoSortWorkflowNodes(activeGraph.nodes, activeGraph.edges),
+    [activeGraph],
   )
 
   const paramNodes = sortedNodes.filter((n) =>
@@ -1022,10 +980,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   )
 
   const handleGenerate = useCallback(() => {
-    if (firstPreflightIssue) {
-      showToast(firstPreflightIssue)
-      return
-    }
     // Persist the edited params so they survive remounts and are the values actually used.
     // Drop the pending debounce — this save supersedes it.
     if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
@@ -1037,13 +991,12 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     }
     saveAndClaim(wf)
     run(wf, allExtensions)
-  }, [firstPreflightIssue, nodes, edges, workflow, allExtensions, run, showToast, saveAndClaim])
+  }, [nodes, edges, workflow, allExtensions, run, saveAndClaim])
 
   const primaryAction = resolveWorkflowRunPrimaryAction({
     runState,
     checkpoint,
     canContinue,
-    hasRunValidationIssue: Boolean(firstPreflightIssue),
   })
   const landmarkClearAction = resolveWorkflowRunLandmarkClearAction({ checkpoint, canContinue })
 
@@ -1097,7 +1050,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
         landmarkClearAction={landmarkClearAction}
         landmarkError={checkpoint?.landmarkCapture?.nodeId === checkpoint?.owner.nodeId ? checkpoint?.landmarkCapture?.error : undefined}
         runState={runState}
-        runValidationIssue={preflightIssues[0] ?? null}
         isRunning={isRunning}
         onGenerate={handleGenerate}
         onCancel={cancel}

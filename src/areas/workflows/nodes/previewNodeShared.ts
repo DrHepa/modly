@@ -10,7 +10,19 @@ export const PREVIEW_VIDEO_EMPTY_COPY = 'Connect a video to preview.'
 
 type PreviewEdge = {
   source: string
+  sourceHandle?: string | null
   target: string
+}
+
+function resolvePreviewOutput(incomingEdge: PreviewEdge | undefined, nodeOutputs: Record<string, string>): string | undefined {
+  if (!incomingEdge) {
+    return undefined
+  }
+
+  const outputKey = incomingEdge.sourceHandle
+    ? `${incomingEdge.source}::output::${incomingEdge.sourceHandle}`
+    : incomingEdge.source
+  return nodeOutputs[outputKey]
 }
 
 type ResolvePreviewImageUrlArgs = {
@@ -40,7 +52,7 @@ export function normalizePreviewImageUrl({ imageUrl, apiUrl }: NormalizePreviewI
 export function resolvePreviewImageUrl({ nodeId, apiUrl, edges, nodeImageOutputs }: ResolvePreviewImageUrlArgs): string | undefined {
   const incomingEdge = edges.find((edge) => edge.target === nodeId)
   return normalizePreviewImageUrl({
-    imageUrl: incomingEdge ? nodeImageOutputs[incomingEdge.source] : undefined,
+    imageUrl: resolvePreviewOutput(incomingEdge, nodeImageOutputs),
     apiUrl,
   })
 }
@@ -72,7 +84,7 @@ export function normalizePreviewVideoUrl({ videoUrl, apiUrl }: NormalizePreviewV
 export function resolvePreviewVideoUrl({ nodeId, apiUrl, edges, nodeVideoOutputs }: ResolvePreviewVideoUrlArgs): string | undefined {
   const incomingEdge = edges.find((edge) => edge.target === nodeId)
   return normalizePreviewVideoUrl({
-    videoUrl: incomingEdge ? nodeVideoOutputs[incomingEdge.source] : undefined,
+    videoUrl: resolvePreviewOutput(incomingEdge, nodeVideoOutputs),
     apiUrl,
   })
 }

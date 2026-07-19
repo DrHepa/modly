@@ -54,6 +54,33 @@ test('resolvePreviewImageUrl returns the upstream image output for the first inc
   assert.equal(imageUrl, 'http://127.0.0.1:8000/workspace/first.png')
 })
 
+test('resolvePreviewImageUrl routes a named secondary output by sourceHandle', () => {
+  const imageUrl = resolvePreviewImageUrl({
+    nodeId: 'preview-image',
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'model-node', sourceHandle: 'depth', target: 'preview-image' }],
+    nodeImageOutputs: {
+      'model-node': '/workspace/primary.png',
+      'model-node::output::depth': '/workspace/depth.png',
+    },
+  })
+
+  assert.equal(imageUrl, 'http://127.0.0.1:8000/workspace/depth.png')
+})
+
+test('resolvePreviewImageUrl does not fall back to the anonymous primary for a named output', () => {
+  const imageUrl = resolvePreviewImageUrl({
+    nodeId: 'preview-image',
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'model-node', sourceHandle: 'depth', target: 'preview-image' }],
+    nodeImageOutputs: {
+      'model-node': '/workspace/primary.png',
+    },
+  })
+
+  assert.equal(imageUrl, undefined)
+})
+
 test('resolvePreviewImageUrl preserves non-workspace upstream outputs without apiUrl', () => {
   const imageUrl = resolvePreviewImageUrl({
     nodeId: 'preview-image',
@@ -115,4 +142,18 @@ test('resolvePreviewVideoUrl returns the upstream video output for the first inc
   })
 
   assert.equal(videoUrl, 'http://127.0.0.1:8000/workspace/video/generated.mp4')
+})
+
+test('resolvePreviewVideoUrl routes a named secondary output by sourceHandle', () => {
+  const videoUrl = resolvePreviewVideoUrl({
+    nodeId: 'preview-video',
+    apiUrl: 'http://127.0.0.1:8000',
+    edges: [{ source: 'model-node', sourceHandle: 'preview_clip', target: 'preview-video' }],
+    nodeVideoOutputs: {
+      'model-node': '/workspace/video/primary.mp4',
+      'model-node::output::preview_clip': '/workspace/video/preview-clip.mp4',
+    },
+  })
+
+  assert.equal(videoUrl, 'http://127.0.0.1:8000/workspace/video/preview-clip.mp4')
 })

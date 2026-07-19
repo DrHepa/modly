@@ -2,13 +2,22 @@ import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 import type { WorkflowExtension } from './mockExtensions'
-import { getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
+import { getExtensionSourcePort, getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
 import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
+import { deriveActiveWorkflowGraph } from './workflowActiveGraph.ts'
 
 type ArtifactType = ArtifactKind
 
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+
+function asArtifactKind(value: string | undefined): ArtifactKind | undefined {
+  return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
+    ? value as ArtifactKind
+    : undefined
+}
+
 type ProcessRulePhase = 'connect' | 'run'
-type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target'
+type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target' | 'min-items' | 'max-items'
 
 export type ProcessConnectionRuleIssue = {
   phase: ProcessRulePhase
@@ -21,6 +30,8 @@ export type ProcessConnectionRuleIssue = {
   actualType?: ArtifactType
   sourceNodeId?: string
   edgeIds?: string[]
+  minItems?: number
+  maxItems?: number
 }
 
 type ValidationContext = {
@@ -44,19 +55,35 @@ function getExtensionForNode(node: WFNode | undefined, allExtensions: WorkflowEx
   return allExtensions.find((extension) => extension.id === extensionId)
 }
 
-function resolveNodeOutputType(node: WFNode | undefined, allExtensions: WorkflowExtension[]): ArtifactType | undefined {
+export function resolveEffectiveWorkflowIoContract(
+  node: WFNode | undefined,
+  extension: WorkflowExtension | undefined,
+): WFNode['data']['ioContract'] {
+  return node?.data.ioContract ?? extension?.ioContract
+}
+
+function resolveNodeOutputType(
+  node: WFNode | undefined,
+  allExtensions: WorkflowExtension[],
+  sourceHandle?: string | null,
+): ArtifactType | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
 
-  return getExtensionForNode(node, allExtensions)?.output
+  const extension = getExtensionForNode(node, allExtensions)
+  if (!extension) return undefined
+  if (extension.type !== 'model') return extension.output
+  if (resolveEffectiveWorkflowIoContract(node, extension) !== 'named-v1') return extension.output
+  return asArtifactKind(getExtensionSourcePort(extension, sourceHandle)?.type)
 }
 
 function getPortAwareTargetExtension(node: WFNode | undefined, allExtensions: WorkflowExtension[]): WorkflowExtension | undefined {
   const extension = getExtensionForNode(node, allExtensions)
-  if (!extension || extension.type !== 'process') return undefined
+  if (!extension) return undefined
+  if (extension.type === 'model' && resolveEffectiveWorkflowIoContract(node, extension) !== 'named-v1') return undefined
   if (!Array.isArray(extension.inputs) || extension.inputs.length === 0) return undefined
   return extension
 }
@@ -83,6 +110,20 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
     }
   }
 
+  if (issue.code === 'min-items') {
+    return {
+      ...issue,
+      message: `Port "${issue.portName}" requires at least ${issue.minItems} connections.`,
+    }
+  }
+
+  if (issue.code === 'max-items') {
+    return {
+      ...issue,
+      message: `Port "${issue.portName}" accepts at most ${issue.maxItems} connections.`,
+    }
+  }
+
   return {
     ...issue,
     message: issue.phase === 'connect'
@@ -92,80 +133,21 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
 }
 
 export function validateProcessConnection({ connection, nodes, edges, allExtensions }: ConnectionValidationContext): ProcessConnectionRuleIssue | null {
-  const targetNode = getNodeById(nodes, connection.target)
-  if (!targetNode) return null
-
-  const targetExtension = getExtensionForNode(targetNode, allExtensions)
-  if (targetExtension?.input === 'none') {
-    return createIssue({
-      phase: 'connect',
-      code: 'inputless-target',
-      targetNodeId: targetNode.id,
-      targetHandle: connection.targetHandle ?? null,
-      portName: null,
-      sourceNodeId: connection.source ?? undefined,
-    })
-  }
-
-  const previewTargetKind = previewNodeTargetArtifactKind(targetNode.type)
-  if (previewTargetKind) {
-    const actualType = resolveNodeOutputType(getNodeById(nodes, connection.source), allExtensions)
-    if (actualType && actualType !== previewTargetKind) {
-      return createIssue({
-        phase: 'connect',
-        code: 'type-mismatch',
-        targetNodeId: targetNode.id,
-        targetHandle: connection.targetHandle ?? null,
-        portName: previewTargetKind,
-        expectedType: previewTargetKind,
-        actualType,
-        sourceNodeId: connection.source ?? undefined,
-      })
-    }
-    return null
-  }
-
-  const portAwareTargetExtension = getPortAwareTargetExtension(targetNode, allExtensions)
-  if (!portAwareTargetExtension) return null
-
-  const targetPort = getProcessTargetPort(portAwareTargetExtension, connection.targetHandle)
-  if (!targetPort) return null
-
-  const duplicateEdges = edges.filter((edge) => edge.target === targetNode.id && edge.targetHandle === targetPort.name)
-  if (duplicateEdges.length > 0) {
-    return createIssue({
-      phase: 'connect',
-      code: 'duplicate-port',
-      targetNodeId: targetNode.id,
-      targetHandle: targetPort.name,
-      portName: targetPort.name,
-      edgeIds: duplicateEdges.map((edge) => edge.id),
-    })
-  }
-
-  const actualType = resolveNodeOutputType(getNodeById(nodes, connection.source), allExtensions)
-  if (actualType && actualType !== targetPort.type) {
-    return createIssue({
-      phase: 'connect',
-      code: 'type-mismatch',
-      targetNodeId: targetNode.id,
-      targetHandle: targetPort.name,
-      portName: targetPort.name,
-      expectedType: targetPort.type,
-      actualType,
-      sourceNodeId: connection.source ?? undefined,
-    })
-  }
-
+  void connection
+  void nodes
+  void edges
+  void allExtensions
   return null
 }
 
 export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: ValidationContext): ProcessConnectionRuleIssue | null {
-  for (const node of nodes) {
+  const activeGraph = deriveActiveWorkflowGraph(nodes, edges)
+
+  for (const node of activeGraph.nodes) {
     const previewTargetKind = previewNodeTargetArtifactKind(node.type)
     if (previewTargetKind) {
-      const previewEdge = edges.find((edge) => edge.target === node.id)
-      const actualType = resolveNodeOutputType(getNodeById(nodes, previewEdge?.source), allExtensions)
+      const previewEdge = activeGraph.edges.find((edge) => edge.target === node.id)
+      const actualType = resolveNodeOutputType(getNodeById(activeGraph.nodes, previewEdge?.source), allExtensions, previewEdge?.sourceHandle)
       if (actualType && actualType !== previewTargetKind) {
         return createIssue({
           phase: 'run',
@@ -183,7 +165,7 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: Vali
 
     const targetExtension = getExtensionForNode(node, allExtensions)
     if (targetExtension?.input === 'none') {
-      const illegalEdges = edges.filter((edge) => edge.target === node.id)
+      const illegalEdges = activeGraph.edges.filter((edge) => edge.target === node.id)
       if (illegalEdges.length > 0) {
         return createIssue({
           phase: 'run',
@@ -200,11 +182,11 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: Vali
     const extension = getPortAwareTargetExtension(node, allExtensions)
     if (!extension) continue
 
-    const targetEdges = edges.filter((edge) => edge.target === node.id)
+    const targetEdges = activeGraph.edges.filter((edge) => edge.target === node.id)
 
     for (const port of getProcessTargetPorts(extension)) {
       const portEdges = targetEdges.filter((edge) => edge.targetHandle === port.name)
-      if (portEdges.length > 1) {
+      if (!port.multiple && portEdges.length > 1) {
         return createIssue({
           phase: 'run',
           code: 'duplicate-port',
@@ -215,28 +197,56 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: Vali
         })
       }
 
-      if (port.required && portEdges.length === 0) {
+      if (port.multiple && portEdges.length > (port.maxItems ?? 1)) {
+        return createIssue({
+          phase: 'run',
+          code: 'max-items',
+          targetNodeId: node.id,
+          targetHandle: port.name,
+          portName: port.name,
+          maxItems: port.maxItems ?? 1,
+          edgeIds: portEdges.map((edge) => edge.id),
+        })
+      }
+
+      if (port.multiple && portEdges.length < (port.minItems ?? 1)) {
+        const expectedType = asArtifactKind(port.type)
+        return createIssue({
+          phase: 'run',
+          code: 'min-items',
+          targetNodeId: node.id,
+          targetHandle: port.name,
+          portName: port.name,
+          minItems: port.minItems ?? 1,
+          ...(expectedType ? { expectedType } : {}),
+          edgeIds: portEdges.map((edge) => edge.id),
+        })
+      }
+
+      if (!port.multiple && port.required && portEdges.length === 0) {
+        const expectedType = asArtifactKind(port.type)
         return createIssue({
           phase: 'run',
           code: 'missing-required-port',
           targetNodeId: node.id,
           targetHandle: port.name,
           portName: port.name,
-          expectedType: port.type,
+          ...(expectedType ? { expectedType } : {}),
         })
       }
 
-      if (portEdges.length === 1) {
-        const sourceNode = getNodeById(nodes, portEdges[0].source)
-        const actualType = resolveNodeOutputType(sourceNode, allExtensions)
+      for (const edge of portEdges) {
+        const sourceNode = getNodeById(activeGraph.nodes, edge.source)
+        const actualType = resolveNodeOutputType(sourceNode, allExtensions, edge.sourceHandle)
         if (actualType && actualType !== port.type) {
+          const expectedType = asArtifactKind(port.type)
           return createIssue({
             phase: 'run',
             code: 'type-mismatch',
             targetNodeId: node.id,
             targetHandle: port.name,
             portName: port.name,
-            expectedType: port.type,
+            ...(expectedType ? { expectedType } : {}),
             actualType,
             sourceNodeId: sourceNode?.id,
           })

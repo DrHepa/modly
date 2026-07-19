@@ -40,6 +40,7 @@ import {
 } from './workflowArtifacts.ts'
 import { resolveSceneSourceManifest } from './workflowSceneSource.ts'
 import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
+import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from './workflowActiveGraph.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -770,358 +771,6 @@ export function buildModelGenerationRequest(args: {
   }
 }
 
-// ─── Topological sort ─────────────────────────────────────────────────────────
-
-function topoSort(nodes: WFNode[], edges: WFEdge[]): WFNode[] {
-  const nodeMap = new Map(nodes.map((n) => [n.id, n]))
-  const adj     = new Map(nodes.map((n) => [n.id, [] as string[]]))
-  const inDeg   = new Map(nodes.map((n) => [n.id, 0]))
-  for (const e of edges) {
-    if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) continue
-    adj.get(e.source)!.push(e.target)
-    inDeg.set(e.target, (inDeg.get(e.target) ?? 0) + 1)
-  }
-
-  const visited = new Set<string>()
-  const result: WFNode[] = []
-
-  const visit = (id: string): void => {
-    if (visited.has(id)) return
-    for (const e of edges) {
-      if (e.target === id && !visited.has(e.source) && nodeMap.has(e.source)) return
-    }
-    const node = nodeMap.get(id)
-    if (!node) return
-    visited.add(id)
-    result.push(node)
-    for (const childId of adj.get(id) ?? []) visit(childId)
-  }
-
-  for (const node of nodes) if ((inDeg.get(node.id) ?? 0) === 0) visit(node.id)
-  for (const node of nodes) if (!visited.has(node.id)) visit(node.id)
-  return result
-}
-
-// ─── While container geometry ──────────────────────────────────────────────────
-// Body membership can't rely on parentId alone: React Flow only assigns it when a
-// node is dragged into the container, so a While resized around existing nodes (or
-// nodes added by palette click) leaves them unparented. We therefore also test
-// on-canvas containment at run time.
-
-interface WhileBounds { x: number; y: number; w: number; h: number }
-
-function nodeSize(n: WFNode): { w: number; h: number } {
-  const measured = (n as { measured?: { width?: number; height?: number } }).measured
-  const styleW = n.style?.width
-  const styleH = n.style?.height
-  return {
-    w: measured?.width  ?? n.width  ?? (typeof styleW === 'number' ? styleW : 200),
-    h: measured?.height ?? n.height ?? (typeof styleH === 'number' ? styleH : 80),
-  }
-}
-
-function whileBounds(w: WFNode): WhileBounds {
-  const s = nodeSize(w)
-  return { x: w.position.x, y: w.position.y, w: s.w, h: s.h }
-}
-
-function isInsideWhile(n: WFNode, whileId: string, b: WhileBounds): boolean {
-  if (n.parentId === whileId) return true
-  if (n.parentId) return false   // explicit child of another container
-  const s = nodeSize(n)
-  const cx = n.position.x + s.w / 2
-  const cy = n.position.y + s.h / 2
-  return cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h
-}
-
-// ─── Branch identification ────────────────────────────────────────────────────
-// A node belongs to Wait W's branch if its single nearest upstream Wait is W
-// (dominance). Nodes with no upstream Wait — or with multiple (merges) — execute
-// in the pre-phase before any user pause.
-
-function identifyBranches(workflow: Workflow): {
-  preExecExtNodes: WFNode[]
-  branches:        Map<string, WFNode[]>
-  waitIds:         string[]
-  parentWait:      Map<string, string | null>
-  ordered:         WFNode[]
-} {
-  const ordered = topoSort(workflow.nodes, workflow.edges)
-  const nodeMap = new Map(workflow.nodes.map((n) => [n.id, n]))
-  const waitIds = ordered.filter((n) => isBranchStarter(n.type)).map((n) => n.id)
-
-  // A node is owned by its single nearest upstream Wait (dominance). This lets
-  // Wait → … → Wait chains nest: nodes after the 2nd Wait belong to it, not the 1st.
-  const branchOwner = new Map<string, string>()
-  for (const node of workflow.nodes) {
-    if (isBranchStarter(node.type) || !isExecutable(node)) continue
-    const nearest = nearestUpstreamWaits(node.id, workflow.edges, nodeMap)
-    if (nearest.size === 1) branchOwner.set(node.id, [...nearest][0])
-  }
-
-  // Each Wait's parent = its own nearest upstream Wait (null if top-level).
-  const parentWait = new Map<string, string | null>()
-  for (const w of waitIds) {
-    const nearest = nearestUpstreamWaits(w, workflow.edges, nodeMap)
-    parentWait.set(w, nearest.size === 1 ? [...nearest][0] : null)
-  }
-
-  const branches = new Map<string, WFNode[]>()
-  for (const w of waitIds) branches.set(w, [])
-  const preExecExtNodes: WFNode[] = []
-  for (const node of ordered) {
-    if (!isExecutable(node)) continue
-    const owner = branchOwner.get(node.id)
-    if (owner) branches.get(owner)!.push(node)
-    else preExecExtNodes.push(node)
-  }
-
-  return { preExecExtNodes, branches, waitIds, parentWait, ordered }
-}
-
-// ─── For Each iterator execution ───────────────────────────────────────────────
-// Emits the current iteration's file. Image iterators emit an image path; text
-// iterators read the file and emit its text. The iteration index comes from the
-// loop's progress (its own node id keys the loop).
-
-async function executeIteratorNode(
-  node:        WFNode,
-  ctx:         RunContext,
-  setRunState: (updater: (s: WorkflowRunState) => WorkflowRunState) => void,
-): Promise<void> {
-  const files   = ctx.iteratorFiles.get(node.id) ?? []
-  const current = useWorkflowRunStore.getState().whileProgress[node.id]?.current ?? 1
-  const path    = files[current - 1]
-  if (!path) throw new Error('For Each: no file for this iteration')
-
-  const kind = iteratorConfig(node)
-  const name = path.split(/[\\/]/).pop()
-  setRunState((s) => ({ ...s, blockProgress: 30, blockStep: `Reading ${name}` }))
-
-  if (kind.outputType === 'text') {
-    const text = await readTextFile(path)
-    ctx.nodeOutputs.set(node.id, { text, outputType: 'text' })
-  } else {
-    ctx.nodeOutputs.set(node.id, { filePath: path, outputType: kind.outputType })
-  }
-  setRunState((s) => ({ ...s, blockProgress: 100, blockStep: `Loaded ${name}` }))
-}
-
-// ─── Per-node execution ──────────────────────────────────────────────────────
-// Resolves inputs (walking through Wait passthroughs), runs the extension
-// (model or process), updates nodeOutputs, and pushes the mesh to the scene
-// if it feeds an Add-to-Scene through Waits.
-
-async function executeExtensionNode(
-  node:        WFNode,
-  ctx:         RunContext,
-  setRunState: (updater: (s: WorkflowRunState) => WorkflowRunState) => void,
-): Promise<void> {
-  if (isIterator(node.type)) {
-    await executeIteratorNode(node, ctx, setRunState)
-    return
-  }
-
-  const { workflow, allExtensions, client, workspaceDir, nodeOutputs, nodeMap,
-          selectedImagePath, selectedImageData } = ctx
-
-  const ext = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
-  // Freshest params at the moment the node starts (so loop iterations / Retry pick
-  // up edits made while paused, not the values captured at run start).
-  const liveParams = _liveParams.current.get(node.id) ?? node.data.params ?? {}
-
-  const resolveSource = (sourceId: string): NodeOutput | undefined => {
-    const realId = resolveDataSource(sourceId, workflow.edges, nodeMap)
-    return realId ? nodeOutputs.get(realId) : undefined
-  }
-
-  let nodeInputPath:     string | undefined
-  let nodeInputText:     string | undefined
-  let nodeInputMeshPath: string | undefined
-  // Per-slot texts for multi-text-input nodes (e.g. positive/negative prompts).
-  // Indexed by target handle: input-0 → texts[0], input-1 → texts[1].
-  const nodeInputTexts: (string | undefined)[] = []
-
-  const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
-
-  if (ext?.inputs && ext.inputs.length > 1) {
-    for (const edge of incomingEdges) {
-      const src = resolveSource(edge.source)
-      if (!src) continue
-      if (src.outputType === 'mesh')        nodeInputMeshPath = src.filePath
-      else if (src.outputType === 'image')  nodeInputPath     = src.filePath
-      else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
-      if (src.text !== undefined && src.text.trim().length > 0) {
-        nodeInputText = src.text
-        const slot = /^input-(\d+)$/.exec(edge.targetHandle ?? '')
-        if (slot) nodeInputTexts[Number(slot[1])] = src.text
-      }
-    }
-  } else {
-    for (const edge of incomingEdges) {
-      const src = resolveSource(edge.source)
-      if (src?.filePath !== undefined) nodeInputPath = src.filePath
-      if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
-    }
-  }
-
-  const isModelNode = ext?.type === 'model'
-
-  if (isModelNode) {
-    const isTextInput = ext?.inputs ? ext.inputs.every((i) => i === 'text') : ext?.input === 'text'
-    const activeImagePath = isTextInput ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isTextInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
-      throw new Error('No input image selected for model node')
-    }
-
-    let blob: Blob
-    let fname: string
-    if (isTextInput || (selectedImageData && nodeInputPath === undefined)) {
-      const base64 = selectedImageData && nodeInputPath === undefined
-        ? selectedImageData
-        : 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' // 1x1 transparent PNG
-      fname = 'placeholder.png'
-      blob = new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else {
-      const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
-      const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-      blob = new Blob([bytes], { type: 'image/png' })
-      fname = activeImagePath?.split(/[\\/]/).pop() ?? 'image.png'
-    }
-
-    const extraParams: Record<string, unknown> = {}
-    if (nodeInputMeshPath) {
-      const norm = nodeInputMeshPath.replace(/\\/g, '/')
-      extraParams.mesh_path = norm.startsWith(workspaceDir)
-        ? norm.slice(workspaceDir.length).replace(/^\//, '')
-        : norm
-    }
-    if (nodeInputText !== undefined && nodeInputText.trim().length > 0) {
-      extraParams.prompt = nodeInputText
-      extraParams.text   = nodeInputText
-    }
-
-    const schemaDefaults = Object.fromEntries(
-      (ext.params ?? []).map((p) => [p.id, p.default]),
-    )
-    const effectiveParams = { ...schemaDefaults, ...liveParams }
-
-    const fd = new FormData()
-    fd.append('image', blob, fname)
-    fd.append('model_id', node.data.extensionId ?? '')
-    fd.append('collection', 'Workflows')
-    fd.append('remesh', 'none')
-    fd.append('enable_texture', 'false')
-    fd.append('texture_resolution', '1024')
-    fd.append('params', JSON.stringify({ ...effectiveParams, ...extraParams }))
-
-    setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
-
-    const { data } = await client.post<{ job_id: string }>(
-      '/generate/from-image', fd,
-      { headers: { 'Content-Type': 'multipart/form-data' } },
-    )
-    _activeJobId.current = data.job_id
-
-    while (true) {
-      if (_cancel.current) {
-        await client.post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
-        _activeJobId.current = null
-        throw new Error('Cancelled')
-      }
-      await new Promise((r) => setTimeout(r, 1200))
-
-      const { data: st } = await client.get<{
-        status: string; progress?: number; step?: string; output_url?: string; error?: string
-      }>(`/generate/status/${_activeJobId.current}`)
-
-      if (st.status === 'done' && st.output_url) {
-        const rel = st.output_url.replace(/^\/workspace\//, '')
-        nodeInputPath = `${workspaceDir}/${rel}`
-        _activeJobId.current = null
-        setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Generation complete' }))
-        break
-      }
-      if (st.status === 'error') throw new Error(st.error ?? 'Generation failed')
-
-      setRunState((s) => ({ ...s, blockProgress: st.progress ?? s.blockProgress, blockStep: st.step ?? 'Generating…' }))
-      useAppStore.getState().updateCurrentJob({ status: 'generating', progress: st.progress, step: st.step })
-    }
-  } else {
-    if (ext?.input === 'mesh'  && !nodeInputPath) throw new Error(`${ext.name} needs an incoming mesh connection`)
-    if (ext?.input === 'image' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming image connection`)
-    if (ext?.input === 'audio' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming audio connection`)
-    if (ext?.input === 'text'  && !nodeInputText) throw new Error(`${ext.name} needs an incoming text connection`)
-
-    const parts  = (node.data.extensionId ?? '').split('/')
-    const extId  = parts[0]
-    const nid    = parts[1] ?? ''
-    const result = await window.electron.extensions.runProcess(
-      extId,
-      {
-        filePath: nodeInputPath,
-        text:     nodeInputText,
-        texts:    nodeInputTexts.length > 0 ? nodeInputTexts : undefined,
-        nodeId:   nid,
-      },
-      liveParams as Record<string, unknown>,
-    )
-    if (!result.success) throw new Error(result.error ?? 'Process extension failed')
-    nodeInputPath = result.result?.filePath ?? nodeInputPath
-    nodeInputText = result.result?.text     ?? nodeInputText
-    setRunState((s) => ({ ...s, blockProgress: 100, blockStep: 'Done' }))
-  }
-
-  const outputType = ext?.output ?? (nodeInputPath ? 'mesh' : undefined)
-  nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
-
-  const output = nodeOutputs.get(node.id)
-  const url = isSceneMeshOutput(output) ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
-  if (url && reachesSceneOutput(node.id, workflow.edges, nodeMap)) {
-    ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
-    useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
-  }
-}
-
-// ─── Wait dependency helpers ───────────────────────────────────────────────────
-
-/** All Waits nested (transitively) under `rootId`, via the parentWait chain. */
-function descendantWaits(rootId: string, ctx: RunContext): Set<string> {
-  const out = new Set<string>()
-  let frontier = new Set<string>([rootId])
-  while (frontier.size > 0) {
-    const next = new Set<string>()
-    for (const w of ctx.waitIds) {
-      const parent = ctx.parentWait.get(w)
-      if (parent && frontier.has(parent) && !out.has(w)) { out.add(w); next.add(w) }
-    }
-    frontier = next
-  }
-  return out
-}
-
-/**
- * Push the mesh of every scene output owned by `waitId`'s branch to the viewer.
- * A branch whose only scene output has no in-branch processing (e.g. Wait → Add
- * to Scene) gets no immediate push during execution, so the display has to be
- * driven here, when the user continues that branch.
- */
-function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
-  for (const node of ctx.ordered) {
-    if (!isSceneOutput(node.type)) continue
-    const owners = nearestUpstreamWaits(node.id, ctx.workflow.edges, ctx.nodeMap)
-    if (owners.size !== 1 || [...owners][0] !== waitId) continue
-    const inEdge = ctx.workflow.edges.find((e) => e.target === node.id)
-    if (!inEdge) continue
-    const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap)
-    const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
-    const url = isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
-    if (url) {
-      ctx.lastSceneMesh = url
-      useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
-    }
-  }
-}
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 
@@ -1175,9 +824,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
     const appState     = useAppStore.getState()
     const apiUrl       = appState.apiUrl
-    const ordered      = topoSort(workflow.nodes, workflow.edges)
+    const activeGraph  = deriveActiveWorkflowGraph(workflow.nodes, workflow.edges)
+    const ordered      = topoSortWorkflowNodes(activeGraph.nodes, activeGraph.edges)
     const execNodes    = ordered.filter((n) =>
-      (n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode') && n.data.enabled,
+      n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode',
     )
 
     const selectedImagePath = appState.selectedImagePath ?? ''
@@ -1388,7 +1038,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       const indexOf = new Map(preExecExtNodes.map((n, i) => [n.id, i]))
 
         const node = execNodes[i]
-        const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
+        const incomingEdges = activeGraph.edges.filter((e) => e.target === node.id)
 
         // ── Built-in Wait-like checkpoints are not external extensions ─────────────
         // Keep them ahead of workflow dispatch so built-ins with no extensionId do not
@@ -1424,7 +1074,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             ? createLandmarkSession({ workflowId: workflow.id, nodeId: node.id, targetArtifact: inputArtifact })
             : undefined
           const humanoidTarget = !isLandmarksCheckpoint && inputArtifact?.kind === 'mesh'
-            ? resolveWaitCheckpointHumanoidTarget({ nodeId: node.id, edges: workflow.edges, nodes: workflow.nodes, allExtensions })
+            ? resolveWaitCheckpointHumanoidTarget({ nodeId: node.id, edges: activeGraph.edges, nodes: activeGraph.nodes, allExtensions })
             : undefined
 
           let waitCheckpointReview: WaitCheckpointReviewState | undefined
@@ -1557,11 +1207,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
-        if (ext.input === 'none' && incomingEdges.length > 0) {
-          throw new Error(
-            `Model ${ext.id} declares input "none" and cannot accept incoming edges. Remove incoming edges and run it as a source node.`,
-          )
-        }
         const hydratedParams = hydrateWorkflowNodeParams(ext, node.data.params as Record<string, unknown> | undefined)
         const artifactProvenance = {
           workflowId: workflow.id,
@@ -1631,11 +1276,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
         const routedMeshParams: Record<string, string> = {}
         if (modelMeshRouting.applies) {
-          for (const requiredPort of modelMeshRouting.requiredPorts) {
-            if (!modelMeshRouting.routed.get(requiredPort)) {
-              throw new Error(`Missing required ${requiredPort} mesh input for extension ${ext.id}`)
-            }
-          }
           const riggedMeshPath = modelMeshRouting.routed.get('rigged_mesh')
           if (riggedMeshPath) {
             const normalized = normalizeWorkflowPath(riggedMeshPath, workspaceDir)
@@ -1749,8 +1389,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         } else {
           const processInput = buildProcessExecutionInput({
             node,
-            nodes: workflow.nodes,
-            edges: workflow.edges,
+            nodes: activeGraph.nodes,
+            edges: activeGraph.edges,
             allExtensions,
             nodeOutputs,
             previousNodeOutput: i > 0 ? nodeOutputs.get(execNodes[i - 1].id) : undefined,
@@ -1782,7 +1422,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         if (
           norm?.startsWith(workspaceDir) &&
           outputType === 'mesh' &&
-          workflow.edges.some((e) => e.source === node.id && addToSceneNodeIds.has(e.target))
+          activeGraph.edges.some((e) => e.source === node.id && addToSceneNodeIds.has(e.target))
         ) {
           useAppStore.getState().updateCurrentJob({
             status:    'done',
@@ -1793,7 +1433,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
         }
         if (norm?.startsWith(workspaceDir)) {
           const outputUrl = `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
-          if (workflow.edges.some((e) => e.source === node.id && addToWorldsNodeIds.has(e.target))) {
+          if (activeGraph.edges.some((e) => e.source === node.id && addToWorldsNodeIds.has(e.target))) {
             await addWorkflowOutputUrlToWorlds(outputUrl, outputType)
           }
         }
@@ -1823,7 +1463,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
       // Use the last scene output node in topo order — its predecessor is the final scene mesh.
       const outputNodeDef = [...ordered].reverse().find((n) => sceneOutputNodeIds.has(n.id))
       if (outputNodeDef) {
-        for (const edge of workflow.edges.filter((e) => e.target === outputNodeDef.id)) {
+        for (const edge of activeGraph.edges.filter((e) => e.target === outputNodeDef.id)) {
           const src = nodeOutputs.get(edge.source)
           if (src?.filePath) {
             artifact = nodeArtifacts.get(edge.source)

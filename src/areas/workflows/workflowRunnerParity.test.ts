@@ -21,6 +21,7 @@ test('runtime workflow entrypoints use workflowRunStore instead of useWorkflowRu
 
   assert.match(workflowPanelSource, /workflowRunStore/)
   assert.doesNotMatch(workflowPanelSource, /useWorkflowRunner/)
+  assert.doesNotMatch(workflowPanelSource, /validateWorkflowProcessRun/)
 
   assert.match(extensionNodeSource, /workflowRunStore/)
   assert.doesNotMatch(extensionNodeSource, /useWorkflowRunner/)

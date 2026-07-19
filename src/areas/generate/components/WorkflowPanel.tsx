@@ -16,7 +16,7 @@ import type { WorkflowExtension } from '@areas/workflows/mockExtensions'
 import ChatPanel from './ChatPanel'
 
 type PanelMode = 'basic' | 'chat'
-import { validateWorkflowProcessRun } from '@areas/workflows/processConnectionRules'
+import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from '@areas/workflows/workflowActiveGraph'
 import AdvancedOptionsSection from '@areas/workflows/components/AdvancedOptionsSection'
 import WorkflowParamControl from '@areas/workflows/components/WorkflowParamControl'
 import { partitionAdvancedParams } from '@areas/workflows/workflowParamSchema'
@@ -47,29 +47,6 @@ const TYPE_COLOR: Record<string, string> = {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function topoSortNodes(nodes: Workflow['nodes'], edges: Workflow['edges']): WFNode[] {
-  const nodeMap  = new Map(nodes.map((n) => [n.id, n]))
-  const inDegree = new Map(nodes.map((n) => [n.id, 0]))
-  const adj      = new Map(nodes.map((n) => [n.id, [] as string[]]))
-  for (const e of edges) {
-    if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) continue
-    adj.get(e.source)!.push(e.target)
-    inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1)
-  }
-  const queue  = nodes.filter((n) => (inDegree.get(n.id) ?? 0) === 0)
-  const result: WFNode[] = []
-  while (queue.length > 0) {
-    const node = queue.shift()!
-    result.push(node)
-    for (const neighbor of adj.get(node.id) ?? []) {
-      const deg = (inDegree.get(neighbor) ?? 0) - 1
-      inDegree.set(neighbor, deg)
-      if (deg === 0) queue.push(nodeMap.get(neighbor)!)
-    }
-  }
-  return result
-}
 
 function mimeFromPath(p: string): string {
   const ext = p.split('.').pop()?.toLowerCase() ?? ''
@@ -183,7 +160,6 @@ export function resolveWorkflowRunPrimaryAction(input: {
   runState: Pick<WorkflowRunState, 'status' | 'blockStep' | 'substitutionPoint'>
   activeNodeId: string | null
   landmarkSession?: WorkflowPanelLandmarkSession
-  hasRunValidationIssue: boolean
 }): WorkflowRunPrimaryAction {
   const pausedLandmarksNodeId = input.runState.status === 'paused' && input.runState.blockStep === 'Paused — mark required landmarks'
     ? input.runState.substitutionPoint?.nodeId
@@ -201,7 +177,7 @@ export function resolveWorkflowRunPrimaryAction(input: {
     return { kind: 'stop', label: 'Stop', disabled: false }
   }
 
-  return { kind: 'generate', label: 'Generate 3D Model', disabled: input.hasRunValidationIssue }
+  return { kind: 'generate', label: 'Generate 3D Model', disabled: false }
 }
 
 export function resolveWorkflowRunLandmarkClearAction(input: {
@@ -248,7 +224,6 @@ export function WorkflowRunFooter({
   primaryAction,
   landmarkClearAction,
   runState,
-  runValidationIssue,
   isRunning,
   onGenerate,
   onCancel,
@@ -258,7 +233,6 @@ export function WorkflowRunFooter({
   primaryAction: WorkflowRunPrimaryAction
   landmarkClearAction?: WorkflowRunLandmarkClearAction
   runState: WorkflowRunState
-  runValidationIssue: { message: string } | null
   isRunning: boolean
   onGenerate: () => void
   onCancel: () => void
@@ -274,7 +248,7 @@ export function WorkflowRunFooter({
 
   return (
     <div className="shrink-0 px-4 pt-3 pb-4 border-t border-zinc-800 flex flex-col gap-2">
-      <WorkflowRunFeedback runState={runState} runValidationIssue={runValidationIssue} isRunning={isRunning} />
+      <WorkflowRunFeedback runState={runState} runValidationIssue={null} isRunning={isRunning} />
       <button
         onClick={() => executeWorkflowRunPrimaryAction(primaryAction, handlers)}
         disabled={primaryAction.disabled}
@@ -361,18 +335,6 @@ export function WorkflowRunFeedback({
         </div>
       )
     }
-  }
-
-  if (runValidationIssue && !isRunning) {
-    return (
-      <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-red-950/40 border border-red-800/50">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
-          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-        </svg>
-        <span className="text-[10px] text-red-400 font-medium">{runValidationIssue.message}</span>
-      </div>
-    )
   }
 
   return null
@@ -956,16 +918,15 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- react to run completion; nodes/updateNodeData read at that point
   }, [runState.status, runState.outputUrl])
 
-  const runValidationIssue = useMemo(() => validateWorkflowProcessRun({
-    nodes: toWorkflowNodes(nodes),
-    edges: toWorkflowEdges(edges),
-    allExtensions,
-  }), [nodes, edges, allExtensions])
+  const activeGraph = useMemo(() => deriveActiveWorkflowGraph(
+    toWorkflowNodes(nodes),
+    toWorkflowEdges(edges),
+  ), [nodes, edges])
 
   // Ordered nodes for params list — only those marked showInGenerate
   const sortedNodes = useMemo(
-    () => topoSortNodes(toWorkflowNodes(nodes), toWorkflowEdges(edges)),
-    [nodes, edges],
+    () => topoSortWorkflowNodes(activeGraph.nodes, activeGraph.edges),
+    [activeGraph],
   )
 
   const paramNodes = sortedNodes.filter((n) =>
@@ -982,7 +943,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     runState,
     activeNodeId,
     landmarkSession,
-    hasRunValidationIssue: Boolean(runValidationIssue),
   })
   const landmarkClearAction = resolveWorkflowRunLandmarkClearAction({ runState, landmarkSession })
 
@@ -1035,7 +995,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
         primaryAction={primaryAction}
         landmarkClearAction={landmarkClearAction}
         runState={runState}
-        runValidationIssue={runValidationIssue}
         isRunning={isRunning}
         onGenerate={handleGenerate}
         onCancel={cancel}

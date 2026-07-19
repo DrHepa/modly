@@ -4,6 +4,7 @@ import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
 const {
+  resolveEffectiveWorkflowIoContract,
   validateProcessConnection,
   validateWorkflowProcessRun,
 } = await import(new URL('./processConnectionRules.ts', import.meta.url).href)
@@ -82,7 +83,7 @@ function createSceneProcessExtension(overrides: ProcessWorkflowExtensionOverride
   }
 }
 
-function createConnection(overrides: Partial<Connection>): Connection {
+function createConnection(overrides: Partial<Connection> = {}): Connection {
   return {
     source: 'source-node',
     target: 'target-node',
@@ -92,7 +93,81 @@ function createConnection(overrides: Partial<Connection>): Connection {
   }
 }
 
-test('rejects connect-time type mismatches with port metadata', () => {
+test('resolves persisted ioContract before installed metadata and falls back only when absent', () => {
+  const installedNamed = createModelExtension({ ioContract: 'named-v1' })
+  const installedLegacy = createModelExtension({ ioContract: undefined })
+  const persistedNamed = createNode('persisted', 'extensionNode', {
+    extensionId: installedLegacy.id,
+    ioContract: 'named-v1',
+    enabled: true,
+    params: {},
+  })
+  const upgradedSavedNode = createNode('upgraded', 'extensionNode', {
+    extensionId: installedNamed.id,
+    enabled: true,
+    params: {},
+  })
+  const exactLegacyNode = createNode('legacy', 'extensionNode', {
+    extensionId: installedLegacy.id,
+    enabled: true,
+    params: {},
+  })
+
+  assert.equal(resolveEffectiveWorkflowIoContract(persistedNamed, installedLegacy), 'named-v1')
+  assert.equal(resolveEffectiveWorkflowIoContract(upgradedSavedNode, installedNamed), 'named-v1')
+  assert.equal(resolveEffectiveWorkflowIoContract(exactLegacyNode, installedLegacy), undefined)
+})
+
+test('allows upgraded saved model nodes with installed named-v1 ports to connect permissively', () => {
+  const source = createNode('source-node', 'meshNode')
+  const target = createNode('target-node', 'extensionNode', {
+    extensionId: 'named/model',
+    enabled: true,
+    params: {},
+  })
+  const extension = createModelExtension({
+    id: 'named/model',
+    extensionId: 'named',
+    nodeId: 'model',
+    input: 'image',
+    ioContract: 'named-v1',
+    inputs: [{ name: 'front', type: 'image' }],
+  })
+
+  const issue = validateProcessConnection({
+    connection: createConnection({ targetHandle: 'front' }),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [extension],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('keeps exact no-marker model nodes on legacy connection validation', () => {
+  const source = createNode('source-node', 'meshNode')
+  const target = createNode('target-node', 'extensionNode', {
+    extensionId: 'legacy/model',
+    enabled: true,
+    params: {},
+  })
+  const extension = createModelExtension({
+    id: 'legacy/model',
+    extensionId: 'legacy',
+    nodeId: 'model',
+    input: 'image',
+    inputs: [{ name: 'front', type: 'image' }],
+  })
+
+  assert.equal(validateProcessConnection({
+    connection: createConnection({ targetHandle: 'front' }),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [extension],
+  }), null)
+})
+
+test('allows connect-time type mismatches with port metadata', () => {
   const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
   const source = createNode('source-node', 'meshNode')
 
@@ -106,20 +181,10 @@ test('rejects connect-time type mismatches with port metadata', () => {
     ])],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'connect',
-    code: 'type-mismatch',
-    message: 'Port "reference_image" expects image but received mesh.',
-    targetNodeId: 'target-node',
-    targetHandle: 'reference_image',
-    portName: 'reference_image',
-    expectedType: 'image',
-    actualType: 'mesh',
-    sourceNodeId: 'source-node',
-  })
+  assert.equal(issue, null)
 })
 
-test('rejects incoming edges into inputless model nodes at connect time', () => {
+test('allows incoming edges into inputless model nodes at connect time', () => {
   const target = createNode('target-node', 'extensionNode', { extensionId: 'gaussiangpt/generate', enabled: true, params: {} })
   const source = createNode('source-node', 'imageNode')
 
@@ -130,18 +195,10 @@ test('rejects incoming edges into inputless model nodes at connect time', () => 
     allExtensions: [createModelExtension()],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'connect',
-    code: 'inputless-target',
-    message: 'This node declares input "none" and cannot accept incoming edges. Remove the connection and run it as a source node.',
-    targetNodeId: 'target-node',
-    targetHandle: null,
-    portName: null,
-    sourceNodeId: 'source-node',
-  })
+  assert.equal(issue, null)
 })
 
-test('rejects duplicate connections to the same named port', () => {
+test('allows duplicate connections to the same named port at connect time', () => {
   const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
   const sourceA = createNode('source-a', 'meshNode')
   const sourceB = createNode('source-b', 'meshNode')
@@ -162,15 +219,7 @@ test('rejects duplicate connections to the same named port', () => {
     ])],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'connect',
-    code: 'duplicate-port',
-    message: 'Port "coarse_mesh" already has a connection.',
-    targetNodeId: 'target-node',
-    targetHandle: 'coarse_mesh',
-    portName: 'coarse_mesh',
-    edgeIds: ['edge-1'],
-  })
+  assert.equal(issue, null)
 })
 
 test('detects missing required ports before run with clear metadata', () => {
@@ -351,7 +400,7 @@ test('accepts scene-to-scene connections for named scene process ports', () => {
   assert.equal(issue, null)
 })
 
-test('rejects scene outputs wired into non-scene process ports', () => {
+test('allows scene outputs wired into non-scene process ports at connect time', () => {
   const source = createNode('source-node', 'sceneNode', { enabled: true, params: { path: 'Scenes/castle' } })
   const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
 
@@ -364,20 +413,32 @@ test('rejects scene outputs wired into non-scene process ports', () => {
     ],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'connect',
-    code: 'type-mismatch',
-    message: 'Port "reference_image" expects image but received scene.',
-    targetNodeId: 'target-node',
-    targetHandle: 'reference_image',
-    portName: 'reference_image',
-    expectedType: 'image',
-    actualType: 'scene',
-    sourceNodeId: 'source-node',
-  })
+  assert.equal(issue, null)
 })
 
-test('rejects non-video sources connected to Preview Video nodes at connect time', () => {
+test('ignores disabled executable nodes and their incident edges during run diagnostics', () => {
+  const source = createNode('image-source', 'imageNode')
+  const disabledTarget = createNode('disabled-target', 'extensionNode', {
+    extensionId: 'ext/refiner',
+    enabled: false,
+    params: {},
+  })
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [source, disabledTarget],
+    edges: [
+      { id: 'edge-image', source: 'image-source', target: 'disabled-target', targetHandle: 'reference_image' },
+    ],
+    allExtensions: [createProcessExtension([
+      { name: 'reference_image', type: 'image' },
+      { name: 'coarse_mesh', type: 'mesh' },
+    ])],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('allows non-video sources connected to Preview Video nodes at connect time', () => {
   const source = createNode('source-node', 'imageNode')
   const target = createNode('target-node', 'previewVideoNode')
 
@@ -388,17 +449,7 @@ test('rejects non-video sources connected to Preview Video nodes at connect time
     allExtensions: [],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'connect',
-    code: 'type-mismatch',
-    message: 'Port "video" expects video but received image.',
-    targetNodeId: 'target-node',
-    targetHandle: null,
-    portName: 'video',
-    expectedType: 'video',
-    actualType: 'image',
-    sourceNodeId: 'source-node',
-  })
+  assert.equal(issue, null)
 })
 
 test('accepts video extension outputs connected to Preview Video nodes', () => {

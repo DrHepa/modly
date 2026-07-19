@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { mkdtemp, rm } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
@@ -9,6 +10,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const workflowPanelEntry = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
+const workflowPanelSource = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 
 async function loadWorkflowPanelModule() {
   const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-workflow-panel-'))
@@ -332,7 +334,15 @@ test('WorkflowRunFeedback keeps validation copy and explains unsupported capabil
     isRunning: false,
   })
 
-  assert.match(validationHtml, /Required port &quot;prompt&quot; is missing\./i)
+  assert.equal(validationHtml, '')
+})
+
+test('WorkflowPanel source keeps Generate ungated by semantic run validation', async () => {
+  const source = await readFile(workflowPanelSource, 'utf8')
+
+  assert.doesNotMatch(source, /validateWorkflowProcessRun/)
+  assert.doesNotMatch(source, /hasRunValidationIssue/)
+  assert.match(source, /WorkflowRunFeedback[\s\S]*runState=\{runState\}[\s\S]*runValidationIssue=\{null\}[\s\S]*isRunning=\{isRunning\}/)
 })
 
 test('ArtifactHistoryDisclosure is a collapsed secondary Wait checkpoint entry by default', async () => {

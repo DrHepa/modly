@@ -81,6 +81,66 @@ const originalSetTimeout = globalThis.setTimeout
 
 let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
+test('workflowRunStore ignores disabled siblings and still runs an active inputless model', async () => {
+  const activeExt = createWorkflowExtension({
+    id: 'sense/open-image',
+    extensionId: 'sense',
+    nodeId: 'open-image',
+    type: 'model',
+    input: 'none',
+    output: 'image',
+  })
+  const disabledExt = createWorkflowExtension({
+    id: 'disabled/requires-image',
+    extensionId: 'disabled',
+    nodeId: 'requires-image',
+    type: 'model',
+    input: 'image',
+    output: 'mesh',
+    inputs: [{ name: 'image', type: 'image', required: true }],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-disabled-sibling',
+    name: 'Disabled sibling',
+    description: '',
+    nodes: [
+      createNode('active-model', 'extensionNode', { extensionId: activeExt.id, enabled: true, params: {} }),
+      createNode('disabled-model', 'extensionNode', { extensionId: disabledExt.id, enabled: false, params: {} }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-active-output', source: 'active-model', target: 'output-node' },
+      { id: 'edge-disabled-input', source: 'active-model', target: 'disabled-model', targetHandle: 'image' },
+    ],
+    createdAt: '2026-07-17T00:00:00.000Z',
+    updatedAt: '2026-07-17T00:00:00.000Z',
+  }
+  const postCalls: string[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      postCalls.push(path)
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-disabled-sibling' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-disabled-sibling')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.png', output_kind: 'image' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [activeExt, disabledExt])
+
+  assert.deepEqual(postCalls, ['/generate/from-none'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(runProcessCalls.length, 0)
+})
+
 let fsReadCalls: string[]
 let landmarkSidecarWriteCalls: LandmarkSidecarWriteCall[]
 let humanoidDraftReadCalls: HumanoidDraftReadCall[]
@@ -1297,7 +1357,7 @@ test('workflowRunStore falls back stale mesh target handle into single rigged me
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
-test('workflowRunStore blocks animate-rigged-mesh before generation when rigged mesh is missing', async () => {
+test('workflowRunStore still dispatches animate-rigged-mesh when rigged mesh is missing', async () => {
   const ext = createWorkflowExtension({
     id: 'kimodo/animate-rigged-mesh',
     extensionId: 'kimodo-soma-rp',
@@ -1318,29 +1378,43 @@ test('workflowRunStore blocks animate-rigged-mesh before generation when rigged 
     }),
     includeMeshEdge: false,
   })
-  let postCalls = 0
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
   let getCalls = 0
 
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
   axiosClientMock = {
-    async post(path: string) {
-      postCalls += 1
-      throw new Error(`Unexpected axios.post call: ${path}`)
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown> })
+      assert.equal(path, '/generate/from-text')
+      return { data: { job_id: 'job-animate-without-rigged-mesh' } }
     },
     async get(path: string) {
       getCalls += 1
-      throw new Error(`Unexpected axios.get call: ${path}`)
+      assert.equal(path, '/generate/status/job-animate-without-rigged-mesh')
+      return { data: { status: 'done', output_url: '/workspace/output/animated.glb' } }
     },
   }
 
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
-  assert.equal(postCalls, 0)
-  assert.equal(getCalls, 0)
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.equal(
-    useWorkflowRunStore.getState().runState.error,
-    'Error: Missing required rigged_mesh mesh input for extension kimodo/animate-rigged-mesh',
-  )
+  assert.equal(postCalls.length, 1)
+  assert.equal(getCalls, 1)
+  assert.deepEqual(postCalls[0].data, {
+    prompt: 'Walk forward',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: {
+      motion_prompt: 'Walk forward',
+    },
+  })
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore blocks model dispatch before backend requests when capability input metadata is missing or unsupported', async () => {
@@ -3434,7 +3508,7 @@ test('shouldUsePreviousNodeFallback disables positional fallback only for inputl
   assert.equal(shouldUsePreviousNodeFallback('scene'), true)
 })
 
-test('workflowRunStore fails stale incoming edges into inputless models with an actionable runtime error', async () => {
+test('workflowRunStore ignores incoming edges for inputless models and still runs them as sources', async () => {
   const ext = createWorkflowExtension({
     id: 'gaussiangpt/generate',
     extensionId: 'gaussiangpt',
@@ -3457,10 +3531,25 @@ test('workflowRunStore fails stale incoming edges into inputless models with an 
     updatedAt: '2026-07-12T00:00:00.000Z',
   }
 
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string) {
+      assert.equal(path, '/generate/from-none')
+      return { data: { job_id: 'job-inputless-ignores-edge' } }
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-inputless-ignores-edge')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.scene.json', output_kind: 'scene' } }
+    },
+  }
+
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /declares input "none" and cannot accept incoming edges/i)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore fails when actual generation output kind mismatches the declared model output and does not route it', async () => {

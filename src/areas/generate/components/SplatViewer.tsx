@@ -1,10 +1,37 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
-import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d'
+import {
+  type AbortablePromise,
+  type Viewer,
+  type ViewerOptions,
+} from '@mkkellogg/gaussian-splats-3d'
 
 export interface SplatViewerHandle {
   screenshot: () => string | null
+}
+
+function resolveSplatViewerErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+const SPLAT_VIEWER_OPTIONS: ViewerOptions = {
+  rootElement: null,
+  selfDrivenMode: true,
+  useBuiltInControls: true,
+  sharedMemoryForWorkers: false,
+  gpuAcceleratedSort: false,
+  initialCameraPosition: [0, 1.2, -3.8],
+  initialCameraLookAt: [0, 0.8, 0],
+  cameraUp: [0, 1, 0],
+}
+
+const SPLAT_SCENE_ROTATION: [number, number, number, number] = [0, 0, 1, 0]
+
+type GaussianSplatsModule = typeof import('@mkkellogg/gaussian-splats-3d')
+
+function loadGaussianSplatsModule(): Promise<GaussianSplatsModule> {
+  return import('@mkkellogg/gaussian-splats-3d')
 }
 
 // ---------------------------------------------------------------------------
@@ -29,13 +56,31 @@ function makeAxisLabelTexture(letter: string, bg: string): THREE.CanvasTexture {
   return new THREE.CanvasTexture(canvas)
 }
 
-const GIZMO_AXES: { letter: string; color: string; pos: [number, number, number]; rot: [number, number, number] }[] = [
+const GIZMO_AXES: { letter: 'X' | 'Y' | 'Z'; color: string; pos: [number, number, number]; rot: [number, number, number] }[] = [
   { letter: 'X', color: '#f87171', pos: [1, 0, 0], rot: [0, 0, 0] },
   { letter: 'Y', color: '#4ade80', pos: [0, 1, 0], rot: [0, 0, Math.PI / 2] },
   { letter: 'Z', color: '#60a5fa', pos: [0, 0, 1], rot: [0, -Math.PI / 2, 0] },
 ]
 
 type Axis = 'x' | 'y' | 'z'
+
+const AXIS_BY_LETTER: Record<'X' | 'Y' | 'Z', Axis> = {
+  X: 'x',
+  Y: 'y',
+  Z: 'z',
+}
+
+const AXIS_DIRECTIONS: Record<Axis, [number, number, number]> = {
+  x: [1, 0, 0],
+  y: [0, 1, 0],
+  z: [0, 0, 1],
+}
+
+const AXIS_UP_VECTORS: Record<Axis, [number, number, number]> = {
+  x: [0, 1, 0],
+  y: [0, 0, -1],
+  z: [0, 1, 0],
+}
 
 function AxisBubble({
   axis,
@@ -51,7 +96,7 @@ function AxisBubble({
     <sprite
       position={axis.pos}
       scale={hovered ? 1.2 : 1}
-      onPointerDown={(e) => { e.stopPropagation(); onAxisClick(axis.letter.toLowerCase() as Axis) }}
+      onPointerDown={(e) => { e.stopPropagation(); onAxisClick(AXIS_BY_LETTER[axis.letter]) }}
       onPointerOver={(e) => { e.stopPropagation(); setHovered(true); document.body.style.cursor = 'pointer' }}
       onPointerOut={() => { setHovered(false); document.body.style.cursor = 'default' }}
     >
@@ -121,12 +166,13 @@ function SplatGizmo({
 // to them, then drop the grid under the model's feet.
 // ---------------------------------------------------------------------------
 
-function frameSplatToView(viewer: any, grid: THREE.GridHelper): void {
-  const splatMesh = viewer?.splatMesh
+function frameSplatToView(viewer: Viewer, grid: THREE.GridHelper): void {
+  const splatMesh = viewer.getSplatMesh()
   const camera = viewer?.camera
   if (!splatMesh || !camera) return
+  if (!splatMesh.getSplatCenter) return
 
-  const count: number = splatMesh.getSplatCount?.() ?? 0
+  const count = splatMesh.getSplatCount?.() ?? 0
   if (count === 0) return
 
   const box = new THREE.Box3()
@@ -170,7 +216,7 @@ function frameSplatToView(viewer: any, grid: THREE.GridHelper): void {
 const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boolean }>(
   function SplatViewer({ url, autoRotate }, ref): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const viewerRef = useRef<any>(null)
+  const viewerRef = useRef<Viewer | null>(null)
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const [message, setMessage] = useState<string>('')
 
@@ -202,71 +248,70 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
     setMessage('')
 
     let disposed = false
-    let viewer: any = null
+    let viewer: Viewer | null = null
+    let loadPromise: AbortablePromise<void> | null = null
+    let grid: THREE.GridHelper | null = null
 
-    try {
-      viewer = new GaussianSplats3D.Viewer({
-        rootElement:            container,
-        selfDrivenMode:         true,
-        useBuiltInControls:     true,
-        sharedMemoryForWorkers: false,        // no cross-origin isolation in Electron/Vite
-        gpuAcceleratedSort:     false,        // CPU sort — most robust across GPUs/Electron
-        // Frame like the mesh viewer: look at the model's centre (feet at y=0,
-        // head ≈ 2), from the front. This splat faces −Z after the 180° Z flip,
-        // so the camera sits on the −Z side to show the face, not the back.
-        initialCameraPosition:  [0, 1.2, -3.8],
-        initialCameraLookAt:    [0, 0.8, 0],
-        cameraUp:               [0, 1, 0],
-      })
-      viewerRef.current = viewer
+    void loadGaussianSplatsModule()
+      .then((module) => {
+        if (disposed) return
 
-      // Match the mesh viewer's framing: mkkellogg defaults to fov 65, the mesh
-      // Canvas uses 45 — the wider fov made the splat look smaller / distorted.
-      if (viewer.camera) {
-        viewer.camera.fov = 45
-        viewer.camera.updateProjectionMatrix()
-      }
+        viewer = new module.Viewer({
+          ...SPLAT_VIEWER_OPTIONS,
+          rootElement: container,
+        })
+        viewerRef.current = viewer
 
-      // Floor grid, matching the mesh viewer.
-      const grid = new THREE.GridHelper(10, 20, 0x3f3f46, 0x27272a)
-      viewer.threeScene.add(grid)
+        // Match the mesh viewer's framing: mkkellogg defaults to fov 65, the mesh
+        // Canvas uses 45 — the wider fov made the splat look smaller / distorted.
+        if (viewer.camera) {
+          viewer.camera.fov = 45
+          viewer.camera.updateProjectionMatrix()
+        }
 
-      viewer
-        .addSplatScene(url, {
-          format:          GaussianSplats3D.SceneFormat.Splat,
-          showLoadingUI:   false,
+        // Floor grid, matching the mesh viewer.
+        grid = new THREE.GridHelper(10, 20, 0x3f3f46, 0x27272a)
+        viewer.threeScene.add(grid)
+
+        loadPromise = viewer.addSplatScene(url, {
+          format: module.SceneFormat.Splat,
+          showLoadingUI: false,
           progressiveLoad: false,
-          rotation:        [0, 0, 1, 0],   // 180° about Z — 3DGS is Y-down; stands it upright while keeping the front toward the camera (X-mirror is invisible on a symmetric model)
+          rotation: SPLAT_SCENE_ROTATION, // 180° about Z — 3DGS is Y-down; stands it upright while keeping the front toward the camera (X-mirror is invisible on a symmetric model)
         })
-        .then(() => {
-          if (disposed) return
-          viewer.start()
-          frameSplatToView(viewer, grid)
-          setStatus('ready')
-        })
-        .catch((err: unknown) => {
-          if (disposed) return
-          console.error('[SplatViewer] load failed:', err)
-          setStatus('error')
-          setMessage(String((err as Error)?.message ?? err))
-        })
-    } catch (err) {
-      console.error('[SplatViewer] init failed:', err)
-      setStatus('error')
-      setMessage(String((err as Error)?.message ?? err))
-    }
+        return loadPromise
+          .then(() => {
+            if (disposed) return
+            viewer?.start()
+            if (viewer && grid) frameSplatToView(viewer, grid)
+            setStatus('ready')
+          })
+      })
+      .catch((err: unknown) => {
+        if (disposed) return
+        console.error('[SplatViewer] init failed:', err)
+        setStatus('error')
+        setMessage(resolveSplatViewerErrorMessage(err))
+      })
 
     return () => {
       disposed = true
       viewerRef.current = null
+      loadPromise?.abort('Generate SplatViewer unmounted.')
+      if (grid) {
+        viewer?.threeScene.remove(grid)
+        grid.geometry.dispose()
+        const material = Array.isArray(grid.material) ? grid.material : [grid.material]
+        material.forEach((entry) => entry.dispose())
+      }
       try {
         viewer?.stop()
-        viewer?.dispose()
+        void viewer?.dispose()
       } catch { /* already torn down */ }
     }
   }, [url])
 
-  const getCameraQuaternion = () => viewerRef.current?.camera?.quaternion as THREE.Quaternion | undefined
+  const getCameraQuaternion = () => viewerRef.current?.camera?.quaternion
 
   // Snap the camera to look down an axis, like the mesh viewer's gizmo.
   const snapToAxis = (axis: Axis) => {
@@ -276,9 +321,9 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
     const controls = viewer.controls
     const target: THREE.Vector3 = controls?.target ?? new THREE.Vector3(0, 0.8, 0)
     const dist = camera.position.distanceTo(target) || 4
-    const dir = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] }[axis]
+    const dir = AXIS_DIRECTIONS[axis]
     camera.position.set(target.x + dir[0] * dist, target.y + dir[1] * dist, target.z + dir[2] * dist)
-    camera.up.set(...(axis === 'y' ? [0, 0, -1] : [0, 1, 0]) as [number, number, number])
+    camera.up.set(...AXIS_UP_VECTORS[axis])
     camera.lookAt(target)
     controls?.update?.()
   }

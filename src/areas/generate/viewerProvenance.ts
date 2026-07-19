@@ -32,7 +32,7 @@ export function resolveViewerTargetPresentation(target: ViewerAssetTarget): View
   }
 }
 
-export function resolveViewerRigSourceWorkspacePath(target: Pick<ViewerAssetTarget, 'workspacePath' | 'modelUrl'>): string | undefined {
+export function resolveViewerRigSourceWorkspacePath(target: { workspacePath?: string; modelUrl: string | null }): string | undefined {
   return normalizeViewerRigWorkspacePath(target.workspacePath) ?? resolveViewerAssetWorkspacePathFromUrl(target.modelUrl)
 }
 

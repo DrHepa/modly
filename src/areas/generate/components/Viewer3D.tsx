@@ -1,10 +1,11 @@
 import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode, ErrorInfo } from 'react'
-import { Canvas, useFrame, useThree } from '@react-three/fiber'
+import type { ReactNode, ErrorInfo, MutableRefObject } from 'react'
+import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber'
 import type { ThreeEvent } from '@react-three/fiber'
 import { Environment, GizmoHelper, Html, Lightformer, OrbitControls, useGizmoContext, useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js'
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
 
 // Patch THREE pour utiliser BVH sur tous les meshes — réduit le raycast O(N) → O(log N)
@@ -13,7 +14,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree as any
 THREE.Mesh.prototype.raycast = acceleratedRaycast
 import SplatViewer, { type SplatViewerHandle } from './SplatViewer'
 import { useGeneration } from '@shared/hooks/useGeneration'
-import { useAppStore } from '@shared/stores/appStore'
+import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
+import type { LightSettings } from '@shared/stores/appStore'
 import { ViewerEditToolbar, ViewerViewToolbar, type ViewMode } from './ViewerToolbar'
 import type { MotionRetargetArtifactLink } from './MotionRetargetPanel'
 import { RigEditorPanel, type RigEditorHumanoidReviewProps } from './RigEditorPanel'
@@ -51,10 +53,10 @@ import {
 } from '../sceneEditExportRuntime'
 import { useWorkflowRunStore } from '../../workflows/workflowRunStore'
 import type { LandmarkId, LandmarkPoint } from '../../workflows/landmarks'
-import type { LightSettings } from '../GeneratePage'
-import { DEFAULT_LIGHT_SETTINGS } from '../GeneratePage'
 import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionMethod, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult } from '../../../shared/types/electron.d'
 import type { ArtifactRef } from '../../../shared/types/artifacts.ts'
+
+export type GizmoMode = 'translate' | 'rotate' | 'scale'
 
 type RigStats = {
   hasRig: boolean
@@ -461,6 +463,7 @@ interface MeshModelProps {
   rigSkeletonSummary?: RigSkeletonSummary
   selectedBoneId?: RigBoneId
   onSceneReady: (scene: THREE.Object3D, parts: ScenePart[]) => void
+  onObject: (obj: THREE.Object3D | null) => void
   landmarkPicking?: {
     activeLandmarkId: LandmarkId
     canvas: HTMLCanvasElement | null
@@ -468,8 +471,26 @@ interface MeshModelProps {
   }
 }
 
-function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, editMode, sceneParts, onStats, onSelect, onAnimationAvailability, onAnimationControlsReady, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady, rigSkeletonSummary, selectedBoneId, onSceneReady, landmarkPicking }: MeshModelProps): JSX.Element {
-  const { scene, animations } = useGLTF(url)
+function MeshModel(props: MeshModelProps): JSX.Element {
+  const extension = props.url.split('?')[0]?.split('.').pop()?.toLowerCase()
+  return extension === 'obj' ? <ObjMeshModel {...props} /> : <GltfMeshModel {...props} />
+}
+
+function GltfMeshModel(props: MeshModelProps): JSX.Element {
+  const { scene, animations } = useGLTF(props.url)
+  return <SceneMeshModel {...props} scene={scene} animations={animations} loaderType="gltf" />
+}
+
+function ObjMeshModel(props: MeshModelProps): JSX.Element {
+  const scene = useLoader(OBJLoader, props.url)
+  return <SceneMeshModel {...props} scene={scene} animations={[]} loaderType="obj" />
+}
+
+function SceneMeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, editMode, sceneParts, onStats, onSelect, onAnimationAvailability, onAnimationControlsReady, onRigStats, onRigSkeletonSummary, onPoseClipBonesReady, rigSkeletonSummary, selectedBoneId, onSceneReady, onObject, landmarkPicking, scene, animations, loaderType }: MeshModelProps & {
+  scene: THREE.Group | THREE.Scene
+  animations: THREE.AnimationClip[]
+  loaderType: 'gltf' | 'obj'
+}): JSX.Element {
   const captured = useRef(false)
   const edgeHelpers = useRef<THREE.LineSegments[]>([])
   const mixerRef = useRef<THREE.AnimationMixer | null>(null)
@@ -575,7 +596,7 @@ function MeshModel({ url, rigSourceWorkspacePath, viewMode, animationPlaying, ed
         }
       })
     }
-  }, [url, scene])
+  }, [loaderType, scene, url])
 
   // Compute BVH on all geometries for fast raycasting (O(log N) vs O(N)).
   // Also force DoubleSide on every material so faces with inverted normals
@@ -1323,6 +1344,55 @@ function EmptyState(): JSX.Element {
       <p className="mt-4 text-sm">3D model will appear here</p>
     </div>
   )
+}
+
+type TransformSnapshot = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3 }
+
+function isViewer3DSplatWorkspacePath(workspacePath: string | undefined): workspacePath is string {
+  return Boolean(
+    workspacePath
+    && isSafeViewerWorkspaceRelativePath(workspacePath)
+    && /\.(ply|splat)$/i.test(workspacePath),
+  )
+}
+
+function encodeViewer3DWorkspacePath(workspacePath: string): string {
+  return workspacePath.split('/').map((segment) => encodeURIComponent(segment)).join('/')
+}
+
+function resolveViewer3DSplatWorkspacePath(target: ViewerAssetTarget, modelUrl: string | null): string | undefined {
+  if (target.kind !== 'none' && isViewer3DSplatWorkspacePath(target.workspacePath)) return target.workspacePath
+  if (!modelUrl) return undefined
+
+  let candidate: string | undefined
+  if (modelUrl.startsWith('/workspace/')) {
+    candidate = decodeURIComponent(modelUrl.slice('/workspace/'.length))
+  } else {
+    try {
+      const parsed = new URL(modelUrl)
+      if (parsed.pathname.startsWith('/workspace/')) {
+        candidate = decodeURIComponent(parsed.pathname.slice('/workspace/'.length))
+      } else if (parsed.pathname === '/optimize/serve-file') {
+        const path = parsed.searchParams.get('path')
+        candidate = path ? decodeURIComponent(path) : undefined
+      }
+    } catch {
+      candidate = undefined
+    }
+  }
+
+  return isViewer3DSplatWorkspacePath(candidate) ? candidate : undefined
+}
+
+function resolveViewer3DSplatUrl(apiUrl: string, workspacePath: string | undefined, modelUrl: string | null): string | null {
+  if (!workspacePath) return modelUrl && /\.splat(?:$|\?)/i.test(modelUrl) ? modelUrl : null
+  if (/\.ply$/i.test(workspacePath)) {
+    return `${apiUrl}/optimize/ply-to-splat?path=${encodeURIComponent(workspacePath)}`
+  }
+  if (/\.splat$/i.test(workspacePath)) {
+    return `${apiUrl}/workspace/${encodeViewer3DWorkspacePath(workspacePath)}`
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -2583,6 +2653,9 @@ function createViewer3DKimodoFallbackArtifact(args: {
 }): KimodoMotionArtifact {
   const runtimeStatus = readViewer3DMetadataString(args.metadata, 'runtime_status') ?? readViewer3DMetadataString(args.metadata, 'runtimeStatus')
   const retargetStatus = readViewer3DMetadataString(args.metadata, 'retarget_status') ?? readViewer3DMetadataString(args.metadata, 'retargetStatus')
+  const solverStatus = readViewer3DMetadataString(args.metadata, 'solver_status') ?? readViewer3DMetadataString(args.metadata, 'solverStatus')
+  const basisStatus = readViewer3DMetadataString(args.metadata, 'basis_status') ?? readViewer3DMetadataString(args.metadata, 'basisStatus')
+  const rootMotionStatus = readViewer3DMetadataString(args.metadata, 'root_motion_status') ?? readViewer3DMetadataString(args.metadata, 'rootMotionStatus')
   const animationMappingStatus = readViewer3DMetadataString(args.metadata, 'animation_mapping_status') ?? readViewer3DMetadataString(args.metadata, 'animationMappingStatus')
   const visualQualityStatus = readViewer3DMetadataString(args.metadata, 'visual_quality_status') ?? readViewer3DMetadataString(args.metadata, 'visualQualityStatus')
   const warningsValue = args.metadata.warnings
@@ -2605,20 +2678,22 @@ function createViewer3DKimodoFallbackArtifact(args: {
     motionNpzWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.motion_npz_artifact ?? args.metadata.canonical_motion_artifact, 'motion.npz'),
     motionBvhWorkspacePath: resolveViewer3DBundleArtifactWorkspacePath(args.descriptor.bundleWorkspacePath, args.metadata.motion_bvh_artifact, 'motion.bvh'),
     diagnostics: {
-      runtimeStatus,
-      retargetStatus,
-      animationMappingStatus,
-      stabilizationStatus: readViewer3DMetadataString(args.metadata, 'stabilization_status'),
-      visualQualityStatus,
-      sourceKind: readViewer3DMetadataString(args.metadata, 'source_kind'),
-      mappingConfidence: readViewer3DMetadataString(args.metadata, 'mapping_confidence'),
+      runtimeStatus: runtimeStatus ?? null,
+      retargetStatus: retargetStatus ?? null,
+      solverStatus: solverStatus ?? null,
+      basisStatus: basisStatus ?? null,
+      rootMotionStatus: rootMotionStatus ?? null,
+      animationMappingStatus: animationMappingStatus ?? null,
+      stabilizationStatus: readViewer3DMetadataString(args.metadata, 'stabilization_status') ?? null,
+      visualQualityStatus: visualQualityStatus ?? null,
+      sourceKind: readViewer3DMetadataString(args.metadata, 'source_kind') ?? null,
+      mappingConfidence: readViewer3DMetadataString(args.metadata, 'mapping_confidence') ?? null,
       retargetErrorCode: readViewer3DMetadataString(args.metadata, 'retarget_error_code') ?? null,
       retargetErrorAliases: [],
       retargetErrorMessage: readViewer3DMetadataString(args.metadata, 'retarget_error_message') ?? null,
       warnings,
       raw: rawMetadata,
     },
-    warnings,
   }
 }
 
@@ -2640,7 +2715,7 @@ export function resolveViewer3DKimodoSourceRigFallback(args: {
 
   const sourceWorkspacePath = resolveViewer3DKimodoFallbackSourceWorkspacePath(args.metadata)
   const artifact = createViewer3DKimodoFallbackArtifact({ descriptor: args.descriptor, metadata: args.metadata, sourceWorkspacePath })
-  const fallbackWarnings = dedupeViewer3DWarnings([VIEWER3D_KIMODO_SOURCE_RIG_FALLBACK_WARNING, ...artifact.warnings])
+  const fallbackWarnings = dedupeViewer3DWarnings([VIEWER3D_KIMODO_SOURCE_RIG_FALLBACK_WARNING, ...artifact.diagnostics.warnings])
 
   if (!isViewer3DKimodoPreviewOnlyDegradedArtifact(artifact, args.previewHasUsableRig) || !sourceWorkspacePath) {
     return inactive(artifact)
@@ -4288,7 +4363,7 @@ export function resolveViewer3DPresentation(target: ViewerAssetTarget): Viewer3D
   return resolveViewerTargetPresentation(target)
 }
 
-export function resolveViewer3DRigSourceWorkspacePath(target: Pick<ViewerAssetTarget, 'workspacePath' | 'modelUrl'>): string | undefined {
+export function resolveViewer3DRigSourceWorkspacePath(target: { workspacePath?: string; modelUrl: string | null }): string | undefined {
   return resolveViewerRigSourceWorkspacePath(target)
 }
 
@@ -4330,13 +4405,15 @@ export function resolveViewer3DOverlayLayout({
 
 export const resolveViewer3DLandmarkMarkers = deriveLandmarkMarkers
 
-export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { lightSettings?: LightSettings }): JSX.Element {
+export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmoMode = null, gizmoUndoRef }: { lightSettings?: LightSettings; gizmoMode?: GizmoMode | null; gizmoUndoRef?: MutableRefObject<(() => boolean) | null> }): JSX.Element {
   const { currentJob } = useGeneration()
   const apiUrl = useAppStore((s) => s.apiUrl)
 
   const setStoreMeshStats = useAppStore((s) => s.setMeshStats)
   const meshStats = useAppStore((s) => s.meshStats)
   const setCurrentJob = useAppStore((s) => s.setCurrentJob)
+  const selected = useAppStore((s) => s.meshSelected)
+  const setSelected = useAppStore((s) => s.setMeshSelected)
   const workflowRunState = useWorkflowRunStore((s) => s.runState)
   const setPendingReplacement = useWorkflowRunStore((s) => s.setPendingReplacement)
   const landmarkSession = useWorkflowRunStore((s) => s.landmarkSession)
@@ -4355,7 +4432,6 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const [motionRetargetState, setMotionRetargetState] = useState<Viewer3DMotionRetargetState>(() => createViewer3DMotionRetargetState())
   const [motionRetargetVisibility, setMotionRetargetVisibility] = useState<Viewer3DMotionRetargetVisibilityState>(() => createViewer3DMotionRetargetVisibilityState())
   const [selectedRigTarget, setSelectedRigTarget] = useState<Viewer3DSelectedRigTargetState>(() => createViewer3DSelectedRigTargetState())
-  const [selected, setSelected] = useState(false)
   const [sceneEditMode, setSceneEditMode] = useState<'idle' | 'editing'>('idle')
   const [sceneParts, setSceneParts] = useState<ScenePart[]>([])
   const [editPlan, setEditPlan] = useState<EditPlan | null>(null)
@@ -4367,12 +4443,16 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
   const [kimodoMetadata, setKimodoMetadata] = useState<Record<string, unknown> | null>(null)
   const [artifactPreviewState, setArtifactPreviewState] = useState<Viewer3DArtifactPreviewState>(() => createViewer3DArtifactPreviewState())
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const splatRef = useRef<SplatViewerHandle | null>(null)
   const sceneRef = useRef<THREE.Object3D | null>(null)
+  const [meshObject, setMeshObject] = useState<THREE.Object3D | null>(null)
   const poseClipBonesRef = useRef<Map<RigBoneId, THREE.Bone>>(new Map())
   const poseClipSnapshotRef = useRef<PoseClipQuaternionSnapshot | null>(null)
   const motionRetargetSnapshotRef = useRef<MotionRetargetTransformSnapshot | null>(null)
   const motionRetargetWasOpenRef = useRef(motionRetargetVisibility.isOpen)
   const animationControlsRef = useRef<Viewer3DAnimationControls | null>(null)
+  const transformHistory = useRef<TransformSnapshot[]>([])
+  const pendingTransform = useRef<TransformSnapshot | null>(null)
 
   const viewerTarget = resolveViewerAssetTarget({ currentJob, apiUrl, workflowArtifact: workflowRunState.artifact })
   const modelSource = resolveViewerModelSource(viewerTarget)
@@ -4421,6 +4501,9 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     [baseModelUrl, currentJob?.id, motionRetargetPresentation, rigSourceWorkspacePath, sourceRigFallback],
   )
   const modelUrl = authoringPresentation.modelUrl
+  const splatWorkspacePath = resolveViewer3DSplatWorkspacePath(viewerTarget, modelUrl)
+  const isSplat = Boolean(splatWorkspacePath)
+  const splatUrl = resolveViewer3DSplatUrl(apiUrl, splatWorkspacePath, modelUrl)
   const authoringRigSourceWorkspacePath = authoringPresentation.rigSourceWorkspacePath
   const sceneEditSource = resolveSceneEditSourceDescriptor({ currentJobId: currentJob?.id, modelSource })
   const sceneEditVisibility = resolveSceneEditControlsVisibility({ modelSource, source: sceneEditSource?.artifact ?? null })
@@ -4595,8 +4678,12 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     setKimodoMetadata(null)
     sceneRef.current = null
     poseClipBonesRef.current = new Map()
+    transformHistory.current = []
+    pendingTransform.current = null
     setStoreMeshStats(null)
   }, [currentJob?.id, baseModelUrl])
+
+  useEffect(() => () => setSelected(false), [setSelected])
 
   useEffect(() => {
     const request = resolveViewer3DRigMetaHydrationRequest(rigEditorState.summary, semanticHydrationSource)
@@ -4804,6 +4891,42 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
     link.href = dataUrl
     link.click()
   }
+
+  const handleGizmoDragStart = useCallback(() => {
+    if (!meshObject) return
+    pendingTransform.current = {
+      p: meshObject.position.clone(),
+      q: meshObject.quaternion.clone(),
+      s: meshObject.scale.clone(),
+    }
+  }, [meshObject])
+
+  const handleGizmoDragEnd = useCallback(() => {
+    const before = pendingTransform.current
+    pendingTransform.current = null
+    if (!before || !meshObject) return
+    const changed = !meshObject.position.equals(before.p)
+      || !meshObject.quaternion.equals(before.q)
+      || !meshObject.scale.equals(before.s)
+    if (changed) transformHistory.current.push(before)
+  }, [meshObject])
+
+  const undoTransform = useCallback((): boolean => {
+    const previous = transformHistory.current.pop()
+    if (!previous || !meshObject) return false
+    meshObject.position.copy(previous.p)
+    meshObject.quaternion.copy(previous.q)
+    meshObject.scale.copy(previous.s)
+    return true
+  }, [meshObject])
+
+  useEffect(() => {
+    if (!gizmoUndoRef) return
+    gizmoUndoRef.current = undoTransform
+    return () => {
+      if (gizmoUndoRef.current === undoTransform) gizmoUndoRef.current = null
+    }
+  }, [gizmoUndoRef, undoTransform])
 
   const handleAnimationAvailability = (available: boolean) => {
     setHasAnimations(available)
@@ -5400,6 +5523,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS }: { l
                 rigSkeletonSummary={rigTargetState.summary}
                 selectedBoneId={rigTargetState.selectedBoneId}
                 onSceneReady={handleSceneReady}
+                onObject={setMeshObject}
                 landmarkPicking={landmarkSession ? {
                   activeLandmarkId: landmarkSession.activeLandmarkId,
                   canvas: canvasRef.current,

@@ -130,6 +130,7 @@ test('AutomationHttpBridge returns 500 for unexpected bridge errors', async () =
   try {
     const response = await requestJson(AUTOMATION_HTTP_BRIDGE_PATH, undefined, bridge)
     assert.equal(response.status, 500)
+    assert.match(response.headers.get('content-type') ?? '', /^application\/json/)
     assert.deepEqual(await response.json(), {
       error: {
         code: 'PROCESS_EXECUTION_FAILED',

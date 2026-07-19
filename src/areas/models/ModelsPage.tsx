@@ -29,6 +29,19 @@ const SORTS: { id: SortId; label: string }[] = [
 
 const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
 
+type ExtensionsApiWithLocalInstall = Pick<typeof window.electron.extensions, 'installFromLocal'>
+type ModelApiWithDownloadControls = Pick<typeof window.electron.model, 'pauseDownload' | 'cancelDownload'>
+
+function hasLocalInstall(api: unknown): api is ExtensionsApiWithLocalInstall {
+  return typeof api === 'object' && api !== null && 'installFromLocal' in api && typeof api.installFromLocal === 'function'
+}
+
+function hasDownloadControls(api: unknown): api is ModelApiWithDownloadControls {
+  return typeof api === 'object' && api !== null
+    && 'pauseDownload' in api && typeof api.pauseDownload === 'function'
+    && 'cancelDownload' in api && typeof api.cancelDownload === 'function'
+}
+
 type ModelDownloadApi = {
   download: (modelId: string, variantId?: string) => Promise<ModelDownloadResult & { paused?: boolean; cancelled?: boolean }>
   downloadAssets: (modelId: string) => Promise<ModelDownloadResult>
@@ -230,7 +243,10 @@ export default function ModelsPage(): JSX.Element {
   const clearInstall      = useExtensionsStore((s) => s.clearInstallState)
 
   const allExtensions: AnyExtension[] = useMemo(
-    () => [...modelExtensions, ...processExtensions],
+    () => [...modelExtensions, ...processExtensions].sort((a, b) => {
+      if (a.builtin !== b.builtin) return a.builtin ? -1 : 1
+      return a.name.localeCompare(b.name)
+    }),
     [modelExtensions, processExtensions],
   )
 
@@ -471,14 +487,32 @@ export default function ModelsPage(): JSX.Element {
   }
 
   async function handlePauseDownload(fullId: string) {
+    if (!hasDownloadControls(window.electron.model)) {
+      setGhErr('Pause is unavailable in this build.')
+      return
+    }
+
+    const previousStatus = downloading[fullId]?.status
     setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: { ...prev[fullId], paused: true, status: 'Pausing…' } }) : prev)
-    await window.electron.model.pauseDownload(fullId)
+    const result = await window.electron.model.pauseDownload(fullId)
+    if (!result.success) {
+      setGhErr(result.error ?? 'Could not pause download.')
+      setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: {
+        ...prev[fullId], paused: false,
+        status: prev[fullId].status === 'Pausing…' ? previousStatus : prev[fullId].status,
+      } }) : prev)
+    }
   }
 
   async function handleCancelDownload(fullId: string) {
-    setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
+    if (!hasDownloadControls(window.electron.model)) {
+      setGhErr('Cancel is unavailable in this build.')
+      return
+    }
+
     const result = await window.electron.model.cancelDownload(fullId)
-    if (!result.success) setGhErr(result.error ?? 'Could not cancel download')
+    if (!result.success) setGhErr(result.error ?? 'Could not cancel download.')
+    else setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
     await refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
   }
 
@@ -521,6 +555,11 @@ export default function ModelsPage(): JSX.Element {
   // ── Local extension install ──────────────────────────────────────────
 
   async function handleLocalInstall() {
+    if (!hasLocalInstall(window.electron.extensions)) {
+      setGhErr('Local folder linking is unavailable in this build.')
+      return
+    }
+
     setGhErr(null)
     clearInstall()
     const result = await installFromLocal()
@@ -679,7 +718,7 @@ export default function ModelsPage(): JSX.Element {
           </button>
           <button
             onClick={handleLocalInstall}
-            disabled={isInstalling}
+            disabled={isInstalling || !hasLocalInstall(window.electron.extensions)}
             title="Link a local extension folder"
             className="inline-flex items-center gap-2 px-3.5 py-2 rounded-[9px] text-xs font-medium border border-zinc-700/60 bg-white/[0.025] text-zinc-200 hover:bg-white/[0.06] hover:border-zinc-600 transition-colors whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
           >

@@ -41,7 +41,7 @@ interface Props {
   onInstallAll:     (ext: AnyExtension) => void
   onPauseDownload:  (fullId: string) => void
   onCancelDownload: (fullId: string) => void
-  onOpen:           (ext: AnyExtension) => void
+  onOpen?:          (ext: AnyExtension) => void
   onRuntimeReadinessAction?: (modelId: string, action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string }
 }
 
@@ -62,11 +62,12 @@ export function ExtensionCard({
   const { total, done, installing, hasAvailable } = extInstallSummary(ext, verifiedInstalledIds, downloading)
 
   const handleOpen = (e: React.MouseEvent) => {
+    if (!onOpen) return
     if ((e.target as HTMLElement).closest('button')) return
     onOpen(ext)
   }
   const handleKey = (e: React.KeyboardEvent) => {
-    if (e.target !== e.currentTarget) return
+    if (!onOpen || e.target !== e.currentTarget) return
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
       onOpen(ext)
@@ -128,12 +129,12 @@ export function ExtensionCard({
 
   return (
     <div
-      role="button"
-      tabIndex={0}
+      role={onOpen ? 'button' : undefined}
+      tabIndex={onOpen ? 0 : undefined}
       onClick={handleOpen}
       onKeyDown={handleKey}
-      aria-label={`${ext.name} — open details`}
-      className="relative flex flex-col min-h-[218px] p-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 overflow-hidden cursor-pointer transition-all duration-150 hover:bg-zinc-900 hover:border-zinc-700 hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-14px_rgba(0,0,0,0.7)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+      aria-label={onOpen ? `${ext.name} — open details` : undefined}
+      className={`relative flex flex-col min-h-[218px] p-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 overflow-hidden transition-all duration-150 hover:bg-zinc-900 hover:border-zinc-700 hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-14px_rgba(0,0,0,0.7)] ${onOpen ? 'cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent' : ''}`}
     >
       {/* Header */}
       <div className="flex items-start gap-3">

@@ -625,11 +625,10 @@ def test_build_scene_candidate_preserves_image_output_kind(api_modules):
     }
 
 
-def test_validate_model_input_normalizes_legacy_json_to_scene():
-    from services.generator_registry import normalize_model_input, validate_model_input
+def test_validate_model_input_preserves_generic_json_kind():
+    from services.generator_registry import normalize_model_input
 
-    assert normalize_model_input("JSON") == "scene"
-    assert validate_model_input("json", context="demo/fake.input") == "scene"
+    assert normalize_model_input("JSON") == "JSON"
 
 def test_generation_jobs_preserve_running_status_and_cancel_parity_for_image_and_text(api_modules, monkeypatch, caplog):
     from services.generator_registry import generator_registry

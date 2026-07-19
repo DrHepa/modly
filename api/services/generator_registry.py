@@ -76,8 +76,6 @@ _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
 
 
 def normalize_model_input(value):
-    if isinstance(value, str) and value.lower() == "json":
-        return "scene"
     return value
 
 

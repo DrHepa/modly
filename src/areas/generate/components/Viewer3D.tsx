@@ -9,6 +9,7 @@ import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js'
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 
 // Patch THREE pour utiliser BVH sur tous les meshes — réduit le raycast O(N) → O(log N)
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree as any
@@ -93,6 +94,107 @@ export function collectViewer3DSceneStats(scene: THREE.Object3D): ViewerGeometry
     vertices: Math.round(vertices),
     triangles: Math.round(triangles),
   }
+}
+
+function cloneViewer3DMaterial<T extends THREE.Material>(material: T): T {
+  return material.clone() as T
+}
+
+export function cloneViewer3DLoadedScene<T extends THREE.Object3D>(source: T): T {
+  const clone = cloneSkeleton(source) as T
+  clone.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
+    child.material = Array.isArray(child.material)
+      ? child.material.map((material) => cloneViewer3DMaterial(material))
+      : cloneViewer3DMaterial(child.material)
+    child.userData.originalMaterial = child.material
+  })
+  return clone
+}
+
+export function disposeViewer3DOwnedSceneResources(scene: THREE.Object3D): void {
+  const disposed = new Set<THREE.Material>()
+
+  const disposeMaterial = (material: THREE.Material | undefined): void => {
+    if (!material || disposed.has(material)) return
+    disposed.add(material)
+    material.dispose()
+  }
+
+  scene.traverse((child) => {
+    if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
+    const materials = Array.isArray(child.material) ? child.material : [child.material]
+    materials.forEach(disposeMaterial)
+
+    const originalMaterial = child.userData.originalMaterial as THREE.Material | THREE.Material[] | undefined
+    ;(Array.isArray(originalMaterial) ? originalMaterial : [originalMaterial]).forEach(disposeMaterial)
+  })
+}
+
+export function hasViewer3DRenderableContent(object: THREE.Object3D | null | undefined): boolean {
+  let found = false
+  object?.traverse((child) => {
+    if (found) return
+    if (child instanceof THREE.Mesh || child instanceof THREE.Points) found = true
+  })
+  return found
+}
+
+export function shouldEnableViewer3DBvh(args: { editMode: boolean; landmarkPicking?: MeshModelProps['landmarkPicking'] }): boolean {
+  return args.editMode || Boolean(args.landmarkPicking)
+}
+
+type Viewer3DCameraFrame = {
+  target: THREE.Vector3
+  position: THREE.Vector3
+  near: number
+  far: number
+  minDistance: number
+  maxDistance: number
+}
+
+export function resolveViewer3DCameraFrame(args: {
+  bounds: THREE.Box3
+  aspect: number
+  fovDegrees: number
+  direction?: THREE.Vector3
+  margin?: number
+}): Viewer3DCameraFrame | undefined {
+  if (args.bounds.isEmpty()) return undefined
+
+  const sphere = args.bounds.getBoundingSphere(new THREE.Sphere())
+  const radius = Math.max(sphere.radius, 0.05)
+  const aspect = Number.isFinite(args.aspect) && args.aspect > 0 ? args.aspect : 1
+  const halfVerticalFov = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(args.fovDegrees, 10, 120) / 2)
+  const halfHorizontalFov = Math.atan(Math.tan(halfVerticalFov) * aspect)
+  const limitingHalfFov = Math.max(0.01, Math.min(halfVerticalFov, halfHorizontalFov))
+  const margin = args.margin ?? 1.2
+  const distance = (radius / Math.sin(limitingHalfFov)) * margin
+  const direction = args.direction && args.direction.lengthSq() > 1e-6
+    ? args.direction.clone().normalize()
+    : new THREE.Vector3(0.9, 0.55, 1).normalize()
+
+  const target = sphere.center.clone()
+  const position = target.clone().add(direction.multiplyScalar(distance))
+  const near = Math.max(0.01, distance - radius * 2.5)
+  const far = Math.max(near + 1, distance + radius * 4)
+
+  return {
+    target,
+    position,
+    near,
+    far,
+    minDistance: Math.max(0.01, radius * 0.15),
+    maxDistance: Math.max(distance * 8, radius * 4),
+  }
+}
+
+export function shouldRenderViewer3DViewportGizmos(args: {
+  modelUrl: string | null
+  hasCurrentJob: boolean
+  object: THREE.Object3D | null | undefined
+}): boolean {
+  return Boolean(args.modelUrl && args.hasCurrentJob && hasViewer3DRenderableContent(args.object))
 }
 
 type JointMarker = {
@@ -622,7 +724,8 @@ function MeshModel(props: MeshModelProps): JSX.Element {
 }
 
 function GltfMeshModel(props: MeshModelProps): JSX.Element {
-  const { scene, animations } = useGLTF(props.url)
+  const { scene: loadedScene, animations } = useGLTF(props.url)
+  const scene = useMemo(() => cloneViewer3DLoadedScene(loadedScene), [loadedScene])
   const { animationPlaying, onAnimationAvailability, poseOwnerRef, onAnimationControlsReady } = props
   const mixerRef = useRef<THREE.AnimationMixer | null>(null)
   const actionsRef = useRef<THREE.AnimationAction[]>([])
@@ -660,16 +763,17 @@ function GltfMeshModel(props: MeshModelProps): JSX.Element {
     }
   }, -1)
 
-  return <SceneMeshModel {...props} scene={scene} animations={animations} loaderType="gltf" />
+  return <SceneMeshModel {...props} scene={scene} animations={animations} />
 }
 
 const EMPTY_ANIMATIONS: readonly THREE.AnimationClip[] = []
 
 function ObjMeshModel(props: MeshModelProps): JSX.Element {
-  const scene = useLoader(OBJLoader, props.url)
+  const loadedScene = useLoader(OBJLoader, props.url)
+  const scene = useMemo(() => cloneViewer3DLoadedScene(loadedScene), [loadedScene])
   const { onAnimationAvailability } = props
   useEffect(() => { onAnimationAvailability(false) }, [onAnimationAvailability])
-  return <SceneMeshModel {...props} scene={scene} animations={EMPTY_ANIMATIONS} loaderType="obj" />
+  return <SceneMeshModel {...props} scene={scene} animations={EMPTY_ANIMATIONS} />
 }
 
 function SceneMeshModel({
@@ -681,7 +785,6 @@ function SceneMeshModel({
   onObject,
   onRigStats,
   scene,
-  loaderType,
   animations,
   rigSourceWorkspacePath,
   selectedBoneId,
@@ -690,10 +793,10 @@ function SceneMeshModel({
   landmarkPicking,
 }: MeshModelProps & {
   scene: THREE.Group | THREE.Scene
-  loaderType: 'gltf' | 'obj'
   animations: readonly THREE.AnimationClip[]
 }): JSX.Element {
   const captured = useRef(false)
+  const bvhGeometriesRef = useRef<Set<THREE.BufferGeometry>>(new Set())
   const { gl } = useThree()
   const originals = useMemo(() => {
     const originalMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
@@ -725,57 +828,69 @@ function SceneMeshModel({
 
   // Expose the scene object so Viewer3D can attach the transform gizmo to it.
   useEffect(() => {
-    onObject(scene)
+    onObject(hasViewer3DRenderableContent(scene) ? scene : null)
     return () => onObject(null)
   }, [scene, onObject])
 
-  // Snapshot source resources before material overrides. Teardown must release
-  // originals even when an influence clone is still mounted; shared assets once.
+  // Dispose only the per-instance cloned materials we own. Loader caches and
+  // shared geometries stay intact so StrictMode remounts do not invalidate them.
   useEffect(() => {
-    const geometries = new Set<THREE.BufferGeometry>()
-    const materials = new Set<THREE.Material>()
-    scene.traverse((child) => {
-      if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
-      geometries.add(child.geometry)
-      const meshMaterials = Array.isArray(child.material) ? child.material : [child.material]
-      meshMaterials.forEach((material) => materials.add(material))
-    })
-    return () => {
-      if (loaderType === 'obj') useLoader.clear(OBJLoader, url)
-      else useGLTF.clear(url)
-      geometries.forEach((geometry) => geometry.dispose())
-      materials.forEach((material) => material.dispose())
-    }
-  }, [loaderType, scene, url])
-
-  // Only source geometry participates in BVH and DoubleSide setup.
-  useEffect(() => {
-    const geometries = new Set<THREE.BufferGeometry>()
-    scene.traverse((child) => {
-      if (!(child instanceof THREE.Mesh)) return
-      geometries.add(child.geometry)
-      const mats = Array.isArray(child.material) ? child.material : [child.material]
-      mats.forEach((material: THREE.Material) => { material.side = THREE.DoubleSide })
-    })
-    geometries.forEach((geometry) => (geometry as any).computeBoundsTree())
-    return () => {
-      geometries.forEach((geometry) => (geometry as any).disposeBoundsTree?.())
-    }
+    return () => disposeViewer3DOwnedSceneResources(scene)
   }, [scene])
 
-  // Centre the mesh on the grid. Runs only on first load / model change — never
-  // on plain re-renders, so a live gizmo transform is not silently overwritten.
   useEffect(() => {
-    // Clear any cached transform before measuring (useGLTF may reuse a scene
-    // that still carries an earlier gizmo pose).
-    scene.position.set(0, 0, 0)
-    scene.rotation.set(0, 0, 0)
-    scene.scale.set(1, 1, 1)
-    const box = new THREE.Box3().setFromObject(scene)
-    const center = new THREE.Vector3()
-    box.getCenter(center)
-    scene.position.set(-center.x, -box.min.y, -center.z)
+    scene.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return
+      const materials = Array.isArray(child.material) ? child.material : [child.material]
+      materials.forEach((material) => {
+        material.side = THREE.DoubleSide
+        material.needsUpdate = true
+      })
+    })
+  }, [scene])
 
+  // Build BVHs only when edit/picking features need accelerated raycasts.
+  useEffect(() => {
+    if (!shouldEnableViewer3DBvh({ editMode, landmarkPicking })) return
+
+    let cancelled = false
+    let timeoutId: number | null = null
+    let idleId: number | null = null
+
+    const build = () => {
+      if (cancelled) return
+      const built = new Set<THREE.BufferGeometry>()
+      scene.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return
+        const geometry = child.geometry
+        if (built.has(geometry)) return
+        ;(geometry as any).computeBoundsTree?.()
+        built.add(geometry)
+      })
+      bvhGeometriesRef.current = built
+    }
+
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+      idleId = window.requestIdleCallback(() => build())
+    } else {
+      timeoutId = window.setTimeout(build, 0)
+    }
+
+    return () => {
+      cancelled = true
+      if (idleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(idleId)
+      }
+      if (timeoutId !== null && typeof window !== 'undefined') window.clearTimeout(timeoutId)
+      bvhGeometriesRef.current.forEach((geometry) => {
+        ;(geometry as any).disposeBoundsTree?.()
+      })
+      bvhGeometriesRef.current = new Set()
+    }
+  }, [editMode, landmarkPicking, scene])
+
+  // Preserve authored transforms. Only collect stats when the loaded scene changes.
+  useEffect(() => {
     onStats(collectViewer3DSceneStats(scene))
   }, [scene, onStats])
 
@@ -865,6 +980,47 @@ function SceneMeshModel({
     </>
   )
 
+}
+
+function SceneFrameController({ object, frameKey, controlsRef }: {
+  object: THREE.Object3D | null
+  frameKey: string | null
+  controlsRef: MutableRefObject<OrbitControlsImpl | null>
+}): null {
+  const { camera, size, invalidate } = useThree()
+  const lastFramedKeyRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!object || !frameKey || lastFramedKeyRef.current === frameKey || !hasViewer3DRenderableContent(object)) return
+
+    object.updateMatrixWorld(true)
+    const frame = resolveViewer3DCameraFrame({
+      bounds: new THREE.Box3().setFromObject(object),
+      aspect: size.width > 0 && size.height > 0 ? size.width / size.height : 1,
+      fovDegrees: camera instanceof THREE.PerspectiveCamera ? camera.fov : 45,
+      direction: camera.position.clone().sub(controlsRef.current?.target ?? new THREE.Vector3()),
+    })
+    if (!frame) return
+
+    camera.position.copy(frame.position)
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.near = frame.near
+      camera.far = frame.far
+      camera.updateProjectionMatrix()
+    }
+
+    if (controlsRef.current) {
+      controlsRef.current.target.copy(frame.target)
+      controlsRef.current.minDistance = frame.minDistance
+      controlsRef.current.maxDistance = frame.maxDistance
+      controlsRef.current.update()
+    }
+
+    lastFramedKeyRef.current = frameKey
+    invalidate()
+  }, [camera, controlsRef, frameKey, invalidate, object, size.height, size.width])
+
+  return null
 }
 
 function LandmarkMarkers({
@@ -2561,6 +2717,18 @@ type Viewer3DKimodoMetadataDescriptor = {
   detectionMode: 'provenance' | 'sibling-metadata'
 }
 
+export function isViewer3DKimodoSiblingMetadataCandidate(workspacePath: string | undefined): boolean {
+  if (!workspacePath) return false
+  const normalized = workspacePath.replace(/\\/g, '/').trim()
+  if (!isSafeViewerWorkspaceRelativePath(normalized, { meshOnly: true })) return false
+
+  const lower = normalized.toLowerCase()
+  const fileName = lower.split('/').pop()
+  if (fileName !== 'animated.glb' && fileName !== 'preview.glb') return false
+
+  return lower.split('/').some((segment) => segment.includes('kimodo'))
+}
+
 export function resolveViewer3DKimodoMetadataDescriptor(args: {
   apiUrl: string
   artifact?: ArtifactRef
@@ -2570,15 +2738,15 @@ export function resolveViewer3DKimodoMetadataDescriptor(args: {
   const artifact = args.artifact ?? createViewer3DKimodoFallbackArtifactFromModelUrl(args.modelUrl, args.apiUrl, args.workspaceDir)
   if (!artifact) return undefined
 
+  const artifactWorkspacePath = resolveViewer3DArtifactWorkspacePath(artifact, args.modelUrl, args.apiUrl, args.workspaceDir)
+  if (!artifactWorkspacePath) return undefined
+
   const detectionMode = artifact.provenance?.extensionId === 'kimodo-soma-rp' && artifact.provenance.extensionNodeId === 'animate-rigged-mesh'
     ? 'provenance'
-    : !artifact.provenance && resolveViewer3DArtifactWorkspacePath(artifact, args.modelUrl, args.apiUrl, args.workspaceDir)?.endsWith('.glb')
+    : !artifact.provenance && isViewer3DKimodoSiblingMetadataCandidate(artifactWorkspacePath)
       ? 'sibling-metadata'
       : undefined
   if (!detectionMode) return undefined
-
-  const artifactWorkspacePath = resolveViewer3DArtifactWorkspacePath(artifact, args.modelUrl, args.apiUrl, args.workspaceDir)
-  if (!artifactWorkspacePath) return undefined
 
   const bundleSegments = artifactWorkspacePath.split('/')
   if (bundleSegments.length < 2) return undefined
@@ -4767,6 +4935,7 @@ export default function Viewer3D({
   modelRef.current = isSplat ? null : modelUrl
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const splatRef = useRef<SplatViewerHandle | null>(null)
+  const controlsRef = useRef<OrbitControlsImpl | null>(null)
   const [meshObject, setMeshObject] = useState<THREE.Object3D | null>(null)
   const transformHistory = useRef<TransformSnapshot[]>([])
   const pendingTransform = useRef<TransformSnapshot | null>(null)
@@ -4780,6 +4949,9 @@ export default function Viewer3D({
   const hasRig = !!modelUrl && !isSplat && rigSource?.url === modelUrl && rigSource.stats.hasRig
   const [loadedSource, sourceRef, setLoadedSource] = useCurrentState<LoadedScene | null>(() => null)
   const liveSource = loadedSource?.url === modelUrl && !isSplat ? loadedSource : null
+  const currentMeshObject = liveSource?.scene === meshObject ? meshObject : null
+  const canRenderViewportGizmos = shouldRenderViewer3DViewportGizmos({ modelUrl, hasCurrentJob: Boolean(currentJob), object: currentMeshObject })
+  const sceneFrameKey = modelUrl && currentMeshObject ? `${modelUrl}:${currentMeshObject.uuid}` : null
   const isLive = useCallback((source: LoadedScene | null): source is LoadedScene =>
     !!source && sourceRef.current === source && modelRef.current === source.url, [sourceRef])
   useEffect(() => {
@@ -5793,6 +5965,8 @@ export default function Viewer3D({
             />
           ))}
 
+          <SceneFrameController object={currentMeshObject} frameKey={sceneFrameKey} controlsRef={controlsRef} />
+
           {selected && meshObject && gizmoMode === 'translate' && (
             <TranslateGizmo object={meshObject} onDragStart={handleGizmoDragStart} onDragEnd={handleGizmoDragEnd} />
           )}
@@ -5804,6 +5978,7 @@ export default function Viewer3D({
           )}
 
           <OrbitControls
+            ref={controlsRef}
             makeDefault
             enablePan
             enableZoom
@@ -5816,9 +5991,11 @@ export default function Viewer3D({
             dampingFactor={0.05}
           />
 
-          <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={modelUrl && currentJob ? 2 : 0}>
-            <GizmoBubbles />
-          </GizmoHelper>
+          {canRenderViewportGizmos ? (
+            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={2}>
+              <GizmoBubbles />
+            </GizmoHelper>
+          ) : null}
         </Canvas>
         )}
 

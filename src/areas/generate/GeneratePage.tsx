@@ -491,6 +491,10 @@ export function AssetLibraryPopover({
   )
 }
 
+export function resolveGenerateImportFailureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 // ---------------------------------------------------------------------------
 // GeneratePage
 // ---------------------------------------------------------------------------
@@ -678,6 +682,8 @@ export default function GeneratePage(): JSX.Element {
       const job: GenerationJob = buildSceneImportGenerationJob({ meshPath: filePath, url, displayName: filePath.split(/[\\/]/).pop() ?? filePath })
       setCurrentJob(job)
       pushMeshUrl(url)
+    } catch (error) {
+      showError(resolveGenerateImportFailureMessage(error))
     } finally {
       setImporting(false)
     }

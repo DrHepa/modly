@@ -42,12 +42,9 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     .find((e) => e.id === data.extensionId)
 
   const isTerminal = ext?.id === 'mesh-exporter'
-  const legacyInput = ext?.input === 'none' ? undefined : ext?.input
-  const targetPorts = ext?.input === 'none'
-    ? []
-    : getProcessTargetPorts({ input: legacyInput ?? 'image', inputs: ext?.inputs })
+  const targetPorts = ext ? getProcessTargetPorts(ext) : []
   const hasNamedTargetPorts = targetPorts.length > 1 || targetPorts.some((port) => !port.isLegacy)
-  const sourcePorts = isTerminal ? [] : getExtensionSourcePorts({ output: ext?.output, outputs: ext?.type === 'model' ? ext.outputs : undefined })
+  const sourcePorts = isTerminal ? [] : getExtensionSourcePorts({ output: ext?.output })
   const hasNamedSourcePorts = sourcePorts.some((port) => !port.isLegacy)
   const hasParams = (ext?.params.length ?? 0) > 0
   const paramSections = partitionAdvancedParams(ext?.params ?? [])
@@ -97,7 +94,6 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
               <div className="flex shrink-0 flex-col items-end gap-1 self-start pt-0.5">
                 {sourcePorts.map((port) => (
                   <div key={port.name ?? '__legacy-source'} className="flex items-center justify-end gap-1.5 min-w-0">
-                    {!port.isLegacy && <span className="text-[9px] text-zinc-400 truncate">{port.label ?? port.name}</span>}
                     <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium border ${TAG_CLS[port.type] ?? 'border-zinc-700 bg-zinc-800 text-zinc-400'}`}>
                       {port.type}
                     </span>
@@ -145,24 +141,6 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
             }}
           />
         ))}
-        {hasNamedSourcePorts && sourcePorts[0] && (
-          <Handle
-            key="__primary-source-alias"
-            type="source"
-            position={Position.Right}
-            isConnectable={false}
-            aria-label="Primary output compatibility handle"
-            style={{
-              background: PROCESS_PORT_HANDLE_COLOR[sourcePorts[0].type],
-              width: 8,
-              height: 8,
-              border: '2px solid #18181b',
-              top: handleTop,
-              opacity: 0,
-              pointerEvents: 'none',
-            }}
-          />
-        )}
         {sourcePorts.map((port, index) => (
           <Handle
             key={port.name ?? '__legacy-source'}

@@ -1,6 +1,6 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
-import type { ExtensionOutputPort, ExtensionWorkflowNode, ModelInputKind, ParamSchema, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, ProcessPort } from '@shared/types/electron.d'
 import type { ArtifactKind } from '@shared/types/artifacts.ts'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
@@ -15,8 +15,6 @@ interface WorkflowExtensionBase {
   description:     string
   output:          ArtifactKind
   inputs?:         ProcessPort[]
-  outputs?:        ExtensionOutputPort[]
-  ioContract?:      'named-v1'
   processOwnerId?: string
   params:          ParamSchema[]
   builtin:         boolean
@@ -151,8 +149,6 @@ export function buildAllWorkflowExtensions(
         input:           node.input,
         output:          node.output,
         ...(node.inputs ? { inputs: normalizeWorkflowProcessInputs(node.inputs) } : {}),
-        ...(node.outputs ? { outputs: node.outputs } : {}),
-        ...(node.ioContract ? { ioContract: node.ioContract } : {}),
         ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          normalizeWorkflowParams(node.paramsSchema),
         builtin:         ext.builtin,

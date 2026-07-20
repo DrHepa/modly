@@ -1,5 +1,4 @@
 import type {
-  ExtensionOutputPort,
   ModelInputKind,
   ProcessPort,
 } from '../../shared/types/electron.d'
@@ -14,7 +13,6 @@ type ProcessPortOwner = {
 
 type ExtensionOutputOwner = {
   output?: ArtifactKind
-  outputs?: ExtensionOutputPort[]
 }
 
 export type ResolvedProcessTargetPort = {
@@ -85,16 +83,6 @@ export function getProcessTargetPort(owner: ProcessPortOwner, targetHandle?: str
 }
 
 export function getExtensionSourcePorts(owner: ExtensionOutputOwner): ResolvedExtensionSourcePort[] {
-  if (Array.isArray(owner.outputs) && owner.outputs.length > 0) {
-    return owner.outputs.map((port, index) => ({
-      name: port.name,
-      ...(port.label ? { label: port.label } : {}),
-      type: port.type,
-      isLegacy: false,
-      primary: index === 0,
-    }))
-  }
-
   if (!owner.output) return []
   return [{ name: null, type: owner.output, isLegacy: true, primary: true }]
 }

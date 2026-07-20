@@ -5,7 +5,7 @@ import type {
   WFNode,
 } from '../../shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions.ts'
-import { getExtensionSourcePort, getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
+import { getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
 import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 
 type NodeOutput = {
@@ -33,7 +33,6 @@ type BuildProcessExecutionInputArgs = {
 function getNodeOutputType(
   node: WFNode | undefined,
   allExtensions: WorkflowExtension[],
-  sourceHandle?: string | null,
 ): NamedProcessInput['type'] | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
@@ -47,30 +46,14 @@ function getNodeOutputType(
   const extension = getWorkflowExtension(extensionId, allExtensions)
   if (!extension) return undefined
   if (extension.type !== 'model') return extension.output
-  return asArtifactKind(getExtensionSourcePort(extension, sourceHandle)?.type)
-}
-
-
-export function getWorkflowNodeOutputKey(nodeId: string, sourceHandle: string): string {
-  return `${nodeId}::output::${sourceHandle}`
+  return extension.output
 }
 
 export function resolveWorkflowEdgeOutput<T extends NodeOutput>(
-  edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
+  edge: Pick<WFEdge, 'source'>,
   nodeOutputs: Map<string, T>,
-  sourceExtension?: Pick<WorkflowExtension, 'id' | 'type' | 'outputs'>,
 ): T | undefined {
-  const modelSourceExtension = sourceExtension?.type === 'model' ? sourceExtension : undefined
-  if (!edge.sourceHandle || !modelSourceExtension?.outputs?.length) return nodeOutputs.get(edge.source)
-
-  const preservedNamedOutput = nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, edge.sourceHandle))
-  if (preservedNamedOutput) return preservedNamedOutput
-
-  const declaredNamedOutput = modelSourceExtension.outputs.find((output) => output.name === edge.sourceHandle)
-  if (!declaredNamedOutput) return nodeOutputs.get(edge.source)
-
-  return nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, declaredNamedOutput.name))
-    ?? nodeOutputs.get(edge.source)
+  return nodeOutputs.get(edge.source)
 }
 
 function getProcessNodeId(node: WFNode, extension: WorkflowExtension | undefined): string {
@@ -102,8 +85,7 @@ export function buildProcessExecutionInput({
     for (const edge of incomingEdges) {
       const sourceNode = nodes.find((candidate) => candidate.id === edge.source)
       const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
-      const sourceExtension = getWorkflowExtension(sourceExtensionId, allExtensions)
-      const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs, sourceExtension)
+      const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs)
       if (sourceOutput?.filePath !== undefined) filePath = sourceOutput.filePath
       if (sourceOutput?.text !== undefined) text = sourceOutput.text
     }
@@ -125,11 +107,10 @@ export function buildProcessExecutionInput({
 
     const sourceNode = nodes.find((candidate) => candidate.id === edge.source)
     const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
-    const sourceExtension = getWorkflowExtension(sourceExtensionId, allExtensions)
-    const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs, sourceExtension)
+    const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs)
     if (!sourceOutput || (sourceOutput.filePath === undefined && sourceOutput.text === undefined)) continue
 
-    const type = getNodeOutputType(sourceNode, allExtensions, edge.sourceHandle)
+    const type = getNodeOutputType(sourceNode, allExtensions)
       ?? asArtifactKind(targetPort.type)
     if (!type) continue
 

@@ -19,10 +19,7 @@ function resolvePreviewOutput(incomingEdge: PreviewEdge | undefined, nodeOutputs
     return undefined
   }
 
-  const outputKey = incomingEdge.sourceHandle
-    ? `${incomingEdge.source}::output::${incomingEdge.sourceHandle}`
-    : incomingEdge.source
-  return nodeOutputs[outputKey]
+  return nodeOutputs[incomingEdge.source]
 }
 
 type ResolvePreviewImageUrlArgs = {

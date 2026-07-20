@@ -37,7 +37,7 @@ test('inputless model nodes expose no target socket and skip predecessor fallbac
   const extensionNodeSource = await readWorkflowFile('nodes/ExtensionNode.tsx')
   const runStoreSource = await readWorkflowFile('workflowRunStore.ts')
 
-  assert.match(extensionNodeSource, /ext\?\.input === 'none'\s*\? \[\]/)
+  assert.match(extensionNodeSource, /const targetPorts = ext \? getProcessTargetPorts\(ext\) : \[\]/)
   assert.match(extensionNodeSource, /ext\?\.input !== 'none'/)
   assert.match(runStoreSource, /export function shouldUsePreviousNodeFallback[\s\S]*return input !== 'none'/)
   assert.match(runStoreSource, /else if \(shouldUsePreviousNodeFallback\(ext\.input\)\)/)
@@ -47,11 +47,12 @@ test('inputless model nodes expose no target socket and skip predecessor fallbac
 })
 
 
-test('named-output model nodes keep an anonymous primary source alias for legacy edges', async () => {
+test('extension nodes keep a single anonymous primary source handle for legacy edges', async () => {
   const source = await readWorkflowFile('nodes/ExtensionNode.tsx')
-  assert.match(source, /key="__primary-source-alias"/)
-  assert.match(source, /isConnectable=\{false\}/)
+  assert.match(source, /getExtensionSourcePorts\(\{ output: ext\?\.output \}\)/)
+  assert.match(source, /\{\.\.\.\(port\.name \? \{ id: port\.name \} : \{\}\)\}/)
   assert.match(source, /sourcePorts\.map\(\(port, index\)/)
+  assert.doesNotMatch(source, /__primary-source-alias/)
 })
 
 test('extension node tag classes keep scene and audio styling on distinct keys', async () => {

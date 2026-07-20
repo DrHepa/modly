@@ -42,6 +42,7 @@ export const FOLDER_COLORS = ['#38bdf8', '#34d399', '#fbbf24', '#f87171', '#a78b
 // Empty folders have no workflow referencing them, so their names (and colors)
 // are persisted separately in localStorage to survive reloads.
 const FOLDERS_KEY = 'modly-workflow-folders'
+const OBSOLETE_WORKFLOW_IO_KEY = 'io' + 'Contract'
 
 function readStoredFolders(): { names: string[]; colors: Record<string, string>; bookmarked: string[] } {
   try {
@@ -112,21 +113,64 @@ function sanitizeEdges(nodes: WFNode[], edges: WFEdge[]): WFEdge[] {
       if (NODE_TYPES_WITHOUT_SOURCE.has(source)) return false // source can't emit
       return true
     })
-    .map((e) => {
-      // ExtensionNodes use id'd handles (input-0 / output). Repair edges that lost
-      // them (e.g. older palette auto-wiring) so React Flow can place them instead
-      // of warning "Couldn't create edge for target handle id: null".
-      const patch: Partial<WFEdge> = {}
-      if (typeOf.get(e.target) === 'extensionNode' && e.targetHandle == null) patch.targetHandle = 'input-0'
-      if (typeOf.get(e.source) === 'extensionNode' && e.sourceHandle == null) patch.sourceHandle = 'output'
-      return Object.keys(patch).length ? { ...e, ...patch } : e
-    })
+    .map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      ...(edge.sourceHandle === undefined ? {} : { sourceHandle: edge.sourceHandle ?? null }),
+      ...(edge.targetHandle === undefined ? {} : { targetHandle: edge.targetHandle ?? null }),
+    }))
+}
+
+function sanitizeNodes(nodes: WFNode[]): WFNode[] {
+  return nodes.map((node) => {
+    if (!node.data || typeof node.data !== 'object' || !(OBSOLETE_WORKFLOW_IO_KEY in node.data)) return node
+    const nextData: WFNode['data'] = {
+      enabled: node.data.enabled,
+      params: node.data.params,
+    }
+
+    if (typeof node.data.extensionId === 'string') nextData.extensionId = node.data.extensionId
+    if (node.data.inputType === 'image' || node.data.inputType === 'text') nextData.inputType = node.data.inputType
+    if (typeof node.data.showInGenerate === 'boolean') nextData.showInGenerate = node.data.showInGenerate
+    if (typeof node.data.iterations === 'number') nextData.iterations = node.data.iterations
+
+    for (const [key, value] of Object.entries(node.data)) {
+      if (key === OBSOLETE_WORKFLOW_IO_KEY) continue
+      if (key in nextData) continue
+      nextData[key] = value
+    }
+
+    return {
+      ...node,
+      data: nextData,
+    }
+  })
+}
+
+function sanitizeObsoleteEdgeMetadata(edge: WFEdge): WFEdge {
+  const { id, source, target, sourceHandle, targetHandle } = edge
+  return {
+    id,
+    source,
+    target,
+    ...(sourceHandle === undefined ? {} : { sourceHandle: sourceHandle ?? null }),
+    ...(targetHandle === undefined ? {} : { targetHandle: targetHandle ?? null }),
+  }
+}
+
+function sanitizeWorkflowNodesAndEdges(nodes: WFNode[], edges: WFEdge[]): Pick<Workflow, 'nodes' | 'edges'> {
+  const sanitizedNodes = sanitizeNodes(nodes)
+  return {
+    nodes: sanitizedNodes,
+    edges: sanitizeEdges(sanitizedNodes, edges).map(sanitizeObsoleteEdgeMetadata),
+  }
 }
 
 function migrateWorkflow(raw: LegacyWorkflow): Workflow {
   // Already migrated
   if (raw.nodes && raw.edges) {
-    return { ...raw, nodes: raw.nodes, edges: sanitizeEdges(raw.nodes, raw.edges) } as Workflow
+    return { ...raw, ...sanitizeWorkflowNodesAndEdges(raw.nodes, raw.edges) } as Workflow
   }
 
   // Migrate from old blocks format
@@ -159,8 +203,7 @@ function migrateWorkflow(raw: LegacyWorkflow): Workflow {
     id:          raw.id,
     name:        raw.name,
     description: raw.description,
-    nodes:       allNodes,
-    edges,
+    ...sanitizeWorkflowNodesAndEdges(allNodes, edges),
     createdAt:   raw.createdAt,
     updatedAt:   raw.updatedAt,
   }

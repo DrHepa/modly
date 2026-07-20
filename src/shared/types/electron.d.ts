@@ -92,8 +92,6 @@ export interface ExtensionNode<
   input:            TInput
   output:           ArtifactKind
   inputs?:          ProcessPort[]
-  outputs?:         ExtensionOutputPort[]
-  ioContract?:      'named-v1'
   paramsSchema:     RawParamSchema[]
   hfRepo?:          string
   hfDownloads?:     HfDownloadDescriptor[]
@@ -158,13 +156,6 @@ export interface ProcessPort {
   min_items?: number
   max_items?: number
   ordered?: true
-}
-
-export interface ExtensionOutputPort {
-  name:   string
-  label?: string
-  type:   ExtensionPortKind
-  required?: boolean
 }
 
 export interface NamedProcessInput {
@@ -937,7 +928,6 @@ export type EditedSceneArtifactWriteResult =
 export interface WFNodeData {
   [key: string]: unknown
   extensionId?:    string
-  ioContract?:     'named-v1'
   inputType?:      'image' | 'text'
   enabled:         boolean
   showInGenerate?: boolean
@@ -966,7 +956,6 @@ export interface WFEdge {
   target:        string
   sourceHandle?: string | null
   targetHandle?: string | null
-  targetItemIndex?: number
 }
 
 export interface Workflow {

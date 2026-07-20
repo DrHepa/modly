@@ -951,7 +951,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   const handleGenerate = useCallback(() => {
     if (firstPreflightIssue) {
       showToast(firstPreflightIssue)
-      return
     }
     const wf: Workflow = { ...workflow, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges) }
     run(wf, allExtensions)

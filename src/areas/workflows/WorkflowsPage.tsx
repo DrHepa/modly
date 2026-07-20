@@ -1214,7 +1214,6 @@ function WorkflowCanvasInner({
     if (isRunning) { cancel(); return }
     if (preflightIssues.length > 0) {
       showToast(preflightIssues[0].message)
-      return
     }
     const wf: Workflow = { ...workflow, name, nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), updatedAt: new Date().toISOString() }
     onSave(wf)

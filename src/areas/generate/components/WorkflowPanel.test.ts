@@ -369,6 +369,14 @@ test('WorkflowPanel source keeps Generate ungated by semantic run validation', a
   assert.match(source, /WorkflowRunFeedback[\s\S]*runState=\{runState\}[\s\S]*runValidationIssue=\{null\}[\s\S]*isRunning=\{isRunning\}/)
 })
 
+test('WorkflowPanel warns on preflight issues without blocking Generate', async () => {
+  const source = await readFile(workflowPanelSource, 'utf8')
+
+  assert.match(source, /if \(firstPreflightIssue\) \{\s*showToast\(firstPreflightIssue\)\s*\}\s*const wf: Workflow/s)
+  assert.match(source, /const wf: Workflow = \{ \.\.\.workflow, nodes: toWorkflowNodes\(nodes\), edges: toWorkflowEdges\(edges\) \}\s*\n\s*run\(wf, allExtensions\)/)
+  assert.doesNotMatch(source, /if \(firstPreflightIssue\) \{\s*showToast\(firstPreflightIssue\)\s*return/s)
+})
+
 test('ArtifactHistoryDisclosure is a collapsed secondary Wait checkpoint entry by default', async () => {
   const html = await renderArtifactHistoryDisclosure({ rows: artifactHistoryRows })
 

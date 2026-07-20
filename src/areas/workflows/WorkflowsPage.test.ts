@@ -102,3 +102,11 @@ test('WorkflowsPage source never disables Run because of semantic process valida
   assert.doesNotMatch(source, /disabled=!isRunning && Boolean\(runValidationIssue\)/)
   assert.match(source, /title="Run workflow"/)
 })
+
+test('WorkflowsPage warns on preflight issues without blocking save and run', async () => {
+  const source = await readFile(sourcePath, 'utf8')
+
+  assert.match(source, /if \(preflightIssues\.length > 0\) \{\s*showToast\(preflightIssues\[0\]\.message\)\s*\}\s*const wf: Workflow/s)
+  assert.match(source, /onSave\(wf\)\s*\n\s*runWorkflow\(wf, allExtensions\)/)
+  assert.doesNotMatch(source, /if \(preflightIssues\.length > 0\) \{\s*showToast\(preflightIssues\[0\]\.message\)\s*return/s)
+})

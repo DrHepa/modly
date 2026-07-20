@@ -16,6 +16,18 @@ const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const workflowPanelEntry = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 const workflowPanelSource = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 
+function createLocalStorageMock(): Storage {
+  const store = new Map<string, string>()
+  return {
+    get length() { return store.size },
+    clear() { store.clear() },
+    getItem(key) { return store.get(key) ?? null },
+    key(index) { return [...store.keys()][index] ?? null },
+    removeItem(key) { store.delete(key) },
+    setItem(key, value) { store.set(key, value) },
+  }
+}
+
 async function loadWorkflowPanelModule() {
   const result = await build({
     entryPoints: [workflowPanelEntry],
@@ -32,7 +44,7 @@ async function loadWorkflowPanelModule() {
   vm.runInNewContext(result.outputFiles[0].text, {
     module, exports: module.exports, require: createRequire(import.meta.url), console, process, Promise,
     // The SSR fixture never reads or writes the user's persisted browser state.
-    localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    localStorage: createLocalStorageMock(),
   })
   return {
     module: module.exports,

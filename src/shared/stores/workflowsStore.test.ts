@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
 import type { Workflow } from '@shared/types/electron.d'
+import { WORKFLOW_TAB_SESSION_KEY, WORKFLOW_TAB_SESSION_VERSION } from './workflowTabSession'
 
 const localStorageState = new Map<string, string>()
 
@@ -32,6 +33,7 @@ if (!globalThis.localStorage) {
 
 const listCalls: Workflow[][] = []
 let listError: Error | null = null
+let importResult: { success: boolean; workflow?: Workflow } = { success: false }
 
 Object.defineProperty(globalThis, 'window', {
   configurable: true,
@@ -49,7 +51,7 @@ Object.defineProperty(globalThis, 'window', {
           return { success: true }
         },
         async import() {
-          return { success: false }
+          return importResult
         },
         async export() {
           return { success: true }
@@ -77,9 +79,19 @@ function workflow(id: string, name: string, updatedAt: string, folder?: string, 
   }
 }
 
+function writeTabSession(value: unknown): void {
+  localStorage.setItem(WORKFLOW_TAB_SESSION_KEY, JSON.stringify(value))
+}
+
+function readTabSession(): unknown {
+  const raw = localStorage.getItem(WORKFLOW_TAB_SESSION_KEY)
+  return raw === null ? null : JSON.parse(raw)
+}
+
 beforeEach(() => {
   listCalls.length = 0
   listError = null
+  importResult = { success: false }
   localStorage.clear()
   useWorkflowsStore.setState({
     workflows: [],
@@ -115,6 +127,102 @@ test('workflowsStore.load keeps resolved collision lists renderable and clears l
   assert.deepEqual(state.openIds, [canonical.id, sibling.id])
   assert.equal(state.activeId, canonical.id)
   assert.deepEqual(state.folders, ['Recovered'])
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: [canonical.id, sibling.id],
+    activeId: canonical.id,
+  })
+})
+
+test('workflowsStore hydrates open order and active tab from persisted session on restart', async () => {
+  const first = workflow('first', 'First', '2026-06-22T18:00:00.000Z')
+  const second = workflow('second', 'Second', '2026-06-22T17:00:00.000Z')
+  const third = workflow('third', 'Third', '2026-06-22T16:00:00.000Z')
+  writeTabSession({ version: WORKFLOW_TAB_SESSION_VERSION, openIds: [second.id, first.id], activeId: first.id })
+  listCalls.push([first, second, third])
+
+  useWorkflowsStore.setState({
+    workflows: [],
+    loading: false,
+    activeId: first.id,
+    openIds: [second.id, first.id],
+    folders: [],
+    folderColors: {},
+    bookmarkedFolders: [],
+  })
+
+  await useWorkflowsStore.getState().load()
+
+  const state = useWorkflowsStore.getState()
+  assert.deepEqual(state.openIds, [second.id, first.id])
+  assert.equal(state.activeId, first.id)
+})
+
+test('workflowsStore.load preserves explicit closed-all tab session', async () => {
+  const latest = workflow('latest', 'Latest', '2026-06-22T18:00:00.000Z')
+  const older = workflow('older', 'Older', '2026-06-22T17:00:00.000Z')
+  writeTabSession({ version: WORKFLOW_TAB_SESSION_VERSION, openIds: [], activeId: null })
+  listCalls.push([latest, older])
+
+  await useWorkflowsStore.getState().load()
+
+  const state = useWorkflowsStore.getState()
+  assert.deepEqual(state.openIds, [])
+  assert.equal(state.activeId, null)
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: [],
+    activeId: null,
+  })
+})
+
+test('workflowsStore.load falls back to the most recent workflow when persisted tabs were deleted', async () => {
+  const latest = workflow('latest', 'Latest', '2026-06-22T18:00:00.000Z')
+  const older = workflow('older', 'Older', '2026-06-22T17:00:00.000Z')
+  writeTabSession({ version: WORKFLOW_TAB_SESSION_VERSION, openIds: ['deleted-a', 'deleted-b'], activeId: 'deleted-b' })
+  listCalls.push([latest, older])
+
+  await useWorkflowsStore.getState().load()
+
+  const state = useWorkflowsStore.getState()
+  assert.deepEqual(state.openIds, [latest.id])
+  assert.equal(state.activeId, latest.id)
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: [latest.id],
+    activeId: latest.id,
+  })
+})
+
+test('workflowsStore.load ignores malformed persisted session and keeps default newest fallback', async () => {
+  localStorage.setItem(WORKFLOW_TAB_SESSION_KEY, '{bad-json')
+  const latest = workflow('latest', 'Latest', '2026-06-22T18:00:00.000Z')
+  const older = workflow('older', 'Older', '2026-06-22T17:00:00.000Z')
+  listCalls.push([latest, older])
+
+  await useWorkflowsStore.getState().load()
+
+  const state = useWorkflowsStore.getState()
+  assert.deepEqual(state.openIds, [latest.id])
+  assert.equal(state.activeId, latest.id)
+})
+
+test('workflowsStore.load repairs duplicate persisted ids and invalid active id', async () => {
+  const first = workflow('first', 'First', '2026-06-22T18:00:00.000Z')
+  const second = workflow('second', 'Second', '2026-06-22T17:00:00.000Z')
+  writeTabSession({ version: WORKFLOW_TAB_SESSION_VERSION, openIds: [second.id, second.id, first.id], activeId: 'missing' })
+  listCalls.push([first, second])
+
+  await useWorkflowsStore.getState().load()
+
+  const state = useWorkflowsStore.getState()
+  assert.deepEqual(state.openIds, [second.id, first.id])
+  assert.equal(state.activeId, second.id)
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: [second.id, first.id],
+    activeId: second.id,
+  })
 })
 
 test('workflowsStore.load preserves existing workflows when listing fails', async () => {
@@ -155,6 +263,72 @@ test('workflowsStore.load preserves legacy null handles instead of fabricating n
 
   const loaded = useWorkflowsStore.getState().workflows[0]
   assert.deepEqual(loaded.edges, [{ id: 'edge', source: 'source', target: 'target', sourceHandle: null, targetHandle: null }])
+})
+
+test('workflowsStore actions persist tab session mutations and reject activating closed ids', async () => {
+  const imported = workflow('imported', 'Imported', '2026-06-22T19:00:00.000Z')
+  importResult = { success: true, workflow: imported }
+
+  useWorkflowsStore.setState({
+    workflows: [workflow('first', 'First', '2026-06-22T18:00:00.000Z'), workflow('second', 'Second', '2026-06-22T17:00:00.000Z')],
+    loading: false,
+    activeId: 'first',
+    openIds: ['first'],
+    folders: [],
+    folderColors: {},
+    bookmarkedFolders: [],
+  })
+  writeTabSession({ version: WORKFLOW_TAB_SESSION_VERSION, openIds: ['first'], activeId: 'first' })
+
+  useWorkflowsStore.getState().openWorkflow('second')
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['first', 'second'],
+    activeId: 'second',
+  })
+
+  useWorkflowsStore.getState().moveOpenTab('second', 'first')
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['second', 'first'],
+    activeId: 'second',
+  })
+
+  useWorkflowsStore.getState().setActive('first')
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['second', 'first'],
+    activeId: 'first',
+  })
+
+  useWorkflowsStore.getState().closeWorkflow('second')
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['first'],
+    activeId: 'first',
+  })
+
+  useWorkflowsStore.getState().setActive('second')
+  assert.equal(useWorkflowsStore.getState().activeId, 'first')
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['first'],
+    activeId: 'first',
+  })
+
+  await useWorkflowsStore.getState().importFile()
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['first', imported.id],
+    activeId: imported.id,
+  })
+
+  await useWorkflowsStore.getState().remove(imported.id)
+  assert.deepEqual(readTabSession(), {
+    version: WORKFLOW_TAB_SESSION_VERSION,
+    openIds: ['first'],
+    activeId: 'first',
+  })
 })
 
 test('workflowsStore.load strips obsolete workflow metadata safely', async () => {

@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     generator_registry.initialize()
     yield
     # Shutdown: unload all models and stop the local LLM server
-    generator_registry.unload_all()
+    generator_registry.shutdown_all()
     from services.llm_server import llama_pool
     llama_pool.unload_all(force=True)
 

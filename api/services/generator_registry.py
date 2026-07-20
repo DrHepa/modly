@@ -1445,6 +1445,12 @@ class GeneratorRegistry:
                     + ", ".join(still_loaded)
                 )
 
+    def shutdown_all(self) -> None:
+        """Stop all runtimes through the confirmed, locked unload boundary."""
+        with self._lifecycle_lock:
+            self._invalidate_runtime_readiness()
+            self.unload_all()
+
 
 _EVIDENCE_ALLOWLIST = {
     "source",

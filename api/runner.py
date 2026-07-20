@@ -120,11 +120,16 @@ def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
     return node, model_dir
 
 
-def _resolve_ready_schema(GenClass, node: dict, manifest: dict) -> list:
-    try:
-        return GenClass.params_schema()
-    except Exception:
-        return node.get("params_schema") or manifest.get("params_schema", [])
+def _resolve_ready_schema(gen, node: dict, manifest: dict) -> list:
+    schema = getattr(gen, "params_schema", None)
+    if callable(schema):
+        try:
+            resolved = schema()
+            if resolved is not None:
+                return resolved
+        except Exception:
+            pass
+    return node.get("params_schema") or manifest.get("params_schema", [])
 
 
 def _generator_is_loaded(gen) -> bool:
@@ -238,12 +243,6 @@ def main() -> None:
     # explicit node id; MODEL_DIR name inference remains only as a legacy fallback.
     node, model_dir = resolve_runner_context(manifest)
 
-    # Announce readiness and send params_schema so ExtensionProcess
-    # can serve it without needing to query the subprocess later.
-    # We try to get it from the generator class (may be a classmethod),
-    # falling back to the selected node, then to the top-level manifest.
-    send({"type": "ready", "params_schema": _resolve_ready_schema(GenClass, node, manifest)})
-
     # Use MODEL_DIR env var (set by ExtensionProcess) when available so the
     # generator uses the exact same path that is_downloaded() checks against.
     # Falls back to MODELS_DIR/manifest_id for legacy / standalone use.
@@ -257,6 +256,10 @@ def main() -> None:
     gen.input = node.get("input") or manifest.get("input", "image")
     gen.hf_downloads = node.get("hf_downloads") or manifest.get("hf_downloads", [])
     gen.https_downloads = node.get("https_downloads") or manifest.get("https_downloads", [])
+
+    # Announce readiness after construction and manifest injection, without
+    # loading weights. Instance schemas can use the selected node metadata.
+    send({"type": "ready", "params_schema": _resolve_ready_schema(gen, node, manifest)})
 
     # Active cancel events keyed by request id
     _cancel: dict[str, threading.Event] = {}

@@ -28,6 +28,38 @@ test('listStoredWorkflows reports filename/id mismatches and deduplicates by wor
   assert.deepEqual(result.diagnostics.duplicateIds, [{ workflowId: 'same-id', files: ['same-id.json', 'wrong-file.json'] }])
 })
 
+test('listStoredWorkflows prefers the canonical filename when the reported collision exists', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'modly-workflows-collision-'))
+  const canonicalId = '5c721f0a-27ff-4627-81b9-7a37154bcd7e'
+  const mismatchedFileId = '65e20864-140a-4ba7-b9d5-8541cad4ddd1'
+
+  await writeFile(
+    join(dir, `${mismatchedFileId}.json`),
+    JSON.stringify(workflow(canonicalId, 'Mismatch Copy', '2026-06-22T17:00:00.000Z')),
+    'utf-8',
+  )
+  await writeFile(
+    join(dir, `${canonicalId}.json`),
+    JSON.stringify(workflow(canonicalId, 'Canonical Copy', '2026-06-22T16:00:00.000Z')),
+    'utf-8',
+  )
+
+  const result = await listStoredWorkflows(dir)
+
+  assert.deepEqual(result.workflows.map((item) => item.id), [canonicalId])
+  assert.equal(result.workflows[0].name, 'Canonical Copy')
+  assert.deepEqual(result.diagnostics.filenameIdMismatches, [{
+    file: `${mismatchedFileId}.json`,
+    fileId: mismatchedFileId,
+    workflowId: canonicalId,
+  }])
+  assert.deepEqual(result.diagnostics.duplicateIds, [{
+    workflowId: canonicalId,
+    files: [`${canonicalId}.json`, `${mismatchedFileId}.json`],
+  }])
+  assert.deepEqual(result.diagnostics.corruptedFiles, [])
+})
+
 test('saveWorkflowWithBackup copies the previous workflow before overwriting', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'modly-workflows-save-'))
   await writeFile(join(dir, 'workflow-id.json'), JSON.stringify(workflow('workflow-id', 'Before')), 'utf-8')

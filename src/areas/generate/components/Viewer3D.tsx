@@ -60,6 +60,9 @@ import type { ArtifactRef } from '../../../shared/types/artifacts.ts'
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale'
 
+// Drei Hud with priority 1 renders the default scene first, then the gizmo HUD.
+export const VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY = 1
+
 type RigStats = {
   hasRig: boolean
   skinnedMeshCount: number
@@ -5730,7 +5733,7 @@ export default function Viewer3D({ lightSettings = DEFAULT_LIGHT_SETTINGS, gizmo
           />
 
           {canRenderViewportGizmos ? (
-            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={2}>
+            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY}>
               <GizmoBubbles />
             </GizmoHelper>
           ) : null}

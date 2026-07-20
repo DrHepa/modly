@@ -227,6 +227,24 @@ test('Viewer3D viewport gizmos render only when a real renderable object is load
   }
 })
 
+test('Viewer3D viewport gizmo locks Drei Hud render priority to 1 when a model is renderable', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const source = readFileSync(viewer3DEntry, 'utf8')
+    const meshGroup = new THREE.Group()
+    meshGroup.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial()))
+
+    assert.equal(module.shouldRenderViewer3DViewportGizmos({ modelUrl: 'http://127.0.0.1:8000/workspace/mesh.glb', hasCurrentJob: true, object: meshGroup }), true)
+    assert.equal(module.VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY, 1)
+    assert.match(source, /renderPriority=\{VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY\}/)
+    assert.doesNotMatch(source, /renderPriority=\{0\}/)
+    assert.doesNotMatch(source, /renderPriority=\{2\}/)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('Viewer3D local DreamCube regression GLB parses and reports finite bounds when present', { skip: !existsSync(dreamCubeRegressionGlbPath) }, async () => {
   const bytes = readFileSync(dreamCubeRegressionGlbPath)
   const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)

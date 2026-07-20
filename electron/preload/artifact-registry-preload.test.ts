@@ -3,9 +3,20 @@ import test from 'node:test'
 
 const { createElectronApi } = await import(new URL('./electron-api.ts', import.meta.url).href)
 
+const webFrame = { setZoomFactor() {} }
+
+function createTestApi(ipcRenderer: {
+  invoke(channel: string, ...args: unknown[]): Promise<unknown>
+  send(channel: string, ...args: unknown[]): void
+  on(channel: string, listener: (...args: unknown[]) => void): void
+  removeAllListeners(channel: string): void
+}) {
+  return createElectronApi({ ipcRenderer, webFrame })
+}
+
 test('preload workspace artifact registry invokes minimal sidecar IPC channels', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -71,7 +82,7 @@ test('preload workspace artifact registry invokes minimal sidecar IPC channels',
 
 test('preload workspace artifact registry invokes edited scene artifact IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -106,7 +117,7 @@ test('preload workspace artifact registry invokes edited scene artifact IPC chan
 
 test('preload exposes scoped Worlds scene manifest writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -128,7 +139,7 @@ test('preload exposes scoped Worlds scene manifest writer IPC channel', async ()
 
 test('preload workspace artifact registry exposes landmark sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -175,7 +186,7 @@ test('preload workspace artifact registry exposes landmark sidecar writer IPC ch
 
 test('preload workspace artifact registry exposes pose clip sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -267,7 +278,7 @@ test('preload workspace artifact registry exposes pose clip sidecar reader IPC c
       error: 'Invalid pose clip sidecar: invalid_schema',
     },
   ] as const
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -307,7 +318,7 @@ test('preload workspace artifact registry exposes pose clip sidecar reader IPC c
 
 test('preload workspace artifact registry exposes motion retarget sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -416,7 +427,7 @@ test('preload workspace artifact registry exposes motion retarget sidecar reader
       error: 'Invalid motion retarget sidecar: invalid_schema',
     },
   ] as const
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -456,7 +467,7 @@ test('preload workspace artifact registry exposes motion retarget sidecar reader
 
 test('preload workspace artifact registry exposes workspace artifact preview and download IPC channels', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -514,7 +525,7 @@ test('preload workspace artifact registry exposes workspace artifact preview and
 
 test('preload workspace artifact registry exposes dedicated rig rename sidecar writer IPC channel', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -567,7 +578,7 @@ test('preload workspace artifact registry exposes dedicated rig rename sidecar w
 
 test('preload rig rename sidecar writer does not route through generic sidecar or GLB export IPC', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -642,7 +653,7 @@ test('preload workspace artifact registry exposes dedicated rig rename sidecar r
       sidecarWorkspacePath: 'Workflows/rig-edits/invalid-rig-aliases.rig.v1.json',
     },
   ] as const
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -712,7 +723,7 @@ test('preload workspace artifact registry exposes read-only UniRig rigmeta sidec
       message: 'Invalid rigmeta JSON: Unexpected token',
     },
   ] as const
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -743,7 +754,7 @@ test('preload workspace artifact registry exposes read-only UniRig rigmeta sidec
 
 test('preload workspace artifact registry exposes humanoid draft discovery and promotion persistence IPC channels', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},
@@ -837,7 +848,7 @@ test('preload workspace asset library exposes list, read, and open IPC channels'
     success: true,
     entry: listResult.entries[0],
   } as const
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},

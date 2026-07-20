@@ -8,15 +8,43 @@ export type IpcRendererLike = {
   removeAllListeners(channel: string): void
 }
 
-export function createElectronApi(ipcRenderer: IpcRendererLike) {
+export type WebFrameLike = {
+  setZoomFactor(factor: number): void
+}
+
+export type ElectronApiDependencies = {
+  ipcRenderer: IpcRendererLike
+  webFrame: WebFrameLike
+}
+
+function assertWebFrame(webFrame: WebFrameLike): void {
+  if (typeof webFrame?.setZoomFactor !== 'function') {
+    throw new TypeError('createElectronApi requires Electron webFrame.setZoomFactor')
+  }
+}
+
+export function createElectronApi({ ipcRenderer, webFrame }: ElectronApiDependencies) {
+  assertWebFrame(webFrame)
+
   return {
     window: {
       minimize: () => ipcRenderer.send('window:minimize'),
       maximize: () => ipcRenderer.send('window:maximize'),
-      close:    () => ipcRenderer.send('window:close')
+      close:    () => ipcRenderer.send('window:close'),
+      isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:isMaximized') as Promise<boolean>,
+      onMaximizeChange: (cb: (isMaximized: boolean) => void) => {
+        ipcRenderer.on('window:maximizeChanged', (_event, isMaximized) => cb(Boolean(isMaximized)))
+      },
+      offMaximizeChange: () => ipcRenderer.removeAllListeners('window:maximizeChanged'),
+    },
+    ui: {
+      setZoomFactor: (factor: number) => webFrame.setZoomFactor(factor),
     },
     shell: {
       openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
+    },
+    system: {
+      memory: (): Promise<{ total: number; used: number; available: number }> => ipcRenderer.invoke('system:memory') as Promise<{ total: number; used: number; available: number }>,
     },
     python: {
       start:     (): Promise<{ success: boolean; port?: number; error?: string }> => ipcRenderer.invoke('python:start') as Promise<{ success: boolean; port?: number; error?: string }>,
@@ -32,9 +60,11 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
       selectSceneFile:   (): Promise<string | null> => ipcRenderer.invoke('fs:selectSceneFile') as Promise<string | null>,
       saveModel:         (defaultName: string): Promise<string | null> => ipcRenderer.invoke('fs:saveModel', defaultName) as Promise<string | null>,
       readFileBase64:    (filePath: string): Promise<string> => ipcRenderer.invoke('fs:readFileBase64', filePath) as Promise<string>,
-      selectDirectory:   (): Promise<string | null> => ipcRenderer.invoke('fs:selectDirectory') as Promise<string | null>,
+      selectDirectory:   (defaultPath?: string): Promise<string | null> => ipcRenderer.invoke('fs:selectDirectory', defaultPath) as Promise<string | null>,
       savePath:          (args: { filters: { name: string; extensions: string[] }[]; defaultPath?: string }): Promise<string | null> => ipcRenderer.invoke('fs:savePath', args) as Promise<string | null>,
       listDir:           (dirPath: string): Promise<string[]> => ipcRenderer.invoke('fs:listDir', dirPath) as Promise<string[]>,
+      listFiles:         (dirPath: string, extensions?: string[]): Promise<string[]> => ipcRenderer.invoke('fs:listFiles', dirPath, extensions) as Promise<string[]>,
+      selectTextFile:    (): Promise<string | null> => ipcRenderer.invoke('fs:selectTextFile') as Promise<string | null>,
       moveDirectory:     (args: { src: string; dest: string }): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('fs:moveDirectory', args) as Promise<{ success: boolean; error?: string }>,
       deleteDirectory:   (dirPath: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('fs:deleteDirectory', dirPath) as Promise<{ success: boolean; error?: string }>,
       readScreenshotDataUrl: (filename: string): Promise<string> => ipcRenderer.invoke('fs:readScreenshotDataUrl', filename) as Promise<string>,
@@ -114,6 +144,7 @@ export function createElectronApi(ipcRenderer: IpcRendererLike) {
     extensions: {
       list: (): Promise<AnyExtension[]> => ipcRenderer.invoke('extensions:list') as Promise<AnyExtension[]>,
       installFromGitHub: (url: string): Promise<ExtensionInstallResult> => ipcRenderer.invoke('extensions:installFromGitHub', url) as Promise<ExtensionInstallResult>,
+      installFromLocal: (): Promise<ExtensionInstallResult & { cancelled?: boolean; localPath?: string }> => ipcRenderer.invoke('extensions:installFromLocal') as Promise<ExtensionInstallResult & { cancelled?: boolean; localPath?: string }>,
       uninstall: (extensionId: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:uninstall', extensionId) as Promise<{ success: boolean; error?: string }>,
       repair: (extensionId: string): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:repair', extensionId) as Promise<{ success: boolean; error?: string }>,
       reload: (): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('extensions:reload') as Promise<{ success: boolean; error?: string }>,

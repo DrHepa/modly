@@ -5,9 +5,20 @@ const { createElectronApi } = await import(
   new URL('./electron-api.ts', import.meta.url).href
 )
 
+const webFrame = { setZoomFactor() {} }
+
+function createTestApi(ipcRenderer: {
+  invoke(channel: string, ...args: unknown[]): Promise<unknown>
+  send(channel: string, ...args: unknown[]): void
+  on(channel: string, listener: (...args: unknown[]) => void): void
+  removeAllListeners(channel: string): void
+}) {
+  return createElectronApi({ ipcRenderer, webFrame })
+}
+
 test('preload HTTPS asset download sends only the canonical modelId payload', async () => {
   const invocations: Array<{ channel: string; args: unknown[] }> = []
-  const api = createElectronApi({
+  const api = createTestApi({
     send() {},
     on() {},
     removeAllListeners() {},

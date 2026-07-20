@@ -29,6 +29,7 @@ import {
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
 import { normalizeWorkflowEdges } from './workflowEdgeNormalization'
+import { resolveOpenWorkflows } from './openWorkflows'
 import { validateWorkflowPreflight } from './preflight'
 import { useWorkflowRunStore } from './workflowRunStore'
 import WorkflowEdge     from './nodes/WorkflowEdge'
@@ -795,13 +796,14 @@ function HelpModal({ onClose }: { onClose: () => void }) {
 // ─── Workflow canvas (inner, requires ReactFlowProvider) ──────────────────────
 
 function WorkflowCanvasInner({
-  workflow, allExtensions, onSave, panelOpen, onTogglePanel, onOpen, onImport,
+  workflow, allExtensions, onSave, panelOpen, onTogglePanel, onNew, onOpen, onImport,
 }: {
   workflow:         Workflow
   allExtensions:    WorkflowExtension[]
   onSave:           (w: Workflow) => void
   panelOpen:        boolean
   onTogglePanel:    () => void
+  onNew:            () => void
   onOpen:           () => void
   onImport:         () => void
 }) {
@@ -1237,6 +1239,18 @@ function WorkflowCanvasInner({
       {/* Header toolbar */}
       <div className="flex items-center gap-2 px-5 py-3 border-b border-zinc-800 shrink-0 bg-zinc-950/20">
 
+        {/* New */}
+        <button
+          onClick={onNew}
+          title="New workflow"
+          className="flex items-center gap-2 px-3.5 py-2 rounded-md text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 transition-colors shrink-0"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          <span className="text-sm font-medium">New Workflow</span>
+        </button>
+
         {/* Open */}
         <button
           onClick={onOpen}
@@ -1541,6 +1555,21 @@ export default function WorkflowsPage(): JSX.Element {
     s.runState.status === 'running' || s.runState.status === 'paused' ? s.activeWorkflowId : null,
   )
 
+  const handleCreateBlank = useCallback(async () => {
+    const wf = newWorkflow()
+    await save(wf)
+    openWorkflow(wf.id)
+  }, [save, openWorkflow])
+
+  // Closing the tab of an empty workflow (no nodes) deletes it too — a blank
+  // "New Workflow" the user closes is throwaway, don't let them pile up on disk.
+  // Reads the store directly so a keyboard shortcut never acts on a stale list.
+  const handleCloseTab = useCallback((id: string) => {
+    const wf = useWorkflowsStore.getState().workflows.find((w) => w.id === id)
+    if (wf && wf.nodes.length === 0) { remove(id); return }
+    closeWorkflow(id)
+  }, [remove, closeWorkflow])
+
   // Close the tab context menu on any outside click (it has no backdrop of its own)
   useEffect(() => {
     if (!tabMenu) return
@@ -1585,8 +1614,7 @@ export default function WorkflowsPage(): JSX.Element {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- store setters are stable; handleCreateBlank only uses them
-  }, [activeId, openIds])
+  }, [activeId, openIds, handleCreateBlank, handleCloseTab, setActive])
 
   // Fresh search / closed color picker each time the Open popup opens
   useEffect(() => {
@@ -1610,14 +1638,8 @@ export default function WorkflowsPage(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- setActive is a stable store setter
   }, [workflows, loading, activeId, openIds])
 
-  const openWorkflows  = openIds.map((id) => workflows.find((w) => w.id === id)).filter((w): w is Workflow => !!w)
+  const openWorkflows  = useMemo(() => resolveOpenWorkflows(workflows, openIds), [workflows, openIds])
   const activeWorkflow = workflows.find((w) => w.id === activeId) ?? null
-
-  async function handleCreateBlank() {
-    const wf = newWorkflow()
-    await save(wf)
-    openWorkflow(wf.id)
-  }
 
   async function handleImport() {
     const result = await importFile()
@@ -1791,15 +1813,6 @@ export default function WorkflowsPage(): JSX.Element {
     )
   }
 
-  // Closing the tab of an empty workflow (no nodes) deletes it too — a blank
-  // "New Workflow" the user closes is throwaway, don't let them pile up on disk.
-  // Reads the store directly so a keyboard shortcut never acts on a stale list.
-  function handleCloseTab(id: string) {
-    const wf = useWorkflowsStore.getState().workflows.find((w) => w.id === id)
-    if (wf && wf.nodes.length === 0) { remove(id); return }
-    closeWorkflow(id)
-  }
-
   async function handleToggleBookmark(id: string) {
     const wf = workflows.find((w) => w.id === id)
     if (!wf) return
@@ -1847,7 +1860,7 @@ export default function WorkflowsPage(): JSX.Element {
 
       {/* Tab bar */}
       <div className="flex items-stretch border-b border-zinc-800 bg-zinc-950/30 overflow-x-auto shrink-0 h-9">
-          {workflows.map((wf) => (
+          {openWorkflows.map((wf) => (
             <div
               key={wf.id}
               draggable
@@ -2197,6 +2210,7 @@ export default function WorkflowsPage(): JSX.Element {
               onSave={save}
               panelOpen={panelOpen}
               onTogglePanel={() => setPanelOpen((o) => !o)}
+              onNew={handleCreateBlank}
               onOpen={() => setOpenListVisible(true)}
               onImport={handleImport}
             />

@@ -1,5 +1,11 @@
 import { create } from 'zustand'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
+import {
+  createWorkflowTabSession,
+  readWorkflowTabSession,
+  reconcileWorkflowTabSession,
+  writeWorkflowTabSession,
+} from './workflowTabSession'
 
 interface WorkflowsStore {
   workflows:   Workflow[]
@@ -65,6 +71,10 @@ function readStoredFolders(): { names: string[]; colors: Record<string, string>;
 
 function storeFolders(names: string[], colors: Record<string, string>, bookmarked: string[]): void {
   try { localStorage.setItem(FOLDERS_KEY, JSON.stringify({ names, colors, bookmarked })) } catch { /* quota/private mode */ }
+}
+
+function persistTabSession(openIds: string[], activeId: string | null): void {
+  writeWorkflowTabSession(createWorkflowTabSession(openIds, activeId))
 }
 
 /** Least-used palette color, so new folders spread across the palette. */
@@ -211,14 +221,17 @@ function migrateWorkflow(raw: LegacyWorkflow): Workflow {
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 
+const initialFolders = readStoredFolders()
+const initialTabSession = readWorkflowTabSession()
+
 export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
   workflows: [],
   loading:   false,
-  activeId:  null,
-  openIds:   [],
-  folders:           readStoredFolders().names,
-  folderColors:      readStoredFolders().colors,
-  bookmarkedFolders: readStoredFolders().bookmarked,
+  activeId:  initialTabSession.session?.activeId ?? null,
+  openIds:   initialTabSession.session?.openIds ?? [],
+  folders:           initialFolders.names,
+  folderColors:      initialFolders.colors,
+  bookmarkedFolders: initialFolders.bookmarked,
 
   async load() {
     set({ loading: true })
@@ -236,14 +249,18 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
         list.push(wf)
       }
       set((s) => {
-        // Keep already-open tabs that still exist; on a fresh session open the
-        // most recent workflow (the list arrives sorted by updatedAt desc).
-        const openIds = s.openIds.length > 0
-          ? s.openIds.filter((id) => list.some((w) => w.id === id))
-          : (list.length > 0 ? [list[0].id] : [])
-        const activeId = s.activeId && openIds.includes(s.activeId) ? s.activeId : (openIds[0] ?? null)
+        const storedTabSession = readWorkflowTabSession()
+        const inMemoryTabSession = s.openIds.length > 0 || s.activeId !== null
+          ? createWorkflowTabSession(s.openIds, s.activeId)
+          : null
+        const tabSession = reconcileWorkflowTabSession({
+          exists: storedTabSession.exists || inMemoryTabSession !== null,
+          session: storedTabSession.session ?? inMemoryTabSession,
+        }, list.map((workflow) => workflow.id))
+        const { openIds, activeId } = tabSession
         // Folders referenced by workflows always exist, even if localStorage was cleared
         const folders = [...new Set([...s.folders, ...list.map((w) => w.folder).filter((f): f is string => !!f)])]
+        persistTabSession(openIds, activeId)
         storeFolders(folders, s.folderColors, s.bookmarkedFolders)
         return { workflows: list, loading: false, openIds, activeId, folders }
       })
@@ -271,10 +288,12 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
     if (result.success) {
       set((s) => {
         const openIds = s.openIds.filter((x) => x !== id)
+        const activeId = s.activeId === id ? (openIds[0] ?? null) : s.activeId
+        persistTabSession(openIds, activeId)
         return {
           workflows: s.workflows.filter((w) => w.id !== id),
           openIds,
-          activeId:  s.activeId === id ? (openIds[0] ?? null) : s.activeId,
+          activeId,
         }
       })
     }
@@ -287,10 +306,13 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
       const wf = migrateWorkflow(result.workflow as LegacyWorkflow)
       set((s) => {
         const filtered = s.workflows.filter((w) => w.id !== wf.id)
+        const openIds = s.openIds.includes(wf.id) ? s.openIds : [...s.openIds, wf.id]
+        const activeId = wf.id
+        persistTabSession(openIds, activeId)
         return {
           workflows: [wf, ...filtered],
-          openIds:   s.openIds.includes(wf.id) ? s.openIds : [...s.openIds, wf.id],
-          activeId:  wf.id,
+          openIds,
+          activeId,
         }
       })
     }
@@ -302,14 +324,20 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
   },
 
   setActive(id) {
-    set({ activeId: id })
+    set((s) => {
+      if (id !== null && !s.openIds.includes(id)) return s
+      persistTabSession(s.openIds, id)
+      return { activeId: id }
+    })
   },
 
   openWorkflow(id) {
-    set((s) => ({
-      openIds:  s.openIds.includes(id) ? s.openIds : [...s.openIds, id],
-      activeId: id,
-    }))
+    set((s) => {
+      const openIds = s.openIds.includes(id) ? s.openIds : [...s.openIds, id]
+      const activeId = id
+      persistTabSession(openIds, activeId)
+      return { openIds, activeId }
+    })
   },
 
   closeWorkflow(id) {
@@ -320,6 +348,7 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
       const activeId = s.activeId === id
         ? (openIds[Math.min(Math.max(idx, 0), openIds.length - 1)] ?? null)
         : s.activeId
+      persistTabSession(openIds, activeId)
       return { openIds, activeId }
     })
   },
@@ -331,6 +360,7 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
       const idx = ids.indexOf(targetId)
       if (idx === -1) return s
       ids.splice(idx, 0, dragId)
+      persistTabSession(ids, s.activeId)
       return { openIds: ids }
     })
   },

@@ -12,27 +12,51 @@ const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const workflowPanelEntry = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 const workflowPanelSource = path.join(projectRoot, 'src/areas/generate/components/WorkflowPanel.tsx')
 
+function createLocalStorageMock(): Storage {
+  const store = new Map<string, string>()
+  return {
+    get length() { return store.size },
+    clear() { store.clear() },
+    getItem(key) { return store.get(key) ?? null },
+    key(index) { return [...store.keys()][index] ?? null },
+    removeItem(key) { store.delete(key) },
+    setItem(key, value) { store.set(key, value) },
+  }
+}
+
 async function loadWorkflowPanelModule() {
   const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-workflow-panel-'))
   const outfile = path.join(tempDir, 'WorkflowPanel.bundle.mjs')
+  const previousLocalStorage = globalThis.localStorage
 
-  await build({
-    entryPoints: [workflowPanelEntry],
-    outfile,
-    bundle: true,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    external: ['react', 'react-dom/server', 'react/jsx-runtime', '@xyflow/react', 'zustand', 'axios'],
-  })
+  globalThis.localStorage = createLocalStorageMock()
 
-  const module = await import(pathToFileURL(outfile).href)
+  try {
+    await build({
+      entryPoints: [workflowPanelEntry],
+      outfile,
+      bundle: true,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      external: ['react', 'react-dom/server', 'react/jsx-runtime', '@xyflow/react', 'zustand', 'axios'],
+    })
 
-  return {
-    module,
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true })
-    },
+    const module = await import(pathToFileURL(outfile).href)
+
+    return {
+      module,
+      async cleanup() {
+        if (previousLocalStorage === undefined) delete globalThis.localStorage
+        else globalThis.localStorage = previousLocalStorage
+        await rm(tempDir, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    if (previousLocalStorage === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = previousLocalStorage
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 

@@ -54,6 +54,9 @@ import type { HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, H
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale'
 
+// Drei Hud with priority 1 renders the default scene first, then the gizmo HUD.
+export const VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY = 1
+
 const SELECTION_OUTLINE_VISIBLE_COLOR = 0x8b5cf6
 const SELECTION_OUTLINE_HIDDEN_COLOR = 0x5b21b6
 const SELECTION_OUTLINE_EDGE_STRENGTH = 2.5
@@ -6040,7 +6043,7 @@ export default function Viewer3D({
           />
 
           {canRenderViewportGizmos ? (
-            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={2}>
+            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY}>
               <GizmoBubbles />
             </GizmoHelper>
           ) : null}

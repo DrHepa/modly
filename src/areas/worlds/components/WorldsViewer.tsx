@@ -188,6 +188,25 @@ type WorldsMeasuredBounds = {
   size: THREE.Vector3
 }
 
+type WorldsDeferredTaskHandle = {
+  cancel: () => void
+}
+
+type WorldsDeferredTaskScheduler = (callback: () => void) => WorldsDeferredTaskHandle
+
+type WorldsSceneFitAction = 'noop' | 'apply-bounds-fit' | 'apply-initial-view' | 'refresh-limits'
+
+type WorldsGltfSceneInstance = {
+  scene: THREE.Object3D
+  dispose: () => void
+}
+
+const worldsManagedBoundsTreeRefCounts = new WeakMap<THREE.BufferGeometry, number>()
+
+function isWorldsMeshObject(object: THREE.Object3D): object is THREE.Mesh {
+  return (object as THREE.Object3D & { isMesh?: boolean }).isMesh === true
+}
+
 export function WorldsViewer({
   items,
   initialView,
@@ -1304,7 +1323,8 @@ function PlySceneObject({ item, onBoundsChange }: { item: WorldSceneItem; onBoun
 
 function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element {
   const gltf = useGLTF(item.url)
-  const scene = useMemo(() => cloneSkeletonScene(gltf.scene), [gltf.scene])
+  const instance = useMemo(() => createWorldsGltfSceneInstance(gltf.scene), [gltf.scene])
+  const scene = instance.scene
   const poseClipRef = useRef<{
     sidecar: PoseClipSidecarV1
     bonesById: Map<string, THREE.Bone>
@@ -1313,24 +1333,12 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChang
   useEffect(() => {
     scene.traverse((child) => {
       child.userData.worldsSceneItemId = item.id
-      if (child instanceof THREE.Mesh) {
-        ;(child.geometry as any).computeBoundsTree?.()
-        const materials = Array.isArray(child.material) ? child.material : [child.material]
-        materials.forEach((material) => {
-          material.side = THREE.DoubleSide
-          material.needsUpdate = true
-        })
-      }
     })
     onBoundsChange()
     return () => {
-      scene.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          ;(child.geometry as any).disposeBoundsTree?.()
-        }
-      })
+      instance.dispose()
     }
-  }, [item.id, onBoundsChange, scene])
+  }, [instance, item.id, onBoundsChange, scene])
   useEffect(() => {
     const animation = item.animation
     poseClipRef.current = null
@@ -1704,6 +1712,43 @@ export function createWorldsBoundsCameraFitSnapshot(
   }
 }
 
+export function hasWorldsCameraBoundsGeometry(bounds: WorldsCameraBounds): boolean {
+  return Number.isFinite(bounds.distance)
+    && bounds.distance > 0
+    && Number.isFinite(bounds.size.x)
+    && Number.isFinite(bounds.size.y)
+    && Number.isFinite(bounds.size.z)
+    && bounds.size.lengthSq() > 0
+}
+
+export function resolveWorldsSceneFitAction({
+  fitKeyChanged,
+  initialViewChanged,
+  hasInitialView,
+  hasMeasuredBounds,
+  hasSnapshot,
+  hasAppliedBoundsFitForCurrentFitKey,
+  loadRevisionChanged,
+}: {
+  fitKeyChanged: boolean
+  initialViewChanged: boolean
+  hasInitialView: boolean
+  hasMeasuredBounds: boolean
+  hasSnapshot: boolean
+  hasAppliedBoundsFitForCurrentFitKey: boolean
+  loadRevisionChanged: boolean
+}): WorldsSceneFitAction {
+  if (hasInitialView) {
+    if (!hasSnapshot || fitKeyChanged || initialViewChanged) return 'apply-initial-view'
+    if (loadRevisionChanged) return 'refresh-limits'
+    return 'noop'
+  }
+
+  if (!hasMeasuredBounds) return 'noop'
+  if (!hasAppliedBoundsFitForCurrentFitKey) return 'apply-bounds-fit'
+  return 'noop'
+}
+
 export function applyWorldsCameraFitLimits(
   camera: THREE.Camera,
   controls: WorldsOrbitControlsHandle | null,
@@ -1768,6 +1813,139 @@ export function refreshWorldsCameraFitSnapshotLimits(
   return refreshedSnapshot
 }
 
+export function scheduleWorldsDeferredTask(callback: () => void): WorldsDeferredTaskHandle {
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    const handle = window.requestIdleCallback(() => callback())
+    return {
+      cancel: () => window.cancelIdleCallback(handle),
+    }
+  }
+
+  if (typeof requestAnimationFrame === 'function') {
+    const handle = requestAnimationFrame(() => callback())
+    return {
+      cancel: () => cancelAnimationFrame(handle),
+    }
+  }
+
+  let cancelled = false
+  queueMicrotask(() => {
+    if (!cancelled) callback()
+  })
+
+  return {
+    cancel: () => {
+      cancelled = true
+    },
+  }
+}
+
+export function cloneWorldsSceneMaterialsForInstance(target: THREE.Object3D): Set<THREE.Material> {
+  const ownedMaterials = new Set<THREE.Material>()
+  const clonesBySourceMaterial = new Map<THREE.Material, THREE.Material>()
+
+  target.traverse((child) => {
+    if (!isWorldsMeshObject(child)) return
+
+    const sourceMaterials = Array.isArray(child.material) ? child.material : [child.material]
+    const clonedMaterials = sourceMaterials.map((material) => {
+      const cached = clonesBySourceMaterial.get(material)
+      if (cached) return cached
+      const clone = material.clone()
+      clone.side = THREE.DoubleSide
+      clone.needsUpdate = true
+      clonesBySourceMaterial.set(material, clone)
+      ownedMaterials.add(clone)
+      return clone
+    })
+
+    child.material = Array.isArray(child.material) ? clonedMaterials : clonedMaterials[0]!
+  })
+
+  return ownedMaterials
+}
+
+export function acquireWorldsManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
+  const existingCount = worldsManagedBoundsTreeRefCounts.get(geometry)
+  if (existingCount) {
+    worldsManagedBoundsTreeRefCounts.set(geometry, existingCount + 1)
+    return true
+  }
+
+  if ((geometry as { boundsTree?: unknown }).boundsTree) return false
+
+  ;(geometry as any).computeBoundsTree?.()
+  if (!(geometry as { boundsTree?: unknown }).boundsTree) return false
+  worldsManagedBoundsTreeRefCounts.set(geometry, 1)
+  return true
+}
+
+export function releaseWorldsManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
+  const existingCount = worldsManagedBoundsTreeRefCounts.get(geometry)
+  if (!existingCount) return false
+  if (existingCount > 1) {
+    worldsManagedBoundsTreeRefCounts.set(geometry, existingCount - 1)
+    return false
+  }
+
+  ;(geometry as any).disposeBoundsTree?.()
+  worldsManagedBoundsTreeRefCounts.delete(geometry)
+  return true
+}
+
+export function scheduleWorldsSceneBoundsTreeBuild(
+  target: THREE.Object3D,
+  schedule: WorldsDeferredTaskScheduler = scheduleWorldsDeferredTask,
+): { cancel: () => void; release: () => void } {
+  const acquiredGeometries = new Set<THREE.BufferGeometry>()
+  let released = false
+  const scheduled = schedule(() => {
+    if (released) return
+
+    target.traverse((child) => {
+      if (!isWorldsMeshObject(child)) return
+      const geometry = child.geometry
+      if (!geometry || acquiredGeometries.has(geometry)) return
+      if (acquireWorldsManagedBoundsTree(geometry)) acquiredGeometries.add(geometry)
+    })
+  })
+
+  const release = () => {
+    if (released) return
+    released = true
+    scheduled.cancel()
+    acquiredGeometries.forEach((geometry) => {
+      releaseWorldsManagedBoundsTree(geometry)
+    })
+    acquiredGeometries.clear()
+  }
+
+  return {
+    cancel: () => {
+      scheduled.cancel()
+      released = true
+    },
+    release,
+  }
+}
+
+export function createWorldsGltfSceneInstance(
+  sourceScene: THREE.Object3D,
+  schedule: WorldsDeferredTaskScheduler = scheduleWorldsDeferredTask,
+): WorldsGltfSceneInstance {
+  const scene = cloneSkeletonScene(sourceScene)
+  const ownedMaterials = cloneWorldsSceneMaterialsForInstance(scene)
+  const boundsTreeBuild = scheduleWorldsSceneBoundsTreeBuild(scene, schedule)
+
+  return {
+    scene,
+    dispose: () => {
+      boundsTreeBuild.release()
+      ownedMaterials.forEach((material) => material.dispose())
+    },
+  }
+}
+
 function SceneFitController({
   initialView,
   fitKey,
@@ -1787,57 +1965,73 @@ function SceneFitController({
 }): null {
   const bounds = useBounds()
   const { camera } = useThree()
-  const observedInitialViewRef = useRef(false)
   const previousInitialViewRef = useRef<SceneArtifactManifestInitialView | undefined>(undefined)
-  const observedLoadRevisionRef = useRef(loadRevision)
+  const previousFitKeyRef = useRef<string | null>(null)
+  const previousLoadRevisionRef = useRef(loadRevision)
+  const boundsFitKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
-    const shouldApplyInitialFit = cameraFitSnapshotRef.current === null
-    const initialViewChanged = observedInitialViewRef.current
+    const fitKeyChanged = previousFitKeyRef.current !== fitKey
+    const initialViewChanged = previousInitialViewRef.current !== undefined
       && previousInitialViewRef.current !== initialView
+    const loadRevisionChanged = previousLoadRevisionRef.current !== loadRevision
+
     bounds.refresh()
     const measuredBounds = bounds.getSize()
-    const desiredSnapshot = initialView
-      ? createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
-      : createWorldsBoundsCameraFitSnapshot(measuredBounds, camera.up)
+    const action = resolveWorldsSceneFitAction({
+      fitKeyChanged,
+      initialViewChanged,
+      hasInitialView: !!initialView,
+      hasMeasuredBounds: hasWorldsCameraBoundsGeometry(measuredBounds),
+      hasSnapshot: cameraFitSnapshotRef.current !== null,
+      hasAppliedBoundsFitForCurrentFitKey: boundsFitKeyRef.current === fitKey,
+      loadRevisionChanged,
+    })
 
-    if (shouldApplyInitialFit || initialViewChanged) {
-        cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
+    if (action === 'apply-initial-view' && initialView) {
+      const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
+      cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
+        camera,
+        orbitControlsRef.current,
+        desiredSnapshot,
+        collisionSurfaces,
+      )
+      boundsFitKeyRef.current = null
+    } else if (action === 'apply-bounds-fit') {
+      const desiredSnapshot = createWorldsBoundsCameraFitSnapshot(measuredBounds, camera.up)
+      cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
+        camera,
+        orbitControlsRef.current,
+        desiredSnapshot,
+        collisionSurfaces,
+      )
+      boundsFitKeyRef.current = fitKey
+    } else if (action === 'refresh-limits') {
+      const snapshot = cameraFitSnapshotRef.current
+      if (snapshot) {
+        cameraFitSnapshotRef.current = refreshWorldsCameraFitSnapshotLimits(
           camera,
           orbitControlsRef.current,
-          desiredSnapshot,
-          collisionSurfaces,
+          snapshot,
+          measuredBounds,
         )
-      } else {
-        const collisionOrigin = cameraFitSnapshotRef.current?.position ?? camera.position
+      } else if (initialView) {
+        const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
+        const collisionOrigin = camera.position
         const resolvedSnapshot = createCollisionSafeWorldsCameraFitSnapshot(
           desiredSnapshot,
           collisionOrigin,
           collisionSurfaces,
         )
-      cameraFitSnapshotRef.current = resolvedSnapshot
-      applyWorldsCameraFitLimits(camera, orbitControlsRef.current, resolvedSnapshot)
+        cameraFitSnapshotRef.current = resolvedSnapshot
+        applyWorldsCameraFitLimits(camera, orbitControlsRef.current, resolvedSnapshot)
+      }
     }
 
+    previousFitKeyRef.current = fitKey
     previousInitialViewRef.current = initialView
-    observedInitialViewRef.current = true
-  }, [bounds, camera, cameraFitSnapshotRef, collisionSurfaces, fitKey, initialView, orbitControlsRef])
-
-  useEffect(() => {
-    const previousLoadRevision = observedLoadRevisionRef.current
-    observedLoadRevisionRef.current = loadRevision
-    if (!initialView || loadRevision === previousLoadRevision) return
-
-    const snapshot = cameraFitSnapshotRef.current
-    if (!snapshot) return
-    bounds.refresh()
-    cameraFitSnapshotRef.current = refreshWorldsCameraFitSnapshotLimits(
-      camera,
-      orbitControlsRef.current,
-      snapshot,
-      bounds.getSize(),
-    )
-  }, [bounds, camera, cameraFitSnapshotRef, initialView, loadRevision, orbitControlsRef])
+    previousLoadRevisionRef.current = loadRevision
+  }, [bounds, camera, cameraFitSnapshotRef, collisionSurfaces, fitKey, initialView, loadRevision, orbitControlsRef])
 
   useEffect(() => {
     if (resetToken === 0) return

@@ -506,8 +506,9 @@ test('WorldsViewer exposes selection state and a local transform toolbar contrac
     assert.equal(viewerSource.includes('computeBoundsTree'), true)
     assert.equal(viewerSource.includes('acceleratedRaycast'), true)
     assert.equal(viewerSource.includes('SkeletonUtils'), true)
-    assert.equal(viewerSource.includes('cloneSkeletonScene(gltf.scene)'), true)
-    assert.equal(viewerSource.includes('material.side = THREE.DoubleSide'), true)
+    assert.equal(viewerSource.includes('createWorldsGltfSceneInstance(gltf.scene)'), true)
+    assert.equal(viewerSource.includes('cloneWorldsSceneMaterialsForInstance(scene)'), true)
+    assert.equal(viewerSource.includes('clone.side = THREE.DoubleSide'), true)
     assert.equal(viewerSource.includes('WorldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('worldsSelectionHitbox'), true)
     assert.equal(viewerSource.includes('worldsCollisionSurface'), true)
@@ -1161,6 +1162,108 @@ test('WorldsViewer creates stable fit keys from visible scene descriptors', asyn
   }
 })
 
+test('WorldsViewer fit action applies bounds fit when delayed GLTF bounds arrive without an initial view', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.equal(module.resolveWorldsSceneFitAction({
+      fitKeyChanged: true,
+      initialViewChanged: false,
+      hasInitialView: false,
+      hasMeasuredBounds: false,
+      hasSnapshot: true,
+      hasAppliedBoundsFitForCurrentFitKey: false,
+      loadRevisionChanged: false,
+    }), 'noop')
+
+    assert.equal(module.resolveWorldsSceneFitAction({
+      fitKeyChanged: false,
+      initialViewChanged: false,
+      hasInitialView: false,
+      hasMeasuredBounds: true,
+      hasSnapshot: true,
+      hasAppliedBoundsFitForCurrentFitKey: false,
+      loadRevisionChanged: true,
+    }), 'apply-bounds-fit')
+
+    const bounds = {
+      center: new THREE.Vector3(10, 4, -3),
+      size: new THREE.Vector3(8, 6, 4),
+      distance: 14,
+    }
+    const snapshot = module.createWorldsBoundsCameraFitSnapshot(bounds)
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500)
+    const controls = {
+      target: new THREE.Vector3(),
+      maxDistance: 500,
+      update: () => undefined,
+      saveState: () => undefined,
+    }
+
+    module.applyWorldsCameraFitSnapshot(camera, controls, snapshot)
+
+    assert.deepEqual(controls.target.toArray(), [10, 4, -3])
+    assert.notDeepEqual(camera.position.toArray(), [2.4, 1.8, 2.8])
+    assert.ok(camera.position.distanceTo(snapshot.target) > 0)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer fit action preserves saved initial view while delayed bounds only refresh limits', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.equal(module.resolveWorldsSceneFitAction({
+      fitKeyChanged: false,
+      initialViewChanged: false,
+      hasInitialView: true,
+      hasMeasuredBounds: true,
+      hasSnapshot: true,
+      hasAppliedBoundsFitForCurrentFitKey: false,
+      loadRevisionChanged: true,
+    }), 'refresh-limits')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer fit action does not steal the camera again for repeated bounds changes on the same loaded render set', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.equal(module.resolveWorldsSceneFitAction({
+      fitKeyChanged: false,
+      initialViewChanged: false,
+      hasInitialView: false,
+      hasMeasuredBounds: true,
+      hasSnapshot: true,
+      hasAppliedBoundsFitForCurrentFitKey: true,
+      loadRevisionChanged: true,
+    }), 'noop')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer fit action refits when the visible render set changes', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    assert.equal(module.resolveWorldsSceneFitAction({
+      fitKeyChanged: true,
+      initialViewChanged: false,
+      hasInitialView: false,
+      hasMeasuredBounds: true,
+      hasSnapshot: true,
+      hasAppliedBoundsFitForCurrentFitKey: false,
+      loadRevisionChanged: false,
+    }), 'apply-bounds-fit')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('WorldsViewer applies an explicit initial view and reset restores the same bounded camera snapshot', async () => {
   const { module, cleanup } = await loadViewerModule()
 
@@ -1270,6 +1373,108 @@ test('WorldsViewer refreshes loaded-scene camera limits without moving the expli
     assert.equal(camera.near, refreshedSnapshot.near)
     assert.equal(camera.far, refreshedSnapshot.far)
     assert.equal(controls.maxDistance, refreshedSnapshot.maxDistance)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer defers BVH construction until scheduled work and cancels cleanly before the first build', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const geometry = new THREE.BoxGeometry(1, 1, 1)
+    let computeCalls = 0
+    let disposeCalls = 0
+    ;(geometry as any).computeBoundsTree = () => {
+      computeCalls += 1
+      ;(geometry as any).boundsTree = { built: true }
+    }
+    ;(geometry as any).disposeBoundsTree = () => {
+      disposeCalls += 1
+      delete (geometry as any).boundsTree
+    }
+
+    const scene = new THREE.Group()
+    scene.add(new THREE.Mesh(geometry, new THREE.MeshBasicMaterial()))
+    const scheduled: Array<() => void> = []
+    const task = module.scheduleWorldsSceneBoundsTreeBuild(scene, (callback: () => void) => {
+      scheduled.push(callback)
+      return { cancel: () => undefined }
+    })
+
+    assert.equal(computeCalls, 0)
+    assert.equal(scheduled.length, 1)
+
+    task.release()
+    scheduled[0]!()
+
+    assert.equal(computeCalls, 0)
+    assert.equal(disposeCalls, 0)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorldsViewer GLTF instance cloning owns per-instance materials and keeps shared GLTF resources alive across remounts', async () => {
+  const { module, cleanup } = await loadViewerModule()
+
+  try {
+    const sourceMaterial = new THREE.MeshStandardMaterial({ color: '#ffffff', side: THREE.FrontSide })
+    let sourceMaterialDisposed = false
+    sourceMaterial.dispose = () => {
+      sourceMaterialDisposed = true
+      THREE.Material.prototype.dispose.call(sourceMaterial)
+    }
+
+    const geometry = new THREE.BoxGeometry(1, 1, 1)
+    let computeCalls = 0
+    let disposeCalls = 0
+    ;(geometry as any).computeBoundsTree = () => {
+      computeCalls += 1
+      ;(geometry as any).boundsTree = { built: true }
+    }
+    ;(geometry as any).disposeBoundsTree = () => {
+      disposeCalls += 1
+      delete (geometry as any).boundsTree
+    }
+
+    const sourceScene = new THREE.Group()
+    sourceScene.add(new THREE.Mesh(geometry, sourceMaterial))
+
+    const clonedScene = sourceScene.clone()
+    module.cloneWorldsSceneMaterialsForInstance(clonedScene)
+    const clonedMesh = clonedScene.children[0]
+
+    assert.ok(clonedMesh instanceof THREE.Mesh)
+    assert.notEqual(clonedMesh.material, sourceMaterial)
+    assert.equal((clonedMesh.material as THREE.Material).side, THREE.DoubleSide)
+    assert.equal(sourceMaterial.side, THREE.FrontSide)
+
+    const scheduled: Array<() => void> = []
+    const scheduler = (callback: () => void) => {
+      scheduled.push(callback)
+      return { cancel: () => undefined }
+    }
+
+    const firstInstance = module.createWorldsGltfSceneInstance(sourceScene, scheduler)
+    const secondInstance = module.createWorldsGltfSceneInstance(sourceScene, scheduler)
+    const firstMesh = firstInstance.scene.children[0]
+    const secondMesh = secondInstance.scene.children[0]
+
+    assert.ok(firstMesh instanceof THREE.Mesh)
+    assert.ok(secondMesh instanceof THREE.Mesh)
+
+    assert.equal(computeCalls, 0)
+    scheduled.forEach((run) => run())
+    assert.equal(computeCalls, 1)
+
+    firstInstance.dispose()
+    assert.equal(disposeCalls, 0)
+    assert.equal(sourceMaterialDisposed, false)
+
+    secondInstance.dispose()
+    assert.equal(disposeCalls, 1)
+    assert.equal(sourceMaterialDisposed, false)
   } finally {
     await cleanup()
   }

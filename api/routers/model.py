@@ -686,7 +686,7 @@ def _download_file_streamed(
                 "file": filename,
                 "fileIndex": file_index,
                 "totalFiles": total_files,
-                "status": f"Retrying after error ({attempt}/{retries})…",
+                "status": f"Retrying after error ({attempt}/{retries})...",
                 "bytesDownloaded": preserved_bytes,
                 "stalledSeconds": 0,
             })
@@ -715,7 +715,7 @@ def _parse_content_length(raw: Optional[str]) -> Optional[int]:
 
 
 def _download_status(downloaded: int, total: Optional[int], attempt: int, retries: int, resumed: bool = False) -> str:
-    prefix = "Resuming…" if resumed and downloaded > 0 else "Downloading…"
+    prefix = "Resuming..." if resumed and downloaded > 0 else "Downloading..."
     if total and total > 0:
         pct = min(100, round(downloaded / total * 100))
         return f"{prefix} {pct}%"

@@ -22,7 +22,28 @@ export interface WebFrameLike {
 
 export type WebUtilsLike = Pick<typeof import('electron').webUtils, 'getPathForFile'>
 
-export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFrameLike, webUtils: WebUtilsLike) {
+export type ElectronApiDependencies = {
+  ipcRenderer: IpcRendererLike
+  webFrame: WebFrameLike
+  webUtils?: WebUtilsLike
+}
+
+function assertWebFrame(webFrame: WebFrameLike | undefined): asserts webFrame is WebFrameLike {
+  if (typeof webFrame?.setZoomFactor !== 'function') {
+    throw new TypeError('createElectronApi requires Electron webFrame.setZoomFactor')
+  }
+}
+
+export function createElectronApi(
+  dependencies: ElectronApiDependencies | IpcRendererLike,
+  legacyWebFrame?: WebFrameLike,
+  legacyWebUtils?: WebUtilsLike,
+) {
+  const { ipcRenderer, webFrame, webUtils } = 'ipcRenderer' in dependencies
+    ? dependencies
+    : { ipcRenderer: dependencies, webFrame: legacyWebFrame, webUtils: legacyWebUtils }
+  assertWebFrame(webFrame)
+
   return {
     automation: {
       capabilities: (): Promise<AutomationCapabilitiesResponse> =>
@@ -36,7 +57,7 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       close:        () => ipcRenderer.send('window:close'),
       isMaximized:  () => ipcRenderer.invoke('window:isMaximized') as Promise<boolean>,
       onMaximizeChange: (cb: (isMaximized: boolean) => void) => {
-        ipcRenderer.on('window:maximizeChanged', (_event, isMaximized) => cb(isMaximized as boolean))
+        ipcRenderer.on('window:maximizeChanged', (_event, isMaximized) => cb(Boolean(isMaximized)))
       },
       offMaximizeChange: () => ipcRenderer.removeAllListeners('window:maximizeChanged'),
     },
@@ -83,8 +104,12 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
 
     // File system dialogs + local file reading
     fs: {
-      getPathForFile:    (file: Parameters<WebUtilsLike['getPathForFile']>[0]): string =>
-        webUtils.getPathForFile(file),
+      getPathForFile:    (file: Parameters<WebUtilsLike['getPathForFile']>[0]): string => {
+        if (typeof webUtils?.getPathForFile !== 'function') {
+          throw new TypeError('createElectronApi requires Electron webUtils.getPathForFile')
+        }
+        return webUtils.getPathForFile(file)
+      },
       selectImage:       (): Promise<string | null> =>
         ipcRenderer.invoke('fs:selectImage') as Promise<string | null>,
       selectMeshFile:    (): Promise<string | null> =>
@@ -291,19 +316,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       installFromGitHub: (url: string): Promise<ExtensionInstallResult> =>
         ipcRenderer.invoke('extensions:installFromGitHub', url) as Promise<ExtensionInstallResult>,
 
-      installFromLocal: (): Promise<{
-        success: boolean; error?: string; cancelled?: boolean
-        needsRepair?: boolean
-        extensionId?: string
-        extension?: AnyExtension
-        localPath?: string
-      }> => ipcRenderer.invoke('extensions:installFromLocal') as Promise<{
-        success: boolean; error?: string; cancelled?: boolean
-        needsRepair?: boolean
-        extensionId?: string
-        extension?: AnyExtension
-        localPath?: string
-      }>,
+      installFromLocal: (): Promise<ExtensionInstallResult & { cancelled?: boolean; needsRepair?: boolean; localPath?: string }> =>
+        ipcRenderer.invoke('extensions:installFromLocal') as Promise<ExtensionInstallResult & { cancelled?: boolean; needsRepair?: boolean; localPath?: string }>,
 
       uninstall: (extensionId: string): Promise<{ success: boolean; error?: string }> =>
         ipcRenderer.invoke('extensions:uninstall', extensionId) as Promise<{ success: boolean; error?: string }>,

@@ -1295,15 +1295,7 @@ declare global {
       extensions: {
         list:              () => Promise<AnyExtension[]>
         installFromGitHub: (url: string) => Promise<ExtensionInstallResult>
-        installFromLocal:  () => Promise<{
-          success:      boolean
-          error?:       string
-          cancelled?:   boolean
-          needsRepair?: boolean
-          extensionId?: string
-          extension?:   AnyExtension
-          localPath?:   string
-        }>
+        installFromLocal:  () => Promise<ExtensionInstallResult & { cancelled?: boolean; needsRepair?: boolean; localPath?: string }>
         uninstall:   (extensionId: string) => Promise<{ success: boolean; error?: string }>
         repair:      (extensionId: string) => Promise<{ success: boolean; error?: string }>
         reload:      () => Promise<{ success: boolean; error?: string; errors?: Record<string, string> }>

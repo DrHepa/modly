@@ -216,6 +216,17 @@ test('GeneratePage library seam reports unsupported and unknown entries with ope
   }
 })
 
+test('GeneratePage import failures resolve to visible user-facing copy', async () => {
+  const { module, cleanup } = await loadGeneratePageModule()
+
+  try {
+    assert.equal(module.resolveGenerateImportFailureMessage(new Error('Import pipeline rejected mesh file')), 'Import pipeline rejected mesh file')
+    assert.equal(module.resolveGenerateImportFailureMessage('Mesh import failed'), 'Mesh import failed')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('GeneratePage library seam renders scope and capability sections with direct file entries only', async () => {
   const { module, cleanup } = await loadGeneratePageModule()
 

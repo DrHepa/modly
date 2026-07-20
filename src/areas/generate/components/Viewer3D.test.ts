@@ -6,9 +6,11 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build, type Plugin } from 'esbuild'
 import * as THREE from 'three'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const viewer3DEntry = path.join(projectRoot, 'src/areas/generate/components/Viewer3D.tsx')
+const dreamCubeRegressionGlbPath = '/home/drhepa/Documentos/Modly/workspace/Workflows/dreamcube-20260718-173840-d973837e/output_mesh.glb'
 
 function aliasPlugin(): Plugin {
   const resolvePath = (basePath: string): string => {
@@ -129,6 +131,116 @@ test('Viewer3D scene stats count point vertices without triangles and preserve m
   } finally {
     await cleanup()
   }
+})
+
+test('Viewer3D clones loaded scenes and disposes only owned instance materials', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const sourceMaterial = new THREE.MeshStandardMaterial({ color: '#22c55e' })
+    let sourceMaterialDisposeCalls = 0
+    sourceMaterial.dispose = (() => { sourceMaterialDisposeCalls += 1 }) as typeof sourceMaterial.dispose
+
+    const sourceGeometry = new THREE.BoxGeometry(1, 2, 3)
+    let sourceGeometryDisposeCalls = 0
+    sourceGeometry.dispose = (() => { sourceGeometryDisposeCalls += 1 }) as typeof sourceGeometry.dispose
+
+    const sourceScene = new THREE.Group()
+    sourceScene.add(new THREE.Mesh(sourceGeometry, sourceMaterial))
+
+    const instance = module.cloneViewer3DLoadedScene(sourceScene) as THREE.Group
+    const sourceMesh = sourceScene.children[0] as THREE.Mesh
+    const instanceMesh = instance.children[0] as THREE.Mesh
+
+    assert.notEqual(instanceMesh.material, sourceMesh.material)
+    assert.equal(instanceMesh.geometry, sourceMesh.geometry)
+
+    module.disposeViewer3DOwnedSceneResources(instance)
+
+    assert.equal(sourceMaterialDisposeCalls, 0)
+    assert.equal(sourceGeometryDisposeCalls, 0)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D camera framing resolves finite bounds for tiny huge and offset meshes without changing object transforms', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const tiny = module.resolveViewer3DCameraFrame({
+      bounds: new THREE.Box3(new THREE.Vector3(-0.0005, 0, -0.0005), new THREE.Vector3(0.0005, 0.001, 0.0005)),
+      aspect: 16 / 9,
+      fovDegrees: 45,
+    })
+    const huge = module.resolveViewer3DCameraFrame({
+      bounds: new THREE.Box3(new THREE.Vector3(-5000, -2500, -4000), new THREE.Vector3(5000, 3500, 4500)),
+      aspect: 16 / 9,
+      fovDegrees: 45,
+    })
+    const offset = module.resolveViewer3DCameraFrame({
+      bounds: new THREE.Box3(new THREE.Vector3(100, -2, 300), new THREE.Vector3(104, 6, 308)),
+      aspect: 1,
+      fovDegrees: 45,
+    })
+
+    assert.ok(tiny)
+    assert.ok(huge)
+    assert.ok(offset)
+    assert.ok(Number.isFinite(tiny.position.length()))
+    assert.ok(Number.isFinite(huge.position.length()))
+    assert.ok(Number.isFinite(offset.position.length()))
+    assert.deepEqual(offset.target.toArray(), [102, 2, 304])
+    assert.ok(huge.position.distanceTo(huge.target) > tiny.position.distanceTo(tiny.target))
+    assert.ok(tiny.near > 0)
+    assert.ok(huge.far > huge.near)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D BVH acceleration stays gated behind edit or landmark picking features', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    assert.equal(module.shouldEnableViewer3DBvh({ editMode: false }), false)
+    assert.equal(module.shouldEnableViewer3DBvh({ editMode: true }), true)
+    assert.equal(module.shouldEnableViewer3DBvh({ editMode: false, landmarkPicking: { activeLandmarkId: 'hips', canvas: null, onPoint: () => undefined } }), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D viewport gizmos render only when a real renderable object is loaded', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+
+  try {
+    const empty = new THREE.Group()
+    const meshGroup = new THREE.Group()
+    meshGroup.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial()))
+
+    assert.equal(module.shouldRenderViewer3DViewportGizmos({ modelUrl: 'http://127.0.0.1:8000/workspace/mesh.glb', hasCurrentJob: true, object: empty }), false)
+    assert.equal(module.shouldRenderViewer3DViewportGizmos({ modelUrl: 'http://127.0.0.1:8000/workspace/mesh.glb', hasCurrentJob: false, object: meshGroup }), false)
+    assert.equal(module.shouldRenderViewer3DViewportGizmos({ modelUrl: 'http://127.0.0.1:8000/workspace/mesh.glb', hasCurrentJob: true, object: meshGroup }), true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Viewer3D local DreamCube regression GLB parses and reports finite bounds when present', { skip: !existsSync(dreamCubeRegressionGlbPath) }, async () => {
+  const bytes = readFileSync(dreamCubeRegressionGlbPath)
+  const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+  const loader = new GLTFLoader()
+  const gltf = await new Promise<{ scene: THREE.Group }>((resolve, reject) => loader.parse(arrayBuffer, '', resolve, reject))
+
+  gltf.scene.updateMatrixWorld(true)
+  const bounds = new THREE.Box3().setFromObject(gltf.scene)
+  const size = bounds.getSize(new THREE.Vector3())
+
+  assert.equal(bounds.isEmpty(), false)
+  assert.ok(size.x > 0)
+  assert.ok(size.y > 0)
+  assert.ok(size.z > 0)
 })
 
 test('resolveViewer3DPresentation marks workflow checkpoints as temporary and not deletable', async () => {
@@ -4075,6 +4187,10 @@ test('Viewer3D resolves safe Kimodo metadata descriptors only for workspace-back
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
+    assert.equal(module.isViewer3DKimodoSiblingMetadataCandidate('Workflows/dreamcube-20260718-173840-d973837e/output_mesh.glb'), false)
+    assert.equal(module.isViewer3DKimodoSiblingMetadataCandidate('Workflows/kimodo-20260521-230257-c858ac59/output_mesh.glb'), false)
+    assert.equal(module.isViewer3DKimodoSiblingMetadataCandidate('Workflows/kimodo-20260521-230257-c858ac59/animated.glb'), true)
+
     assert.deepEqual(
       module.resolveViewer3DKimodoMetadataDescriptor({
         apiUrl: 'http://127.0.0.1:8000',
@@ -4160,6 +4276,14 @@ test('Viewer3D resolves safe Kimodo metadata descriptors only for workspace-back
         metadataUrl: 'http://127.0.0.1:8765/workspace/Workflows/kimodo-20260521-230257-c858ac59/metadata.json',
         detectionMode: 'sibling-metadata',
       },
+    )
+
+    assert.equal(
+      module.resolveViewer3DKimodoMetadataDescriptor({
+        apiUrl: 'http://127.0.0.1:8000',
+        modelUrl: 'http://127.0.0.1:8000/workspace/Workflows/dreamcube-20260718-173840-d973837e/output_mesh.glb',
+      }),
+      undefined,
     )
 
     assert.equal(

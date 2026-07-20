@@ -1,4 +1,4 @@
-import { getExtensionSourcePort, getExtensionSourcePorts, getProcessTargetPort, getProcessTargetPorts } from './processPorts'
+import { getExtensionSourcePorts, getProcessTargetPort, getProcessTargetPorts } from './processPorts'
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -25,10 +25,10 @@ import type { WorkflowExtension } from './mockExtensions'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory'
 import {
   resolveProcessConnectionSource,
-  resolveEffectiveWorkflowIoContract,
   validateProcessConnection,
   type ProcessConnectionRuleIssue,
 } from './processConnectionRules'
+import { normalizeWorkflowEdges } from './workflowEdgeNormalization'
 import { useWorkflowRunStore } from './workflowRunStore'
 import { validateWorkflowPreflight } from './preflight'
 import WorkflowEdge     from './nodes/WorkflowEdge'
@@ -98,34 +98,6 @@ function newId(): string { return crypto.randomUUID() }
 // another — the canvas remounts per tab but the module survives).
 const _nodeClipboard: { current: { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[]; pastes: number } | null } = { current: null }
 
-function withStableTargetItemIndex(args: {
-  connection: Connection
-  nodes: WFNode[]
-  edges: WFEdge[]
-  allExtensions: WorkflowExtension[]
-}): Connection & Pick<WFEdge, 'targetItemIndex'> {
-  const targetNode = args.nodes.find((node) => node.id === args.connection.target)
-  const extensionId = typeof targetNode?.data.extensionId === 'string' ? targetNode.data.extensionId : ''
-  const extension = args.allExtensions.find((candidate) => candidate.id === extensionId)
-  const supportsNamedPorts = extension?.type !== 'model'
-    || resolveEffectiveWorkflowIoContract(targetNode, extension) === 'named-v1'
-  const port = extension && supportsNamedPorts
-    ? getProcessTargetPort(extension, args.connection.targetHandle)
-    : undefined
-  if (!port?.multiple) return args.connection
-
-  const existing = args.edges.filter((edge) => (
-    edge.target === args.connection.target
-    && edge.targetHandle === port.name
-  ))
-  const highestIndex = existing.reduce(
-    (highest, edge, index) => Math.max(highest, edge.targetItemIndex ?? index),
-    -1,
-  )
-  return { ...args.connection, targetItemIndex: highestIndex + 1 }
-}
-
-
 function workflowSelectionForExtension(extension: WorkflowExtension): { type: string; extensionId?: string } {
   const utilityNodeType = resolveWorkflowUtilityNodeType(extension)
   return utilityNodeType ? { type: utilityNodeType } : { type: 'extensionNode', extensionId: extension.id }
@@ -137,15 +109,7 @@ function createWorkflowExtensionNode(args: {
   position: WFNode['position']
   allExtensions: WorkflowExtension[]
 }): WFNode {
-  const node = createHydratedExtensionWorkflowNode(args)
-  const extension = args.allExtensions.find((candidate) => candidate.id === args.extensionId)
-  const ioContract = resolveEffectiveWorkflowIoContract(node, extension)
-  if (extension?.type !== 'model' || ioContract !== 'named-v1') return node
-
-  return {
-    ...node,
-    data: { ...node.data, ioContract },
-  }
+  return createHydratedExtensionWorkflowNode(args)
 }
 
 function setWorkflowExtensionDragData(event: DragEvent, extension: WorkflowExtension): void {
@@ -836,7 +800,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
 
 // ─── Connection type helpers ──────────────────────────────────────────────────
 
-function getNodeOutputType(node: FlowNode<WFNodeData> | undefined, allExts: WorkflowExtension[], sourceHandle?: string | null): string | undefined {
+function getNodeOutputType(node: FlowNode<WFNodeData> | undefined, allExts: WorkflowExtension[]): string | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'meshNode')  return 'mesh'
@@ -844,9 +808,6 @@ function getNodeOutputType(node: FlowNode<WFNodeData> | undefined, allExts: Work
   if (node.type === 'textNode')  return 'text'
   if (node.type === 'imagePreviewNode') return 'image'
   const extension = allExts.find((e) => e.id === node.data.extensionId)
-  if (extension?.type === 'model' && (node.data.ioContract ?? extension.ioContract) === 'named-v1') {
-    return getExtensionSourcePort(extension, sourceHandle)?.type
-  }
   return extension?.output
 }
 
@@ -898,6 +859,8 @@ function WorkflowCanvasInner({
   const autosaveMountedRef = useRef(false)
   const preflightToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const didMountRef = useRef(false)
+  const nodesRef = useRef(nodes)
+  const edgesRef = useRef(edges)
 
   // ─── Undo / Redo ──────────────────────────────────────────────────────────
   type Snapshot = { nodes: FlowNode<WFNodeData>[]; edges: FlowEdge[] }
@@ -909,17 +872,44 @@ function WorkflowCanvasInner({
 
   // Re-sync when workflow switches
   useEffect(() => {
-    setNodes(toFlowNodes(workflow.nodes))
-    setEdges(toFlowEdges(workflow.edges))
+    const normalized = normalizeWorkflowEdges({
+      nodes: workflow.nodes,
+      edges: workflow.edges,
+      allExtensions,
+    })
+    const flowNodes = toFlowNodes(workflow.nodes)
+    const flowEdges = toFlowEdges(normalized.edges)
+    setNodes(flowNodes)
+    setEdges(flowEdges)
     setConnectionIssue(null)
-    historyRef.current = [{ nodes: toFlowNodes(workflow.nodes), edges: toFlowEdges(workflow.edges) }]
+    historyRef.current = [{ nodes: flowNodes, edges: flowEdges }]
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-sync only when the workflow switches; adding nodes/edges would reset the editor on every change
   }, [workflow.id])
 
-  useEffect(() => { setConnectionIssue(null) }, [nodes, edges])
+  useEffect(() => {
+    nodesRef.current = nodes
+    edgesRef.current = edges
+  }, [nodes, edges])
+
+  useEffect(() => {
+    // Extension metadata can arrive after the workflow loads. Normalize once when
+    // that happens, but don't pollute undo history with migration-only edits.
+    const normalized = normalizeWorkflowEdges({
+      nodes: toWorkflowNodes(nodesRef.current),
+      edges: toWorkflowEdges(edgesRef.current),
+      allExtensions,
+    })
+    if (!normalized.changed) return
+    skipPushRef.current = true
+    setEdges(toFlowEdges(normalized.edges))
+  }, [allExtensions, setEdges])
+
+  useEffect(() => {
+    setConnectionIssue(null)
+  }, [nodes, edges])
 
   // Re-sync when Generate tab (or another external source) saves param changes
   useEffect(() => {
@@ -1049,19 +1039,13 @@ function WorkflowCanvasInner({
 
     if (issue) setConnectionIssue(issue)
 
-    const indexedConnection = withStableTargetItemIndex({
-      connection,
-      nodes: nextNodes,
-      edges: toWorkflowEdges(edges),
-      allExtensions,
-    })
     setConnectionIssue(null)
-    setEdges((eds) => addEdge({ ...indexedConnection, ...DEFAULT_EDGE_OPTS }, eds))
+    setEdges((eds) => addEdge({ ...connection, ...DEFAULT_EDGE_OPTS }, eds))
     return true
   }, [nodes, edges, allExtensions, setEdges])
 
   const isValidConnection = useCallback((connection: FlowEdge | Connection) => {
-    const srcType = getNodeOutputType(getNode(connection.source) as FlowNode<WFNodeData>, allExtensions, connection.sourceHandle)
+    const srcType = getNodeOutputType(getNode(connection.source) as FlowNode<WFNodeData>, allExtensions)
     const tgtType = getNodeInputType(getNode(connection.target) as FlowNode<WFNodeData>, connection.targetHandle, allExtensions)
     if (srcType && tgtType && srcType !== tgtType) return false  // type mismatch (unknown types allowed)
     // Reject connections that would create a cycle: if the target can already
@@ -1264,18 +1248,16 @@ function WorkflowCanvasInner({
         const extension = allExtensions.find((candidate) => candidate.id === extensionId)
         const sourceNode = getNode(pending.nodeId) as FlowNode<WFNodeData> | undefined
         const sourceType = sourceNode?.type === 'extensionNode'
-          ? getNodeOutputType(sourceNode, allExtensions, pending.handleId)
+          ? getNodeOutputType(sourceNode, allExtensions)
           : resolveProcessConnectionSource(pending.nodeId, {
             nodes: toWorkflowNodes(nodes), edges: toWorkflowEdges(edges), allExtensions,
           }).type ?? getNodeOutputType(sourceNode, allExtensions)
         const ports = extension ? getProcessTargetPorts(extension) : []
         const firstPort = ports.find((port) => port.type === sourceType) ?? ports[0]
-        const sourcePorts = extension?.type === 'model' && node.data.ioContract === 'named-v1'
-          ? getExtensionSourcePorts(extension)
-          : []
+        const sourcePorts = extension ? getExtensionSourcePorts(extension) : []
         const connection: Connection = isSource
-          ? { source: pending.nodeId, sourceHandle: pending.handleId ?? null, target: newNodeId, targetHandle: isExt ? (firstPort?.name ?? 'input-0') : null }
-          : { source: newNodeId, sourceHandle: isExt ? (sourcePorts[0]?.name ?? 'output') : null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
+          ? { source: pending.nodeId, sourceHandle: pending.handleId ?? null, target: newNodeId, targetHandle: isExt ? (firstPort?.name ?? null) : null }
+          : { source: newNodeId, sourceHandle: isExt ? (sourcePorts[0]?.name ?? null) : null, target: pending.nodeId, targetHandle: pending.handleId ?? null }
         appendValidatedEdge(connection, nextNodes)
       }
     }

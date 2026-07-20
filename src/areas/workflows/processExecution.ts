@@ -5,10 +5,9 @@ import type {
   WFNode,
 } from '../../shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions.ts'
-import { getExtensionSourcePort, getProcessTargetPort, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
+import { getProcessTargetPort, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
 import { assignSlotFilePaths, type SlotInputType } from './slotInputs.ts'
 import { resolveDataSource } from './nodeBehaviors.ts'
-import { resolveEffectiveWorkflowIoContract } from './processConnectionRules.ts'
 
 type NodeOutput = {
   filePath?: string
@@ -29,7 +28,6 @@ type BuildProcessExecutionInputArgs = {
 function getNodeOutputType(
   node: WFNode | undefined,
   allExtensions: WorkflowExtension[],
-  sourceHandle?: string | null,
 ): NamedProcessInput['type'] | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
@@ -44,11 +42,8 @@ function getNodeOutputType(
   const extension = getWorkflowExtension(extensionId, allExtensions)
   if (!extension) return undefined
   if (extension.type !== 'model') return extension.output
-  return resolveEffectiveWorkflowIoContract(node, extension) === 'named-v1'
-    ? getExtensionSourcePort(extension, sourceHandle)?.type
-    : extension.output
+  return extension.output
 }
-
 
 export function resolveWorkflowEdgeSource(
   edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
@@ -69,25 +64,11 @@ export function resolveWorkflowEdgeSource(
   return { source: sourceId, sourceHandle: sourceEdge.sourceHandle }
 }
 
-export function getWorkflowNodeOutputKey(nodeId: string, sourceHandle: string): string {
-  return `${nodeId}::output::${sourceHandle}`
-}
-
 export function resolveWorkflowEdgeOutput<T extends NodeOutput>(
-  edge: Pick<WFEdge, 'source' | 'sourceHandle'>,
+  edge: Pick<WFEdge, 'source'>,
   nodeOutputs: Map<string, T>,
-  sourceExtension?: Pick<WorkflowExtension, 'id' | 'type' | 'outputs'>,
 ): T | undefined {
-  const modelSourceExtension = sourceExtension?.type === 'model' ? sourceExtension : undefined
-  if (!edge.sourceHandle || !modelSourceExtension?.outputs?.length) return nodeOutputs.get(edge.source)
-
-  const preservedNamedOutput = nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, edge.sourceHandle))
-  if (preservedNamedOutput) return preservedNamedOutput
-
-  const declaredNamedOutput = getExtensionSourcePort(modelSourceExtension, edge.sourceHandle)
-  return (declaredNamedOutput?.name
-    ? nodeOutputs.get(getWorkflowNodeOutputKey(edge.source, declaredNamedOutput.name))
-    : undefined) ?? nodeOutputs.get(edge.source)
+  return nodeOutputs.get(edge.source)
 }
 
 function getProcessNodeId(node: WFNode, extension: WorkflowExtension | undefined): string {
@@ -119,13 +100,7 @@ export function buildProcessExecutionInput({
   const resolveOutput = (edge: WFEdge) => {
     const sourceEdge = resolveWorkflowEdgeSource(edge, edges, nodeMap, nodeOutputs)
     if (!sourceEdge) return undefined
-    const sourceNode = nodeMap.get(sourceEdge.source)
-    const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
-    const sourceExtension = getWorkflowExtension(sourceExtensionId, allExtensions)
-    const effectiveExtension = sourceExtension?.type === 'model'
-      && resolveEffectiveWorkflowIoContract(sourceNode, sourceExtension) !== 'named-v1'
-      ? undefined : sourceExtension
-    return resolveWorkflowEdgeOutput(sourceEdge, nodeOutputs, effectiveExtension)
+    return resolveWorkflowEdgeOutput(sourceEdge, nodeOutputs)
   }
 
   const inputs: Record<string, NamedProcessInput> = {}
@@ -136,7 +111,7 @@ export function buildProcessExecutionInput({
     const sourceNodeId = sourceEdge?.source
     const output = resolveOutput(edge)
     if (!output || (output.filePath === undefined && output.text === undefined)) continue
-    const type = output.outputType ?? getNodeOutputType(nodeMap.get(sourceNodeId!), allExtensions, sourceEdge?.sourceHandle) ?? port.type
+    const type = output.outputType ?? getNodeOutputType(nodeMap.get(sourceNodeId!), allExtensions) ?? port.type
     Object.defineProperty(inputs, port.name ?? 'input-0', { enumerable: true, configurable: true, writable: true, value: {
       type, sourceNodeId: sourceNodeId!,
       ...(output.filePath !== undefined ? { filePath: output.filePath } : {}),

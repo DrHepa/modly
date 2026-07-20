@@ -1,7 +1,7 @@
 import type { ModelExtension, ProcessExtension } from '@shared/stores/extensionsStore'
 export type { ParamSchema } from '@shared/types/electron.d'
 import { normalizeWorkflowParams } from './workflowParamSchema.ts'
-import type { ExtensionOutputPort, ExtensionWorkflowNode, ModelInputKind, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
+import type { ExtensionWorkflowNode, ModelInputKind, ParamSchema, RawParamSchema, WeightVariantsInfo, ProcessPort } from '@shared/types/electron.d'
 import { PREVIEW_VIDEO_NODE_TYPE } from './nodes/previewNodeShared.ts'
 
 interface WorkflowExtensionBase {
@@ -16,8 +16,6 @@ interface WorkflowExtensionBase {
   inputs?:         string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:    string[]                                  // display labels per input slot
   output:          string
-  outputs?:        ExtensionOutputPort[]
-  ioContract?:      'named-v1'
   processOwnerId?: string
   params:          ParamSchema[]
   builtin:         boolean
@@ -168,8 +166,6 @@ export function buildAllWorkflowExtensions(
         inputs:          normalizeWorkflowProcessInputs(node.inputs),
         inputLabels:     node.inputLabels,
         output:          node.output,
-        ...(node.outputs ? { outputs: node.outputs } : {}),
-        ...(node.ioContract ? { ioContract: node.ioContract } : {}),
         ...(node.processOwnerId ? { processOwnerId: node.processOwnerId } : {}),
         params:          applyParamDefaults(node.paramsSchema, node.paramDefaults),
         builtin:         ext.builtin,

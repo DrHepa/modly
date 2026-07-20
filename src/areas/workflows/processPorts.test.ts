@@ -5,6 +5,7 @@ const {
   getProcessTargetPorts,
   getProcessTargetPort,
   getExtensionSourcePorts,
+  getExtensionSourcePort,
   resolveProcessTargetColor,
 } = await import(new URL('./processPorts.ts', import.meta.url).href)
 
@@ -126,6 +127,22 @@ for (const type of ['model', 'process']) {
   })
 }
 
+test('resolves declared legacy model inputs through the same named target-port helper', () => {
+  const ports = getProcessTargetPorts({
+    input: 'none',
+    inputs: [
+      { name: 'front', label: 'Front view', type: 'image' },
+      { name: 'left', label: 'Left view', type: 'image', required: false },
+    ],
+  })
+
+  assert.deepEqual(ports, [
+    { name: 'front', label: 'Front view', type: 'image', required: true, isLegacy: false },
+    { name: 'left', label: 'Left view', type: 'image', required: false, isLegacy: false },
+  ])
+  assert.equal(getProcessTargetPort({ input: 'none', inputs: ports }, 'front')?.name, 'front')
+})
+
 test('uses targetHandle to resolve process target colors and preserves legacy fallback', () => {
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'coarse_mesh'), '#a78bfa')
   assert.equal(resolveProcessTargetColor(multiInputProcessNode, 'reference_image'), '#38bdf8')
@@ -144,6 +161,16 @@ test('keeps positional string ports, repeated types and slot handles distinct fr
   assert.equal(resolveProcessTargetColor(owner, 'input-3'), '#34d399')
   assert.equal(resolveProcessTargetColor(owner, 'input-4'), '#52525b')
 })
+test('resolves named source ports by handle and keeps null as the primary legacy fallback', () => {
+  const owner = { output: 'image' as const }
+
+  assert.deepEqual(getExtensionSourcePorts(owner), [
+    { name: null, type: 'image', isLegacy: true, primary: true },
+  ])
+  assert.equal(getExtensionSourcePort(owner, 'caption'), undefined)
+  assert.equal(getExtensionSourcePort(owner, null)?.name, null)
+})
+
 
 test('workflow discovery keeps defaults and labels for both representations without modifying manifests', async () => {
   const { buildAllWorkflowExtensions } = await import('./mockExtensions.ts')
@@ -203,7 +230,7 @@ test('resolves video process ports and colors as first-class workflow handles', 
 })
 
 
-test('keeps six arbitrary named model input and output handles intact', () => {
+test('model source ports collapse to a single legacy handle without closing named target metadata', () => {
   const faces = ['front', 'right', 'back', 'left', 'top', 'bottom']
   const targets = getProcessTargetPorts({
     input: 'image',
@@ -213,13 +240,11 @@ test('keeps six arbitrary named model input and output handles intact', () => {
       required: index === 0,
     })),
   })
-  const sources = getExtensionSourcePorts({
-    output: 'image',
-    outputs: faces.map((name) => ({ name: `${name}_depth`, type: 'image' })),
-  })
+  const sources = getExtensionSourcePorts({ output: 'mesh' })
 
   assert.deepEqual(targets.map((port: { name: string }) => port.name), faces)
-  assert.deepEqual(sources.map((port: { name: string }) => port.name), faces.map((name) => `${name}_depth`))
-  assert.equal(sources[0].primary, true)
-  assert.equal(sources.slice(1).every((port: { primary: boolean }) => port.primary === false), true)
+  assert.deepEqual(sources, [
+    { name: null, type: 'mesh', isLegacy: true, primary: true },
+  ])
+  assert.equal(getExtensionSourcePort({ output: 'mesh' }, 'named-output'), undefined)
 })

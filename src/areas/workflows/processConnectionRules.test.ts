@@ -4,7 +4,6 @@ import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
 const {
-  resolveEffectiveWorkflowIoContract,
   validateProcessConnection,
   validateWorkflowProcessRun,
 } = await import(new URL('./processConnectionRules.ts', import.meta.url).href)
@@ -93,32 +92,7 @@ function createConnection(overrides: Partial<Connection> = {}): Connection {
   }
 }
 
-test('resolves persisted ioContract before installed metadata and falls back only when absent', () => {
-  const installedNamed = createModelExtension({ ioContract: 'named-v1' })
-  const installedLegacy = createModelExtension({ ioContract: undefined })
-  const persistedNamed = createNode('persisted', 'extensionNode', {
-    extensionId: installedLegacy.id,
-    ioContract: 'named-v1',
-    enabled: true,
-    params: {},
-  })
-  const upgradedSavedNode = createNode('upgraded', 'extensionNode', {
-    extensionId: installedNamed.id,
-    enabled: true,
-    params: {},
-  })
-  const exactLegacyNode = createNode('legacy', 'extensionNode', {
-    extensionId: installedLegacy.id,
-    enabled: true,
-    params: {},
-  })
-
-  assert.equal(resolveEffectiveWorkflowIoContract(persistedNamed, installedLegacy), 'named-v1')
-  assert.equal(resolveEffectiveWorkflowIoContract(upgradedSavedNode, installedNamed), 'named-v1')
-  assert.equal(resolveEffectiveWorkflowIoContract(exactLegacyNode, installedLegacy), undefined)
-})
-
-test('allows upgraded saved model nodes with installed named-v1 ports to connect permissively', () => {
+test('keeps model connections legacy even when stale named handles are present', () => {
   const source = createNode('source-node', 'meshNode')
   const target = createNode('target-node', 'extensionNode', {
     extensionId: 'named/model',
@@ -130,7 +104,6 @@ test('allows upgraded saved model nodes with installed named-v1 ports to connect
     extensionId: 'named',
     nodeId: 'model',
     input: 'image',
-    ioContract: 'named-v1',
     inputs: [{ name: 'front', type: 'image' }],
   })
 

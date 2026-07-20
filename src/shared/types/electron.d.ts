@@ -86,8 +86,6 @@ export interface ExtensionNode<
   inputs?:          string[] | ProcessPort[]   // positional slots or explicit named ports
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
   output:           string
-  outputs?:         ExtensionOutputPort[]
-  ioContract?:      'named-v1'
   paramsSchema:     RawParamSchema[]
   paramDefaults?:   Record<string, boolean | number | string>
   hfRepo?:          string
@@ -168,13 +166,6 @@ export interface ProcessPort {
   min_items?: number
   max_items?: number
   ordered?: true
-}
-
-export interface ExtensionOutputPort {
-  name:   string
-  label?: string
-  type:   ExtensionPortKind
-  required?: boolean
 }
 
 export interface NamedProcessInput {
@@ -966,7 +957,6 @@ export type EditedSceneArtifactWriteResult =
 
 export interface WFNodeData {
   extensionId?:    string
-  ioContract?:     'named-v1'
   inputType?:      'image' | 'text'
   enabled:         boolean
   showInGenerate?: boolean
@@ -995,7 +985,6 @@ export interface WFEdge {
   target:        string
   sourceHandle?: string | null
   targetHandle?: string | null
-  targetItemIndex?: number
 }
 
 export interface Workflow {

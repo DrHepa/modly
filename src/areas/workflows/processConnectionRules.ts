@@ -1,7 +1,7 @@
 import type { Connection } from '@xyflow/react'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions'
-import { getExtensionSourcePort, getProcessTargetPort, getProcessTargetPorts, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
+import { getProcessTargetPort, getProcessTargetPorts, getPositionalInputTypes, hasNamedProcessInputs } from './processPorts.ts'
 import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
 import { deriveActiveWorkflowGraph } from './workflowActiveGraph.ts'
 
@@ -49,17 +49,9 @@ function getExtensionForNode(node: WFNode | undefined, allExtensions: WorkflowEx
   return allExtensions.find((extension) => extension.id === extensionId)
 }
 
-export function resolveEffectiveWorkflowIoContract(
-  node: WFNode | undefined,
-  extension: WorkflowExtension | undefined,
-): WFNode['data']['ioContract'] {
-  return node?.data.ioContract ?? (extension && 'ioContract' in extension ? extension.ioContract : undefined)
-}
-
 function resolveNodeOutputType(
   node: WFNode | undefined,
   allExtensions: WorkflowExtension[],
-  sourceHandle?: string | null,
 ): ArtifactType | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
@@ -71,8 +63,7 @@ function resolveNodeOutputType(
   const extension = getExtensionForNode(node, allExtensions)
   if (!extension) return undefined
   if (extension.type !== 'model') return extension.output
-  if (resolveEffectiveWorkflowIoContract(node, extension) !== 'named-v1') return extension.output
-  return getExtensionSourcePort(extension, sourceHandle)?.type
+  return extension.output
 }
 
 /** Shared by palette autowiring and validation so both select the same source kind. */
@@ -88,7 +79,7 @@ export function resolveProcessConnectionSource(
 function getPortAwareTargetExtension(node: WFNode | undefined, allExtensions: WorkflowExtension[]): WorkflowExtension | undefined {
   const extension = getExtensionForNode(node, allExtensions)
   if (!extension) return undefined
-  if (extension.type === 'model' && resolveEffectiveWorkflowIoContract(node, extension) !== 'named-v1') return undefined
+  if (extension.type === 'model') return undefined
   if (extension.type === 'process' && !hasNamedProcessInputs(extension.inputs)
     && extension.input !== 'scene' && !getPositionalInputTypes(extension)?.includes('scene')) return undefined
   if (extension.type !== 'process' && (!Array.isArray(extension.inputs) || extension.inputs.length === 0)) return undefined
@@ -155,7 +146,7 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions, target
     const previewTargetKind = previewNodeTargetArtifactKind(node.type)
     if (previewTargetKind) {
       const previewEdge = activeGraph.edges.find((edge) => edge.target === node.id)
-      const actualType = resolveNodeOutputType(getNodeById(activeGraph.nodes, previewEdge?.source), allExtensions, previewEdge?.sourceHandle)
+      const actualType = resolveNodeOutputType(getNodeById(activeGraph.nodes, previewEdge?.source), allExtensions)
       if (actualType && actualType !== previewTargetKind) {
         return createIssue({
           phase: 'run',
@@ -246,7 +237,7 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions, target
       for (const edge of portEdges) {
         const sourceId = resolveDataSource(edge.source, activeGraph.edges, new Map(activeGraph.nodes.map((candidate) => [candidate.id, candidate])))
         const sourceNode = getNodeById(activeGraph.nodes, sourceId)
-        const actualType = resolveNodeOutputType(sourceNode, allExtensions, edge.sourceHandle)
+        const actualType = resolveNodeOutputType(sourceNode, allExtensions)
         if (actualType && actualType !== port.type) {
           const expectedType = port.type
           return createIssue({

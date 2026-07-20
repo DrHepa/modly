@@ -1,4 +1,4 @@
-import type { ExtensionOutputPort, ProcessPort } from '../../shared/types/electron.d'
+import type { ProcessPort } from '../../shared/types/electron.d'
 
 type ProcessPortOwner = {
   input?: string
@@ -7,7 +7,6 @@ type ProcessPortOwner = {
 
 type ExtensionOutputOwner = {
   output?: string
-  outputs?: ExtensionOutputPort[]
 }
 
 export type ResolvedProcessTargetPort = {
@@ -49,7 +48,6 @@ export function getPositionalInputTypes(owner: ProcessPortOwner): string[] | und
 }
 
 export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessTargetPort[] {
-  if (owner.input === 'none') return []
   if (hasNamedProcessInputs(owner.inputs)) {
     return owner.inputs.map((port) => ({
       name: port.name,
@@ -65,6 +63,7 @@ export function getProcessTargetPorts(owner: ProcessPortOwner): ResolvedProcessT
       } : {}),
     }))
   }
+  if (owner.input === 'none') return []
   if (owner.inputs?.length) {
     return (owner.inputs as string[]).map((type, i) => ({
       name: `input-${i}`, type, required: true, isLegacy: true,
@@ -84,16 +83,6 @@ export function getProcessTargetPort(owner: ProcessPortOwner, targetHandle?: str
 }
 
 export function getExtensionSourcePorts(owner: ExtensionOutputOwner): ResolvedExtensionSourcePort[] {
-  if (Array.isArray(owner.outputs) && owner.outputs.length > 0) {
-    return owner.outputs.map((port, index) => ({
-      name: port.name,
-      ...(port.label ? { label: port.label } : {}),
-      type: port.type,
-      isLegacy: false,
-      primary: index === 0,
-    }))
-  }
-
   if (!owner.output) return []
   return [{ name: null, type: owner.output, isLegacy: true, primary: true }]
 }

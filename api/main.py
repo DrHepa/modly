@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     generator_registry.initialize()
     yield
     # Shutdown: unload all models
-    generator_registry.unload_all()
+    generator_registry.shutdown_all()
 
 
 class _StatusFilter(logging.Filter):

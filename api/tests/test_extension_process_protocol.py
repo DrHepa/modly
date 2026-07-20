@@ -289,3 +289,143 @@ def test_extension_process_serializes_readiness_and_load_requests(monkeypatch, t
     assert results["readiness"] == {"ok": True, "machine_code": "ready"}
     assert sent == [{"action": "runtime_readiness"}, {"action": "load"}]
     assert process.is_loaded() is True
+
+
+def test_extension_process_start_waits_for_ready_and_keeps_live_pid(monkeypatch, tmp_path):
+    process = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+
+    class FakePopen:
+        def __init__(self):
+            self.pid = 4321
+            self.stdin = None
+            self.stdout = None
+            self.stderr = None
+
+        def poll(self):
+            return None
+
+    class NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("services.extension_process._venv_python", lambda _ext_dir: python)
+    monkeypatch.setattr("services.extension_process.subprocess.Popen", lambda *args, **kwargs: FakePopen())
+    monkeypatch.setattr("services.extension_process.threading.Thread", NoopThread)
+    monkeypatch.setattr(process, "_recv", lambda timeout=None: {"type": "ready", "params_schema": []})
+
+    process._start()
+
+    assert process._proc is not None
+    assert process._proc.pid == 4321
+    assert process.is_loaded() is False
+
+
+def test_extension_process_stop_graceful_path_and_kill_fallback_do_not_leak(monkeypatch, tmp_path):
+    sent: list[dict] = []
+
+    class GracefulProc:
+        def __init__(self):
+            self.wait_calls: list[float] = []
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            return 0
+
+    graceful = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    graceful._proc = GracefulProc()
+    graceful._loaded = True
+    graceful._queue.put({"type": "ready"})
+    monkeypatch.setattr(graceful, "_send", sent.append)
+
+    graceful.stop()
+
+    assert sent == [{"action": "shutdown"}]
+    assert graceful._proc is None
+    assert graceful._loaded is False
+    assert graceful._queue.empty()
+
+    class KillProc:
+        def __init__(self):
+            self.kill_calls = 0
+            self.wait_calls: list[float] = []
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise TimeoutError("stuck")
+            return 0
+
+        def kill(self):
+            self.kill_calls += 1
+
+    kill_sent: list[dict] = []
+    fallback = ExtensionProcess(tmp_path, {"id": "runtime-ext/mesh"})
+    fallback._proc = KillProc()
+    fallback._loaded = True
+    fallback._queue.put({"type": "ready"})
+    monkeypatch.setattr(fallback, "_send", kill_sent.append)
+
+    fallback.stop()
+
+    assert kill_sent == [{"action": "shutdown"}]
+    assert fallback._proc is None
+    assert fallback._loaded is False
+    assert fallback._queue.empty()
+
+
+def test_extension_process_concurrent_readiness_and_load_start_one_pid(monkeypatch, tmp_path):
+    process = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    start_calls = 0
+    ready_release = threading.Event()
+    sent: list[dict] = []
+
+    class RunningProc:
+        pid = 999
+
+        def poll(self):
+            return None
+
+    def fake_start() -> None:
+        nonlocal start_calls
+        start_calls += 1
+        ready_release.wait(timeout=1)
+        process._proc = RunningProc()
+
+    responses = iter([
+        {"type": "runtime_readiness", "status": {"ok": True, "machine_code": "ready"}},
+        {"type": "loaded"},
+    ])
+
+    monkeypatch.setattr(process, "_start", fake_start)
+    monkeypatch.setattr(process, "_send", sent.append)
+    monkeypatch.setattr(process, "_recv", lambda timeout=None: next(responses))
+
+    readiness_result = {}
+
+    def run_readiness() -> None:
+        readiness_result.update(process.readiness_status())
+
+    readiness_thread = threading.Thread(target=run_readiness)
+    load_thread = threading.Thread(target=process.load)
+
+    readiness_thread.start()
+    load_thread.start()
+    time.sleep(0.05)
+    ready_release.set()
+    readiness_thread.join(timeout=1)
+    load_thread.join(timeout=1)
+
+    assert start_calls == 1
+    assert readiness_result == {"ok": True, "machine_code": "ready"}
+    assert sent == [{"action": "runtime_readiness"}, {"action": "load"}]

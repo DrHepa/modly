@@ -138,8 +138,9 @@ class ExtensionProcess:
             # Wait for ready — runner sends params_schema in this message
             msg = self._recv(timeout=None)
             if msg.get("type") == "ready":
-                # Override params_schema with what the generator class actually declares
-                if msg.get("params_schema"):
+                # The manifest-declared node schema is the primary capability contract.
+                # Use runtime schema only for legacy extensions that omit one.
+                if msg.get("params_schema") and not self._params_schema:
                     self._params_schema = msg["params_schema"]
 
                 print(f"[ExtensionProcess] {self.MODEL_ID} subprocess started (pid {self._proc.pid})")
@@ -155,11 +156,6 @@ class ExtensionProcess:
 
             raise RuntimeError(f"[{self.MODEL_ID}] Expected 'ready', got: {msg}")
 
-        # The node manifest is the capability contract. Use a runtime schema only
-        # for legacy extensions that do not declare one in their manifest.
-        if msg.get("params_schema") and not self._params_schema:
-            self._params_schema = msg["params_schema"]
-
     def _resolve_auto_repair_package(self, module_name: str) -> Optional[str]:
         """
         Maps a missing import name to a pip package for safe auto-repair.
@@ -171,6 +167,12 @@ class ExtensionProcess:
             return _AUTO_REPAIR_PACKAGE_MAP[module_name]
         root = module_name.split(".")[0]
         return _AUTO_REPAIR_PACKAGE_MAP.get(root)
+
+    def _extract_missing_module(self, msg: dict) -> Optional[str]:
+        """Returns missing import name from a runner error payload, if present."""
+        blob = f"{msg.get('message', '')}\n{msg.get('traceback', '')}"
+        match = _MISSING_MODULE_RE.search(blob)
+        return match.group(1) if match else None
 
     def _install_missing_package(self, python: Path, module_name: str, package_name: str) -> None:
         """Best-effort auto-repair for a known missing import in extension venv."""
@@ -437,22 +439,22 @@ class ExtensionProcess:
     def stop(self) -> None:
         """Gracefully shut down the subprocess."""
         with self._get_request_lock():
-            if self._proc and self._proc.poll() is None:
-                try:
-                    self._send({"action": "shutdown"})
-                    self._proc.wait(timeout=15)
-                except Exception:
-                    self._proc.kill()
-        self._loaded = False
-        self._proc   = None
-        self._loaded = False
-        if proc and proc.poll() is None:
+            proc = self._proc
             try:
-                proc.kill()
-                proc.wait(timeout=5)
+                if proc and proc.poll() is None:
+                    self._send({"action": "shutdown"})
+                    proc.wait(timeout=15)
             except Exception:
-                pass
-        self._drain_queue()
+                try:
+                    if proc and proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                except Exception:
+                    pass
+            finally:
+                self._proc = None
+                self._loaded = False
+                self._drain_queue()
 
     def _drain_queue(self) -> None:
         while not self._queue.empty():

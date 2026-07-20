@@ -362,11 +362,7 @@ class GeneratorRegistry:
         Unloads all current generators before reloading.
         """
         print("[Registry] Reloading extensions…")
-        for gen in self._generators.values():
-            try:
-                gen.unload()
-            except Exception:
-                pass
+        self.shutdown_all()
         self._generators.clear()
         self._manifests.clear()
         self._errors.clear()
@@ -571,11 +567,21 @@ class GeneratorRegistry:
                 gen.outputs_dir = workspace_dir
 
     def unload_all(self) -> None:
+        self.shutdown_all()
+
+    def shutdown_all(self) -> None:
         for gen in self._generators.values():
-            if isinstance(gen, ExtensionProcess):
-                gen.stop()
-            else:
-                gen.unload()
+            try:
+                if isinstance(gen, ExtensionProcess):
+                    gen.stop()
+                else:
+                    gen.unload()
+            except Exception:
+                pass
+
+        with self._runtime_readiness_lock:
+            self._runtime_readiness_cache.clear()
+            self._runtime_readiness_inflight.clear()
 
 
 _EVIDENCE_ALLOWLIST = {

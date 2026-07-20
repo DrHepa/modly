@@ -48,6 +48,40 @@ class LegacyGenerator:
     VRAM_GB = 0
 
 
+class RecordingExtensionProcess(ExtensionProcess):
+    def __init__(self, model_id: str):
+        self.MODEL_ID = model_id
+        self.model_id = model_id
+        self.stop_calls = 0
+        self.unload_calls = 0
+        self.load_calls = 0
+        self.readiness_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def unload(self) -> None:
+        self.unload_calls += 1
+
+    def load(self) -> None:
+        self.load_calls += 1
+
+    def readiness_status(self) -> dict:
+        self.readiness_calls += 1
+        return {"ok": True, "machine_code": "ready"}
+
+
+class RecordingDirectGenerator:
+    DISPLAY_NAME = "Direct"
+    VRAM_GB = 0
+
+    def __init__(self):
+        self.unload_calls = 0
+
+    def unload(self) -> None:
+        self.unload_calls += 1
+
+
 def _registry(model_id: str, generator) -> GeneratorRegistry:
     registry = GeneratorRegistry()
     registry._generators = {model_id: generator}
@@ -330,3 +364,55 @@ def test_runner_returns_generator_readiness_or_unsupported_contract():
 
     assert runner.resolve_runtime_readiness(ReadyGenerator()) == {"ok": True, "machine_code": "ready"}
     assert runner.resolve_runtime_readiness(UnsupportedGenerator())["machine_code"] == "unsupported_contract"
+
+
+def test_registry_reload_stops_old_extension_process_before_rebuilding(monkeypatch):
+    old_process = RecordingExtensionProcess("runtime-ext/text-to-image")
+    registry = GeneratorRegistry()
+    registry._generators = {"runtime-ext/text-to-image": old_process}
+    registry._manifests = {"runtime-ext/text-to-image": {"id": "runtime-ext/text-to-image", "name": "Runtime"}}
+    registry._errors = {"runtime-ext/text-to-image": "old error"}
+
+    initialized = []
+    monkeypatch.setattr(registry, "initialize", lambda: initialized.append(True))
+
+    registry.reload()
+
+    assert old_process.stop_calls == 1
+    assert old_process.unload_calls == 0
+    assert initialized == [True]
+
+
+def test_registry_shutdown_stops_model_runners_and_unloads_direct_generators():
+    extension_process = RecordingExtensionProcess("runtime-ext/text-to-image")
+    direct_generator = RecordingDirectGenerator()
+    registry = GeneratorRegistry()
+    registry._generators = {
+        "runtime-ext/text-to-image": extension_process,
+        "legacy-ext/image-to-mesh": direct_generator,
+    }
+    registry._runtime_readiness_cache = {"runtime-ext/text-to-image": (time.monotonic(), {"ok": True})}
+    registry._runtime_readiness_inflight = {"runtime-ext/text-to-image": object()}
+
+    registry.shutdown_all()
+
+    assert extension_process.stop_calls == 1
+    assert extension_process.unload_calls == 0
+    assert direct_generator.unload_calls == 1
+    assert registry._runtime_readiness_cache == {}
+    assert registry._runtime_readiness_inflight == {}
+
+
+def test_runtime_readiness_startup_path_starts_pid_without_loading_weights(monkeypatch):
+    process = RecordingExtensionProcess("runtime-ext/text-to-image")
+    registry = GeneratorRegistry()
+    registry._generators = {"runtime-ext/text-to-image": process}
+    registry._manifests = {"runtime-ext/text-to-image": {"id": "runtime-ext/text-to-image", "name": "Runtime"}}
+
+    monkeypatch.setattr(registry, "_sync_generator_model_dir", lambda model_id: process)
+
+    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])
+
+    assert readiness["runtime-ext/text-to-image"]["machine_code"] == "ready"
+    assert process.readiness_calls == 1
+    assert process.load_calls == 0

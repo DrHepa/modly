@@ -82,21 +82,49 @@ def load_generator(manifest: dict):
     return getattr(mod, manifest["generator_class"])
 
 
-def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
+def _select_node(manifest: dict, model_dir_override: str = "", model_id: str = "") -> dict:
     nodes = manifest.get("nodes") or []
-    node = {}
+    if not nodes:
+        return {}
 
-    if nodes and MODEL_ID and "/" in MODEL_ID:
-        requested_node_id = MODEL_ID.split("/", 1)[1]
-        node = next((candidate for candidate in nodes if candidate.get("id") == requested_node_id), {})
+    if model_id and "/" in model_id:
+        requested_node_id = model_id.split("/", 1)[1]
+        requested_node = next((node for node in nodes if node.get("id") == requested_node_id), None)
+        if requested_node:
+            return requested_node
 
-    if not node and nodes and _MODEL_DIR_OVERRIDE:
-        node_id = Path(_MODEL_DIR_OVERRIDE).name
-        node = next((candidate for candidate in nodes if candidate.get("id") == node_id), {})
+    if model_dir_override:
+        node_id = Path(model_dir_override).name
+        matched_node = next((node for node in nodes if node.get("id") == node_id), None)
+        if matched_node:
+            return matched_node
 
-    if not node and nodes:
-        node = nodes[0]
+    return nodes[0]
 
+
+def _resolve_ready_schema(gen, node: dict, manifest: dict) -> list:
+    schema = getattr(gen, "params_schema", None)
+    if callable(schema):
+        try:
+            resolved = schema()
+            if resolved is not None:
+                return resolved
+        except Exception:
+            pass
+    return node.get("params_schema") or manifest.get("params_schema", [])
+
+
+def _apply_manifest_metadata(gen, manifest: dict, node: dict) -> None:
+    gen.hf_repo = node.get("hf_repo") or manifest.get("hf_repo", "")
+    gen.hf_downloads = node.get("hf_downloads") or manifest.get("hf_downloads", [])
+    gen.https_downloads = node.get("https_downloads") or manifest.get("https_downloads", [])
+    gen.hf_skip_prefixes = node.get("hf_skip_prefixes") or manifest.get("hf_skip_prefixes", [])
+    gen.download_check = node.get("download_check") or manifest.get("download_check", "")
+    gen._params_schema = node.get("params_schema") or manifest.get("params_schema", [])
+
+
+def resolve_runner_context(manifest: dict) -> tuple[dict, Path]:
+    node = _select_node(manifest, _MODEL_DIR_OVERRIDE, MODEL_ID)
     model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / (MODEL_ID or manifest["id"])
     return node, model_dir
 
@@ -146,12 +174,9 @@ def main() -> None:
     gen.model_id         = model_id
     gen.node_id          = node.get("id", "")
     gen.input            = node.get("input") or manifest.get("input", "image")
-    gen.hf_repo          = manifest.get("hf_repo", "")          or node.get("hf_repo", "")
-    gen.hf_downloads      = manifest.get("hf_downloads", [])      or node.get("hf_downloads", [])
-    gen.https_downloads   = manifest.get("https_downloads", [])   or node.get("https_downloads", [])
-    gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", []) or node.get("hf_skip_prefixes", [])
-    gen.download_check   = manifest.get("download_check", "")   or node.get("download_check", "")
-    gen._params_schema   = manifest.get("params_schema", [])    or node.get("params_schema", [])
+    _apply_manifest_metadata(gen, manifest, node)
+
+    send({"type": "ready", "params_schema": _resolve_ready_schema(gen, node, manifest)})
 
     # Active cancel events keyed by request id
     _cancel: dict[str, threading.Event] = {}

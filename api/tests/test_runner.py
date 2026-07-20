@@ -7,6 +7,7 @@ import tempfile
 import importlib
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 _tmp_ext_dir = tempfile.mkdtemp(prefix="modly-runner-test-")
@@ -33,15 +34,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(node["id"], "quality")
 
     def test_ready_schema_falls_back_to_selected_node_schema(self) -> None:
-        class GenClass:
-            @classmethod
-            def params_schema(cls):
+        class Gen:
+            def params_schema(self):
                 raise RuntimeError("not available")
 
         manifest = {"params_schema": [{"id": "manifest"}]}
         node = {"params_schema": [{"id": "node"}]}
 
-        schema = _resolve_ready_schema(GenClass, node, manifest)
+        schema = _resolve_ready_schema(Gen(), node, manifest)
 
         self.assertEqual(schema, [{"id": "node"}])
 
@@ -98,23 +98,98 @@ class SelectNodeTests(unittest.TestCase):
 
 
 class ResolveReadySchemaTests(unittest.TestCase):
-    def test_uses_generator_classmethod_when_available(self) -> None:
-        class GenClass:
-            @classmethod
-            def params_schema(cls):
+    def test_uses_generator_method_when_available(self) -> None:
+        class Gen:
+            def params_schema(self):
                 return [{"id": "from-class"}]
 
-        schema = _resolve_ready_schema(GenClass, {"params_schema": [{"id": "node"}]}, {})
+        schema = _resolve_ready_schema(Gen(), {"params_schema": [{"id": "node"}]}, {})
         self.assertEqual(schema, [{"id": "from-class"}])
 
     def test_falls_back_to_manifest_when_node_has_no_schema(self) -> None:
-        class GenClass:
-            @classmethod
-            def params_schema(cls):
+        class Gen:
+            def params_schema(self):
                 raise RuntimeError("unavailable")
 
-        schema = _resolve_ready_schema(GenClass, {}, {"params_schema": [{"id": "manifest"}]})
+        schema = _resolve_ready_schema(Gen(), {}, {"params_schema": [{"id": "manifest"}]})
         self.assertEqual(schema, [{"id": "manifest"}])
+
+
+class MainTests(unittest.TestCase):
+    def test_main_emits_ready_before_reading_actions(self) -> None:
+        manifest = {
+            "id": "bundle/node-a",
+            "generator_class": "FakeGenerator",
+            "nodes": [{"id": "node-a", "params_schema": [{"id": "node-schema"}]}],
+        }
+        sent: list[dict] = []
+
+        class FakeGenerator:
+            def __init__(self, model_dir, outputs_dir):
+                self.model_dir = model_dir
+                self.outputs_dir = outputs_dir
+                self.load_calls = 0
+
+            def params_schema(self):
+                return [{"id": "runtime-schema"}]
+
+            def load(self):
+                self.load_calls += 1
+
+            def unload(self):
+                pass
+
+        with mock.patch.object(runner, "load_generator", return_value=FakeGenerator), \
+             mock.patch.object(runner, "send", side_effect=sent.append), \
+             mock.patch.object(runner, "recv", return_value=iter(())), \
+             mock.patch.object(
+                 Path,
+                 "read_text",
+                 return_value=json.dumps(manifest),
+             ):
+            runner.main()
+
+        self.assertEqual(sent, [{"type": "ready", "params_schema": [{"id": "runtime-schema"}]}])
+
+    def test_main_ready_emission_does_not_call_load(self) -> None:
+        manifest = {
+            "id": "bundle/node-a",
+            "generator_class": "FakeGenerator",
+            "nodes": [{"id": "node-a", "params_schema": [{"id": "node-schema"}]}],
+        }
+        sent: list[dict] = []
+        fake_generator = None
+
+        class FakeGenerator:
+            def __init__(self, model_dir, outputs_dir):
+                nonlocal fake_generator
+                fake_generator = self
+                self.model_dir = model_dir
+                self.outputs_dir = outputs_dir
+                self.load_calls = 0
+
+            def params_schema(self):
+                return [{"id": "runtime-schema"}]
+
+            def load(self):
+                self.load_calls += 1
+
+            def unload(self):
+                pass
+
+        with mock.patch.object(runner, "load_generator", return_value=FakeGenerator), \
+             mock.patch.object(runner, "send", side_effect=sent.append), \
+             mock.patch.object(runner, "recv", return_value=iter(())), \
+             mock.patch.object(
+                 Path,
+                 "read_text",
+                 return_value=json.dumps(manifest),
+             ):
+            runner.main()
+
+        self.assertIsNotNone(fake_generator)
+        self.assertEqual(fake_generator.load_calls, 0)
+        self.assertEqual(sent[0]["type"], "ready")
 
 
 class ProtocolTests(unittest.TestCase):

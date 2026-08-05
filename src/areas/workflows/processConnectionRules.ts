@@ -61,6 +61,7 @@ function resolveNodeOutputType(
 ): ArtifactType | undefined {
   if (!node) return undefined
   if (node.type === 'imageNode') return 'image'
+  if (node.type === 'videoNode') return 'video'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'

@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
 from services.hf_download_assets import hf_download_assets_ready
 from services.https_download_assets import https_download_assets_ready
 
@@ -86,6 +87,7 @@ class ExtensionProcess:
         env["EXTENSION_DIR"] = str(self.ext_dir)
         env["MODELS_DIR"]    = str(MODELS_DIR)
         env["WORKSPACE_DIR"] = str(WORKSPACE_DIR)
+        env[MODLY_WORKSPACE_DIR_ENV] = str(WORKSPACE_DIR.resolve())
         env["MODLY_API_DIR"] = str(Path(__file__).parent.parent)
         env["MODEL_ID"] = self.MODEL_ID
         # Pass the exact model_dir so runner.py doesn't have to re-derive it
@@ -338,7 +340,7 @@ class ExtensionProcess:
 
     def generate(
         self,
-        image_bytes: bytes,
+        image_bytes: bytes | Path,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -348,13 +350,29 @@ class ExtensionProcess:
         with self._get_request_lock():
             self._ensure_started()
             req_id = str(uuid.uuid4())
-            self._send({
-                "action":      "generate",
-                "id":          req_id,
-                "image_b64":   base64.b64encode(image_bytes).decode(),
-                "params":      params,
-                "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
-            })
+            if isinstance(image_bytes, bytes):
+                request = {
+                    "action":      "generate",
+                    "id":          req_id,
+                    "image_b64":   base64.b64encode(image_bytes).decode(),
+                    "params":      params,
+                    "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+                }
+            elif isinstance(image_bytes, Path):
+                if self.input != "video":
+                    raise TypeError(
+                        f"[{self.MODEL_ID}] Path input requires a model declaring input 'video'."
+                    )
+                request = {
+                    "action":      "generate",
+                    "id":          req_id,
+                    "input":       {"kind": "video", "path": str(image_bytes)},
+                    "params":      params,
+                    "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+                }
+            else:
+                raise TypeError("Generation input must be bytes or pathlib.Path.")
+            self._send(request)
 
             while True:
                 # Check for cancellation

@@ -122,14 +122,16 @@ class BaseGenerator(ABC):
     @abstractmethod
     def generate(
         self,
-        image_bytes: bytes,
+        image_bytes: bytes | Path,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
         """
-        Starts 3D generation from an image.
+        Starts generation from an in-memory image or validated file-backed input.
         Returns the path to the generated .glb file.
+        image_bytes: legacy parameter name; bytes for image input or a Path for
+        supported file-backed inputs.
         progress_cb(percent: int, step_label: str)
         cancel_event: set this to interrupt generation between steps.
         """

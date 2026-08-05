@@ -84,11 +84,13 @@ test('preload restored fs and extensions APIs use the correct channels', async (
   })
 
   assert.equal(await api.fs.selectDirectory('/workspace/current'), 'fs:selectDirectory')
+  assert.equal(await api.fs.selectVideo(), 'fs:selectVideo')
   assert.equal(await api.fs.listFiles('/workspace/current', ['png', '.json']), 'fs:listFiles')
   assert.equal(await api.fs.selectTextFile(), 'fs:selectTextFile')
   assert.equal(await api.extensions.installFromLocal(), 'extensions:installFromLocal')
   assert.deepEqual(invocations, [
     { channel: 'fs:selectDirectory', args: ['/workspace/current'] },
+    { channel: 'fs:selectVideo', args: [] },
     { channel: 'fs:listFiles', args: ['/workspace/current', ['png', '.json']] },
     { channel: 'fs:selectTextFile', args: [] },
     { channel: 'extensions:installFromLocal', args: [] },

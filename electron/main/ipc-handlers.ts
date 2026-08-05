@@ -45,6 +45,7 @@ import { assertSafeExtensionId, assertSafeOwnershipSegment, resolveExtensionPath
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 import { updatesSupported } from './updater'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
+import { importVideoInputToWorkspace } from './video-input-import'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -485,6 +486,22 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     })
 
     return result.canceled ? null : result.filePaths[0]
+  })
+
+  ipcMain.handle('fs:selectVideo', async () => {
+    const win = getWindow()
+    if (!win) return null
+
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Select a video',
+      properties: ['openFile']
+    })
+
+    const sourcePath = result.filePaths[0]
+    if (result.canceled || !sourcePath) return null
+
+    const workspaceDir = getSettings(app.getPath('userData')).workspaceDir
+    return await importVideoInputToWorkspace({ sourcePath, workspaceDir })
   })
 
   ipcMain.handle('fs:selectMeshFile', async () => {
@@ -973,10 +990,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     nodes?: {
       id:                string
       name?:             string
-      input?:            'mesh' | 'image' | 'text' | 'audio'
-      inputs?:           ('mesh' | 'image' | 'text' | 'audio')[]
+      input?:            'mesh' | 'image' | 'text' | 'audio' | 'video'
+      inputs?:           ('mesh' | 'image' | 'text' | 'audio' | 'video')[]
       input_labels?:     string[]
-      output?:           'mesh' | 'image' | 'text' | 'audio'
+      output?:           'mesh' | 'image' | 'text' | 'audio' | 'video'
       params_schema?:    unknown[]
       param_defaults?:   Record<string, unknown>
       hf_repo?:          string

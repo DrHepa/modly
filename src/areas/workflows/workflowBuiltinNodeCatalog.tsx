@@ -9,6 +9,7 @@ import {
 
 export const WORKFLOW_BUILTIN_PANEL_NODES = [
   { type: 'imageNode', label: 'Image', color: '#38bdf8', icon: <><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></> },
+  { type: 'videoNode', label: 'Video', color: '#fb7185', icon: <><path d="M15 10l4.55-2.27A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.89L15 14"/><rect x="3" y="6" width="12" height="12" rx="2"/></> },
   { type: 'textNode', label: 'Text', color: '#fbbf24', icon: <><path d="M17 6.1H3M21 12.1H3M15.1 18H3"/></> },
   { type: 'meshNode', label: 'Load 3D Mesh', color: '#a78bfa', icon: <><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></> },
   { type: 'sceneNode', label: 'Load Scene', color: '#34d399', icon: <><path d="M4 7h16"/><path d="M7 4h10v16H7z"/><path d="M10 11h4"/><path d="M10 15h4"/></> },
@@ -22,6 +23,7 @@ export const WORKFLOW_BUILTIN_PANEL_NODES = [
 
 export const WORKFLOW_BUILTIN_PALETTE_NODES = [
   { type: 'imageNode', label: 'Image', color: '#38bdf8', description: 'Image input' },
+  { type: 'videoNode', label: 'Video', color: '#fb7185', description: 'Video input' },
   { type: 'textNode', label: 'Text', color: '#fbbf24', description: 'Text input' },
   { type: 'meshNode', label: 'Load 3D Mesh', color: '#a78bfa', description: 'Load a 3D mesh file or use current model' },
   { type: 'sceneNode', label: 'Load Scene', color: '#34d399', description: 'Load an existing scene manifest or scene directory' },

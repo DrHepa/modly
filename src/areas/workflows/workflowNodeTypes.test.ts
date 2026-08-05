@@ -11,6 +11,7 @@ const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const nodeTypesEntry = path.join(projectRoot, 'src/areas/workflows/workflowNodeTypes.tsx')
 const landmarksNodeEntry = path.join(projectRoot, 'src/areas/workflows/nodes/LandmarksNode.tsx')
 const landmarksNodeGuideEntry = path.join(projectRoot, 'src/areas/workflows/nodes/LandmarksNodeGuide.tsx')
+const videoNodeEntry = path.join(projectRoot, 'src/areas/workflows/nodes/VideoNode.tsx')
 
 async function bundleModule(entry: string, bundleName: string) {
   const tempDir = await mkdtemp(path.join(projectRoot, `.tmp-${bundleName}-`))
@@ -232,5 +233,60 @@ test('workflow nodeTypes maps previewVideoNode to the PreviewVideoNode component
     assert.equal(module.WORKFLOW_NODE_TYPES.previewVideoNode?.name, 'PreviewVideoNode')
   } finally {
     cleanup()
+  }
+})
+
+test('workflow nodeTypes maps videoNode to the VideoNode source component', async () => {
+  const { module, cleanup } = await bundleModule(nodeTypesEntry, 'workflow-node-types-video-source')
+  try {
+    assert.equal(module.WORKFLOW_NODE_TYPES.videoNode?.name, 'VideoNode')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('VideoNodeContent exposes visible file identity and accessible select, change, and clear actions', async () => {
+  const { module, cleanup } = await bundleModule(videoNodeEntry, 'workflow-video-node')
+  try {
+    const emptyMarkup = renderToStaticMarkup(React.createElement(module.VideoNodeContent, {
+      onSelect: () => {},
+      onClear: () => {},
+    }))
+    assert.match(emptyMarkup, />Select video</)
+
+    const selectedMarkup = renderToStaticMarkup(React.createElement(module.VideoNodeContent, {
+      displayName: 'walkaround.mp4',
+      onSelect: () => {},
+      onClear: () => {},
+    }))
+    assert.match(selectedMarkup, /walkaround\.mp4/)
+    assert.match(selectedMarkup, />Change</)
+    assert.match(selectedMarkup, />Clear</)
+    assert.match(selectedMarkup, /aria-label="Change selected video"/)
+    assert.match(selectedMarkup, /aria-label="Clear selected video"/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('VideoNode resolves path-only selections to a visible basename', async () => {
+  const { module, cleanup } = await bundleModule(videoNodeEntry, 'workflow-video-node-path-label')
+  try {
+    assert.equal(
+      module.resolveVideoSelectionLabel({ videoPath: 'Workflows/Inputs/Videos/turntable.mp4' }),
+      'turntable.mp4',
+    )
+    assert.equal(
+      module.resolveVideoSelectionLabel({ videoPath: 'Workflows\\Inputs\\Videos\\walkaround.webm' }),
+      'walkaround.webm',
+    )
+    assert.equal(
+      module.resolveVideoSelectionLabel({ displayName: 'Friendly clip', videoPath: 'ignored.mp4' }),
+      'Friendly clip',
+    )
+    assert.equal(module.resolveVideoSelectionLabel({ videoPath: '/' }), 'Selected video')
+    assert.equal(module.resolveVideoSelectionLabel({}), undefined)
+  } finally {
+    await cleanup()
   }
 })

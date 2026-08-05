@@ -47,6 +47,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const TYPE_COLOR: Record<string, string> = {
   image: '#38bdf8',
+  video: '#fb7185',
   mesh:  '#a78bfa',
   text:  '#fbbf24',
 }
@@ -442,6 +443,76 @@ function ImageParamRow({ nodeId, nodes, onPatch }: { nodeId: string; nodes: Flow
           <span className="text-[10px] text-zinc-500">Browse image…</span>
         </button>
       )}
+    </div>
+  )
+}
+
+function VideoParamRow({ nodeId, nodes, onPatch }: { nodeId: string; nodes: FlowNode[]; onPatch: PatchFn }) {
+  const node = nodes.find((candidate) => candidate.id === nodeId)
+  const data = node?.data as { params: Record<string, unknown> } | undefined
+  const videoPath = typeof data?.params.videoPath === 'string' ? data.params.videoPath : undefined
+  const displayName = typeof data?.params.displayName === 'string'
+    ? data.params.displayName
+    : videoPath?.split('/').pop()
+  const [error, setError] = useState<string>()
+
+  const selectVideo = useCallback(async () => {
+    setError(undefined)
+    try {
+      const selection = await window.electron.fs.selectVideo()
+      if (!selection) return
+      onPatch(nodeId, {
+        params: {
+          ...(data?.params ?? {}),
+          videoPath: selection.workspacePath,
+          displayName: selection.displayName,
+        },
+      })
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }, [data?.params, nodeId, onPatch])
+
+  const clearVideo = useCallback(() => {
+    setError(undefined)
+    const params = { ...(data?.params ?? {}) }
+    delete params.videoPath
+    delete params.displayName
+    onPatch(nodeId, { params })
+  }, [data?.params, nodeId, onPatch])
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-1.5">
+        <svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fb7185" strokeWidth="2">
+          <path d="M15 10l4.55-2.27A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.89L15 14"/>
+          <rect x="3" y="6" width="12" height="12" rx="2"/>
+        </svg>
+        <span className="text-[11px] font-medium text-zinc-300">Video</span>
+      </div>
+      {displayName ? (
+        <>
+          <p className="truncate rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-2 text-[10px] text-zinc-200" title={displayName} aria-live="polite">
+            {displayName}
+          </p>
+          <div className="flex gap-2">
+            <button type="button" aria-label="Change selected video" onClick={selectVideo}
+              className="min-h-8 flex-1 rounded-md border border-zinc-700 px-2 text-[10px] text-zinc-300 hover:border-rose-400/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400">
+              Change
+            </button>
+            <button type="button" aria-label="Clear selected video" onClick={clearVideo}
+              className="min-h-8 rounded-md border border-zinc-700 px-2 text-[10px] text-zinc-400 hover:border-red-400/60 hover:text-red-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400">
+              Clear
+            </button>
+          </div>
+        </>
+      ) : (
+        <button type="button" onClick={selectVideo}
+          className="min-h-10 w-full rounded-lg border border-dashed border-zinc-700 px-3 text-[10px] text-zinc-400 hover:border-rose-400/60 hover:bg-rose-400/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400">
+          Select video
+        </button>
+      )}
+      {error && <p role="alert" className="text-[10px] leading-snug text-red-400">{error}</p>}
     </div>
   )
 }
@@ -937,7 +1008,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
   )
 
   const paramNodes = sortedNodes.filter((n) =>
-    (n.type === 'imageNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode')
+    (n.type === 'imageNode' || n.type === 'videoNode' || n.type === 'textNode' || n.type === 'meshNode' || n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode')
     && (n.data as { showInGenerate?: boolean }).showInGenerate === true,
   )
 
@@ -973,6 +1044,7 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
           return (
             <div key={node.id}>
               {node.type === 'imageNode' && <ImageParamRow nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
+              {node.type === 'videoNode' && <VideoParamRow nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'textNode'  && <TextParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'meshNode'  && <MeshParamRow  nodeId={node.id} nodes={nodes} onPatch={patchNode} />}
               {node.type === 'waitNode'  && <WaitParamRow  nodeId={node.id} />}

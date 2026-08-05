@@ -662,3 +662,18 @@ test('WorkflowRunFooter exposes clickable Continue and Clear for completed unpin
   assert.match(html, /Clear landmarks/i)
   assert.doesNotMatch(html, /disabled=""/i)
 })
+
+test('WorkflowPanel exposes pinned video sources without base64 or image transport', async () => {
+  const source = await readFile(workflowPanelSource, 'utf8')
+  const start = source.indexOf('function VideoParamRow')
+  const end = source.indexOf('function MeshParamRow', start)
+  assert.ok(start >= 0 && end > start)
+
+  const videoRowSource = source.slice(start, end)
+  assert.match(videoRowSource, /window\.electron\.fs\.selectVideo\(\)/)
+  assert.match(videoRowSource, /videoPath/)
+  assert.match(videoRowSource, /displayName/)
+  assert.match(source, /node\.type === 'videoNode'/)
+  assert.match(source, /<VideoParamRow/)
+  assert.doesNotMatch(videoRowSource, /readFileBase64|selectImage|image\/png|from-image/)
+})

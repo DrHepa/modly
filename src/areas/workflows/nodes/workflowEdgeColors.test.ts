@@ -2,7 +2,17 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { PROCESS_PORT_HANDLE_COLOR } from '../processPorts.ts'
-import { resolveWorkflowEdgeTargetColor } from './workflowEdgeColors.ts'
+import {
+  resolveWorkflowEdgeSourceColor,
+  resolveWorkflowEdgeTargetColor,
+} from './workflowEdgeColors.ts'
+
+test('resolveWorkflowEdgeSourceColor uses the rose video color for video source nodes', () => {
+  assert.equal(
+    resolveWorkflowEdgeSourceColor({ sourceNodeType: 'videoNode' }),
+    PROCESS_PORT_HANDLE_COLOR.video,
+  )
+})
 
 test('resolveWorkflowEdgeTargetColor treats both preview node variants as image sinks', () => {
   assert.equal(resolveWorkflowEdgeTargetColor({ targetNodeType: 'previewImageNode' }), PROCESS_PORT_HANDLE_COLOR.image)

@@ -584,6 +584,11 @@ type ModelGenerationRequest =
       params: Record<string, unknown>
     }
   | {
+      kind: 'video'
+      videoPath: string
+      params: Record<string, unknown>
+    }
+  | {
       kind: 'text'
       payload: {
         prompt: string
@@ -615,8 +620,10 @@ const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 
 
 function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
   const norm = filePath.replace(/\\/g, '/')
-  return norm.startsWith(workspaceDir)
-    ? norm.slice(workspaceDir.length).replace(/^\//, '')
+  const workspace = workspaceDir.replace(/\\/g, '/').replace(/\/$/, '')
+  if (norm === workspace) return ''
+  return norm.startsWith(`${workspace}/`)
+    ? norm.slice(workspace.length + 1)
     : norm
 }
 
@@ -867,6 +874,18 @@ export function buildModelGenerationRequest(args: {
         scene_path: scenePath,
         input_scene_path: scenePath,
       },
+    }
+  }
+
+  if (input === 'video') {
+    const activeVideoPath = nodeInputPath
+    if (!activeVideoPath) {
+      throw new Error(`Missing required video input for extension ${ext.id}`)
+    }
+    return {
+      kind: 'video',
+      videoPath: normalizeWorkflowPath(activeVideoPath, workspaceDir),
+      params: nodeParams,
     }
   }
 
@@ -1123,6 +1142,12 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           // model node falls through to selectedImageData (= overrideImageData).
           const resolvedPath = overrideImageData ? undefined : (fp ?? selectedImagePath ?? undefined)
           const output = { filePath: resolvedPath, outputType: 'image' }
+          nodeOutputs.set(node.id, output)
+          rememberArtifactOutput(node.id, output)
+        }
+        if (node.type === 'videoNode') {
+          const fp = node.data.params?.videoPath as string | undefined
+          const output = { filePath: fp, outputType: 'video' }
           nodeOutputs.set(node.id, output)
           rememberArtifactOutput(node.id, output)
         }
@@ -1530,6 +1555,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
             if (src.text !== undefined)           nodeInputText     = src.text
           }
+        } else if (mode === 'model' && ext.input === 'video') {
+          for (const edge of incomingEdges) {
+            const src = resolveRunEdgeOutput(edge, nodeOutputs)
+            if (src?.outputType === 'video' && src.filePath !== undefined) nodeInputPath = src.filePath
+          }
         } else if (shouldUsePreviousNodeFallback(ext.input)) {
           // Single-input. Inputless model sources never consume edges or prior outputs.
           for (const edge of incomingEdges) {
@@ -1602,7 +1632,17 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
                 texture_resolution: 1024,
                 params: request.params,
               })
-              : request.kind === 'image'
+              : request.kind === 'video'
+                ? client.post<{ job_id: string }>('/generate/from-video', {
+                  video_path: request.videoPath,
+                  model_id: node.data.extensionId ?? '',
+                  collection: 'Workflows',
+                  remesh: 'none',
+                  enable_texture: false,
+                  texture_resolution: 1024,
+                  params: request.params,
+                })
+                : request.kind === 'image'
                   ? (async () => {
                     const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
                     const blob  = new Blob([bytes], { type: 'image/png' })

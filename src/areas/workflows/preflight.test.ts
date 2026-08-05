@@ -107,3 +107,25 @@ test('preflight accepts video outputs for video workflow consumers', () => {
 
   assert.deepEqual(issues, [])
 })
+
+test('preflight accepts a Video source connected to a video-to-mesh model', () => {
+  const workflow = createWorkflow([
+    createNode('video-source', 'videoNode', {
+      enabled: true,
+      params: { videoPath: 'Workflows/Inputs/Videos/turntable.mp4' },
+    }),
+    createNode('video-model', 'extensionNode', {
+      extensionId: 'lingbot-map/reconstruct',
+      enabled: true,
+      params: {},
+    }),
+  ])
+
+  const issues = validateWorkflowPreflight(workflow, [createModelExtension({
+    id: 'lingbot-map/reconstruct',
+    input: 'video',
+    output: 'mesh',
+  })])
+
+  assert.deepEqual(issues, [])
+})

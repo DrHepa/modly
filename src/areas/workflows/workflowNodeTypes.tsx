@@ -1,5 +1,6 @@
 import ExtensionNode from './nodes/ExtensionNode'
 import ImageNode from './nodes/ImageNode'
+import VideoNode from './nodes/VideoNode'
 import TextNode from './nodes/TextNode'
 import AddToSceneNode from './nodes/AddToSceneNode'
 import AddToWorldsNode from './nodes/AddToWorldsNode'
@@ -16,6 +17,7 @@ import { PREVIEW_IMAGE_NODE_TYPE, PREVIEW_VIDEO_NODE_TYPE, PREVIEW_VIEWS_NODE_TY
 export const WORKFLOW_NODE_TYPES = {
   extensionNode: ExtensionNode,
   imageNode: ImageNode,
+  videoNode: VideoNode,
   textNode: TextNode,
   outputNode: AddToSceneNode,
   addToWorldsNode: AddToWorldsNode,

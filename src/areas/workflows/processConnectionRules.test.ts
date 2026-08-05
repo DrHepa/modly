@@ -461,3 +461,37 @@ test('rejects persisted video outputs wired into image preview nodes before run'
     sourceNodeId: 'video-source',
   })
 })
+
+test('preserves video source type when validating named process ports before run', () => {
+  const source = createNode('video-source', 'videoNode', {
+    enabled: true,
+    params: { videoPath: 'Workflows/Inputs/Videos/source.mp4' },
+  })
+  const target = createNode('target-node', 'extensionNode', {
+    extensionId: 'ext/refiner',
+    enabled: true,
+    params: {},
+  })
+
+  const issue = validateWorkflowProcessRun({
+    nodes: [source, target],
+    edges: [
+      { id: 'edge-video', source: 'video-source', target: 'target-node', targetHandle: 'reference_image' },
+    ],
+    allExtensions: [createProcessExtension([
+      { name: 'reference_image', type: 'image' },
+    ])],
+  })
+
+  assert.deepEqual(issue, {
+    phase: 'run',
+    code: 'type-mismatch',
+    message: 'Port "reference_image" expects image but received video.',
+    targetNodeId: 'target-node',
+    targetHandle: 'reference_image',
+    portName: 'reference_image',
+    expectedType: 'image',
+    actualType: 'video',
+    sourceNodeId: 'video-source',
+  })
+})

@@ -38,6 +38,16 @@ class GenerateFromTextRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class GenerateFromVideoRequest(BaseModel):
+    video_path: str
+    model_id: str
+    collection: str = "Default"
+    remesh: str = "quad"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class GenerateFromNoneRequest(BaseModel):
     model_id: str
     collection: str = "Default"

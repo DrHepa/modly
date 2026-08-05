@@ -5,15 +5,19 @@ from schemas.generation import (
     GenerateFromNoneRequest,
     GenerateFromSceneRequest,
     GenerateFromTextRequest,
+    GenerateFromVideoRequest,
 )
+from services.generation_inputs import GenerationInputPathError, resolve_workspace_video_input_path
 from services.generator_registry import generator_registry
 from services.generation_jobs import (
     cancel_job as cancel_generation_job,
     create_from_image_job,
     create_from_none_job,
+    create_from_video_job,
     create_from_scene_job,
     create_from_text_job,
     get_job_status,
+    get_workspace_dir,
     parse_params_object,
     require_model_input,
     resolve_validated_scene_manifest_path,
@@ -65,6 +69,44 @@ async def generate_from_image(
     }
 
     job = create_from_image_job(background_tasks, image_bytes, full_params, collection)
+    return {"job_id": job.job_id}
+
+
+@router.post("/from-video")
+async def generate_from_video(
+    payload: GenerateFromVideoRequest,
+    background_tasks: BackgroundTasks,
+):
+    if payload.remesh not in ("quad", "triangle", "none"):
+        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
+
+    collection = sanitize_collection_name(payload.collection)
+    model_id = require_model_input(payload.model_id, "video")
+
+    full_params = {
+        "remesh": payload.remesh,
+        "enable_texture": payload.enable_texture,
+        "texture_resolution": payload.texture_resolution,
+        **payload.params,
+    }
+
+    try:
+        resolved_video_path = resolve_workspace_video_input_path(
+            payload.video_path,
+            workspace_dir=get_workspace_dir(),
+        )
+    except GenerationInputPathError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    generator_registry.switch_model(model_id)
+
+    job = create_from_video_job(
+        background_tasks,
+        resolved_video_path,
+        full_params,
+        collection,
+    )
+
     return {"job_id": job.job_id}
 
 

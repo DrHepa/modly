@@ -3804,3 +3804,132 @@ test('workflowRunStore uses actual scene output kind for Add to Worlds scene rou
   assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'scene')
   assert.deepEqual(useWorldsSceneStore.getState().sceneItems.map((item: { id: string }) => item.id), ['base'])
 })
+
+test('buildModelGenerationRequest creates a workspace-relative video request and rejects a missing source', () => {
+  const ext = createWorkflowExtension({
+    id: 'lingbot-map/reconstruct',
+    extensionId: 'lingbot-map',
+    nodeId: 'reconstruct',
+    name: 'LingBot-Map',
+    input: 'video',
+    output: 'mesh',
+    params: [],
+  })
+  const node = createNode('video-model', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: { quality: 'draft' },
+  })
+
+  const request = buildModelGenerationRequest({
+    ext,
+    node,
+    nodeParams: { quality: 'draft' },
+    nodeInputPath: '/workspace/Workflows/Inputs/Videos/turntable.mp4',
+    workspaceDir: '/workspace',
+  })
+
+  assert.deepEqual(request, {
+    kind: 'video',
+    videoPath: 'Workflows/Inputs/Videos/turntable.mp4',
+    params: { quality: 'draft' },
+  })
+
+  const collidingPrefixRequest = buildModelGenerationRequest({
+    ext,
+    node,
+    nodeParams: { quality: 'draft' },
+    nodeInputPath: '/workspace2/Workflows/Inputs/Videos/turntable.mp4',
+    workspaceDir: '/workspace',
+  })
+
+  assert.deepEqual(collidingPrefixRequest, {
+    kind: 'video',
+    videoPath: '/workspace2/Workflows/Inputs/Videos/turntable.mp4',
+    params: { quality: 'draft' },
+  })
+  assert.throws(
+    () => buildModelGenerationRequest({
+      ext,
+      node,
+      nodeParams: { quality: 'draft' },
+      workspaceDir: '/workspace',
+    }),
+    { message: 'Missing required video input for extension lingbot-map/reconstruct' },
+  )
+})
+
+test('workflowRunStore dispatches video models as path-only JSON without multipart or image transport', async () => {
+  const ext = createWorkflowExtension({
+    id: 'lingbot-map/reconstruct',
+    extensionId: 'lingbot-map',
+    nodeId: 'reconstruct',
+    name: 'LingBot-Map',
+    input: 'video',
+    output: 'mesh',
+    params: [{ id: 'quality', label: 'Quality', type: 'string', default: 'draft' }],
+  })
+  const workflow: Workflow = {
+    id: 'workflow-video-model',
+    name: 'Video model dispatch',
+    description: '',
+    nodes: [
+      createNode('video-source', 'videoNode', { enabled: true, params: { videoPath: 'Workflows/Inputs/Videos/turntable.mp4' } }),
+      createNode('video-model', 'extensionNode', {
+        extensionId: ext.id,
+        enabled: true,
+        params: { quality: 'draft' },
+      }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-video', source: 'video-source', target: 'video-model' },
+      { id: 'edge-output', source: 'video-model', target: 'output-node' },
+    ],
+    createdAt: '2026-07-21T00:00:00.000Z',
+    updatedAt: '2026-07-21T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: Record<string, unknown>; config: unknown }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown, config?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown>, config })
+      if (path === '/generate/from-video') return { data: { job_id: 'job-video-model' } }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-video-model')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/lingbot-map.glb', output_kind: 'mesh' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  const call = postCalls[0]
+  assert.equal(call.path, '/generate/from-video')
+  assert.deepEqual(call.data, {
+    video_path: 'Workflows/Inputs/Videos/turntable.mp4',
+    model_id: ext.id,
+    collection: 'Workflows',
+    remesh: 'none',
+    enable_texture: false,
+    texture_resolution: 1024,
+    params: { quality: 'draft' },
+  })
+  assert.equal(call.config, undefined)
+  assert.equal(call.data instanceof FormData, false)
+  assert.equal(Object.hasOwn(call.data, 'file'), false)
+  assert.equal(Object.hasOwn(call.data, 'image'), false)
+  assert.equal(Object.hasOwn(call.data, 'image_b64'), false)
+  assert.equal(Object.hasOwn(call.data.params as object, 'video_path'), false)
+  assert.deepEqual(fsReadCalls, [])
+  assert.equal(runProcessCalls.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['video-model']?.kind, 'mesh')
+})

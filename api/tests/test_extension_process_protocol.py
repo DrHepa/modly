@@ -429,3 +429,80 @@ def test_extension_process_concurrent_readiness_and_load_start_one_pid(monkeypat
     assert start_calls == 1
     assert readiness_result == {"ok": True, "machine_code": "ready"}
     assert sent == [{"action": "runtime_readiness"}, {"action": "load"}]
+
+
+def test_extension_process_preserves_legacy_image_message(monkeypatch, tmp_path):
+    import base64
+
+    process = ExtensionProcess(tmp_path, {"id": "demo/image", "input": "image"})
+    sent: list[dict] = []
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+    monkeypatch.setattr(
+        process,
+        "_recv",
+        lambda timeout=None: {
+            "type": "done",
+            "id": sent[0]["id"],
+            "output_path": str(tmp_path / "mesh.glb"),
+        },
+    )
+
+    process.generate(b"image-bytes", {"quality": "draft"})
+
+    message = sent[0]
+    assert set(message) == {"action", "id", "image_b64", "params", "outputs_dir"}
+    assert base64.b64decode(message["image_b64"]) == b"image-bytes"
+    assert message["params"] == {"quality": "draft"}
+    assert "input" not in message
+
+
+def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tmp_path):
+    process = ExtensionProcess(tmp_path, {"id": "demo/video", "input": "video"})
+    sent: list[dict] = []
+    video_path = tmp_path / "clip.mp4"
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+    monkeypatch.setattr(
+        process,
+        "_recv",
+        lambda timeout=None: {
+            "type": "done",
+            "id": sent[0]["id"],
+            "output_path": str(tmp_path / "mesh.glb"),
+        },
+    )
+
+    process.generate(video_path, {"quality": "draft"})
+
+    message = sent[0]
+    assert set(message) == {"action", "id", "input", "params", "outputs_dir"}
+    assert message["input"] == {"kind": "video", "path": str(video_path)}
+    assert message["params"] == {"quality": "draft"}
+    assert "path" not in message["params"]
+    assert "image_b64" not in message
+
+
+def test_extension_process_exports_workspace_generation_input_root(monkeypatch, tmp_path):
+    import services.generator_registry as registry_module
+    from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
+
+    workspace_dir = tmp_path / "workspace"
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace_dir)
+
+    process = ExtensionProcess(tmp_path / "extension", {"id": "demo/video", "input": "video"})
+    env = process._build_env()
+
+    assert env[MODLY_WORKSPACE_DIR_ENV] == str(workspace_dir.resolve())

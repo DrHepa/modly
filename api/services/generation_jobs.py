@@ -26,6 +26,11 @@ IMAGE_OUTPUT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".g
 MESH_OUTPUT_SUFFIXES = frozenset({".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"})
 VIDEO_OUTPUT_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi"})
 AUDIO_OUTPUT_SUFFIXES = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"})
+def get_workspace_dir() -> Path:
+    """Return the runtime workspace root shared with extension subprocesses."""
+    import services.generator_registry as registry_module
+
+    return registry_module.WORKSPACE_DIR
 
 
 def _log_job_progress(job: JobStatus) -> bool:
@@ -62,13 +67,18 @@ def create_generation_job(
     params: dict,
     collection: str = "Default",
     image_bytes: Optional[bytes] = None,
+    generation_input: bytes | Path | None = None,
     prompt: Optional[str] = None,
 ) -> JobStatus:
+    if image_bytes is not None and generation_input is not None:
+        raise ValueError("Provide image_bytes or generation_input, not both.")
+
     job = create_job()
     background_tasks.add_task(
         _run_generation,
         job.job_id,
         image_bytes=image_bytes,
+        generation_input=generation_input,
         prompt=prompt,
         params=params,
         collection=collection,
@@ -80,6 +90,20 @@ def create_from_image_job(background_tasks: BackgroundTasks, image_bytes: bytes,
     return create_generation_job(
         background_tasks,
         image_bytes=image_bytes,
+        params=params,
+        collection=collection,
+    )
+
+
+def create_from_video_job(
+    background_tasks: BackgroundTasks,
+    video_path: Path,
+    params: dict,
+    collection: str = "Default",
+) -> JobStatus:
+    return create_generation_job(
+        background_tasks,
+        generation_input=video_path,
         params=params,
         collection=collection,
     )
@@ -343,6 +367,7 @@ async def _run_generation(
     job_id: str,
     *,
     image_bytes: Optional[bytes] = None,
+    generation_input: bytes | Path | None = None,
     prompt: Optional[str] = None,
     params: dict,
     collection: str = "Default",
@@ -388,7 +413,8 @@ async def _run_generation(
 
         cancel_event = _cancel_events.get(job_id)
         supports_cancel = "cancel_event" in inspect.signature(gen.generate).parameters
-        generation_input = image_bytes if image_bytes is not None else b""
+        if generation_input is None:
+            generation_input = image_bytes if image_bytes is not None else b""
         generation_params = dict(params)
         if prompt is not None:
             generation_params.setdefault("prompt", prompt)

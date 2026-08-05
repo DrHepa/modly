@@ -61,7 +61,7 @@ Object.defineProperty(globalThis, 'window', {
   },
 })
 
-const { useWorkflowsStore } = await import(new URL('./workflowsStore.ts', import.meta.url).href)
+const { NODE_TYPES_WITHOUT_TARGET, useWorkflowsStore } = await import(new URL('./workflowsStore.ts', import.meta.url).href)
 const obsoleteWorkflowIoKey = 'io' + 'Contract'
 const obsoleteEdgeOrderKey = 'targetItem' + 'Index'
 
@@ -329,6 +329,10 @@ test('workflowsStore actions persist tab session mutations and reject activating
     openIds: ['first'],
     activeId: 'first',
   })
+})
+
+test('videoNode is a source-only workflow node', () => {
+  assert.equal(NODE_TYPES_WITHOUT_TARGET.has('videoNode'), true)
 })
 
 test('workflowsStore.load strips obsolete workflow metadata safely', async () => {

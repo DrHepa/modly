@@ -192,6 +192,86 @@ class MainTests(unittest.TestCase):
         self.assertEqual(sent[0]["type"], "ready")
 
 
+class GenerationInputProtocolTests(unittest.TestCase):
+    def test_legacy_image_payload_decodes_to_bytes(self) -> None:
+        import base64
+
+        payload = base64.b64encode(b"legacy-image").decode()
+
+        result = runner._resolve_generation_input(
+            {"image_b64": payload},
+            declared_input="image",
+        )
+
+        self.assertEqual(result, b"legacy-image")
+
+    def test_typed_video_kind_must_match_declared_input(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            runner._resolve_generation_input(
+                {"input": {"kind": "video", "path": "/tmp/clip.mp4"}},
+                declared_input="image",
+            )
+
+    def test_main_delivers_validated_video_path_to_generator(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="modly-runner-workspace-"))
+        video_path = workspace_dir / "Workflows" / "clip.capture"
+        video_path.parent.mkdir(parents=True)
+        video_path.write_bytes(b"video")
+        manifest = {
+            "id": "bundle/video-node",
+            "generator_class": "FakeGenerator",
+            "input": "video",
+        }
+        received: list[tuple[object, dict]] = []
+        sent: list[dict] = []
+
+        class FakeGenerator:
+            def __init__(self, model_dir, outputs_dir):
+                self.model_dir = model_dir
+                self.outputs_dir = outputs_dir
+
+            def params_schema(self):
+                return []
+
+            def generate(self, generation_input, params, progress_cb, cancel_event):
+                received.append((generation_input, params))
+                return workspace_dir / "output.glb"
+
+            def unload(self):
+                pass
+
+        messages = iter([
+            {
+                "action": "generate",
+                "id": "video-request",
+                "input": {"kind": "video", "path": str(video_path)},
+                "params": {"quality": "draft"},
+            },
+            {"action": "shutdown", "id": None},
+        ])
+
+        with mock.patch.object(runner, "load_generator", return_value=FakeGenerator), \
+             mock.patch.object(runner, "send", side_effect=sent.append), \
+             mock.patch.object(runner, "recv", return_value=messages), \
+             mock.patch.object(runner, "MODLY_WORKSPACE_DIR", workspace_dir, create=True), \
+             mock.patch.object(
+                 Path,
+                 "read_text",
+                 return_value=json.dumps(manifest),
+             ):
+            runner.main()
+
+        self.assertEqual(received, [(video_path.resolve(), {"quality": "draft"})])
+        self.assertTrue(any(
+            message == {
+                "type": "done",
+                "id": "video-request",
+                "output_path": str(workspace_dir / "output.glb"),
+            }
+            for message in sent
+        ))
+
+
 class ProtocolTests(unittest.TestCase):
     """recv()/send() implement the newline-delimited JSON wire protocol."""
 

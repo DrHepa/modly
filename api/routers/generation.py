@@ -22,6 +22,7 @@ from services.generation_jobs import (
     get_workspace_dir,
     parse_params_object,
     sanitize_collection,
+    sanitize_collection_name,
     validate_image_upload,
     validate_model_id,
     require_model_id,

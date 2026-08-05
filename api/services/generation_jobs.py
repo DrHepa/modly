@@ -135,6 +135,9 @@ def sanitize_collection(collection: str) -> str:
     return collection
 
 
+sanitize_collection_name = sanitize_collection
+
+
 def create_job() -> JobStatus:
     _purge_old_jobs()
     job_id = str(uuid.uuid4())
@@ -413,6 +416,7 @@ async def _run_generation(
     output_kind: str = "mesh",
     model_id: Optional[str] = None,
 ) -> None:
+    collection = sanitize_collection_name(collection)
     # Pinned jobs share one model lifecycle. Switching is deliberately deferred
     # until this job runs on the dedicated worker: request-time switches can
     # otherwise unload a running job or leave A loading beside B.  Crucially,

@@ -6,10 +6,6 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from services.hf_download_assets import hf_download_assets_ready
-from services.https_download_assets import https_download_assets_ready
-
-
 class GenerationCancelled(Exception):
     """Raised by generators when a cancel_event is set mid-generation."""
 
@@ -73,12 +69,16 @@ class BaseGenerator(ABC):
         Can be overridden in generator.py for custom logic.
         """
         if self.https_downloads:
+            from services.https_download_assets import https_download_assets_ready
+
             return https_download_assets_ready(
                 self.model_dir,
                 self.model_id,
                 self.https_downloads,
             )
         if self.hf_downloads:
+            from services.hf_download_assets import hf_download_assets_ready
+
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
             return (self.model_dir / self.download_check).exists()

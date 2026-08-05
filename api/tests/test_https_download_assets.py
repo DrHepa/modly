@@ -796,6 +796,7 @@ def test_registry_propagates_https_plan_and_model_input(
     assert generator.model_id == "demo/generate"
     assert generator.input == "none"
     assert generator.https_downloads == plan
+    assert generator.is_downloaded() is False
 
     with pytest.raises(RuntimeError, match="Models UI"):
         generator._auto_download()

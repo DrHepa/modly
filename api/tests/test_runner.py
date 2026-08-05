@@ -5,6 +5,7 @@ import sys
 import json
 import tempfile
 import importlib
+import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -116,6 +117,90 @@ class ResolveReadySchemaTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_runner_emits_ready_without_host_third_party_packages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="modly-isolated-runner-") as tmp:
+            root = Path(tmp)
+            extension_dir = root / "extension"
+            model_dir = root / "models" / "isolated" / "ready"
+            workspace_dir = root / "workspace"
+            extension_dir.mkdir()
+            model_dir.mkdir(parents=True)
+            workspace_dir.mkdir()
+
+            manifest = {
+                "id": "isolated",
+                "generator_class": "MinimalGenerator",
+                "nodes": [
+                    {
+                        "id": "ready",
+                        "input": "image",
+                        "output": "mesh",
+                        "params_schema": [],
+                    }
+                ],
+            }
+            (extension_dir / "manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            (extension_dir / "generator.py").write_text(
+                "\n".join(
+                    [
+                        "from services.generators.base import BaseGenerator",
+                        "",
+                        "class MinimalGenerator(BaseGenerator):",
+                        "    def load(self):",
+                        "        self._model = object()",
+                        "",
+                        "    def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):",
+                        "        return self.outputs_dir / 'unused.glb'",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env.pop("PYTHONHOME", None)
+            env.pop("PYTHONPATH", None)
+            env.update(
+                {
+                    "EXTENSION_DIR": str(extension_dir),
+                    "MODEL_ID": "isolated/ready",
+                    "MODEL_DIR": str(model_dir),
+                    "MODELS_DIR": str(root / "models"),
+                    "WORKSPACE_DIR": str(workspace_dir),
+                    "MODLY_API_DIR": str(Path(runner.__file__).resolve().parent),
+                    "PYTHONNOUSERSITE": "1",
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, "-S", str(Path(runner.__file__).resolve())],
+                input="",
+                text=True,
+                capture_output=True,
+                cwd=extension_dir,
+                env=env,
+                timeout=10,
+                check=False,
+            )
+
+            messages = [
+                json.loads(line)
+                for line in completed.stdout.splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(
+                messages,
+                msg=f"runner emitted no protocol messages; stderr={completed.stderr!r}",
+            )
+            self.assertEqual(
+                messages[0],
+                {"type": "ready", "params_schema": []},
+                msg=f"stderr={completed.stderr!r}",
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
     def test_main_emits_ready_before_reading_actions(self) -> None:
         manifest = {
             "id": "bundle/node-a",

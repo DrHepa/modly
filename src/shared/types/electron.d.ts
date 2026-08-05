@@ -5,6 +5,7 @@ import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
 import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, MotionRetargetSourceBone, MotionRetargetSessionSnapshot } from '../../areas/generate/motionRetargetPlan.ts'
 import type { PlyKind } from '../ply/plyHeaderClassification.ts'
+import type { AgentSessionsApi } from './agentSessions.ts'
 
 export type {
   ArtifactKind,
@@ -1064,6 +1065,7 @@ export interface AutomationCapabilitiesResponse {
 declare global {
   interface Window {
     electron: {
+      agentSessions: AgentSessionsApi
       shell: {
         openExternal: (url: string) => Promise<void>
       }

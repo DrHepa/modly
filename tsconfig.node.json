@@ -25,6 +25,7 @@
     "src/areas/generate/rigEffectiveNaming.ts",
     "src/areas/generate/rigMetaNaming.ts",
     "src/areas/generate/rigRenamePlan.ts",
-    "src/areas/generate/rigSkeleton.ts"
+    "src/areas/generate/rigSkeleton.ts",
+    "src/shared/types/agentSessions.ts"
   ]
 }

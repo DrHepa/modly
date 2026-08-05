@@ -1,15 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useAgentStore } from '@shared/stores/agentStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
 import { buildAllWorkflowExtensions } from '@areas/workflows/mockExtensions'
+import { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'
+import AgentSessionHistory from './AgentSessionHistory'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 import type { ThinkingMode } from '@shared/stores/agentStore'
 import type { Workflow } from '@shared/types/electron.d'
+import type { AgentAttachmentRef, AgentSessionMessage, AgentSessionSummary } from '@shared/types/agentSessions'
 
 interface Message {
   id: string
@@ -18,6 +21,12 @@ interface Message {
   thinking?: string
   imageDataUrls?: string[]
   actions?: ActionDone[]
+  summaries?: AgentSessionSummary[]
+}
+
+interface PendingAttachment {
+  file: File
+  dataUrl: string
 }
 
 type WorkflowDraft = Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
@@ -128,6 +137,28 @@ export class AgentApiError extends Error {
   }
 }
 
+export class AgentAttachmentRollbackError extends Error {
+  readonly code = 'agent_attachment_rollback_failed'
+  readonly recoverable = true
+
+  constructor(cause: unknown) {
+    super('The message was not saved, and its staged attachments could not be removed. Please retry cleanup before sending again.', { cause })
+    this.name = 'AgentAttachmentRollbackError'
+  }
+}
+
+export async function rollbackFailedSendAttachments(
+  attachmentIds: string[],
+  removeAttachments: (attachmentIds: string[]) => Promise<void>,
+): Promise<void> {
+  if (attachmentIds.length === 0) return
+  try {
+    await removeAttachments(attachmentIds)
+  } catch (error) {
+    throw new AgentAttachmentRollbackError(error)
+  }
+}
+
 export async function parseAgentChatResponse(
   response: Pick<Response, 'ok' | 'status' | 'json'>,
 ): Promise<AgentChatData> {
@@ -189,6 +220,9 @@ export interface PendingAgentWorkflow {
   id: string
   name: string
   notifyAgentOnCompletion: boolean
+  sessionId: string
+  originMessages: Message[]
+  uiToken?: OriginBoundUiToken
 }
 
 export function shouldNotifyAgentAfterWorkflowCompletion(workflow: PendingAgentWorkflow): boolean {
@@ -198,6 +232,96 @@ export function shouldNotifyAgentAfterWorkflowCompletion(workflow: PendingAgentW
 export function withActionFailureSummary(message: string, failureCount: number): string {
   if (failureCount <= 0) return message
   return `${message} ${failureCount} completed action${failureCount === 1 ? '' : 's'} could not be reflected locally.`
+}
+
+export function createSubmissionGate() {
+  let busy = false
+  return {
+    async run<T>(operation: () => Promise<T>): Promise<T | undefined> {
+      if (busy) return undefined
+      busy = true
+      try { return await operation() }
+      finally { busy = false }
+    },
+  }
+}
+
+export interface OriginBoundUiToken {
+  isCurrent(): boolean
+  run(update: () => void): void
+}
+
+export function createOriginBoundUiGate(getActiveSessionId: () => string | null) {
+  let generation = 0
+  return {
+    begin(sessionId: string): OriginBoundUiToken {
+      const originGeneration = generation
+      const isCurrent = () => generation === originGeneration && getActiveSessionId() === sessionId
+      return {
+        isCurrent,
+        run(update: () => void): void {
+          if (isCurrent()) update()
+        },
+      }
+    },
+    invalidate(): void {
+      generation += 1
+    },
+  }
+}
+
+export function createSessionRestoreCoordinator<T>(update: (messages: T[]) => void) {
+  let generation = 0
+  return {
+    async restore(sessionId: string | null, hydrate: () => Promise<T[]>): Promise<void> {
+      const restoreGeneration = ++generation
+      update([])
+      if (!sessionId) return
+      const restored = await hydrate()
+      if (restoreGeneration === generation) update(restored)
+    },
+    cancel(): void {
+      generation += 1
+      update([])
+    },
+  }
+}
+
+export function buildSafeWorkflowFailureMessage(workflowName: string, messageId: string): Message {
+  return {
+    id: messageId,
+    role: 'assistant',
+    content: `Workflow '${workflowName}' failed.`,
+    summaries: [{ kind: 'action', label: `Workflow failed: ${workflowName}` }],
+  }
+}
+
+export async function restorePersistedMessage(
+  persisted: AgentSessionMessage,
+  attachments: AgentAttachmentRef[],
+  readAttachment: (attachmentId: string) => Promise<Uint8Array>,
+  existing?: Message,
+): Promise<Message> {
+  const imageDataUrls = (await Promise.all(persisted.attachmentIds.map(async (attachmentId) => {
+    const ref = attachments.find((attachment) => attachment.id === attachmentId)
+    if (!ref) return null
+    try {
+      const bytes = await readAttachment(attachmentId)
+      const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
+      return `data:${ref.mimeType};base64,${btoa(binary)}`
+    } catch {
+      return null
+    }
+  }))).filter((value): value is string => Boolean(value))
+  return {
+    id: persisted.id,
+    role: persisted.role,
+    content: persisted.content,
+    ...(imageDataUrls.length ? { imageDataUrls } : {}),
+    ...(persisted.summaries.length ? { summaries: persisted.summaries } : {}),
+    ...(existing?.thinking ? { thinking: existing.thinking } : {}),
+    ...(existing?.actions ? { actions: existing.actions } : {}),
+  }
 }
 
 export function appendSubmittedMessage<T>(messages: readonly T[], message: T): T[] {
@@ -266,6 +390,23 @@ const TOOL_LABELS: Record<string, string> = {
   create_workflow:      'Created workflow',
 }
 
+function completedActionSummary(action: ActionDone, messageId: string, index: number): AgentSessionSummary {
+  const label = TOOL_LABELS[action.tool] ?? 'Completed action'
+  if (action.payload?.type === 'mesh_update' && action.payload.url.startsWith('/workspace/')) {
+    const workspacePath = action.payload.url.slice('/workspace/'.length)
+    const segments = workspacePath.split('/')
+    if (workspacePath && !workspacePath.includes('\\') && segments.every((segment) => segment && segment !== '.' && segment !== '..')) {
+      const refId = `${messageId}-artifact-${index}`
+      return {
+        kind: 'artifact',
+        label,
+        artifact: { id: refId, kind: 'mesh', versionId: refId, workspacePath },
+      }
+    }
+  }
+  return { kind: 'action', label }
+}
+
 function ActionsCard({ actions, onUndo }: { actions: ActionDone[]; onUndo?: () => void }): JSX.Element {
   const [expanded, setExpanded] = useState(false)
   const meshActions = actions.filter((a) => a.payload?.type === 'mesh_update')
@@ -321,6 +462,18 @@ function ActionsCard({ actions, onUndo }: { actions: ActionDone[]; onUndo?: () =
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+function PersistedSummaries({ summaries }: { summaries: AgentSessionSummary[] }): JSX.Element {
+  return (
+    <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-3 py-2 text-[11px] text-zinc-400">
+      {summaries.map((summary, index) => (
+        <p key={`${summary.kind}-${index}`}>
+          {summary.label}{summary.artifact ? ` — ${summary.artifact.workspacePath}` : ''}
+        </p>
+      ))}
     </div>
   )
 }
@@ -437,7 +590,7 @@ export default function ChatPanel(): JSX.Element {
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [ollamaModels, setOllamaModels]       = useState<string[]>([])
   const [pendingWorkflow, setPendingWorkflow]  = useState<PendingAgentWorkflow | null>(null)
-  const [attachments, setAttachments]         = useState<string[]>([]) // data URLs
+  const [attachments, setAttachments]         = useState<PendingAttachment[]>([])
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
   const endRef                                = useRef<HTMLDivElement>(null)
@@ -445,7 +598,52 @@ export default function ChatPanel(): JSX.Element {
   const modelPickerRef                        = useRef<HTMLDivElement>(null)
   const fileInputRef                          = useRef<HTMLInputElement>(null)
   const messagesRef                           = useRef<Message[]>([])
+  const submissionGateRef                     = useRef(createSubmissionGate())
+  const originUiGateRef                       = useRef(createOriginBoundUiGate(
+    () => useAgentSessionsStore.getState().activeSession?.id ?? null,
+  ))
+  const sessionRestoreRef                     = useRef(createSessionRestoreCoordinator<Message>((nextMessages) => {
+    messagesRef.current = nextMessages
+    setMessages(nextMessages)
+  }))
+  const transientSessionIdRef                 = useRef<string | null>(null)
   messagesRef.current = messages
+
+  const activeSession = useAgentSessionsStore((state) => state.activeSession)
+  const initializedSessions = useAgentSessionsStore((state) => state.initialized)
+  const initializeSessions = useAgentSessionsStore((state) => state.initialize)
+  const appendPersistedMessage = useAgentSessionsStore((state) => state.appendMessage)
+  const addPersistedAttachment = useAgentSessionsStore((state) => state.addAttachment)
+  const removePersistedAttachments = useAgentSessionsStore((state) => state.removeAttachments)
+
+  useEffect(() => { void initializeSessions() }, [initializeSessions])
+
+  useLayoutEffect(() => {
+    const nextSessionId = activeSession?.id ?? null
+    if (transientSessionIdRef.current === nextSessionId) return
+    transientSessionIdRef.current = nextSessionId
+    originUiGateRef.current.invalidate()
+    setInput('')
+    setAttachments([])
+    setError(null)
+    setShowAll(false)
+    setIsDragging(false)
+    setIsLoading(false)
+  }, [activeSession?.id])
+
+  useLayoutEffect(() => {
+    const session = activeSession
+    void sessionRestoreRef.current.restore(session?.id ?? null, async () => {
+      if (!session) return []
+      return Promise.all(session.messages.map((persisted) => restorePersistedMessage(
+        persisted,
+        session.attachments,
+        (attachmentId) => window.electron.agentSessions.readAttachment({ sessionId: session.id, attachmentId }),
+        messagesRef.current.find((message) => message.id === persisted.id),
+      )))
+    })
+    return () => sessionRestoreRef.current.cancel()
+  }, [activeSession?.id, activeSession?.revision])
 
   const apiUrl           = useAppStore((s) => s.apiUrl)
   const currentJob       = useAppStore((s) => s.currentJob)
@@ -490,28 +688,36 @@ export default function ChatPanel(): JSX.Element {
     if (runState.status !== 'done' && runState.status !== 'error') return
 
     const wf = pendingWorkflow
-    setPendingWorkflow(null)
+    const uiToken = wf.uiToken ?? originUiGateRef.current.begin(wf.sessionId)
+    setPendingWorkflow((current) => current === wf ? null : current)
 
     if (runState.status === 'error') {
-      setMessages((prev) => [...prev, {
-        id: `sys-${Date.now()}`,
-        role: 'assistant',
-        content: `The workflow '${wf.name}' failed: ${runState.error ?? 'Unknown error'}`,
-      }])
+      const failureMessage = buildSafeWorkflowFailureMessage(wf.name, `sys-${Date.now()}`)
+      void appendPersistedMessage(wf.sessionId, failureMessage).catch((failure) => {
+        uiToken.run(() => {
+          setError(failure instanceof Error ? failure.message : 'Chat history could not save the workflow result.')
+        })
+      })
+      uiToken.run(() => {
+        setMessages((prev) => [...prev, failureMessage])
+        if (runState.error) setError(runState.error)
+      })
       return
     }
 
     // Update viewer with the generated mesh
     if (runState.outputUrl) {
-      updateCurrentJob({ outputUrl: runState.outputUrl, status: 'done', progress: 100 })
-      pushMeshUrl(runState.outputUrl)
+      uiToken.run(() => {
+        updateCurrentJob({ outputUrl: runState.outputUrl, status: 'done', progress: 100 })
+        pushMeshUrl(runState.outputUrl!)
+      })
     }
 
     if (!shouldNotifyAgentAfterWorkflowCompletion(wf)) return
 
     // Send automatic follow-up to agent
     const completionCtx = `Workflow '${wf.name}' just completed.${runState.outputUrl ? ` Output mesh: ${runState.outputUrl}` : ''} Ask the user what they'd like to do next.`
-    callAgent(messagesRef.current, { workflowCompletion: completionCtx })
+    void callAgent(wf.sessionId, wf.originMessages, { workflowCompletion: completionCtx }, uiToken)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fire on run-status transition; error/outputUrl read atomically
   }, [runState.status, pendingWorkflow])
 
@@ -534,6 +740,8 @@ export default function ChatPanel(): JSX.Element {
     actions: ActionDone[],
     msgs: Message[],
     notifyAgentOnWorkflowCompletion: boolean,
+    originatingSessionId: string,
+    uiToken: OriginBoundUiToken,
   ): Promise<AgentActionFailure[]> {
     // Extract base64 from the most recent user message that had an image attached
     const latestImageDataUrl = [...msgs].reverse()
@@ -543,15 +751,29 @@ export default function ChatPanel(): JSX.Element {
 
     return applyAgentActions(actions, async (action) => {
       const payload = action.payload
+      if (payload && !uiToken.isCurrent()) {
+        throw new Error('The originating Agent session is no longer active.')
+      }
       if (payload?.type === 'mesh_update') {
-        updateCurrentJob({ outputUrl: payload.url })
-        pushMeshUrl(payload.url)
+        uiToken.run(() => {
+          updateCurrentJob({ outputUrl: payload.url })
+          pushMeshUrl(payload.url)
+        })
       }
       if (payload?.type === 'run_workflow') {
         const wf = workflows.find((w) => w.id === payload.workflow_id)
         if (!wf) throw new Error('The completed workflow action is no longer available locally.')
-        void runWorkflow(wf, allExtensions, overrideImageData)
-        setPendingWorkflow({ id: wf.id, name: wf.name, notifyAgentOnCompletion: notifyAgentOnWorkflowCompletion })
+        uiToken.run(() => {
+          void runWorkflow(wf, allExtensions, overrideImageData)
+          setPendingWorkflow({
+            id: wf.id,
+            name: wf.name,
+            notifyAgentOnCompletion: notifyAgentOnWorkflowCompletion,
+            sessionId: originatingSessionId,
+            originMessages: msgs,
+            uiToken,
+          })
+        })
       }
       if (payload?.type === 'create_workflow') {
         const draft = payload.workflow
@@ -559,15 +781,22 @@ export default function ChatPanel(): JSX.Element {
         const wf: Workflow = { ...draft, id: crypto.randomUUID(), createdAt: now, updatedAt: now }
         const result = await saveWorkflow(wf)
         if (!result.success) throw new Error('The completed workflow creation could not be saved locally.')
-        setActiveWorkflow(wf.id)
+        uiToken.run(() => setActiveWorkflow(wf.id))
       }
     })
   }
 
-  async function callAgent(msgs: Message[], extraContext: Record<string, unknown> = {}) {
-    await withAgentLoading(setIsLoading, async () => {
+  async function callAgent(
+    originatingSessionId: string,
+    msgs: Message[],
+    extraContext: Record<string, unknown> = {},
+    uiToken = originUiGateRef.current.begin(originatingSessionId),
+  ) {
+    uiToken.run(() => {
+      setIsLoading(true)
       setError(null)
-      try {
+    })
+    try {
         const context = { ...buildContext(), ...extraContext }
 
         // Inject workflow completion as a system hint if present
@@ -593,29 +822,42 @@ export default function ChatPanel(): JSX.Element {
         })
         const data = await parseAgentChatResponse(res)
 
-        setMessages((prev) => [...prev, {
+        const assistantMessage: Message = {
           id: `a-${Date.now()}`,
           role: 'assistant',
           content: data.message,
           thinking: data.thinking ?? undefined,
           actions: data.actions.length ? data.actions : undefined,
-        }])
+        }
+        const actionFailures = await applyCompletedActions(data.actions, [...msgs, assistantMessage], true, originatingSessionId, uiToken)
+        const failedActions = new Set(actionFailures.map((failure) => failure.action))
+        await appendPersistedMessage(originatingSessionId, {
+          id: assistantMessage.id,
+          role: assistantMessage.role,
+          content: assistantMessage.content,
+          summaries: data.actions
+            .filter((action) => !failedActions.has(action))
+            .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
+        })
+        uiToken.run(() => {
+          setMessages((prev) => [...prev, assistantMessage])
+        })
 
-        const actionFailures = await applyCompletedActions(data.actions, msgs, true)
         if (actionFailures.length > 0) {
           throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
         }
-      } catch (e: unknown) {
+    } catch (e: unknown) {
         let actionFailureCount = 0
         if (e instanceof AgentApiError && e.actions.length > 0) {
-          const actionFailures = await applyCompletedActions(e.actions, msgs, false)
+          const actionFailures = await applyCompletedActions(e.actions, msgs, false, originatingSessionId, uiToken)
           actionFailureCount = actionFailures.length
         }
         const msg = e instanceof Error ? e.message : String(e)
         const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
-        setError(withActionFailureSummary(safeMessage, actionFailureCount))
-      }
-    })
+        uiToken.run(() => setError(withActionFailureSummary(safeMessage, actionFailureCount)))
+    } finally {
+      uiToken.run(() => setIsLoading(false))
+    }
   }
 
   async function fetchOllamaModels() {
@@ -629,12 +871,15 @@ export default function ChatPanel(): JSX.Element {
   }
 
   function handleFiles(files: File[]) {
-    files.forEach((file) => {
-      if (!file.type.startsWith('image/')) return
+    const originatingSessionId = activeSession?.id
+    if (!originatingSessionId) return
+    const uiToken = originUiGateRef.current.begin(originatingSessionId)
+    files.slice(0, 8 - attachments.length).forEach((file) => {
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) return
       const reader = new FileReader()
       reader.onload = (e) => {
         const dataUrl = e.target?.result as string
-        setAttachments((prev) => [...prev, dataUrl])
+        uiToken.run(() => setAttachments((prev) => [...prev, { file, dataUrl }]))
       }
       reader.readAsDataURL(file)
     })
@@ -663,21 +908,63 @@ export default function ChatPanel(): JSX.Element {
   }
 
   async function handleSend() {
-    const text = input.trim()
-    if (!text || isLoading || pendingWorkflow) return
+    await submissionGateRef.current.run(async () => {
+      const text = input.trim()
+      const originatingSessionId = activeSession?.id
+      const workflowBlocksSession = pendingWorkflow?.sessionId === originatingSessionId
+      if (!text || isLoading || workflowBlocksSession || !initializedSessions || !originatingSessionId) return
+      const uiToken = originUiGateRef.current.begin(originatingSessionId)
 
-    const userMsg: Message = {
-      id: `u-${Date.now()}`,
-      role: 'user',
-      content: text,
-      ...(attachments.length ? { imageDataUrls: [...attachments] } : {}),
-    }
-    const nextMessages = appendSubmittedMessage(messages, userMsg)
-    setMessages(nextMessages)
-    setInput('')
-    setAttachments([])
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
-    await callAgent(nextMessages)
+      const attachmentIds: string[] = []
+      let userPersisted = false
+      try {
+        for (const attachment of attachments) {
+          const updated = await addPersistedAttachment(originatingSessionId, {
+            name: attachment.file.name,
+            mimeType: attachment.file.type,
+            bytes: new Uint8Array(await attachment.file.arrayBuffer()),
+          })
+          attachmentIds.push(updated.attachments.at(-1)!.id)
+        }
+
+        const userMsg: Message = {
+          id: `u-${Date.now()}`,
+          role: 'user',
+          content: text,
+          ...(attachments.length ? { imageDataUrls: attachments.map((attachment) => attachment.dataUrl) } : {}),
+        }
+        await appendPersistedMessage(originatingSessionId, {
+          id: userMsg.id,
+          role: userMsg.role,
+          content: userMsg.content,
+          attachmentIds,
+        })
+        userPersisted = true
+        const nextMessages = appendSubmittedMessage(messagesRef.current, userMsg)
+        uiToken.run(() => {
+          setMessages(nextMessages)
+          setInput('')
+          setAttachments([])
+          if (textareaRef.current) textareaRef.current.style.height = 'auto'
+        })
+        await callAgent(originatingSessionId, nextMessages, {}, uiToken)
+      } catch (failure) {
+        let visibleFailure = failure
+        if (!userPersisted && attachmentIds.length > 0) {
+          try {
+            await rollbackFailedSendAttachments(
+              attachmentIds,
+              (ids) => removePersistedAttachments(originatingSessionId, ids),
+            )
+          } catch (rollbackFailure) {
+            visibleFailure = rollbackFailure
+          }
+        }
+        uiToken.run(() => {
+          setError(visibleFailure instanceof Error ? visibleFailure.message : 'The message could not be saved. Please try again.')
+        })
+      }
+    })
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -696,6 +983,7 @@ export default function ChatPanel(): JSX.Element {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      <AgentSessionHistory />
       {/* Drag overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 flex items-center justify-center rounded-xl border-2 border-dashed border-accent/60 bg-accent/5 pointer-events-none">
@@ -760,6 +1048,9 @@ export default function ChatPanel(): JSX.Element {
                   {msg.actions && msg.actions.length > 0 && (
                     <ActionsCard actions={msg.actions} onUndo={undoMesh} />
                   )}
+                  {!msg.actions?.length && msg.summaries && msg.summaries.length > 0 && (
+                    <PersistedSummaries summaries={msg.summaries} />
+                  )}
                   <FeedbackRow content={msg.content} />
                 </div>
               )}
@@ -767,7 +1058,7 @@ export default function ChatPanel(): JSX.Element {
           ))}
 
           {/* Workflow progress card — visible while agent waits for workflow */}
-          {pendingWorkflow && <WorkflowProgressCard name={pendingWorkflow.name} />}
+          {pendingWorkflow && pendingWorkflow.sessionId === activeSession?.id && <WorkflowProgressCard name={pendingWorkflow.name} />}
 
           {/* Loading indicator */}
           {isLoading && (
@@ -806,9 +1097,9 @@ export default function ChatPanel(): JSX.Element {
           {/* Attachment previews */}
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
-              {attachments.map((url, i) => (
+              {attachments.map((attachment, i) => (
                 <div key={i} className="relative group">
-                  <img src={url} alt="" className="h-14 w-14 object-cover rounded-lg border border-zinc-700/50" />
+                  <img src={attachment.dataUrl} alt="" className="h-14 w-14 object-cover rounded-lg border border-zinc-700/50" />
                   <button
                     onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
                     className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-zinc-700 border border-zinc-600 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
@@ -894,7 +1185,7 @@ export default function ChatPanel(): JSX.Element {
 
             <button
               onClick={handleSend}
-              disabled={!input.trim() || isLoading}
+              disabled={!input.trim() || isLoading || !initializedSessions}
               className="w-6 h-6 rounded-full bg-accent hover:bg-accent-dark disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors shrink-0"
             >
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

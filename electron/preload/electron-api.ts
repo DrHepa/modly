@@ -1,4 +1,5 @@
 import type { AnyExtension, ArtifactRegistryReadRequest, ArtifactRegistryReadResult, ArtifactRegistryWriteRequest, ArtifactRegistryWriteResult, AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, ExtensionInstallProgress, ExtensionInstallResult, HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, ProcessInput, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, RuntimeReadinessAction, RuntimeReadinessActionResult, RuntimeReadinessResponse, VideoInputSelection, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
+import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
 import { invokeExtensionsRunProcess } from './run-process-ipc.ts'
 
 export type IpcRendererLike = {
@@ -27,6 +28,18 @@ export function createElectronApi({ ipcRenderer, webFrame }: ElectronApiDependen
   assertWebFrame(webFrame)
 
   return {
+    agentSessions: {
+      list: (): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:list') as Promise<AgentSessionListResult>,
+      create: (request: AgentSessionCreateRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:create', request) as Promise<AgentSession>,
+      read: (request: AgentSessionReadRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:read', request) as Promise<AgentSession>,
+      activate: (request: AgentSessionActivateRequest): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:activate', request) as Promise<AgentSessionListResult>,
+      rename: (request: AgentSessionRenameRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:rename', request) as Promise<AgentSession>,
+      delete: (request: AgentSessionDeleteRequest): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:delete', request) as Promise<AgentSessionListResult>,
+      appendMessage: (request: AgentSessionAppendMessageRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:appendMessage', request) as Promise<AgentSession>,
+      addAttachment: (request: AgentSessionAddAttachmentRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:addAttachment', request) as Promise<AgentSession>,
+      removeAttachment: (request: AgentSessionRemoveAttachmentRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:removeAttachment', request) as Promise<AgentSession>,
+      readAttachment: (request: AgentSessionReadAttachmentRequest): Promise<Uint8Array> => ipcRenderer.invoke('agentSessions:readAttachment', request) as Promise<Uint8Array>,
+    },
     window: {
       minimize: () => ipcRenderer.send('window:minimize'),
       maximize: () => ipcRenderer.send('window:maximize'),

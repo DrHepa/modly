@@ -224,3 +224,123 @@ test('submitted messages remain in history and loading clears after request fail
     await cleanup()
   }
 })
+
+test('restoring history retains safe summaries and degrades only a failed attachment', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const restored = await module.restorePersistedMessage(
+      {
+        id: 'm1', role: 'assistant', content: 'Completed.',
+        attachmentIds: ['good', 'missing'],
+        summaries: [{ kind: 'action', label: 'Ran workflow' }],
+      },
+      [
+        { id: 'good', name: 'good.png', mimeType: 'image/png', sizeBytes: 12 },
+        { id: 'missing', name: 'missing.png', mimeType: 'image/png', sizeBytes: 12 },
+      ],
+      async (attachmentId: string) => {
+        if (attachmentId === 'missing') throw new Error('blob unavailable')
+        return Uint8Array.from([137, 80, 78, 71])
+      },
+    )
+    assert.deepEqual(restored.summaries, [{ kind: 'action', label: 'Ran workflow' }])
+    assert.equal(restored.imageDataUrls.length, 1)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('workflow failure persistence uses a safe summary without raw runtime errors', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const message = module.buildSafeWorkflowFailureMessage('Mesh cleanup', 'failure-1', '/home/user/secret.log token=private')
+    assert.equal(message.content, "Workflow 'Mesh cleanup' failed.")
+    assert.deepEqual(message.summaries, [{ kind: 'action', label: 'Workflow failed: Mesh cleanup' }])
+    assert.equal(JSON.stringify(message).includes('/home/user/secret.log'), false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('submission gate rejects rapid duplicate sends and recovers after completion', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const gate = module.createSubmissionGate()
+    let release!: () => void
+    const pending = gate.run(() => new Promise<void>((resolve) => { release = resolve }))
+    assert.equal(await gate.run(async () => { throw new Error('must not run') }), undefined)
+    release()
+    await pending
+    assert.equal(await gate.run(async () => 'next'), 'next')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('session restore clears immediately and stale hydration cannot re-inject prior messages', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const views: string[][] = []
+    const coordinator = module.createSessionRestoreCoordinator((messages: Array<{ id: string }>) => {
+      views.push(messages.map((message) => message.id))
+    })
+    let releaseOld!: (messages: Array<{ id: string }>) => void
+    const oldRestore = coordinator.restore('old', () => new Promise((resolve) => { releaseOld = resolve }))
+    const newRestore = coordinator.restore('new', async () => [{ id: 'new-message' }])
+    await newRestore
+    releaseOld([{ id: 'old-message' }])
+    await oldRestore
+    assert.deepEqual(views, [[], [], ['new-message']])
+
+    await coordinator.restore(null, async () => [{ id: 'must-not-render' }])
+    assert.deepEqual(views.at(-1), [])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('origin-bound UI tokens suppress late errors and finally updates after a session switch', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    let activeSessionId: string | null = 's1'
+    const updates: string[] = []
+    const gate = module.createOriginBoundUiGate(() => activeSessionId)
+    const oldRequest = gate.begin('s1')
+    oldRequest.run(() => updates.push('s1-loading'))
+
+    activeSessionId = 's2'
+    gate.invalidate()
+    const currentRequest = gate.begin('s2')
+    oldRequest.run(() => updates.push('s1-error'))
+    currentRequest.run(() => updates.push('s2-loading'))
+    oldRequest.run(() => updates.push('s1-finally'))
+    currentRequest.run(() => updates.push('s2-error'))
+
+    assert.deepEqual(updates, ['s1-loading', 's2-loading', 's2-error'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('failed-send attachment rollback surfaces cleanup failure as recoverable', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    let rollbackAttempts = 0
+    await assert.rejects(
+      module.rollbackFailedSendAttachments(['attachment-1'], async () => {
+        rollbackAttempts += 1
+        throw new Error('injected remove failure')
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.equal(error.name, 'AgentAttachmentRollbackError')
+        assert.equal((error as Error & { recoverable?: boolean }).recoverable, true)
+        assert.match(error.message, /staged attachments could not be removed/i)
+        return true
+      },
+    )
+    assert.equal(rollbackAttempts, 1)
+  } finally {
+    await cleanup()
+  }
+})

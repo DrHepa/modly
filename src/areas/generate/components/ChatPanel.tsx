@@ -20,17 +20,200 @@ interface Message {
   actions?: ActionDone[]
 }
 
-interface ActionDone {
+type WorkflowDraft = Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
+
+type ActionPayload =
+  | { type: 'mesh_update'; url: string; face_count?: number }
+  | { type: 'run_workflow'; workflow_id: string; workflow_name: string }
+  | { type: 'create_workflow'; workflow: WorkflowDraft }
+
+export interface ActionDone {
   tool: string
   result: string
-  payload?: {
-    type: string
-    url?: string
-    face_count?: number
-    workflow_id?: string
-    workflow_name?: string
-    workflow?: Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
-  } | null
+  payload?: ActionPayload | null
+}
+
+interface AgentChatData {
+  message: string
+  actions: ActionDone[]
+  thinking?: string
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isWorkflowDraft(value: unknown): value is WorkflowDraft {
+  return isRecord(value)
+    && typeof value.name === 'string'
+    && typeof value.description === 'string'
+    && Array.isArray(value.nodes)
+    && Array.isArray(value.edges)
+}
+
+function parseAction(value: unknown): ActionDone | null {
+  if (!isRecord(value) || typeof value.tool !== 'string' || !value.tool.trim() || typeof value.result !== 'string') {
+    return null
+  }
+
+  if (value.payload === undefined) return { tool: value.tool, result: value.result }
+  if (value.payload === null) return { tool: value.tool, result: value.result, payload: null }
+  if (!isRecord(value.payload) || typeof value.payload.type !== 'string') return null
+
+  const payload = value.payload
+  if (payload.type === 'mesh_update') {
+    if (
+      typeof payload.url !== 'string'
+      || !payload.url.trim()
+      || (payload.face_count !== undefined && (typeof payload.face_count !== 'number' || !Number.isFinite(payload.face_count)))
+    ) return null
+    return {
+      tool: value.tool,
+      result: value.result,
+      payload: {
+        type: 'mesh_update',
+        url: payload.url,
+        ...(typeof payload.face_count === 'number' ? { face_count: payload.face_count } : {}),
+      },
+    }
+  }
+  if (payload.type === 'run_workflow') {
+    if (
+      typeof payload.workflow_id !== 'string'
+      || !payload.workflow_id.trim()
+      || typeof payload.workflow_name !== 'string'
+      || !payload.workflow_name.trim()
+    ) return null
+    return {
+      tool: value.tool,
+      result: value.result,
+      payload: {
+        type: 'run_workflow',
+        workflow_id: payload.workflow_id,
+        workflow_name: payload.workflow_name,
+      },
+    }
+  }
+  if (payload.type === 'create_workflow' && isWorkflowDraft(payload.workflow)) {
+    return {
+      tool: value.tool,
+      result: value.result,
+      payload: { type: 'create_workflow', workflow: payload.workflow },
+    }
+  }
+  return null
+}
+
+function parseActions(value: unknown): { actions: ActionDone[]; valid: boolean } {
+  if (value === undefined) return { actions: [], valid: true }
+  if (!Array.isArray(value)) return { actions: [], valid: false }
+
+  const actions: ActionDone[] = []
+  let valid = true
+  for (const valueAction of value) {
+    const action = parseAction(valueAction)
+    if (action) actions.push(action)
+    else valid = false
+  }
+  return { actions, valid }
+}
+
+export class AgentApiError extends Error {
+  readonly actions: ActionDone[]
+
+  constructor(message: string, actions: ActionDone[]) {
+    super(message)
+    this.name = 'AgentApiError'
+    this.actions = actions
+  }
+}
+
+export async function parseAgentChatResponse(
+  response: Pick<Response, 'ok' | 'status' | 'json'>,
+): Promise<AgentChatData> {
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    if (!response.ok) {
+      throw new AgentApiError('Modly could not complete the request. Please try again.', [])
+    }
+    throw new Error('Modly returned an invalid agent response.')
+  }
+
+  if (!response.ok) {
+    const detail = isRecord(body) && isRecord(body.detail) ? body.detail : null
+    const safeMessage = detail && typeof detail.message === 'string' && detail.message.trim()
+      ? detail.message.trim().slice(0, 500)
+      : 'Modly could not complete the request. Please try again.'
+    throw new AgentApiError(safeMessage, parseActions(detail?.actions).actions)
+  }
+
+  if (!isRecord(body) || typeof body.message !== 'string') {
+    throw new Error('Modly returned an invalid agent response.')
+  }
+  if (body.thinking !== undefined && body.thinking !== null && typeof body.thinking !== 'string') {
+    throw new Error('Modly returned an invalid agent response.')
+  }
+  const parsedActions = parseActions(body.actions)
+  if (!parsedActions.valid) throw new Error('Modly returned an invalid agent response.')
+
+  return {
+    message: body.message,
+    actions: parsedActions.actions,
+    ...(typeof body.thinking === 'string' ? { thinking: body.thinking } : {}),
+  }
+}
+
+export interface AgentActionFailure {
+  action: ActionDone
+  error: unknown
+}
+
+export async function applyAgentActions(
+  actions: ActionDone[],
+  applyAction: (action: ActionDone) => void | Promise<void>,
+): Promise<AgentActionFailure[]> {
+  const failures: AgentActionFailure[] = []
+  for (const action of actions) {
+    try {
+      await applyAction(action)
+    } catch (error) {
+      failures.push({ action, error })
+    }
+  }
+  return failures
+}
+
+export interface PendingAgentWorkflow {
+  id: string
+  name: string
+  notifyAgentOnCompletion: boolean
+}
+
+export function shouldNotifyAgentAfterWorkflowCompletion(workflow: PendingAgentWorkflow): boolean {
+  return workflow.notifyAgentOnCompletion
+}
+
+export function withActionFailureSummary(message: string, failureCount: number): string {
+  if (failureCount <= 0) return message
+  return `${message} ${failureCount} completed action${failureCount === 1 ? '' : 's'} could not be reflected locally.`
+}
+
+export function appendSubmittedMessage<T>(messages: readonly T[], message: T): T[] {
+  return [...messages, message]
+}
+
+export async function withAgentLoading<T>(
+  setLoading: (loading: boolean) => void,
+  operation: () => Promise<T>,
+): Promise<T> {
+  setLoading(true)
+  try {
+    return await operation()
+  } finally {
+    setLoading(false)
+  }
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -74,6 +257,7 @@ const TOOL_LABELS: Record<string, string> = {
   decimate_mesh:        'Decimated mesh',
   smooth_mesh:          'Smoothed mesh',
   list_models:          'Listed models',
+  list_processes:       'Listed processes',
   unload_models:        'Unloaded models',
   get_mesh_info:        'Inspected mesh',
   get_generation_status:'Checked generation',
@@ -252,7 +436,7 @@ export default function ChatPanel(): JSX.Element {
   const [model, setModel]                     = useState(defaultModel)
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [ollamaModels, setOllamaModels]       = useState<string[]>([])
-  const [pendingWorkflow, setPendingWorkflow]  = useState<{ id: string; name: string } | null>(null)
+  const [pendingWorkflow, setPendingWorkflow]  = useState<PendingAgentWorkflow | null>(null)
   const [attachments, setAttachments]         = useState<string[]>([]) // data URLs
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
@@ -323,6 +507,8 @@ export default function ChatPanel(): JSX.Element {
       pushMeshUrl(runState.outputUrl)
     }
 
+    if (!shouldNotifyAgentAfterWorkflowCompletion(wf)) return
+
     // Send automatic follow-up to agent
     const completionCtx = `Workflow '${wf.name}' just completed.${runState.outputUrl ? ` Output mesh: ${runState.outputUrl}` : ''} Ask the user what they'd like to do next.`
     callAgent(messagesRef.current, { workflowCompletion: completionCtx })
@@ -344,74 +530,92 @@ export default function ChatPanel(): JSX.Element {
     return ctx
   }
 
+  async function applyCompletedActions(
+    actions: ActionDone[],
+    msgs: Message[],
+    notifyAgentOnWorkflowCompletion: boolean,
+  ): Promise<AgentActionFailure[]> {
+    // Extract base64 from the most recent user message that had an image attached
+    const latestImageDataUrl = [...msgs].reverse()
+      .find((m) => m.role === 'user' && m.imageDataUrls?.length)
+      ?.imageDataUrls?.[0]
+    const overrideImageData = latestImageDataUrl ? latestImageDataUrl.split(',')[1] : undefined
+
+    return applyAgentActions(actions, async (action) => {
+      const payload = action.payload
+      if (payload?.type === 'mesh_update') {
+        updateCurrentJob({ outputUrl: payload.url })
+        pushMeshUrl(payload.url)
+      }
+      if (payload?.type === 'run_workflow') {
+        const wf = workflows.find((w) => w.id === payload.workflow_id)
+        if (!wf) throw new Error('The completed workflow action is no longer available locally.')
+        void runWorkflow(wf, allExtensions, overrideImageData)
+        setPendingWorkflow({ id: wf.id, name: wf.name, notifyAgentOnCompletion: notifyAgentOnWorkflowCompletion })
+      }
+      if (payload?.type === 'create_workflow') {
+        const draft = payload.workflow
+        const now = new Date().toISOString()
+        const wf: Workflow = { ...draft, id: crypto.randomUUID(), createdAt: now, updatedAt: now }
+        const result = await saveWorkflow(wf)
+        if (!result.success) throw new Error('The completed workflow creation could not be saved locally.')
+        setActiveWorkflow(wf.id)
+      }
+    })
+  }
+
   async function callAgent(msgs: Message[], extraContext: Record<string, unknown> = {}) {
-    setIsLoading(true)
-    setError(null)
-    try {
-      const context = { ...buildContext(), ...extraContext }
+    await withAgentLoading(setIsLoading, async () => {
+      setError(null)
+      try {
+        const context = { ...buildContext(), ...extraContext }
 
-      // Inject workflow completion as a system hint if present
-      const apiMessages = msgs.map((m) => {
-        const entry: { role: string; content: string; images?: string[] } = {
-          role: m.role,
-          content: m.content,
+        // Inject workflow completion as a system hint if present
+        const apiMessages = msgs.map((m) => {
+          const entry: { role: string; content: string; images?: string[] } = {
+            role: m.role,
+            content: m.content,
+          }
+          if (m.imageDataUrls?.length) {
+            entry.images = m.imageDataUrls.map((url) => url.split(',')[1])
+          }
+          return entry
+        })
+        if (extraContext.workflowCompletion) {
+          apiMessages.push({ role: 'user', content: `[System] ${extraContext.workflowCompletion}` })
+          delete context.workflowCompletion
         }
-        if (m.imageDataUrls?.length) {
-          entry.images = m.imageDataUrls.map((url) => url.split(',')[1])
+
+        const res = await fetch(`${apiUrl}/agent/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: apiMessages, ollama_url: ollamaUrl, model, context, thinking: thinkingMode }),
+        })
+        const data = await parseAgentChatResponse(res)
+
+        setMessages((prev) => [...prev, {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: data.message,
+          thinking: data.thinking ?? undefined,
+          actions: data.actions.length ? data.actions : undefined,
+        }])
+
+        const actionFailures = await applyCompletedActions(data.actions, msgs, true)
+        if (actionFailures.length > 0) {
+          throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
         }
-        return entry
-      })
-      if (extraContext.workflowCompletion) {
-        apiMessages.push({ role: 'user', content: `[System] ${extraContext.workflowCompletion}` })
-        delete context.workflowCompletion
+      } catch (e: unknown) {
+        let actionFailureCount = 0
+        if (e instanceof AgentApiError && e.actions.length > 0) {
+          const actionFailures = await applyCompletedActions(e.actions, msgs, false)
+          actionFailureCount = actionFailures.length
+        }
+        const msg = e instanceof Error ? e.message : String(e)
+        const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
+        setError(withActionFailureSummary(safeMessage, actionFailureCount))
       }
-
-      const res = await fetch(`${apiUrl}/agent/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: apiMessages, ollama_url: ollamaUrl, model, context, thinking: thinkingMode }),
-      })
-      if (!res.ok) throw new Error(`API error ${res.status}`)
-
-      const data: { message: string; actions: ActionDone[]; thinking?: string } = await res.json()
-
-      setMessages((prev) => [...prev, {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: data.message,
-        thinking: data.thinking ?? undefined,
-        actions: data.actions?.length ? data.actions : undefined,
-      }])
-
-      // Extract base64 from the most recent user message that had an image attached
-      const latestImageDataUrl = [...msgs].reverse()
-        .find((m) => m.role === 'user' && m.imageDataUrls?.length)
-        ?.imageDataUrls?.[0]
-      const overrideImageData = latestImageDataUrl ? latestImageDataUrl.split(',')[1] : undefined
-
-      for (const action of data.actions ?? []) {
-        if (action.payload?.type === 'mesh_update' && action.payload.url) {
-          updateCurrentJob({ outputUrl: action.payload.url })
-          pushMeshUrl(action.payload.url)
-        }
-        if (action.payload?.type === 'run_workflow' && action.payload.workflow_id) {
-          const wf = workflows.find((w) => w.id === action.payload!.workflow_id)
-          if (wf) { runWorkflow(wf, allExtensions, overrideImageData); setPendingWorkflow({ id: wf.id, name: wf.name }) }
-        }
-        if (action.payload?.type === 'create_workflow' && action.payload.workflow) {
-          const draft = action.payload.workflow as Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
-          const now = new Date().toISOString()
-          const wf: Workflow = { ...draft, id: crypto.randomUUID(), createdAt: now, updatedAt: now }
-          const res = await saveWorkflow(wf)
-          if (res.success) setActiveWorkflow(wf.id)
-        }
-      }
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setError(msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg)
-    } finally {
-      setIsLoading(false)
-    }
+    })
   }
 
   async function fetchOllamaModels() {
@@ -468,7 +672,7 @@ export default function ChatPanel(): JSX.Element {
       content: text,
       ...(attachments.length ? { imageDataUrls: [...attachments] } : {}),
     }
-    const nextMessages = [...messages, userMsg]
+    const nextMessages = appendSubmittedMessage(messages, userMsg)
     setMessages(nextMessages)
     setInput('')
     setAttachments([])

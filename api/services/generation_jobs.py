@@ -50,6 +50,13 @@ VIDEO_OUTPUT_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi"})
 AUDIO_OUTPUT_SUFFIXES = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"})
 
 
+def get_workspace_dir() -> Path:
+    """Return the runtime workspace root shared with extension subprocesses."""
+    import services.generator_registry as registry_module
+
+    return registry_module.WORKSPACE_DIR
+
+
 def _log_job_progress(job: JobStatus) -> bool:
     with _log_lock:
         if _jobs.get(job.job_id) is not job:
@@ -141,7 +148,7 @@ def create_job() -> JobStatus:
 
 def create_generation_job(
     background_tasks: BackgroundTasks,
-    model_input: Union[bytes, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput],
     params: dict,
     collection: str = "Default",
     output_kind: str = "mesh",
@@ -165,6 +172,19 @@ def create_from_image_job(
 ) -> JobStatus:
     return create_generation_job(
         background_tasks, image_bytes, params, collection, output_kind, model_id,
+    )
+
+
+def create_from_video_job(
+    background_tasks: BackgroundTasks,
+    video_path: Path,
+    params: dict,
+    collection: str = "Default",
+    output_kind: str = "mesh",
+    model_id: Optional[str] = None,
+) -> JobStatus:
+    return create_generation_job(
+        background_tasks, video_path, params, collection, output_kind, model_id,
     )
 
 
@@ -387,7 +407,7 @@ def detect_output_kind(output_path: Optional[Path]) -> Optional[str]:
 
 async def _run_generation(
     job_id: str,
-    model_input: Union[bytes, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput],
     params: dict,
     collection: str = "Default",
     output_kind: str = "mesh",
@@ -438,7 +458,7 @@ async def _run_generation(
 
 def _run_generation_impl(
     job_id: str,
-    model_input: Union[bytes, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput],
     params: dict,
     collection: str,
     output_kind: str,

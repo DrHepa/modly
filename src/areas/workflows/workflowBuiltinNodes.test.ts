@@ -144,11 +144,25 @@ test('workflow palette copy clarifies single-image versus multi-view previews', 
 test('catalog extraction preserves every upstream built-in identity', async () => {
   const { module, cleanup } = await loadCatalogModule()
   try {
-    const expected = ['imageNode', 'textNode', 'meshNode', 'sceneNode', 'outputNode', 'previewNode', 'imagePreviewNode', 'previewImageNode', 'landmarksNode', 'waitNode', 'whileNode', 'forEachNode'].sort()
+    const expected = ['imageNode', 'videoNode', 'textNode', 'meshNode', 'sceneNode', 'outputNode', 'previewNode', 'imagePreviewNode', 'previewImageNode', 'landmarksNode', 'waitNode', 'whileNode', 'forEachNode'].sort()
     assert.deepEqual([...module.WORKFLOW_BUILTIN_NODE_TYPES].sort(), expected)
     assert.deepEqual(module.WORKFLOW_BUILTIN_PANEL_NODES.map((node) => node.type).sort(), expected)
     const passthrough = module.WORKFLOW_BUILTIN_PALETTE_NODES.find((node) => node.type === 'imagePreviewNode')
     assert.match(passthrough?.description ?? '', /forward|passthrough/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('workflow catalog exposes Video as a first-class built-in source node', async () => {
+  const { module, cleanup } = await loadCatalogModule()
+  try {
+    assert.ok(module.WORKFLOW_BUILTIN_NODE_TYPES.includes('videoNode'))
+    assert.deepEqual(
+      module.WORKFLOW_BUILTIN_PALETTE_NODES.find((node) => node.type === 'videoNode'),
+      { type: 'videoNode', label: 'Video', color: '#fb7185', description: 'Video input' },
+    )
+    assert.equal(module.WORKFLOW_BUILTIN_PANEL_NODES.find((node) => node.type === 'videoNode')?.label, 'Video')
   } finally {
     await cleanup()
   }

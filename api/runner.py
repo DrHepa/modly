@@ -8,6 +8,7 @@ Environment variables (set by ExtensionProcess):
     EXTENSION_DIR   — absolute path to the extension directory
     MODELS_DIR      — where model weights are stored
     WORKSPACE_DIR   — where generated files are saved
+    MODLY_WORKSPACE_DIR — allowed workspace root for file-backed inputs
     MODLY_API_DIR   — path to Modly's api/ dir (so generator.py can import
                       from services.generators.base)
 
@@ -23,6 +24,8 @@ import threading
 import importlib.util
 from pathlib import Path
 
+from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV, validate_video_input_path
+
 # ------------------------------------------------------------------ #
 # Env
 # ------------------------------------------------------------------ #
@@ -30,6 +33,9 @@ from pathlib import Path
 EXT_DIR       = Path(os.environ["EXTENSION_DIR"])
 MODELS_DIR    = Path(os.environ.get("MODELS_DIR",    Path.home() / ".modly" / "models"))
 WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", Path.home() / ".modly" / "workspace"))
+MODLY_WORKSPACE_DIR = Path(
+    os.environ.get(MODLY_WORKSPACE_DIR_ENV, WORKSPACE_DIR)
+).expanduser().resolve()
 MODLY_API_DIR = os.environ.get("MODLY_API_DIR", "")
 # MODEL_DIR is set by ExtensionProcess to match its own model_dir (composite node id path).
 # Falls back to MODELS_DIR/manifest_id for standalone/legacy use.
@@ -79,6 +85,39 @@ def recv():
             except json.JSONDecodeError as exc:
                 send({"type": "log", "level": "error",
                       "message": f"Runner: invalid JSON on stdin: {exc}"})
+
+
+def _resolve_generation_input(
+    msg: dict,
+    *,
+    declared_input: str,
+) -> bytes | Path:
+    """Decode one legacy or typed generation input from the NDJSON request."""
+    if "input" not in msg:
+        return base64.b64decode(msg["image_b64"])
+    if "image_b64" in msg:
+        raise ValueError("Typed generation input must not include image_b64.")
+
+    envelope = msg["input"]
+    if not isinstance(envelope, dict):
+        raise ValueError("Typed generation input must be an object.")
+
+    kind = envelope.get("kind")
+    if kind != declared_input:
+        raise ValueError(
+            f"Typed input kind '{kind}' does not match generator input '{declared_input}'."
+        )
+    if kind != "video":
+        raise ValueError(f"Unsupported typed generation input kind: {kind!r}.")
+
+    raw_path = envelope.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("Typed video input path must be a non-empty string.")
+
+    return validate_video_input_path(
+        Path(raw_path),
+        workspace_dir=MODLY_WORKSPACE_DIR,
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -279,7 +318,12 @@ def main() -> None:
                 validate_requested_model(msg, manifest, node)
                 cancel_evt = threading.Event()
                 _cancel[rid] = cancel_evt
-                model_input  = decode_model_input(msg)
+                envelope = msg.get("input")
+                model_input = (
+                    _resolve_generation_input(msg, declared_input=gen.input)
+                    if isinstance(envelope, dict) and envelope.get("kind") == "video"
+                    else decode_model_input(msg)
+                )
                 params       = msg.get("params", {})
                 if hasattr(model_input, "kind"):
                     if not isinstance(params, dict):

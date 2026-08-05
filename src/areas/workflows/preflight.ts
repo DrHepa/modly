@@ -25,6 +25,7 @@ export interface WorkflowPreflightIssue {
 function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
   if (node.type === 'imageNode') return 'Image'
   if (node.type === 'textNode') return 'Text'
+  if (node.type === 'videoNode') return 'Video'
   if (node.type === 'meshNode') return 'Load 3D Mesh'
   if (node.type === 'sceneNode') return 'Load Scene'
   if (node.type === 'outputNode') return 'Add to Scene'
@@ -53,6 +54,7 @@ function formatRequiredTypes(types: DataType[]): string {
 
 function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): DataType | undefined {
   if (node.type === 'imageNode') return 'image'
+  if (node.type === 'videoNode') return 'video'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
   if (node.type === 'sceneNode') return 'scene'

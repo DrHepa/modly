@@ -111,6 +111,7 @@ function isSceneMeshOutput(output: NodeOutput | undefined): output is NodeOutput
 function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
   const normalized = filePath.replace(/\\/g, '/')
   const workspace = workspaceDir.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (normalized === workspace) return ''
   return normalized.startsWith(`${workspace}/`) ? normalized.slice(workspace.length + 1) : normalized
 }
 
@@ -460,6 +461,11 @@ type ModelGenerationRequest =
       params: Record<string, unknown>
     }
   | {
+      kind: 'video'
+      videoPath: string
+      params: Record<string, unknown>
+    }
+  | {
       kind: 'text'
       payload: {
         prompt: string
@@ -544,6 +550,18 @@ export function buildModelGenerationRequest(args: {
         texture_resolution: 1024,
         params: nodeParams,
       },
+    }
+  }
+
+  if (input === 'video') {
+    const activeVideoPath = args.nodeInputPath
+    if (!activeVideoPath) {
+      throw new Error(`Missing required video input for extension ${ext.id}`)
+    }
+    return {
+      kind: 'video',
+      videoPath: normalizeWorkflowPath(activeVideoPath, args.workspaceDir),
+      params: nodeParams,
     }
   }
 
@@ -836,6 +854,11 @@ async function executeExtensionNode(
     nodeInputPath     = slots.nodeInputPath
     nodeInputMeshPath = slots.nodeInputMeshPath
     extraImagePaths.push(...slots.extraImagePaths)
+  } else if (mode === 'model' && ext.input === 'video') {
+    for (const edge of incomingEdges) {
+      const src = resolveSource(edge)
+      if (src?.outputType === 'video' && src.filePath !== undefined) nodeInputPath = src.filePath
+    }
   } else if (shouldUsePreviousNodeFallback(ext.input)) {
     for (const edge of incomingEdges) {
       const src = resolveSource(edge)
@@ -849,6 +872,7 @@ async function executeExtensionNode(
   if (mode === 'model') {
     if (!ext.input && !positionalInputs?.length) throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
+    const isVideoInput = ext.input === 'video'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
     const namedModelInputs = !isInputless && hasNamedProcessInputs(ext.inputs) ? ext.inputs : []
@@ -870,17 +894,17 @@ async function executeExtensionNode(
         if (src?.text !== undefined && (!src.outputType || src.outputType === 'text')) nodeInputText = src.text
       }
     }
-    const activeImagePath = (isInputless || isTextInput || isSceneInput) ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isInputless && !isTextInput && !isSceneInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
+    const activeImagePath = (isInputless || isTextInput || isSceneInput || isVideoInput) ? undefined : (nodeInputPath ?? selectedImagePath)
+    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
     }
 
     let blob: Blob | undefined
     let fname = 'image.png'
-    if (!isInputless && !isTextInput && !isSceneInput && selectedImageData && nodeInputPath === undefined) {
+    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && selectedImageData && nodeInputPath === undefined) {
       fname = 'placeholder.png'
       blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else if (!isInputless && !isTextInput && !isSceneInput) {
+    } else if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
@@ -928,6 +952,16 @@ async function executeExtensionNode(
         input_kind: 'scene', input_path: inputPath,
         model_id: node.data.extensionId ?? '', collection: 'Workflows',
         params: { ...effectiveParams, ...extraParams },
+      })
+    } else if (isVideoInput) {
+      const request = buildModelGenerationRequest({
+        ext, node, nodeParams: { ...effectiveParams, ...extraParams }, nodeInputPath, workspaceDir,
+      })
+      if (request.kind !== 'video') throw new Error('Expected video model request')
+      submission = await client.post('/generate/from-video', {
+        video_path: request.videoPath, model_id: node.data.extensionId ?? '',
+        collection: 'Workflows', remesh: 'none', enable_texture: false, texture_resolution: 1024,
+        params: request.params,
       })
     } else if (isTextInput) {
       const { prompt: _prompt, ...params } = effectiveParams
@@ -1547,6 +1581,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             const fp = node.data.params?.filePath as string | undefined
             const resolvedPath = overrideImageData ? undefined : (fp ?? selectedImagePath ?? undefined)
             nodeOutputs.set(node.id, { filePath: resolvedPath, outputType: 'image' })
+          }
+          if (node.type === 'videoNode') {
+            const videoPath = node.data.params?.videoPath as string | undefined
+            nodeOutputs.set(node.id, { filePath: videoPath, outputType: 'video' })
           }
           if (node.type === 'textNode') {
             nodeOutputs.set(node.id, { text: node.data.params?.text as string | undefined })

@@ -2,8 +2,7 @@ import { getBezierPath, useReactFlow, useEdges } from '@xyflow/react'
 import type { EdgeProps } from '@xyflow/react'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { buildAllWorkflowExtensions } from '../mockExtensions'
-import { PROCESS_PORT_HANDLE_COLOR as HANDLE_COLOR } from '../processPorts'
-import { resolveWorkflowEdgeTargetColor } from './workflowEdgeColors'
+import { resolveWorkflowEdgeSourceColor, resolveWorkflowEdgeTargetColor } from './workflowEdgeColors'
 
 export default function WorkflowEdge({
   id, source, target,
@@ -22,13 +21,10 @@ export default function WorkflowEdge({
   const thisEdge    = edges.find((e) => e.id === id)
   const targetHandle = thisEdge?.targetHandle
 
-  const sourceColor = sourceNode?.type === 'imageNode'
-    ? HANDLE_COLOR.image
-    : sourceNode?.type === 'textNode'
-    ? HANDLE_COLOR.text
-    : sourceNode?.type === 'meshNode'
-    ? HANDLE_COLOR.mesh
-    : (HANDLE_COLOR[allExtensions.find((e) => e.id === sourceNode?.data?.extensionId)?.output ?? ''] ?? '#52525b')
+  const sourceColor = resolveWorkflowEdgeSourceColor({
+    sourceNodeType: sourceNode?.type,
+    extensionOutput: allExtensions.find((e) => e.id === sourceNode?.data?.extensionId)?.output,
+  })
 
   // For multi-input nodes pick the color of the specific connected handle
   const targetColor = resolveWorkflowEdgeTargetColor({

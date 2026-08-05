@@ -39,6 +39,11 @@ export {}
 
 // ─── Extension types ──────────────────────────────────────────────────────────
 
+export interface VideoInputSelection {
+  workspacePath: string
+  displayName: string
+}
+
 export type WorkflowNodeComponent = 'video-preview'
 export type ModelInputKind = string
 export type ExtensionPortKind = ArtifactKind | string
@@ -1120,6 +1125,7 @@ declare global {
       fs: {
         getPathForFile:  (file: File) => string
         selectImage:     () => Promise<string | null>
+        selectVideo:     () => Promise<VideoInputSelection | null>
         selectMeshFile:  () => Promise<string | null>
         selectSceneFile: () => Promise<string | null>
         saveModel:       (defaultName: string) => Promise<string | null>

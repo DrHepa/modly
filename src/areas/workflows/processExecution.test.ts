@@ -298,3 +298,31 @@ test('legacy primary outputs ignore stale named handles and retain open types an
   assert.equal(outputs.get('source'), primary)
   assert.equal(outputs.get('source::output::output'), secondary)
 })
+
+test('preserves video source type in named process execution inputs', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const video = createNode('video-source', 'videoNode', {
+    enabled: true,
+    params: { videoPath: 'Workflows/Inputs/Videos/source.mp4' },
+  })
+
+  const input = buildProcessExecutionInput({
+    node: target,
+    nodes: [video, target],
+    edges: [
+      { id: 'edge-video', source: 'video-source', target: 'target-node', targetHandle: 'reference_image' },
+    ],
+    allExtensions: [createProcessExtension([
+      { name: 'reference_image', type: 'image' },
+    ])],
+    nodeOutputs: new Map([
+      ['video-source', { filePath: '/tmp/source.mp4' }],
+    ]),
+  })
+
+  assert.deepEqual(input.inputs?.reference_image, {
+    type: 'video',
+    filePath: '/tmp/source.mp4',
+    sourceNodeId: 'video-source',
+  })
+})

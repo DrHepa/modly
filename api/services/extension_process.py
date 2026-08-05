@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
+from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
 from services.hf_download_assets import hf_download_assets_ready
 from services.https_download_assets import https_download_assets_ready
 
@@ -100,6 +101,7 @@ class ExtensionProcess:
         env["EXTENSION_DIR"] = str(self.ext_dir)
         env["MODELS_DIR"]    = str(MODELS_DIR)
         env["WORKSPACE_DIR"] = str(WORKSPACE_DIR)
+        env[MODLY_WORKSPACE_DIR_ENV] = str(WORKSPACE_DIR.resolve())
         env["MODLY_API_DIR"] = str(Path(__file__).parent.parent)
         # Lets extensions call back into the Modly API (e.g. /llm/chat for the shared LLM).
         env.setdefault("MODLY_API_URL", "http://127.0.0.1:8765")
@@ -387,14 +389,21 @@ class ExtensionProcess:
 
     def generate(
         self,
-        image_bytes: bytes,
+        image_bytes: bytes | Path,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
+        if isinstance(image_bytes, bytes):
+            input_payload = {"image_b64": base64.b64encode(image_bytes).decode()}
+        elif isinstance(image_bytes, Path):
+            if self.input != "video":
+                raise ValueError("File-backed video input requires a video generator.")
+            input_payload = {"input": {"kind": "video", "path": str(image_bytes)}}
+        else:
+            raise TypeError("Generation input must be bytes or a video Path.")
         return self._generate_request(
-            {"image_b64": base64.b64encode(image_bytes).decode()},
-            params, progress_cb, cancel_event,
+            input_payload, params, progress_cb, cancel_event,
         )
 
     def _receive_generation(

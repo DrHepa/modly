@@ -1,5 +1,3 @@
-import re as _re
-
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, BackgroundTasks
 from schemas.generation import (
     GenerateFromNoneRequest,
@@ -21,18 +19,12 @@ from services.generation_jobs import (
     parse_params_object,
     require_model_input,
     resolve_validated_scene_manifest_path,
+    sanitize_collection_name,
     validate_image_upload,
     validate_scene_manifest_path,
 )
 
 router = APIRouter(tags=["generation"])
-
-
-def sanitize_collection_name(collection: str) -> str:
-    collection = collection.strip()
-    if not collection or _re.search(r'[/:*?"<>|\\]', collection):
-        return "Default"
-    return collection
 
 
 @router.post("/from-image")

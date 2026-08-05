@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import threading
 import traceback
 import uuid
@@ -26,6 +27,21 @@ IMAGE_OUTPUT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".g
 MESH_OUTPUT_SUFFIXES = frozenset({".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx", ".usd", ".usda", ".usdc", ".usdz"})
 VIDEO_OUTPUT_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi"})
 AUDIO_OUTPUT_SUFFIXES = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac"})
+_INVALID_COLLECTION_CHARS = re.compile(r'[/:*?"<>|\\]')
+
+
+def sanitize_collection_name(collection: str) -> str:
+    """Return a safe single workspace directory name for generated assets."""
+    collection = collection.strip()
+    if (
+        not collection
+        or collection in {".", ".."}
+        or _INVALID_COLLECTION_CHARS.search(collection)
+    ):
+        return "Default"
+    return collection
+
+
 def get_workspace_dir() -> Path:
     """Return the runtime workspace root shared with extension subprocesses."""
     import services.generator_registry as registry_module
@@ -372,6 +388,7 @@ async def _run_generation(
     params: dict,
     collection: str = "Default",
 ) -> None:
+    collection = sanitize_collection_name(collection)
     job = _jobs[job_id]
     job.status = "running"
     _log_job_progress(job)

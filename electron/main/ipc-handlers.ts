@@ -89,6 +89,7 @@ import { getHfToken, initHfToken, setHfToken } from './hf-token'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 import { importVideoInputToWorkspace } from './video-input-import'
+import { AgentSessionStore } from './agent-session-store'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -248,6 +249,18 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     stopRequested?: 'pause' | 'cancel'
   }
   const activeDownloads = new Map<string, ActiveDownload>()
+  const agentSessionStore = new AgentSessionStore({ rootDir: join(app.getPath('userData'), 'agent-sessions') })
+  void agentSessionStore.list().catch((error) => logger.warn(`Agent session startup maintenance failed: ${error instanceof Error ? error.message : String(error)}`))
+  ipcMain.handle('agentSessions:list', () => agentSessionStore.list())
+  ipcMain.handle('agentSessions:create', (_event, request) => agentSessionStore.create(request))
+  ipcMain.handle('agentSessions:read', (_event, request) => agentSessionStore.read(request))
+  ipcMain.handle('agentSessions:activate', (_event, request) => agentSessionStore.activate(request))
+  ipcMain.handle('agentSessions:rename', (_event, request) => agentSessionStore.rename(request))
+  ipcMain.handle('agentSessions:delete', (_event, request) => agentSessionStore.delete(request))
+  ipcMain.handle('agentSessions:appendMessage', (_event, request) => agentSessionStore.appendMessage(request))
+  ipcMain.handle('agentSessions:addAttachment', (_event, request) => agentSessionStore.addAttachment(request))
+  ipcMain.handle('agentSessions:removeAttachment', (_event, request) => agentSessionStore.removeAttachment(request))
+  ipcMain.handle('agentSessions:readAttachment', (_event, request) => agentSessionStore.readAttachment(request))
   const weightOperations = new ModelWeightOperations()
   // Paused/error sessions retain their original paths even after settings change.
   const interruptedTargets = new Map<string, string[]>()

@@ -28,6 +28,7 @@
     "src/areas/generate/rigRenamePlan.ts",
     "src/areas/generate/poseClipPlan.ts",
     "src/areas/workflows/workflowSceneSource.ts",
-    "src/areas/workflows/processPorts.ts"
+    "src/areas/workflows/processPorts.ts",
+    "src/shared/types/agentSessions.ts"
   ]
 }

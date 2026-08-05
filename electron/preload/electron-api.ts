@@ -8,6 +8,7 @@ import type {
   AssetLibraryReadRequest,
   AssetLibraryReadResult,
 } from '../../src/shared/types/assetLibrary'
+import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
 
 export interface IpcRendererLike {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
@@ -48,6 +49,19 @@ export function createElectronApi(
     automation: {
       capabilities: (): Promise<AutomationCapabilitiesResponse> =>
         ipcRenderer.invoke('automation:capabilities') as Promise<AutomationCapabilitiesResponse>,
+    },
+
+    agentSessions: {
+      list: (): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:list') as Promise<AgentSessionListResult>,
+      create: (request: AgentSessionCreateRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:create', request) as Promise<AgentSession>,
+      read: (request: AgentSessionReadRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:read', request) as Promise<AgentSession>,
+      activate: (request: AgentSessionActivateRequest): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:activate', request) as Promise<AgentSessionListResult>,
+      rename: (request: AgentSessionRenameRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:rename', request) as Promise<AgentSession>,
+      delete: (request: AgentSessionDeleteRequest): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:delete', request) as Promise<AgentSessionListResult>,
+      appendMessage: (request: AgentSessionAppendMessageRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:appendMessage', request) as Promise<AgentSession>,
+      addAttachment: (request: AgentSessionAddAttachmentRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:addAttachment', request) as Promise<AgentSession>,
+      removeAttachment: (request: AgentSessionRemoveAttachmentRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:removeAttachment', request) as Promise<AgentSession>,
+      readAttachment: (request: AgentSessionReadAttachmentRequest): Promise<Uint8Array> => ipcRenderer.invoke('agentSessions:readAttachment', request) as Promise<Uint8Array>,
     },
 
     // Window controls

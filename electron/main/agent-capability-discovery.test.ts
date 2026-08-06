@@ -9,6 +9,7 @@ import {
   listVisibleExtensions,
   parseExtensionManifest,
 } from './automation-capabilities.ts'
+import { discoverGovernedMcpTools, normalizeMcpManifest } from './agent-mcp-manifest.ts'
 
 function declaration(overrides: Record<string, unknown> = {}) {
   return {
@@ -267,49 +268,76 @@ test('invalid normalized snapshot fields remove only Agent eligibility', async (
   }
 })
 
-test('valid MCP tools join the governed inventory without exposing server, command, or executable details', async () => {
+test('seven tools from one MCP server retain one server binding and join the governed inventory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'modly-agent-mcp-capability-'))
   const builtinDir = join(root, 'builtin')
   const userDir = join(root, 'user')
   const extensionDir = join(userDir, 'mcp-tools')
+  const toolDeclarations = [
+    { name: 'inspect_scene', id: 'inspect-scene', displayName: 'Inspect scene', mutating: false },
+    { name: 'create_primitive', id: 'create-primitive', displayName: 'Create primitive', mutating: true },
+    { name: 'apply_transform', id: 'apply-transform', displayName: 'Apply transform', mutating: true },
+    { name: 'assign_material', id: 'assign-material', displayName: 'Assign material', mutating: true },
+    { name: 'render_scene', id: 'render-scene', displayName: 'Render scene', mutating: true },
+    { name: 'export_scene', id: 'export-scene', displayName: 'Export scene', mutating: true },
+    { name: 'save_scene', id: 'save-scene', displayName: 'Save scene', mutating: true },
+  ].map((tool) => ({
+    name: tool.name,
+    capability_id: `mcp-tools/${tool.id}`,
+    display_name: tool.displayName,
+    description: `${tool.displayName} through one governed Blender-like server.`,
+    input_schema: {
+      type: 'object', additionalProperties: false,
+      properties: { request: { type: 'string', maxLength: 100 } }, required: ['request'],
+    },
+    mutating: tool.mutating,
+    approval: { required: true, scope: 'single_action' },
+    artifact: { kind: 'text', media_types: ['text/plain'] },
+  }))
+  const mcpManifest = {
+    schema: 'modly.mcp-stdio.v1', transport: 'stdio', servers: [{
+      id: 'private-server',
+      runtimeFiles: [],
+      command: { executable: 'bin/server', args: ['--stdio'], env: {} },
+      tools: toolDeclarations,
+    }],
+  }
   await mkdir(join(extensionDir, 'bin'), { recursive: true })
   await mkdir(builtinDir, { recursive: true })
   await writeFile(join(extensionDir, 'bin', 'server'), '#!/bin/sh\nexit 0\n')
   await chmod(join(extensionDir, 'bin', 'server'), 0o755)
+  const normalized = normalizeMcpManifest(mcpManifest, 'mcp-tools')
+  assert.equal(normalized.servers.length, 1)
+  assert.equal(normalized.servers[0].tools.length, 7)
   await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
     id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0', type: 'process', entry: 'processor.js', nodes: [],
-    mcp: {
-      schema: 'modly.mcp-stdio.v1', transport: 'stdio', servers: [{
-        id: 'private-server',
-        runtimeFiles: [],
-        command: { executable: 'bin/server', args: ['--stdio'], env: {} },
-        tools: [{
-          name: 'private_tool_name', capability_id: 'mcp-tools/create-text',
-          display_name: 'Create text', description: 'Creates one text artifact.',
-          input_schema: {
-            type: 'object', additionalProperties: false,
-            properties: { text: { type: 'string', maxLength: 100 } }, required: ['text'],
-          },
-          mutating: true,
-          approval: { required: true, scope: 'single_action' },
-          artifact: { kind: 'text', media_types: ['text/plain'] },
-        }],
-      }],
-    },
+    mcp: mcpManifest,
   }))
 
   try {
+    const discovered = await discoverGovernedMcpTools({ builtinDir, userExtensionsDir: userDir })
+    assert.deepEqual(discovered.errors, [])
+    assert.equal(discovered.tools.length, 7)
+    assert.equal(new Set(discovered.tools.map((candidate) => candidate.server.capabilityBindingHash)).size, 1)
+    assert.equal(new Set(discovered.tools.map((candidate) => candidate.tool.capabilityBindingHash)).size, 7)
+
     const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
-    assert.equal(inventory.capabilities.length, 1)
-    const capability = inventory.capabilities[0]
-    assert.equal(capability.id, 'mcp-tools/create-text')
-    assert.equal(capability.execution?.kind, 'mcp_tool')
-    assert.equal(capability.execution?.inputSchemaHash.length, 64)
-    assert.equal(capability.execution?.bindingHash.length, 64)
-    assert.equal(capability.node.output, 'text')
-    const publicJson = JSON.stringify(capability)
+    assert.deepEqual(inventory.errors, [])
+    assert.deepEqual(inventory.capabilities.map((capability) => capability.id), toolDeclarations
+      .map((tool) => tool.capability_id).sort())
+    assert.equal(new Set(inventory.capabilities.map((capability) => capability.hash)).size, 7)
+    const toolBindingHashes = inventory.capabilities.map((capability) => {
+      assert.equal(capability.execution?.kind, 'mcp_tool')
+      if (capability.execution?.kind !== 'mcp_tool') assert.fail('expected MCP tool execution')
+      assert.equal(capability.execution.inputSchemaHash.length, 64)
+      assert.equal(capability.execution.bindingHash.length, 64)
+      assert.equal(capability.node.output, 'text')
+      return capability.execution.bindingHash
+    })
+    assert.equal(new Set(toolBindingHashes).size, 7)
+    const publicJson = JSON.stringify(inventory.capabilities)
     assert.equal(publicJson.includes('private-server'), false)
-    assert.equal(publicJson.includes('private_tool_name'), false)
+    assert.equal(publicJson.includes('inspect_scene'), false)
     assert.equal(publicJson.includes('bin/server'), false)
     assert.equal(publicJson.includes(extensionDir), false)
 

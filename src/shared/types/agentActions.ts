@@ -43,12 +43,12 @@ export interface AgentCapabilitySnapshotV1 {
   }
   node: {
     id: string
-    input: string
+    input: ArtifactKind
     output: ArtifactKind
     inputs?: Array<{
       name: string
       label?: string
-      type: string
+      type: ArtifactKind
       required?: boolean
       multiple?: true
       min_items?: number
@@ -142,4 +142,53 @@ export interface AgentCapabilityInventoryResult {
 
 export interface AgentCapabilitiesApi {
   list(): Promise<AgentCapabilityInventoryResult>
+}
+
+export type AgentActionDecision = 'approve' | 'reject'
+
+export type AgentActionPublicErrorCode =
+  | 'invalid_request'
+  | 'invalid_arguments'
+  | 'action_not_found'
+  | 'capability_not_found'
+  | 'capability_stale'
+  | 'model_stale'
+  | 'artifact_not_found'
+  | 'approval_expired'
+  | 'invalid_state'
+  | 'executor_unavailable'
+  | 'execution_failed'
+  | 'invalid_artifact'
+  | 'capacity_exceeded'
+  | 'internal_error'
+
+export interface AgentActionProposeRequest {
+  capabilityId: string
+  arguments: JsonValue
+  model: AgentOllamaModelSnapshotV1
+}
+
+export interface AgentActionIdRequest {
+  actionId: string
+}
+
+export interface AgentActionDecisionRequest extends AgentActionIdRequest {
+  decision: AgentActionDecision
+}
+
+export type AgentActionMutationResult =
+  | { ok: true, action: AgentActionPublicSummaryV1 }
+  | { ok: false, error: { code: AgentActionPublicErrorCode } }
+
+export type AgentActionListResult =
+  | { ok: true, actions: AgentActionPublicSummaryV1[] }
+  | { ok: false, error: { code: AgentActionPublicErrorCode } }
+
+export interface AgentActionsApi {
+  propose(request: AgentActionProposeRequest): Promise<AgentActionMutationResult>
+  get(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
+  list(): Promise<AgentActionListResult>
+  decide(request: AgentActionDecisionRequest): Promise<AgentActionMutationResult>
+  execute(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
+  cancel(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
 }

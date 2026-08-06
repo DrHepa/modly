@@ -211,6 +211,26 @@ test('Ollama model names accept conservative model syntax and reject URLs, token
   }
 })
 
+test('Agent parameter metadata rejects prototype-pollution identifiers', () => {
+  for (const id of ['__proto__', 'prototype', 'constructor']) {
+    const unsafe = {
+      ...capability,
+      node: { ...capability.node, paramsSchema: [{ id, type: 'string', default: '' }] },
+      hash: '',
+    }
+    unsafe.hash = hashCapability(unsafe)
+    assert.throws(() => createAgentActionProposal({
+      id: `unsafe-${id.replaceAll('_', 'x')}`,
+      capability: unsafe,
+      arguments: {},
+      model,
+      inputArtifacts: [],
+      approval: { scope: 'single_action', expiresAt: '2026-08-06T12:05:00.000Z' },
+      createdAt: '2026-08-06T12:00:00.000Z',
+    }), /parameter|paramsSchema|unsafe/i)
+  }
+})
+
 test('public action summaries omit endpoints, arguments, workspace paths, and trust-boundary secrets', () => {
   const artifact = assertArtifactRefV1({
     schema: 'modly.artifact-ref.v1', version: 1, id: 'mesh-1', kind: 'mesh',

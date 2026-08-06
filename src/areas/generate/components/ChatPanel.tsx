@@ -4,7 +4,6 @@ import { useAgentStore, PROVIDERS, providerBaseUrl } from '@shared/stores/agentS
 import { useLlmModels } from '@shared/stores/llmModelsStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
 import { buildAllWorkflowExtensions } from '@areas/workflows/mockExtensions'
 import { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'
 import AgentSessionHistory from './AgentSessionHistory'
@@ -217,17 +216,29 @@ export async function applyAgentActions(
   return failures
 }
 
-export interface PendingAgentWorkflow {
-  id: string
-  name: string
-  notifyAgentOnCompletion: boolean
-  sessionId: string
-  originMessages: Message[]
-  uiToken?: OriginBoundUiToken
+export const GOVERNED_ACTION_REQUIRED_CODE = 'governed_action_required'
+export const GOVERNED_ACTION_REQUIRED_MESSAGE = 'This action requires approval before Modly can apply it.'
+
+export class GovernedActionRequiredError extends Error {
+  readonly code = GOVERNED_ACTION_REQUIRED_CODE
+  readonly recoverable = true
+
+  constructor() {
+    super(GOVERNED_ACTION_REQUIRED_MESSAGE)
+    this.name = 'GovernedActionRequiredError'
+  }
 }
 
-export function shouldNotifyAgentAfterWorkflowCompletion(workflow: PendingAgentWorkflow): boolean {
-  return workflow.notifyAgentOnCompletion
+export function rejectUngovernedAgentAction(action: ActionDone): void {
+  if (action.payload) throw new GovernedActionRequiredError()
+}
+
+function governedActionFailure(failures: AgentActionFailure[]): GovernedActionRequiredError | null {
+  const failure = failures.find(({ error }) => (
+    error instanceof GovernedActionRequiredError
+    || (isRecord(error) && error.code === GOVERNED_ACTION_REQUIRED_CODE)
+  ))
+  return failure ? new GovernedActionRequiredError() : null
 }
 
 export function withActionFailureSummary(message: string, failureCount: number): string {
@@ -285,15 +296,6 @@ export function createSessionRestoreCoordinator<T>(update: (messages: T[]) => vo
       generation += 1
       update([])
     },
-  }
-}
-
-export function buildSafeWorkflowFailureMessage(workflowName: string, messageId: string): Message {
-  return {
-    id: messageId,
-    role: 'assistant',
-    content: `Workflow '${workflowName}' failed.`,
-    summaries: [{ kind: 'action', label: `Workflow failed: ${workflowName}` }],
   }
 }
 
@@ -553,30 +555,6 @@ function ThinkingBlock({ content }: { content: string }): JSX.Element {
   )
 }
 
-// ─── Workflow progress card ────────────────────────────────────────────────────
-
-function WorkflowProgressCard({ name }: { name: string }): JSX.Element {
-  const runState = useWorkflowRunStore((s) => s.runState)
-  const pct = runState.blockProgress
-  return (
-    <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-3 py-2.5 flex flex-col gap-2">
-      <div className="flex items-center justify-between text-[11px]">
-        <div className="flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shrink-0" />
-          <span className="text-zinc-300 font-medium truncate">{name}</span>
-        </div>
-        <span className="text-zinc-500 shrink-0">{pct}%</span>
-      </div>
-      <div className="h-0.5 bg-zinc-700 rounded-full overflow-hidden">
-        <div className="h-full bg-accent rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
-      </div>
-      {runState.blockStep && (
-        <p className="text-[10px] text-zinc-500 truncate">{runState.blockStep}</p>
-      )}
-    </div>
-  )
-}
-
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export default function ChatPanel(): JSX.Element {
@@ -596,7 +574,6 @@ export default function ChatPanel(): JSX.Element {
   // code/cad models are node tools, not chat models.
   const localModels                           = llmModels.filter((m) => m.downloaded && !(m.tags ?? []).some((t) => t === 'code' || t === 'cad'))
   const [showModelPicker, setShowModelPicker] = useState(false)
-  const [pendingWorkflow, setPendingWorkflow]  = useState<PendingAgentWorkflow | null>(null)
   const [attachments, setAttachments]         = useState<PendingAttachment[]>([])
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
@@ -655,16 +632,10 @@ export default function ChatPanel(): JSX.Element {
   const apiUrl           = useAppStore((s) => s.apiUrl)
   const currentJob       = useAppStore((s) => s.currentJob)
   const meshStats        = useAppStore((s) => s.meshStats)
-  const updateCurrentJob = useAppStore((s) => s.updateCurrentJob)
-  const pushMeshUrl      = useAppStore((s) => s.pushMeshUrl)
   const undoMesh         = useAppStore((s) => s.undoMesh)
 
-  const workflows     = useWorkflowsStore((s) => s.workflows)
-  const saveWorkflow  = useWorkflowsStore((s) => s.save)
-  const openWorkflow = useWorkflowsStore((s) => s.openWorkflow)
+  const workflows = useWorkflowsStore((s) => s.workflows)
   const { modelExtensions, processExtensions } = useExtensionsStore()
-  const runWorkflow   = useWorkflowRunStore((s) => s.run)
-  const runState      = useWorkflowRunStore((s) => s.runState)
   const allExtensions = useMemo(
     () => buildAllWorkflowExtensions(modelExtensions, processExtensions),
     [modelExtensions, processExtensions],
@@ -685,48 +656,9 @@ export default function ChatPanel(): JSX.Element {
     return () => document.removeEventListener('mousedown', handler)
   }, [showModelPicker])
 
-  // Watch workflow completion → send follow-up to agent
-  useEffect(() => {
-    if (!pendingWorkflow) return
-    if (runState.status !== 'done' && runState.status !== 'error') return
-
-    const wf = pendingWorkflow
-    const uiToken = wf.uiToken ?? originUiGateRef.current.begin(wf.sessionId)
-    setPendingWorkflow((current) => current === wf ? null : current)
-
-    if (runState.status === 'error') {
-      const failureMessage = buildSafeWorkflowFailureMessage(wf.name, `sys-${Date.now()}`)
-      void appendPersistedMessage(wf.sessionId, failureMessage).catch((failure) => {
-        uiToken.run(() => {
-          setError(failure instanceof Error ? failure.message : 'Chat history could not save the workflow result.')
-        })
-      })
-      uiToken.run(() => {
-        setMessages((prev) => [...prev, failureMessage])
-        if (runState.error) setError(runState.error)
-      })
-      return
-    }
-
-    // Update viewer with the generated mesh
-    if (runState.outputUrl) {
-      uiToken.run(() => {
-        updateCurrentJob({ outputUrl: runState.outputUrl, status: 'done', progress: 100 })
-        pushMeshUrl(runState.outputUrl!)
-      })
-    }
-
-    if (!shouldNotifyAgentAfterWorkflowCompletion(wf)) return
-
-    // Send automatic follow-up to agent
-    const completionCtx = `Workflow '${wf.name}' just completed.${runState.outputUrl ? ` Output mesh: ${runState.outputUrl}` : ''} Ask the user what they'd like to do next.`
-    void callAgent(wf.sessionId, wf.originMessages, { workflowCompletion: completionCtx }, uiToken)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire on run-status transition; error/outputUrl read atomically
-  }, [runState.status, pendingWorkflow])
-
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, isLoading, pendingWorkflow])
+  }, [messages, isLoading])
 
   function buildContext(): Record<string, unknown> {
     const ctx: Record<string, unknown> = {}
@@ -741,52 +673,8 @@ export default function ChatPanel(): JSX.Element {
 
   async function applyCompletedActions(
     actions: ActionDone[],
-    msgs: Message[],
-    notifyAgentOnWorkflowCompletion: boolean,
-    originatingSessionId: string,
-    uiToken: OriginBoundUiToken,
   ): Promise<AgentActionFailure[]> {
-    // Extract base64 from the most recent user message that had an image attached
-    const latestImageDataUrl = [...msgs].reverse()
-      .find((m) => m.role === 'user' && m.imageDataUrls?.length)
-      ?.imageDataUrls?.[0]
-    const overrideImageData = latestImageDataUrl ? latestImageDataUrl.split(',')[1] : undefined
-
-    return applyAgentActions(actions, async (action) => {
-      const payload = action.payload
-      if (payload && !uiToken.isCurrent()) {
-        throw new Error('The originating Agent session is no longer active.')
-      }
-      if (payload?.type === 'mesh_update') {
-        uiToken.run(() => {
-          updateCurrentJob({ outputUrl: payload.url })
-          pushMeshUrl(payload.url)
-        })
-      }
-      if (payload?.type === 'run_workflow') {
-        const wf = workflows.find((w) => w.id === payload.workflow_id)
-        if (!wf) throw new Error('The completed workflow action is no longer available locally.')
-        uiToken.run(() => {
-          void runWorkflow(wf, allExtensions, overrideImageData)
-          setPendingWorkflow({
-            id: wf.id,
-            name: wf.name,
-            notifyAgentOnCompletion: notifyAgentOnWorkflowCompletion,
-            sessionId: originatingSessionId,
-            originMessages: msgs,
-            uiToken,
-          })
-        })
-      }
-      if (payload?.type === 'create_workflow') {
-        const draft = payload.workflow
-        const now = new Date().toISOString()
-        const wf: Workflow = { ...draft, id: crypto.randomUUID(), createdAt: now, updatedAt: now }
-        const result = await saveWorkflow(wf)
-        if (!result.success) throw new Error('The completed workflow creation could not be saved locally.')
-        uiToken.run(() => openWorkflow(wf.id))
-      }
-    })
+    return applyAgentActions(actions, rejectUngovernedAgentAction)
   }
 
   async function callAgent(
@@ -833,21 +721,21 @@ export default function ChatPanel(): JSX.Element {
         })
         const data = await parseAgentChatResponse(res)
 
+        const actionFailures = await applyCompletedActions(data.actions)
+        const failedActions = new Set(actionFailures.map((failure) => failure.action))
+        const reflectedActions = data.actions.filter((action) => !failedActions.has(action))
         const assistantMessage: Message = {
           id: `a-${Date.now()}`,
           role: 'assistant',
           content: data.message,
           thinking: data.thinking ?? undefined,
-          actions: data.actions.length ? data.actions : undefined,
+          actions: reflectedActions.length ? reflectedActions : undefined,
         }
-        const actionFailures = await applyCompletedActions(data.actions, [...msgs, assistantMessage], true, originatingSessionId, uiToken)
-        const failedActions = new Set(actionFailures.map((failure) => failure.action))
         await appendPersistedMessage(originatingSessionId, {
           id: assistantMessage.id,
           role: assistantMessage.role,
           content: assistantMessage.content,
-          summaries: data.actions
-            .filter((action) => !failedActions.has(action))
+          summaries: reflectedActions
             .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
         })
         uiToken.run(() => {
@@ -855,17 +743,24 @@ export default function ChatPanel(): JSX.Element {
         })
 
         if (actionFailures.length > 0) {
+          const approvalRequired = governedActionFailure(actionFailures)
+          if (approvalRequired) throw approvalRequired
           throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
         }
     } catch (e: unknown) {
         let actionFailureCount = 0
+        let approvalRequired: GovernedActionRequiredError | null = null
         if (e instanceof AgentApiError && e.actions.length > 0) {
-          const actionFailures = await applyCompletedActions(e.actions, msgs, false, originatingSessionId, uiToken)
+          const actionFailures = await applyCompletedActions(e.actions)
           actionFailureCount = actionFailures.length
+          approvalRequired = governedActionFailure(actionFailures)
         }
         const msg = e instanceof Error ? e.message : String(e)
         const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
-        uiToken.run(() => setError(withActionFailureSummary(safeMessage, actionFailureCount)))
+        uiToken.run(() => setError(
+          approvalRequired?.message
+          ?? (e instanceof GovernedActionRequiredError ? e.message : withActionFailureSummary(safeMessage, actionFailureCount)),
+        ))
     } finally {
       uiToken.run(() => setIsLoading(false))
     }
@@ -912,8 +807,7 @@ export default function ChatPanel(): JSX.Element {
     await submissionGateRef.current.run(async () => {
       const text = input.trim()
       const originatingSessionId = activeSession?.id
-      const workflowBlocksSession = pendingWorkflow?.sessionId === originatingSessionId
-      if (!text || isLoading || workflowBlocksSession || !initializedSessions || !originatingSessionId) return
+      if (!text || isLoading || !initializedSessions || !originatingSessionId) return
       const uiToken = originUiGateRef.current.begin(originatingSessionId)
 
       const attachmentIds: string[] = []
@@ -1057,9 +951,6 @@ export default function ChatPanel(): JSX.Element {
               )}
             </div>
           ))}
-
-          {/* Workflow progress card — visible while agent waits for workflow */}
-          {pendingWorkflow && pendingWorkflow.sessionId === activeSession?.id && <WorkflowProgressCard name={pendingWorkflow.name} />}
 
           {/* Loading indicator */}
           {isLoading && (

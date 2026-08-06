@@ -17,6 +17,7 @@ const SHA256_PATTERN = /^(?:sha256:)?[a-f0-9]{64}$/
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const MIME_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i
 const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+const UNSAFE_PARAMETER_IDS = new Set(['__proto__', 'prototype', 'constructor'])
 const ARTIFACT_KIND_SET = new Set<string>(ARTIFACT_KINDS)
 const ACTION_STATUS_SET = new Set<string>(AGENT_ACTION_STATUSES)
 const OLLAMA_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*){0,2}(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/
@@ -349,6 +350,7 @@ export function normalizeAgentParamsSchema(value: unknown): JsonValue[] {
     const commonKeys = ['id', 'label', 'type', 'default', 'tooltip', 'advanced', 'group', 'ui', 'show_if']
     assertExactKeys(param, [...commonKeys, ...typeKeys[type]], label)
     const id = assertSafeId(param.id, `${label}.id`)
+    if (UNSAFE_PARAMETER_IDS.has(id)) throw new TypeError(`${label}.id is unsafe`)
     if (ids.has(id)) throw new TypeError(`Agent capability paramsSchema contains duplicate id "${id}"`)
     ids.add(id)
     const displayLabel = optionalStringField(param, 'label', label, 120)
@@ -499,7 +501,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   return capability
 }
 
-function assertOllamaModelSnapshot(value: unknown): AgentOllamaModelSnapshotV1 {
+export function assertAgentOllamaModelSnapshotV1(value: unknown): AgentOllamaModelSnapshotV1 {
   assertPlainRecord(value, 'Agent Ollama model snapshot')
   assertExactKeys(value, ['provider', 'endpoint', 'model', 'digest'], 'Agent Ollama model snapshot')
   if (value.provider !== 'ollama') throw new TypeError('Agent model provider must be ollama')
@@ -515,7 +517,7 @@ function assertOllamaModelSnapshot(value: unknown): AgentOllamaModelSnapshotV1 {
     throw new TypeError('Agent Ollama model must use a conservative namespace/model:tag identifier')
   }
   const digest = normalizeSha256(value.digest, 'Agent Ollama digest', true)
-  return { provider: 'ollama', endpoint, model, digest }
+  return { provider: 'ollama', endpoint: parsed.origin, model, digest }
 }
 
 function proposalHashPayload(action: {
@@ -618,7 +620,7 @@ export function createAgentActionProposal(input: {
   const id = assertSafeId(input.id, 'Agent action id')
   const capability = assertAgentCapabilitySnapshotV1(input.capability)
   const args = normalizeJsonValue(input.arguments)
-  const model = assertOllamaModelSnapshot(input.model)
+  const model = assertAgentOllamaModelSnapshotV1(input.model)
   const inputArtifacts = input.inputArtifacts.map(assertArtifactRefV1)
   const createdAt = assertIsoTimestamp(input.createdAt, 'Agent action createdAt')
   const expiresAt = assertIsoTimestamp(input.approval.expiresAt, 'Agent action approval expiresAt')
@@ -680,7 +682,7 @@ function normalizeAgentActionV1(value: unknown, now?: string): AgentActionV1 {
   const args = normalizeJsonValue(value.arguments)
   const argumentsHash = normalizeSha256(value.argumentsHash, 'Agent action arguments hash')
   if (sha256Canonical(args) !== argumentsHash) throw new TypeError('Agent action arguments hash does not match normalized arguments')
-  const model = assertOllamaModelSnapshot(value.model)
+  const model = assertAgentOllamaModelSnapshotV1(value.model)
   const modelHash = normalizeSha256(value.modelHash, 'Agent action model hash')
   if (sha256Canonical(model) !== modelHash) throw new TypeError('Agent action model hash does not match its snapshot')
   if (!Array.isArray(value.inputArtifacts) || !Array.isArray(value.outputArtifacts)) throw new TypeError('Agent action artifacts must be arrays')
@@ -862,8 +864,8 @@ function summarizeArtifact(artifact: ArtifactRefV1) {
   }
 }
 
-export function toAgentActionPublicSummary(actionValue: unknown): AgentActionPublicSummaryV1 {
-  const action = assertAgentActionV1(actionValue)
+export function toAgentActionPublicSummary(actionValue: unknown, now = new Date().toISOString()): AgentActionPublicSummaryV1 {
+  const action = assertAgentActionV1(actionValue, now)
   return {
     schema: 'modly.agent-action-summary.v1',
     version: 1,

@@ -8,8 +8,14 @@ import {
   AgentMcpManifestError,
   bindMcpManifest,
   discoverGovernedMcpTools,
+  mcpInheritedFdRequirement,
   normalizeMcpManifest,
 } from './agent-mcp-manifest.ts'
+import {
+  createAgentHostRuntimeRegistry,
+  createDefaultAgentHostRuntimeRegistry,
+  inspectAgentHostRuntimeTree,
+} from './agent-host-runtime.ts'
 
 function manifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -98,6 +104,137 @@ test('normalizes one strict versioned stdio declaration and binds executable ide
   } finally {
     await rm(fixture.root, { recursive: true, force: true })
   }
+})
+
+test('binds typed artifact inputs and bounded file outputs while rejecting a current-owned host runtime', async () => {
+  const fixture = await extensionFixture()
+  const runtimeRoot = join(fixture.root, 'blender-runtime')
+  await mkdir(runtimeRoot, { mode: 0o700 })
+  await writeFile(join(runtimeRoot, 'blender'), '#!/bin/sh\nexit 0\n')
+  await chmod(join(runtimeRoot, 'blender'), 0o700)
+  const server = (manifest().servers as Record<string, unknown>[])[0]
+  const tool = (server.tools as Record<string, unknown>[])[0]
+  const governed = manifest({
+    servers: [{
+      ...server,
+      hostRuntime: { id: 'blender-5.2', executable: 'blender' },
+      artifactOutput: {
+        profile: 'relative-files-v1', maxCount: 2,
+        maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024,
+      },
+      tools: [{
+        ...tool,
+        input_schema: {
+          type: 'object', additionalProperties: false,
+          properties: { sceneArtifact: { type: 'string', maxLength: 128 } },
+          required: ['sceneArtifact'],
+        },
+        input_artifacts: [{
+          argument: 'sceneArtifact', kind: 'blend', media_types: ['application/x-blender'],
+        }],
+        output_schema: {
+          type: 'object', additionalProperties: false,
+          properties: { artifacts: { type: 'array', minItems: 1, maxItems: 1, items: { type: 'object' } } },
+          required: ['artifacts'],
+        },
+        artifact: {
+          outputs: [{
+            path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'],
+            max_bytes: 32 * 1024 * 1024, required: true,
+          }],
+        },
+      }],
+    }],
+  })
+  try {
+    const normalized = normalizeMcpManifest(governed, 'fixture-extension')
+    assert.deepEqual(normalized.servers[0].tools[0].inputArtifacts, [{
+      argument: 'sceneArtifact', kind: 'blend', mediaTypes: ['application/x-blender'], sandboxPath: '/input/0',
+    }])
+    assert.equal(mcpInheritedFdRequirement(normalized.servers[0]), 9)
+    const registry = createAgentHostRuntimeRegistry([{
+      id: 'blender-5.2', rootPath: runtimeRoot, ownerPolicy: 'trusted-non-current',
+    }])
+    await assert.rejects(
+      bindMcpManifest(normalized, fixture.extensionDir, { hostRuntimes: registry }),
+      (error: unknown) => error instanceof AgentMcpManifestError && error.code === 'runtime_unavailable',
+    )
+
+    await assert.rejects(
+      bindMcpManifest(normalized, fixture.extensionDir),
+      (error: unknown) => error instanceof AgentMcpManifestError && error.code === 'runtime_unavailable',
+    )
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('host runtime tree identity is complete, content-bound, bounded, and never trusts the current uid', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.modly-host-runtime-test-'))
+  const runtimeRoot = join(root, 'runtime')
+  const currentUid = process.getuid?.()
+  assert.equal(typeof currentUid, 'number')
+  const nonOwnerUid = currentUid === 0 ? 1 : currentUid! + 1
+  try {
+    await mkdir(join(runtimeRoot, 'scripts'), { recursive: true, mode: 0o755 })
+    await writeFile(join(runtimeRoot, 'blender'), '#!/bin/sh\nexit 0\n')
+    await chmod(join(runtimeRoot, 'blender'), 0o755)
+    await writeFile(join(runtimeRoot, 'scripts', 'startup.py'), 'print("first")\n')
+    await chmod(join(runtimeRoot, 'scripts', 'startup.py'), 0o644)
+
+    await assert.rejects(
+      inspectAgentHostRuntimeTree(runtimeRoot, { currentUid: currentUid! }),
+      /current process/i,
+    )
+    const first = await inspectAgentHostRuntimeTree(runtimeRoot, { currentUid: nonOwnerUid })
+    assert.equal(first.entryCount, 4)
+    assert.equal(first.entries.some((entry) => entry.relativePath === 'scripts/startup.py' && entry.sha256?.length === 64), true)
+
+    await writeFile(join(runtimeRoot, 'scripts', 'startup.py'), 'print("other")\n')
+    await chmod(join(runtimeRoot, 'scripts', 'startup.py'), 0o644)
+    const changed = await inspectAgentHostRuntimeTree(runtimeRoot, { currentUid: nonOwnerUid })
+    assert.notEqual(changed.treeDigest, first.treeDigest)
+
+    await chmod(join(runtimeRoot, 'scripts', 'startup.py'), 0o666)
+    await assert.rejects(inspectAgentHostRuntimeTree(runtimeRoot, { currentUid: nonOwnerUid }), /writable/i)
+    await chmod(join(runtimeRoot, 'scripts', 'startup.py'), 0o644)
+    await symlink('/etc/passwd', join(runtimeRoot, 'escape'))
+    await assert.rejects(inspectAgentHostRuntimeTree(runtimeRoot, { currentUid: nonOwnerUid }), /symlink/i)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('default Blender registry uses a non-current-owner policy rather than a magic uid', () => {
+  const registry = createDefaultAgentHostRuntimeRegistry('linux', 'arm64')
+  assert.deepEqual(registry.definitions.get('blender-5.2'), {
+    id: 'blender-5.2',
+    rootPath: '/opt/blender-5.2.0-aarch64',
+    ownerPolicy: 'trusted-non-current',
+  })
+})
+
+test('artifact bindings and output profiles reject model paths, hashes, unsafe files, and raised legacy defaults', () => {
+  const server = (manifest().servers as Record<string, unknown>[])[0]
+  const tool = (server.tools as Record<string, unknown>[])[0]
+  const withTool = (toolOverride: Record<string, unknown>, serverOverride: Record<string, unknown> = {}) => manifest({
+    servers: [{ ...server, ...serverOverride, tools: [{ ...tool, ...toolOverride }] }],
+  })
+  for (const invalid of [
+    withTool({ input_artifacts: [{ argument: 'path', kind: 'text', media_types: ['text/plain'] }] }),
+    withTool({ input_artifacts: [{ argument: 'text', kind: 'text', media_types: ['text/plain'], path: '/tmp/x' }] }),
+    withTool({ input_artifacts: [{ argument: 'text', kind: 'text', media_types: ['text/plain'], sha256: '0'.repeat(64) }] }),
+    withTool({}, { artifactOutput: { profile: 'artifact-v1', maxCount: 5, maxArtifactBytes: 262_144, maxTotalBytes: 1_048_576 } }),
+    withTool({ artifact: { outputs: [{ path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'], max_bytes: 32 * 1024 * 1024, required: true }] } }, {
+      artifactOutput: { profile: 'relative-files-v1', maxCount: 2, maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024 },
+    }),
+    withTool({ artifact: { outputs: [{ path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'], max_bytes: 16 * 1024 * 1024, required: true }] } }, {
+      artifactOutput: { profile: 'relative-files-v1', maxCount: 2, maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024 },
+    }),
+    withTool({ artifact: { outputs: [{ path: '../scene.blend', kind: 'blend', media_types: ['application/x-blender'], max_bytes: 1, required: true }] } }, {
+      artifactOutput: { profile: 'relative-files-v1', maxCount: 1, maxArtifactBytes: 33 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024 },
+    }),
+  ]) assert.throws(() => normalizeMcpManifest(invalid, 'fixture-extension'), AgentMcpManifestError)
 })
 
 test('invalid MCP metadata is default-denied without changing normal process parsing', () => {

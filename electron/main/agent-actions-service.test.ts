@@ -319,6 +319,140 @@ test('MCP capability proposals preserve canonical schema-shaped arguments withou
   }), 'invalid_arguments')
 })
 
+test('MCP artifact arguments resolve opaque inventory ids in main and bind authoritative identities into the proposal', async () => {
+  const inputSchema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      sceneArtifact: { type: 'string', maxLength: 128 },
+      operation: { type: 'string', maxLength: 32 },
+    },
+    required: ['sceneArtifact', 'operation'],
+  }
+  const capability = capabilityFixture({
+    id: 'mcp-tools/inspect-scene',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'inspect-scene', input: 'blend', output: 'text', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema, inputSchemaHash: sha256Canonical(inputSchema),
+      inputArtifacts: [{
+        argument: 'sceneArtifact', kind: 'blend', mediaTypes: ['application/x-blender'], sandboxPath: '/input/0',
+      }],
+      mutating: false, bindingHash: 'd'.repeat(64),
+    } as never,
+  })
+  const sourceArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'approved-scene', kind: 'blend',
+    mediaType: 'application/x-blender', workspacePath: 'Workflows/scenes/approved.blend',
+    sha256: 'c'.repeat(64), sizeBytes: 4096,
+  }
+  let captured: AgentActionExecutorRequest | undefined
+  let resolvedSession = ''
+  const service = new AgentActionsService({
+    createActionId: () => 'action-mcp-input',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    resolveArtifact: async (originSessionId, artifactId, kind) => {
+      resolvedSession = originSessionId
+      return originSessionId === 'test-session' && artifactId === sourceArtifact.id && kind === sourceArtifact.kind
+        ? sourceArtifact
+        : null
+    },
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      captured = request
+      return { artifacts: [{ ...validOutput, kind: 'text', mediaType: 'text/plain' }] }
+    },
+  })
+  const proposed = await service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { sceneArtifact: sourceArtifact.id, operation: 'inspect' }, model: selectedModel,
+  })
+  assert.equal(JSON.stringify(proposed).includes(sourceArtifact.workspacePath), false)
+  assert.equal(JSON.stringify(proposed).includes(sourceArtifact.sha256), true)
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
+  assert.deepEqual(captured?.arguments, { sceneArtifact: sourceArtifact.id, operation: 'inspect' })
+  assert.deepEqual(captured?.inputArtifacts, [sourceArtifact])
+  assert.equal(resolvedSession, 'test-session')
+
+  for (const [invalid, expected] of [
+    [{ sceneArtifact: sourceArtifact.workspacePath, operation: 'inspect' }, 'invalid_arguments'],
+    [{ sceneArtifact: sourceArtifact.sha256, operation: 'inspect' }, 'artifact_not_found'],
+    [{ sceneArtifact: { artifactId: sourceArtifact.id, path: sourceArtifact.workspacePath }, operation: 'inspect' }, 'invalid_arguments'],
+  ] as const) {
+    await rejectsCode(service.propose({
+      originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+      arguments: invalid as never, model: selectedModel,
+    }), expected)
+  }
+})
+
+test('MCP file outputs are validated against their own declared path policy instead of the first output kind', async () => {
+  const inputSchema = { type: 'object', additionalProperties: false, properties: {} }
+  const capability = capabilityFixture({
+    id: 'mcp-tools/render-pair',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: {
+      id: 'render-pair', input: 'text', output: 'blend', outputs: ['blend', 'text'], paramsSchema: [],
+    },
+    execution: {
+      kind: 'mcp_tool', inputSchema, inputSchemaHash: sha256Canonical(inputSchema),
+      artifacts: {
+        profile: 'relative-files-v1', maxCount: 2, maxArtifactBytes: 1024, maxTotalBytes: 2048,
+        allowed: [
+          { path: 'report.txt', kind: 'text', mediaTypes: ['text/plain'], maxBytes: 1024, required: true },
+          { path: 'scene.blend', kind: 'blend', mediaTypes: ['application/x-blender'], maxBytes: 1024, required: true },
+        ],
+      },
+      mutating: true, bindingHash: 'd'.repeat(64),
+    },
+  })
+  const artifact = (id: string, path: string, kind: ArtifactRefV1['kind'], mediaType: string): ArtifactRefV1 => ({
+    schema: 'modly.artifact-ref.v1', version: 1, id, kind, mediaType,
+    workspacePath: `Workflows/agent-actions/action-mcp-pair/${path}`,
+    sha256: id === 'scene' ? '1'.repeat(64) : '2'.repeat(64), sizeBytes: 16,
+  })
+  const service = new AgentActionsService({
+    createActionId: () => 'action-mcp-pair',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => ({ artifacts: [
+      artifact('scene', 'scene.blend', 'text', 'text/plain'),
+      artifact('report', 'report.txt', 'blend', 'application/x-blender'),
+    ] }),
+  })
+  const proposed = await service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: {}, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'invalid_artifact')
+
+  const validService = new AgentActionsService({
+    createActionId: () => 'action-mcp-pair',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: {
+      async verify(candidate, expectedKind) {
+        assert.equal(expectedKind, candidate.kind)
+        return candidate
+      },
+    },
+    executor: async () => ({ artifacts: [
+      artifact('scene', 'scene.blend', 'blend', 'application/x-blender'),
+      artifact('report', 'report.txt', 'text', 'text/plain'),
+    ] }),
+  })
+  const validProposal = await validService.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: {}, model: selectedModel,
+  })
+  await validService.decide({ actionId: validProposal.id, originSessionId: 'test-session', decision: 'approve' })
+  const completed = await validService.execute({ actionId: validProposal.id, originSessionId: 'test-session' })
+  assert.deepEqual(completed.outputs.map((output) => output.kind), ['blend', 'text'])
+})
+
 test('artifact inputs are resolved from opaque ids and paths or hashes are never accepted from the renderer', async () => {
   const capability = capabilityFixture({
     id: 'mesh-tools/optimize',
@@ -337,7 +471,9 @@ test('artifact inputs are resolved from opaque ids and paths or hashes are never
     resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
     resolveCurrentModel: async () => selectedModel,
     artifactVerifier: passThroughArtifactVerifier,
-    resolveArtifact: async (artifactId) => artifactId === sourceArtifact.id ? sourceArtifact : null,
+    resolveArtifact: async (originSessionId, artifactId) => (
+      originSessionId === 'test-session' && artifactId === sourceArtifact.id ? sourceArtifact : null
+    ),
     executor: async (request) => { captured = request; return { artifacts: [validOutput] } },
   })
 

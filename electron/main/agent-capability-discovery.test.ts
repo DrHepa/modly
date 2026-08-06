@@ -312,6 +312,12 @@ test('valid MCP tools join the governed inventory without exposing server, comma
     assert.equal(publicJson.includes('private_tool_name'), false)
     assert.equal(publicJson.includes('bin/server'), false)
     assert.equal(publicJson.includes(extensionDir), false)
+
+    const unavailable = await listAgentCapabilities({
+      builtinDir, userExtensionsDir: userDir, trustedRepos: new Set(), mcpSandboxReady: false,
+    })
+    assert.deepEqual(unavailable.capabilities, [])
+    assert.ok(unavailable.errors.some((error) => error.code === 'MCP_SANDBOX_UNAVAILABLE'))
   } finally {
     await rm(root, { recursive: true, force: true })
   }

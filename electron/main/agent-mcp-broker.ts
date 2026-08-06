@@ -1,19 +1,21 @@
 import { createHash } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { constants } from 'node:fs'
+import { constants, type BigIntStats } from 'node:fs'
 import {
   lstat,
   mkdir,
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
+  rmdir,
   rm,
   stat,
   type FileHandle,
 } from 'node:fs/promises'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 
 import Ajv from 'ajv'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -23,13 +25,24 @@ import type { Transport, TransportSendOptions } from '@modelcontextprotocol/sdk/
 
 import type { AgentActionExecutor, AgentActionExecutorRequest } from './agent-actions-service.ts'
 import {
+  MCP_MAX_INHERITED_FDS,
   discoverGovernedMcpTools,
   type BoundMcpServer,
   type DiscoveredMcpTool,
   type McpExecutableIdentity,
 } from './agent-mcp-manifest.ts'
 import { assertArtifactRefV1, canonicalJson, sha256Canonical } from './agent-trust-contracts.ts'
-import type { ArtifactRefV1, JsonValue } from '../../src/shared/types/agentActions.ts'
+import type {
+  AgentMcpArtifactOutputContractV1,
+  ArtifactRefV1,
+  JsonValue,
+} from '../../src/shared/types/agentActions.ts'
+import {
+  closeOpenAgentHostRuntime,
+  openBoundAgentHostRuntime,
+  revalidateOpenAgentHostRuntime,
+  type OpenAgentHostRuntime,
+} from './agent-host-runtime.ts'
 
 const MAX_REQUEST_BYTES = 1024 * 1024
 const MAX_RUNTIME_DEPTH = 32
@@ -51,7 +64,7 @@ const MAX_ARTIFACT_BYTES = 256 * 1024
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const ARTIFACT_COPY_CHUNK_BYTES = 64 * 1024
 const SANDBOX_TMPFS_BYTES = 64 * 1024 * 1024
-const MAX_INHERITED_FDS = 32
+const MAX_FILE_OUTPUT_BYTES = 32 * 1024 * 1024
 const PROCESS_TERMINATION_GRACE_MS = 250
 const PROCESS_REAP_TIMEOUT_MS = 2_000
 const DEFAULT_READINESS_CACHE_TTL_MS = 30_000
@@ -87,11 +100,29 @@ export interface McpTransportSession {
   transport: Transport
   cancel(): Promise<void>
   close(): Promise<void>
+  revalidate?(): Promise<void>
+}
+
+interface OpenMcpInputArtifact {
+  binding: DiscoveredMcpTool['tool']['inputArtifacts'][number]
+  ref: ArtifactRefV1
+  handle: FileHandle
+  identity: BigIntStats
 }
 
 export interface McpTransportFactoryContext {
   binding: DiscoveredMcpTool
   signal: AbortSignal
+  inputFiles: readonly OpenMcpInputArtifact[]
+  outputFiles?: readonly OpenMcpOutputFile[]
+}
+
+export interface OpenMcpOutputFile {
+  path: string
+  hostPath: string
+  maxBytes: number
+  handle: FileHandle
+  identity: BigIntStats
 }
 
 export type McpTransportFactory = (context: McpTransportFactoryContext) => Promise<McpTransportSession>
@@ -110,31 +141,39 @@ export interface OwnedStdioTransportOptions {
   env: Readonly<Record<string, string>>
   cwd: string
   inheritedHandles?: readonly FileHandle[]
+  ownsInheritedHandles?: boolean
   terminationGraceMs?: number
   reapTimeoutMs?: number
   onGroupSignal?: (signal: NodeJS.Signals) => void
 }
 
 export interface AgentMcpExecutorOptions {
-  discovery: { builtinDir: string, userExtensionsDir: string }
+  discovery: Parameters<typeof discoverGovernedMcpTools>[0]
   getWorkspaceRoot: () => string | Promise<string>
+  getPrivateTempRoot?: (workspaceRoot: string) => string | Promise<string>
   transportFactory?: McpTransportFactory
   platform?: NodeJS.Platform
   bwrapPath?: string
+  prlimitPath?: string
   systemPaths?: readonly string[]
   initializeTimeoutMs?: number
   listTimeoutMs?: number
   callTimeoutMs?: number
-  sandboxReadiness?: () => Promise<boolean>
+  sandboxReadiness?: AgentMcpSandboxReadiness
 }
+
+export type AgentMcpSandboxProfile = AgentMcpArtifactOutputContractV1['profile']
+export type AgentMcpSandboxReadiness = (profile?: AgentMcpSandboxProfile) => Promise<boolean>
 
 export interface AgentMcpSandboxReadinessOptions {
   platform?: NodeJS.Platform
   bwrapPath?: string
+  prlimitPath?: string
   systemPaths?: readonly string[]
+  getWorkspaceRoot?: () => string | Promise<string>
   cacheTtlMs?: number
   timeoutMs?: number
-  probe?: () => Promise<boolean>
+  probe?: (profile: AgentMcpSandboxProfile) => Promise<boolean>
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -479,7 +518,7 @@ export class OwnedStdioTransport implements Transport {
         }
       }
     } finally {
-      await this.closeInheritedHandles()
+      if (this.options.ownsInheritedHandles !== false) await this.closeInheritedHandles()
     }
   }
 
@@ -536,7 +575,7 @@ export class OwnedStdioTransport implements Transport {
         : true
       if (!exited) this.child?.kill('SIGKILL')
     }
-    await this.closeInheritedHandles()
+    if (this.options.ownsInheritedHandles !== false) await this.closeInheritedHandles()
     if (this.exitPromise) {
       const reaped = await Promise.race([
         this.exitPromise.then(() => true),
@@ -590,6 +629,17 @@ interface ActionOutputPaths {
   workspace: string
   finalRoot: string
   finalDir: string
+  stagingRoot: string
+}
+
+interface RelativeOutputStage {
+  stageDir: string
+  outputDir: string
+  slots: OpenMcpOutputFile[]
+}
+
+export function agentMcpWorkspaceStagingRoot(workspaceRoot: string): string {
+  return join(workspaceRoot, 'Workflows', 'agent-actions', '.staging')
 }
 
 async function createActionOutputPaths(workspaceValue: string, actionId: string): Promise<ActionOutputPaths> {
@@ -602,8 +652,14 @@ async function createActionOutputPaths(workspaceValue: string, actionId: string)
     const workflows = join(workspace, 'Workflows')
     const finalRoot = join(workflows, 'agent-actions')
     const finalDir = join(finalRoot, actionId)
+    const stagingRoot = agentMcpWorkspaceStagingRoot(workspace)
     await ensureDirectory(workflows)
     await ensureDirectory(finalRoot)
+    await ensureDirectory(stagingRoot, 0o700)
+    const stagingInfo = await lstat(stagingRoot)
+    if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink() || (stagingInfo.mode & 0o077) !== 0) {
+      throw new AgentMcpBrokerError('sandbox_unavailable')
+    }
     if (isOutside(workspace, finalDir) || isOutside(workspace, finalRoot)) {
       throw new AgentMcpBrokerError('sandbox_unavailable')
     }
@@ -614,10 +670,75 @@ async function createActionOutputPaths(workspaceValue: string, actionId: string)
       if (error instanceof AgentMcpBrokerError) throw error
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    return { workspace, finalRoot, finalDir }
+    return { workspace, finalRoot, finalDir, stagingRoot }
   } catch (error) {
     if (error instanceof AgentMcpBrokerError) throw error
     throw new AgentMcpBrokerError('sandbox_unavailable', error)
+  }
+}
+
+async function createRelativeOutputStage(
+  paths: ActionOutputPaths,
+  candidate: DiscoveredMcpTool,
+  actionId: string,
+): Promise<RelativeOutputStage> {
+  return createRelativeOutputStageForPolicies(paths, candidate.tool.artifact.allowed, actionId)
+}
+
+async function createRelativeOutputStageForPolicies(
+  paths: ActionOutputPaths,
+  policies: readonly Readonly<{ path?: string, maxBytes: number }>[],
+  actionId: string,
+): Promise<RelativeOutputStage> {
+  const slots: OpenMcpOutputFile[] = []
+  let stageDir: string | undefined
+  try {
+    stageDir = await mkdtemp(join(paths.stagingRoot, `${actionId}-`))
+    const outputDir = join(stageDir, 'output')
+    await mkdir(outputDir, { mode: 0o700 })
+    for (const policy of policies) {
+      if (!policy.path || typeof constants.O_NOFOLLOW !== 'number') throw new AgentMcpBrokerError('sandbox_unavailable')
+      const hostPath = join(outputDir, ...policy.path.split('/'))
+      if (isOutside(outputDir, hostPath)) throw new AgentMcpBrokerError('sandbox_unavailable')
+      await mkdir(dirname(hostPath), { recursive: true, mode: 0o700 })
+      const handle = await open(
+        hostPath,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      )
+      const identity = await handle.stat({ bigint: true })
+      if (!identity.isFile() || identity.nlink !== 1n || identity.size !== 0n || Number(identity.mode & 0o777n) !== 0o600) {
+        await handle.close().catch(() => undefined)
+        throw new AgentMcpBrokerError('sandbox_unavailable')
+      }
+      slots.push({ path: policy.path, hostPath, maxBytes: policy.maxBytes, handle, identity })
+    }
+    return { stageDir, outputDir, slots }
+  } catch (error) {
+    await closeHandles(slots.map((slot) => slot.handle))
+    if (stageDir) await rm(stageDir, { recursive: true, force: true }).catch(() => undefined)
+    if (error instanceof AgentMcpBrokerError) throw error
+    throw new AgentMcpBrokerError('sandbox_unavailable', error)
+  }
+}
+
+async function closeRelativeOutputStage(stage: RelativeOutputStage | undefined): Promise<void> {
+  if (!stage) return
+  await closeHandles(stage.slots.map((slot) => slot.handle))
+}
+
+async function revalidateRelativeOutputSlots(stage: RelativeOutputStage): Promise<void> {
+  for (const slot of stage.slots) {
+    const handleInfo = await slot.handle.stat({ bigint: true })
+    const pathInfo = await lstat(slot.hostPath, { bigint: true })
+    const sameAuthority = (info: BigIntStats): boolean => info.isFile()
+      && info.dev === slot.identity.dev && info.ino === slot.identity.ino
+      && info.uid === slot.identity.uid && info.gid === slot.identity.gid
+      && info.nlink === 1n && Number(info.mode & 0o777n) === 0o600
+    if (!sameAuthority(handleInfo) || !sameAuthority(pathInfo) || handleInfo.size !== pathInfo.size
+      || handleInfo.mtimeNs !== pathInfo.mtimeNs || handleInfo.size > BigInt(slot.maxBytes)) {
+      throw new AgentMcpBrokerError(handleInfo.size > BigInt(slot.maxBytes) ? 'artifact_too_large' : 'invalid_result')
+    }
   }
 }
 
@@ -626,6 +747,11 @@ export function buildBubblewrapLaunch(input: {
   bwrapFd: number
   executableFd: number
   runtimeFiles: readonly Readonly<{ path: string, fd: number }>[]
+  inputFiles?: readonly Readonly<{ path: string, fd: number }>[]
+  hostRuntime?: Readonly<{ rootFd: number, executable: string }>
+  outputFiles?: readonly Readonly<{ path: string, fd: number }>[]
+  prlimitFd?: number
+  outputFileSizeLimitBytes?: number
   executable: string
   entrypoint?: string
   args: readonly string[]
@@ -645,11 +771,32 @@ export function buildBubblewrapLaunch(input: {
   }
   const executable = safeRuntimePath(input.executable)
   const runtimeFiles = input.runtimeFiles.map((file) => ({ path: safeRuntimePath(file.path), fd: file.fd }))
-  const inheritedFds = [input.bwrapFd, input.executableFd, ...runtimeFiles.map((file) => file.fd)]
+  const inputFiles = (input.inputFiles ?? []).map((file, index) => {
+    if (file.path !== `/input/${index}`) throw new AgentMcpBrokerError('sandbox_unavailable')
+    return { path: file.path, fd: file.fd }
+  })
+  const hostRuntime = input.hostRuntime === undefined ? undefined : {
+    rootFd: input.hostRuntime.rootFd,
+    executable: safeRuntimePath(input.hostRuntime.executable),
+  }
+  const outputFiles = (input.outputFiles ?? []).map((file) => ({ path: safeRuntimePath(file.path), fd: file.fd }))
+  const inheritedFds = [
+    input.bwrapFd, input.executableFd, ...runtimeFiles.map((file) => file.fd),
+    ...(hostRuntime ? [hostRuntime.rootFd] : []),
+    ...inputFiles.map((file) => file.fd),
+    ...outputFiles.map((file) => file.fd),
+    ...(input.prlimitFd === undefined ? [] : [input.prlimitFd]),
+  ]
+  const hasBoundOutputs = outputFiles.length > 0
+  const outputLimit = input.outputFileSizeLimitBytes
   if (input.platform !== 'linux' || inheritedFds.some((fd) => !Number.isSafeInteger(fd) || fd < 3)
     || new Set(inheritedFds).size !== inheritedFds.length
-    || inheritedFds.length > MAX_INHERITED_FDS
+    || inheritedFds.length > MCP_MAX_INHERITED_FDS
     || new Set(runtimeFiles.map((file) => file.path)).size !== runtimeFiles.length
+    || new Set(outputFiles.map((file) => file.path)).size !== outputFiles.length
+    || hasBoundOutputs !== (input.prlimitFd !== undefined)
+    || hasBoundOutputs !== (outputLimit !== undefined)
+    || (outputLimit !== undefined && (!Number.isSafeInteger(outputLimit) || outputLimit < 1 || outputLimit > MAX_FILE_OUTPUT_BYTES))
     || (input.entrypoint !== undefined && !runtimeFiles.some((file) => file.path === input.entrypoint))) {
     throw new AgentMcpBrokerError('sandbox_unavailable')
   }
@@ -669,7 +816,7 @@ export function buildBubblewrapLaunch(input: {
     '--size', String(SANDBOX_TMPFS_BYTES), '--tmpfs', '/tmp',
     '--size', String(SANDBOX_TMPFS_BYTES), '--tmpfs', '/home', '--dir', '/home/modly',
     '--size', String(SANDBOX_TMPFS_BYTES), '--tmpfs', '/output',
-    '--dir', '/run', '--dir', '/run/modly',
+    '--dir', '/input', '--dir', '/run', '--dir', '/run/modly',
   ]
   for (const directory of [...runtimeDirectories].sort((left, right) => (
     left.split('/').length - right.split('/').length || left.localeCompare(right)
@@ -685,6 +832,23 @@ export function buildBubblewrapLaunch(input: {
     '--ro-bind-fd', String(input.executableFd), '/run/modly/executable',
   )
   for (const file of runtimeFiles) args.push('--ro-bind-fd', String(file.fd), `/app/${file.path}`)
+  for (const file of inputFiles) args.push('--ro-bind-fd', String(file.fd), file.path)
+  if (hostRuntime) {
+    args.push('--dir', '/runtime', '--ro-bind', `/proc/self/fd/${hostRuntime.rootFd}`, '/runtime')
+  }
+  const outputDirectories = new Set<string>()
+  for (const file of outputFiles) {
+    const segments = file.path.split('/').slice(0, -1)
+    let directory = '/output'
+    for (const segment of segments) {
+      directory = `${directory}/${segment}`
+      outputDirectories.add(directory)
+    }
+  }
+  for (const directory of [...outputDirectories].sort((left, right) => (
+    left.split('/').length - right.split('/').length || left.localeCompare(right)
+  ))) args.push('--dir', directory)
+  for (const file of outputFiles) args.push('--bind-fd', String(file.fd), `/output/${file.path}`)
   args.push(
     '--chdir', '/app',
     '--clearenv',
@@ -696,6 +860,7 @@ export function buildBubblewrapLaunch(input: {
   for (const [key, value] of Object.entries(input.env).sort(([left], [right]) => left.localeCompare(right))) {
     args.push('--setenv', key, value)
   }
+  if (hostRuntime) args.push('--setenv', 'MODLY_HOST_RUNTIME_EXECUTABLE', `/runtime/${hostRuntime.executable}`)
   args.push(
     '--argv0', `/app/${executable}`,
     '--',
@@ -703,6 +868,13 @@ export function buildBubblewrapLaunch(input: {
     ...(entrypoint ? [`/app/${entrypoint}`] : []),
     ...input.args,
   )
+  if (input.prlimitFd !== undefined && outputLimit !== undefined) {
+    return {
+      command: `/proc/self/fd/${input.prlimitFd}`,
+      args: [`--fsize=${outputLimit}:${outputLimit}`, '--', `/proc/self/fd/${input.bwrapFd}`, ...args],
+      env: { ...FIXED_HOST_ENV }, cwd: '/', shell: false,
+    }
+  }
   return { command: `/proc/self/fd/${input.bwrapFd}`, args, env: { ...FIXED_HOST_ENV }, cwd: '/', shell: false }
 }
 
@@ -779,12 +951,135 @@ async function closeHandles(handles: readonly FileHandle[]): Promise<void> {
   await Promise.all(handles.map((handle) => handle.close().catch(() => undefined)))
 }
 
-async function runSandboxProbe(options: AgentMcpSandboxReadinessOptions): Promise<boolean> {
-  if ((options.platform ?? process.platform) !== 'linux') return false
-  const handles: FileHandle[] = []
+function inputStatMatches(left: BigIntStats, right: BigIntStats): boolean {
+  return left.isFile() && right.isFile()
+    && left.dev === right.dev && left.ino === right.ino
+    && left.uid === right.uid && left.gid === right.gid && left.mode === right.mode
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+}
+
+async function assertNoSymlinkInputPath(workspace: string, workspacePath: string): Promise<string> {
+  let cursor = workspace
+  try {
+    for (const [index, segment] of workspacePath.split('/').entries()) {
+      cursor = join(cursor, segment)
+      const info = await lstat(cursor)
+      if (info.isSymbolicLink() || (index < workspacePath.split('/').length - 1 ? !info.isDirectory() : !info.isFile())) {
+        throw new AgentMcpBrokerError('invalid_arguments')
+      }
+    }
+    if (isOutside(workspace, cursor) || await realpath(cursor) !== cursor) throw new AgentMcpBrokerError('invalid_arguments')
+    return cursor
+  } catch (error) {
+    if (error instanceof AgentMcpBrokerError) throw error
+    throw new AgentMcpBrokerError('invalid_arguments', error)
+  }
+}
+
+async function openMcpInputArtifacts(
+  workspace: string,
+  candidate: DiscoveredMcpTool,
+  argumentsValue: JsonValue,
+  refs: readonly ArtifactRefV1[],
+  signal: AbortSignal,
+): Promise<{ argumentsValue: JsonValue, inputs: OpenMcpInputArtifact[] }> {
+  const declarations = candidate.tool.inputArtifacts
+  if (declarations.length !== refs.length || declarations.length > 16
+    || refs.reduce((total, ref) => total + ref.sizeBytes, 0) > 512 * 1024 * 1024
+    || !isPlainRecord(argumentsValue)) throw new AgentMcpBrokerError('invalid_arguments')
+  const normalized = JSON.parse(canonicalJson(argumentsValue)) as Record<string, JsonValue>
+  const inputs: OpenMcpInputArtifact[] = []
+  try {
+    for (const [index, binding] of declarations.entries()) {
+      if (signal.aborted) throw new AgentMcpBrokerError('cancelled')
+      const ref = assertArtifactRefV1(refs[index])
+      if (normalized[binding.argument] !== ref.id || ref.kind !== binding.kind
+        || !binding.mediaTypes.includes(ref.mediaType)) throw new AgentMcpBrokerError('invalid_arguments')
+      const source = await assertNoSymlinkInputPath(workspace, ref.workspacePath)
+      const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
+      const before = await handle.stat({ bigint: true })
+      inputs.push({ binding, ref, handle, identity: before })
+      if (!before.isFile() || before.size !== BigInt(ref.sizeBytes) || await hashOpenFile(handle) !== ref.sha256) {
+        throw new AgentMcpBrokerError('capability_stale')
+      }
+      const after = await handle.stat({ bigint: true })
+      if (!inputStatMatches(before, after)) throw new AgentMcpBrokerError('capability_stale')
+      normalized[binding.argument] = binding.sandboxPath
+    }
+    return { argumentsValue: normalized, inputs }
+  } catch (error) {
+    await closeHandles(inputs.map((input) => input.handle))
+    if (error instanceof AgentMcpBrokerError) throw error
+    throw new AgentMcpBrokerError('capability_stale', error)
+  }
+}
+
+async function revalidateMcpInputArtifacts(inputs: readonly OpenMcpInputArtifact[]): Promise<void> {
+  for (const input of inputs) {
+    const before = await input.handle.stat({ bigint: true })
+    if (!inputStatMatches(before, input.identity) || await hashOpenFile(input.handle) !== input.ref.sha256) {
+      throw new AgentMcpBrokerError('capability_stale')
+    }
+    const after = await input.handle.stat({ bigint: true })
+    if (!inputStatMatches(before, after)) throw new AgentMcpBrokerError('capability_stale')
+  }
+}
+
+async function executeSandboxProbe(
+  launch: BubblewrapLaunch,
+  inheritedHandles: readonly FileHandle[],
+  timeoutMs: number,
+  validate?: () => Promise<boolean>,
+): Promise<boolean> {
   let child: ChildProcess | undefined
   let exitPromise: Promise<{ code: number | null, signal: NodeJS.Signals | null }> | undefined
   let startTime: string | undefined
+  try {
+    child = spawn(launch.command, launch.args, {
+      cwd: launch.cwd, env: launch.env, shell: launch.shell, detached: true,
+      stdio: ['ignore', 'ignore', 'pipe', ...inheritedHandles.map((handle) => handle.fd)],
+    })
+    let stderrBytes = 0
+    child.stderr?.on('data', (chunk: Buffer | string) => { stderrBytes += Buffer.byteLength(chunk) })
+    exitPromise = new Promise((resolveExit, rejectExit) => {
+      child?.once('error', rejectExit)
+      child?.once('close', (code, signal) => resolveExit({ code, signal }))
+    })
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      child?.once('spawn', resolveSpawn)
+      child?.once('error', rejectSpawn)
+    })
+    if (child.pid !== undefined) {
+      const identity = await readLinuxProcessGroupIdentity(child.pid)
+      if (identity?.pgrp === child.pid) startTime = identity.startTime
+    }
+    const outcome = await Promise.race([
+      exitPromise,
+      delay(timeoutMs).then(() => null),
+    ])
+    if (outcome === null || outcome.code !== 0 || outcome.signal !== null || stderrBytes > MAX_CONTENT_BYTES) return false
+    return validate ? await validate() : true
+  } catch {
+    return false
+  } finally {
+    if (child?.pid !== undefined) {
+      try { await signalOwnedProcessGroup(child.pid, startTime, 'SIGTERM') } catch { /* readiness remains false */ }
+      const exited = exitPromise
+        ? await Promise.race([exitPromise.then(() => true), delay(25).then(() => false)]).catch(() => false)
+        : true
+      if (!exited) {
+        try { await signalOwnedProcessGroup(child.pid, startTime, 'SIGKILL') } catch { /* readiness remains false */ }
+      }
+    }
+    if (exitPromise) {
+      await Promise.race([exitPromise.catch(() => undefined), delay(PROCESS_REAP_TIMEOUT_MS)])
+    }
+    await closeHandles(inheritedHandles)
+  }
+}
+
+async function runBasicSandboxProbe(options: AgentMcpSandboxReadinessOptions): Promise<boolean> {
+  const handles: FileHandle[] = []
   try {
     const systemPaths = await existingSystemPaths(options.systemPaths ?? ['/usr', '/bin', '/lib', '/lib64'])
     handles.push(await openTrustedExecutable(options.bwrapPath ?? '/usr/bin/bwrap'))
@@ -801,101 +1096,219 @@ async function runSandboxProbe(options: AgentMcpSandboxReadinessOptions): Promis
       env: {},
       systemPaths,
     })
-    child = spawn(launch.command, launch.args, {
-      cwd: launch.cwd, env: launch.env, shell: launch.shell, detached: true,
-      stdio: ['ignore', 'ignore', 'pipe', ...handles.map((handle) => handle.fd)],
-    })
-    let stderrBytes = 0
-    child.stderr?.on('data', (chunk: Buffer | string) => { stderrBytes += Buffer.byteLength(chunk) })
-    exitPromise = new Promise((resolveExit, rejectExit) => {
-      child?.once('error', rejectExit)
-      child?.once('close', (code, signal) => resolveExit({ code, signal }))
-    })
-    await new Promise<void>((resolveSpawn, rejectSpawn) => {
-      child?.once('spawn', resolveSpawn)
-      child?.once('error', rejectSpawn)
-    })
-    if (child.pid !== undefined) {
-      const identity = await readLinuxProcessGroupIdentity(child.pid)
-      if (identity?.pgrp === child.pid) startTime = identity.startTime
+    return await executeSandboxProbe(
+      launch, handles, options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
+    )
+  } finally {
+    await closeHandles(handles)
+  }
+}
+
+async function missingReadinessDirectories(workspaceValue: string): Promise<string[]> {
+  const workspace = await realpath(workspaceValue)
+  const candidates = [
+    join(workspace, 'Workflows'),
+    join(workspace, 'Workflows', 'agent-actions'),
+    agentMcpWorkspaceStagingRoot(workspace),
+  ]
+  const missing: string[] = []
+  for (const candidate of candidates) {
+    try {
+      await lstat(candidate)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      missing.push(candidate)
     }
-    await closeHandles(handles.splice(0))
-    const outcome = await Promise.race([
-      exitPromise,
-      delay(options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS).then(() => null),
-    ])
-    return outcome !== null && outcome.code === 0 && outcome.signal === null && stderrBytes <= MAX_CONTENT_BYTES
+  }
+  return missing.reverse()
+}
+
+async function runRelativeFilesSandboxProbe(options: AgentMcpSandboxReadinessOptions): Promise<boolean> {
+  if (!options.getWorkspaceRoot) return false
+  const handles: FileHandle[] = []
+  let stage: RelativeOutputStage | undefined
+  let cleanupDirectories: string[] = []
+  try {
+    const workspaceValue = await options.getWorkspaceRoot()
+    cleanupDirectories = await missingReadinessDirectories(workspaceValue)
+    const actionId = `readiness-probe-${process.pid}-${Date.now()}`
+    const paths = await createActionOutputPaths(workspaceValue, actionId)
+    stage = await createRelativeOutputStageForPolicies(paths, [{ path: 'probe-output', maxBytes: 1_024 }], actionId)
+    const output = stage.slots[0]
+    if (!output) return false
+
+    const systemPaths = await existingSystemPaths(options.systemPaths ?? ['/usr', '/bin', '/lib', '/lib64'])
+    const bwrapHandle = await openTrustedExecutable(options.bwrapPath ?? '/usr/bin/bwrap')
+    const shellPath = await realpath('/usr/bin/sh').catch(async () => realpath('/bin/sh'))
+    const shellHandle = await openTrustedExecutable(shellPath)
+    const truePath = await realpath('/usr/bin/true').catch(async () => realpath('/bin/true'))
+    const resourceHandle = await openTrustedExecutable(truePath)
+    const prlimitHandle = await openTrustedExecutable(options.prlimitPath ?? '/usr/bin/prlimit')
+    handles.push(bwrapHandle, shellHandle, resourceHandle, output.handle, prlimitHandle)
+    const launch = buildBubblewrapLaunch({
+      platform: 'linux',
+      bwrapFd: 3,
+      executableFd: 4,
+      runtimeFiles: [{ path: 'probe-resource', fd: 5 }],
+      outputFiles: [{ path: output.path, fd: 6 }],
+      prlimitFd: 7,
+      outputFileSizeLimitBytes: output.maxBytes,
+      executable: 'probe',
+      args: ['-c', 'printf x > /output/probe-output'],
+      env: {},
+      systemPaths,
+    })
+    return await executeSandboxProbe(
+      launch,
+      handles,
+      options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
+      async () => {
+        if (!stage) return false
+        await revalidateRelativeOutputSlots(stage)
+        const info = await output.handle.stat({ bigint: true })
+        if (info.size !== 1n) return false
+        const byte = Buffer.alloc(1)
+        const { bytesRead } = await output.handle.read(byte, 0, 1, 0)
+        return bytesRead === 1 && byte[0] === 0x78
+      },
+    )
   } catch {
     return false
   } finally {
     await closeHandles(handles)
-    if (child?.pid !== undefined) {
-      try { await signalOwnedProcessGroup(child.pid, startTime, 'SIGTERM') } catch { /* readiness remains false */ }
-      const exited = exitPromise
-        ? await Promise.race([exitPromise.then(() => true), delay(25).then(() => false)]).catch(() => false)
-        : true
-      if (!exited) {
-        try { await signalOwnedProcessGroup(child.pid, startTime, 'SIGKILL') } catch { /* readiness remains false */ }
-      }
-    }
-    if (exitPromise) {
-      await Promise.race([exitPromise.catch(() => undefined), delay(PROCESS_REAP_TIMEOUT_MS)])
-    }
+    await closeRelativeOutputStage(stage)
+    if (stage) await rm(stage.stageDir, { recursive: true, force: true }).catch(() => undefined)
+    for (const directory of cleanupDirectories) await rmdir(directory).catch(() => undefined)
   }
+}
+
+async function runSandboxProbe(
+  options: AgentMcpSandboxReadinessOptions,
+  profile: AgentMcpSandboxProfile,
+): Promise<boolean> {
+  if ((options.platform ?? process.platform) !== 'linux') return false
+  return profile === 'relative-files-v1'
+    ? runRelativeFilesSandboxProbe(options)
+    : runBasicSandboxProbe(options)
 }
 
 export function createAgentMcpSandboxReadiness(
   options: AgentMcpSandboxReadinessOptions = {},
-): () => Promise<boolean> {
+): AgentMcpSandboxReadiness {
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_READINESS_CACHE_TTL_MS
   if (!Number.isSafeInteger(cacheTtlMs) || cacheTtlMs < 1) throw new TypeError('MCP readiness cache TTL must be positive')
-  let cached: { expiresAt: number, ready: boolean } | undefined
-  let pending: Promise<boolean> | undefined
-  return async (): Promise<boolean> => {
+  const cached = new Map<AgentMcpSandboxProfile, { expiresAt: number, ready: boolean }>()
+  const pending = new Map<AgentMcpSandboxProfile, Promise<boolean>>()
+  return async (profile = 'artifact-v1'): Promise<boolean> => {
     const now = Date.now()
-    if (cached && cached.expiresAt > now) return cached.ready
-    if (pending) return pending
-    pending = (options.probe ? options.probe() : runSandboxProbe(options))
+    const cachedProfile = cached.get(profile)
+    if (cachedProfile && cachedProfile.expiresAt > now) return cachedProfile.ready
+    const pendingProfile = pending.get(profile)
+    if (pendingProfile) return pendingProfile
+    const probe = (options.probe ? options.probe(profile) : runSandboxProbe(options, profile))
       .then((ready) => ready === true)
       .catch(() => false)
+    pending.set(profile, probe)
     try {
-      const ready = await pending
-      cached = { ready, expiresAt: Date.now() + cacheTtlMs }
+      const ready = await probe
+      cached.set(profile, { ready, expiresAt: Date.now() + cacheTtlMs })
       return ready
     } finally {
-      pending = undefined
+      pending.delete(profile)
     }
   }
 }
 
 function productionTransportFactory(options: AgentMcpExecutorOptions): McpTransportFactory {
-  return async ({ binding }) => {
+  return async ({ binding, inputFiles, outputFiles }) => {
     const platform = options.platform ?? process.platform
     const bwrapPath = options.bwrapPath ?? '/usr/bin/bwrap'
     if (platform !== 'linux') throw new AgentMcpBrokerError('sandbox_unavailable')
     const systemPaths = await existingSystemPaths(options.systemPaths ?? ['/usr', '/bin', '/lib', '/lib64'])
-    const handles: FileHandle[] = []
+    const ownedHandles: FileHandle[] = []
+    let hostRuntime: OpenAgentHostRuntime | undefined
     try {
-      handles.push(await openTrustedExecutable(bwrapPath))
-      handles.push(await openVerifiedLaunchFile(binding.server.executable))
+      ownedHandles.push(await openTrustedExecutable(bwrapPath))
+      ownedHandles.push(await openVerifiedLaunchFile(binding.server.executable))
       for (const runtimeFile of binding.server.runtimeFiles) {
-        handles.push(await openVerifiedLaunchFile(runtimeFile))
+        ownedHandles.push(await openVerifiedLaunchFile(runtimeFile))
+      }
+      const inheritedHandles: FileHandle[] = [...ownedHandles]
+      let nextFd = 3 + inheritedHandles.length
+      let hostRuntimeLaunch: { rootFd: number, executable: string } | undefined
+      if (binding.server.hostRuntime) {
+        hostRuntime = await openBoundAgentHostRuntime(binding.server.hostRuntime)
+        hostRuntimeLaunch = { rootFd: nextFd, executable: binding.server.hostRuntime.executable.relativePath }
+        inheritedHandles.push(hostRuntime.rootHandle)
+        nextFd += 1
+      }
+      const inputLaunch = inputFiles.map((input) => {
+        const result = { path: input.binding.sandboxPath, fd: nextFd }
+        inheritedHandles.push(input.handle)
+        nextFd += 1
+        return result
+      })
+      const outputLaunch: Array<{ path: string, fd: number }> = []
+      let prlimitFd: number | undefined
+      if (binding.server.artifactOutput.profile === 'relative-files-v1') {
+        if (!outputFiles || outputFiles.length !== binding.server.tools.find((tool) => tool.name === binding.tool.name)?.artifact.allowed.length) {
+          throw new AgentMcpBrokerError('sandbox_unavailable')
+        }
+        for (const output of outputFiles) {
+          outputLaunch.push({ path: output.path, fd: nextFd })
+          inheritedHandles.push(output.handle)
+          nextFd += 1
+        }
+        const prlimitHandle = await openTrustedExecutable(options.prlimitPath ?? '/usr/bin/prlimit')
+        ownedHandles.push(prlimitHandle)
+        inheritedHandles.push(prlimitHandle)
+        prlimitFd = nextFd
+        nextFd += 1
+      } else if (outputFiles?.length) {
+        throw new AgentMcpBrokerError('sandbox_unavailable')
       }
       const launch = buildBubblewrapLaunch({
         platform,
         bwrapFd: 3,
         executableFd: 4,
         runtimeFiles: binding.server.runtimeFiles.map((file, index) => ({ path: file.declaredPath, fd: index + 5 })),
+        inputFiles: inputLaunch,
+        ...(hostRuntimeLaunch ? { hostRuntime: hostRuntimeLaunch } : {}),
+        ...(outputLaunch.length ? {
+          outputFiles: outputLaunch,
+          prlimitFd,
+          outputFileSizeLimitBytes: binding.server.artifactOutput.maxArtifactBytes,
+        } : {}),
         executable: binding.server.command.executable,
         entrypoint: binding.server.command.entrypoint,
         args: binding.server.command.args,
         env: binding.server.command.env,
         systemPaths,
       })
-      const transport = new OwnedStdioTransport({ ...launch, inheritedHandles: handles })
-      return { transport, cancel: () => transport.close(), close: () => transport.close() }
+      const transport = new OwnedStdioTransport({
+        ...launch, inheritedHandles, ownsInheritedHandles: false,
+      })
+      let closed = false
+      const finalize = async (): Promise<void> => {
+        if (closed) return
+        closed = true
+        let failure: unknown
+        try {
+          await transport.close()
+          await revalidateMcpInputArtifacts(inputFiles)
+          if (hostRuntime) await revalidateOpenAgentHostRuntime(hostRuntime)
+        } catch (error) { failure = error }
+        await closeHandles(ownedHandles)
+        await closeOpenAgentHostRuntime(hostRuntime)
+        if (failure) throw failure
+      }
+      return { transport, cancel: finalize, close: finalize, revalidate: async () => {
+        await revalidateMcpInputArtifacts(inputFiles)
+        if (hostRuntime) await revalidateOpenAgentHostRuntime(hostRuntime)
+      } }
     } catch (error) {
-      await closeHandles(handles)
+      await closeHandles(ownedHandles)
+      await closeOpenAgentHostRuntime(hostRuntime)
       if (error instanceof AgentMcpBrokerError) throw error
       throw new AgentMcpBrokerError('sandbox_unavailable', error)
     }
@@ -1001,9 +1414,11 @@ function validateArtifactDescriptor(
   candidate: DiscoveredMcpTool,
 ): ValidatedArtifactDescriptor {
   const descriptor = exactRecord(descriptorValue, ['id', 'name', 'kind', 'mediaType', 'sha256', 'dataBase64'])
-  if (descriptor.kind !== candidate.tool.artifact.kind
+  const policy = candidate.tool.artifact.allowed.find((entry) => entry.kind === descriptor.kind
+    && typeof descriptor.mediaType === 'string' && entry.mediaTypes.includes(descriptor.mediaType))
+  if (!policy
     || typeof descriptor.mediaType !== 'string'
-    || !candidate.tool.artifact.mediaTypes.includes(descriptor.mediaType)) {
+    || candidate.tool.artifact.profile !== 'artifact-v1') {
     throw new AgentMcpBrokerError('invalid_result')
   }
   if (typeof descriptor.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(descriptor.id)
@@ -1013,6 +1428,8 @@ function validateArtifactDescriptor(
     || typeof descriptor.dataBase64 !== 'string') {
     throw new AgentMcpBrokerError('invalid_result')
   }
+  const sizeBytes = decodedBase64Size(descriptor.dataBase64)
+  if (sizeBytes > policy.maxBytes) throw new AgentMcpBrokerError('artifact_too_large')
   return {
     id: descriptor.id,
     name: descriptor.name,
@@ -1020,7 +1437,7 @@ function validateArtifactDescriptor(
     mediaType: descriptor.mediaType,
     sha256: descriptor.sha256,
     dataBase64: descriptor.dataBase64,
-    sizeBytes: decodedBase64Size(descriptor.dataBase64),
+    sizeBytes,
   }
 }
 
@@ -1097,7 +1514,8 @@ async function publishResultArtifacts(
   validateContent(result)
   const structured = validateStructuredOutput(candidate.tool.outputSchema, result.structuredContent)
   const record = exactRecord(structured, ['artifacts'])
-  if (!Array.isArray(record.artifacts) || record.artifacts.length < 1 || record.artifacts.length > MAX_ARTIFACTS) {
+  if (!Array.isArray(record.artifacts) || record.artifacts.length < 1
+    || record.artifacts.length > Math.min(MAX_ARTIFACTS, candidate.tool.artifact.maxCount)) {
     throw new AgentMcpBrokerError('invalid_result')
   }
   const descriptors = record.artifacts.map((descriptor) => validateArtifactDescriptor(descriptor, candidate))
@@ -1105,7 +1523,8 @@ async function publishResultArtifacts(
     || new Set(descriptors.map((descriptor) => descriptor.name)).size !== descriptors.length) {
     throw new AgentMcpBrokerError('invalid_result')
   }
-  if (descriptors.reduce((total, descriptor) => total + descriptor.sizeBytes, 0) > MAX_OUTPUT_BYTES) {
+  if (descriptors.reduce((total, descriptor) => total + descriptor.sizeBytes, 0)
+    > Math.min(MAX_OUTPUT_BYTES, candidate.tool.artifact.maxTotalBytes)) {
     throw new AgentMcpBrokerError('artifact_too_large')
   }
   let publishDir: string | undefined
@@ -1136,6 +1555,170 @@ async function publishResultArtifacts(
   }
 }
 
+interface RelativeFileDescriptor {
+  id: string
+  name: string
+  kind: ArtifactRefV1['kind']
+  mediaType: string
+}
+
+function validateRelativeFileDescriptors(
+  resultValue: unknown,
+  candidate: DiscoveredMcpTool,
+): RelativeFileDescriptor[] {
+  const result = exactRecord(resultValue, ['content', 'structuredContent', 'isError'])
+  validateContent(result)
+  const structured = validateStructuredOutput(candidate.tool.outputSchema, result.structuredContent)
+  const record = exactRecord(structured, ['artifacts'])
+  const contract = candidate.tool.artifact
+  if (!Array.isArray(record.artifacts) || record.artifacts.length < 1 || record.artifacts.length > contract.maxCount) {
+    throw new AgentMcpBrokerError('invalid_result')
+  }
+  const byPath = new Map(contract.allowed.map((policy) => [policy.path, policy]))
+  const descriptors = record.artifacts.map((raw): RelativeFileDescriptor => {
+    const descriptor = exactRecord(raw, ['id', 'name', 'kind', 'mediaType'])
+    if (typeof descriptor.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(descriptor.id)
+      || typeof descriptor.name !== 'string' || typeof descriptor.mediaType !== 'string') {
+      throw new AgentMcpBrokerError('invalid_result')
+    }
+    const policy = byPath.get(descriptor.name)
+    if (!policy || descriptor.kind !== policy.kind || !policy.mediaTypes.includes(descriptor.mediaType)) {
+      throw new AgentMcpBrokerError('invalid_result')
+    }
+    return {
+      id: descriptor.id, name: descriptor.name,
+      kind: descriptor.kind as ArtifactRefV1['kind'], mediaType: descriptor.mediaType,
+    }
+  })
+  if (new Set(descriptors.map((item) => item.id)).size !== descriptors.length
+    || new Set(descriptors.map((item) => item.name)).size !== descriptors.length
+    || contract.allowed.some((policy) => policy.required === true && !descriptors.some((item) => item.name === policy.path))) {
+    throw new AgentMcpBrokerError('invalid_result')
+  }
+  return descriptors
+}
+
+async function listRelativeOutputFiles(root: string): Promise<string[]> {
+  const files: string[] = []
+  const visit = async (directory: string, prefix: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true })
+    for (const entry of entries) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name
+      if (entry.isSymbolicLink()) throw new AgentMcpBrokerError('invalid_result')
+      if (entry.isDirectory()) { await visit(join(directory, entry.name), path); continue }
+      if (!entry.isFile()) throw new AgentMcpBrokerError('invalid_result')
+      files.push(path)
+    }
+  }
+  await visit(root, '')
+  return files.sort()
+}
+
+async function copyVerifiedRelativeOutput(
+  descriptor: RelativeFileDescriptor,
+  candidate: DiscoveredMcpTool,
+  stage: RelativeOutputStage,
+  publishDir: string,
+  paths: ActionOutputPaths,
+  signal: AbortSignal,
+  deadline: number,
+): Promise<ArtifactRefV1> {
+  const policy = candidate.tool.artifact.allowed.find((entry) => entry.path === descriptor.name)
+  const slot = stage.slots.find((entry) => entry.path === descriptor.name)
+  if (!policy || !slot || typeof constants.O_NOFOLLOW !== 'number') throw new AgentMcpBrokerError('invalid_result')
+  const destination = join(publishDir, ...descriptor.name.split('/'))
+  await mkdir(join(destination, '..'), { recursive: true, mode: 0o700 })
+  let sourceHandle: FileHandle | undefined
+  let destinationHandle: FileHandle | undefined
+  try {
+    sourceHandle = slot.handle
+    const before = await sourceHandle.stat({ bigint: true })
+    if (!before.isFile() || before.nlink !== 1n
+      || before.dev !== slot.identity.dev || before.ino !== slot.identity.ino
+      || before.uid !== slot.identity.uid || before.gid !== slot.identity.gid
+      || Number(before.mode & 0o777n) !== 0o600) throw new AgentMcpBrokerError('invalid_result')
+    const sizeBytes = Number(before.size)
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > policy.maxBytes) {
+      throw new AgentMcpBrokerError('artifact_too_large')
+    }
+    destinationHandle = await open(
+      destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600,
+    )
+    const hash = createHash('sha256')
+    let total = 0
+    for await (const chunk of sourceHandle.createReadStream({ autoClose: false, start: 0 })) {
+      if (signal.aborted) throw new AgentMcpBrokerError('cancelled')
+      assertWithinDeadline(deadline)
+      const bytes = chunk as Buffer
+      total += bytes.byteLength
+      if (total > policy.maxBytes) throw new AgentMcpBrokerError('artifact_too_large')
+      hash.update(bytes)
+      let offset = 0
+      while (offset < bytes.byteLength) {
+        const write = await destinationHandle.write(bytes, offset, bytes.byteLength - offset)
+        if (write.bytesWritten < 1) throw new AgentMcpBrokerError('invalid_result')
+        offset += write.bytesWritten
+      }
+    }
+    const after = await sourceHandle.stat({ bigint: true })
+    if (total !== sizeBytes || !inputStatMatches(before, after)) throw new AgentMcpBrokerError('invalid_result')
+    const sha256 = hash.digest('hex')
+    await destinationHandle.sync()
+    return assertArtifactRefV1({
+      schema: 'modly.artifact-ref.v1', version: 1, id: descriptor.id,
+      kind: descriptor.kind, mediaType: descriptor.mediaType,
+      workspacePath: relative(paths.workspace, join(paths.finalDir, ...descriptor.name.split('/'))).split(sep).join('/'),
+      sha256, sizeBytes,
+    })
+  } catch (error) {
+    if (error instanceof AgentMcpBrokerError) throw error
+    throw new AgentMcpBrokerError('invalid_result', error)
+  } finally {
+    await destinationHandle?.close().catch(() => undefined)
+  }
+}
+
+async function publishRelativeFileArtifacts(
+  resultValue: unknown,
+  candidate: DiscoveredMcpTool,
+  paths: ActionOutputPaths,
+  stage: RelativeOutputStage,
+  signal: AbortSignal,
+  deadline: number,
+): Promise<{ artifacts: ArtifactRefV1[], rollback: () => Promise<void> }> {
+  const descriptors = validateRelativeFileDescriptors(resultValue, candidate)
+  const files = await listRelativeOutputFiles(stage.outputDir)
+  if (files.length !== descriptors.length || files.some((file, index) => file !== [...descriptors.map((item) => item.name)].sort()[index])) {
+    throw new AgentMcpBrokerError('invalid_result')
+  }
+  const publishDir = join(stage.stageDir, 'publish')
+  await mkdir(publishDir, { mode: 0o700 })
+  try {
+    const artifacts: ArtifactRefV1[] = []
+    for (const descriptor of descriptors) {
+      artifacts.push(await copyVerifiedRelativeOutput(descriptor, candidate, stage, publishDir, paths, signal, deadline))
+    }
+    if (artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > candidate.tool.artifact.maxTotalBytes) {
+      throw new AgentMcpBrokerError('artifact_too_large')
+    }
+    if (signal.aborted) throw new AgentMcpBrokerError('cancelled')
+    assertWithinDeadline(deadline)
+    await rename(publishDir, paths.finalDir)
+    let rollbackPromise: Promise<void> | undefined
+    return {
+      artifacts,
+      rollback: () => {
+        rollbackPromise ??= rm(paths.finalDir, { recursive: true, force: true })
+        return rollbackPromise
+      },
+    }
+  } catch (error) {
+    await rm(paths.finalDir, { recursive: true, force: true }).catch(() => undefined)
+    if (error instanceof AgentMcpBrokerError) throw error
+    throw new AgentMcpBrokerError('invalid_result', error)
+  }
+}
+
 function classifyMcpError(error: unknown, signal: AbortSignal): AgentMcpBrokerError {
   if (error instanceof AgentMcpBrokerError) return error
   if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) return new AgentMcpBrokerError('cancelled', error)
@@ -1155,7 +1738,9 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
     ? options.sandboxReadiness ?? createAgentMcpSandboxReadiness({
       platform: options.platform,
       bwrapPath: options.bwrapPath,
+      prlimitPath: options.prlimitPath,
       systemPaths: options.systemPaths,
+      getWorkspaceRoot: options.getWorkspaceRoot,
     })
     : undefined
 
@@ -1176,8 +1761,23 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
       throw new AgentMcpBrokerError('capability_stale')
     }
     const argumentsValue = validateMcpArguments(candidate.tool.inputSchema, request.arguments)
-    if (readiness && !await readiness()) throw new AgentMcpBrokerError('sandbox_unavailable')
+    if (readiness && !await readiness(candidate.server.artifactOutput.profile)) {
+      throw new AgentMcpBrokerError('sandbox_unavailable')
+    }
     const output = await createActionOutputPaths(await options.getWorkspaceRoot(), request.actionId)
+    const relativeStage = candidate.tool.artifact.profile === 'relative-files-v1'
+      ? await createRelativeOutputStage(output, candidate, request.actionId)
+      : undefined
+    let openedInputs: Awaited<ReturnType<typeof openMcpInputArtifacts>>
+    try {
+      openedInputs = await openMcpInputArtifacts(
+        output.workspace, candidate, argumentsValue, request.inputArtifacts, request.signal,
+      )
+    } catch (error) {
+      await closeRelativeOutputStage(relativeStage)
+      if (relativeStage) await rm(relativeStage.stageDir, { recursive: true, force: true }).catch(() => undefined)
+      throw error
+    }
     const executionDeadline = Math.min(
       Number.MAX_SAFE_INTEGER,
       Date.now() + initializeTimeout + listTimeout + callTimeout,
@@ -1190,7 +1790,12 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
     executionSignal.addEventListener('abort', abort, { once: true })
     try {
       candidate = await revalidateBinding(options.discovery, candidate)
-      session = await factory({ binding: candidate, signal: executionSignal })
+      await revalidateMcpInputArtifacts(openedInputs.inputs)
+      session = await factory({
+        binding: candidate, signal: executionSignal,
+        inputFiles: openedInputs.inputs,
+        ...(relativeStage ? { outputFiles: relativeStage.slots } : {}),
+      })
       const transport = new BoundedTransport(session.transport)
       client = new Client(
         { name: 'modly-agent-mcp-broker', version: '1.0.0' },
@@ -1207,8 +1812,10 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
       if (candidate.tool.capabilityBindingHash !== request.capability.execution.bindingHash) {
         throw new AgentMcpBrokerError('capability_stale')
       }
+      await revalidateMcpInputArtifacts(openedInputs.inputs)
+      await session.revalidate?.()
       const result = await client.callTool(
-        { name: candidate.tool.name, arguments: argumentsValue as Record<string, unknown> },
+        { name: candidate.tool.name, arguments: openedInputs.argumentsValue as Record<string, unknown> },
         CallToolResultSchema,
         { signal: executionSignal, timeout: callTimeout, maxTotalTimeout: callTimeout },
       )
@@ -1216,11 +1823,19 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
       if (candidate.tool.capabilityBindingHash !== request.capability.execution.bindingHash) {
         throw new AgentMcpBrokerError('capability_stale')
       }
+      await revalidateMcpInputArtifacts(openedInputs.inputs)
+      await session.revalidate?.()
       await client.close()
       client = undefined
       await session.close()
       session = undefined
-      const transaction = await publishResultArtifacts(result, candidate, output, request.signal, executionDeadline)
+      await revalidateMcpInputArtifacts(openedInputs.inputs)
+      if (relativeStage) {
+        await revalidateRelativeOutputSlots(relativeStage)
+      }
+      const transaction = relativeStage
+        ? await publishRelativeFileArtifacts(result, candidate, output, relativeStage, request.signal, executionDeadline)
+        : await publishResultArtifacts(result, candidate, output, request.signal, executionDeadline)
       success = true
       return transaction
     } catch (error) {
@@ -1229,6 +1844,9 @@ export function createAgentMcpExecutor(options: AgentMcpExecutorOptions): AgentA
       executionSignal.removeEventListener('abort', abort)
       await client?.close().catch(() => undefined)
       await session?.close().catch(() => undefined)
+      await closeHandles(openedInputs.inputs.map((input) => input.handle))
+      await closeRelativeOutputStage(relativeStage)
+      if (relativeStage) await rm(relativeStage.stageDir, { recursive: true, force: true }).catch(() => undefined)
       if (!success) await rm(output.finalDir, { recursive: true, force: true }).catch(() => undefined)
     }
   }

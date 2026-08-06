@@ -78,8 +78,51 @@ export interface AgentMcpToolExecutionV1 {
   inputSchema: JsonValue
   inputSchemaHash: string
   outputSchemaHash?: string
+  inputArtifacts?: AgentMcpInputArtifactBindingV1[]
+  artifacts?: AgentMcpArtifactOutputContractV1
+  activation?: AgentMcpActivationContractV1
+  limits?: AgentMcpResourceLimitsV1
   mutating: boolean
   bindingHash: string
+}
+
+export interface AgentMcpInputArtifactBindingV1 {
+  argument: string
+  kind: ArtifactKind
+  mediaTypes: string[]
+  sandboxPath: `/input/${number}`
+}
+
+export interface AgentMcpArtifactPolicyV1 {
+  path?: string
+  kind: ArtifactKind
+  mediaTypes: string[]
+  maxBytes: number
+  required?: true
+}
+
+export interface AgentMcpArtifactOutputContractV1 {
+  profile: 'artifact-v1' | 'relative-files-v1'
+  maxCount: number
+  maxArtifactBytes: number
+  maxTotalBytes: number
+  allowed: AgentMcpArtifactPolicyV1[]
+}
+
+export interface AgentMcpActivationContractV1 {
+  platform: 'linux'
+  sandbox: 'bubblewrap'
+  hostRuntime?: { id: string, bindingHash: string }
+}
+
+export interface AgentMcpResourceLimitsV1 {
+  initializeTimeoutMs: number
+  listToolsTimeoutMs: number
+  callTimeoutMs: number
+  terminationGraceMs: number
+  maxTransportBytes: number
+  maxMessageBytes: number
+  maxTextContentBytes: number
 }
 
 export interface AgentCapabilitySnapshotV1 {
@@ -97,6 +140,7 @@ export interface AgentCapabilitySnapshotV1 {
     id: string
     input: ArtifactKind
     output: ArtifactKind
+    outputs?: ArtifactKind[]
     inputs?: Array<{
       name: string
       label?: string

@@ -96,6 +96,7 @@ import { WorkspaceAgentArtifactVerifier } from './agent-artifact-verifier'
 import type { AgentOllamaModelSelectionV1, AgentOllamaModelSnapshotV1 } from '../../src/shared/types/agentActions.ts'
 import {
   AgentMcpBrokerError,
+  agentMcpWorkspaceStagingRoot,
   createAgentMcpExecutor,
   createAgentMcpSandboxReadiness,
 } from './agent-mcp-broker'
@@ -104,6 +105,7 @@ import {
   createAgentProcessExecutor,
 } from './agent-process-executor'
 import { RendererFilesystemAccess } from './renderer-filesystem-access'
+import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -312,6 +314,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return {
         userDataDir,
         agentPrivateTempDir: agentProcessPrivateTempRoot(userDataDir),
+        agentWorkspaceStagingDir: agentMcpWorkspaceStagingRoot(getSettings(userDataDir).workspaceDir),
       }
     },
   })
@@ -386,7 +389,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   }
   const LOCKED_MODEL_FILES_ERROR = 'Model files are still locked after several attempts. Close any programs using the model and try again.'
 
-  const mcpSandboxReadiness = createAgentMcpSandboxReadiness()
+  const mcpSandboxReadiness = createAgentMcpSandboxReadiness({
+    getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
+  })
+  const agentHostRuntimes = createDefaultAgentHostRuntimeRegistry()
   const processExecutor = createAgentProcessExecutor({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
     getPrivateTempRoot: () => agentProcessPrivateTempRoot(app.getPath('userData')),
@@ -408,6 +414,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         builtinDir: getBuiltinExtensionsDir(),
         userExtensionsDir: getSettings(userData).extensionsDir,
         trustedRepos: await fetchTrustedRepos(),
+        hostRuntimes: agentHostRuntimes,
+        mcpSandboxReadiness,
       })
     },
     resolveCurrentModel: resolveCurrentOllamaModel,
@@ -416,7 +424,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }),
     ensureExecutorReady: async (capability) => {
       if (capability.execution?.kind === 'mcp_tool') {
-        if (!await mcpSandboxReadiness()) throw new AgentActionsServiceError('sandbox_unavailable')
+        const profile = capability.execution.artifacts?.profile
+        if (!profile || !await mcpSandboxReadiness(profile)) {
+          throw new AgentActionsServiceError('sandbox_unavailable')
+        }
         return
       }
       if (capability.execution?.kind === 'process') {
@@ -456,6 +467,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           discovery: {
             builtinDir: getBuiltinExtensionsDir(),
             userExtensionsDir: getSettings(userData).extensionsDir,
+            hostRuntimes: agentHostRuntimes,
           },
           getWorkspaceRoot: () => getSettings(userData).workspaceDir,
           sandboxReadiness: mcpSandboxReadiness,
@@ -1720,6 +1732,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       builtinDir: getBuiltinExtensionsDir(),
       userExtensionsDir: getSettings(userData).extensionsDir,
       trustedRepos: await fetchTrustedRepos(),
+      hostRuntimes: agentHostRuntimes,
+      mcpSandboxReadiness,
     })
   })
 

@@ -69,7 +69,11 @@ export interface AgentActionsServiceLike {
 export interface AgentActionsServiceOptions {
   resolveCapabilities: () => Promise<AgentCapabilityInventoryResult>
   resolveCurrentModel: (expected: AgentOllamaModelSnapshotV1) => Promise<unknown>
-  resolveArtifact?: (artifactId: string, expectedKind: ArtifactRefV1['kind']) => Promise<unknown | null>
+  resolveArtifact?: (
+    originSessionId: string,
+    artifactId: string,
+    expectedKind: ArtifactRefV1['kind'],
+  ) => Promise<unknown | null>
   artifactVerifier?: AgentArtifactVerifier
   executor?: AgentActionExecutor
   isExecutorAvailable?: () => boolean
@@ -293,7 +297,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       throw new AgentActionsServiceError('invalid_request', error)
     }
     await this.assertCurrentModel(proposedModel)
-    const normalized = await this.normalizeArguments(capability, request.arguments)
+    const normalized = await this.normalizeArguments(capability, request.arguments, originSessionId)
     if (capability.execution?.kind === 'mcp_tool') {
       try {
         assertMcpApprovalArgumentsPreviewable(normalized.arguments)
@@ -601,14 +605,14 @@ export class AgentActionsService implements AgentActionsServiceLike {
     let transaction: NormalizedExecutorResult | undefined
     if (!failure) {
       try {
-        transaction = this.normalizeExecutorResult(result, prepared.action.capability)
+        transaction = this.normalizeExecutorResult(result, prepared.action.capability, prepared.action.id)
         settlement.rollback = transaction.rollback
         if (!settlement.cancellationRequested && !prepared.controller.signal.aborted) {
           artifacts = await this.verifyArtifacts(
             transaction.artifacts,
-            prepared.action.capability.execution?.kind === 'process'
-              ? undefined
-              : prepared.action.capability.node.output,
+            prepared.action.capability.execution === undefined
+              ? prepared.action.capability.node.output
+              : undefined,
             prepared.controller.signal,
           )
         }
@@ -736,7 +740,11 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
   }
 
-  private async normalizeArguments(capability: AgentCapabilitySnapshotV1, value: unknown): Promise<NormalizedArguments> {
+  private async normalizeArguments(
+    capability: AgentCapabilitySnapshotV1,
+    value: unknown,
+    originSessionId: string,
+  ): Promise<NormalizedArguments> {
     try {
       if (Buffer.byteLength(canonicalJson(value), 'utf8') > MAX_ARGUMENT_BYTES) {
         throw new AgentActionsServiceError('invalid_arguments')
@@ -752,7 +760,45 @@ export class AgentActionsService implements AgentActionsServiceLike {
         if (Buffer.byteLength(canonicalJson(argumentsValue), 'utf8') > MAX_ARGUMENT_BYTES) {
           throw new AgentActionsServiceError('invalid_arguments')
         }
-        return { arguments: argumentsValue, inputArtifacts: [] }
+        const inputArtifacts: ArtifactRefV1[] = []
+        const argumentRecord = argumentsValue as Record<string, JsonValue>
+        for (const binding of capability.execution.inputArtifacts ?? []) {
+          const rawArtifactId = argumentRecord[binding.argument]
+          if (typeof rawArtifactId !== 'string' || !ACTION_ID_PATTERN.test(rawArtifactId)) {
+            throw new AgentActionsServiceError('invalid_arguments')
+          }
+          const artifactId = rawArtifactId
+          if (inputArtifacts.some((artifact) => artifact.id === artifactId)) {
+            throw new AgentActionsServiceError('invalid_arguments')
+          }
+          let rawArtifact: unknown | null
+          try {
+            const sessionCandidates = [...this.actions.values()].flatMap((record) => (
+              record.originSessionId === originSessionId && record.action.status === 'completed'
+                ? record.action.outputArtifacts.filter((artifact) => artifact.id === artifactId && artifact.kind === binding.kind)
+                : []
+            ))
+            if (sessionCandidates.length > 1) throw new AgentActionsServiceError('artifact_not_found')
+            rawArtifact = sessionCandidates[0]
+              ?? (this.options.resolveArtifact
+                ? await this.options.resolveArtifact(originSessionId, artifactId, binding.kind)
+                : null)
+          } catch (error) {
+            if (error instanceof AgentActionsServiceError) throw error
+            throw new AgentActionsServiceError('artifact_not_found', error)
+          }
+          if (rawArtifact === null) throw new AgentActionsServiceError('artifact_not_found')
+          let artifact: ArtifactRefV1
+          try { artifact = assertArtifactRefV1(rawArtifact) } catch (error) {
+            throw new AgentActionsServiceError('artifact_not_found', error)
+          }
+          if (artifact.id !== artifactId || artifact.kind !== binding.kind
+            || !binding.mediaTypes.includes(artifact.mediaType)) {
+            throw new AgentActionsServiceError('artifact_not_found')
+          }
+          inputArtifacts.push(artifact)
+        }
+        return { arguments: argumentsValue, inputArtifacts }
       } catch (error) {
         if (error instanceof AgentActionsServiceError) throw error
         if (error instanceof AgentMcpBrokerError) throw new AgentActionsServiceError('invalid_arguments', error)
@@ -763,8 +809,10 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (!Object.prototype.hasOwnProperty.call(raw, 'input')) throw new AgentActionsServiceError('invalid_arguments')
     const inputArtifacts: ArtifactRefV1[] = []
     const input = capability.node.inputs
-      ? await this.normalizeNamedInputs(capability.node.inputs, raw.input, inputArtifacts)
-      : await this.normalizeInputValue(capability.node.input, false, undefined, undefined, raw.input, inputArtifacts)
+      ? await this.normalizeNamedInputs(capability.node.inputs, raw.input, inputArtifacts, originSessionId)
+      : await this.normalizeInputValue(
+        capability.node.input, false, undefined, undefined, raw.input, inputArtifacts, originSessionId,
+      )
     const paramsRaw = raw.params === undefined
       ? {}
       : assertExactRecord(raw.params, capability.node.paramsSchema.map((param) => {
@@ -790,6 +838,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     schemas: NonNullable<AgentCapabilitySnapshotV1['node']['inputs']>,
     value: unknown,
     inputArtifacts: ArtifactRefV1[],
+    originSessionId: string,
   ): Promise<JsonValue> {
     const record = assertExactRecord(value, schemas.map((schema) => schema.name), 'invalid_arguments')
     const normalized: Record<string, JsonValue> = {}
@@ -805,6 +854,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
         schema.max_items,
         record[schema.name],
         inputArtifacts,
+        originSessionId,
       )
     }
     return normalizeJsonValue(normalized)
@@ -817,6 +867,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     maxItems: number | undefined,
     value: unknown,
     inputArtifacts: ArtifactRefV1[],
+    originSessionId: string,
   ): Promise<JsonValue> {
     if (multiple) {
       if (!Array.isArray(value)) throw new AgentActionsServiceError('invalid_arguments')
@@ -825,17 +876,18 @@ export class AgentActionsService implements AgentActionsServiceLike {
       }
       const normalized: JsonValue[] = []
       for (const entry of value) {
-        normalized.push(await this.normalizeSingleInput(kind, entry, inputArtifacts))
+        normalized.push(await this.normalizeSingleInput(kind, entry, inputArtifacts, originSessionId))
       }
       return normalized
     }
-    return this.normalizeSingleInput(kind, value, inputArtifacts)
+    return this.normalizeSingleInput(kind, value, inputArtifacts, originSessionId)
   }
 
   private async normalizeSingleInput(
     kind: ArtifactRefV1['kind'],
     value: unknown,
     inputArtifacts: ArtifactRefV1[],
+    originSessionId: string,
   ): Promise<JsonValue> {
     if (kind === 'text') return normalizeText(value)
     const reference = assertExactRecord(value, ['artifactId'], 'invalid_arguments')
@@ -843,7 +895,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (!this.options.resolveArtifact) throw new AgentActionsServiceError('artifact_not_found')
     let rawArtifact: unknown | null
     try {
-      rawArtifact = await this.options.resolveArtifact(artifactId, kind)
+      rawArtifact = await this.options.resolveArtifact(originSessionId, artifactId, kind)
     } catch (error) {
       throw new AgentActionsServiceError('artifact_not_found', error)
     }
@@ -943,7 +995,11 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
   }
 
-  private normalizeExecutorResult(value: unknown, capability: AgentCapabilitySnapshotV1): NormalizedExecutorResult {
+  private normalizeExecutorResult(
+    value: unknown,
+    capability: AgentCapabilitySnapshotV1,
+    actionId: string,
+  ): NormalizedExecutorResult {
     const result = assertExactRecord(value, ['artifacts', 'rollback'], 'invalid_artifact')
     if (!Array.isArray(result.artifacts) || result.artifacts.length < 1 || result.artifacts.length > MAX_OUTPUT_ARTIFACTS) {
       throw new AgentActionsServiceError('invalid_artifact')
@@ -960,11 +1016,21 @@ export class AgentActionsService implements AgentActionsServiceLike {
       } catch (error) {
         throw new AgentActionsServiceError('invalid_artifact', error)
       }
+      const mcpArtifacts = capability.execution?.kind === 'mcp_tool' ? capability.execution.artifacts : undefined
       const allowedByProcess = capability.execution?.kind === 'process'
         ? capability.execution.artifacts.allowed.some((policy) => policy.kind === artifact.kind
           && policy.mediaTypes.includes(artifact.mediaType)
           && artifact.sizeBytes <= policy.maxBytes)
-        : artifact.kind === capability.node.output
+        : mcpArtifacts
+          ? mcpArtifacts.allowed.some((policy) => {
+            const pathMatches = mcpArtifacts.profile !== 'relative-files-v1'
+              || (typeof policy.path === 'string'
+                && artifact.workspacePath === `Workflows/agent-actions/${actionId}/${policy.path}`)
+            return pathMatches && policy.kind === artifact.kind
+              && policy.mediaTypes.includes(artifact.mediaType)
+              && artifact.sizeBytes <= policy.maxBytes
+          })
+          : artifact.kind === capability.node.output
       if (!allowedByProcess || ids.has(artifact.id) || paths.has(artifact.workspacePath)) {
         throw new AgentActionsServiceError('invalid_artifact')
       }
@@ -975,6 +1041,22 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (capability.execution?.kind === 'process') {
       if (artifacts.length > capability.execution.artifacts.maxCount
         || artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > capability.execution.artifacts.maxTotalBytes) {
+        throw new AgentActionsServiceError('invalid_artifact')
+      }
+    }
+    if (capability.execution?.kind === 'mcp_tool' && capability.execution.artifacts) {
+      if (artifacts.length > capability.execution.artifacts.maxCount
+        || artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > capability.execution.artifacts.maxTotalBytes) {
+        throw new AgentActionsServiceError('invalid_artifact')
+      }
+      if (capability.execution.artifacts.profile === 'relative-files-v1'
+        && capability.execution.artifacts.allowed.some((policy) => policy.required === true
+          && (typeof policy.path !== 'string' || !artifacts.some((artifact) => (
+            artifact.workspacePath === `Workflows/agent-actions/${actionId}/${policy.path}`
+              && artifact.kind === policy.kind
+              && policy.mediaTypes.includes(artifact.mediaType)
+              && artifact.sizeBytes <= policy.maxBytes
+          ))))) {
         throw new AgentActionsServiceError('invalid_artifact')
       }
     }

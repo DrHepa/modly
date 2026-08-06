@@ -6,16 +6,29 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import Ajv from 'ajv'
 
 import { ARTIFACT_KINDS, type ArtifactKind } from '../../src/shared/types/artifacts.ts'
-import type { AgentApprovalPolicyV1, JsonValue } from '../../src/shared/types/agentActions.ts'
+import type {
+  AgentApprovalPolicyV1,
+  AgentMcpArtifactOutputContractV1,
+  AgentMcpInputArtifactBindingV1,
+  JsonValue,
+} from '../../src/shared/types/agentActions.ts'
 import { canonicalJson, sha256Canonical } from './agent-trust-contracts.ts'
 import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
+import {
+  AgentHostRuntimeError,
+  bindAgentHostRuntime,
+  normalizeAgentHostRuntimeRelativePath,
+  type AgentHostRuntimeDeclaration,
+  type AgentHostRuntimeRegistry,
+  type BoundAgentHostRuntime,
+} from './agent-host-runtime.ts'
 
 const MCP_SCHEMA = 'modly.mcp-stdio.v1' as const
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const SAFE_ENV_KEY = /^[A-Z_][A-Z0-9_]{0,63}$/
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
-const DANGEROUS_ENV = /^(?:PATH|HOME|NODE_OPTIONS|PYTHONPATH|LD_.+|DYLD_.+)$/i
+const DANGEROUS_ENV = /^(?:PATH|HOME|NODE_OPTIONS|PYTHONPATH|MODLY_.+|LD_.+|DYLD_.+)$/i
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const SHELL_OR_INTERPOLATION = /[\0\r\n`$;&|<>*?\\]/
 const MAX_SERVERS = 16
@@ -31,13 +44,17 @@ const MAX_MANIFEST_BYTES = 512 * 1_024
 const MAX_MANIFEST_DEPTH = 64
 const MAX_MANIFEST_PROPERTIES = 10_000
 const MAX_MANIFEST_ARRAY = 5_000
+const EMBEDDED_MAX_ARTIFACTS = 4
+const EMBEDDED_MAX_ARTIFACT_BYTES = 256 * 1024
+const EMBEDDED_MAX_TOTAL_BYTES = 1024 * 1024
+const FILE_MAX_ARTIFACTS = 8
+const FILE_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+const FILE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+export const MCP_MAX_INHERITED_FDS = 64
 
 type JsonSchema = Record<string, JsonValue>
 
-export type McpArtifactDeclaration = Readonly<{
-  kind: ArtifactKind
-  mediaTypes: readonly string[]
-}>
+export type McpArtifactDeclaration = Readonly<AgentMcpArtifactOutputContractV1>
 
 export type NormalizedMcpTool = Readonly<{
   name: string
@@ -48,6 +65,7 @@ export type NormalizedMcpTool = Readonly<{
   inputSchemaHash: string
   outputSchema?: JsonSchema
   outputSchemaHash?: string
+  inputArtifacts: readonly Readonly<AgentMcpInputArtifactBindingV1>[]
   mutating: boolean
   approval: AgentApprovalPolicyV1
   artifact: McpArtifactDeclaration
@@ -56,6 +74,8 @@ export type NormalizedMcpTool = Readonly<{
 export type NormalizedMcpServer = Readonly<{
   id: string
   runtimeFiles: readonly string[]
+  hostRuntime?: Readonly<AgentHostRuntimeDeclaration>
+  artifactOutput: Readonly<Omit<AgentMcpArtifactOutputContractV1, 'allowed'>>
   command: Readonly<{
     executable: string
     entrypoint?: string
@@ -71,6 +91,15 @@ export type NormalizedMcpManifest = Readonly<{
   servers: readonly NormalizedMcpServer[]
 }>
 
+export function mcpInheritedFdRequirement(server: NormalizedMcpServer): number {
+  const maximumInputs = server.tools.reduce((maximum, tool) => Math.max(maximum, tool.inputArtifacts.length), 0)
+  const fileOutputs = server.artifactOutput.profile === 'relative-files-v1' ? server.artifactOutput.maxCount : 0
+  const prlimit = fileOutputs > 0 ? 1 : 0
+  // bwrap + extension executable + runtime files + one root FD for the
+  // content-bound host runtime + input FDs + exact writable output slots.
+  return 2 + server.runtimeFiles.length + (server.hostRuntime ? 1 : 0) + maximumInputs + fileOutputs + prlimit
+}
+
 export type McpExecutableIdentity = Readonly<{
   declaredPath: string
   realPath: string
@@ -85,10 +114,11 @@ export type McpExecutableIdentity = Readonly<{
 export type McpEntrypointIdentity = Omit<McpExecutableIdentity, 'symlink'> & Readonly<{ symlink: false }>
 export type McpRuntimeFileIdentity = McpEntrypointIdentity
 
-export type BoundMcpServer = Omit<NormalizedMcpServer, 'tools' | 'runtimeFiles'> & Readonly<{
+export type BoundMcpServer = Omit<NormalizedMcpServer, 'tools' | 'runtimeFiles' | 'hostRuntime'> & Readonly<{
   executable: McpExecutableIdentity
   entrypoint?: McpEntrypointIdentity
   runtimeFiles: readonly McpRuntimeFileIdentity[]
+  hostRuntime?: BoundAgentHostRuntime
   capabilityBindingHash: string
   tools: readonly (NormalizedMcpTool & Readonly<{ capabilityBindingHash: string }>)[]
 }>
@@ -109,13 +139,13 @@ export type DiscoveredMcpTool = Readonly<{
 }>
 
 export interface McpDiscoveryError {
-  code: 'MCP_MANIFEST_INVALID' | 'MCP_ID_COLLISION'
+  code: 'MCP_MANIFEST_INVALID' | 'MCP_ID_COLLISION' | 'MCP_RUNTIME_UNAVAILABLE'
   message: string
   capabilityId?: string
 }
 
 export class AgentMcpManifestError extends Error {
-  readonly code: 'invalid_manifest' | 'unsafe_command' | 'unsafe_executable'
+  readonly code: 'invalid_manifest' | 'unsafe_command' | 'unsafe_executable' | 'runtime_unavailable'
 
   constructor(code: AgentMcpManifestError['code'], message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause })
@@ -314,29 +344,179 @@ function normalizeApproval(value: unknown, label: string): AgentApprovalPolicyV1
   return { required: true, scope: 'single_action' }
 }
 
-function normalizeArtifact(value: unknown, label: string): McpArtifactDeclaration {
-  const artifact = record(value, label)
-  exactKeys(artifact, ['kind', 'media_types'], label)
-  if (typeof artifact.kind !== 'string' || !(ARTIFACT_KINDS as readonly string[]).includes(artifact.kind)) {
-    throw new AgentMcpManifestError('invalid_manifest', `${label}.kind is invalid`)
+function positiveInteger(value: unknown, label: string, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label} is outside its bound`)
   }
-  if (!Array.isArray(artifact.media_types) || artifact.media_types.length < 1 || artifact.media_types.length > 16) {
-    throw new AgentMcpManifestError('invalid_manifest', `${label}.media_types is invalid`)
-  }
-  const mediaTypes = artifact.media_types.map((entry, index) => {
-    const mediaType = literal(entry, `${label}.media_types[${index}]`, 128).toLowerCase()
-    if (!MEDIA_TYPE.test(mediaType)) throw new AgentMcpManifestError('invalid_manifest', `${label}.media_types is invalid`)
-    return mediaType
-  })
-  if (new Set(mediaTypes).size !== mediaTypes.length) throw new AgentMcpManifestError('invalid_manifest', `${label}.media_types contains duplicates`)
-  return { kind: artifact.kind as ArtifactKind, mediaTypes }
+  return value
 }
 
-function normalizeTool(value: unknown, extensionId: string, label: string): NormalizedMcpTool {
+function normalizeMediaTypes(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label} is invalid`)
+  }
+  const mediaTypes = value.map((entry, index) => {
+    const mediaType = literal(entry, `${label}.media_types[${index}]`, 128).toLowerCase()
+    if (!MEDIA_TYPE.test(mediaType)) throw new AgentMcpManifestError('invalid_manifest', `${label} is invalid`)
+    return mediaType
+  }).sort()
+  if (new Set(mediaTypes).size !== mediaTypes.length) throw new AgentMcpManifestError('invalid_manifest', `${label} contains duplicates`)
+  return mediaTypes
+}
+
+function normalizeArtifactOutput(value: unknown, label: string): Omit<AgentMcpArtifactOutputContractV1, 'allowed'> {
+  if (value === undefined) return {
+    profile: 'artifact-v1', maxCount: EMBEDDED_MAX_ARTIFACTS,
+    maxArtifactBytes: EMBEDDED_MAX_ARTIFACT_BYTES, maxTotalBytes: EMBEDDED_MAX_TOTAL_BYTES,
+  }
+  const output = record(value, label)
+  exactKeys(output, ['profile', 'maxCount', 'maxArtifactBytes', 'maxTotalBytes'], label)
+  if (output.profile !== 'artifact-v1' && output.profile !== 'relative-files-v1') {
+    throw new AgentMcpManifestError('invalid_manifest', `${label}.profile is unsupported`)
+  }
+  const fileProfile = output.profile === 'relative-files-v1'
+  const maxCount = positiveInteger(output.maxCount, `${label}.maxCount`, fileProfile ? FILE_MAX_ARTIFACTS : EMBEDDED_MAX_ARTIFACTS)
+  const maxArtifactBytes = positiveInteger(
+    output.maxArtifactBytes, `${label}.maxArtifactBytes`,
+    fileProfile ? FILE_MAX_ARTIFACT_BYTES : EMBEDDED_MAX_ARTIFACT_BYTES,
+  )
+  const maxTotalBytes = positiveInteger(
+    output.maxTotalBytes, `${label}.maxTotalBytes`,
+    fileProfile ? FILE_MAX_TOTAL_BYTES : EMBEDDED_MAX_TOTAL_BYTES,
+  )
+  if (maxArtifactBytes > maxTotalBytes) throw new AgentMcpManifestError('invalid_manifest', `${label} has inconsistent byte limits`)
+  if (maxTotalBytes > maxCount * maxArtifactBytes) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label} exceeds its count-by-file aggregate bound`)
+  }
+  if (fileProfile && maxTotalBytes !== maxCount * maxArtifactBytes) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label} must derive its aggregate from uniform fixed output slots`)
+  }
+  return { profile: output.profile, maxCount, maxArtifactBytes, maxTotalBytes }
+}
+
+function normalizeArtifact(
+  value: unknown,
+  output: Omit<AgentMcpArtifactOutputContractV1, 'allowed'>,
+  label: string,
+): McpArtifactDeclaration {
+  const artifact = record(value, label)
+  if (output.profile === 'artifact-v1') {
+    exactKeys(artifact, ['kind', 'media_types'], label)
+    if (typeof artifact.kind !== 'string' || !(ARTIFACT_KINDS as readonly string[]).includes(artifact.kind)) {
+      throw new AgentMcpManifestError('invalid_manifest', `${label}.kind is invalid`)
+    }
+    return {
+      ...output,
+      allowed: [{
+        kind: artifact.kind as ArtifactKind,
+        mediaTypes: normalizeMediaTypes(artifact.media_types, `${label}.media_types`),
+        maxBytes: output.maxArtifactBytes,
+      }],
+    }
+  }
+  exactKeys(artifact, ['outputs'], label)
+  if (!Array.isArray(artifact.outputs) || artifact.outputs.length < 1 || artifact.outputs.length > output.maxCount) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label}.outputs must be bounded`)
+  }
+  const paths = new Set<string>()
+  const allowed = artifact.outputs.map((raw, index) => {
+    const outputLabel = `${label}.outputs[${index}]`
+    const declaration = record(raw, outputLabel)
+    exactKeys(declaration, ['path', 'kind', 'media_types', 'max_bytes', 'required'], outputLabel)
+    const path = extensionRelativePath(declaration.path, `${outputLabel}.path`)
+    if (paths.has(path)) throw new AgentMcpManifestError('invalid_manifest', `${label}.outputs contains duplicate paths`)
+    paths.add(path)
+    if (typeof declaration.kind !== 'string' || !(ARTIFACT_KINDS as readonly string[]).includes(declaration.kind)) {
+      throw new AgentMcpManifestError('invalid_manifest', `${outputLabel}.kind is invalid`)
+    }
+    if (declaration.required !== true) throw new AgentMcpManifestError('invalid_manifest', `${outputLabel}.required must be true`)
+    const maxBytes = positiveInteger(declaration.max_bytes, `${outputLabel}.max_bytes`, output.maxArtifactBytes)
+    if (maxBytes !== output.maxArtifactBytes) {
+      throw new AgentMcpManifestError('invalid_manifest', `${outputLabel}.max_bytes must equal the server hard file-size limit`)
+    }
+    return {
+      path,
+      kind: declaration.kind as ArtifactKind,
+      mediaTypes: normalizeMediaTypes(declaration.media_types, `${outputLabel}.media_types`),
+      maxBytes,
+      required: true as const,
+    }
+  }).sort((left, right) => left.path.localeCompare(right.path))
+  if (allowed.some((entry, index) => allowed.some((other, otherIndex) => (
+    index !== otherIndex && other.path?.startsWith(`${entry.path}/`)
+  )))) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label}.outputs contains overlapping paths`)
+  }
+  return {
+    ...output,
+    maxCount: allowed.length,
+    maxTotalBytes: allowed.length * output.maxArtifactBytes,
+    allowed,
+  }
+}
+
+function normalizeInputArtifacts(
+  value: unknown,
+  schema: JsonSchema,
+  label: string,
+): AgentMcpInputArtifactBindingV1[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) {
+    throw new AgentMcpManifestError('invalid_manifest', `${label} must be a bounded array`)
+  }
+  const properties = isPlainRecord(schema.properties) ? schema.properties : undefined
+  const required = Array.isArray(schema.required) ? new Set(schema.required) : new Set<unknown>()
+  const argumentsSeen = new Set<string>()
+  return value.map((raw, index) => {
+    const bindingLabel = `${label}[${index}]`
+    const binding = record(raw, bindingLabel)
+    exactKeys(binding, ['argument', 'kind', 'media_types'], bindingLabel)
+    const argument = safeId(binding.argument, `${bindingLabel}.argument`)
+    if (argumentsSeen.has(argument)) throw new AgentMcpManifestError('invalid_manifest', `${label} contains duplicate arguments`)
+    argumentsSeen.add(argument)
+    if (typeof binding.kind !== 'string' || !(ARTIFACT_KINDS as readonly string[]).includes(binding.kind)) {
+      throw new AgentMcpManifestError('invalid_manifest', `${bindingLabel}.kind is invalid`)
+    }
+    const property = properties?.[argument]
+    if (!isPlainRecord(property) || property.type !== 'string'
+      || !Number.isSafeInteger(property.maxLength) || (property.maxLength as number) < 1 || (property.maxLength as number) > 128
+      || !required.has(argument)) {
+      throw new AgentMcpManifestError('invalid_manifest', `${bindingLabel}.argument must name a required bounded string property`)
+    }
+    return {
+      argument,
+      kind: binding.kind as ArtifactKind,
+      mediaTypes: normalizeMediaTypes(binding.media_types, `${bindingLabel}.media_types`),
+      sandboxPath: `/input/${index}` as `/input/${number}`,
+    }
+  })
+}
+
+function normalizeHostRuntime(value: unknown, label: string): AgentHostRuntimeDeclaration | undefined {
+  if (value === undefined) return undefined
+  const runtime = record(value, label)
+  exactKeys(runtime, ['id', 'executable'], label)
+  try {
+    return {
+      id: safeId(runtime.id, `${label}.id`),
+      executable: normalizeAgentHostRuntimeRelativePath(runtime.executable, `${label}.executable`),
+    }
+  } catch (error) {
+    if (error instanceof AgentMcpManifestError) throw error
+    throw new AgentMcpManifestError('invalid_manifest', `${label} is invalid`, error)
+  }
+}
+
+function normalizeTool(
+  value: unknown,
+  extensionId: string,
+  artifactOutput: Omit<AgentMcpArtifactOutputContractV1, 'allowed'>,
+  label: string,
+): NormalizedMcpTool {
   const tool = record(value, label)
   exactKeys(tool, [
     'name', 'capability_id', 'display_name', 'description', 'input_schema', 'output_schema',
-    'mutating', 'approval', 'artifact',
+    'input_artifacts', 'mutating', 'approval', 'artifact',
   ], label)
   const name = safeId(tool.name, `${label}.name`)
   const capabilityId = literal(tool.capability_id, `${label}.capability_id`, 257)
@@ -349,6 +529,7 @@ function normalizeTool(value: unknown, extensionId: string, label: string): Norm
   }
   const input = jsonSchema(tool.input_schema, `${label}.input_schema`)
   const output = tool.output_schema === undefined ? undefined : jsonSchema(tool.output_schema, `${label}.output_schema`)
+  const inputArtifacts = normalizeInputArtifacts(tool.input_artifacts, input.schema, `${label}.input_artifacts`)
   if (typeof tool.mutating !== 'boolean') throw new AgentMcpManifestError('invalid_manifest', `${label}.mutating must be boolean`)
   return {
     name,
@@ -357,10 +538,11 @@ function normalizeTool(value: unknown, extensionId: string, label: string): Norm
     description: displayText(tool.description, `${label}.description`, 500),
     inputSchema: input.schema,
     inputSchemaHash: input.hash,
+    inputArtifacts,
     ...(output ? { outputSchema: output.schema, outputSchemaHash: output.hash } : {}),
     mutating: tool.mutating,
     approval: normalizeApproval(tool.approval, `${label}.approval`),
-    artifact: normalizeArtifact(tool.artifact, `${label}.artifact`),
+    artifact: normalizeArtifact(tool.artifact, artifactOutput, `${label}.artifact`),
   }
 }
 
@@ -382,7 +564,7 @@ export function normalizeMcpManifest(value: unknown, extensionIdValue: string): 
   const servers = manifest.servers.map((rawServer, serverIndex): NormalizedMcpServer => {
     const label = `MCP manifest servers[${serverIndex}]`
     const server = record(rawServer, label)
-    exactKeys(server, ['id', 'runtimeFiles', 'command', 'tools'], label)
+    exactKeys(server, ['id', 'runtimeFiles', 'hostRuntime', 'artifactOutput', 'command', 'tools'], label)
     const id = safeId(server.id, `${label}.id`)
     if (serverIds.has(id)) throw new AgentMcpManifestError('invalid_manifest', 'MCP manifest contains duplicate server ids')
     serverIds.add(id)
@@ -391,16 +573,22 @@ export function normalizeMcpManifest(value: unknown, extensionIdValue: string): 
     }
     const command = normalizeCommand(server.command, `${label}.command`)
     const runtimeFiles = normalizeRuntimeFiles(server.runtimeFiles, command.entrypoint, `${label}.runtimeFiles`)
+    const hostRuntime = normalizeHostRuntime(server.hostRuntime, `${label}.hostRuntime`)
+    const artifactOutput = normalizeArtifactOutput(server.artifactOutput, `${label}.artifactOutput`)
     const toolNames = new Set<string>()
     const tools = server.tools.map((rawTool, toolIndex) => {
-      const tool = normalizeTool(rawTool, extensionId, `${label}.tools[${toolIndex}]`)
+      const tool = normalizeTool(rawTool, extensionId, artifactOutput, `${label}.tools[${toolIndex}]`)
       if (toolNames.has(tool.name)) throw new AgentMcpManifestError('invalid_manifest', `${label}.tools contains duplicate names`)
       if (capabilityIds.has(tool.capabilityId)) throw new AgentMcpManifestError('invalid_manifest', 'MCP manifest contains duplicate capability ids')
       toolNames.add(tool.name)
       capabilityIds.add(tool.capabilityId)
       return tool
     })
-    return { id, runtimeFiles, command, tools }
+    const normalized = { id, runtimeFiles, ...(hostRuntime ? { hostRuntime } : {}), artifactOutput, command, tools }
+    if (mcpInheritedFdRequirement(normalized) > MCP_MAX_INHERITED_FDS) {
+      throw new AgentMcpManifestError('invalid_manifest', `${label} exceeds inherited descriptor capacity`)
+    }
+    return normalized
   })
   return { schema: MCP_SCHEMA, transport: 'stdio', servers }
 }
@@ -528,7 +716,11 @@ async function readBoundedManifest(path: string): Promise<unknown> {
   }
 }
 
-export async function bindMcpManifest(manifest: NormalizedMcpManifest, extensionDir: string): Promise<BoundMcpManifest> {
+export async function bindMcpManifest(
+  manifest: NormalizedMcpManifest,
+  extensionDir: string,
+  options: { hostRuntimes?: AgentHostRuntimeRegistry } = {},
+): Promise<BoundMcpManifest> {
   const servers = await Promise.all(manifest.servers.map(async (server): Promise<BoundMcpServer> => {
     const executable = await fileIdentity(extensionDir, server.command.executable, { executable: true, allowVenvPythonSymlink: true })
     const runtimeFiles = await Promise.all(server.runtimeFiles.map(async (path) => (
@@ -540,6 +732,21 @@ export async function bindMcpManifest(manifest: NormalizedMcpManifest, extension
     if (server.command.entrypoint !== undefined && !entrypoint) {
       throw new AgentMcpManifestError('unsafe_executable', 'MCP entrypoint identity is missing from runtimeFiles')
     }
+    let hostRuntime: BoundAgentHostRuntime | undefined
+    if (server.hostRuntime) {
+      try {
+        hostRuntime = await bindAgentHostRuntime(options.hostRuntimes, server.hostRuntime)
+      } catch (error) {
+        if (error instanceof AgentHostRuntimeError) {
+          throw new AgentMcpManifestError(
+            error.code === 'runtime_unavailable' ? 'runtime_unavailable' : 'unsafe_executable',
+            'Named MCP host runtime could not be bound',
+            error,
+          )
+        }
+        throw error
+      }
+    }
     const serverBinding = {
       schema: 'modly.mcp-server-binding.v1',
       serverId: server.id,
@@ -547,6 +754,12 @@ export async function bindMcpManifest(manifest: NormalizedMcpManifest, extension
       executable,
       entrypoint: entrypoint ?? null,
       runtimeFiles,
+      hostRuntime: hostRuntime ? {
+        id: hostRuntime.id,
+        executable: hostRuntime.executable.relativePath,
+        bindingHash: hostRuntime.bindingHash,
+      } : null,
+      artifactOutput: server.artifactOutput,
       tools: server.tools.map((tool) => ({
         name: tool.name,
         capabilityId: tool.capabilityId,
@@ -554,14 +767,17 @@ export async function bindMcpManifest(manifest: NormalizedMcpManifest, extension
         outputSchemaHash: tool.outputSchemaHash ?? null,
         mutating: tool.mutating,
         approval: tool.approval,
+        inputArtifacts: tool.inputArtifacts,
         artifact: tool.artifact,
       })),
     }
     const capabilityBindingHash = sha256Canonical(serverBinding)
+    const { hostRuntime: _declaredHostRuntime, ...serverWithoutHostRuntime } = server
     return {
-      ...server,
+      ...serverWithoutHostRuntime,
       executable,
       ...(entrypoint ? { entrypoint } : {}),
+      ...(hostRuntime ? { hostRuntime } : {}),
       runtimeFiles,
       capabilityBindingHash,
       tools: server.tools.map((tool) => ({
@@ -573,6 +789,7 @@ export async function bindMcpManifest(manifest: NormalizedMcpManifest, extension
           name: tool.name,
           inputSchemaHash: tool.inputSchemaHash,
           outputSchemaHash: tool.outputSchemaHash ?? null,
+          inputArtifacts: tool.inputArtifacts,
           artifact: tool.artifact,
         }),
       })),
@@ -584,6 +801,7 @@ export async function bindMcpManifest(manifest: NormalizedMcpManifest, extension
 async function discoverRoot(
   root: string,
   rootKind: DiscoveredMcpTool['rootKind'],
+  hostRuntimes?: AgentHostRuntimeRegistry,
 ): Promise<{ tools: DiscoveredMcpTool[], errors: McpDiscoveryError[] }> {
   const tools: DiscoveredMcpTool[] = []
   const errors: McpDiscoveryError[] = []
@@ -604,7 +822,7 @@ async function discoverRoot(
       if (extensionManifest.type !== 'process' || extensionManifest.mcp === undefined) continue
       const extensionId = assertSafeExtensionId(typeof extensionManifest.id === 'string' ? extensionManifest.id : entry.name)
       const normalized = normalizeMcpManifest(extensionManifest.mcp, extensionId)
-      const bound = await bindMcpManifest(normalized, extensionDir)
+      const bound = await bindMcpManifest(normalized, extensionDir, { hostRuntimes })
       const name = typeof extensionManifest.name === 'string' && extensionManifest.name.trim() ? extensionManifest.name.trim() : extensionId
       const version = typeof extensionManifest.version === 'string' && extensionManifest.version.trim() ? extensionManifest.version.trim() : undefined
       for (const server of bound.servers) {
@@ -621,6 +839,10 @@ async function discoverRoot(
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      if (error instanceof AgentMcpManifestError && error.code === 'runtime_unavailable') {
+        errors.push({ code: 'MCP_RUNTIME_UNAVAILABLE', message: 'A required named MCP host runtime is unavailable.' })
+        continue
+      }
       errors.push({ code: 'MCP_MANIFEST_INVALID', message: 'An invalid MCP declaration was excluded from Agent discovery.' })
     }
   }
@@ -630,10 +852,11 @@ async function discoverRoot(
 export async function discoverGovernedMcpTools(options: {
   builtinDir: string
   userExtensionsDir: string
+  hostRuntimes?: AgentHostRuntimeRegistry
 }): Promise<{ tools: DiscoveredMcpTool[], errors: McpDiscoveryError[] }> {
   const [builtin, user] = await Promise.all([
-    discoverRoot(options.builtinDir, 'builtin'),
-    discoverRoot(options.userExtensionsDir, 'user'),
+    discoverRoot(options.builtinDir, 'builtin', options.hostRuntimes),
+    discoverRoot(options.userExtensionsDir, 'user', options.hostRuntimes),
   ])
   const candidates = [...builtin.tools, ...user.tools]
   const counts = new Map<string, number>()

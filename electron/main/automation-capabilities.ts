@@ -15,6 +15,7 @@ import type {
   AgentCapabilityDeclarationV1,
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
+  AgentMcpArtifactOutputContractV1,
 } from '../../src/shared/types/agentActions.ts'
 import { discoverGovernedMcpTools, type DiscoveredMcpTool } from './agent-mcp-manifest.ts'
 import {
@@ -22,6 +23,7 @@ import {
   bindAgentProcessExecution,
   normalizeAgentProcessDeclaration,
 } from './agent-process-manifest.ts'
+import type { AgentHostRuntimeRegistry } from './agent-host-runtime.ts'
 
 export type ModelInputKind = ArtifactKind | string | 'none'
 export type ExtensionPortKind = ArtifactKind | string
@@ -1257,6 +1259,11 @@ async function buildAgentCapabilitySnapshot(
 function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCapabilitySnapshotV1 | undefined {
   try {
     const nodeId = candidate.tool.capabilityId.split('/')[1]
+    const primaryArtifact = candidate.tool.artifact.allowed[0]
+    if (!primaryArtifact) return undefined
+    const outputKinds = candidate.tool.artifact.allowed.reduce<ArtifactKind[]>((kinds, artifact) => (
+      kinds.includes(artifact.kind) ? kinds : [...kinds, artifact.kind]
+    ), [])
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1267,7 +1274,8 @@ function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCap
       node: {
         id: nodeId,
         input: 'text' as const,
-        output: candidate.tool.artifact.kind,
+        output: primaryArtifact.kind,
+        outputs: outputKinds,
         paramsSchema: [],
       },
       execution: {
@@ -1275,6 +1283,27 @@ function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCap
         inputSchema: candidate.tool.inputSchema,
         inputSchemaHash: candidate.tool.inputSchemaHash,
         ...(candidate.tool.outputSchemaHash ? { outputSchemaHash: candidate.tool.outputSchemaHash } : {}),
+        ...(candidate.tool.inputArtifacts.length ? { inputArtifacts: candidate.tool.inputArtifacts } : {}),
+        artifacts: candidate.tool.artifact,
+        activation: {
+          platform: 'linux' as const,
+          sandbox: 'bubblewrap' as const,
+          ...(candidate.server.hostRuntime ? {
+            hostRuntime: {
+              id: candidate.server.hostRuntime.id,
+              bindingHash: candidate.server.hostRuntime.bindingHash,
+            },
+          } : {}),
+        },
+        limits: {
+          initializeTimeoutMs: 10_000,
+          listToolsTimeoutMs: 10_000,
+          callTimeoutMs: 5 * 60 * 1_000,
+          terminationGraceMs: 250,
+          maxTransportBytes: 4 * 1024 * 1024,
+          maxMessageBytes: 2 * 1024 * 1024,
+          maxTextContentBytes: 64 * 1024,
+        },
         mutating: candidate.tool.mutating,
         bindingHash: candidate.tool.capabilityBindingHash,
       },
@@ -1290,6 +1319,9 @@ export async function listAgentCapabilities(options: {
   builtinDir: string
   userExtensionsDir: string
   trustedRepos: Set<string>
+  hostRuntimes?: AgentHostRuntimeRegistry
+  mcpSandboxReady?: boolean | Readonly<Record<AgentMcpArtifactOutputContractV1['profile'], boolean>>
+  mcpSandboxReadiness?: (profile: AgentMcpArtifactOutputContractV1['profile']) => Promise<boolean>
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
     listVisibleResolvedExtensionsDetailed(options),
@@ -1301,7 +1333,24 @@ export async function listAgentCapabilities(options: {
     return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(extension, node, resolved.extDir))
   }))
   const processCandidates = processResults.filter((snapshot): snapshot is AgentCapabilitySnapshotV1 => snapshot !== undefined)
-  const mcpCandidates = mcpResult.tools.flatMap((candidate) => {
+  const profileReadiness = new Map<AgentMcpArtifactOutputContractV1['profile'], boolean>()
+  const readinessProbe = options.mcpSandboxReadiness
+  if (readinessProbe) {
+    const profiles = [...new Set(mcpResult.tools.map((candidate) => candidate.server.artifactOutput.profile))]
+    await Promise.all(profiles.map(async (profile) => {
+      const ready = await readinessProbe(profile).catch(() => false)
+      profileReadiness.set(profile, ready === true)
+    }))
+  }
+  const isMcpReady = (candidate: DiscoveredMcpTool): boolean => {
+    if (readinessProbe) return profileReadiness.get(candidate.server.artifactOutput.profile) === true
+    if (typeof options.mcpSandboxReady === 'object') {
+      return options.mcpSandboxReady[candidate.server.artifactOutput.profile] === true
+    }
+    return options.mcpSandboxReady !== false
+  }
+  const readyMcpTools = mcpResult.tools.filter(isMcpReady)
+  const mcpCandidates = readyMcpTools.flatMap((candidate) => {
     const snapshot = buildMcpAgentCapabilitySnapshot(candidate)
     return snapshot ? [snapshot] : []
   })
@@ -1316,7 +1365,7 @@ export async function listAgentCapabilities(options: {
       counts.set(id, (counts.get(id) ?? 0) + 1)
     }
   }
-  for (const candidate of mcpResult.tools) {
+  for (const candidate of readyMcpTools) {
     counts.set(candidate.tool.capabilityId, (counts.get(candidate.tool.capabilityId) ?? 0) + 1)
   }
   const collisionIds = [...counts.entries()]
@@ -1341,6 +1390,10 @@ export async function listAgentCapabilities(options: {
         message: error.message,
         ...(error.capabilityId ? { capabilityId: error.capabilityId } : {}),
       })),
+      ...(readyMcpTools.length < mcpResult.tools.length ? [{
+        code: 'MCP_SANDBOX_UNAVAILABLE',
+        message: 'MCP Agent capabilities are unavailable because the production sandbox readiness probe failed.',
+      }] : []),
       ...collisionIds.map((capabilityId) => ({
         code: 'AGENT_CAPABILITY_ID_COLLISION',
         message: 'An ambiguous Agent capability identifier was excluded from discovery.',

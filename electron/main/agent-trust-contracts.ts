@@ -330,11 +330,135 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
   }
 }
 
+function normalizeMcpMediaTypes(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) throw new TypeError(`${label} must be bounded`)
+  const mediaTypes = value.map((entry, index) => {
+    const mediaType = assertString(entry, `${label}[${index}]`, 128).toLowerCase()
+    if (!MIME_TYPE_PATTERN.test(mediaType)) throw new TypeError(`${label} is invalid`)
+    return mediaType
+  }).sort()
+  if (new Set(mediaTypes).size !== mediaTypes.length) throw new TypeError(`${label} contains duplicates`)
+  return mediaTypes
+}
+
+function normalizeMcpInputArtifacts(value: unknown, inputSchema: JsonValue): NonNullable<Extract<AgentCapabilitySnapshotV1['execution'], { kind: 'mcp_tool' }>['inputArtifacts']> | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) throw new TypeError('Agent capability MCP input artifacts must be bounded')
+  assertPlainRecord(inputSchema, 'Agent capability MCP input schema')
+  const properties = inputSchema.properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) throw new TypeError('Agent capability MCP input artifact schema has no properties')
+  const required = new Set(Array.isArray(inputSchema.required) ? inputSchema.required : [])
+  const argumentsSeen = new Set<string>()
+  return value.map((raw, index) => {
+    const label = `Agent capability MCP inputArtifacts[${index}]`
+    assertPlainRecord(raw, label)
+    assertExactKeys(raw, ['argument', 'kind', 'mediaTypes', 'sandboxPath'], label)
+    const argument = assertSafeId(raw.argument, `${label}.argument`)
+    if (argumentsSeen.has(argument)) throw new TypeError('Agent capability MCP input artifact arguments are duplicated')
+    argumentsSeen.add(argument)
+    if (!isArtifactKind(raw.kind)) throw new TypeError(`${label}.kind is invalid`)
+    const property = (properties as Record<string, unknown>)[argument]
+    if (!property || typeof property !== 'object' || Array.isArray(property)
+      || (property as Record<string, unknown>).type !== 'string' || !required.has(argument)) {
+      throw new TypeError(`${label}.argument is not a required string property`)
+    }
+    if (raw.sandboxPath !== `/input/${index}`) throw new TypeError(`${label}.sandboxPath is not deterministic`)
+    return {
+      argument, kind: raw.kind,
+      mediaTypes: normalizeMcpMediaTypes(raw.mediaTypes, `${label}.mediaTypes`),
+      sandboxPath: raw.sandboxPath as `/input/${number}`,
+    }
+  })
+}
+
+function normalizeMcpArtifacts(value: unknown): NonNullable<Extract<AgentCapabilitySnapshotV1['execution'], { kind: 'mcp_tool' }>['artifacts']> | undefined {
+  if (value === undefined) return undefined
+  assertPlainRecord(value, 'Agent capability MCP artifacts')
+  assertExactKeys(value, ['profile', 'maxCount', 'maxArtifactBytes', 'maxTotalBytes', 'allowed'], 'Agent capability MCP artifacts')
+  if (value.profile !== 'artifact-v1' && value.profile !== 'relative-files-v1') throw new TypeError('Agent capability MCP artifact profile is invalid')
+  const fileProfile = value.profile === 'relative-files-v1'
+  const maxCount = assertFiniteNumber(value.maxCount, 'Agent capability MCP maxCount', true)
+  const maxArtifactBytes = assertFiniteNumber(value.maxArtifactBytes, 'Agent capability MCP maxArtifactBytes', true)
+  const maxTotalBytes = assertFiniteNumber(value.maxTotalBytes, 'Agent capability MCP maxTotalBytes', true)
+  if (maxCount < 1 || maxCount > (fileProfile ? 8 : 4)
+    || maxArtifactBytes < 1 || maxArtifactBytes > (fileProfile ? 32 * 1024 * 1024 : 256 * 1024)
+    || maxTotalBytes < maxArtifactBytes || maxTotalBytes > (fileProfile ? 64 * 1024 * 1024 : 1024 * 1024)
+    || !Array.isArray(value.allowed) || value.allowed.length < 1 || value.allowed.length > maxCount) {
+    throw new TypeError('Agent capability MCP artifact bounds are invalid')
+  }
+  if (fileProfile && (maxTotalBytes !== maxCount * maxArtifactBytes || value.allowed.length !== maxCount)) {
+    throw new TypeError('Agent capability MCP fixed output bounds are not exactly enforceable')
+  }
+  const paths = new Set<string>()
+  const allowed = value.allowed.map((raw, index) => {
+    const label = `Agent capability MCP artifacts.allowed[${index}]`
+    assertPlainRecord(raw, label)
+    assertExactKeys(raw, ['path', 'kind', 'mediaTypes', 'maxBytes', 'required'], label)
+    const path = raw.path === undefined ? undefined : assertWorkspaceRelativePath(raw.path)
+    if ((fileProfile && path === undefined) || (!fileProfile && path !== undefined) || (path !== undefined && paths.has(path))) {
+      throw new TypeError(`${label}.path is invalid or duplicated`)
+    }
+    if (path) paths.add(path)
+    if (!isArtifactKind(raw.kind)) throw new TypeError(`${label}.kind is invalid`)
+    const maxBytes = assertFiniteNumber(raw.maxBytes, `${label}.maxBytes`, true)
+    if (maxBytes < 1 || maxBytes > maxArtifactBytes
+      || (fileProfile && maxBytes !== maxArtifactBytes)
+      || (fileProfile ? raw.required !== true : raw.required !== undefined)) {
+      throw new TypeError(`${label} has invalid bounds or requirement`)
+    }
+    return {
+      ...(path ? { path } : {}), kind: raw.kind,
+      mediaTypes: normalizeMcpMediaTypes(raw.mediaTypes, `${label}.mediaTypes`), maxBytes,
+      ...(fileProfile ? { required: true as const } : {}),
+    }
+  }).sort((left, right) => (left.path ?? left.kind).localeCompare(right.path ?? right.kind))
+  return { profile: value.profile, maxCount, maxArtifactBytes, maxTotalBytes, allowed }
+}
+
+function normalizeMcpActivation(value: unknown): NonNullable<Extract<AgentCapabilitySnapshotV1['execution'], { kind: 'mcp_tool' }>['activation']> | undefined {
+  if (value === undefined) return undefined
+  assertPlainRecord(value, 'Agent capability MCP activation')
+  assertExactKeys(value, ['platform', 'sandbox', 'hostRuntime'], 'Agent capability MCP activation')
+  if (value.platform !== 'linux' || value.sandbox !== 'bubblewrap') throw new TypeError('Agent capability MCP activation is invalid')
+  if (value.hostRuntime === undefined) return { platform: 'linux', sandbox: 'bubblewrap' }
+  assertPlainRecord(value.hostRuntime, 'Agent capability MCP host runtime')
+  assertExactKeys(value.hostRuntime, ['id', 'bindingHash'], 'Agent capability MCP host runtime')
+  return {
+    platform: 'linux', sandbox: 'bubblewrap',
+    hostRuntime: {
+      id: assertSafeId(value.hostRuntime.id, 'Agent capability MCP host runtime id'),
+      bindingHash: normalizeSha256(value.hostRuntime.bindingHash, 'Agent capability MCP host runtime bindingHash'),
+    },
+  }
+}
+
+function normalizeMcpLimits(value: unknown): NonNullable<Extract<AgentCapabilitySnapshotV1['execution'], { kind: 'mcp_tool' }>['limits']> | undefined {
+  if (value === undefined) return undefined
+  assertPlainRecord(value, 'Agent capability MCP limits')
+  const keys = [
+    'initializeTimeoutMs', 'listToolsTimeoutMs', 'callTimeoutMs', 'terminationGraceMs',
+    'maxTransportBytes', 'maxMessageBytes', 'maxTextContentBytes',
+  ] as const
+  assertExactKeys(value, keys, 'Agent capability MCP limits')
+  const result = Object.fromEntries(keys.map((key) => {
+    const normalized = assertFiniteNumber(value[key], `Agent capability MCP limits.${key}`, true)
+    const maximum = key.endsWith('TimeoutMs') || key === 'terminationGraceMs'
+      ? 30 * 60 * 1_000
+      : 1024 * 1024 * 1024
+    if (normalized < 1 || normalized > maximum) throw new TypeError(`Agent capability MCP limits.${key} is invalid`)
+    return [key, normalized]
+  })) as unknown as NonNullable<Extract<AgentCapabilitySnapshotV1['execution'], { kind: 'mcp_tool' }>['limits']>
+  return result
+}
+
 function normalizeExecution(value: unknown): AgentCapabilitySnapshotV1['execution'] {
   if (value === undefined) return undefined
   assertPlainRecord(value, 'Agent capability execution')
   if (value.kind === 'process') return normalizeProcessExecution(value)
-  assertExactKeys(value, ['kind', 'inputSchema', 'inputSchemaHash', 'outputSchemaHash', 'mutating', 'bindingHash'], 'Agent capability execution')
+  assertExactKeys(value, [
+    'kind', 'inputSchema', 'inputSchemaHash', 'outputSchemaHash', 'inputArtifacts', 'artifacts',
+    'activation', 'limits', 'mutating', 'bindingHash',
+  ], 'Agent capability execution')
   if (value.kind !== 'mcp_tool') throw new TypeError('Agent capability execution kind is invalid')
   assertPlainRecord(value.inputSchema, 'Agent capability MCP inputSchema')
   const inputSchema = normalizeJsonValue(value.inputSchema)
@@ -342,6 +466,10 @@ function normalizeExecution(value: unknown): AgentCapabilitySnapshotV1['executio
     throw new TypeError('Agent capability MCP inputSchema hash does not match')
   }
   if (typeof value.mutating !== 'boolean') throw new TypeError('Agent capability MCP mutating must be a boolean')
+  const inputArtifacts = normalizeMcpInputArtifacts(value.inputArtifacts, inputSchema)
+  const artifacts = normalizeMcpArtifacts(value.artifacts)
+  const activation = normalizeMcpActivation(value.activation)
+  const limits = normalizeMcpLimits(value.limits)
   return {
     kind: 'mcp_tool',
     inputSchema,
@@ -349,6 +477,10 @@ function normalizeExecution(value: unknown): AgentCapabilitySnapshotV1['executio
     ...(value.outputSchemaHash === undefined ? {} : {
       outputSchemaHash: normalizeSha256(value.outputSchemaHash, 'Agent capability MCP outputSchemaHash'),
     }),
+    ...(inputArtifacts ? { inputArtifacts } : {}),
+    ...(artifacts ? { artifacts } : {}),
+    ...(activation ? { activation } : {}),
+    ...(limits ? { limits } : {}),
     mutating: value.mutating,
     bindingHash: normalizeSha256(value.bindingHash, 'Agent capability MCP bindingHash'),
   }
@@ -601,11 +733,21 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   }
 
   assertPlainRecord(value.node, 'Agent capability node')
-  assertExactKeys(value.node, ['id', 'input', 'output', 'inputs', 'paramsSchema'], 'Agent capability node')
+  assertExactKeys(value.node, ['id', 'input', 'output', 'outputs', 'inputs', 'paramsSchema'], 'Agent capability node')
   const nodeId = assertSafeId(value.node.id, 'Agent capability node id')
   const input = assertString(value.node.input, 'Agent capability node input', 64)
   if (!isArtifactKind(input)) throw new TypeError('Agent capability node input is invalid')
   if (!isArtifactKind(value.node.output)) throw new TypeError('Agent capability node output is invalid')
+  let outputs: ArtifactKind[] | undefined
+  if (value.node.outputs !== undefined) {
+    if (!Array.isArray(value.node.outputs) || value.node.outputs.length < 1 || value.node.outputs.length > 32
+      || value.node.outputs.some((kind) => !isArtifactKind(kind))
+      || new Set(value.node.outputs).size !== value.node.outputs.length
+      || value.node.outputs[0] !== value.node.output) {
+      throw new TypeError('Agent capability node outputs are invalid')
+    }
+    outputs = [...value.node.outputs] as ArtifactKind[]
+  }
   const paramsSchema = normalizeAgentParamsSchema(value.node.paramsSchema)
   const inputs = normalizeAgentInputs(value.node.inputs)
   const execution = normalizeExecution(value.execution)
@@ -619,6 +761,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
     extension,
     node: {
       id: nodeId, input, output: value.node.output,
+      ...(outputs ? { outputs } : {}),
       ...(inputs ? { inputs } : {}), paramsSchema,
     },
     ...(execution ? { execution } : {}),

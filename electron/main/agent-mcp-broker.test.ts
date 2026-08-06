@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -48,6 +48,23 @@ const outputSchema = {
   },
   required: ['artifacts'],
 }
+const relativeFileOutputSchema = {
+  type: 'object' as const, additionalProperties: false,
+  properties: {
+    artifacts: {
+      type: 'array' as const, minItems: 1, maxItems: 1,
+      items: {
+        type: 'object' as const, additionalProperties: false,
+        properties: {
+          id: { type: 'string' as const }, name: { const: 'scene.blend' },
+          kind: { const: 'blend' }, mediaType: { const: 'application/x-blender' },
+        },
+        required: ['id', 'name', 'kind', 'mediaType'],
+      },
+    },
+  },
+  required: ['artifacts'],
+}
 
 interface Fixture {
   root: string
@@ -55,6 +72,11 @@ interface Fixture {
   userDir: string
   workspaceDir: string
   capability: AgentCapabilitySnapshotV1
+}
+
+interface FileFixture extends Fixture {
+  privateDir: string
+  inputArtifact: AgentActionExecutorRequest['inputArtifacts'][number]
 }
 
 async function fixture(): Promise<Fixture> {
@@ -89,6 +111,54 @@ async function fixture(): Promise<Fixture> {
   return { root, builtinDir, userDir, workspaceDir, capability: inventory.capabilities[0] }
 }
 
+async function fileFixture(): Promise<FileFixture> {
+  const target = await fixture()
+  const extensionDir = join(target.userDir, 'fixture-mcp')
+  const privateDir = join(target.root, 'private')
+  await mkdir(privateDir, { mode: 0o700 })
+  const source = Buffer.from('approved scene bytes')
+  await mkdir(join(target.workspaceDir, 'Workflows', 'sources'), { recursive: true })
+  await writeFile(join(target.workspaceDir, 'Workflows', 'sources', 'scene.blend'), source)
+  const inputArtifact = {
+    schema: 'modly.artifact-ref.v1' as const, version: 1 as const, id: 'approved-scene', kind: 'blend' as const,
+    mediaType: 'application/x-blender', workspacePath: 'Workflows/sources/scene.blend',
+    sha256: createHash('sha256').update(source).digest('hex'), sizeBytes: source.byteLength,
+  }
+  const fileInputSchema = {
+    type: 'object' as const, additionalProperties: false,
+    properties: { sceneArtifact: { type: 'string' as const, maxLength: 128 } },
+    required: ['sceneArtifact'],
+  }
+  await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
+    id: 'fixture-mcp', name: 'Fixture MCP', version: '1.0.0', type: 'process', entry: 'processor.js', nodes: [],
+    mcp: {
+      schema: 'modly.mcp-stdio.v1', transport: 'stdio', servers: [{
+        id: 'fixture-server', runtimeFiles: ['server.mjs'],
+        artifactOutput: {
+          profile: 'relative-files-v1', maxCount: 1,
+          maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024,
+        },
+        command: { executable: 'bin/server', entrypoint: 'server.mjs', args: ['--stdio'], env: {} },
+        tools: [{
+          name: 'render_scene', capability_id: 'fixture-mcp/render-scene', display_name: 'Render scene',
+          description: 'Reads one bound scene and emits one broker-owned file.',
+          input_schema: fileInputSchema,
+          input_artifacts: [{ argument: 'sceneArtifact', kind: 'blend', media_types: ['application/x-blender'] }],
+          output_schema: relativeFileOutputSchema,
+          mutating: true, approval: { required: true, scope: 'single_action' },
+          artifact: { outputs: [{
+            path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'],
+            max_bytes: 32 * 1024 * 1024, required: true,
+          }] },
+        }],
+      }],
+    },
+  }))
+  const inventory = await listAgentCapabilities({ builtinDir: target.builtinDir, userExtensionsDir: target.userDir, trustedRepos: new Set() })
+  assert.equal(inventory.capabilities.length, 1)
+  return { ...target, privateDir, capability: inventory.capabilities[0], inputArtifact }
+}
+
 function request(capability: AgentCapabilitySnapshotV1, signal = new AbortController().signal): AgentActionExecutorRequest {
   return {
     actionId: 'action-mcp-fixture', originSessionId: 'session-mcp-fixture',
@@ -97,6 +167,14 @@ function request(capability: AgentCapabilitySnapshotV1, signal = new AbortContro
       provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'qwen3.6:latest',
       digest: `sha256:${'a'.repeat(64)}`,
     },
+  }
+}
+
+function fileRequest(target: FileFixture): AgentActionExecutorRequest {
+  return {
+    ...request(target.capability),
+    arguments: { sceneArtifact: target.inputArtifact.id },
+    inputArtifacts: [target.inputArtifact],
   }
 }
 
@@ -115,7 +193,7 @@ function embeddedArtifact(text: string, overrides: Record<string, unknown> = {})
 
 function serverFactory(options: {
   tools?: Array<{ name: string, inputSchema: typeof inputSchema, outputSchema?: typeof outputSchema }>
-  onCall: (args: { server: Server, signal: AbortSignal }) => Promise<unknown>
+  onCall: (args: { server: Server, signal: AbortSignal, argumentsValue: unknown }) => Promise<unknown>
   onList?: () => Promise<void>
   capabilities?: NonNullable<ConstructorParameters<typeof Server>[1]>['capabilities']
   onClose?: () => void
@@ -131,7 +209,9 @@ function serverFactory(options: {
       await options.onList?.()
       return { tools }
     })
-    server.setRequestHandler(CallToolRequestSchema, async () => options.onCall({ server, signal: context.signal }) as never)
+    server.setRequestHandler(CallToolRequestSchema, async (requestValue) => options.onCall({
+      server, signal: context.signal, argumentsValue: requestValue.params.arguments,
+    }) as never)
     await server.connect(serverTransport)
     return {
       transport: clientTransport,
@@ -169,6 +249,79 @@ test('official SDK client executes an exact tool set and returns only authoritat
     assert.equal(closed, 1)
     await result.rollback()
     await assert.rejects(readFile(join(target.workspaceDir, String(result.artifacts[0].workspacePath))), { code: 'ENOENT' })
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('typed MCP artifact ids become deterministic read-only input paths and relative files publish only after exit', async () => {
+  const target = await fileFixture()
+  let outputFile = ''
+  let receivedArguments: unknown
+  const fileInputSchema = target.capability.execution?.kind === 'mcp_tool'
+    ? target.capability.execution.inputSchema as typeof inputSchema
+    : inputSchema
+  try {
+    const baseFactory = serverFactory({
+      tools: [{ name: 'render_scene', inputSchema: fileInputSchema, outputSchema: relativeFileOutputSchema as never }],
+      onCall: async ({ argumentsValue }) => {
+        receivedArguments = argumentsValue
+        await writeFile(outputFile, 'rendered scene')
+        return {
+          content: [{ type: 'text', text: 'created' }],
+          structuredContent: { artifacts: [{
+            id: 'rendered-scene', name: 'scene.blend', kind: 'blend', mediaType: 'application/x-blender',
+          }] },
+        }
+      },
+    })
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: () => target.workspaceDir,
+      transportFactory: async (context) => {
+        assert.deepEqual(context.outputFiles?.map((slot) => slot.path), ['scene.blend'])
+        outputFile = context.outputFiles?.[0]?.hostPath ?? ''
+        assert.ok(outputFile.startsWith(join(target.workspaceDir, 'Workflows', 'agent-actions', '.staging')))
+        return baseFactory(context)
+      },
+    })
+    const result = await executor(fileRequest(target)) as { artifacts: Array<Record<string, unknown>>, rollback: () => Promise<void> }
+    assert.deepEqual(receivedArguments, { sceneArtifact: '/input/0' })
+    assert.equal(result.artifacts[0].kind, 'blend')
+    assert.equal(await readFile(join(target.workspaceDir, String(result.artifacts[0].workspacePath)), 'utf8'), 'rendered scene')
+    await result.rollback()
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('relative-file output rejects hardlinks and rolls back the whole publication', async () => {
+  const target = await fileFixture()
+  let outputFile = ''
+  const fileInputSchema = target.capability.execution?.kind === 'mcp_tool'
+    ? target.capability.execution.inputSchema as typeof inputSchema
+    : inputSchema
+  try {
+    const baseFactory = serverFactory({
+      tools: [{ name: 'render_scene', inputSchema: fileInputSchema, outputSchema: relativeFileOutputSchema as never }],
+      onCall: async () => {
+        await writeFile(outputFile, 'unsafe hardlink')
+        await link(outputFile, join(outputFile, '..', 'alias.blend'))
+        return {
+          content: [{ type: 'text', text: 'created' }],
+          structuredContent: { artifacts: [{
+            id: 'rendered-scene', name: 'scene.blend', kind: 'blend', mediaType: 'application/x-blender',
+          }] },
+        }
+      },
+    })
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: () => target.workspaceDir,
+      transportFactory: async (context) => { outputFile = context.outputFiles?.[0]?.hostPath ?? ''; return baseFactory(context) },
+    })
+    await assert.rejects(executor(fileRequest(target)), AgentMcpBrokerError)
+    await assert.rejects(readdir(join(target.workspaceDir, 'Workflows/agent-actions/action-mcp-fixture')), { code: 'ENOENT' })
   } finally {
     await rm(target.root, { recursive: true, force: true })
   }
@@ -424,10 +577,18 @@ test('bubblewrap launch is direct, no-network, read-only, minimal-env, and fail-
     const launch = buildBubblewrapLaunch({
       platform: 'linux', bwrapFd: 3, executableFd: 4,
       runtimeFiles: [{ path: 'server.mjs', fd: 5 }],
+      outputFiles: [{ path: 'scene.blend', fd: 6 }],
+      prlimitFd: 7,
+      outputFileSizeLimitBytes: 32 * 1024 * 1024,
       executable: 'bin/server',
       entrypoint: 'server.mjs', args: ['--stdio'], env: { FIXTURE_MODE: 'honest' }, systemPaths: ['/usr', '/bin', '/lib'],
     })
-    assert.equal(launch.command, '/proc/self/fd/3')
+    assert.equal(launch.command, '/proc/self/fd/7')
+    assert.deepEqual(launch.args.slice(0, 3), [
+      `--fsize=${32 * 1024 * 1024}:${32 * 1024 * 1024}`,
+      '--',
+      '/proc/self/fd/3',
+    ])
     assert.equal(launch.shell, false)
     assert.ok(launch.args.includes('--unshare-all'))
     assert.ok(launch.args.includes('--unshare-user'))
@@ -436,12 +597,16 @@ test('bubblewrap launch is direct, no-network, read-only, minimal-env, and fail-
     assert.ok(launch.args.includes('--clearenv'))
     assert.ok(launch.args.includes('/app/server.mjs'))
     assert.ok(launch.args.includes('--ro-bind-fd'))
-    assert.equal(launch.args.includes('--bind-fd'), false)
+    const outputBind = launch.args.findIndex((value, index) => value === '--bind-fd'
+      && launch.args[index + 1] === '6' && launch.args[index + 2] === '/output/scene.blend')
+    assert.notEqual(outputBind, -1)
+    assert.equal(launch.args.some((value, index) => value === '--bind'
+      && launch.args[index + 2] === '/output'), false)
     assert.ok(launch.args.includes('--size'))
     assert.deepEqual(launch.args.slice(launch.args.indexOf('--size'), launch.args.indexOf('--size') + 4), [
       '--size', String(64 * 1024 * 1024), '--tmpfs', '/tmp',
     ])
-    assert.ok(launch.args.some((value, index) => value === '--tmpfs' && launch.args[index + 1] === '/output'))
+    assert.ok(launch.args.includes('--dir') && launch.args.includes('/output'))
     assert.equal(launch.args.includes('/extension'), false)
     assert.ok(launch.args.includes('/run/modly/executable'))
     assert.equal(JSON.stringify(launch).includes(process.env.HOME ?? 'impossible'), false)
@@ -451,16 +616,64 @@ test('bubblewrap launch is direct, no-network, read-only, minimal-env, and fail-
   }
 })
 
-test('sandbox readiness is asynchronous, capability-probed, and cached', async () => {
-  let probes = 0
+test('sandbox readiness is asynchronous, profile-probed, and cached independently', async () => {
+  const probes: string[] = []
   const readiness = createAgentMcpSandboxReadiness({
     platform: 'linux',
-    probe: async () => { probes += 1; return false },
+    probe: async (profile) => {
+      probes.push(profile)
+      return profile === 'artifact-v1'
+    },
     cacheTtlMs: 30_000,
   })
-  assert.equal(await readiness(), false)
-  assert.equal(await readiness(), false)
-  assert.equal(probes, 1)
+  assert.equal(await readiness('artifact-v1'), true)
+  assert.equal(await readiness('artifact-v1'), true)
+  assert.equal(await readiness('relative-files-v1'), false)
+  assert.equal(await readiness('relative-files-v1'), false)
+  assert.deepEqual(probes, ['artifact-v1', 'relative-files-v1'])
+})
+
+test('fixed-output inventory requires its complete readiness profile while basic MCP remains available', async () => {
+  const basic = await fixture()
+  const fixed = await fileFixture()
+  try {
+    const partialReadiness = createAgentMcpSandboxReadiness({
+      platform: 'linux',
+      probe: async (profile) => profile === 'artifact-v1',
+    })
+    const partialProfiles = {
+      'artifact-v1': await partialReadiness('artifact-v1'),
+      'relative-files-v1': await partialReadiness('relative-files-v1'),
+    }
+    const basicInventory = await listAgentCapabilities({
+      builtinDir: basic.builtinDir, userExtensionsDir: basic.userDir, trustedRepos: new Set(),
+      mcpSandboxReady: partialProfiles,
+    })
+    const fixedUnavailable = await listAgentCapabilities({
+      builtinDir: fixed.builtinDir, userExtensionsDir: fixed.userDir, trustedRepos: new Set(),
+      mcpSandboxReady: partialProfiles,
+    })
+    assert.equal(basicInventory.capabilities.length, 1)
+    assert.deepEqual(fixedUnavailable.capabilities, [])
+    assert.ok(fixedUnavailable.errors.some((error) => error.code === 'MCP_SANDBOX_UNAVAILABLE'))
+
+    const completeReadiness = createAgentMcpSandboxReadiness({
+      platform: 'linux',
+      probe: async () => true,
+    })
+    const completeProfiles = {
+      'artifact-v1': await completeReadiness('artifact-v1'),
+      'relative-files-v1': await completeReadiness('relative-files-v1'),
+    }
+    const fixedAvailable = await listAgentCapabilities({
+      builtinDir: fixed.builtinDir, userExtensionsDir: fixed.userDir, trustedRepos: new Set(),
+      mcpSandboxReady: completeProfiles,
+    })
+    assert.equal(fixedAvailable.capabilities.length, 1)
+  } finally {
+    await rm(basic.root, { recursive: true, force: true })
+    await rm(fixed.root, { recursive: true, force: true })
+  }
 })
 
 test('owned stdio transport kills the complete detached process group without orphans', async (t) => {
@@ -553,8 +766,10 @@ test('broker source has no renderer IPC or legacy extensions:runProcess path', a
   assert.match(source, /signalOwnedProcessGroup\(pid, startTime, 'SIGTERM'\)/)
   assert.match(source, /signalOwnedProcessGroup\(pid, startTime, 'SIGKILL'\)/)
   assert.match(source, /sha256 !== identity\.sha256/)
-  assert.match(source, /inheritedHandles: handles/)
+  assert.match(source, /inheritedHandles, ownsInheritedHandles: false/)
   assert.match(source, /'--ro-bind-fd'/)
+  assert.match(source, /sourceHandle = slot\.handle/)
+  assert.doesNotMatch(source, /sourceHandle = await open\(source/)
   const preload = await readFile(new URL('../preload/electron-api.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(preload, /['"]mcp:|callMcp|runMcp|serverId/)
 })

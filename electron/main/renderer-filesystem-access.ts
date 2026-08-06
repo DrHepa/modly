@@ -10,7 +10,11 @@ export interface RendererFilesystemConfiguredRoots {
 
 export interface RendererFilesystemAccessOptions {
   getConfiguredRoots: () => RendererFilesystemConfiguredRoots
-  getProtectedRoots: () => { userDataDir: string, agentPrivateTempDir: string }
+  getProtectedRoots: () => {
+    userDataDir: string
+    agentPrivateTempDir: string
+    agentWorkspaceStagingDir: string
+  }
 }
 
 export class RendererFilesystemAccessError extends Error {
@@ -60,13 +64,25 @@ export class RendererFilesystemAccess {
     }
   }
 
-  async #assertNotProtected(candidate: string, configured: readonly string[]): Promise<void> {
+  async #assertNotProtected(
+    candidate: string,
+    configured: readonly string[],
+    rejectProtectedAncestor = false,
+  ): Promise<void> {
     const rawProtected = this.#options.getProtectedRoots()
     const protectedRoot = async (value: string): Promise<string> => {
       try { return await realpath(resolve(value)) } catch { return resolve(value) }
     }
     const agentPrivateTempDir = await protectedRoot(rawProtected.agentPrivateTempDir)
-    if (isWithin(agentPrivateTempDir, candidate)) throw new RendererFilesystemAccessError()
+    if (isWithin(agentPrivateTempDir, candidate)
+      || (rejectProtectedAncestor && isWithin(candidate, agentPrivateTempDir))) {
+      throw new RendererFilesystemAccessError()
+    }
+    const agentWorkspaceStagingDir = await protectedRoot(rawProtected.agentWorkspaceStagingDir)
+    if (isWithin(agentWorkspaceStagingDir, candidate)
+      || (rejectProtectedAncestor && isWithin(candidate, agentWorkspaceStagingDir))) {
+      throw new RendererFilesystemAccessError()
+    }
     const userDataDir = await protectedRoot(rawProtected.userDataDir)
     if (isWithin(userDataDir, candidate) && !configured.some((root) => isWithin(root, candidate))) {
       throw new RendererFilesystemAccessError()
@@ -115,8 +131,8 @@ export class RendererFilesystemAccess {
     const dest = await canonicalDirectory(raw.dest)
     const roots = await this.#roots()
     const mutableRoots = [roots.modelsDir, roots.workspaceDir, roots.workflowsDir]
-    await this.#assertNotProtected(src, mutableRoots)
-    await this.#assertNotProtected(dest, mutableRoots)
+    await this.#assertNotProtected(src, mutableRoots, true)
+    await this.#assertNotProtected(dest, mutableRoots, true)
     if (!mutableRoots.includes(src) || !this.#selectedRoots.has(dest)
       || isWithin(src, dest) || isWithin(dest, src)) {
       throw new RendererFilesystemAccessError()
@@ -128,7 +144,7 @@ export class RendererFilesystemAccess {
     const candidate = await canonicalDirectory(value)
     const roots = await this.#roots()
     const mutableRoots = [roots.modelsDir, roots.workspaceDir, roots.workflowsDir]
-    await this.#assertNotProtected(candidate, mutableRoots)
+    await this.#assertNotProtected(candidate, mutableRoots, true)
     if (!mutableRoots.includes(candidate) && candidate !== join(roots.workspaceDir, 'tmp')) {
       throw new RendererFilesystemAccessError()
     }

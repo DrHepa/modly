@@ -14,6 +14,7 @@ test('renderer filesystem access is limited to canonical configured roots and ex
   const workflowsDir = join(userDataDir, 'workflows')
   const extensionsDir = join(userDataDir, 'extensions')
   const agentPrivateTempDir = join(userDataDir, 'agent-private')
+  const agentWorkspaceStagingDir = join(workspaceDir, 'Workflows', 'agent-actions', '.staging')
   const selectedDir = join(root, 'selected')
   const outsideDir = join(root, 'outside')
   const workspacePrefixTrap = `${workspaceDir}-evil`
@@ -22,12 +23,13 @@ test('renderer filesystem access is limited to canonical configured roots and ex
   }
   await mkdir(join(workspaceDir, 'tmp'))
   await mkdir(join(workspaceDir, 'Workflows', 'agent-actions'), { recursive: true })
+  await mkdir(agentWorkspaceStagingDir, { recursive: true })
   await mkdir(join(selectedDir, 'nested'))
   await symlink(workspaceDir, join(root, 'workspace-link'))
 
   const access = new RendererFilesystemAccess({
     getConfiguredRoots: () => ({ modelsDir, workspaceDir, workflowsDir, extensionsDir }),
-    getProtectedRoots: () => ({ userDataDir, agentPrivateTempDir }),
+    getProtectedRoots: () => ({ userDataDir, agentPrivateTempDir, agentWorkspaceStagingDir }),
   })
 
   try {
@@ -36,6 +38,8 @@ test('renderer filesystem access is limited to canonical configured roots and ex
     await assert.rejects(access.resolveListDirectory(outsideDir))
     await assert.rejects(access.resolveListDirectory(userDataDir))
     await assert.rejects(access.resolveListDirectory(agentPrivateTempDir))
+    await assert.rejects(access.resolveListFiles(agentWorkspaceStagingDir))
+    await assert.rejects(access.grantSelectedDirectory(agentWorkspaceStagingDir))
     await assert.rejects(access.resolveListDirectory(join(root, 'workspace-link')))
 
     assert.equal(await access.grantSelectedDirectory(selectedDir), selectedDir)
@@ -50,10 +54,11 @@ test('renderer filesystem access is limited to canonical configured roots and ex
     await assert.rejects(access.resolveMoveDirectory({ src: outsideDir, dest: selectedDir }))
     await assert.rejects(access.resolveMoveDirectory({ src: modelsDir, dest: outsideDir }))
 
-    assert.equal(await access.resolveDeleteDirectory(workspaceDir), workspaceDir)
+    await assert.rejects(access.resolveDeleteDirectory(workspaceDir))
     assert.equal(await access.resolveDeleteDirectory(join(workspaceDir, 'tmp')), join(workspaceDir, 'tmp'))
     await assert.rejects(access.resolveDeleteDirectory(join(workspaceDir, 'Workflows', 'agent-actions')))
     await assert.rejects(access.resolveDeleteDirectory(agentPrivateTempDir))
+    await assert.rejects(access.resolveMoveDirectory({ src: workspaceDir, dest: selectedDir }))
   } finally {
     await rm(root, { recursive: true, force: true })
   }

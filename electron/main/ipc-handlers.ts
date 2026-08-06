@@ -46,7 +46,7 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { activeExtensionInstalls, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { activeExtensionInstalls, listAgentCapabilities, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { fetchTrustedRepos } from './trusted-repos'
@@ -1557,6 +1557,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
+
+  ipcMain.handle('agentCapabilities:list', async () => {
+    const userData = app.getPath('userData')
+    return listAgentCapabilities({
+      builtinDir: getBuiltinExtensionsDir(),
+      userExtensionsDir: getSettings(userData).extensionsDir,
+      trustedRepos: await fetchTrustedRepos(),
+    })
+  })
 
   // Bundle discovery wraps the same transactional install and setup contract.
   ipcMain.handle('extensions:installFromGitHub', async (_event, githubUrl: string) => {

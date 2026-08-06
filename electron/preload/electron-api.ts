@@ -9,6 +9,7 @@ import type {
   AssetLibraryReadResult,
 } from '../../src/shared/types/assetLibrary'
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
+import type { AgentCapabilityInventoryResult } from '../../src/shared/types/agentActions.ts'
 
 export interface IpcRendererLike {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
@@ -51,6 +52,9 @@ export function createElectronApi(
         ipcRenderer.invoke('automation:capabilities') as Promise<AutomationCapabilitiesResponse>,
     },
 
+    agentCapabilities: {
+      list: (): Promise<AgentCapabilityInventoryResult> => ipcRenderer.invoke('agentCapabilities:list') as Promise<AgentCapabilityInventoryResult>,
+    },
     agentSessions: {
       list: (): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:list') as Promise<AgentSessionListResult>,
       create: (request: AgentSessionCreateRequest): Promise<AgentSession> => ipcRenderer.invoke('agentSessions:create', request) as Promise<AgentSession>,

@@ -6,6 +6,23 @@ import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdap
 import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, MotionRetargetSourceBone, MotionRetargetSessionSnapshot } from '../../areas/generate/motionRetargetPlan.ts'
 import type { PlyKind } from '../ply/plyHeaderClassification.ts'
 import type { AgentSessionsApi } from './agentSessions.ts'
+import type { AgentCapabilitiesApi, AgentCapabilityDeclarationV1 } from './agentActions.ts'
+
+export type {
+  AgentActionApprovalV1,
+  AgentActionEventV1,
+  AgentActionPublicSummaryV1,
+  AgentActionStatus,
+  AgentActionV1,
+  AgentApprovalPolicyV1,
+  AgentCapabilitiesApi,
+  AgentCapabilityDeclarationV1,
+  AgentCapabilityInventoryResult,
+  AgentCapabilitySnapshotV1,
+  AgentOllamaModelSnapshotV1,
+  ArtifactRefV1,
+  JsonValue,
+} from './agentActions.ts'
 
 export type {
   ArtifactKind,
@@ -110,6 +127,7 @@ export interface ExtensionNode<
   weightGroups?:    string[]
   weightVariants?:  WeightVariantsInfo
   automation?:      CapabilityAutomationMetadata
+  agent?:           AgentCapabilityDeclarationV1
 }
 
 export interface CapabilityPauseMetadata {
@@ -1093,6 +1111,7 @@ declare global {
   interface Window {
     electron: {
       agentSessions: AgentSessionsApi
+      agentCapabilities: AgentCapabilitiesApi
       shell: {
         openExternal: (url: string) => Promise<void>
       }

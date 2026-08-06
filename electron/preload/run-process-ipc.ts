@@ -1,5 +1,8 @@
 import type { ProcessInput, ProcessResult } from '../../src/shared/types/electron.d'
 
+// Legacy user-driven workflow surface. Governed Agent actions must never import
+// or invoke this channel; migration into the future broker is tracked separately.
+
 type IpcInvoke = (
   channel: string,
   extensionId: string,

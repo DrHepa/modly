@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync, statSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -142,21 +142,53 @@ test('action application attempts every returned action exactly once after a han
   }
 })
 
-test('failed-turn workflows suppress agent re-entry while successful workflows retain follow-up', async () => {
+test('Agent mutation payloads fail closed before any legacy mutation can run', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
-    assert.equal(module.shouldNotifyAgentAfterWorkflowCompletion({
-      id: 'wf-failed-turn',
-      name: 'Failed turn workflow',
-      notifyAgentOnCompletion: false,
-    }), false)
-    assert.equal(module.shouldNotifyAgentAfterWorkflowCompletion({
-      id: 'wf-success-turn',
-      name: 'Successful turn workflow',
-      notifyAgentOnCompletion: true,
-    }), true)
+    const actions = [
+      { tool: 'smooth_mesh', result: 'mesh', payload: { type: 'mesh_update', url: '/workspace/mesh.glb' } },
+      { tool: 'run_workflow', result: 'run', payload: { type: 'run_workflow', workflow_id: 'wf-1', workflow_name: 'Workflow' } },
+      {
+        tool: 'create_workflow',
+        result: 'create',
+        payload: {
+          type: 'create_workflow',
+          workflow: { name: 'Draft', description: 'Draft workflow', nodes: [], edges: [] },
+        },
+      },
+    ]
+    const legacyMutations: string[] = []
+
+    const failures = await module.applyAgentActions(actions, async (action: { payload: { type: string } }) => {
+      await module.rejectUngovernedAgentAction(action)
+      legacyMutations.push(action.payload.type)
+    })
+
+    assert.deepEqual(legacyMutations, [])
+    assert.equal(failures.length, 3)
+    for (const failure of failures) {
+      assert.equal(failure.error?.code, 'governed_action_required')
+      assert.equal(failure.error?.message, 'This action requires approval before Modly can apply it.')
+    }
   } finally {
     await cleanup()
+  }
+})
+
+test('ChatPanel has no transitive legacy workflow or mesh mutation path for Agent actions', async () => {
+  const source = await readFile(chatPanelEntry, 'utf8')
+  for (const forbidden of [
+    '@areas/workflows/workflowRunStore',
+    'useWorkflowRunStore',
+    'runWorkflow',
+    'saveWorkflow',
+    'setActiveWorkflow',
+    'updateCurrentJob',
+    'pushMeshUrl',
+    'pendingWorkflow',
+    'setPendingWorkflow',
+  ]) {
+    assert.equal(source.includes(forbidden), false, `ChatPanel must not contain ${forbidden}`)
   }
 })
 
@@ -245,18 +277,6 @@ test('restoring history retains safe summaries and degrades only a failed attach
     )
     assert.deepEqual(restored.summaries, [{ kind: 'action', label: 'Ran workflow' }])
     assert.equal(restored.imageDataUrls.length, 1)
-  } finally {
-    await cleanup()
-  }
-})
-
-test('workflow failure persistence uses a safe summary without raw runtime errors', async () => {
-  const { module, cleanup } = await loadChatPanelModule()
-  try {
-    const message = module.buildSafeWorkflowFailureMessage('Mesh cleanup', 'failure-1', '/home/user/secret.log token=private')
-    assert.equal(message.content, "Workflow 'Mesh cleanup' failed.")
-    assert.deepEqual(message.summaries, [{ kind: 'action', label: 'Workflow failed: Mesh cleanup' }])
-    assert.equal(JSON.stringify(message).includes('/home/user/secret.log'), false)
   } finally {
     await cleanup()
   }

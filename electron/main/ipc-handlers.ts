@@ -47,6 +47,10 @@ import { updatesSupported } from './updater'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 import { importVideoInputToWorkspace } from './video-input-import'
 import { AgentSessionStore } from './agent-session-store'
+import { AgentActionsService } from './agent-actions-service'
+import { registerAgentActionsIpcHandlers } from './agent-actions-ipc'
+import { WorkspaceAgentArtifactVerifier } from './agent-artifact-verifier'
+import type { AgentOllamaModelSnapshotV1 } from '../../src/shared/types/agentActions.ts'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -333,6 +337,25 @@ async function resolveOwnershipContext(userData: string, capabilityId: string) {
   return { extensions, ownership, siblingCapabilityIds }
 }
 
+async function resolveCurrentOllamaModel(expected: AgentOllamaModelSnapshotV1): Promise<unknown> {
+  const response = await axios.get(`${expected.endpoint}/api/tags`, { timeout: 5_000 })
+  const payload = response.data
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { models?: unknown }).models)) return null
+  const model = (payload as { models: unknown[] }).models.find((candidate) => {
+    if (!candidate || typeof candidate !== 'object') return false
+    const record = candidate as { name?: unknown, model?: unknown }
+    return record.name === expected.model || record.model === expected.model
+  })
+  if (!model || typeof model !== 'object') return null
+  const digest = (model as { digest?: unknown }).digest
+  return {
+    provider: 'ollama',
+    endpoint: expected.endpoint,
+    model: expected.model,
+    digest,
+  }
+}
+
 export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
   const activeDownloads = new Map<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>()
   const agentSessionStore = new AgentSessionStore({ rootDir: join(app.getPath('userData'), 'agent-sessions') })
@@ -347,6 +370,26 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('agentSessions:addAttachment', (_event, request) => agentSessionStore.addAttachment(request))
   ipcMain.handle('agentSessions:removeAttachment', (_event, request) => agentSessionStore.removeAttachment(request))
   ipcMain.handle('agentSessions:readAttachment', (_event, request) => agentSessionStore.readAttachment(request))
+
+  const agentActionsService = new AgentActionsService({
+    resolveCapabilities: async () => {
+      const userData = app.getPath('userData')
+      return listAgentCapabilities({
+        builtinDir: getBuiltinExtensionsDir(),
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        trustedRepos: await fetchTrustedRepos(),
+      })
+    },
+    resolveCurrentModel: resolveCurrentOllamaModel,
+    artifactVerifier: new WorkspaceAgentArtifactVerifier({
+      getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
+    }),
+    // A governed production executor is introduced separately. Until then,
+    // execution consumes approval and fails closed as executor_unavailable.
+    isExecutorAvailable: () => false,
+    executor: async () => { throw new Error('Governed Agent executor is unavailable') },
+  })
+  registerAgentActionsIpcHandlers(ipcMain, agentActionsService)
 
   const handleStructuredModelAssetDownload = async (
     event: IpcMainInvokeEvent,

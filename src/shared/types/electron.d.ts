@@ -6,14 +6,22 @@ import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdap
 import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, MotionRetargetSourceBone, MotionRetargetSessionSnapshot } from '../../areas/generate/motionRetargetPlan.ts'
 import type { PlyKind } from '../ply/plyHeaderClassification.ts'
 import type { AgentSessionsApi } from './agentSessions.ts'
-import type { AgentCapabilitiesApi, AgentCapabilityDeclarationV1 } from './agentActions.ts'
+import type { AgentActionsApi, AgentCapabilitiesApi, AgentCapabilityDeclarationV1 } from './agentActions.ts'
 
 export type {
   AgentActionApprovalV1,
+  AgentActionDecision,
+  AgentActionDecisionRequest,
   AgentActionEventV1,
+  AgentActionIdRequest,
+  AgentActionListResult,
+  AgentActionMutationResult,
+  AgentActionProposeRequest,
   AgentActionPublicSummaryV1,
+  AgentActionPublicErrorCode,
   AgentActionStatus,
   AgentActionV1,
+  AgentActionsApi,
   AgentApprovalPolicyV1,
   AgentCapabilitiesApi,
   AgentCapabilityDeclarationV1,
@@ -1083,6 +1091,7 @@ export interface AutomationCapabilitiesResponse {
 declare global {
   interface Window {
     electron: {
+      agentActions: AgentActionsApi
       agentSessions: AgentSessionsApi
       agentCapabilities: AgentCapabilitiesApi
       shell: {

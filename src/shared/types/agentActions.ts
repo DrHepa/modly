@@ -43,10 +43,38 @@ export interface AgentProcessArtifactContractV1 {
   allowed: AgentProcessArtifactPolicyV1[]
 }
 
+export interface AgentProcessPythonRuntimeDeclarationV1 {
+  kind: 'extension-python-venv-v1'
+  interpreter: 'bin/python'
+}
+
+export interface AgentProcessPythonBaseInterpreterIdentityV1 {
+  device: string
+  inode: string
+  uid: number
+  gid: number
+  mode: number
+  size: number
+  nlink: number
+  mtimeNs: string
+  ctimeNs: string
+  sha256: string
+}
+
+export interface AgentProcessPythonRuntimeBindingV1 extends AgentProcessPythonRuntimeDeclarationV1 {
+  baseInterpreter: AgentProcessPythonBaseInterpreterIdentityV1
+  treeDigest: string
+  sourceIdentityHash: string
+  entryCount: number
+  logicalBytes: number
+  bindingHash: string
+}
+
 export interface AgentProcessDeclarationV1 {
   schema: 'modly.agent-process.v1'
   runtimeFiles: string[]
   resourceFiles: string[]
+  runtime?: AgentProcessPythonRuntimeDeclarationV1
   artifacts: AgentProcessArtifactContractV1
 }
 
@@ -68,6 +96,7 @@ export interface AgentProcessExecutionV1 {
   entry: string
   runtimeFiles: AgentProcessRuntimeFileIdentityV1[]
   resourceFiles: AgentProcessRuntimeFileIdentityV1[]
+  runtime?: AgentProcessPythonRuntimeBindingV1
   runtimeHash: string
   artifacts: AgentProcessArtifactContractV1
   bindingHash: string

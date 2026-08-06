@@ -75,6 +75,10 @@ function agentProcessPrivateTempRoot(userDataDir: string): string {
   return join(userDataDir, 'agent-process-private')
 }
 
+function agentProcessRuntimeSnapshotRoot(userDataDir: string): string {
+  return join(userDataDir, 'agent-process-runtime-snapshots')
+}
+
 // ─── GPU detect (best-effort, no Python required) ─────────────────────────────
 
 interface GpuInfo {
@@ -404,6 +408,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return {
         userDataDir,
         agentPrivateTempDir: agentProcessPrivateTempRoot(userDataDir),
+        agentRuntimeSnapshotDir: agentProcessRuntimeSnapshotRoot(userDataDir),
         agentWorkspaceStagingDir: agentMcpWorkspaceStagingRoot(getSettings(userDataDir).workspaceDir),
       }
     },
@@ -434,10 +439,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         builtinDir: getBuiltinExtensionsDir(),
         userExtensionsDir: getSettings(userData).extensionsDir,
         trustedRepos: await fetchTrustedRepos(),
+        processPythonExecutable: () => getVenvPythonExe(userData),
       }, capabilityId)
     },
     resolveCurrentModel: resolveCurrentOllamaModel,
     resolvePythonExecutable: () => getVenvPythonExe(app.getPath('userData')),
+    getRuntimeSnapshotRoot: () => agentProcessRuntimeSnapshotRoot(app.getPath('userData')),
+    pythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
   })
   const agentActionsService = new AgentActionsService({
     resolveCapabilities: async () => {
@@ -448,6 +456,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         trustedRepos: await fetchTrustedRepos(),
         hostRuntimes: agentHostRuntimes,
         mcpSandboxReadiness,
+        processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
+        processPythonExecutable: () => getVenvPythonExe(userData),
       })
     },
     resolveCurrentModel: resolveCurrentOllamaModel,
@@ -1246,6 +1256,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       trustedRepos: await fetchTrustedRepos(),
       hostRuntimes: agentHostRuntimes,
       mcpSandboxReadiness,
+      processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
+      processPythonExecutable: () => getVenvPythonExe(userData),
     })
   })
 

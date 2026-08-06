@@ -1223,12 +1223,18 @@ async function buildAgentCapabilitySnapshot(
   extension: ListedProcessExtension,
   node: ListedExtensionNode<ArtifactKind>,
   extensionDir: string,
-): Promise<AgentCapabilitySnapshotV1 | undefined> {
-  if (!node.agent) return undefined
+  processPythonExecutable?: string,
+): Promise<{
+  capability?: AgentCapabilitySnapshotV1
+  error?: { code: string, message: string, capabilityId: string }
+}> {
+  if (!node.agent) return {}
   try {
     const paramsSchema = normalizeAgentParamsSchema(node.paramsSchema)
     const inputs = node.inputs?.map((input) => ({ ...input }))
-    const execution = await bindAgentProcessExecution(extensionDir, extension.entry, node.agent.process)
+    const execution = await bindAgentProcessExecution(
+      extensionDir, extension.entry, node.agent.process, processPythonExecutable,
+    )
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1250,9 +1256,31 @@ async function buildAgentCapabilitySnapshot(
       execution,
       approval: { ...node.agent.approval },
     }
-    return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
-  } catch {
-    return undefined
+    return { capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }) }
+  } catch (error) {
+    const runtimeRequired = node.agent.process.runtime?.kind === 'extension-python-venv-v1'
+    const stale = error instanceof AgentProcessManifestError && error.code === 'runtime_stale'
+    const unavailable = error instanceof AgentProcessManifestError && error.code === 'unsafe_runtime'
+    const code = runtimeRequired
+      ? stale ? 'PROCESS_PYTHON_RUNTIME_STALE' : unavailable ? 'PROCESS_PYTHON_RUNTIME_UNAVAILABLE' : 'PROCESS_AGENT_METADATA_INVALID'
+      : stale ? 'PROCESS_RUNTIME_STALE' : unavailable ? 'PROCESS_RUNTIME_UNAVAILABLE' : 'PROCESS_AGENT_METADATA_INVALID'
+    return {
+      error: {
+        code,
+        message: runtimeRequired
+          ? stale
+            ? 'An extension Python runtime changed during discovery and was excluded.'
+            : unavailable
+              ? 'An extension Python runtime is missing or unsafe and was excluded.'
+              : 'An Agent process declaration is invalid and was excluded.'
+          : stale
+            ? 'An Agent process runtime changed during discovery and was excluded.'
+            : unavailable
+              ? 'An Agent process runtime is missing or unsafe and was excluded.'
+              : 'An Agent process declaration is invalid and was excluded.',
+        capabilityId: node.agent.capability_id,
+      },
+    }
   }
 }
 
@@ -1322,17 +1350,38 @@ export async function listAgentCapabilities(options: {
   hostRuntimes?: AgentHostRuntimeRegistry
   mcpSandboxReady?: boolean | Readonly<Record<AgentMcpArtifactOutputContractV1['profile'], boolean>>
   mcpSandboxReadiness?: (profile: AgentMcpArtifactOutputContractV1['profile']) => Promise<boolean>
+  processPythonSandboxReadiness?: () => Promise<boolean>
+  processPythonExecutable?: () => string | null | Promise<string | null>
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
     listVisibleResolvedExtensionsDetailed(options),
     discoverGovernedMcpTools(options),
   ])
+  const processPythonExecutable = options.processPythonExecutable
+    ? await Promise.resolve(options.processPythonExecutable()).catch(() => null) ?? undefined
+    : undefined
   const processResults = await Promise.all(result.extensions.flatMap((resolved) => {
     const extension = resolved.extension
     if (extension.type !== 'process') return []
-    return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(extension, node, resolved.extDir))
+    return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(
+      extension, node, resolved.extDir, processPythonExecutable,
+    ))
   }))
-  const processCandidates = processResults.filter((snapshot): snapshot is AgentCapabilitySnapshotV1 => snapshot !== undefined)
+  const processFailures = processResults.flatMap((result) => result.error ? [result.error] : [])
+  const discoveredProcessCandidates = processResults.flatMap((result) => result.capability ? [result.capability] : [])
+  const hasPythonRuntime = discoveredProcessCandidates.some((candidate) => (
+    candidate.execution?.kind === 'process' && candidate.execution.runtime !== undefined
+  ))
+  let pythonSandboxReady = !hasPythonRuntime
+  if (hasPythonRuntime && options.processPythonSandboxReadiness) {
+    pythonSandboxReady = await options.processPythonSandboxReadiness().then((ready) => ready === true).catch(() => false)
+  }
+  const processCandidates = discoveredProcessCandidates.filter((candidate) => (
+    candidate.execution?.kind !== 'process' || candidate.execution.runtime === undefined || pythonSandboxReady
+  ))
+  const unavailablePythonCapabilities = pythonSandboxReady ? [] : discoveredProcessCandidates.flatMap((candidate) => (
+    candidate.execution?.kind === 'process' && candidate.execution.runtime !== undefined ? [candidate.id] : []
+  ))
   const profileReadiness = new Map<AgentMcpArtifactOutputContractV1['profile'], boolean>()
   const readinessProbe = options.mcpSandboxReadiness
   if (readinessProbe) {
@@ -1385,6 +1434,12 @@ export async function listAgentCapabilities(options: {
           ? 'An extension manifest is invalid and was excluded from Agent discovery.'
           : 'Agent capability discovery could not inspect one or more extensions.',
       })),
+      ...processFailures,
+      ...unavailablePythonCapabilities.map((capabilityId) => ({
+        code: 'PROCESS_PYTHON_SANDBOX_UNAVAILABLE',
+        message: 'An extension Python Agent capability is unavailable because its production sandbox readiness probe failed.',
+        capabilityId,
+      })),
       ...mcpResult.errors.map((error) => ({
         code: error.code,
         message: error.message,
@@ -1410,18 +1465,28 @@ export type GovernedAgentProcessTarget = Readonly<{
 }>
 
 export async function resolveGovernedAgentProcessTarget(
-  options: { builtinDir: string, userExtensionsDir: string, trustedRepos: Set<string> },
+  options: {
+    builtinDir: string
+    userExtensionsDir: string
+    trustedRepos: Set<string>
+    processPythonExecutable?: () => string | null | Promise<string | null>
+  },
   capabilityId: string,
 ): Promise<GovernedAgentProcessTarget> {
   const result = await listVisibleResolvedExtensionsDetailed(options)
   const matches: GovernedAgentProcessTarget[] = []
+  const processPythonExecutable = options.processPythonExecutable
+    ? await Promise.resolve(options.processPythonExecutable()).catch(() => null) ?? undefined
+    : undefined
   for (const resolved of result.extensions) {
     if (resolved.extension.type !== 'process') continue
     for (const node of resolved.extension.nodes) {
       if (`${resolved.extension.id}/${node.id}` !== capabilityId) continue
-      const capability = await buildAgentCapabilitySnapshot(resolved.extension, node, resolved.extDir)
-      if (capability?.execution?.kind === 'process') {
-        matches.push({ capability, extensionDir: resolved.extDir, entry: resolved.extension.entry })
+      const capability = await buildAgentCapabilitySnapshot(
+        resolved.extension, node, resolved.extDir, processPythonExecutable,
+      )
+      if (capability.capability?.execution?.kind === 'process') {
+        matches.push({ capability: capability.capability, extensionDir: resolved.extDir, entry: resolved.extension.entry })
       }
     }
   }

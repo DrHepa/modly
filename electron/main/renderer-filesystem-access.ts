@@ -13,6 +13,7 @@ export interface RendererFilesystemAccessOptions {
   getProtectedRoots: () => {
     userDataDir: string
     agentPrivateTempDir: string
+    agentRuntimeSnapshotDir: string
     agentWorkspaceStagingDir: string
   }
 }
@@ -76,6 +77,10 @@ export class RendererFilesystemAccess {
     const agentPrivateTempDir = await protectedRoot(rawProtected.agentPrivateTempDir)
     if (isWithin(agentPrivateTempDir, candidate)
       || (rejectProtectedAncestor && isWithin(candidate, agentPrivateTempDir))) {
+      throw new RendererFilesystemAccessError()
+    }
+    const agentRuntimeSnapshotDir = await protectedRoot(rawProtected.agentRuntimeSnapshotDir)
+    if (isWithin(agentRuntimeSnapshotDir, candidate) || isWithin(candidate, agentRuntimeSnapshotDir)) {
       throw new RendererFilesystemAccessError()
     }
     const agentWorkspaceStagingDir = await protectedRoot(rawProtected.agentWorkspaceStagingDir)

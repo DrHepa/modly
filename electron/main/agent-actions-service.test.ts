@@ -11,6 +11,7 @@ import {
   type AgentActionExecutorRequest,
 } from './agent-actions-service.ts'
 import { WorkspaceAgentArtifactVerifier, type AgentArtifactVerifier } from './agent-artifact-verifier.ts'
+import { AgentProcessTerminalError } from './agent-process-executor.ts'
 import { sha256Canonical } from './agent-trust-contracts.ts'
 import type {
   AgentCapabilitySnapshotV1,
@@ -581,6 +582,38 @@ test('approval lease is consumed once and concurrent execute calls invoke the ex
   resolveExecution({ artifacts: [validOutput] })
   assert.equal((await first).status, 'completed')
   await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'invalid_state')
+  assert.equal(executions, 1)
+})
+
+test('terminal child failure consumes its single-use approval and completes no publication accounting', async () => {
+  const capability = capabilityFixture()
+  let executions = 0
+  const service = new AgentActionsService({
+    createActionId: () => 'action-terminal-child-failure',
+    createLease: () => 'one-use-secret-token-32bytes-error',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => {
+      executions += 1
+      throw new AgentActionsServiceError('execution_failed', new AgentProcessTerminalError({
+        code: 'model_binding_unavailable',
+        message: 'The approved model binding is unavailable.',
+      }))
+    },
+  })
+  const action = await service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+
+  await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'execution_failed')
+  const failed = await service.get({ actionId: action.id, originSessionId: 'test-session' })
+  assert.equal(failed.status, 'failed')
+  assert.deepEqual(failed.outputs, [])
+  assert.equal(executions, 1)
+  await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'invalid_state')
   assert.equal(executions, 1)
 })
 

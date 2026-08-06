@@ -143,6 +143,45 @@ test('message persistence is allowlisted and rejects runtime or secret-bearing f
   })
 })
 
+test('terminal governed action summaries persist only minimal safe public evidence', async () => {
+  await withStore(async (store) => {
+    const session = await store.create({})
+    const terminalSummary = {
+      kind: 'governed-action' as const,
+      label: 'Text to CAD completed',
+      governedAction: {
+        status: 'completed' as const,
+        capability: 'Text to CAD',
+        model: 'qwen3.6:latest',
+        outputs: [{ kind: 'mesh', sha256: 'a'.repeat(64), sizeBytes: 42 }],
+      },
+    }
+    const appended = await store.appendMessage({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      message: { id: 'terminal-action', role: 'assistant', content: 'Text to CAD completed.', summaries: [terminalSummary] },
+    })
+    assert.deepEqual(appended.messages[0].summaries, [terminalSummary])
+
+    for (const invalidSummary of [
+      { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, status: 'approved' } },
+      { ...terminalSummary, actionId: 'private-action-id' },
+      { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, digest: `sha256:${'b'.repeat(64)}` } },
+      { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, arguments: { input: '/home/user/private.glb' } } },
+      { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, outputs: [{ ...terminalSummary.governedAction.outputs[0], path: '/home/user/private.glb' }] } },
+    ]) {
+      await assert.rejects(
+        store.appendMessage({
+          sessionId: session.id,
+          expectedRevision: appended.revision,
+          message: { id: `invalid-${Math.random()}`, role: 'assistant', content: 'Invalid.', summaries: [invalidSummary as never] },
+        }),
+        /invalid agent session message/i,
+      )
+    }
+  })
+})
+
 test('optimistic revisions reject stale writes', async () => {
   await withStore(async (store) => {
     const session = await store.create({})

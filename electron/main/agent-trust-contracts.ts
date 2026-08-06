@@ -10,6 +10,7 @@ import {
   type AgentCapabilitySnapshotV1,
   type AgentOllamaModelSnapshotV1,
   type ArtifactRefV1,
+  type JsonPrimitive,
   type JsonValue,
 } from '../../src/shared/types/agentActions.ts'
 
@@ -889,6 +890,134 @@ function summarizeArtifact(artifact: ArtifactRefV1) {
   }
 }
 
+const APPROVAL_PREVIEW_LIMIT = 12
+const MCP_APPROVAL_PREVIEW_LIMIT = 128
+const MCP_APPROVAL_PREVIEW_DEPTH = 32
+const MCP_APPROVAL_PREVIEW_STRING_LENGTH = 4_096
+const SENSITIVE_PREVIEW_LABEL = /(token|secret|password|credential|authorization|bearer|jwt|private[ _-]?key|access[ _-]?key|api[ _-]?key|url|uri|path|file|directory)/i
+const SENSITIVE_PREVIEW_VALUE = /(?:\b(?:authorization|bearer|password|passwd|passphrase|token|secret|credential|api[ _-]?key|client[ _-]?secret)\b|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{8,}|\bgithub_pat_[A-Za-z0-9_]{8,}|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----)/i
+const URL_OR_PATH_VALUE = /(?:^[A-Za-z]:[\\/]|^[/\\]|[\\/]|:\/\/)/
+
+function previewText(value: unknown, sensitive: boolean): string {
+  if (sensitive) return '[redacted]'
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'number' && Number.isFinite(value)) return String(Object.is(value, -0) ? 0 : value)
+  if (typeof value !== 'string') return '[structured value]'
+  if (SENSITIVE_PREVIEW_VALUE.test(value) || URL_OR_PATH_VALUE.test(value)) return '[redacted]'
+  const normalized = Array.from(value, (character) => {
+    const code = character.charCodeAt(0)
+    return code <= 0x1f || code === 0x7f ? ' ' : character
+  }).join('').trim()
+  if (!normalized) return '[empty]'
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 157)}...`
+}
+
+function humanizePreviewLabel(value: string): string {
+  const normalized = value.replace(/[._-]+/g, ' ').trim().slice(0, 80)
+  return normalized ? `${normalized[0].toUpperCase()}${normalized.slice(1)}` : 'Value'
+}
+
+function mcpPreviewString(value: string): string {
+  if (value.length > MCP_APPROVAL_PREVIEW_STRING_LENGTH) {
+    throw new TypeError('MCP string exceeds the approval preview boundary')
+  }
+  if (!value) return '[empty]'
+  let escaped = ''
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]
+    const code = value.charCodeAt(index)
+    if (character === '\\') escaped += '\\\\'
+    else if (character === '\n') escaped += '\\n'
+    else if (character === '\r') escaped += '\\r'
+    else if (character === '\t') escaped += '\\t'
+    else if (code <= 0x1f || code === 0x7f) escaped += `\\u${code.toString(16).padStart(4, '0')}`
+    else escaped += character
+  }
+  return escaped
+}
+
+function mcpPreviewText(value: JsonPrimitive, path: string): string {
+  if (value === null) return 'null'
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'number' && Number.isFinite(value)) return String(Object.is(value, -0) ? 0 : value)
+  if (typeof value !== 'string') throw new TypeError('MCP approval value is not JSON-compatible')
+  if (SENSITIVE_PREVIEW_LABEL.test(path) || SENSITIVE_PREVIEW_VALUE.test(value) || URL_OR_PATH_VALUE.test(value)) {
+    return '[redacted]'
+  }
+  return mcpPreviewString(value)
+}
+
+function mcpApprovalPreview(argumentsValue: JsonValue): Array<{ label: string, value: string }> {
+  const preview: Array<{ label: string, value: string }> = []
+  const visit = (value: JsonValue, path: string, depth: number): void => {
+    if (depth > MCP_APPROVAL_PREVIEW_DEPTH || preview.length >= MCP_APPROVAL_PREVIEW_LIMIT) {
+      throw new TypeError('MCP arguments exceed the approval preview boundary')
+    }
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        preview.push({ label: path || '$', value: '[empty array]' })
+        return
+      }
+      value.forEach((child, index) => visit(child, `${path}[${index}]`, depth + 1))
+      return
+    }
+    if (value !== null && typeof value === 'object') {
+      const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+      if (entries.length === 0) {
+        preview.push({ label: path || '$', value: '[empty object]' })
+        return
+      }
+      for (const [key, child] of entries) visit(child, path ? `${path}.${key}` : key, depth + 1)
+      return
+    }
+    const label = path || '$'
+    preview.push({ label, value: mcpPreviewText(value, path) })
+  }
+  visit(argumentsValue, '', 0)
+  return preview
+}
+
+export function assertMcpApprovalArgumentsPreviewable(argumentsValue: JsonValue): void {
+  mcpApprovalPreview(argumentsValue)
+}
+
+function actionApprovalPreview(action: AgentActionV1): Array<{ label: string, value: string }> {
+  if (!action.arguments || typeof action.arguments !== 'object' || Array.isArray(action.arguments)) return []
+  const argumentsRecord = action.arguments as Record<string, JsonValue>
+  const preview: Array<{ label: string, value: string }> = []
+  const add = (labelValue: string, value: unknown) => {
+    if (preview.length >= APPROVAL_PREVIEW_LIMIT) return
+    const label = humanizePreviewLabel(labelValue)
+    preview.push({ label, value: previewText(value, SENSITIVE_PREVIEW_LABEL.test(labelValue)) })
+  }
+
+  if (action.capability.execution?.kind === 'mcp_tool') {
+    return mcpApprovalPreview(argumentsRecord)
+  }
+
+  const input = argumentsRecord.input
+  if (action.capability.node.inputs && input && typeof input === 'object' && !Array.isArray(input)) {
+    const namedInputs = input as Record<string, JsonValue>
+    for (const schema of action.capability.node.inputs) {
+      if (!Object.prototype.hasOwnProperty.call(namedInputs, schema.name)) continue
+      add(schema.label ?? schema.name, schema.type === 'text' ? namedInputs[schema.name] : `[${schema.type} artifact]`)
+    }
+  } else {
+    add('Input', action.capability.node.input === 'text' ? input : `[${action.capability.node.input} artifact]`)
+  }
+  const params = argumentsRecord.params
+  if (params && typeof params === 'object' && !Array.isArray(params)) {
+    const paramsRecord = params as Record<string, JsonValue>
+    for (const schemaValue of action.capability.node.paramsSchema) {
+      if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) continue
+      const schema = schemaValue as Record<string, JsonValue>
+      if (typeof schema.id !== 'string' || !Object.prototype.hasOwnProperty.call(paramsRecord, schema.id)) continue
+      add(typeof schema.label === 'string' ? schema.label : schema.id, paramsRecord[schema.id])
+    }
+  }
+  return preview
+}
+
 export function toAgentActionPublicSummary(actionValue: unknown, now = new Date().toISOString()): AgentActionPublicSummaryV1 {
   const action = assertAgentActionV1(actionValue, now)
   return {
@@ -903,6 +1032,7 @@ export function toAgentActionPublicSummary(actionValue: unknown, now = new Date(
       displayName: action.capability.displayName,
       description: action.capability.description,
       hash: action.capability.hash,
+      risk: action.capability.execution?.mutating === false ? 'read_only' : 'mutating',
     },
     model: {
       provider: action.model.provider,
@@ -910,6 +1040,7 @@ export function toAgentActionPublicSummary(actionValue: unknown, now = new Date(
       digest: action.model.digest,
     },
     approval: { ...action.approval },
+    preview: actionApprovalPreview(action),
     inputs: action.inputArtifacts.map(summarizeArtifact),
     outputs: action.outputArtifacts.map(summarizeArtifact),
   }

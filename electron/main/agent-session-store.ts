@@ -6,8 +6,10 @@ import path from 'node:path'
 import {
   AGENT_SESSION_SCHEMA,
   AGENT_SESSION_SCHEMA_VERSION,
+  AGENT_GOVERNED_TERMINAL_STATUSES,
   type AgentArtifactRef,
   type AgentAttachmentRef,
+  type AgentGovernedTerminalStatus,
   type AgentSession,
   type AgentSessionActivateRequest,
   type AgentSessionAddAttachmentRequest,
@@ -145,8 +147,35 @@ function parseArtifact(value: unknown): AgentArtifactRef | null {
 }
 
 function parseSummary(value: unknown): AgentSessionSummary | null {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['kind', 'label', 'artifact'])) return null
-  if ((value.kind !== 'action' && value.kind !== 'artifact') || !safePersistedText(value.label, 300)) return null
+  if (!isRecord(value) || !safePersistedText(value.label, 300)) return null
+  if (value.kind === 'governed-action') {
+    if (!hasOnlyKeys(value, ['kind', 'label', 'governedAction']) || !isRecord(value.governedAction)) return null
+    const governedAction = value.governedAction
+    if (!hasOnlyKeys(governedAction, ['status', 'capability', 'model', 'outputs'])) return null
+    if (typeof governedAction.status !== 'string'
+      || !(AGENT_GOVERNED_TERMINAL_STATUSES as readonly string[]).includes(governedAction.status)) return null
+    if (!safePersistedText(governedAction.capability, 200) || !safePersistedText(governedAction.model, 200)) return null
+    if (!Array.isArray(governedAction.outputs) || governedAction.outputs.length > 32) return null
+    const outputs = governedAction.outputs.map((output) => {
+      if (!isRecord(output) || !hasOnlyKeys(output, ['kind', 'sha256', 'sizeBytes'])) return null
+      if (!safePersistedText(output.kind, 80) || typeof output.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(output.sha256)) return null
+      if (!Number.isSafeInteger(output.sizeBytes) || (output.sizeBytes as number) < 0) return null
+      return { kind: output.kind.trim(), sha256: output.sha256, sizeBytes: output.sizeBytes as number }
+    })
+    if (outputs.some((output) => !output)) return null
+    return {
+      kind: 'governed-action',
+      label: value.label.trim(),
+      governedAction: {
+        status: governedAction.status as AgentGovernedTerminalStatus,
+        capability: governedAction.capability.trim(),
+        model: governedAction.model.trim(),
+        outputs: outputs as Array<{ kind: string, sha256: string, sizeBytes: number }>,
+      },
+    } as AgentSessionSummary
+  }
+  if (!hasOnlyKeys(value, ['kind', 'label', 'artifact'])) return null
+  if (value.kind !== 'action' && value.kind !== 'artifact') return null
   const artifact = value.artifact === undefined ? undefined : parseArtifact(value.artifact)
   if (value.artifact !== undefined && !artifact) return null
   if (value.kind === 'artifact' && !artifact) return null

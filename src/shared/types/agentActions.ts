@@ -89,6 +89,12 @@ export interface AgentOllamaModelSnapshotV1 {
   digest: string
 }
 
+export interface AgentOllamaModelSelectionV1 {
+  provider: 'ollama'
+  endpoint: string
+  model: string
+}
+
 export interface AgentActionApprovalV1 {
   scope: AgentApprovalScope
   expiresAt: string
@@ -132,9 +138,12 @@ export interface AgentActionPublicSummaryV1 {
   status: AgentActionStatus
   createdAt: string
   updatedAt: string
-  capability: Pick<AgentCapabilitySnapshotV1, 'id' | 'displayName' | 'description' | 'hash'>
+  capability: Pick<AgentCapabilitySnapshotV1, 'id' | 'displayName' | 'description' | 'hash'> & {
+    risk: 'read_only' | 'mutating'
+  }
   model: Pick<AgentOllamaModelSnapshotV1, 'provider' | 'model' | 'digest'>
   approval: AgentActionApprovalV1
+  preview: Array<{ label: string, value: string }>
   inputs: Array<Pick<ArtifactRefV1, 'id' | 'kind' | 'mediaType' | 'sha256' | 'sizeBytes'>>
   outputs: Array<Pick<ArtifactRefV1, 'id' | 'kind' | 'mediaType' | 'sha256' | 'sizeBytes'>>
 }
@@ -176,16 +185,42 @@ export type AgentActionPublicErrorCode =
   | 'internal_error'
 
 export interface AgentActionProposeRequest {
+  originSessionId: string
   capabilityId: string
+  capabilityHash: string
+  arguments: JsonValue
+  modelLeaseId: string
+}
+
+export interface AgentActionResolvedProposeRequest {
+  originSessionId: string
+  capabilityId: string
+  capabilityHash: string
   arguments: JsonValue
   model: AgentOllamaModelSnapshotV1
+}
+
+export interface AgentModelLeaseRequest {
+  originSessionId: string
+  model: AgentOllamaModelSelectionV1
+}
+
+export interface AgentModelLeaseV1 {
+  id: string
+  expiresAt: string
 }
 
 export interface AgentActionIdRequest {
   actionId: string
 }
 
-export interface AgentActionDecisionRequest extends AgentActionIdRequest {
+export interface AgentActionSessionRequest {
+  originSessionId: string
+}
+
+export interface AgentActionSessionGetRequest extends AgentActionIdRequest, AgentActionSessionRequest {}
+
+export interface AgentActionDecisionRequest extends AgentActionSessionGetRequest {
   decision: AgentActionDecision
 }
 
@@ -197,11 +232,16 @@ export type AgentActionListResult =
   | { ok: true, actions: AgentActionPublicSummaryV1[] }
   | { ok: false, error: { code: AgentActionPublicErrorCode } }
 
+export type AgentModelLeaseResult =
+  | { ok: true, lease: AgentModelLeaseV1 }
+  | { ok: false, error: { code: AgentActionPublicErrorCode } }
+
 export interface AgentActionsApi {
+  leaseModel(request: AgentModelLeaseRequest): Promise<AgentModelLeaseResult>
   propose(request: AgentActionProposeRequest): Promise<AgentActionMutationResult>
-  get(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
-  list(): Promise<AgentActionListResult>
+  get(request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult>
+  list(request: AgentActionSessionRequest): Promise<AgentActionListResult>
   decide(request: AgentActionDecisionRequest): Promise<AgentActionMutationResult>
-  execute(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
-  cancel(request: AgentActionIdRequest): Promise<AgentActionMutationResult>
+  execute(request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult>
+  cancel(request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult>
 }

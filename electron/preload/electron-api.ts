@@ -9,7 +9,7 @@ import type {
   AssetLibraryReadResult,
 } from '../../src/shared/types/assetLibrary'
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
-import type { AgentActionDecisionRequest, AgentActionIdRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentCapabilityInventoryResult } from '../../src/shared/types/agentActions.ts'
+import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult } from '../../src/shared/types/agentActions.ts'
 
 export interface IpcRendererLike {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
@@ -53,12 +53,13 @@ export function createElectronApi(
     },
 
     agentActions: {
+      leaseModel: (request: AgentModelLeaseRequest): Promise<AgentModelLeaseResult> => ipcRenderer.invoke('agentActions:leaseModel', request) as Promise<AgentModelLeaseResult>,
       propose: (request: AgentActionProposeRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:propose', request) as Promise<AgentActionMutationResult>,
-      get: (request: AgentActionIdRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:get', request) as Promise<AgentActionMutationResult>,
-      list: (): Promise<AgentActionListResult> => ipcRenderer.invoke('agentActions:list') as Promise<AgentActionListResult>,
+      get: (request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:get', request) as Promise<AgentActionMutationResult>,
+      list: (request: AgentActionSessionRequest): Promise<AgentActionListResult> => ipcRenderer.invoke('agentActions:list', request) as Promise<AgentActionListResult>,
       decide: (request: AgentActionDecisionRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:decide', request) as Promise<AgentActionMutationResult>,
-      execute: (request: AgentActionIdRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:execute', request) as Promise<AgentActionMutationResult>,
-      cancel: (request: AgentActionIdRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:cancel', request) as Promise<AgentActionMutationResult>,
+      execute: (request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:execute', request) as Promise<AgentActionMutationResult>,
+      cancel: (request: AgentActionSessionGetRequest): Promise<AgentActionMutationResult> => ipcRenderer.invoke('agentActions:cancel', request) as Promise<AgentActionMutationResult>,
     },
     agentCapabilities: {
       list: (): Promise<AgentCapabilityInventoryResult> => ipcRenderer.invoke('agentCapabilities:list') as Promise<AgentCapabilityInventoryResult>,

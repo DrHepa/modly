@@ -18,11 +18,38 @@ export interface AgentArtifactRef {
   workspacePath: string
 }
 
-export interface AgentSessionSummary {
+export interface AgentCompletedSessionSummary {
   kind: 'action' | 'artifact'
   label: string
   artifact?: AgentArtifactRef
 }
+
+export const AGENT_GOVERNED_TERMINAL_STATUSES = [
+  'rejected',
+  'expired',
+  'completed',
+  'failed',
+  'cancelled',
+] as const
+
+export type AgentGovernedTerminalStatus = typeof AGENT_GOVERNED_TERMINAL_STATUSES[number]
+
+export interface AgentGovernedActionTerminalSummary {
+  kind: 'governed-action'
+  label: string
+  governedAction: {
+    status: AgentGovernedTerminalStatus
+    capability: string
+    model: string
+    outputs: Array<{
+      kind: string
+      sha256: string
+      sizeBytes: number
+    }>
+  }
+}
+
+export type AgentSessionSummary = AgentCompletedSessionSummary | AgentGovernedActionTerminalSummary
 
 export interface AgentSessionMessage {
   id: string

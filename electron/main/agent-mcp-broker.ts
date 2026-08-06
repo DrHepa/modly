@@ -36,6 +36,11 @@ const MAX_RUNTIME_DEPTH = 32
 const MAX_RUNTIME_PROPERTIES = 2_048
 const MAX_RUNTIME_ARRAY = 1_000
 const MAX_RUNTIME_STRING = 200_000
+const MAX_APPROVAL_SCHEMA_DEPTH = 16
+const MAX_APPROVAL_SCHEMA_NODES = 512
+const MAX_APPROVAL_ARRAY_ITEMS = 100
+const MAX_APPROVAL_STRING_LENGTH = 4_096
+const APPROVAL_PROPERTY_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,127}$/
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 const MAX_RESULT_BYTES = MAX_MESSAGE_BYTES
@@ -217,6 +222,76 @@ export function validateMcpArguments(schema: unknown, value: unknown): JsonValue
   const validate = compileSchema(schema, 'invalid_arguments')
   if (!validate(normalized)) throw new AgentMcpBrokerError('invalid_arguments')
   return normalized
+}
+
+function assertPreviewableSchemaNode(
+  schema: unknown,
+  depth: number,
+  state: { nodes: number },
+): void {
+  if (depth > MAX_APPROVAL_SCHEMA_DEPTH || !isPlainRecord(schema)) {
+    throw new AgentMcpBrokerError('invalid_arguments')
+  }
+  state.nodes += 1
+  if (state.nodes > MAX_APPROVAL_SCHEMA_NODES) throw new AgentMcpBrokerError('invalid_arguments')
+  for (const keyword of [
+    '$ref', '$defs', 'definitions', 'patternProperties', 'propertyNames',
+    'unevaluatedProperties', 'dependentSchemas', 'dependencies',
+    'allOf', 'anyOf', 'oneOf', 'not', 'if', 'then', 'else',
+    'contains', 'prefixItems', 'unevaluatedItems', 'pattern', 'format',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(schema, keyword)) {
+      throw new AgentMcpBrokerError('invalid_arguments')
+    }
+  }
+  if (Array.isArray(schema.type) || typeof schema.type !== 'string') {
+    throw new AgentMcpBrokerError('invalid_arguments')
+  }
+  switch (schema.type) {
+    case 'object': {
+      if (schema.additionalProperties !== false || !isPlainRecord(schema.properties)) {
+        throw new AgentMcpBrokerError('invalid_arguments')
+      }
+      for (const [key, child] of Object.entries(schema.properties)) {
+        if (!APPROVAL_PROPERTY_NAME.test(key) || key === '__proto__' || key === 'prototype' || key === 'constructor') {
+          throw new AgentMcpBrokerError('invalid_arguments')
+        }
+        assertPreviewableSchemaNode(child, depth + 1, state)
+      }
+      return
+    }
+    case 'array':
+      if (
+        !Number.isSafeInteger(schema.maxItems)
+        || (schema.maxItems as number) < 0
+        || (schema.maxItems as number) > MAX_APPROVAL_ARRAY_ITEMS
+        || schema.items === undefined
+      ) throw new AgentMcpBrokerError('invalid_arguments')
+      assertPreviewableSchemaNode(schema.items, depth + 1, state)
+      return
+    case 'string':
+      if (!Number.isSafeInteger(schema.maxLength) || (schema.maxLength as number) < 0 || (schema.maxLength as number) > MAX_APPROVAL_STRING_LENGTH) {
+        throw new AgentMcpBrokerError('invalid_arguments')
+      }
+      return
+    case 'integer':
+    case 'number':
+    case 'boolean':
+    case 'null':
+      return
+    default:
+      throw new AgentMcpBrokerError('invalid_arguments')
+  }
+}
+
+/**
+ * Proposal-time validation intentionally uses the exact execution-time Ajv
+ * validator, then applies the smaller schema subset whose normalized values can
+ * be rendered completely in the approval UI.
+ */
+export function validateMcpProposalArguments(schema: unknown, value: unknown): JsonValue {
+  assertPreviewableSchemaNode(schema, 0, { nodes: 0 })
+  return validateMcpArguments(schema, value)
 }
 
 function validateStructuredOutput(schema: unknown | undefined, value: unknown): JsonValue {

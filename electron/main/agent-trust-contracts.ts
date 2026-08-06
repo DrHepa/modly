@@ -229,6 +229,29 @@ function capabilityUnsigned(capability: AgentCapabilitySnapshotV1): Omit<AgentCa
   return unsigned
 }
 
+function normalizeMcpExecution(value: unknown): AgentCapabilitySnapshotV1['execution'] {
+  if (value === undefined) return undefined
+  assertPlainRecord(value, 'Agent capability execution')
+  assertExactKeys(value, ['kind', 'inputSchema', 'inputSchemaHash', 'outputSchemaHash', 'mutating', 'bindingHash'], 'Agent capability execution')
+  if (value.kind !== 'mcp_tool') throw new TypeError('Agent capability execution kind is invalid')
+  assertPlainRecord(value.inputSchema, 'Agent capability MCP inputSchema')
+  const inputSchema = normalizeJsonValue(value.inputSchema)
+  if (sha256Canonical(inputSchema) !== normalizeSha256(value.inputSchemaHash, 'Agent capability MCP inputSchemaHash')) {
+    throw new TypeError('Agent capability MCP inputSchema hash does not match')
+  }
+  if (typeof value.mutating !== 'boolean') throw new TypeError('Agent capability MCP mutating must be a boolean')
+  return {
+    kind: 'mcp_tool',
+    inputSchema,
+    inputSchemaHash: value.inputSchemaHash as string,
+    ...(value.outputSchemaHash === undefined ? {} : {
+      outputSchemaHash: normalizeSha256(value.outputSchemaHash, 'Agent capability MCP outputSchemaHash'),
+    }),
+    mutating: value.mutating,
+    bindingHash: normalizeSha256(value.bindingHash, 'Agent capability MCP bindingHash'),
+  }
+}
+
 type AgentSnapshotInputs = NonNullable<AgentCapabilitySnapshotV1['node']['inputs']>
 type AgentSnapshotInput = AgentSnapshotInputs[number]
 
@@ -457,7 +480,7 @@ function normalizeAgentInputs(value: unknown): AgentSnapshotInputs | undefined {
 
 export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapabilitySnapshotV1 {
   assertPlainRecord(value, 'Agent capability snapshot')
-  assertExactKeys(value, ['schema', 'version', 'id', 'displayName', 'description', 'extension', 'node', 'approval', 'hash'], 'Agent capability snapshot')
+  assertExactKeys(value, ['schema', 'version', 'id', 'displayName', 'description', 'extension', 'node', 'execution', 'approval', 'hash'], 'Agent capability snapshot')
   if (value.schema !== 'modly.agent-capability.v1' || value.version !== 1) throw new TypeError('Agent capability snapshot schema/version is invalid')
   const id = assertString(value.id, 'Agent capability id', 257)
   const idSegments = id.split('/')
@@ -482,6 +505,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   if (!isArtifactKind(value.node.output)) throw new TypeError('Agent capability node output is invalid')
   const paramsSchema = normalizeAgentParamsSchema(value.node.paramsSchema)
   const inputs = normalizeAgentInputs(value.node.inputs)
+  const execution = normalizeMcpExecution(value.execution)
 
   assertPlainRecord(value.approval, 'Agent capability approval')
   assertExactKeys(value.approval, ['required', 'scope'], 'Agent capability approval')
@@ -494,6 +518,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
       id: nodeId, input, output: value.node.output,
       ...(inputs ? { inputs } : {}), paramsSchema,
     },
+    ...(execution ? { execution } : {}),
     approval: { required: true, scope: 'single_action' }, hash,
   }
   if (id !== `${extension.id}/${nodeId}`) throw new TypeError('Agent capability id must match its extension and node identity')

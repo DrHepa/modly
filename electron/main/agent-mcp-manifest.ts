@@ -859,22 +859,29 @@ export async function discoverGovernedMcpTools(options: {
     discoverRoot(options.userExtensionsDir, 'user', options.hostRuntimes),
   ])
   const candidates = [...builtin.tools, ...user.tools]
-  const counts = new Map<string, number>()
-  const identities = (candidate: DiscoveredMcpTool): string[] => [
-    `server:${candidate.extension.id}/${candidate.server.id}`,
-    `tool:${candidate.extension.id}/${candidate.server.id}/${candidate.tool.name}`,
-    `capability:${candidate.tool.capabilityId}`,
+  const ownersByIdentity = new Map<string, Set<object>>()
+  const identities = (candidate: DiscoveredMcpTool): readonly (readonly [string, object])[] => [
+    [`extension:${candidate.extension.id}`, candidate.manifest],
+    [`server:${candidate.extension.id}/${candidate.server.id}`, candidate.server],
+    [`tool:${candidate.extension.id}/${candidate.server.id}/${candidate.tool.name}`, candidate.tool],
+    [`capability:${candidate.tool.capabilityId}`, candidate.tool],
   ]
   for (const candidate of candidates) {
-    for (const identity of identities(candidate)) counts.set(identity, (counts.get(identity) ?? 0) + 1)
+    for (const [identity, owner] of identities(candidate)) {
+      const owners = ownersByIdentity.get(identity) ?? new Set<object>()
+      owners.add(owner)
+      ownersByIdentity.set(identity, owners)
+    }
   }
-  const collided = new Set([...counts].filter(([, count]) => count > 1).map(([identity]) => identity))
+  const collided = new Set([...ownersByIdentity]
+    .filter(([, owners]) => owners.size > 1)
+    .map(([identity]) => identity))
   const collisionCapabilities = [...new Set(candidates
-    .filter((candidate) => identities(candidate).some((identity) => collided.has(identity)))
+    .filter((candidate) => identities(candidate).some(([identity]) => collided.has(identity)))
     .map((candidate) => candidate.tool.capabilityId))].sort()
   return {
     tools: candidates
-      .filter((candidate) => identities(candidate).every((identity) => !collided.has(identity)))
+      .filter((candidate) => identities(candidate).every(([identity]) => !collided.has(identity)))
       .sort((left, right) => left.tool.capabilityId.localeCompare(right.tool.capabilityId)),
     errors: [
       ...builtin.errors,

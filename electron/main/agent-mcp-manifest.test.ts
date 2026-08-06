@@ -106,6 +106,29 @@ test('normalizes one strict versioned stdio declaration and binds executable ide
   }
 })
 
+test('normalization rejects duplicate server ids, tool names, and capability ids', () => {
+  const server = (manifest().servers as Record<string, unknown>[])[0]
+  const tool = (server.tools as Record<string, unknown>[])[0]
+  assert.throws(() => normalizeMcpManifest(manifest({
+    servers: [server, {
+      ...server,
+      tools: [{ ...tool, name: 'second_tool', capability_id: 'fixture-extension/second-tool' }],
+    }],
+  }), 'fixture-extension'), AgentMcpManifestError)
+  assert.throws(() => normalizeMcpManifest(manifest({
+    servers: [{
+      ...server,
+      tools: [tool, { ...tool, capability_id: 'fixture-extension/second-tool' }],
+    }],
+  }), 'fixture-extension'), AgentMcpManifestError)
+  assert.throws(() => normalizeMcpManifest(manifest({
+    servers: [{
+      ...server,
+      tools: [tool, { ...tool, name: 'second_tool' }],
+    }],
+  }), 'fixture-extension'), AgentMcpManifestError)
+})
+
 test('binds typed artifact inputs and bounded file outputs while rejecting a current-owned host runtime', async () => {
   const fixture = await extensionFixture()
   const runtimeRoot = join(fixture.root, 'blender-runtime')
@@ -320,12 +343,12 @@ test('binding rejects symlinks except a resolved non-world-writable venv Python 
   }
 })
 
-test('discovery collision-denies duplicate server, tool, and capability identities across roots', async () => {
+test('discovery collision-denies conflicting extension and server ownership across roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'modly-mcp-roots-'))
   const builtinDir = join(root, 'builtin')
   const userDir = join(root, 'user')
   try {
-    for (const base of [builtinDir, userDir]) {
+    for (const [index, base] of [builtinDir, userDir].entries()) {
       const ext = join(base, 'fixture-extension')
       await mkdir(join(ext, 'bin'), { recursive: true })
       await writeFile(join(ext, 'bin', 'server'), '#!/bin/sh\nexit 0\n')
@@ -333,13 +356,42 @@ test('discovery collision-denies duplicate server, tool, and capability identiti
       await writeFile(join(ext, 'server.mjs'), 'export {}\n')
       await mkdir(join(ext, 'assets'), { recursive: true })
       await writeFile(join(ext, 'assets', 'prompt.txt'), 'fixture prompt\n')
+      await writeFile(join(ext, 'assets', 'alternate.txt'), 'alternate runtime\n')
+      const server = (manifest().servers as Record<string, unknown>[])[0]
+      const tool = (server.tools as Record<string, unknown>[])[0]
+      const declaration = index === 0 ? manifest() : manifest({
+        servers: [{
+          ...server,
+          runtimeFiles: ['server.mjs', 'assets/prompt.txt', 'assets/alternate.txt'],
+          artifactOutput: {
+            profile: 'relative-files-v1', maxCount: 1,
+            maxArtifactBytes: 1024, maxTotalBytes: 1024,
+          },
+          tools: [{
+            ...tool,
+            name: 'inspect_scene',
+            capability_id: 'fixture-extension/inspect-scene',
+            display_name: 'Inspect scene',
+            artifact: {
+              outputs: [{
+                path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'],
+                max_bytes: 1024, required: true,
+              }],
+            },
+          }],
+        }],
+      })
       await writeFile(join(ext, 'manifest.json'), JSON.stringify({
-        id: 'fixture-extension', type: 'process', entry: 'processor.js', nodes: [], mcp: manifest(),
+        id: 'fixture-extension', type: 'process', entry: 'processor.js', nodes: [], mcp: declaration,
       }))
     }
     const result = await discoverGovernedMcpTools({ builtinDir, userExtensionsDir: userDir })
     assert.deepEqual(result.tools, [])
-    assert.ok(result.errors.some((error) => error.code === 'MCP_ID_COLLISION'))
+    assert.deepEqual(result.errors.filter((error) => error.code === 'MCP_ID_COLLISION')
+      .map((error) => error.capabilityId).sort(), [
+      'fixture-extension/inspect-scene',
+      'fixture-extension/write-artifact',
+    ])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

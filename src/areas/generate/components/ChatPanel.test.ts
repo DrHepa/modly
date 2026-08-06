@@ -192,6 +192,523 @@ test('ChatPanel has no transitive legacy workflow or mesh mutation path for Agen
   }
 })
 
+test('ChatPanel wires capability discovery and governed proposals without automatic execution', async () => {
+  const source = await readFile(chatPanelEntry, 'utf8')
+  assert.match(source, /window\.electron\.agentCapabilities\.list\(\)/)
+  assert.match(source, /proposeGovernedAgentActions\(\{[\s\S]*\n\s*proposals,/)
+  assert.match(source, /JSON\.stringify\(\{[\s\S]*capabilities[\s\S]*\}\)/)
+  assert.match(source, /<GovernedActionCard/)
+  assert.equal(source.includes('approveAndExecute'), false)
+})
+
+test('chat response parses bounded governed proposals separately from completed read actions', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const response = await module.parseAgentChatResponse({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        message: 'Approval is required.',
+        actions: [{ tool: 'list_models', result: '{}', payload: null }],
+        proposals: [{
+          type: 'action_proposal',
+          capabilityId: 'text-to-cad/generate',
+          capabilityHash: 'a'.repeat(64),
+          modelLeaseId: 'lease-1',
+          arguments: { input: 'chair', params: { quality: 'balanced' } },
+        }],
+      }),
+    })
+    assert.equal(response.actions.length, 1)
+    assert.deepEqual(response.proposals, [{
+      type: 'action_proposal',
+      capabilityId: 'text-to-cad/generate',
+      capabilityHash: 'a'.repeat(64),
+      modelLeaseId: 'lease-1',
+      arguments: { input: 'chair', params: { quality: 'balanced' } },
+    }])
+
+    await assert.rejects(module.parseAgentChatResponse({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        message: 'bad', actions: [],
+        proposals: [{
+          type: 'action_proposal', capabilityId: '__proto__/run', capabilityHash: 'a'.repeat(64),
+          modelLeaseId: 'lease-1', arguments: {},
+        }],
+      }),
+    }), /invalid agent response/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('capability prompt inventory is deterministic, bounded, and contains only safe hints', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const snapshot = {
+      schema: 'modly.agent-capability.v1', version: 1,
+      id: 'text-to-cad/generate', displayName: 'Text to CAD', description: 'Generate CAD.',
+      extension: { id: 'text-to-cad', name: 'Text to CAD' },
+      node: {
+        id: 'generate', input: 'text', output: 'mesh',
+        paramsSchema: [{ id: 'quality', label: 'Quality', type: 'select', default: 'balanced', options: [{ value: 'balanced', label: 'Balanced' }] }],
+      },
+      approval: { required: true, scope: 'single_action' },
+      hash: 'a'.repeat(64),
+    }
+    assert.deepEqual(module.buildAgentCapabilityPromptInventory({ capabilities: [snapshot], errors: [] }), [{
+      id: 'text-to-cad/generate', hash: 'a'.repeat(64), name: 'Text to CAD', description: 'Generate CAD.',
+      inputHints: [
+        { path: 'input', type: 'text', required: true, description: 'Text input' },
+        { path: 'params.quality', type: 'select', required: false, description: 'Quality', options: ['balanced'] },
+      ],
+    }])
+    assert.throws(() => module.buildAgentCapabilityPromptInventory({ capabilities: [snapshot, snapshot], errors: [] }), /collision/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('proposal handoff sends only the immutable session, capability hash, raw args, and opaque model lease', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const calls: unknown[] = []
+    const result = await module.proposeGovernedAgentActions({
+      proposals: [{
+        type: 'action_proposal', capabilityId: 'text-to-cad/generate', capabilityHash: 'a'.repeat(64),
+        modelLeaseId: 'lease-1', arguments: { input: 'chair', params: {} },
+      }],
+      originSessionId: 'session-a',
+      modelLeaseId: 'lease-1',
+      isCurrent: () => true,
+      propose: async (request: unknown) => {
+        calls.push(request)
+        return { ok: true, action: { id: 'action-1', status: 'proposed' } }
+      },
+    })
+    assert.deepEqual(calls, [{
+      originSessionId: 'session-a', capabilityId: 'text-to-cad/generate',
+      capabilityHash: 'a'.repeat(64), modelLeaseId: 'lease-1',
+      arguments: { input: 'chair', params: {} },
+    }])
+    for (const forbidden of ['digest', 'endpoint', 'qwen3.6']) {
+      assert.equal(JSON.stringify(calls).includes(forbidden), false, forbidden)
+    }
+    assert.equal(result.actions.length, 1)
+    assert.deepEqual(result.errors, [])
+
+    const stale = await module.proposeGovernedAgentActions({
+      proposals: [{
+        type: 'action_proposal', capabilityId: 'text-to-cad/generate', capabilityHash: 'a'.repeat(64),
+        modelLeaseId: 'lease-1', arguments: {},
+      }],
+      originSessionId: 'session-a',
+      modelLeaseId: 'lease-1',
+      isCurrent: () => true,
+      propose: async () => ({ ok: false, error: { code: 'model_stale' } }),
+    })
+    assert.deepEqual(stale.errors, [{ code: 'model_stale', message: 'The selected Ollama model changed or its digest is unavailable. Select the model again.' }])
+
+    const mismatchedLease = await module.proposeGovernedAgentActions({
+      proposals: [{
+        type: 'action_proposal', capabilityId: 'text-to-cad/generate', capabilityHash: 'a'.repeat(64),
+        modelLeaseId: 'lease-other', arguments: {},
+      }],
+      originSessionId: 'session-a',
+      modelLeaseId: 'lease-1',
+      isCurrent: () => true,
+      propose: async () => { throw new Error('must not run') },
+    })
+    assert.equal(mismatchedLease.actions.length, 0)
+    assert.equal(mismatchedLease.errors[0].code, 'model_stale')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a deferred proposal is compensated exactly once after its origin session switches', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const tracker = module.createGovernedProposalTracker()
+    let resolveProposal!: (result: unknown) => void
+    const compensationIds: string[] = []
+    const acceptedIds: string[] = []
+    let current = true
+    const pending = module.proposeGovernedAgentActions({
+      proposals: [{
+        type: 'action_proposal', capabilityId: 'text-to-cad/generate', capabilityHash: 'a'.repeat(64),
+        modelLeaseId: 'lease-1', arguments: { input: 'chair' },
+      }],
+      originSessionId: 'session-a',
+      modelLeaseId: 'lease-1',
+      isCurrent: () => current,
+      tracker,
+      acceptAction: (action: { id: string }) => { acceptedIds.push(action.id); return true },
+      compensate: async (action: { id: string }) => { compensationIds.push(action.id); return null },
+      propose: () => new Promise((resolve) => { resolveProposal = resolve }),
+    })
+
+    current = false
+    tracker.invalidateOrigin('session-a')
+    resolveProposal({ ok: true, action: { id: 'late-action', status: 'proposed' } })
+    const result = await pending
+    assert.deepEqual(acceptedIds, [])
+    assert.deepEqual(result.actions, [])
+    assert.deepEqual(compensationIds, ['late-action'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('unmount invalidation compensates a late proposal and tracker resolution is idempotent', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const tracker = module.createGovernedProposalTracker()
+    const lease = tracker.track('session-a', () => true)
+    tracker.invalidateAll()
+    let compensations = 0
+    const action = { id: 'late-unmount-action', status: 'proposed' }
+    const first = await lease.resolve(action, () => true, async () => { compensations += 1; return null })
+    const second = await lease.resolve(action, () => true, async () => { compensations += 1; return null })
+    assert.equal(first.kind, 'compensated')
+    assert.equal(second.kind, 'ignored')
+    assert.equal(compensations, 1)
+    assert.equal(tracker.size(), 0)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('late proposal compensation skips persistence after origin deletion and can reject a still-proposed action', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const persisted: string[] = []
+    const decisions: unknown[] = []
+    const cancellations: unknown[] = []
+    const result = await module.compensateLateGovernedProposal({
+      action: { id: 'deleted-origin-action', status: 'proposed' },
+      originSessionId: 'deleted-session',
+      sessionExists: () => false,
+      isOriginActive: () => false,
+      cancel: async (request: unknown) => {
+        cancellations.push(request)
+        return { ok: false, error: { code: 'invalid_state' } }
+      },
+      get: async () => ({ ok: true, action: { id: 'deleted-origin-action', status: 'proposed' } }),
+      list: async () => { throw new Error('terminal rejection must not poll') },
+      reject: async (request: unknown) => {
+        decisions.push(request)
+        return { ok: true, action: { id: 'deleted-origin-action', status: 'rejected' } }
+      },
+      persistTerminal: async (action: { id: string }) => { persisted.push(action.id) },
+      reportError: () => { throw new Error('deleted origin must not receive UI errors') },
+    })
+    assert.equal(result.kind, 'terminal')
+    assert.deepEqual(cancellations, [{ actionId: 'deleted-origin-action', originSessionId: 'deleted-session' }])
+    assert.deepEqual(decisions, [{
+      actionId: 'deleted-origin-action', originSessionId: 'deleted-session', decision: 'reject',
+    }])
+    assert.deepEqual(persisted, [])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('pending compensation keeps no UI authority, persists no terminal state, and reports only to an active origin', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const persisted: string[] = []
+    const errors: string[] = []
+    let originActive = false
+    let reconcileNowMs = 0
+    const input = {
+      action: { id: 'pending-action', status: 'proposed' },
+      originSessionId: 'session-a',
+      sessionExists: () => true,
+      isOriginActive: () => originActive,
+      cancel: async () => ({ ok: false, error: { code: 'cancellation_pending' } }),
+      get: async () => ({ ok: true, action: { id: 'pending-action', status: 'executing' } }),
+      list: async () => ({ ok: true, actions: [{ id: 'pending-action', status: 'executing' }] }),
+      reject: async () => { throw new Error('executing actions cannot be rejected') },
+      reconcileWait: async (milliseconds: number) => { reconcileNowMs += milliseconds },
+      reconcileNow: () => reconcileNowMs,
+      reconcileHardTimeoutMs: 1,
+      persistTerminal: async (action: { id: string }) => { persisted.push(action.id) },
+      reportError: (message: string) => { errors.push(message) },
+    }
+    assert.equal((await module.compensateLateGovernedProposal(input)).kind, 'pending')
+    assert.deepEqual(persisted, [])
+    assert.deepEqual(errors, [])
+
+    originActive = true
+    assert.equal((await module.compensateLateGovernedProposal(input)).kind, 'pending')
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /hidden.*expire/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('cancellation_pending reconciles through the session-filtered list even when the direct refresh fails', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const persisted: string[] = []
+    const listRequests: unknown[] = []
+    const result = await module.compensateLateGovernedProposal({
+      action: { id: 'pending-action', status: 'executing' },
+      originSessionId: 'session-a',
+      sessionExists: () => true,
+      isOriginActive: () => false,
+      cancel: async () => ({ ok: false, error: { code: 'cancellation_pending' } }),
+      get: async () => ({ ok: false, error: { code: 'internal_error' } }),
+      list: async (request: unknown) => {
+        listRequests.push(request)
+        return { ok: true, actions: [{ id: 'pending-action', status: 'cancelled' }] }
+      },
+      reject: async () => { throw new Error('must not reject executing actions') },
+      persistTerminal: async (action: { id: string }) => { persisted.push(action.id) },
+      reportError: () => { throw new Error('inactive origin must not receive UI errors') },
+    })
+    assert.equal(result.kind, 'terminal')
+    assert.deepEqual(listRequests, [{ originSessionId: 'session-a' }])
+    assert.deepEqual(persisted, ['pending-action'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('governed commands keep approve and run separate, gate sessions, and serialize double clicks', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const calls: Array<{ operation: string, request: unknown }> = []
+    const api = {
+      get: async (request: unknown) => { calls.push({ operation: 'get', request }); return { ok: true, action: { id: 'action-1', status: 'expired' } } },
+      decide: async (request: unknown) => { calls.push({ operation: 'decide', request }); return { ok: true, action: { id: 'action-1', status: 'approved' } } },
+      execute: async (request: unknown) => { calls.push({ operation: 'execute', request }); return { ok: true, action: { id: 'action-1', status: 'completed' } } },
+      cancel: async (request: unknown) => { calls.push({ operation: 'cancel', request }); return { ok: true, action: { id: 'action-1', status: 'cancelled' } } },
+    }
+    await module.invokeGovernedActionCommand('approve', 'action-1', 'session-a', () => 'session-a', api)
+    await module.invokeGovernedActionCommand('run', 'action-1', 'session-a', () => 'session-a', api)
+    await module.invokeGovernedActionCommand('reject', 'action-1', 'session-a', () => 'session-a', api)
+    await module.invokeGovernedActionCommand('cancel', 'action-1', 'session-a', () => 'session-a', api)
+    await module.invokeGovernedActionCommand('refresh', 'action-1', 'session-a', () => 'session-a', api)
+    assert.deepEqual(calls, [
+      { operation: 'decide', request: { actionId: 'action-1', originSessionId: 'session-a', decision: 'approve' } },
+      { operation: 'execute', request: { actionId: 'action-1', originSessionId: 'session-a' } },
+      { operation: 'decide', request: { actionId: 'action-1', originSessionId: 'session-a', decision: 'reject' } },
+      { operation: 'cancel', request: { actionId: 'action-1', originSessionId: 'session-a' } },
+      { operation: 'get', request: { actionId: 'action-1', originSessionId: 'session-a' } },
+    ])
+    await assert.rejects(
+      module.invokeGovernedActionCommand('run', 'action-1', 'session-a', () => 'session-b', api),
+      /originating Agent session is no longer active/i,
+    )
+    assert.equal(calls.length, 5)
+
+    const gate = module.createKeyedOperationGate()
+    let release!: () => void
+    const first = gate.run('action-1', () => new Promise<void>((resolve) => { release = resolve }))
+    assert.equal(await gate.run('action-1', async () => { throw new Error('must not run') }), undefined)
+    release()
+    await first
+  } finally {
+    await cleanup()
+  }
+})
+
+test('approval expiry is fail-closed and the approved card exposes separate Run and Cancel controls', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const proposed = {
+      status: 'proposed',
+      approval: { expiresAt: '2026-08-06T10:05:00.000Z' },
+    }
+    assert.equal(module.isGovernedApprovalExpired(proposed, Date.parse('2026-08-06T10:04:59.999Z')), false)
+    assert.equal(module.isGovernedApprovalExpired(proposed, Date.parse('2026-08-06T10:05:00.000Z')), true)
+    assert.equal(module.isGovernedApprovalExpired({
+      status: 'proposed', approval: { expiresAt: 'not-a-date' },
+    }, Date.now()), true)
+    assert.equal(module.isGovernedApprovalExpired({
+      status: 'executing', approval: { expiresAt: '2026-08-06T10:05:00.000Z' },
+    }, Date.parse('2026-08-06T10:06:00.000Z')), false)
+
+    const source = await readFile(chatPanelEntry, 'utf8')
+    const approvedControls = source.match(/action\.status === 'approved'[\s\S]*?action\.status === 'executing'/)?.[0] ?? ''
+    assert.match(approvedControls, /onCommand\(entry, 'run'\)/)
+    assert.match(approvedControls, /onCommand\(entry, 'cancel'\)/)
+    assert.match(source, /onExpire/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('cancellation reconciliation polls only the immutable origin session until a terminal action appears', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const requests: unknown[] = []
+    const responses = [
+      { ok: true, actions: [{ id: 'action-1', status: 'executing' }] },
+      { ok: true, actions: [{ id: 'action-1', status: 'cancelled' }] },
+    ]
+    const terminal = await module.reconcileGovernedActionUntilTerminal({
+      actionId: 'action-1',
+      originSessionId: 'session-a',
+      list: async (request: unknown) => {
+        requests.push(request)
+        return responses.shift() ?? { ok: true, actions: [] }
+      },
+      wait: async () => {},
+    })
+    assert.deepEqual(terminal, { id: 'action-1', status: 'cancelled' })
+    assert.deepEqual(requests, [
+      { originSessionId: 'session-a' },
+      { originSessionId: 'session-a' },
+    ])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('cancellation reconciliation waits without busy-looping until authoritative approval expiry', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    let nowMs = Date.parse('2026-08-06T10:00:00.000Z')
+    const expiresAt = new Date(nowMs + 750).toISOString()
+    const waits: number[] = []
+    let polls = 0
+    const terminal = await module.reconcileGovernedActionUntilTerminal({
+      actionId: 'action-expiring',
+      originSessionId: 'session-a',
+      list: async () => {
+        polls += 1
+        return {
+          ok: true,
+          actions: [{
+            id: 'action-expiring', status: 'proposed', approval: { expiresAt },
+          }],
+        }
+      },
+      now: () => nowMs,
+      hardTimeoutMs: 5_000,
+      wait: async (milliseconds: number) => {
+        assert.ok(milliseconds > 0)
+        waits.push(milliseconds)
+        nowMs += milliseconds
+      },
+    })
+    assert.equal(terminal, null)
+    assert.equal(polls, 4)
+    assert.deepEqual(waits, [250, 250, 250])
+
+    let hardNowMs = 0
+    const hardWaits: number[] = []
+    let hardPolls = 0
+    assert.equal(await module.reconcileGovernedActionUntilTerminal({
+      actionId: 'action-executing',
+      originSessionId: 'session-a',
+      list: async () => {
+        hardPolls += 1
+        return { ok: true, actions: [{ id: 'action-executing', status: 'executing' }] }
+      },
+      now: () => hardNowMs,
+      hardTimeoutMs: 600,
+      wait: async (milliseconds: number) => {
+        assert.ok(milliseconds > 0)
+        hardWaits.push(milliseconds)
+        hardNowMs += milliseconds
+      },
+    }), null)
+    assert.equal(hardPolls, 4)
+    assert.deepEqual(hardWaits, [250, 250, 100])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('chat mints a main-process model lease before FastAPI and sends only the opaque lease into proposal handoff', async () => {
+  const source = await readFile(chatPanelEntry, 'utf8')
+  assert.match(source, /window\.electron\.agentActions\.leaseModel\(\{[\s\S]*originSessionId:[\s\S]*model: selectedModel/)
+  assert.match(source, /body: JSON\.stringify\(\{[\s\S]*modelLeaseId/)
+  assert.match(source, /handoffGovernedProposals\([\s\S]*modelLeaseId/)
+})
+
+test('only terminal governed actions produce minimal durable summaries', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const action = {
+      schema: 'modly.agent-action-summary.v1', version: 1,
+      id: 'action-private-id', status: 'proposed',
+      createdAt: '2026-08-06T10:00:00.000Z', updatedAt: '2026-08-06T10:00:00.000Z',
+      capability: {
+        id: 'text-to-cad/generate', displayName: 'Text to CAD', description: 'Generate CAD.',
+        hash: 'a'.repeat(64), risk: 'mutating',
+      },
+      model: { provider: 'ollama', model: 'qwen3.6:latest', digest: `sha256:${'b'.repeat(64)}` },
+      approval: { scope: 'single_action', expiresAt: '2026-08-06T10:05:00.000Z' },
+      preview: [{ label: 'Input', value: 'chair' }], inputs: [],
+      outputs: [{ id: 'artifact-private-id', kind: 'mesh', mediaType: 'model/gltf-binary', sha256: 'c'.repeat(64), sizeBytes: 42 }],
+    }
+
+    for (const status of ['proposed', 'approved', 'executing']) {
+      assert.equal(module.buildGovernedTerminalSummary({ ...action, status }), null)
+    }
+
+    const summary = module.buildGovernedTerminalSummary({ ...action, status: 'completed' })
+    assert.deepEqual(summary, {
+      kind: 'governed-action',
+      label: 'Text to CAD completed',
+      governedAction: {
+        status: 'completed', capability: 'Text to CAD', model: 'qwen3.6:latest',
+        outputs: [{ kind: 'mesh', sha256: 'c'.repeat(64), sizeBytes: 42 }],
+      },
+    })
+    const serialized = JSON.stringify(summary)
+    for (const privateValue of ['action-private-id', 'artifact-private-id', 'digest', 'preview', 'arguments', 'endpoint']) {
+      assert.equal(serialized.includes(privateValue), false, privateValue)
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+test('session switches hide and cancel only non-terminal actions from the prior session', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const entries = [
+      { originSessionId: 'session-a', action: { id: 'proposed', status: 'proposed' } },
+      { originSessionId: 'session-a', action: { id: 'executing', status: 'executing' } },
+      { originSessionId: 'session-a', action: { id: 'completed', status: 'completed' } },
+      { originSessionId: 'session-b', action: { id: 'other', status: 'approved' } },
+    ]
+    assert.deepEqual(module.planGovernedSessionSwitch(entries, 'session-a', 'session-b'), {
+      cancelActionIds: ['proposed', 'executing'],
+      retained: [{ originSessionId: 'session-b', action: { id: 'other', status: 'approved' } }],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Ollama model discovery accepts only bounded model names from authoritative objects', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    assert.deepEqual(module.parseOllamaModelNames({
+      models: [
+        { name: 'qwen3.6:latest', digest: `sha256:${'a'.repeat(64)}` },
+        { name: 'devstral:latest', digest: `sha256:${'b'.repeat(64)}` },
+        { name: 'qwen3.6:latest', digest: `sha256:${'c'.repeat(64)}` },
+        { name: '', digest: 'bad' },
+        'legacy-untrusted-string',
+      ],
+    }), ['devstral:latest', 'qwen3.6:latest'])
+    assert.deepEqual(module.parseOllamaModelNames({ models: 'not-an-array' }), [])
+  } finally {
+    await cleanup()
+  }
+})
+
 test('response guards reject malformed success actions and drop malformed error actions safely', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {

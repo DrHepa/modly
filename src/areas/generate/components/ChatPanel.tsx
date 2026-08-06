@@ -1,9 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useAgentStore } from '@shared/stores/agentStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
-import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import { buildAllWorkflowExtensions } from '@areas/workflows/mockExtensions'
 import { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'
 import AgentSessionHistory from './AgentSessionHistory'
 
@@ -11,7 +9,25 @@ import AgentSessionHistory from './AgentSessionHistory'
 
 import type { ThinkingMode } from '@shared/stores/agentStore'
 import type { Workflow } from '@shared/types/electron.d'
-import type { AgentAttachmentRef, AgentSessionMessage, AgentSessionSummary } from '@shared/types/agentSessions'
+import type {
+  AgentAttachmentRef,
+  AgentGovernedActionTerminalSummary,
+  AgentGovernedTerminalStatus,
+  AgentSessionMessage,
+  AgentSessionSummary,
+} from '@shared/types/agentSessions'
+import type {
+  AgentActionMutationResult,
+  AgentActionProposeRequest,
+  AgentActionPublicErrorCode,
+  AgentActionPublicSummaryV1,
+  AgentActionStatus,
+  AgentActionsApi,
+  AgentCapabilityInventoryResult,
+  AgentCapabilitySnapshotV1,
+  AgentOllamaModelSelectionV1,
+  JsonValue,
+} from '@shared/types/agentActions'
 
 interface Message {
   id: string
@@ -26,6 +42,13 @@ interface Message {
 interface PendingAttachment {
   file: File
   dataUrl: string
+}
+
+export interface SessionGovernedAction {
+  originSessionId: string
+  action: AgentActionPublicSummaryV1
+  busyCommand?: GovernedActionCommand
+  error?: string
 }
 
 type WorkflowDraft = Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
@@ -44,11 +67,85 @@ export interface ActionDone {
 interface AgentChatData {
   message: string
   actions: ActionDone[]
+  proposals: AgentActionProposal[]
   thinking?: string
+}
+
+export interface AgentActionProposal {
+  type: 'action_proposal'
+  capabilityId: string
+  capabilityHash: string
+  modelLeaseId: string
+  arguments: Record<string, JsonValue>
+}
+
+export interface AgentCapabilityPromptInputHint {
+  path: string
+  type: string
+  required: boolean
+  description: string
+  options?: Array<string | number>
+}
+
+export interface AgentCapabilityPromptView {
+  id: string
+  hash: string
+  name: string
+  description: string
+  inputHints: AgentCapabilityPromptInputHint[]
+}
+
+const MAX_AGENT_PROPOSALS = 4
+const MAX_AGENT_CAPABILITIES = 32
+const MAX_AGENT_CAPABILITY_BYTES = 32 * 1024
+const MAX_AGENT_JSON_BYTES = 16 * 1024
+const UNSAFE_JSON_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const HASH_PATTERN = /^[a-f0-9]{64}$/
+const OLLAMA_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/
+const GOVERNED_TERMINAL_STATUSES = new Set<AgentActionStatus>([
+  'rejected', 'expired', 'completed', 'failed', 'cancelled',
+])
+
+function isGovernedTerminalStatus(status: AgentActionStatus): status is AgentGovernedTerminalStatus {
+  return GOVERNED_TERMINAL_STATUSES.has(status)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isBoundedJson(value: unknown, depth = 0): value is JsonValue {
+  if (depth > 4) return false
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (Array.isArray(value)) return value.every((entry) => isBoundedJson(entry, depth + 1))
+  if (!isRecord(value)) return false
+  return Reflect.ownKeys(value).every((key) => (
+    typeof key === 'string'
+    && key.length > 0
+    && key.length <= 128
+    && !UNSAFE_JSON_KEYS.has(key)
+    && isBoundedJson(value[key], depth + 1)
+  ))
+}
+
+function boundedJsonObject(value: unknown): Record<string, JsonValue> | null {
+  if (!isRecord(value) || !isBoundedJson(value)) return null
+  try {
+    const encoded = JSON.stringify(value)
+    if (new TextEncoder().encode(encoded).byteLength > MAX_AGENT_JSON_BYTES) return null
+    return JSON.parse(encoded) as Record<string, JsonValue>
+  } catch {
+    return null
+  }
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set(keys)
+  return Reflect.ownKeys(value).every((key) => typeof key === 'string' && allowed.has(key))
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
 }
 
 function isWorkflowDraft(value: unknown): value is WorkflowDraft {
@@ -126,13 +223,47 @@ function parseActions(value: unknown): { actions: ActionDone[]; valid: boolean }
   return { actions, valid }
 }
 
+function parseProposal(value: unknown): AgentActionProposal | null {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'type', 'capabilityId', 'capabilityHash', 'modelLeaseId', 'arguments',
+  ])) return null
+  if (
+    value.type !== 'action_proposal'
+    || typeof value.capabilityId !== 'string'
+    || !CAPABILITY_ID_PATTERN.test(value.capabilityId)
+    || value.capabilityId.split('/').some((segment) => UNSAFE_JSON_KEYS.has(segment))
+    || typeof value.capabilityHash !== 'string'
+    || !HASH_PATTERN.test(value.capabilityHash)
+    || typeof value.modelLeaseId !== 'string'
+    || !OPAQUE_ID_PATTERN.test(value.modelLeaseId)
+  ) return null
+  const argumentsValue = boundedJsonObject(value.arguments)
+  return argumentsValue ? {
+    type: 'action_proposal',
+    capabilityId: value.capabilityId,
+    capabilityHash: value.capabilityHash,
+    modelLeaseId: value.modelLeaseId,
+    arguments: argumentsValue,
+  } : null
+}
+
+function parseProposals(value: unknown): { proposals: AgentActionProposal[]; valid: boolean } {
+  if (value === undefined) return { proposals: [], valid: true }
+  if (!Array.isArray(value) || value.length > MAX_AGENT_PROPOSALS) return { proposals: [], valid: false }
+  const proposals = value.map(parseProposal)
+  if (proposals.some((proposal) => proposal === null)) return { proposals: [], valid: false }
+  return { proposals: proposals as AgentActionProposal[], valid: true }
+}
+
 export class AgentApiError extends Error {
   readonly actions: ActionDone[]
+  readonly proposals: AgentActionProposal[]
 
-  constructor(message: string, actions: ActionDone[]) {
+  constructor(message: string, actions: ActionDone[], proposals: AgentActionProposal[] = []) {
     super(message)
     this.name = 'AgentApiError'
     this.actions = actions
+    this.proposals = proposals
   }
 }
 
@@ -176,7 +307,11 @@ export async function parseAgentChatResponse(
     const safeMessage = detail && typeof detail.message === 'string' && detail.message.trim()
       ? detail.message.trim().slice(0, 500)
       : 'Modly could not complete the request. Please try again.'
-    throw new AgentApiError(safeMessage, parseActions(detail?.actions).actions)
+    throw new AgentApiError(
+      safeMessage,
+      parseActions(detail?.actions).actions,
+      parseProposals(detail?.proposals).proposals,
+    )
   }
 
   if (!isRecord(body) || typeof body.message !== 'string') {
@@ -186,11 +321,13 @@ export async function parseAgentChatResponse(
     throw new Error('Modly returned an invalid agent response.')
   }
   const parsedActions = parseActions(body.actions)
-  if (!parsedActions.valid) throw new Error('Modly returned an invalid agent response.')
+  const parsedProposals = parseProposals(body.proposals)
+  if (!parsedActions.valid || !parsedProposals.valid) throw new Error('Modly returned an invalid agent response.')
 
   return {
     message: body.message,
     actions: parsedActions.actions,
+    proposals: parsedProposals.proposals,
     ...(typeof body.thinking === 'string' ? { thinking: body.thinking } : {}),
   }
 }
@@ -243,6 +380,488 @@ function governedActionFailure(failures: AgentActionFailure[]): GovernedActionRe
 export function withActionFailureSummary(message: string, failureCount: number): string {
   if (failureCount <= 0) return message
   return `${message} ${failureCount} completed action${failureCount === 1 ? '' : 's'} could not be reflected locally.`
+}
+
+function displayText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim() || value.length > maxLength) return null
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0)
+    return code <= 0x1f || code === 0x7f
+  }) ? null : value
+}
+
+function parameterHint(param: JsonValue): AgentCapabilityPromptInputHint | null {
+  if (!isRecord(param)) return null
+  const id = displayText(param.id, 128)
+  const type = displayText(param.type, 32)
+  if (!id || !type || UNSAFE_JSON_KEYS.has(id) || !['select', 'int', 'float', 'string', 'boolean'].includes(type)) return null
+  const label = displayText(param.label, 120) ?? id.replace(/[._-]+/g, ' ')
+  const description = displayText(param.tooltip, 300) ?? label.replace(/^./, (value) => value.toUpperCase())
+  const options = type === 'select' && Array.isArray(param.options)
+    ? param.options.flatMap((option) => {
+        if (!isRecord(option)) return []
+        const value = option.value
+        return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) ? [value] : []
+      }).slice(0, 32)
+    : undefined
+  return {
+    path: `params.${id}`,
+    type,
+    required: false,
+    description,
+    ...(options?.length ? { options } : {}),
+  }
+}
+
+function mcpInputHints(capability: AgentCapabilitySnapshotV1): AgentCapabilityPromptInputHint[] {
+  const schema = capability.execution?.inputSchema
+  if (!isRecord(schema) || !isRecord(schema.properties)) return []
+  const properties = schema.properties
+  const required = new Set(Array.isArray(schema.required) ? schema.required.filter((value): value is string => typeof value === 'string') : [])
+  return Object.keys(properties).sort().flatMap((id) => {
+    if (UNSAFE_JSON_KEYS.has(id) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) return []
+    const property = properties[id]
+    if (!isRecord(property)) return []
+    const rawType = property.type
+    const type = rawType === 'integer' ? 'int' : rawType === 'number' ? 'float' : rawType
+    if (typeof type !== 'string' || !['string', 'int', 'float', 'boolean'].includes(type)) return []
+    const description = displayText(property.description, 300)
+      ?? displayText(property.title, 120)
+      ?? id.replace(/[._-]+/g, ' ').replace(/^./, (value) => value.toUpperCase())
+    const options = Array.isArray(property.enum)
+      ? property.enum.filter((value): value is string | number => typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))).slice(0, 32)
+      : undefined
+    return [{
+      path: `arguments.${id}`,
+      type,
+      required: required.has(id),
+      description,
+      ...(options?.length ? { options } : {}),
+    }]
+  }).slice(0, 32)
+}
+
+export function buildAgentCapabilityPromptInventory(inventory: AgentCapabilityInventoryResult): AgentCapabilityPromptView[] {
+  if (!inventory || !Array.isArray(inventory.capabilities) || inventory.capabilities.length > MAX_AGENT_CAPABILITIES) {
+    throw new Error('Agent capability inventory exceeds its safe bounds.')
+  }
+  const views = inventory.capabilities.map((capability): AgentCapabilityPromptView => {
+    const id = displayText(capability.id, 257)
+    const name = displayText(capability.displayName, 80)
+    const description = displayText(capability.description, 500)
+    if (
+      !id || !CAPABILITY_ID_PATTERN.test(id) || id.split('/').some((segment) => UNSAFE_JSON_KEYS.has(segment))
+      || !HASH_PATTERN.test(capability.hash) || !name || !description
+    ) throw new Error('Agent capability inventory contains an invalid entry.')
+    const inputHints = capability.execution?.kind === 'mcp_tool'
+      ? mcpInputHints(capability)
+      : [
+          ...(capability.node.inputs?.map((input) => ({
+            path: `input.${input.name}`,
+            type: input.type,
+            required: input.required !== false,
+            description: displayText(input.label, 120) ?? `${input.type.replace(/^./, (value) => value.toUpperCase())} input`,
+          })) ?? [{
+            path: 'input',
+            type: capability.node.input,
+            required: true,
+            description: `${capability.node.input.replace(/^./, (value) => value.toUpperCase())} input`,
+          }]),
+          ...capability.node.paramsSchema.flatMap((param) => {
+            const hint = parameterHint(param)
+            return hint ? [hint] : []
+          }),
+        ].slice(0, 32)
+    return { id, hash: capability.hash, name, description, inputHints }
+  }).sort((left, right) => left.id.localeCompare(right.id))
+  if (new Set(views.map((view) => view.id)).size !== views.length || new Set(views.map((view) => view.hash)).size !== views.length) {
+    throw new Error('Agent capability inventory contains a collision.')
+  }
+  if (new TextEncoder().encode(JSON.stringify(views)).byteLength > MAX_AGENT_CAPABILITY_BYTES) {
+    throw new Error('Agent capability inventory exceeds its safe bounds.')
+  }
+  return views
+}
+
+export function normalizeLocalOllamaEndpoint(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim() || value.length > 256) return null
+  try {
+    const endpoint = new URL(value)
+    if (
+      endpoint.protocol !== 'http:'
+      || !new Set(['127.0.0.1', 'localhost', '[::1]']).has(endpoint.hostname)
+      || endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+      || (endpoint.pathname !== '/' && endpoint.pathname !== '')
+    ) return null
+    return endpoint.origin
+  } catch {
+    return null
+  }
+}
+
+export interface GovernedActionHandoffError {
+  code: string
+  message: string
+}
+
+export interface GovernedProposalResolution {
+  kind: 'accepted' | 'compensated' | 'ignored'
+  error?: GovernedActionHandoffError
+}
+
+export interface GovernedProposalLease {
+  resolve(
+    action: AgentActionPublicSummaryV1,
+    accept: (action: AgentActionPublicSummaryV1) => boolean,
+    compensate: (action: AgentActionPublicSummaryV1) => Promise<GovernedActionHandoffError | null>,
+  ): Promise<GovernedProposalResolution>
+  reject(): void
+}
+
+export interface GovernedProposalTracker {
+  track(originSessionId: string, isCurrent: () => boolean): GovernedProposalLease
+  invalidateOrigin(originSessionId: string): void
+  invalidateAll(): void
+  size(): number
+}
+
+export function createGovernedProposalTracker(): GovernedProposalTracker {
+  interface Entry {
+    originSessionId: string
+    isCurrent: () => boolean
+    invalidated: boolean
+    settled: boolean
+  }
+  const entries = new Set<Entry>()
+  return {
+    track(originSessionId, isCurrent) {
+      const entry: Entry = { originSessionId, isCurrent, invalidated: false, settled: false }
+      entries.add(entry)
+      const finish = () => {
+        if (entry.settled) return false
+        entry.settled = true
+        entries.delete(entry)
+        return true
+      }
+      return {
+        async resolve(action, accept, compensate) {
+          if (!finish()) return { kind: 'ignored' }
+          let accepted = false
+          if (!entry.invalidated && entry.isCurrent()) {
+            try { accepted = accept(action) } catch { accepted = false }
+          }
+          if (accepted) return { kind: 'accepted' }
+          try {
+            const error = await compensate(action)
+            return { kind: 'compensated', ...(error ? { error } : {}) }
+          } catch {
+            return {
+              kind: 'compensated',
+              error: { code: 'internal_error', message: 'A late governed proposal remains hidden and will expire automatically.' },
+            }
+          }
+        },
+        reject() { finish() },
+      }
+    },
+    invalidateOrigin(originSessionId) {
+      for (const entry of entries) {
+        if (entry.originSessionId === originSessionId) entry.invalidated = true
+      }
+    },
+    invalidateAll() {
+      for (const entry of entries) entry.invalidated = true
+    },
+    size() { return entries.size },
+  }
+}
+
+const GOVERNED_RECONCILE_INTERVAL_MS = 250
+const GOVERNED_RECONCILE_HARD_TIMEOUT_MS = 10 * 60 * 1_000
+
+export async function reconcileGovernedActionUntilTerminal(input: {
+  actionId: string
+  originSessionId: string
+  list: AgentActionsApi['list']
+  wait?: (milliseconds: number) => Promise<void>
+  now?: () => number
+  shouldContinue?: () => boolean
+  hardTimeoutMs?: number
+}): Promise<AgentActionPublicSummaryV1 | null> {
+  const wait = input.wait ?? ((milliseconds: number) => new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, milliseconds)
+  }))
+  const now = input.now ?? Date.now
+  const startedAt = now()
+  if (!Number.isFinite(startedAt)) return null
+  const requestedHardTimeout = input.hardTimeoutMs
+  const hardTimeoutMs = Number.isSafeInteger(requestedHardTimeout) && (requestedHardTimeout ?? 0) > 0
+    ? Math.min(requestedHardTimeout as number, GOVERNED_RECONCILE_HARD_TIMEOUT_MS)
+    : GOVERNED_RECONCILE_HARD_TIMEOUT_MS
+  const hardDeadline = startedAt + hardTimeoutMs
+  let actionDeadline = hardDeadline
+  while (true) {
+    if (input.shouldContinue && !input.shouldContinue()) return null
+    const beforePoll = now()
+    if (!Number.isFinite(beforePoll) || beforePoll > hardDeadline) return null
+    try {
+      const result = await input.list({ originSessionId: input.originSessionId })
+      if (result.ok) {
+        const action = result.actions.find((candidate) => candidate.id === input.actionId)
+        if (!action) return null
+        if (isGovernedTerminalStatus(action.status)) return action
+        if (action.status === 'proposed' || action.status === 'approved') {
+          const expiresAt = Date.parse(action.approval.expiresAt)
+          if (!Number.isFinite(expiresAt)) return null
+          actionDeadline = Math.min(hardDeadline, expiresAt)
+        } else {
+          actionDeadline = hardDeadline
+        }
+      } else if (result.error.code === 'action_not_found') {
+        return null
+      }
+    } catch {
+      // A transient IPC failure is retried within the bounded reconciliation window.
+    }
+    const afterPoll = now()
+    if (!Number.isFinite(afterPoll) || afterPoll >= actionDeadline) return null
+    const delayMs = Math.min(GOVERNED_RECONCILE_INTERVAL_MS, actionDeadline - afterPoll)
+    if (delayMs <= 0) return null
+    await wait(delayMs)
+  }
+}
+
+export async function compensateLateGovernedProposal(input: {
+  action: AgentActionPublicSummaryV1
+  originSessionId: string
+  sessionExists: () => boolean
+  isOriginActive: () => boolean
+  cancel: AgentActionsApi['cancel']
+  get: AgentActionsApi['get']
+  list: AgentActionsApi['list']
+  reject: AgentActionsApi['decide']
+  reconcileWait?: (milliseconds: number) => Promise<void>
+  reconcileNow?: () => number
+  reconcileHardTimeoutMs?: number
+  persistTerminal: (action: AgentActionPublicSummaryV1) => Promise<void>
+  reportError: (message: string) => void
+}): Promise<{ kind: 'terminal' | 'pending' }> {
+  const actionId = input.action.id
+  let latest: AgentActionPublicSummaryV1 | null = null
+  try {
+    const cancelled = await input.cancel({ actionId, originSessionId: input.originSessionId })
+    if (cancelled.ok && cancelled.action.id === actionId) latest = cancelled.action
+  } catch {
+    // Resolve authoritative state below; never recover by exposing the proposal.
+  }
+
+  if (!latest) {
+    try {
+      const refreshed = await input.get({ actionId, originSessionId: input.originSessionId })
+      if (refreshed.ok && refreshed.action.id === actionId) latest = refreshed.action
+    } catch {
+      // Main expiry remains the final fallback when the state cannot be resolved.
+    }
+  }
+
+  if (latest?.status === 'proposed') {
+    try {
+      const rejected = await input.reject({
+        actionId,
+        originSessionId: input.originSessionId,
+        decision: 'reject',
+      })
+      if (rejected.ok && rejected.action.id === actionId) latest = rejected.action
+    } catch {
+      // Keep the proposal hidden and rely on its bounded main-process expiry.
+    }
+  }
+
+  if (!latest || !isGovernedTerminalStatus(latest.status)) {
+    const reconciled = await reconcileGovernedActionUntilTerminal({
+      actionId,
+      originSessionId: input.originSessionId,
+      list: input.list,
+      shouldContinue: input.sessionExists,
+      wait: input.reconcileWait,
+      now: input.reconcileNow,
+      hardTimeoutMs: input.reconcileHardTimeoutMs,
+    })
+    if (reconciled) latest = reconciled
+  }
+
+  if (latest && isGovernedTerminalStatus(latest.status)) {
+    if (input.sessionExists()) {
+      try {
+        await input.persistTerminal(latest)
+      } catch {
+        if (input.isOriginActive()) {
+          input.reportError('A late governed action finished, but its terminal summary could not be saved.')
+        }
+      }
+    }
+    return { kind: 'terminal' }
+  }
+
+  if (input.isOriginActive()) {
+    input.reportError('A late governed proposal remains hidden and will expire automatically because cancellation is still pending.')
+  }
+  return { kind: 'pending' }
+}
+
+function governedActionErrorMessage(code: string): string {
+  if (code === 'model_stale') return 'The selected Ollama model changed or its digest is unavailable. Select the model again.'
+  if (code === 'capability_stale' || code === 'capability_not_found') return 'This capability changed or is no longer available. Refresh and try again.'
+  if (code === 'invalid_arguments') return 'The proposed arguments are not valid for this capability.'
+  if (code === 'capacity_exceeded') return 'Too many governed actions are pending. Finish or reject one before proposing another.'
+  return 'Modly could not create this governed action proposal.'
+}
+
+function governedActionCommandErrorMessage(code: AgentActionPublicErrorCode): string {
+  if (code === 'action_not_found') return 'This governed action is no longer available.'
+  if (code === 'approval_expired') return 'This approval expired. Ask the Agent to propose the action again.'
+  if (code === 'invalid_state') return 'This governed action is no longer in the expected state.'
+  if (code === 'execution_failed') return 'The governed action failed. No unverified output was accepted.'
+  if (code === 'cancellation_pending') return 'Cancellation is still being settled. You can retry in a moment.'
+  if (code === 'executor_unavailable' || code === 'sandbox_unavailable') return 'The governed executor is unavailable.'
+  if (code === 'capability_stale' || code === 'capability_not_found') return governedActionErrorMessage(code)
+  if (code === 'model_stale') return governedActionErrorMessage(code)
+  return 'Modly could not update this governed action.'
+}
+
+export async function proposeGovernedAgentActions(input: {
+  proposals: AgentActionProposal[]
+  originSessionId: string
+  modelLeaseId: string
+  isCurrent: () => boolean
+  propose: (request: AgentActionProposeRequest) => Promise<AgentActionMutationResult>
+  tracker?: GovernedProposalTracker
+  acceptAction?: (action: AgentActionPublicSummaryV1) => boolean
+  compensate?: (action: AgentActionPublicSummaryV1) => Promise<GovernedActionHandoffError | null>
+}): Promise<{ actions: AgentActionPublicSummaryV1[], errors: GovernedActionHandoffError[] }> {
+  const actions: AgentActionPublicSummaryV1[] = []
+  const errors: GovernedActionHandoffError[] = []
+  const tracker = input.tracker ?? createGovernedProposalTracker()
+  if (!OPAQUE_ID_PATTERN.test(input.modelLeaseId)) {
+    return { actions, errors: [{ code: 'model_stale', message: governedActionErrorMessage('model_stale') }] }
+  }
+  for (const proposal of input.proposals.slice(0, MAX_AGENT_PROPOSALS)) {
+    if (!input.isCurrent()) break
+    if (proposal.modelLeaseId !== input.modelLeaseId) {
+      errors.push({ code: 'model_stale', message: governedActionErrorMessage('model_stale') })
+      continue
+    }
+    const lease = tracker.track(input.originSessionId, input.isCurrent)
+    try {
+      const result = await input.propose({
+        originSessionId: input.originSessionId,
+        capabilityId: proposal.capabilityId,
+        capabilityHash: proposal.capabilityHash,
+        arguments: proposal.arguments,
+        modelLeaseId: proposal.modelLeaseId,
+      })
+      if (result.ok) {
+        const resolution = await lease.resolve(
+          result.action,
+          (action) => {
+            if (!input.isCurrent()) return false
+            return input.acceptAction ? input.acceptAction(action) : true
+          },
+          input.compensate ?? (async () => ({
+            code: 'internal_error',
+            message: 'A late governed proposal remains hidden and will expire automatically.',
+          })),
+        )
+        if (resolution.kind === 'accepted') actions.push(result.action)
+        if (resolution.error) errors.push(resolution.error)
+      } else {
+        lease.reject()
+        if (input.isCurrent()) errors.push({ code: result.error.code, message: governedActionErrorMessage(result.error.code) })
+      }
+    } catch {
+      lease.reject()
+      if (input.isCurrent()) errors.push({ code: 'internal_error', message: governedActionErrorMessage('internal_error') })
+    }
+  }
+  return { actions, errors }
+}
+
+export type GovernedActionCommand = 'approve' | 'reject' | 'run' | 'cancel' | 'refresh'
+
+export async function invokeGovernedActionCommand(
+  command: GovernedActionCommand,
+  actionId: string,
+  originSessionId: string,
+  getActiveSessionId: () => string | null,
+  api: Pick<AgentActionsApi, 'get' | 'decide' | 'execute' | 'cancel'>,
+): Promise<AgentActionMutationResult> {
+  if (getActiveSessionId() !== originSessionId) throw new Error('The originating Agent session is no longer active.')
+  if (command === 'refresh') return api.get({ actionId, originSessionId })
+  if (command === 'approve' || command === 'reject') {
+    return api.decide({ actionId, originSessionId, decision: command === 'approve' ? 'approve' : 'reject' })
+  }
+  if (command === 'run') return api.execute({ actionId, originSessionId })
+  return api.cancel({ actionId, originSessionId })
+}
+
+export function createKeyedOperationGate() {
+  const pending = new Set<string>()
+  return {
+    async run<T>(key: string, operation: () => Promise<T>): Promise<T | undefined> {
+      if (pending.has(key)) return undefined
+      pending.add(key)
+      try { return await operation() }
+      finally { pending.delete(key) }
+    },
+  }
+}
+
+export function buildGovernedTerminalSummary(
+  action: AgentActionPublicSummaryV1,
+): AgentGovernedActionTerminalSummary | null {
+  if (!isGovernedTerminalStatus(action.status)) return null
+  return {
+    kind: 'governed-action',
+    label: `${action.capability.displayName} ${action.status}`,
+    governedAction: {
+      status: action.status,
+      capability: action.capability.displayName,
+      model: action.model.model,
+      outputs: action.outputs.map((output) => ({
+        kind: output.kind,
+        sha256: output.sha256,
+        sizeBytes: output.sizeBytes,
+      })),
+    },
+  }
+}
+
+export function planGovernedSessionSwitch<T extends {
+  originSessionId: string
+  action: { id: string, status: AgentActionStatus }
+}>(entries: readonly T[], previousSessionId: string | null, nextSessionId: string | null): {
+  cancelActionIds: string[]
+  retained: T[]
+} {
+  return {
+    cancelActionIds: previousSessionId === null
+      ? []
+      : entries
+          .filter((entry) => entry.originSessionId === previousSessionId && !isGovernedTerminalStatus(entry.action.status))
+          .map((entry) => entry.action.id),
+    retained: nextSessionId === null ? [] : entries.filter((entry) => entry.originSessionId === nextSessionId),
+  }
+}
+
+export function parseOllamaModelNames(value: unknown): string[] {
+  if (!isRecord(value) || !Array.isArray(value.models) || value.models.length > 256) return []
+  const names = value.models.flatMap((entry) => {
+    if (!isRecord(entry) || !hasExactKeys(entry, ['name', 'digest'])) return []
+    const name = displayText(entry.name, 200)
+    if (!name || typeof entry.digest !== 'string' || !OLLAMA_DIGEST_PATTERN.test(entry.digest)) return []
+    return [name]
+  })
+  return [...new Set(names)].sort((left, right) => left.localeCompare(right))
 }
 
 export function createSubmissionGate() {
@@ -468,10 +1087,166 @@ function ActionsCard({ actions, onUndo }: { actions: ActionDone[]; onUndo?: () =
   )
 }
 
+function governedStatusLabel(status: AgentActionStatus): string {
+  return status.replace(/^./, (value) => value.toUpperCase())
+}
+
+function formatByteCount(value: number): string {
+  if (value < 1_024) return `${value} B`
+  if (value < 1_024 * 1_024) return `${(value / 1_024).toFixed(1)} KiB`
+  return `${(value / (1_024 * 1_024)).toFixed(1)} MiB`
+}
+
+export function isGovernedApprovalExpired(
+  action: Pick<AgentActionPublicSummaryV1, 'status' | 'approval'>,
+  nowMs = Date.now(),
+): boolean {
+  if (action.status !== 'proposed' && action.status !== 'approved') return false
+  const expiresAtMs = Date.parse(action.approval.expiresAt)
+  return !Number.isFinite(expiresAtMs) || nowMs >= expiresAtMs
+}
+
+function GovernedActionCard({
+  entry,
+  onCommand,
+  onExpire,
+}: {
+  entry: SessionGovernedAction
+  onCommand: (entry: SessionGovernedAction, command: GovernedActionCommand) => void
+  onExpire: (entry: SessionGovernedAction) => void
+}): JSX.Element {
+  const { action } = entry
+  const statusLabel = governedStatusLabel(action.status)
+  const buttonClass = 'rounded-md border border-zinc-600 px-2.5 py-1 text-[11px] text-zinc-200 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40'
+  const [approvalExpired, setApprovalExpired] = useState(() => isGovernedApprovalExpired(action))
+  const entryRef = useRef(entry)
+  const onExpireRef = useRef(onExpire)
+  entryRef.current = entry
+  onExpireRef.current = onExpire
+
+  useEffect(() => {
+    if (action.status !== 'proposed' && action.status !== 'approved') {
+      setApprovalExpired(false)
+      return
+    }
+    const expiresAtMs = Date.parse(action.approval.expiresAt)
+    const remainingMs = expiresAtMs - Date.now()
+    if (!Number.isFinite(expiresAtMs) || remainingMs <= 0) {
+      setApprovalExpired(true)
+      onExpireRef.current(entryRef.current)
+      return
+    }
+    setApprovalExpired(false)
+    const timer = globalThis.setTimeout(() => {
+      setApprovalExpired(true)
+      onExpireRef.current(entryRef.current)
+    }, remainingMs)
+    return () => globalThis.clearTimeout(timer)
+  }, [action.approval.expiresAt, action.id, action.status])
+
+  return (
+    <section
+      aria-label={`Governed action: ${action.capability.displayName}`}
+      className="rounded-xl border border-amber-700/40 bg-amber-950/20 p-3 text-[11px]"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="font-medium text-zinc-100">{action.capability.displayName}</p>
+          <p className="mt-0.5 text-zinc-400">{action.capability.description}</p>
+        </div>
+        <span className="shrink-0 rounded-full border border-amber-700/40 px-2 py-0.5 text-[10px] text-amber-300">
+          {action.capability.risk === 'mutating' ? 'Changes data' : 'Read only'}
+        </span>
+      </div>
+
+      <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-zinc-400">
+        <dt>Status</dt><dd aria-live="polite" className="text-zinc-200">{statusLabel}</dd>
+        <dt>Model</dt><dd className="truncate text-zinc-300">{action.model.model}</dd>
+        {action.preview.map((item, index) => (
+          <div key={`${item.label}-${index}`} className="contents">
+            <dt>{item.label}</dt><dd className="break-words text-zinc-300">{item.value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      {action.outputs.length > 0 && (
+        <div className="mt-2 border-t border-zinc-700/50 pt-2 text-zinc-400">
+          <p className="mb-1 text-zinc-300">Verified outputs</p>
+          {action.outputs.map((output) => (
+            <p key={`${output.sha256}-${output.id}`} className="font-mono text-[10px]">
+              {output.kind} · {output.sha256.slice(0, 12)}… · {formatByteCount(output.sizeBytes)}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {entry.error && <p role="alert" className="mt-2 text-red-400">{entry.error}</p>}
+
+      <div className="mt-3 flex gap-2">
+        {action.status === 'proposed' && (
+          <>
+            <button
+              type="button"
+              aria-label={`Approve ${action.capability.displayName}`}
+              disabled={approvalExpired || entry.busyCommand !== undefined}
+              onClick={() => onCommand(entry, 'approve')}
+              className={`${buttonClass} border-emerald-700/60 text-emerald-300 hover:bg-emerald-950/40`}
+            >Approve</button>
+            <button
+              type="button"
+              aria-label={`Reject ${action.capability.displayName}`}
+              disabled={approvalExpired || entry.busyCommand !== undefined}
+              onClick={() => onCommand(entry, 'reject')}
+              className={buttonClass}
+            >Reject</button>
+          </>
+        )}
+        {action.status === 'approved' && (
+          <>
+            <button
+              type="button"
+              aria-label={`Run ${action.capability.displayName}`}
+              disabled={approvalExpired || entry.busyCommand !== undefined}
+              onClick={() => onCommand(entry, 'run')}
+              className={`${buttonClass} border-emerald-700/60 text-emerald-300 hover:bg-emerald-950/40`}
+            >Run</button>
+            <button
+              type="button"
+              aria-label={`Cancel ${action.capability.displayName}`}
+              disabled={entry.busyCommand !== undefined}
+              onClick={() => onCommand(entry, 'cancel')}
+              className={buttonClass}
+            >Cancel</button>
+          </>
+        )}
+        {action.status === 'executing' && (
+          <button
+            type="button"
+            aria-label={`Cancel ${action.capability.displayName}`}
+            disabled={entry.busyCommand !== undefined}
+            onClick={() => onCommand(entry, 'cancel')}
+            className={buttonClass}
+          >Cancel</button>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function PersistedSummaries({ summaries }: { summaries: AgentSessionSummary[] }): JSX.Element {
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-3 py-2 text-[11px] text-zinc-400">
-      {summaries.map((summary, index) => (
+      {summaries.map((summary, index) => summary.kind === 'governed-action' ? (
+        <div key={`${summary.kind}-${index}`}>
+          <p>{summary.label}</p>
+          <p className="text-zinc-500">Model: {summary.governedAction.model}</p>
+          {summary.governedAction.outputs.map((output) => (
+            <p key={`${output.sha256}-${output.kind}`} className="font-mono text-[10px] text-zinc-500">
+              {output.kind} · {output.sha256.slice(0, 12)}… · {formatByteCount(output.sizeBytes)}
+            </p>
+          ))}
+        </div>
+      ) : (
         <p key={`${summary.kind}-${index}`}>
           {summary.label}{summary.artifact ? ` — ${summary.artifact.workspacePath}` : ''}
         </p>
@@ -570,12 +1345,19 @@ export default function ChatPanel(): JSX.Element {
   const [attachments, setAttachments]         = useState<PendingAttachment[]>([])
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
+  const [governedActions, setGovernedActions] = useState<SessionGovernedAction[]>([])
   const endRef                                = useRef<HTMLDivElement>(null)
   const textareaRef                           = useRef<HTMLTextAreaElement>(null)
   const modelPickerRef                        = useRef<HTMLDivElement>(null)
   const fileInputRef                          = useRef<HTMLInputElement>(null)
   const messagesRef                           = useRef<Message[]>([])
+  const governedActionsRef                    = useRef<SessionGovernedAction[]>([])
   const submissionGateRef                     = useRef(createSubmissionGate())
+  const actionOperationGateRef                = useRef(createKeyedOperationGate())
+  const proposalTrackerRef                    = useRef(createGovernedProposalTracker())
+  const persistedActionIdsRef                 = useRef(new Set<string>())
+  const terminalMessageCounterRef             = useRef(0)
+  const mountedRef                            = useRef(true)
   const originUiGateRef                       = useRef(createOriginBoundUiGate(
     () => useAgentSessionsStore.getState().activeSession?.id ?? null,
   ))
@@ -585,6 +1367,7 @@ export default function ChatPanel(): JSX.Element {
   }))
   const transientSessionIdRef                 = useRef<string | null>(null)
   messagesRef.current = messages
+  governedActionsRef.current = governedActions
 
   const activeSession = useAgentSessionsStore((state) => state.activeSession)
   const initializedSessions = useAgentSessionsStore((state) => state.initialized)
@@ -598,8 +1381,14 @@ export default function ChatPanel(): JSX.Element {
   useLayoutEffect(() => {
     const nextSessionId = activeSession?.id ?? null
     if (transientSessionIdRef.current === nextSessionId) return
-    transientSessionIdRef.current = nextSessionId
+    const previousSessionId = transientSessionIdRef.current
     originUiGateRef.current.invalidate()
+    if (previousSessionId) proposalTrackerRef.current.invalidateOrigin(previousSessionId)
+    const switchPlan = planGovernedSessionSwitch(governedActionsRef.current, previousSessionId, nextSessionId)
+    if (previousSessionId) void cancelGovernedActionIds(previousSessionId, switchPlan.cancelActionIds)
+    governedActionsRef.current = switchPlan.retained
+    setGovernedActions(switchPlan.retained)
+    transientSessionIdRef.current = nextSessionId
     setInput('')
     setAttachments([])
     setError(null)
@@ -607,6 +1396,19 @@ export default function ChatPanel(): JSX.Element {
     setIsDragging(false)
     setIsLoading(false)
   }, [activeSession?.id])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      originUiGateRef.current.invalidate()
+      proposalTrackerRef.current.invalidateAll()
+      const originSessionId = transientSessionIdRef.current
+      if (!originSessionId) return
+      const switchPlan = planGovernedSessionSwitch(governedActionsRef.current, originSessionId, null)
+      void cancelGovernedActionIds(originSessionId, switchPlan.cancelActionIds)
+    }
+  }, [])
 
   useLayoutEffect(() => {
     const session = activeSession
@@ -628,11 +1430,6 @@ export default function ChatPanel(): JSX.Element {
   const undoMesh         = useAppStore((s) => s.undoMesh)
 
   const workflows = useWorkflowsStore((s) => s.workflows)
-  const { modelExtensions, processExtensions } = useExtensionsStore()
-  const allExtensions = useMemo(
-    () => buildAllWorkflowExtensions(modelExtensions, processExtensions),
-    [modelExtensions, processExtensions],
-  )
 
   useEffect(() => {
     setModel(defaultModel)
@@ -655,17 +1452,228 @@ export default function ChatPanel(): JSX.Element {
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, isLoading])
+  }, [messages, governedActions, isLoading])
 
   function buildContext(): Record<string, unknown> {
     const ctx: Record<string, unknown> = {}
     if (currentJob?.outputUrl) ctx.currentMeshPath = currentJob.outputUrl.replace('/workspace/', '')
     if (meshStats?.triangles)  ctx.meshTriangles   = meshStats.triangles
     if (workflows.length > 0)  ctx.workflows       = workflows.map((w) => ({ id: w.id, name: w.name }))
-    if (allExtensions.length > 0) ctx.extensions   = allExtensions.map((e) => ({
-      id: e.id, name: e.name, input: e.input, output: e.output,
-    }))
     return ctx
+  }
+
+  function updateGovernedActions(
+    update: (current: SessionGovernedAction[]) => SessionGovernedAction[],
+  ): void {
+    const next = update(governedActionsRef.current)
+    governedActionsRef.current = next
+    if (mountedRef.current) setGovernedActions(next)
+  }
+
+  function upsertGovernedActions(
+    originSessionId: string,
+    actions: AgentActionPublicSummaryV1[],
+  ): void {
+    if (actions.length === 0) return
+    updateGovernedActions((current) => {
+      const replacements = new Map(actions.map((action) => [action.id, action]))
+      const next = current.map((entry) => {
+        const action = entry.originSessionId === originSessionId ? replacements.get(entry.action.id) : undefined
+        if (!action) return entry
+        replacements.delete(entry.action.id)
+        return { originSessionId, action }
+      })
+      for (const action of replacements.values()) next.push({ originSessionId, action })
+      return next
+    })
+  }
+
+  async function persistGovernedTerminalAction(
+    originSessionId: string,
+    action: AgentActionPublicSummaryV1,
+  ): Promise<void> {
+    const summary = buildGovernedTerminalSummary(action)
+    if (!summary) return
+    if (persistedActionIdsRef.current.has(action.id)) {
+      updateGovernedActions((current) => current.filter((entry) => entry.action.id !== action.id))
+      return
+    }
+    persistedActionIdsRef.current.add(action.id)
+    const messageId = `governed-${Date.now()}-${++terminalMessageCounterRef.current}`
+    try {
+      await appendPersistedMessage(originSessionId, {
+        id: messageId,
+        role: 'assistant',
+        content: `${summary.label}.`,
+        summaries: [summary],
+      })
+      updateGovernedActions((current) => current.filter((entry) => entry.action.id !== action.id))
+    } catch {
+      persistedActionIdsRef.current.delete(action.id)
+      if (mountedRef.current && useAgentSessionsStore.getState().activeSession?.id === originSessionId) {
+        setError('The action finished, but its terminal summary could not be saved.')
+      }
+    }
+  }
+
+  async function acceptGovernedActionUpdate(
+    originSessionId: string,
+    action: AgentActionPublicSummaryV1,
+  ): Promise<void> {
+    if (useAgentSessionsStore.getState().activeSession?.id === originSessionId) {
+      upsertGovernedActions(originSessionId, [action])
+    }
+    await persistGovernedTerminalAction(originSessionId, action)
+  }
+
+  async function cancelGovernedActionIds(originSessionId: string, actionIds: string[]): Promise<void> {
+    for (const actionId of actionIds) {
+      try {
+        let latest: AgentActionPublicSummaryV1 | null = null
+        const result = await window.electron.agentActions.cancel({ actionId, originSessionId })
+        if (result.ok && result.action.id === actionId) {
+          latest = result.action
+        }
+        if (!latest) {
+          const refreshed = await window.electron.agentActions.get({ actionId, originSessionId })
+          if (refreshed.ok && refreshed.action.id === actionId) latest = refreshed.action
+        }
+        if (!latest || !isGovernedTerminalStatus(latest.status)) {
+          const reconciled = await reconcileGovernedActionUntilTerminal({
+            actionId,
+            originSessionId,
+            list: window.electron.agentActions.list,
+            shouldContinue: () => {
+              const state = useAgentSessionsStore.getState()
+              return state.activeSession?.id === originSessionId
+                || state.sessions.some((session) => session.id === originSessionId)
+            },
+          })
+          if (reconciled) latest = reconciled
+        }
+        if (latest) await persistGovernedTerminalAction(originSessionId, latest)
+      } catch {
+        // The prior session is already hidden. A later service cleanup still expires the lease.
+      }
+    }
+  }
+
+  async function handoffGovernedProposals(
+    proposals: AgentActionProposal[],
+    originSessionId: string,
+    modelLeaseId: string,
+    uiToken: OriginBoundUiToken,
+  ): Promise<GovernedActionHandoffError[]> {
+    if (proposals.length === 0) return []
+    const handoff = await proposeGovernedAgentActions({
+      proposals,
+      originSessionId,
+      modelLeaseId,
+      isCurrent: uiToken.isCurrent,
+      propose: (request) => window.electron.agentActions.propose(request),
+      tracker: proposalTrackerRef.current,
+      acceptAction: (action) => {
+        let accepted = false
+        uiToken.run(() => {
+          upsertGovernedActions(originSessionId, [action])
+          accepted = true
+        })
+        return accepted
+      },
+      compensate: async (action) => {
+        const outcome = await compensateLateGovernedProposal({
+          action,
+          originSessionId,
+          sessionExists: () => {
+            const state = useAgentSessionsStore.getState()
+            return state.activeSession?.id === originSessionId
+              || state.sessions.some((session) => session.id === originSessionId)
+          },
+          isOriginActive: () => mountedRef.current
+            && useAgentSessionsStore.getState().activeSession?.id === originSessionId,
+          cancel: (request) => window.electron.agentActions.cancel(request),
+          get: (request) => window.electron.agentActions.get(request),
+          list: (request) => window.electron.agentActions.list(request),
+          reject: (request) => window.electron.agentActions.decide(request),
+          persistTerminal: (terminalAction) => persistGovernedTerminalAction(originSessionId, terminalAction),
+          reportError: (message) => { if (mountedRef.current) setError(message) },
+        })
+        return outcome.kind === 'pending'
+          ? { code: 'cancellation_pending', message: 'A late governed proposal remains hidden and will expire automatically.' }
+          : null
+      },
+    })
+    return handoff.errors
+  }
+
+  function handleGovernedActionCommand(
+    entry: SessionGovernedAction,
+    command: GovernedActionCommand,
+  ): void {
+    void actionOperationGateRef.current.run(entry.action.id, async () => {
+      if (useAgentSessionsStore.getState().activeSession?.id !== entry.originSessionId) return
+      updateGovernedActions((current) => current.map((candidate) => candidate.action.id === entry.action.id
+        ? {
+            ...candidate,
+            action: command === 'run' ? { ...candidate.action, status: 'executing' } : candidate.action,
+            busyCommand: command,
+            error: undefined,
+          }
+        : candidate))
+
+      let visibleError: string | null = null
+      try {
+        const result = await invokeGovernedActionCommand(
+          command,
+          entry.action.id,
+          entry.originSessionId,
+          () => useAgentSessionsStore.getState().activeSession?.id ?? null,
+          window.electron.agentActions,
+        )
+        if (result.ok) {
+          if (result.action.id !== entry.action.id) throw new Error('Governed action identity changed.')
+          await acceptGovernedActionUpdate(entry.originSessionId, result.action)
+        } else {
+          visibleError = governedActionCommandErrorMessage(result.error.code)
+          if (result.error.code === 'cancellation_pending') {
+            const reconciled = await reconcileGovernedActionUntilTerminal({
+              actionId: entry.action.id,
+              originSessionId: entry.originSessionId,
+              list: window.electron.agentActions.list,
+              shouldContinue: () => mountedRef.current
+                && useAgentSessionsStore.getState().activeSession?.id === entry.originSessionId,
+            })
+            if (reconciled) {
+              visibleError = null
+              await acceptGovernedActionUpdate(entry.originSessionId, reconciled)
+            }
+          }
+          if (!visibleError) return
+          const refreshed = await window.electron.agentActions.get({
+            actionId: entry.action.id,
+            originSessionId: entry.originSessionId,
+          })
+          if (refreshed.ok && refreshed.action.id === entry.action.id) {
+            await acceptGovernedActionUpdate(entry.originSessionId, refreshed.action)
+          }
+        }
+      } catch {
+        visibleError = useAgentSessionsStore.getState().activeSession?.id === entry.originSessionId
+          ? 'Modly could not update this governed action.'
+          : null
+      } finally {
+        if (useAgentSessionsStore.getState().activeSession?.id === entry.originSessionId) {
+          updateGovernedActions((current) => current.map((candidate) => candidate.action.id === entry.action.id
+            ? {
+                ...candidate,
+                busyCommand: undefined,
+                ...(visibleError ? { error: visibleError } : {}),
+              }
+            : candidate))
+          if (visibleError) setError(visibleError)
+        }
+      }
+    })
   }
 
   async function applyCompletedActions(
@@ -680,76 +1688,124 @@ export default function ChatPanel(): JSX.Element {
     extraContext: Record<string, unknown> = {},
     uiToken = originUiGateRef.current.begin(originatingSessionId),
   ) {
+    const selectedModel: AgentOllamaModelSelectionV1 = {
+      provider: 'ollama',
+      endpoint: ollamaUrl,
+      model,
+    }
+    const selectedThinkingMode = thinkingMode
+    let modelLeaseId: string | null = null
     uiToken.run(() => {
       setIsLoading(true)
       setError(null)
     })
     try {
-        const context = { ...buildContext(), ...extraContext }
+      const [capabilityInventory, modelLeaseResult] = await Promise.all([
+        window.electron.agentCapabilities.list(),
+        window.electron.agentActions.leaseModel({
+          originSessionId: originatingSessionId,
+          model: selectedModel,
+        }),
+      ])
+      if (!modelLeaseResult.ok) throw new Error(governedActionErrorMessage(modelLeaseResult.error.code))
+      const leaseExpiresAt = Date.parse(modelLeaseResult.lease.expiresAt)
+      if (
+        !OPAQUE_ID_PATTERN.test(modelLeaseResult.lease.id)
+        || !Number.isFinite(leaseExpiresAt)
+        || leaseExpiresAt <= Date.now()
+      ) throw new Error(governedActionErrorMessage('model_stale'))
+      modelLeaseId = modelLeaseResult.lease.id
+      const capabilities = buildAgentCapabilityPromptInventory(capabilityInventory)
+      const context = { ...buildContext(), ...extraContext }
 
-        // Inject workflow completion as a system hint if present
-        const apiMessages = msgs.map((m) => {
-          const entry: { role: string; content: string; images?: string[] } = {
-            role: m.role,
-            content: m.content,
-          }
-          if (m.imageDataUrls?.length) {
-            entry.images = m.imageDataUrls.map((url) => url.split(',')[1])
-          }
-          return entry
-        })
-        if (extraContext.workflowCompletion) {
-          apiMessages.push({ role: 'user', content: `[System] ${extraContext.workflowCompletion}` })
-          delete context.workflowCompletion
+      // Inject workflow completion as a system hint if present
+      const apiMessages = msgs.map((m) => {
+        const entry: { role: string; content: string; images?: string[] } = {
+          role: m.role,
+          content: m.content,
         }
-
-        const res = await fetch(`${apiUrl}/agent/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: apiMessages, ollama_url: ollamaUrl, model, context, thinking: thinkingMode }),
-        })
-        const data = await parseAgentChatResponse(res)
-
-        const actionFailures = await applyCompletedActions(data.actions)
-        const failedActions = new Set(actionFailures.map((failure) => failure.action))
-        const reflectedActions = data.actions.filter((action) => !failedActions.has(action))
-        const assistantMessage: Message = {
-          id: `a-${Date.now()}`,
-          role: 'assistant',
-          content: data.message,
-          thinking: data.thinking ?? undefined,
-          actions: reflectedActions.length ? reflectedActions : undefined,
+        if (m.imageDataUrls?.length) {
+          entry.images = m.imageDataUrls.map((url) => url.split(',')[1])
         }
-        await appendPersistedMessage(originatingSessionId, {
-          id: assistantMessage.id,
-          role: assistantMessage.role,
-          content: assistantMessage.content,
-          summaries: reflectedActions
-            .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
-        })
-        uiToken.run(() => {
-          setMessages((prev) => [...prev, assistantMessage])
-        })
+        return entry
+      })
+      if (extraContext.workflowCompletion) {
+        apiMessages.push({ role: 'user', content: `[System] ${extraContext.workflowCompletion}` })
+        delete context.workflowCompletion
+      }
 
-        if (actionFailures.length > 0) {
-          const approvalRequired = governedActionFailure(actionFailures)
-          if (approvalRequired) throw approvalRequired
-          throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
-        }
+      const res = await fetch(`${apiUrl}/agent/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: apiMessages,
+          ollama_url: selectedModel.endpoint,
+          model: selectedModel.model,
+          modelLeaseId,
+          context,
+          thinking: selectedThinkingMode,
+          capabilities,
+        }),
+      })
+      const data = await parseAgentChatResponse(res)
+      const proposalErrors = await handoffGovernedProposals(
+        data.proposals,
+        originatingSessionId,
+        modelLeaseId,
+        uiToken,
+      )
+
+      const actionFailures = await applyCompletedActions(data.actions)
+      const failedActions = new Set(actionFailures.map((failure) => failure.action))
+      const reflectedActions = data.actions.filter((action) => !failedActions.has(action))
+      const assistantMessage: Message = {
+        id: `a-${Date.now()}`,
+        role: 'assistant',
+        content: data.message,
+        thinking: data.thinking ?? undefined,
+        actions: reflectedActions.length ? reflectedActions : undefined,
+      }
+      await appendPersistedMessage(originatingSessionId, {
+        id: assistantMessage.id,
+        role: assistantMessage.role,
+        content: assistantMessage.content,
+        summaries: reflectedActions
+          .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
+      })
+      uiToken.run(() => {
+        setMessages((prev) => [...prev, assistantMessage])
+        if (proposalErrors.length > 0) setError(proposalErrors.map((failure) => failure.message).join(' '))
+      })
+
+      if (actionFailures.length > 0) {
+        const approvalRequired = governedActionFailure(actionFailures)
+        if (approvalRequired) throw approvalRequired
+        throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
+      }
     } catch (e: unknown) {
-        let actionFailureCount = 0
-        let approvalRequired: GovernedActionRequiredError | null = null
-        if (e instanceof AgentApiError && e.actions.length > 0) {
+      let actionFailureCount = 0
+      let approvalRequired: GovernedActionRequiredError | null = null
+      let proposalErrors: GovernedActionHandoffError[] = []
+      if (e instanceof AgentApiError && modelLeaseId) {
+        proposalErrors = await handoffGovernedProposals(
+          e.proposals,
+          originatingSessionId,
+          modelLeaseId,
+          uiToken,
+        )
+        if (e.actions.length > 0) {
           const actionFailures = await applyCompletedActions(e.actions)
           actionFailureCount = actionFailures.length
           approvalRequired = governedActionFailure(actionFailures)
         }
-        const msg = e instanceof Error ? e.message : String(e)
-        const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
-        uiToken.run(() => setError(
-          approvalRequired?.message
-          ?? (e instanceof GovernedActionRequiredError ? e.message : withActionFailureSummary(safeMessage, actionFailureCount)),
-        ))
+      }
+      const msg = e instanceof Error ? e.message : String(e)
+      const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
+      const primaryMessage = approvalRequired?.message
+        ?? (e instanceof GovernedActionRequiredError ? e.message : withActionFailureSummary(safeMessage, actionFailureCount))
+      uiToken.run(() => setError(
+        [primaryMessage, ...proposalErrors.map((failure) => failure.message)].join(' '),
+      ))
     } finally {
       uiToken.run(() => setIsLoading(false))
     }
@@ -759,7 +1815,7 @@ export default function ChatPanel(): JSX.Element {
     try {
       const res = await fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(ollamaUrl)}`)
       const data = await res.json()
-      setOllamaModels(data.models ?? [])
+      setOllamaModels(parseOllamaModelNames(data))
     } catch {
       setOllamaModels([])
     }
@@ -869,6 +1925,7 @@ export default function ChatPanel(): JSX.Element {
   const collapsed = !showAll && messages.length > COLLAPSE_AFTER
   const hidden    = collapsed ? messages.length - COLLAPSE_AFTER : 0
   const visible   = collapsed ? messages.slice(-COLLAPSE_AFTER) : messages
+  const visibleGovernedActions = governedActions.filter((entry) => entry.originSessionId === activeSession?.id)
 
   return (
     <div
@@ -898,7 +1955,7 @@ export default function ChatPanel(): JSX.Element {
               </svg>
             </div>
             <p className="text-[11px] text-zinc-500 text-center leading-relaxed">
-              Ask me to generate, optimize,<br />or run a workflow.
+              Ask me to inspect Modly<br />or propose a governed action.
             </p>
           </div>
         )}
@@ -949,6 +2006,15 @@ export default function ChatPanel(): JSX.Element {
                 </div>
               )}
             </div>
+          ))}
+
+          {visibleGovernedActions.map((entry) => (
+            <GovernedActionCard
+              key={entry.action.id}
+              entry={entry}
+              onCommand={handleGovernedActionCommand}
+              onExpire={(candidate) => handleGovernedActionCommand(candidate, 'refresh')}
+            />
           ))}
 
           {/* Loading indicator */}

@@ -106,43 +106,53 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
   })
 
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: 'legacy/not-opted-in',
+    capabilityHash: '0'.repeat(64),
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   }), 'capability_not_found')
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: { hidden: true } },
     model: selectedModel,
   }), 'invalid_arguments')
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: { quality: 'ultra' } },
     model: selectedModel,
   }), 'invalid_arguments')
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
     status: 'approved',
   } as never), 'invalid_request')
 
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: { quality: 'draft' } },
     model: selectedModel,
   })
   assert.equal(proposed.status, 'proposed')
   const publicJson = JSON.stringify(proposed)
-  assert.equal(publicJson.includes('chair'), false)
+  assert.deepEqual(proposed.preview[0], { label: 'Input', value: 'chair' })
   assert.equal(publicJson.includes('127.0.0.1'), false)
   assert.equal(publicJson.includes('private-lease-token'), false)
   assert.equal('arguments' in proposed, false)
 
   time.advance(10)
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
   time.advance(10)
-  const completed = await service.execute({ actionId: proposed.id })
+  const completed = await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.equal(completed.status, 'completed')
   assert.deepEqual(captured?.arguments, {
     input: 'chair',
@@ -150,6 +160,53 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
   })
   assert.equal(captured?.model.endpoint, 'http://127.0.0.1:11434')
   assert.equal(JSON.stringify(completed).includes(validOutput.workspacePath), false)
+})
+
+test('main binds actions to an origin session and generates a bounded redacted approval preview', async () => {
+  let nextId = 0
+  const capability = capabilityFixture({
+    node: {
+      id: 'generate', input: 'text', output: 'mesh',
+      paramsSchema: [
+        { id: 'quality', label: 'Quality', type: 'select', default: 'balanced', options: [{ value: 'balanced', label: 'Balanced' }] },
+        { id: 'api_token', label: 'API token', type: 'string', default: '' },
+        { id: 'notes', label: 'Notes', type: 'string', default: '' },
+      ],
+    },
+  })
+  const service = new AgentActionsService({
+    createActionId: () => `session-action-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+
+  const first = await service.propose({
+    originSessionId: 'session-a',
+    capabilityId: capability.id,
+    capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: { api_token: 'https://private.invalid/token', notes: 'Authorization: Bearer private-secret' } },
+    model: selectedModel,
+  } as never)
+  const second = await service.propose({
+    originSessionId: 'session-b',
+    capabilityId: capability.id,
+    capabilityHash: capability.hash,
+    arguments: { input: 'table', params: {} },
+    model: selectedModel,
+  } as never)
+
+  assert.equal(first.capability.risk, 'mutating')
+  assert.deepEqual(first.preview, [
+    { label: 'Input', value: 'chair' },
+    { label: 'Quality', value: 'balanced' },
+    { label: 'API token', value: '[redacted]' },
+    { label: 'Notes', value: '[redacted]' },
+  ])
+  assert.equal(JSON.stringify(first).includes('private.invalid'), false)
+  assert.equal(JSON.stringify(first).includes('private-secret'), false)
+  assert.deepEqual((await service.list({ originSessionId: 'session-a' } as never)).map((action) => action.id), [first.id])
+  assert.deepEqual((await service.list({ originSessionId: 'session-b' } as never)).map((action) => action.id), [second.id])
+  await rejectsCode(service.get({ actionId: first.id, originSessionId: 'session-b' } as never), 'action_not_found')
 })
 
 test('MCP capability proposals preserve canonical schema-shaped arguments without workflow input wrappers', async () => {
@@ -183,15 +240,19 @@ test('MCP capability proposals preserve canonical schema-shaped arguments withou
     },
   })
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { text: 'hello' },
     model: selectedModel,
   })
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
-  await service.execute({ actionId: proposed.id })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.deepEqual(captured?.arguments, { text: 'hello' })
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: Object.assign(Object.create(null), { constructor: 'polluted' }),
     model: selectedModel,
   }), 'invalid_arguments')
@@ -220,20 +281,24 @@ test('artifact inputs are resolved from opaque ids and paths or hashes are never
   })
 
   await rejectsCode(service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: sourceArtifact, params: {} } as never,
     model: selectedModel,
   }), 'invalid_arguments')
 
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: { artifactId: sourceArtifact.id }, params: {} },
     model: selectedModel,
   })
   assert.equal(JSON.stringify(proposed).includes(sourceArtifact.workspacePath), false)
   assert.equal(JSON.stringify(proposed).includes(sourceArtifact.sha256), true)
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
-  await service.execute({ actionId: proposed.id })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.deepEqual(captured?.arguments, { input: sourceArtifact, params: {} })
 })
 
@@ -253,40 +318,42 @@ test('approval fails closed when capability, model, or expiry changes after prop
     executor: async () => ({ artifacts: [validOutput] }),
   })
   const propose = () => service.propose({
+    originSessionId: 'test-session',
     capabilityId: initialCapability.id,
+    capabilityHash: initialCapability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
 
   const capabilityAction = await propose()
   currentCapability = capabilityFixture({ description: 'Changed capability.' })
-  await rejectsCode(service.decide({ actionId: capabilityAction.id, decision: 'approve' }), 'capability_stale')
-  assert.equal((await service.get({ actionId: capabilityAction.id })).status, 'cancelled')
+  await rejectsCode(service.decide({ actionId: capabilityAction.id, originSessionId: 'test-session', decision: 'approve' }), 'capability_stale')
+  assert.equal((await service.get({ actionId: capabilityAction.id, originSessionId: 'test-session' })).status, 'cancelled')
 
   currentCapability = initialCapability
   const modelAction = await propose()
   currentModel = { ...selectedModel, digest: `sha256:${'d'.repeat(64)}` }
-  await rejectsCode(service.decide({ actionId: modelAction.id, decision: 'approve' }), 'model_stale')
-  assert.equal((await service.get({ actionId: modelAction.id })).status, 'cancelled')
+  await rejectsCode(service.decide({ actionId: modelAction.id, originSessionId: 'test-session', decision: 'approve' }), 'model_stale')
+  assert.equal((await service.get({ actionId: modelAction.id, originSessionId: 'test-session' })).status, 'cancelled')
 
   currentModel = selectedModel
   const expiredAction = await propose()
   time.advance(1_000)
-  await rejectsCode(service.decide({ actionId: expiredAction.id, decision: 'approve' }), 'approval_expired')
-  assert.equal((await service.get({ actionId: expiredAction.id })).status, 'expired')
+  await rejectsCode(service.decide({ actionId: expiredAction.id, originSessionId: 'test-session', decision: 'approve' }), 'approval_expired')
+  assert.equal((await service.get({ actionId: expiredAction.id, originSessionId: 'test-session' })).status, 'expired')
 
   const staleExecution = await propose()
-  await service.decide({ actionId: staleExecution.id, decision: 'approve' })
+  await service.decide({ actionId: staleExecution.id, originSessionId: 'test-session', decision: 'approve' })
   currentCapability = capabilityFixture({ description: 'Changed after approval.' })
-  await rejectsCode(service.execute({ actionId: staleExecution.id }), 'capability_stale')
-  assert.equal((await service.get({ actionId: staleExecution.id })).status, 'cancelled')
+  await rejectsCode(service.execute({ actionId: staleExecution.id, originSessionId: 'test-session' }), 'capability_stale')
+  assert.equal((await service.get({ actionId: staleExecution.id, originSessionId: 'test-session' })).status, 'cancelled')
 
   currentCapability = initialCapability
   const expiredLease = await propose()
-  await service.decide({ actionId: expiredLease.id, decision: 'approve' })
+  await service.decide({ actionId: expiredLease.id, originSessionId: 'test-session', decision: 'approve' })
   time.advance(1_000)
-  await rejectsCode(service.execute({ actionId: expiredLease.id }), 'approval_expired')
-  assert.equal((await service.get({ actionId: expiredLease.id })).status, 'expired')
+  await rejectsCode(service.execute({ actionId: expiredLease.id, originSessionId: 'test-session' }), 'approval_expired')
+  assert.equal((await service.get({ actionId: expiredLease.id, originSessionId: 'test-session' })).status, 'expired')
 })
 
 test('approval lease is consumed once and concurrent execute calls invoke the executor at most once', async () => {
@@ -303,18 +370,20 @@ test('approval lease is consumed once and concurrent execute calls invoke the ex
     executor: async () => { executions += 1; return executionResult },
   })
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
 
-  const first = service.execute({ actionId: proposed.id })
+  const first = service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   await new Promise((resolve) => setImmediate(resolve))
-  await rejectsCode(service.execute({ actionId: proposed.id }), 'invalid_state')
+  await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'invalid_state')
   resolveExecution({ artifacts: [validOutput] })
   assert.equal((await first).status, 'completed')
-  await rejectsCode(service.execute({ actionId: proposed.id }), 'invalid_state')
+  await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'invalid_state')
   assert.equal(executions, 1)
 })
 
@@ -336,15 +405,17 @@ test('approval expiring during authoritative re-resolution never reaches the exe
     executor: async () => { executions += 1; return { artifacts: [validOutput] } },
   })
   const action = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: action.id, decision: 'approve' })
+  await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
   expireDuringResolution = true
-  await rejectsCode(service.execute({ actionId: action.id }), 'approval_expired')
+  await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'approval_expired')
   assert.equal(executions, 0)
-  assert.equal((await service.get({ actionId: action.id })).status, 'cancelled')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'cancelled')
 })
 
 test('cancellation is idempotent and late executor success cannot overwrite cancelled state', async () => {
@@ -366,22 +437,24 @@ test('cancellation is idempotent and late executor success cannot overwrite canc
     },
   })
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
-  const running = service.execute({ actionId: proposed.id })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  const running = service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   await didStart
 
-  const cancelling = service.cancel({ actionId: proposed.id })
+  const cancelling = service.cancel({ actionId: proposed.id, originSessionId: 'test-session' })
   await new Promise<void>((resolve) => setImmediate(resolve))
   assert.equal(executorSignal?.aborted, true)
   resolveExecution({ artifacts: [validOutput] })
   assert.equal((await cancelling).status, 'cancelled')
-  assert.equal((await service.cancel({ actionId: proposed.id })).status, 'cancelled')
+  assert.equal((await service.cancel({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'cancelled')
   assert.equal((await running).status, 'cancelled')
-  assert.equal((await service.get({ actionId: proposed.id })).status, 'cancelled')
+  assert.equal((await service.get({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'cancelled')
 })
 
 test('executor output is fail-closed for unavailable executors, path escapes, wrong kinds, and duplicate artifacts', async () => {
@@ -398,30 +471,32 @@ test('executor output is fail-closed for unavailable executors, path escapes, wr
   })
   const createApproved = async () => {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: 'chair', params: {} },
       model: selectedModel,
     })
-    await service.decide({ actionId: action.id, decision: 'approve' })
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
     return action.id
   }
 
   const unavailable = await createApproved()
-  await rejectsCode(service.execute({ actionId: unavailable }), 'executor_unavailable')
-  assert.equal((await service.get({ actionId: unavailable })).status, 'approved')
+  await rejectsCode(service.execute({ actionId: unavailable, originSessionId: 'test-session' }), 'executor_unavailable')
+  assert.equal((await service.get({ actionId: unavailable, originSessionId: 'test-session' })).status, 'approved')
   executor = async () => ({ artifacts: [validOutput] })
-  assert.equal((await service.execute({ actionId: unavailable })).status, 'completed')
+  assert.equal((await service.execute({ actionId: unavailable, originSessionId: 'test-session' })).status, 'completed')
 
   executor = async () => ({ artifacts: [{ ...validOutput, workspacePath: '../escape.glb' }] })
   const escape = await createApproved()
-  await rejectsCode(service.execute({ actionId: escape }), 'invalid_artifact')
-  assert.equal((await service.get({ actionId: escape })).outputs.length, 0)
+  await rejectsCode(service.execute({ actionId: escape, originSessionId: 'test-session' }), 'invalid_artifact')
+  assert.equal((await service.get({ actionId: escape, originSessionId: 'test-session' })).outputs.length, 0)
 
   executor = async () => ({ artifacts: [{ ...validOutput, kind: 'image' }] })
-  await rejectsCode(service.execute({ actionId: await createApproved() }), 'invalid_artifact')
+  await rejectsCode(service.execute({ actionId: await createApproved(), originSessionId: 'test-session' }), 'invalid_artifact')
 
   executor = async () => ({ artifacts: [validOutput, validOutput] })
-  await rejectsCode(service.execute({ actionId: await createApproved() }), 'invalid_artifact')
+  await rejectsCode(service.execute({ actionId: await createApproved(), originSessionId: 'test-session' }), 'invalid_artifact')
 })
 
 test('a governed executor can return stable fail-closed sandbox_unavailable without exposing its cause', async () => {
@@ -434,13 +509,15 @@ test('a governed executor can return stable fail-closed sandbox_unavailable with
     executor: async () => { throw new AgentActionsServiceError('sandbox_unavailable', new Error('/private/bwrap path')) },
   })
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
-  await rejectsCode(service.execute({ actionId: proposed.id }), 'sandbox_unavailable')
-  const failed = await service.get({ actionId: proposed.id })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'sandbox_unavailable')
+  const failed = await service.get({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.equal(failed.status, 'failed')
   assert.equal(JSON.stringify(failed).includes('/private'), false)
 })
@@ -464,31 +541,35 @@ test('sandbox readiness failure preserves the approval lease for a retry until e
     executor: async () => { executions += 1; return { artifacts: [validOutput] } },
   })
   const proposed = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: proposed.id, decision: 'approve' })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
 
-  await rejectsCode(service.execute({ actionId: proposed.id }), 'sandbox_unavailable')
-  assert.equal((await service.get({ actionId: proposed.id })).status, 'approved')
+  await rejectsCode(service.execute({ actionId: proposed.id, originSessionId: 'test-session' }), 'sandbox_unavailable')
+  assert.equal((await service.get({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'approved')
   assert.equal(executions, 0)
 
   ready = true
-  assert.equal((await service.execute({ actionId: proposed.id })).status, 'completed')
+  assert.equal((await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'completed')
   assert.equal(executions, 1)
 
   ready = false
   const expiring = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'table', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: expiring.id, decision: 'approve' })
-  await rejectsCode(service.execute({ actionId: expiring.id }), 'sandbox_unavailable')
+  await service.decide({ actionId: expiring.id, originSessionId: 'test-session', decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: expiring.id, originSessionId: 'test-session' }), 'sandbox_unavailable')
   time.advance(1_000)
-  await rejectsCode(service.execute({ actionId: expiring.id }), 'approval_expired')
-  assert.equal((await service.get({ actionId: expiring.id })).status, 'expired')
+  await rejectsCode(service.execute({ actionId: expiring.id, originSessionId: 'test-session' }), 'approval_expired')
+  assert.equal((await service.get({ actionId: expiring.id, originSessionId: 'test-session' })).status, 'expired')
 })
 
 test('terminal actions are bounded, expired actions are pruned into terminal state, and restart restores nothing', async () => {
@@ -508,30 +589,34 @@ test('terminal actions are bounded, expired actions are pruned into terminal sta
   const service = new AgentActionsService(dependencies)
   for (let index = 0; index < 3; index += 1) {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: `chair-${index}`, params: {} },
       model: selectedModel,
     })
     time.advance(1)
-    await service.decide({ actionId: action.id, decision: 'reject' })
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'reject' })
     time.advance(1)
   }
-  assert.deepEqual((await service.list()).map((action) => action.id), [
+  assert.deepEqual((await service.list({ originSessionId: 'test-session' })).map((action) => action.id), [
     'action-retention-2',
     'action-retention-3',
   ])
 
   const expiring = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'expiring', params: {} },
     model: selectedModel,
   })
   time.advance(100)
-  assert.equal((await service.get({ actionId: expiring.id })).status, 'expired')
+  assert.equal((await service.get({ actionId: expiring.id, originSessionId: 'test-session' })).status, 'expired')
 
   const restarted = new AgentActionsService({ ...dependencies, createActionId: () => 'after-restart' })
-  assert.deepEqual(await restarted.list(), [])
-  await rejectsCode(restarted.get({ actionId: expiring.id }), 'action_not_found')
+  assert.deepEqual(await restarted.list({ originSessionId: 'test-session' }), [])
+  await rejectsCode(restarted.get({ actionId: expiring.id, originSessionId: 'test-session' }), 'action_not_found')
 })
 
 test('cancellation during input revalidation prevents executor invocation', async () => {
@@ -563,14 +648,16 @@ test('cancellation during input revalidation prevents executor invocation', asyn
     executor: async () => { executions += 1; return { artifacts: [validOutput] } },
   })
   const action = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: { artifactId: source.id }, params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: action.id, decision: 'approve' })
-  const running = service.execute({ actionId: action.id })
+  await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+  const running = service.execute({ actionId: action.id, originSessionId: 'test-session' })
   await didStartVerification
-  assert.equal((await service.cancel({ actionId: action.id })).status, 'cancelled')
+  assert.equal((await service.cancel({ actionId: action.id, originSessionId: 'test-session' })).status, 'cancelled')
   releaseVerification()
   assert.equal((await running).status, 'cancelled')
   assert.equal(executions, 0)
@@ -598,19 +685,21 @@ test('cancellation wins while final output verification is awaiting and cannot b
     executor: async () => ({ artifacts: [validOutput] }),
   })
   const action = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: action.id, decision: 'approve' })
-  const running = service.execute({ actionId: action.id })
+  await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+  const running = service.execute({ actionId: action.id, originSessionId: 'test-session' })
   await didStartOutputVerification
-  const cancelling = service.cancel({ actionId: action.id })
+  const cancelling = service.cancel({ actionId: action.id, originSessionId: 'test-session' })
   await new Promise<void>((resolve) => setImmediate(resolve))
   releaseOutputVerification()
   assert.equal((await cancelling).status, 'cancelled')
   assert.equal((await running).status, 'cancelled')
-  assert.equal((await service.get({ actionId: action.id })).status, 'cancelled')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'cancelled')
 })
 
 test('transactional executor output is rolled back before post-publication verification failure becomes terminal', async () => {
@@ -632,14 +721,16 @@ test('transactional executor output is rolled back before post-publication verif
   })
   try {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: 'chair', params: {} },
       model: selectedModel,
     })
-    await service.decide({ actionId: action.id, decision: 'approve' })
-    await rejectsCode(service.execute({ actionId: action.id }), 'invalid_artifact')
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+    await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'invalid_artifact')
     await assert.rejects(readFile(published), { code: 'ENOENT' })
-    assert.equal((await service.get({ actionId: action.id })).status, 'failed')
+    assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'failed')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -674,14 +765,16 @@ test('cancellation after executor publication awaits rollback before exposing ca
   })
   try {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: 'chair', params: {} },
       model: selectedModel,
     })
-    await service.decide({ actionId: action.id, decision: 'approve' })
-    const running = service.execute({ actionId: action.id })
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+    const running = service.execute({ actionId: action.id, originSessionId: 'test-session' })
     await didStartVerification
-    const cancelling = service.cancel({ actionId: action.id })
+    const cancelling = service.cancel({ actionId: action.id, originSessionId: 'test-session' })
     await new Promise<void>((resolve) => setImmediate(resolve))
     assert.equal(await readFile(published, 'utf8'), 'published bytes')
     releaseVerification()
@@ -721,15 +814,17 @@ test('cancellation between atomic publication and executor handoff waits for reg
   })
   try {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: 'chair', params: {} },
       model: selectedModel,
     })
-    await service.decide({ actionId: action.id, decision: 'approve' })
-    const running = service.execute({ actionId: action.id })
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+    const running = service.execute({ actionId: action.id, originSessionId: 'test-session' })
     await didPublish
     let cancelSettled = false
-    const cancelling = service.cancel({ actionId: action.id }).finally(() => { cancelSettled = true })
+    const cancelling = service.cancel({ actionId: action.id, originSessionId: 'test-session' }).finally(() => { cancelSettled = true })
     await new Promise<void>((resolve) => setImmediate(resolve))
     assert.equal(cancelSettled, false)
     assert.equal(await readFile(published, 'utf8'), 'published bytes')
@@ -762,20 +857,22 @@ test('cancellation timeout stays non-terminal when an executor ignores abort and
     },
   })
   const action = await service.propose({
+    originSessionId: 'test-session',
     capabilityId: capability.id,
+    capabilityHash: capability.hash,
     arguments: { input: 'chair', params: {} },
     model: selectedModel,
   })
-  await service.decide({ actionId: action.id, decision: 'approve' })
-  const running = service.execute({ actionId: action.id })
+  await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
+  const running = service.execute({ actionId: action.id, originSessionId: 'test-session' })
   await didStartExecutor
-  await rejectsCode(service.cancel({ actionId: action.id }), 'cancellation_pending')
-  assert.equal((await service.get({ actionId: action.id })).status, 'executing')
-  await rejectsCode(service.cancel({ actionId: action.id }), 'cancellation_pending')
-  assert.equal((await service.get({ actionId: action.id })).status, 'executing')
+  await rejectsCode(service.cancel({ actionId: action.id, originSessionId: 'test-session' }), 'cancellation_pending')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'executing')
+  await rejectsCode(service.cancel({ actionId: action.id, originSessionId: 'test-session' }), 'cancellation_pending')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'executing')
   releaseExecutor()
   assert.equal((await running).status, 'cancelled')
-  assert.equal((await service.get({ actionId: action.id })).status, 'cancelled')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'test-session' })).status, 'cancelled')
 })
 
 test('input artifact mutation is detected immediately before start and never reaches the executor', async () => {
@@ -807,15 +904,212 @@ test('input artifact mutation is detected immediately before start and never rea
   })
   try {
     const action = await service.propose({
+    originSessionId: 'test-session',
       capabilityId: capability.id,
+    capabilityHash: capability.hash,
       arguments: { input: { artifactId: source.id }, params: {} },
       model: selectedModel,
     })
-    await service.decide({ actionId: action.id, decision: 'approve' })
+    await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
     await writeFile(join(workflows, 'source.glb'), Buffer.from('mutated mesh!'))
-    await rejectsCode(service.execute({ actionId: action.id }), 'invalid_artifact')
+    await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'invalid_artifact')
     assert.equal(executions, 0)
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('every action read and mutation is authorized by the immutable origin session in main', async () => {
+  const capability = capabilityFixture()
+  const service = new AgentActionsService({
+    createActionId: () => 'session-owned-action',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+  const action = await service.propose({
+    originSessionId: 'session-a',
+    capabilityId: capability.id,
+    capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  } as never)
+
+  await rejectsCode(service.get({ actionId: action.id, originSessionId: 'session-b' }), 'action_not_found')
+  await rejectsCode(service.decide({ actionId: action.id, originSessionId: 'session-b', decision: 'reject' } as never), 'action_not_found')
+  await service.decide({ actionId: action.id, originSessionId: 'session-a', decision: 'approve' } as never)
+  await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'session-b' } as never), 'action_not_found')
+  await rejectsCode(service.cancel({ actionId: action.id, originSessionId: 'session-b' } as never), 'action_not_found')
+  assert.equal((await service.get({ actionId: action.id, originSessionId: 'session-a' })).status, 'approved')
+
+  await rejectsCode(service.get({ actionId: action.id } as never), 'invalid_request')
+  await rejectsCode(service.decide({ actionId: action.id, decision: 'reject' } as never), 'invalid_request')
+  await rejectsCode(service.execute({ actionId: action.id } as never), 'invalid_request')
+  await rejectsCode(service.cancel({ actionId: action.id } as never), 'invalid_request')
+})
+
+test('proposal compares the capability hash seen by the model before creating an action', async () => {
+  const capability = capabilityFixture()
+  const service = new AgentActionsService({
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a',
+    capabilityId: capability.id,
+    capabilityHash: 'f'.repeat(64),
+    arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  } as never), 'capability_stale')
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a', capabilityId: capability.id,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  } as never), 'invalid_request')
+  await rejectsCode(service.propose({
+    capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  } as never), 'invalid_request')
+  assert.deepEqual(await service.list({ originSessionId: 'session-a' }), [])
+})
+
+test('MCP proposal validation is strict and its approval preview includes every executable nested argument', async () => {
+  const scalarProperties = Object.fromEntries(Array.from({ length: 13 }, (_, index) => [
+    `field_${String(index + 1).padStart(2, '0')}`,
+    { type: 'string', maxLength: 80 },
+  ]))
+  const inputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ...scalarProperties,
+      nested: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          bearer: { type: 'string', maxLength: 200 },
+          github: { type: 'string', maxLength: 200 },
+          aws: { type: 'string', maxLength: 200 },
+          jwt: { type: 'string', maxLength: 400 },
+          pem: { type: 'string', maxLength: 400 },
+        },
+        required: ['bearer', 'github', 'aws', 'jwt', 'pem'],
+      },
+      items: {
+        type: 'array',
+        maxItems: 2,
+        items: { type: 'string', maxLength: 80 },
+      },
+      exact_text: { type: 'string', maxLength: 200 },
+      null_value: { type: 'null' },
+    },
+    required: [...Object.keys(scalarProperties), 'nested', 'items', 'exact_text', 'null_value'],
+  }
+  const capability = capabilityFixture({
+    id: 'mcp-tools/preview-all',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'preview-all', input: 'text', output: 'mesh', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema, inputSchemaHash: sha256Canonical(inputSchema),
+      mutating: true, bindingHash: 'e'.repeat(64),
+    },
+  })
+  const service = new AgentActionsService({
+    createActionId: () => 'mcp-preview-all',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+  const argumentsValue = {
+    ...Object.fromEntries(Object.keys(scalarProperties).map((key) => [key, key])),
+    nested: {
+      bearer: 'Bearer abcdefghijklmnopqrstuvwxyz',
+      github: 'github_pat_11AA22BB33CC44DD55',
+      aws: 'AKIAIOSFODNN7EXAMPLE',
+      jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature',
+      pem: '-----BEGIN PRIVATE KEY----- secret -----END PRIVATE KEY-----',
+    },
+    items: ['first', 'second'],
+    exact_text: 'line one\nline two',
+    null_value: null,
+  }
+  const action = await service.propose({
+    originSessionId: 'session-a', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: argumentsValue, model: selectedModel,
+  } as never)
+
+  assert.ok(action.preview.some((entry) => entry.label === 'field_13' && entry.value === 'field_13'))
+  assert.ok(action.preview.some((entry) => entry.label === 'items[1]' && entry.value === 'second'))
+  assert.deepEqual(action.preview.find((entry) => entry.label === 'exact_text'), {
+    label: 'exact_text', value: 'line one\\nline two',
+  })
+  assert.deepEqual(action.preview.find((entry) => entry.label === 'null_value'), {
+    label: 'null_value', value: 'null',
+  })
+  for (const label of ['nested.bearer', 'nested.github', 'nested.aws', 'nested.jwt', 'nested.pem']) {
+    assert.deepEqual(action.preview.find((entry) => entry.label === label), { label, value: '[redacted]' })
+  }
+
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { ...argumentsValue, hidden: 'must never become approvable' }, model: selectedModel,
+  } as never), 'invalid_arguments')
+
+  const openSchema = { type: 'object', additionalProperties: true }
+  const openCapability = capabilityFixture({
+    id: 'mcp-tools/open-schema',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'open-schema', input: 'text', output: 'mesh', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema: openSchema, inputSchemaHash: sha256Canonical(openSchema),
+      mutating: true, bindingHash: 'f'.repeat(64),
+    },
+  })
+  const openService = new AgentActionsService({
+    resolveCapabilities: async () => ({ capabilities: [openCapability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+  await rejectsCode(openService.propose({
+    originSessionId: 'session-a', capabilityId: openCapability.id, capabilityHash: openCapability.hash,
+    arguments: { hidden: 'not governed by a closed schema' }, model: selectedModel,
+  } as never), 'invalid_arguments')
+
+  for (const [nodeId, unsafeSchema, unsafeArguments] of [
+    [
+      'pattern-schema',
+      { type: 'object', additionalProperties: false, properties: {}, patternProperties: { '^x': { type: 'string', maxLength: 80 } } },
+      { x_hidden: 'not declared as a fixed approval field' },
+    ],
+    [
+      'unbounded-array',
+      { type: 'object', additionalProperties: false, properties: { items: { type: 'array', items: { type: 'string', maxLength: 80 } } } },
+      { items: ['unbounded'] },
+    ],
+    [
+      'unbounded-string',
+      { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
+      { text: 'unbounded' },
+    ],
+    [
+      'oversized-preview-string',
+      { type: 'object', additionalProperties: false, properties: { text: { type: 'string', maxLength: 5_000 } } },
+      { text: 'bounded by Ajv but too large for complete human approval' },
+    ],
+  ] as const) {
+    const unsafeCapability = capabilityFixture({
+      id: `mcp-tools/${nodeId}`,
+      extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+      node: { id: nodeId, input: 'text', output: 'mesh', paramsSchema: [] },
+      execution: {
+        kind: 'mcp_tool', inputSchema: unsafeSchema as never, inputSchemaHash: sha256Canonical(unsafeSchema),
+        mutating: true, bindingHash: 'a'.repeat(64),
+      },
+    })
+    const unsafeService = new AgentActionsService({
+      resolveCapabilities: async () => ({ capabilities: [unsafeCapability], errors: [] }),
+      resolveCurrentModel: async () => selectedModel,
+    })
+    await rejectsCode(unsafeService.propose({
+      originSessionId: 'session-a', capabilityId: unsafeCapability.id, capabilityHash: unsafeCapability.hash,
+      arguments: unsafeArguments, model: selectedModel,
+    } as never), 'invalid_arguments')
   }
 })

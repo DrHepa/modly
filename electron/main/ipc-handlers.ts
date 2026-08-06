@@ -50,7 +50,7 @@ import { AgentSessionStore } from './agent-session-store'
 import { AgentActionsService, AgentActionsServiceError } from './agent-actions-service'
 import { registerAgentActionsIpcHandlers } from './agent-actions-ipc'
 import { WorkspaceAgentArtifactVerifier } from './agent-artifact-verifier'
-import type { AgentOllamaModelSnapshotV1 } from '../../src/shared/types/agentActions.ts'
+import type { AgentOllamaModelSelectionV1, AgentOllamaModelSnapshotV1 } from '../../src/shared/types/agentActions.ts'
 import {
   AgentMcpBrokerError,
   createAgentMcpExecutor,
@@ -343,7 +343,11 @@ async function resolveOwnershipContext(userData: string, capabilityId: string) {
 }
 
 async function resolveCurrentOllamaModel(expected: AgentOllamaModelSnapshotV1): Promise<unknown> {
-  const response = await axios.get(`${expected.endpoint}/api/tags`, { timeout: 5_000 })
+  const response = await axios.get(`${expected.endpoint}/api/tags`, {
+    timeout: 5_000,
+    maxRedirects: 0,
+    validateStatus: (status) => status === 200,
+  })
   const payload = response.data
   if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { models?: unknown }).models)) return null
   const model = (payload as { models: unknown[] }).models.find((candidate) => {
@@ -359,6 +363,13 @@ async function resolveCurrentOllamaModel(expected: AgentOllamaModelSnapshotV1): 
     model: expected.model,
     digest,
   }
+}
+
+async function resolveSelectedOllamaModel(selection: AgentOllamaModelSelectionV1): Promise<unknown> {
+  return resolveCurrentOllamaModel({
+    ...selection,
+    digest: `sha256:${'0'.repeat(64)}`,
+  })
 }
 
 export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
@@ -420,7 +431,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       }
     },
   })
-  registerAgentActionsIpcHandlers(ipcMain, agentActionsService)
+  registerAgentActionsIpcHandlers(ipcMain, agentActionsService, {
+    resolveSelectedModel: resolveSelectedOllamaModel,
+  })
 
   const handleStructuredModelAssetDownload = async (
     event: IpcMainInvokeEvent,

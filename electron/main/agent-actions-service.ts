@@ -2,8 +2,9 @@ import { randomBytes, randomUUID } from 'node:crypto'
 
 import type {
   AgentActionDecisionRequest,
-  AgentActionIdRequest,
-  AgentActionProposeRequest,
+  AgentActionResolvedProposeRequest,
+  AgentActionSessionGetRequest,
+  AgentActionSessionRequest,
   AgentActionPublicErrorCode,
   AgentActionPublicSummaryV1,
   AgentActionV1,
@@ -14,6 +15,7 @@ import type {
   JsonValue,
 } from '../../src/shared/types/agentActions.ts'
 import {
+  assertMcpApprovalArgumentsPreviewable,
   assertAgentActionV1,
   assertAgentCapabilitySnapshotV1,
   assertAgentOllamaModelSnapshotV1,
@@ -26,9 +28,11 @@ import {
   transitionAgentAction,
 } from './agent-trust-contracts.ts'
 import type { AgentArtifactVerifier } from './agent-artifact-verifier.ts'
+import { AgentMcpBrokerError, validateMcpProposalArguments } from './agent-mcp-broker.ts'
 
 const ACTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const SHA256_PATTERN = /^[a-f0-9]{64}$/
 const TERMINAL_STATUSES = new Set(['rejected', 'expired', 'completed', 'failed', 'cancelled'])
 const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1_000
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1_000
@@ -53,12 +57,12 @@ export type AgentActionExecutorRequest = Readonly<{
 export type AgentActionExecutor = (request: AgentActionExecutorRequest) => Promise<unknown>
 
 export interface AgentActionsServiceLike {
-  propose(request: AgentActionProposeRequest): Promise<AgentActionPublicSummaryV1>
-  get(request: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1>
-  list(): Promise<AgentActionPublicSummaryV1[]>
+  propose(request: AgentActionResolvedProposeRequest): Promise<AgentActionPublicSummaryV1>
+  get(request: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1>
+  list(request: AgentActionSessionRequest): Promise<AgentActionPublicSummaryV1[]>
   decide(request: AgentActionDecisionRequest): Promise<AgentActionPublicSummaryV1>
-  execute(request: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1>
-  cancel(request: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1>
+  execute(request: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1>
+  cancel(request: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1>
 }
 
 export interface AgentActionsServiceOptions {
@@ -82,6 +86,7 @@ export interface AgentActionsServiceOptions {
 interface PrivateActionRecord {
   action: AgentActionV1
   generation: number
+  originSessionId: string
 }
 
 interface ApprovalLease {
@@ -140,6 +145,13 @@ function assertSafeActionId(value: unknown): string {
 
 function assertCapabilityId(value: unknown): string {
   if (typeof value !== 'string' || !CAPABILITY_ID_PATTERN.test(value)) {
+    throw new AgentActionsServiceError('invalid_request')
+  }
+  return value
+}
+
+function assertCapabilityHash(value: unknown): string {
+  if (typeof value !== 'string' || !SHA256_PATTERN.test(value)) {
     throw new AgentActionsServiceError('invalid_request')
   }
   return value
@@ -264,12 +276,15 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (this.maxTerminalActions > this.maxActions) throw new TypeError('maxTerminalActions must not exceed maxActions')
   }
 
-  async propose(requestValue: AgentActionProposeRequest): Promise<AgentActionPublicSummaryV1> {
+  async propose(requestValue: AgentActionResolvedProposeRequest): Promise<AgentActionPublicSummaryV1> {
     this.prune()
     if (this.actions.size >= this.maxActions) throw new AgentActionsServiceError('capacity_exceeded')
-    const request = assertExactRecord(requestValue, ['capabilityId', 'arguments', 'model'], 'invalid_request')
+    const request = assertExactRecord(requestValue, ['originSessionId', 'capabilityId', 'capabilityHash', 'arguments', 'model'], 'invalid_request')
+    const originSessionId = assertSafeActionId(request.originSessionId)
     const capabilityId = assertCapabilityId(request.capabilityId)
+    const capabilityHash = assertCapabilityHash(request.capabilityHash)
     const capability = await this.resolveCapability(capabilityId, 'capability_not_found')
+    if (capability.hash !== capabilityHash) throw new AgentActionsServiceError('capability_stale')
     let proposedModel: AgentOllamaModelSnapshotV1
     try {
       proposedModel = assertAgentOllamaModelSnapshotV1(request.model)
@@ -278,8 +293,15 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
     await this.assertCurrentModel(proposedModel)
     const normalized = await this.normalizeArguments(capability, request.arguments)
-    const currentCapability = await this.resolveCapability(capabilityId, 'capability_not_found')
-    if (currentCapability.hash !== capability.hash) throw new AgentActionsServiceError('capability_stale')
+    if (capability.execution?.kind === 'mcp_tool') {
+      try {
+        assertMcpApprovalArgumentsPreviewable(normalized.arguments)
+      } catch (error) {
+        throw new AgentActionsServiceError('invalid_arguments', error)
+      }
+    }
+    const currentCapability = await this.resolveCapability(capabilityId, 'capability_stale')
+    if (currentCapability.hash !== capabilityHash) throw new AgentActionsServiceError('capability_stale')
 
     this.prune()
     if (this.actions.size >= this.maxActions) throw new AgentActionsServiceError('capacity_exceeded')
@@ -297,36 +319,43 @@ export class AgentActionsService implements AgentActionsServiceLike {
       approval: { scope: 'single_action', expiresAt },
       createdAt,
     })
-    const record = { action, generation: 0 }
+    const record = { action, generation: 0, originSessionId }
     stableAction(record)
     this.actions.set(id, record)
     return this.toPublic(record)
   }
 
-  async get(requestValue: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1> {
-    const request = assertExactRecord(requestValue, ['actionId'], 'invalid_request')
+  async get(requestValue: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1> {
+    const request = assertExactRecord(requestValue, ['actionId', 'originSessionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
-    this.prune()
-    return this.toPublic(this.requireRecord(actionId))
+    const originSessionId = assertSafeActionId(request.originSessionId)
+    return this.withActionLock(actionId, () => {
+      this.prune()
+      return this.toPublic(this.requireOwnedRecord(actionId, originSessionId))
+    })
   }
 
-  async list(): Promise<AgentActionPublicSummaryV1[]> {
+  async list(requestValue: AgentActionSessionRequest): Promise<AgentActionPublicSummaryV1[]> {
     this.prune()
+    const request = assertExactRecord(requestValue, ['originSessionId'], 'invalid_request')
+    const originSessionId = assertSafeActionId(request.originSessionId)
     return [...this.actions.values()]
+      .filter((record) => record.originSessionId === originSessionId)
       .sort((left, right) => left.action.createdAt.localeCompare(right.action.createdAt) || left.action.id.localeCompare(right.action.id))
       .map((record) => this.toPublic(record))
   }
 
   async decide(requestValue: AgentActionDecisionRequest): Promise<AgentActionPublicSummaryV1> {
-    const request = assertExactRecord(requestValue, ['actionId', 'decision'], 'invalid_request')
+    const request = assertExactRecord(requestValue, ['actionId', 'originSessionId', 'decision'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
+    const originSessionId = assertSafeActionId(request.originSessionId)
     if (request.decision !== 'approve' && request.decision !== 'reject') {
       throw new AgentActionsServiceError('invalid_request')
     }
     if (request.decision === 'reject') {
       return this.withActionLock(actionId, () => {
         this.prune()
-        const record = this.requireRecord(actionId)
+        const record = this.requireOwnedRecord(actionId, originSessionId)
         if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
         if (record.action.status !== 'proposed') throw new AgentActionsServiceError('invalid_state')
         this.transition(record, 'rejected')
@@ -337,7 +366,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
 
     const snapshot = await this.withActionLock(actionId, () => {
       this.prune()
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
       if (record.action.status !== 'proposed') throw new AgentActionsServiceError('invalid_state')
       return { action: cloneCanonical(record.action), generation: record.generation }
@@ -351,7 +380,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
 
     return this.withActionLock(actionId, () => {
       this.prune()
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'cancelled') return this.toPublic(record)
       if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
       if (record.action.status !== 'proposed' || record.generation !== snapshot.generation) {
@@ -393,12 +422,13 @@ export class AgentActionsService implements AgentActionsServiceLike {
     })
   }
 
-  async execute(requestValue: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1> {
-    const request = assertExactRecord(requestValue, ['actionId'], 'invalid_request')
+  async execute(requestValue: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1> {
+    const request = assertExactRecord(requestValue, ['actionId', 'originSessionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
+    const originSessionId = assertSafeActionId(request.originSessionId)
     const readinessSnapshot = await this.withActionLock(actionId, () => {
       this.prune()
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
       if (record.action.status !== 'approved') throw new AgentActionsServiceError('invalid_state')
       const lease = this.leases.get(actionId)
@@ -422,7 +452,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (readinessFailure) {
       return this.withActionLock(actionId, () => {
         this.prune()
-        const record = this.requireRecord(actionId)
+        const record = this.requireOwnedRecord(actionId, originSessionId)
         if (record.action.status === 'cancelled') return this.toPublic(record)
         if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired', readinessFailure)
         if (record.action.status !== 'approved' || record.generation !== readinessSnapshot.generation) {
@@ -436,7 +466,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
     const prepared = await this.withActionLock(actionId, () => {
       this.prune()
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
       if (record.action.status !== 'approved') throw new AgentActionsServiceError('invalid_state')
       const lease = this.leases.get(actionId)
@@ -507,7 +537,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
         | { summary: AgentActionPublicSummaryV1 }
         | { failure: AgentActionsServiceError }
       const preflightResult = await this.withActionLock(actionId, (): PreflightResult => {
-        const record = this.requireRecord(actionId)
+        const record = this.requireOwnedRecord(actionId, originSessionId)
         if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
         if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
           throw new AgentActionsServiceError('invalid_state')
@@ -541,7 +571,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)
       || !settlement || settlement.cancellationRequested || prepared.controller.signal.aborted) {
       return this.withActionLock(actionId, () => {
-        const record = this.requireRecord(actionId)
+        const record = this.requireOwnedRecord(actionId, originSessionId)
         if (record.action.status === 'cancelled') return this.toPublic(record)
         if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
           throw new AgentActionsServiceError('invalid_state')
@@ -607,7 +637,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       | { summary: AgentActionPublicSummaryV1 }
       | { failure: AgentActionsServiceError }
     const finalized = await this.withActionLock(actionId, (): FinalizedResult => {
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
       if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
         throw new AgentActionsServiceError('invalid_state')
@@ -637,15 +667,16 @@ export class AgentActionsService implements AgentActionsServiceLike {
     throw finalized.failure
   }
 
-  async cancel(requestValue: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1> {
-    const request = assertExactRecord(requestValue, ['actionId'], 'invalid_request')
+  async cancel(requestValue: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1> {
+    const request = assertExactRecord(requestValue, ['actionId', 'originSessionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
+    const originSessionId = assertSafeActionId(request.originSessionId)
     type CancellationStep =
       | { summary: AgentActionPublicSummaryV1 }
       | { settlement: Promise<void> }
     const step = await this.withActionLock(actionId, (): CancellationStep => {
       this.prune()
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
       if (record.action.status !== 'proposed' && record.action.status !== 'approved' && record.action.status !== 'executing') {
         throw new AgentActionsServiceError('invalid_state')
@@ -676,7 +707,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       throw new AgentActionsServiceError('cancellation_pending')
     }
     return this.withActionLock(actionId, () => {
-      const record = this.requireRecord(actionId)
+      const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'cancelled') return this.toPublic(record)
       if (record.action.status === 'failed') throw new AgentActionsServiceError('execution_failed')
       throw new AgentActionsServiceError('cancellation_pending')
@@ -713,13 +744,14 @@ export class AgentActionsService implements AgentActionsServiceLike {
     if (capability.execution?.kind === 'mcp_tool') {
       try {
         if (!isPlainRecord(value)) throw new AgentActionsServiceError('invalid_arguments')
-        const argumentsValue = normalizeJsonValue(value)
+        const argumentsValue = validateMcpProposalArguments(capability.execution.inputSchema, value)
         if (Buffer.byteLength(canonicalJson(argumentsValue), 'utf8') > MAX_ARGUMENT_BYTES) {
           throw new AgentActionsServiceError('invalid_arguments')
         }
         return { arguments: argumentsValue, inputArtifacts: [] }
       } catch (error) {
         if (error instanceof AgentActionsServiceError) throw error
+        if (error instanceof AgentMcpBrokerError) throw new AgentActionsServiceError('invalid_arguments', error)
         throw new AgentActionsServiceError('invalid_arguments', error)
       }
     }
@@ -1019,6 +1051,12 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private requireRecord(actionId: string): PrivateActionRecord {
     const record = this.actions.get(actionId)
     if (!record) throw new AgentActionsServiceError('action_not_found')
+    return record
+  }
+
+  private requireOwnedRecord(actionId: string, originSessionId: string): PrivateActionRecord {
+    const record = this.requireRecord(actionId)
+    if (record.originSessionId !== originSessionId) throw new AgentActionsServiceError('action_not_found')
     return record
   }
 

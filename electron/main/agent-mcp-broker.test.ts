@@ -91,7 +91,8 @@ async function fixture(): Promise<Fixture> {
 
 function request(capability: AgentCapabilitySnapshotV1, signal = new AbortController().signal): AgentActionExecutorRequest {
   return {
-    actionId: 'action-mcp-fixture', capability, arguments: { text: 'hello' }, inputArtifacts: [], signal,
+    actionId: 'action-mcp-fixture', originSessionId: 'session-mcp-fixture',
+    capability, arguments: { text: 'hello' }, inputArtifacts: [], signal,
     model: {
       provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'qwen3.6:latest',
       digest: `sha256:${'a'.repeat(64)}`,

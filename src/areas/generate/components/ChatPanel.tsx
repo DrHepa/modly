@@ -414,7 +414,8 @@ function parameterHint(param: JsonValue): AgentCapabilityPromptInputHint | null 
 }
 
 function mcpInputHints(capability: AgentCapabilitySnapshotV1): AgentCapabilityPromptInputHint[] {
-  const schema = capability.execution?.inputSchema
+  if (capability.execution?.kind !== 'mcp_tool') return []
+  const schema = capability.execution.inputSchema
   if (!isRecord(schema) || !isRecord(schema.properties)) return []
   const properties = schema.properties
   const required = new Set(Array.isArray(schema.required) ? schema.required.filter((value): value is string => typeof value === 'string') : [])

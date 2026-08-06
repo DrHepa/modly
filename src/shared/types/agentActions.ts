@@ -28,6 +28,49 @@ export interface AgentCapabilityDeclarationV1 {
   display_name: string
   description: string
   approval: AgentApprovalPolicyV1
+  process: AgentProcessDeclarationV1
+}
+
+export interface AgentProcessArtifactPolicyV1 {
+  kind: ArtifactKind
+  mediaTypes: string[]
+  maxBytes: number
+}
+
+export interface AgentProcessArtifactContractV1 {
+  maxCount: number
+  maxTotalBytes: number
+  allowed: AgentProcessArtifactPolicyV1[]
+}
+
+export interface AgentProcessDeclarationV1 {
+  schema: 'modly.agent-process.v1'
+  runtimeFiles: string[]
+  resourceFiles: string[]
+  artifacts: AgentProcessArtifactContractV1
+}
+
+export interface AgentProcessRuntimeFileIdentityV1 {
+  path: string
+  device: string
+  inode: string
+  uid: number
+  gid: number
+  mode: number
+  size: number
+  mtimeNs: string
+  sha256: string
+}
+
+export interface AgentProcessExecutionV1 {
+  kind: 'process'
+  schema: 'modly.agent-process-execution.v1'
+  entry: string
+  runtimeFiles: AgentProcessRuntimeFileIdentityV1[]
+  resourceFiles: AgentProcessRuntimeFileIdentityV1[]
+  runtimeHash: string
+  artifacts: AgentProcessArtifactContractV1
+  bindingHash: string
 }
 
 export interface AgentMcpToolExecutionV1 {
@@ -66,7 +109,7 @@ export interface AgentCapabilitySnapshotV1 {
     }>
     paramsSchema: JsonValue[]
   }
-  execution?: AgentMcpToolExecutionV1
+  execution?: AgentMcpToolExecutionV1 | AgentProcessExecutionV1
   approval: AgentApprovalPolicyV1
   hash: string
 }

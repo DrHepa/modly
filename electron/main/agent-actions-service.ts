@@ -47,6 +47,7 @@ type PlainRecord = Record<string, unknown>
 
 export type AgentActionExecutorRequest = Readonly<{
   actionId: string
+  originSessionId: string
   capability: AgentCapabilitySnapshotV1
   arguments: JsonValue
   model: AgentOllamaModelSnapshotV1
@@ -487,6 +488,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       this.transition(record, 'executing')
       const executorRequest: AgentActionExecutorRequest = {
         actionId,
+        originSessionId,
         capability: cloneCanonical(record.action.capability),
         arguments: cloneCanonical(record.action.arguments),
         model: cloneCanonical(record.action.model),
@@ -604,7 +606,9 @@ export class AgentActionsService implements AgentActionsServiceLike {
         if (!settlement.cancellationRequested && !prepared.controller.signal.aborted) {
           artifacts = await this.verifyArtifacts(
             transaction.artifacts,
-            prepared.action.capability.node.output,
+            prepared.action.capability.execution?.kind === 'process'
+              ? undefined
+              : prepared.action.capability.node.output,
             prepared.controller.signal,
           )
         }
@@ -956,13 +960,24 @@ export class AgentActionsService implements AgentActionsServiceLike {
       } catch (error) {
         throw new AgentActionsServiceError('invalid_artifact', error)
       }
-      if (artifact.kind !== capability.node.output || ids.has(artifact.id) || paths.has(artifact.workspacePath)) {
+      const allowedByProcess = capability.execution?.kind === 'process'
+        ? capability.execution.artifacts.allowed.some((policy) => policy.kind === artifact.kind
+          && policy.mediaTypes.includes(artifact.mediaType)
+          && artifact.sizeBytes <= policy.maxBytes)
+        : artifact.kind === capability.node.output
+      if (!allowedByProcess || ids.has(artifact.id) || paths.has(artifact.workspacePath)) {
         throw new AgentActionsServiceError('invalid_artifact')
       }
       ids.add(artifact.id)
       paths.add(artifact.workspacePath)
       return artifact
     })
+    if (capability.execution?.kind === 'process') {
+      if (artifacts.length > capability.execution.artifacts.maxCount
+        || artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > capability.execution.artifacts.maxTotalBytes) {
+        throw new AgentActionsServiceError('invalid_artifact')
+      }
+    }
     if (result.rollback === undefined) return { artifacts }
     const rawRollback = result.rollback as () => unknown
     let rollbackPromise: Promise<void> | undefined

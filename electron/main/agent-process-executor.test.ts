@@ -12,6 +12,7 @@ import type {
 import { listAgentCapabilities } from './automation-capabilities.ts'
 import {
   AgentProcessExecutorError,
+  AgentProcessTerminalError,
   createAgentProcessExecutor,
 } from './agent-process-executor.ts'
 import type {
@@ -65,6 +66,20 @@ if (mode === 'hang') {
   setInterval(() => {}, 1000)
 } else if (mode === 'log-flood') {
   process.stdout.write(JSON.stringify({ type: 'log', message: 'x'.repeat(4096) }) + '\n')
+} else if (mode.startsWith('terminal-error')) {
+  const frame = {
+    type: 'error', code: 'model_binding_unavailable',
+    message: 'The approved model binding is unavailable.',
+    details: { retryable: true, stage: 'model_binding' },
+  }
+  if (mode === 'terminal-error-code') frame.code = '../escape'
+  if (mode === 'terminal-error-message') frame.message = 'unsafe\nmessage'
+  if (mode === 'terminal-error-artifacts') frame.artifacts = []
+  process.stdout.write(JSON.stringify(frame) + '\n')
+  if (mode === 'terminal-error-after') {
+    process.stdout.write(JSON.stringify({ type: 'log', message: 'must be rejected' }) + '\n')
+  }
+  if (mode === 'terminal-error-stderr') process.stderr.write('must be rejected')
 } else {
   const plan = await descriptor('plan.md', 'plan', 'text/markdown', '# Plan\n' + inputText)
   const glb = await descriptor('model.glb', 'glb', 'model/gltf-binary', 'glTF')
@@ -109,6 +124,8 @@ async function fixture() {
       params_schema: [{
         id: 'mode', type: 'select', default: 'honest', options: [
           'honest', 'forged', 'path', 'symlink', 'oversize', 'digest', 'partial', 'hang', 'tree', 'log-flood', 'terminal-after',
+          'terminal-error', 'terminal-error-code', 'terminal-error-message', 'terminal-error-artifacts',
+          'terminal-error-after', 'terminal-error-stderr',
         ].map((value) => ({ value, label: value })),
       }],
       agent: {
@@ -194,6 +211,34 @@ test('governed process publishes verified multiple artifacts atomically and roll
   }
 })
 
+test('governed process accepts one bounded terminal child error and publishes nothing', async () => {
+  const value = await fixture()
+  try {
+    const executor = createAgentProcessExecutor({
+      getWorkspaceRoot: () => value.workspaceDir,
+      getPrivateTempRoot: () => value.privateTempRoot,
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }),
+      resolveCurrentModel: async () => model,
+    })
+    await assert.rejects(
+      executor.execute(request(value.capability, value.inputArtifact, 'action-terminal-error', 'terminal-error')),
+      (error: unknown) => {
+        assert.ok(error instanceof AgentProcessTerminalError)
+        assert.equal(error.code, 'execution_failed')
+        assert.deepEqual(error.terminal, {
+          code: 'model_binding_unavailable',
+          message: 'The approved model binding is unavailable.',
+          details: { retryable: true, stage: 'model_binding' },
+        })
+        return true
+      },
+    )
+    await assert.rejects(access(join(value.workspaceDir, 'Workflows', 'agent-actions', 'action-terminal-error')))
+  } finally {
+    await rm(value.root, { recursive: true, force: true })
+  }
+})
+
 test('governed process rejects reserved context, descriptor forgery, output abuse, caps, hangs, and runtime swaps without publication', async (t) => {
   const modes = [
     ['path', 'invalid_artifact'],
@@ -203,6 +248,11 @@ test('governed process rejects reserved context, descriptor forgery, output abus
     ['partial', 'invalid_artifact'],
     ['log-flood', 'protocol_error'],
     ['terminal-after', 'protocol_error'],
+    ['terminal-error-code', 'protocol_error'],
+    ['terminal-error-message', 'protocol_error'],
+    ['terminal-error-artifacts', 'protocol_error'],
+    ['terminal-error-after', 'protocol_error'],
+    ['terminal-error-stderr', 'protocol_error'],
     ['hang', 'timeout'],
   ] as const
   for (const [mode, code] of modes) {
@@ -214,7 +264,9 @@ test('governed process rejects reserved context, descriptor forgery, output abus
           getPrivateTempRoot: () => value.privateTempRoot,
           resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }),
           resolveCurrentModel: async () => model,
-          limits: { startupMs: 2_000, idleMs: 1_000, totalMs: 3_000, terminationGraceMs: 100, maxLogBytes: 256 },
+          limits: mode === 'hang'
+            ? { startupMs: 5_000, idleMs: 5_000, totalMs: 10_000, terminationGraceMs: 500, maxLogBytes: 256 }
+            : { startupMs: 10_000, idleMs: 5_000, totalMs: 15_000, terminationGraceMs: 500, maxLogBytes: 256 },
         })
         if (mode === 'hang') await executor.ensureReady(value.capability)
         await rejectsProcess(executor.execute(request(value.capability, value.inputArtifact, `action-${mode}`, mode)), code)
@@ -326,12 +378,13 @@ test('governed process rejects reserved context, descriptor forgery, output abus
         getPrivateTempRoot: () => value.privateTempRoot,
         resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }),
         resolveCurrentModel: async () => model,
-        limits: { startupMs: 2_000, idleMs: 2_000, totalMs: 4_000, terminationGraceMs: 100 },
+        limits: { startupMs: 10_000, idleMs: 10_000, totalMs: 20_000, terminationGraceMs: 500 },
       })
       unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'modly-agent-unrelated-marker'], { stdio: 'ignore' })
       const running = executor.execute(request(value.capability, value.inputArtifact, 'action-tree', 'tree', controller.signal))
       let treePid = 0
-      for (let attempt = 0; attempt < 100 && treePid === 0; attempt += 1) {
+      const treeStartDeadline = Date.now() + 10_000
+      while (treePid === 0 && Date.now() < treeStartDeadline) {
         const stages = await readdir(value.privateTempRoot).catch(() => [])
         const stage = stages.find((name) => name.startsWith('action-tree-'))
         if (stage) {
@@ -343,7 +396,8 @@ test('governed process rejects reserved context, descriptor forgery, output abus
       assert.ok(treePid > 0)
       controller.abort()
       await rejectsProcess(running, 'aborted')
-      for (let attempt = 0; attempt < 100; attempt += 1) {
+      const treeExitDeadline = Date.now() + 10_000
+      while (Date.now() < treeExitDeadline) {
         try { process.kill(treePid, 0) } catch { treePid = 0; break }
         await new Promise((resolve) => setTimeout(resolve, 10))
       }

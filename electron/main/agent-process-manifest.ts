@@ -8,9 +8,14 @@ import type {
   AgentProcessArtifactContractV1,
   AgentProcessDeclarationV1,
   AgentProcessExecutionV1,
+  AgentProcessPythonRuntimeDeclarationV1,
   AgentProcessRuntimeFileIdentityV1,
 } from '../../src/shared/types/agentActions.ts'
 import { canonicalJson, sha256Canonical } from './agent-trust-contracts.ts'
+import {
+  AgentProcessPythonRuntimeError,
+  bindExtensionPythonRuntime,
+} from './agent-process-python-runtime.ts'
 
 const PROCESS_SCHEMA = 'modly.agent-process.v1' as const
 const EXECUTION_SCHEMA = 'modly.agent-process-execution.v1' as const
@@ -110,9 +115,18 @@ function normalizeArtifacts(value: unknown): AgentProcessArtifactContractV1 {
   return { maxCount, maxTotalBytes, allowed }
 }
 
+function normalizePythonRuntime(value: unknown): AgentProcessPythonRuntimeDeclarationV1 {
+  const runtime = record(value, 'Agent process runtime')
+  exactKeys(runtime, ['kind', 'interpreter'], 'Agent process runtime')
+  if (runtime.kind !== 'extension-python-venv-v1' || runtime.interpreter !== 'bin/python') {
+    throw new AgentProcessManifestError('invalid_metadata', 'Agent process Python runtime must use extension venv bin/python')
+  }
+  return { kind: 'extension-python-venv-v1', interpreter: 'bin/python' }
+}
+
 export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unknown): AgentProcessDeclarationV1 {
   const process = record(value, 'Agent process metadata')
-  exactKeys(process, ['schema', 'runtimeFiles', 'resourceFiles', 'artifacts'], 'Agent process metadata')
+  exactKeys(process, ['schema', 'runtimeFiles', 'resourceFiles', 'runtime', 'artifacts'], 'Agent process metadata')
   if (process.schema !== PROCESS_SCHEMA) throw new AgentProcessManifestError('invalid_metadata', 'Agent process schema is invalid')
   const entry = normalizeAgentProcessRelativePath(entryValue, 'Process entry')
   if (!/\.(?:js|mjs|pyz)$/i.test(entry)) {
@@ -124,6 +138,10 @@ export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unk
   const runtimeFiles = [normalizeAgentProcessRelativePath(process.runtimeFiles[0], 'Agent process runtimeFiles[0]')]
   if (runtimeFiles[0] !== entry) {
     throw new AgentProcessManifestError('invalid_metadata', 'Agent process runtimeFiles must contain only entry')
+  }
+  const runtime = process.runtime === undefined ? undefined : normalizePythonRuntime(process.runtime)
+  if (runtime !== undefined && !/\.pyz$/i.test(entry)) {
+    throw new AgentProcessManifestError('invalid_metadata', 'Extension Python runtime may execute only a Python zipapp')
   }
   if (!Array.isArray(process.resourceFiles) || process.resourceFiles.length > MAX_RESOURCE_FILES) {
     throw new AgentProcessManifestError('invalid_metadata', 'Agent process resourceFiles must be an explicitly bounded array')
@@ -139,6 +157,7 @@ export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unk
     schema: PROCESS_SCHEMA,
     runtimeFiles,
     resourceFiles,
+    ...(runtime ? { runtime } : {}),
     artifacts: normalizeArtifacts(process.artifacts),
   }
   canonicalJson(normalized)
@@ -235,6 +254,7 @@ export async function bindAgentProcessExecution(
   extensionDir: string,
   entry: string,
   declaration: AgentProcessDeclarationV1,
+  baseInterpreterPath?: string,
 ): Promise<AgentProcessExecutionV1> {
   const opened: FileHandle[] = []
   try {
@@ -250,15 +270,29 @@ export async function bindAgentProcessExecution(
       opened.push(bound.handle)
       resourceFiles.push(bound.identity)
     }
-    const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles })
+    const runtime = declaration.runtime
+      ? await bindExtensionPythonRuntime(
+        extensionDir,
+        declaration.runtime,
+        baseInterpreterPath ?? (() => { throw new AgentProcessPythonRuntimeError('runtime_unavailable', 'Trusted base interpreter is unavailable') })(),
+      )
+      : undefined
+    const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}) })
     const artifacts = declaration.artifacts
     const bindingHash = sha256Canonical({ schema: EXECUTION_SCHEMA, entry, runtimeHash, artifacts })
     return {
       kind: 'process', schema: EXECUTION_SCHEMA, entry,
-      runtimeFiles, resourceFiles, runtimeHash, artifacts, bindingHash,
+      runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), runtimeHash, artifacts, bindingHash,
     }
   } catch (error) {
     if (error instanceof AgentProcessManifestError) throw error
+    if (error instanceof AgentProcessPythonRuntimeError) {
+      throw new AgentProcessManifestError(
+        error.code === 'runtime_stale' ? 'runtime_stale' : 'unsafe_runtime',
+        error.message,
+        error,
+      )
+    }
     throw new AgentProcessManifestError('unsafe_runtime', 'Unable to bind Agent process runtime', error)
   } finally {
     await Promise.all(opened.map((handle) => handle.close().catch(() => undefined)))

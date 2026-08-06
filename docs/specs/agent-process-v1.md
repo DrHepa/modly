@@ -35,6 +35,33 @@ trees, relative imports, implicit dependencies, and ordinary `.py` scripts are
 default-denied. JavaScript is loaded by a fixed host launcher from the inherited
 entry FD, so it must not depend on its extension pathname.
 
+An extension may opt a `.pyz` entry into its setup-managed virtual environment
+with this exact declaration:
+
+```json
+{
+  "runtime": {
+    "kind": "extension-python-venv-v1",
+    "interpreter": "bin/python"
+  }
+}
+```
+
+This declaration is valid only for `.pyz`. Its source root is fixed to
+`<extension>/venv`. Bounded relative links that resolve within that tree are
+allowed, including layouts such as `lib64 -> lib`; cycles, dangling links, and
+escapes are rejected. The `bin/python` chain may terminate outside the tree only
+at the exact regular executable selected by Electron main. Discovery binds that
+base interpreter's identity and content digest, the source identity, and a
+portable complete-tree digest into the runtime, execution, capability, and
+action hashes. Source entries must use one cooperative current-UID/group model;
+group-write bits are accepted in that model because every copy is bracketed by
+identity/hash scans, while world-write, special files/bits, hard links, mixed
+ownership/groups, and incomplete or over-bound trees are rejected. A missing
+or changing venv or selected base removes Agent eligibility with an actionable
+runtime error. A failed production sandbox readiness probe removes the
+capability from the runnable inventory.
+
 Optional non-code data files are declared separately in `resourceFiles`.
 Executable permissions and code/archive extensions are rejected for resources.
 Each resource is consumed only through its exact inherited read-only FD; it is
@@ -80,18 +107,50 @@ single bounded JSON document on stdin:
 The child is started with direct argv, `shell: false`, a detached owned process
 group, inherited read-only file descriptors, a minimal environment, and the
 private output directory as cwd/HOME/TMP. JavaScript uses the packaged runtime
-in Node mode with a fixed FD-consuming ESM launcher. Python zipapps use Modly's
-host-managed Python, never an extension-controlled or system fallback. There is
-no cloud, renderer `extensions.runProcess`, or legacy runner fallback.
+in Node mode with a fixed FD-consuming ESM launcher. Legacy Python zipapps may
+use Modly's configured host Python. A zipapp declaring
+`extension-python-venv-v1` is always launched as
+`/runtime/bin/python /app/process.pyz`; launcher selection never falls back to
+the API Python, another host Python, cloud execution, renderer
+`extensions.runProcess`, or the legacy runner.
+
+For the declared runtime, main materializes a content-addressed snapshot under
+`<userData>/agent-process-runtime-snapshots`. The cache root is `0700`; files
+and directories in a completed snapshot have every write bit removed. Creation
+uses a random incomplete directory, reflink when supported and a copy from the
+already-open source FD otherwise, complete destination verification, and an
+atomic rename. The terminal external interpreter link is materialized from the
+verified selected-base handle, so `/runtime/bin/python` resolves wholly within
+the snapshot. Reuse verifies the entire tree. Active reference-counted leases
+cover queued preparation, readiness, and execution; maintenance removes only
+inactive bounded incomplete, corrupt, and stale cache entries.
+
+The approved entry, resources, inputs, snapshot root, and private output root
+remain FD-authorized. Bubblewrap mounts the snapshot read-only at `/runtime`,
+binds the private output at `/output`, mounts resources and inputs read-only,
+unshares the network and other namespaces, clears the environment, and executes
+`/runtime/bin/python /app/process.pyz`. Main revalidates the source venv,
+completed snapshot, trusted bubblewrap executable, bundle/resources, inputs,
+and private output directory immediately before launch and again after a
+successful child exit, before publication.
+
+The sandbox also exposes bounded read-only host OS ABI, standard-library, and
+library trees needed by ordinary Python and native packages. Those mounts are
+an explicit Electron-host trust base visible to approved extension code; they
+are not an automatic interpreter fallback, and their contents are not claimed
+to be bound by the extension runtime hash. The governed launcher remains the
+bound `/runtime/bin/python` regardless of what other executables approved code
+could invoke explicitly from those read-only host mounts.
 
 The only pathname-based action staging is output/publication staging beneath a
 private app-owned `0700` root outside the workspace. That root and the workspace
 publication directory must be on the same filesystem so the complete verified
 artifact set can be published by one atomic rename. Readiness fails closed when
-this invariant is unavailable. Renderer filesystem IPC cannot list, move, or
-delete this private root or arbitrary user-data paths; those operations are
-limited to canonical configured storage roots or explicit directory-picker
-grants and reject symlinks.
+this invariant is unavailable. Renderer filesystem IPC cannot list, grant,
+move, or delete the private action root, the Python snapshot root, their
+descendants, or a containing ancestor. Other operations remain limited to
+canonical configured storage roots or explicit directory-picker grants and
+reject symlinks.
 
 Startup, idle, total, line, message, log, request, and result limits are hard
 bounds. Timeout, cancellation, and protocol failure terminate the owned group
@@ -105,7 +164,7 @@ readiness fails closed.
 
 Stdout is bounded NDJSON. Optional events are `{ "type": "progress",
 "value": 0.5 }` and `{ "type": "log", "message": "..." }`. Exactly one
-terminal result is required:
+terminal result or terminal error is required. A result is:
 
 ```json
 {
@@ -123,9 +182,24 @@ terminal result is required:
 }
 ```
 
-The result frame is absolutely terminal. Any later non-empty stdout frame or
-data, including `progress`, `log`, or another `result`, and any later stderr
-data fails the protocol and removes staged outputs.
+An extension may instead emit one bounded error:
+
+```json
+{
+  "type": "error",
+  "code": "model_binding_unavailable",
+  "message": "The approved model binding is unavailable.",
+  "details": { "retryable": true }
+}
+```
+
+The code uses stable lowercase underscore syntax. Message and optional JSON
+details have strict character, byte, depth, node, and collection bounds. The
+error fails the action, consumes the single-use execution approval, and
+publishes no artifacts. Both terminal frame kinds are absolute: any later
+stdout byte or frame, including whitespace, `progress`, `log`, or another
+terminal frame, and any later stderr data fails the protocol and removes staged
+outputs.
 
 Every descriptor must point inside the action output directory and match the
 approved kind/media/size policy. Main rejects traversal and symlinks, opens
@@ -138,3 +212,8 @@ Publication is transactional. Partial validation, child failure, post-publish
 verification failure, or cancellation removes the entire action publication.
 The existing Agent action settlement barrier waits for the idempotent rollback
 before exposing a terminal cancelled or failed state.
+
+The snapshot boundary assumes other processes running directly as the same OS
+user do not maliciously rewrite Modly's private user-data directory. Such
+same-UID host tampering is outside this contract; renderer and sandboxed child
+access remain explicitly denied.

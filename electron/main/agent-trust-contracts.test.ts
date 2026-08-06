@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  assertAgentCapabilitySnapshotV1,
   assertAgentActionV1,
   assertArtifactRefV1,
   assertWorkspaceRelativePath,
@@ -103,6 +104,73 @@ test('ArtifactRef v1 validates hashes, sizes, media kinds, exact keys, and works
   assert.throws(() => assertArtifactRefV1({ ...artifact, sha256: 'bad' }), /sha256/i)
   assert.throws(() => assertArtifactRefV1({ ...artifact, sizeBytes: -1 }), /sizeBytes/i)
   assert.throws(() => assertArtifactRefV1({ ...artifact, unexpected: true }), /unknown field/i)
+})
+
+test('extension Python runtime bindings are exact and transitively hash-bound', () => {
+  const runtimeUnsigned = {
+    kind: 'extension-python-venv-v1' as const,
+    interpreter: 'bin/python' as const,
+    baseInterpreter: {
+      device: '9', inode: '10', uid: 0, gid: 0, mode: 0o755, size: 1024, nlink: 1,
+      mtimeNs: '11', ctimeNs: '12', sha256: 'f'.repeat(64),
+    },
+    treeDigest: '1'.repeat(64),
+    sourceIdentityHash: '2'.repeat(64),
+    entryCount: 8,
+    logicalBytes: 4096,
+  }
+  const runtime = {
+    ...runtimeUnsigned,
+    bindingHash: sha256Canonical({ schema: 'modly.extension-python-runtime-binding.v1', ...runtimeUnsigned }),
+  }
+  const runtimeFiles = [{
+    path: 'processor.pyz', device: '1', inode: '2', uid: 1000, gid: 1000,
+    mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
+  }]
+  const resourceFiles: never[] = []
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime })
+  const artifacts = {
+    maxCount: 1,
+    maxTotalBytes: 1024,
+    allowed: [{ kind: 'text' as const, mediaTypes: ['text/plain'], maxBytes: 1024 }],
+  }
+  const execution = {
+    kind: 'process' as const,
+    schema: 'modly.agent-process-execution.v1' as const,
+    entry: 'processor.pyz', runtimeFiles, resourceFiles, runtime, runtimeHash, artifacts,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
+    }),
+  }
+  const unsigned = {
+    schema: 'modly.agent-capability.v1' as const,
+    version: 1 as const,
+    id: 'python-tools/run', displayName: 'Run Python', description: 'Run a Python zipapp.',
+    extension: { id: 'python-tools', name: 'Python Tools' },
+    node: { id: 'run', input: 'text' as const, output: 'text' as const, paramsSchema: [] },
+    execution,
+    approval: { required: true as const, scope: 'single_action' as const },
+  }
+  const snapshot = { ...unsigned, hash: sha256Canonical(unsigned) }
+  assert.equal(assertAgentCapabilitySnapshotV1(snapshot).execution?.kind, 'process')
+
+  const withRuntime = (changedRuntime: Record<string, unknown>) => {
+    const changedRuntimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime: changedRuntime })
+    const changedExecution = {
+      ...execution,
+      runtime: changedRuntime,
+      runtimeHash: changedRuntimeHash,
+      bindingHash: sha256Canonical({
+        schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+        runtimeHash: changedRuntimeHash, artifacts,
+      }),
+    }
+    const changedUnsigned = { ...unsigned, execution: changedExecution }
+    return { ...changedUnsigned, hash: sha256Canonical(changedUnsigned) }
+  }
+  assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, interpreter: '/usr/bin/python' })), /Python runtime/i)
+  assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, unknown: true })), /unknown field/i)
+  assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, treeDigest: '4'.repeat(64) })), /binding hash/i)
 })
 
 test('action hashes bind normalized arguments, capability, model, artifacts, scope, and expiry', () => {

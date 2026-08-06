@@ -10,6 +10,7 @@ import {
   type AgentCapabilitySnapshotV1,
   type AgentOllamaModelSnapshotV1,
   type AgentProcessArtifactContractV1,
+  type AgentProcessPythonRuntimeBindingV1,
   type ArtifactRefV1,
   type JsonPrimitive,
   type JsonValue,
@@ -271,7 +272,7 @@ function normalizeProcessArtifactContract(value: unknown): AgentProcessArtifactC
 }
 
 function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabilitySnapshotV1['execution'] {
-  assertExactKeys(value, ['kind', 'schema', 'entry', 'runtimeFiles', 'resourceFiles', 'runtimeHash', 'artifacts', 'bindingHash'], 'Agent capability process execution')
+  assertExactKeys(value, ['kind', 'schema', 'entry', 'runtimeFiles', 'resourceFiles', 'runtime', 'runtimeHash', 'artifacts', 'bindingHash'], 'Agent capability process execution')
   if (value.kind !== 'process' || value.schema !== 'modly.agent-process-execution.v1') {
     throw new TypeError('Agent capability process execution schema is invalid')
   }
@@ -317,8 +318,74 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
     || resourceFiles.some((file) => EXECUTABLE_RESOURCE_EXTENSION.test(file.path) || (file.mode & 0o111) !== 0)) {
     throw new TypeError('Agent capability process file identities are duplicated or do not bind entry')
   }
+  let runtime: AgentProcessPythonRuntimeBindingV1 | undefined
+  if (value.runtime !== undefined) {
+    assertPlainRecord(value.runtime, 'Agent capability process Python runtime')
+    assertExactKeys(value.runtime, [
+      'kind', 'interpreter', 'baseInterpreter', 'treeDigest', 'sourceIdentityHash', 'entryCount', 'logicalBytes', 'bindingHash',
+    ], 'Agent capability process Python runtime')
+    if (value.runtime.kind !== 'extension-python-venv-v1' || value.runtime.interpreter !== 'bin/python'
+      || !/\.pyz$/i.test(entry)) {
+      throw new TypeError('Agent capability process Python runtime is invalid')
+    }
+    const treeDigest = normalizeSha256(value.runtime.treeDigest, 'Agent capability process Python runtime treeDigest')
+    const sourceIdentityHash = normalizeSha256(
+      value.runtime.sourceIdentityHash,
+      'Agent capability process Python runtime sourceIdentityHash',
+    )
+    const entryCount = assertFiniteNumber(value.runtime.entryCount, 'Agent capability process Python runtime entryCount', true)
+    const logicalBytes = assertFiniteNumber(value.runtime.logicalBytes, 'Agent capability process Python runtime logicalBytes', true)
+    if (entryCount < 2 || entryCount > 32_768 || logicalBytes < 1 || logicalBytes > 4 * 1024 * 1024 * 1024) {
+      throw new TypeError('Agent capability process Python runtime bounds are invalid')
+    }
+    const bindingHash = normalizeSha256(value.runtime.bindingHash, 'Agent capability process Python runtime bindingHash')
+    assertPlainRecord(value.runtime.baseInterpreter, 'Agent capability process Python base interpreter')
+    assertExactKeys(value.runtime.baseInterpreter, [
+      'device', 'inode', 'uid', 'gid', 'mode', 'size', 'nlink', 'mtimeNs', 'ctimeNs', 'sha256',
+    ], 'Agent capability process Python base interpreter')
+    const baseDecimal = (candidate: unknown, field: string): string => {
+      const normalized = assertString(candidate, field, 32)
+      if (!/^(?:0|[1-9]\d*)$/.test(normalized)) throw new TypeError(`${field} must be decimal`)
+      return normalized
+    }
+    const baseInteger = (candidate: unknown, field: string, maximum: number): number => {
+      const normalized = assertFiniteNumber(candidate, field, true)
+      if (normalized < 0 || normalized > maximum) throw new TypeError(`${field} is invalid`)
+      return normalized
+    }
+    const baseInterpreter = {
+      device: baseDecimal(value.runtime.baseInterpreter.device, 'Agent capability process Python base device'),
+      inode: baseDecimal(value.runtime.baseInterpreter.inode, 'Agent capability process Python base inode'),
+      uid: baseInteger(value.runtime.baseInterpreter.uid, 'Agent capability process Python base uid', 0xffff_ffff),
+      gid: baseInteger(value.runtime.baseInterpreter.gid, 'Agent capability process Python base gid', 0xffff_ffff),
+      mode: baseInteger(value.runtime.baseInterpreter.mode, 'Agent capability process Python base mode', 0o7777),
+      size: baseInteger(value.runtime.baseInterpreter.size, 'Agent capability process Python base size', 4 * 1024 * 1024 * 1024),
+      nlink: baseInteger(value.runtime.baseInterpreter.nlink, 'Agent capability process Python base nlink', 1),
+      mtimeNs: baseDecimal(value.runtime.baseInterpreter.mtimeNs, 'Agent capability process Python base mtimeNs'),
+      ctimeNs: baseDecimal(value.runtime.baseInterpreter.ctimeNs, 'Agent capability process Python base ctimeNs'),
+      sha256: normalizeSha256(value.runtime.baseInterpreter.sha256, 'Agent capability process Python base sha256'),
+    }
+    if (baseInterpreter.nlink !== 1 || (baseInterpreter.mode & 0o111) === 0 || (baseInterpreter.mode & 0o022) !== 0) {
+      throw new TypeError('Agent capability process Python base interpreter is unsafe')
+    }
+    const unsignedRuntime = {
+      kind: 'extension-python-venv-v1' as const,
+      interpreter: 'bin/python' as const,
+      baseInterpreter,
+      treeDigest,
+      sourceIdentityHash,
+      entryCount,
+      logicalBytes,
+    }
+    if (sha256Canonical({ schema: 'modly.extension-python-runtime-binding.v1', ...unsignedRuntime }) !== bindingHash) {
+      throw new TypeError('Agent capability process Python runtime binding hash does not match')
+    }
+    runtime = { ...unsignedRuntime, bindingHash }
+  }
   const runtimeHash = normalizeSha256(value.runtimeHash, 'Agent capability process runtimeHash')
-  if (sha256Canonical({ runtimeFiles, resourceFiles }) !== runtimeHash) throw new TypeError('Agent capability process runtime hash does not match')
+  if (sha256Canonical({ runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}) }) !== runtimeHash) {
+    throw new TypeError('Agent capability process runtime hash does not match')
+  }
   const artifacts = normalizeProcessArtifactContract(value.artifacts)
   const bindingHash = normalizeSha256(value.bindingHash, 'Agent capability process bindingHash')
   if (sha256Canonical({ schema: 'modly.agent-process-execution.v1', entry, runtimeHash, artifacts }) !== bindingHash) {
@@ -326,7 +393,7 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
   }
   return {
     kind: 'process', schema: 'modly.agent-process-execution.v1', entry,
-    runtimeFiles, resourceFiles, runtimeHash, artifacts, bindingHash,
+    runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), runtimeHash, artifacts, bindingHash,
   }
 }
 

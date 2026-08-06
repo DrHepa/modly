@@ -15,7 +15,10 @@ import type {
 } from './artifacts.ts'
 
 test('declares the artifact kinds supported by workflow artifact refs', () => {
-  assert.deepEqual(ARTIFACT_KINDS, ['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+  assert.deepEqual(ARTIFACT_KINDS, [
+    'image', 'text', 'mesh', 'scene', 'audio', 'video',
+    'plan', 'source', 'step', 'glb', 'blend',
+  ])
 })
 
 test('scene artifacts are manifest-file backed legacy outputs', () => {

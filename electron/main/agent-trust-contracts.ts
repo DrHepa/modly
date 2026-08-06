@@ -9,6 +9,7 @@ import {
   type AgentActionV1,
   type AgentCapabilitySnapshotV1,
   type AgentOllamaModelSnapshotV1,
+  type AgentProcessArtifactContractV1,
   type ArtifactRefV1,
   type JsonPrimitive,
   type JsonValue,
@@ -18,12 +19,17 @@ const SHA256_PATTERN = /^(?:sha256:)?[a-f0-9]{64}$/
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const MIME_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i
 const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
-const UNSAFE_PARAMETER_IDS = new Set(['__proto__', 'prototype', 'constructor'])
+const UNSAFE_PARAMETER_IDS = new Set([
+  '__proto__', 'prototype', 'constructor',
+  'trustedContext', 'actionId', 'originSessionId', 'model', 'inputArtifacts',
+  'resources', 'fdPath', 'dirs', 'capabilityHash', 'runtimeHash',
+])
 const ARTIFACT_KIND_SET = new Set<string>(ARTIFACT_KINDS)
 const ACTION_STATUS_SET = new Set<string>(AGENT_ACTION_STATUSES)
 const OLLAMA_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*){0,2}(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/
 const WINDOWS_FORBIDDEN_SEGMENT_CHARACTER_PATTERN = /[<>:"|?*]/
 const WINDOWS_RESERVED_SEGMENT_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
+const EXECUTABLE_RESOURCE_EXTENSION = /\.(?:[cm]?js|[cm]?ts|py|pyc|pyz|zip|sh|bash|zsh|fish|exe|dll|so|dylib|wasm)$/i
 
 function fail(message: string): never {
   throw new TypeError(`Invalid canonical JSON: ${message}`)
@@ -230,9 +236,104 @@ function capabilityUnsigned(capability: AgentCapabilitySnapshotV1): Omit<AgentCa
   return unsigned
 }
 
-function normalizeMcpExecution(value: unknown): AgentCapabilitySnapshotV1['execution'] {
+function normalizeProcessArtifactContract(value: unknown): AgentProcessArtifactContractV1 {
+  assertPlainRecord(value, 'Agent capability process artifacts')
+  assertExactKeys(value, ['maxCount', 'maxTotalBytes', 'allowed'], 'Agent capability process artifacts')
+  const maxCount = assertFiniteNumber(value.maxCount, 'Agent capability process artifacts maxCount', true)
+  const maxTotalBytes = assertFiniteNumber(value.maxTotalBytes, 'Agent capability process artifacts maxTotalBytes', true)
+  if (maxCount < 1 || maxCount > 32 || maxTotalBytes < 1 || maxTotalBytes > 512 * 1024 * 1024) {
+    throw new TypeError('Agent capability process artifact bounds are invalid')
+  }
+  if (!Array.isArray(value.allowed) || value.allowed.length < 1 || value.allowed.length > 32) {
+    throw new TypeError('Agent capability process allowed artifacts must be bounded')
+  }
+  const kinds = new Set<string>()
+  const allowed = value.allowed.map((raw, index) => {
+    const label = `Agent capability process artifacts allowed[${index}]`
+    assertPlainRecord(raw, label)
+    assertExactKeys(raw, ['kind', 'mediaTypes', 'maxBytes'], label)
+    if (!isArtifactKind(raw.kind) || kinds.has(raw.kind)) throw new TypeError(`${label}.kind is invalid or duplicated`)
+    kinds.add(raw.kind)
+    if (!Array.isArray(raw.mediaTypes) || raw.mediaTypes.length < 1 || raw.mediaTypes.length > 16) {
+      throw new TypeError(`${label}.mediaTypes must be bounded`)
+    }
+    const mediaTypes = raw.mediaTypes.map((mediaType, mediaIndex) => {
+      const normalized = assertString(mediaType, `${label}.mediaTypes[${mediaIndex}]`, 128).toLowerCase()
+      if (!MIME_TYPE_PATTERN.test(normalized)) throw new TypeError(`${label}.mediaTypes is invalid`)
+      return normalized
+    })
+    if (new Set(mediaTypes).size !== mediaTypes.length) throw new TypeError(`${label}.mediaTypes contains duplicates`)
+    const maxBytes = assertFiniteNumber(raw.maxBytes, `${label}.maxBytes`, true)
+    if (maxBytes < 1 || maxBytes > maxTotalBytes) throw new TypeError(`${label}.maxBytes is invalid`)
+    return { kind: raw.kind, mediaTypes: [...mediaTypes].sort(), maxBytes }
+  }).sort((left, right) => left.kind.localeCompare(right.kind))
+  return { maxCount, maxTotalBytes, allowed }
+}
+
+function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabilitySnapshotV1['execution'] {
+  assertExactKeys(value, ['kind', 'schema', 'entry', 'runtimeFiles', 'resourceFiles', 'runtimeHash', 'artifacts', 'bindingHash'], 'Agent capability process execution')
+  if (value.kind !== 'process' || value.schema !== 'modly.agent-process-execution.v1') {
+    throw new TypeError('Agent capability process execution schema is invalid')
+  }
+  const entry = assertWorkspaceRelativePath(value.entry)
+  if (!Array.isArray(value.runtimeFiles) || value.runtimeFiles.length !== 1
+    || !Array.isArray(value.resourceFiles) || value.resourceFiles.length > 23) {
+    throw new TypeError('Agent capability process requires one bundle and bounded resources')
+  }
+  const normalizeIdentity = (raw: unknown, label: string) => {
+    assertPlainRecord(raw, label)
+    assertExactKeys(raw, ['path', 'device', 'inode', 'uid', 'gid', 'mode', 'size', 'mtimeNs', 'sha256'], label)
+    const path = assertWorkspaceRelativePath(raw.path)
+    const decimal = (candidate: unknown, field: string): string => {
+      const normalized = assertString(candidate, `${label}.${field}`, 32)
+      if (!/^(?:0|[1-9]\d*)$/.test(normalized)) throw new TypeError(`${label}.${field} must be decimal`)
+      return normalized
+    }
+    const integer = (candidate: unknown, field: string, maximum: number): number => {
+      const normalized = assertFiniteNumber(candidate, `${label}.${field}`, true)
+      if (normalized < 0 || normalized > maximum) throw new TypeError(`${label}.${field} is invalid`)
+      return normalized
+    }
+    return {
+      path,
+      device: decimal(raw.device, 'device'),
+      inode: decimal(raw.inode, 'inode'),
+      uid: integer(raw.uid, 'uid', 0xffff_ffff),
+      gid: integer(raw.gid, 'gid', 0xffff_ffff),
+      mode: integer(raw.mode, 'mode', 0o7777),
+      size: integer(raw.size, 'size', 64 * 1024 * 1024),
+      mtimeNs: decimal(raw.mtimeNs, 'mtimeNs'),
+      sha256: normalizeSha256(raw.sha256, `${label}.sha256`),
+    }
+  }
+  const runtimeFiles = value.runtimeFiles
+    .map((raw, index) => normalizeIdentity(raw, `Agent capability process runtimeFiles[${index}]`))
+    .sort((left, right) => left.path.localeCompare(right.path))
+  const resourceFiles = value.resourceFiles
+    .map((raw, index) => normalizeIdentity(raw, `Agent capability process resourceFiles[${index}]`))
+    .sort((left, right) => left.path.localeCompare(right.path))
+  const paths = [...runtimeFiles, ...resourceFiles].map((file) => file.path)
+  if (!/\.(?:js|mjs|pyz)$/i.test(entry) || new Set(paths).size !== paths.length || runtimeFiles[0]?.path !== entry
+    || resourceFiles.some((file) => EXECUTABLE_RESOURCE_EXTENSION.test(file.path) || (file.mode & 0o111) !== 0)) {
+    throw new TypeError('Agent capability process file identities are duplicated or do not bind entry')
+  }
+  const runtimeHash = normalizeSha256(value.runtimeHash, 'Agent capability process runtimeHash')
+  if (sha256Canonical({ runtimeFiles, resourceFiles }) !== runtimeHash) throw new TypeError('Agent capability process runtime hash does not match')
+  const artifacts = normalizeProcessArtifactContract(value.artifacts)
+  const bindingHash = normalizeSha256(value.bindingHash, 'Agent capability process bindingHash')
+  if (sha256Canonical({ schema: 'modly.agent-process-execution.v1', entry, runtimeHash, artifacts }) !== bindingHash) {
+    throw new TypeError('Agent capability process binding hash does not match')
+  }
+  return {
+    kind: 'process', schema: 'modly.agent-process-execution.v1', entry,
+    runtimeFiles, resourceFiles, runtimeHash, artifacts, bindingHash,
+  }
+}
+
+function normalizeExecution(value: unknown): AgentCapabilitySnapshotV1['execution'] {
   if (value === undefined) return undefined
   assertPlainRecord(value, 'Agent capability execution')
+  if (value.kind === 'process') return normalizeProcessExecution(value)
   assertExactKeys(value, ['kind', 'inputSchema', 'inputSchemaHash', 'outputSchemaHash', 'mutating', 'bindingHash'], 'Agent capability execution')
   if (value.kind !== 'mcp_tool') throw new TypeError('Agent capability execution kind is invalid')
   assertPlainRecord(value.inputSchema, 'Agent capability MCP inputSchema')
@@ -448,6 +549,7 @@ function normalizeAgentInputs(value: unknown): AgentSnapshotInputs | undefined {
     assertPlainRecord(input, label)
     assertExactKeys(input, ['name', 'label', 'type', 'required', 'multiple', 'min_items', 'max_items', 'ordered'], label)
     const name = assertSafeId(input.name, `${label}.name`)
+    if (UNSAFE_PARAMETER_IDS.has(name)) throw new TypeError(`${label}.name is unsafe`)
     if (names.has(name)) throw new TypeError(`Agent capability inputs contains duplicate name "${name}"`)
     names.add(name)
     if (!isArtifactKind(input.type)) throw new TypeError(`${label}.type is invalid`)
@@ -506,7 +608,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   if (!isArtifactKind(value.node.output)) throw new TypeError('Agent capability node output is invalid')
   const paramsSchema = normalizeAgentParamsSchema(value.node.paramsSchema)
   const inputs = normalizeAgentInputs(value.node.inputs)
-  const execution = normalizeMcpExecution(value.execution)
+  const execution = normalizeExecution(value.execution)
 
   assertPlainRecord(value.approval, 'Agent capability approval')
   assertExactKeys(value.approval, ['required', 'scope'], 'Agent capability approval')
@@ -1032,7 +1134,9 @@ export function toAgentActionPublicSummary(actionValue: unknown, now = new Date(
       displayName: action.capability.displayName,
       description: action.capability.description,
       hash: action.capability.hash,
-      risk: action.capability.execution?.mutating === false ? 'read_only' : 'mutating',
+      risk: action.capability.execution?.kind === 'mcp_tool' && action.capability.execution.mutating === false
+        ? 'read_only'
+        : 'mutating',
     },
     model: {
       provider: action.model.provider,

@@ -158,8 +158,69 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
     input: 'chair',
     params: { iterations: 2, quality: 'draft' },
   })
+  assert.equal(captured?.originSessionId, 'test-session')
   assert.equal(captured?.model.endpoint, 'http://127.0.0.1:11434')
   assert.equal(JSON.stringify(completed).includes(validOutput.workspacePath), false)
+})
+
+test('process execution accepts only its declared multi-artifact policy and keeps trusted context main-owned', async () => {
+  const runtimeFiles = [{
+    path: 'processor.mjs', device: '1', inode: '2', uid: 1000, gid: 1000,
+    mode: 0o644, size: 12, mtimeNs: '3', sha256: 'c'.repeat(64),
+  }]
+  const resourceFiles: typeof runtimeFiles = []
+  const artifacts = {
+    maxCount: 2,
+    maxTotalBytes: 2048,
+    allowed: [
+      { kind: 'glb' as const, mediaTypes: ['model/gltf-binary'], maxBytes: 1536 },
+      { kind: 'plan' as const, mediaTypes: ['text/markdown'], maxBytes: 512 },
+    ],
+  }
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles })
+  const processExecution = {
+    kind: 'process' as const,
+    schema: 'modly.agent-process-execution.v1' as const,
+    entry: 'processor.mjs',
+    runtimeFiles,
+    resourceFiles,
+    runtimeHash,
+    artifacts,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.mjs', runtimeHash, artifacts,
+    }),
+  }
+  const capability = capabilityFixture({ execution: processExecution })
+  const plan: ArtifactRefV1 = {
+    ...validOutput, id: 'generated-plan', kind: 'plan', mediaType: 'text/markdown',
+    workspacePath: 'Workflows/agent-actions/action-process/plan.md', sizeBytes: 64,
+  }
+  const glb: ArtifactRefV1 = {
+    ...validOutput, id: 'generated-glb', kind: 'glb',
+    workspacePath: 'Workflows/agent-actions/action-process/model.glb', sizeBytes: 128,
+  }
+  let captured: AgentActionExecutorRequest | undefined
+  const service = new AgentActionsService({
+    createActionId: () => 'action-process',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (value) => { captured = value; return { artifacts: [plan, glb] } },
+  })
+  await rejectsCode(service.propose({
+    originSessionId: 'session-process', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {}, trustedContext: { actionId: 'forged' } }, model: selectedModel,
+  } as never), 'invalid_arguments')
+
+  const proposed = await service.propose({
+    originSessionId: 'session-process', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'session-process', decision: 'approve' })
+  const completed = await service.execute({ actionId: proposed.id, originSessionId: 'session-process' })
+  assert.equal(completed.status, 'completed')
+  assert.equal(captured?.originSessionId, 'session-process')
+  assert.deepEqual(completed.outputs.map((output) => output.kind), ['plan', 'glb'])
 })
 
 test('main binds actions to an origin session and generates a bounded redacted approval preview', async () => {

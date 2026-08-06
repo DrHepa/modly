@@ -28,6 +28,11 @@ import type {
   AgentCapabilitySnapshotV1,
 } from '../../src/shared/types/agentActions.ts'
 import { discoverGovernedMcpTools, type DiscoveredMcpTool } from './agent-mcp-manifest.ts'
+import {
+  AgentProcessManifestError,
+  bindAgentProcessExecution,
+  normalizeAgentProcessDeclaration,
+} from './agent-process-manifest.ts'
 
 export type ModelInputKind = string
 export type ExtensionPortKind = ArtifactKind | string
@@ -331,7 +336,7 @@ type PartialCapabilityAutomationMetadata = {
 
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
-const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval'])
+const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
 
 function isPlainOwnRecord(value: unknown): value is Record<string, unknown> {
@@ -378,6 +383,7 @@ function hasLoneSurrogate(value: string): boolean {
 export function normalizeAgentCapabilityDeclaration(
   input: unknown,
   expectedCapabilityId: string,
+  entry = 'processor.js',
 ): AgentCapabilityDeclarationV1 | undefined {
   try {
     if (!isPlainOwnRecord(input) || !hasOnlyKeys(input, AGENT_DECLARATION_KEYS)) return undefined
@@ -390,6 +396,7 @@ export function normalizeAgentCapabilityDeclaration(
     if (!isSafeDisplayText(input.display_name, 80) || !isSafeDisplayText(input.description, 500)) return undefined
     if (!isPlainOwnRecord(input.approval) || !hasOnlyKeys(input.approval, AGENT_APPROVAL_KEYS)) return undefined
     if (input.approval.required !== true || input.approval.scope !== 'single_action') return undefined
+    const process = normalizeAgentProcessDeclaration(input.process, entry)
     canonicalJson(input)
     return {
       schema: 'modly.agent-capability-declaration.v1',
@@ -397,6 +404,7 @@ export function normalizeAgentCapabilityDeclaration(
       display_name: input.display_name,
       description: input.description,
       approval: { required: true, scope: 'single_action' },
+      process,
     }
   } catch {
     return undefined
@@ -636,7 +644,7 @@ export function parseExtensionManifest(
     const agentDeclaration = extensionType === 'process'
       && isProcessPortType(n.input)
       && isProcessPortType(n.output)
-      ? normalizeAgentCapabilityDeclaration(n.agent, capabilityId)
+      ? normalizeAgentCapabilityDeclaration(n.agent, capabilityId, parsed.entry ?? 'processor.js')
       : undefined
 
     return {
@@ -1026,14 +1034,16 @@ export async function getManifestProcesses(options: {
   return { processes, errors }
 }
 
-function buildAgentCapabilitySnapshot(
+async function buildAgentCapabilitySnapshot(
   extension: ListedProcessExtension,
   node: ListedExtensionNode,
-): AgentCapabilitySnapshotV1 | undefined {
+  extensionDir: string,
+): Promise<AgentCapabilitySnapshotV1 | undefined> {
   if (!node.agent) return undefined
   try {
     const paramsSchema = normalizeAgentParamsSchema(node.paramsSchema)
     const inputs = node.inputs?.map((input) => typeof input === 'string' ? input : { ...input })
+    const execution = await bindAgentProcessExecution(extensionDir, extension.entry, node.agent.process)
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1052,6 +1062,7 @@ function buildAgentCapabilitySnapshot(
         ...(inputs ? { inputs } : {}),
         paramsSchema,
       },
+      execution,
       approval: { ...node.agent.approval },
     }
     return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
@@ -1098,16 +1109,15 @@ export async function listAgentCapabilities(options: {
   trustedRepos: Set<string>
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
-    listVisibleExtensionsDetailed(options),
+    listVisibleResolvedExtensionsDetailed(options),
     discoverGovernedMcpTools(options),
   ])
-  const processCandidates = result.extensions.flatMap((extension) => {
+  const processResults = await Promise.all(result.extensions.flatMap((resolved) => {
+    const extension = resolved.extension
     if (extension.type !== 'process') return []
-    return extension.nodes.flatMap((node) => {
-      const snapshot = buildAgentCapabilitySnapshot(extension, node)
-      return snapshot ? [snapshot] : []
-    })
-  })
+    return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(extension, node, resolved.extDir))
+  }))
+  const processCandidates = processResults.filter((snapshot): snapshot is AgentCapabilitySnapshotV1 => snapshot !== undefined)
   const mcpCandidates = mcpResult.tools.flatMap((candidate) => {
     const snapshot = buildMcpAgentCapabilitySnapshot(candidate)
     return snapshot ? [snapshot] : []
@@ -1115,7 +1125,8 @@ export async function listAgentCapabilities(options: {
   const candidates = [...processCandidates, ...mcpCandidates]
   const candidateIds = new Set(candidates.map((candidate) => candidate.id))
   const counts = new Map<string, number>()
-  for (const extension of result.extensions) {
+  for (const resolved of result.extensions) {
+    const extension = resolved.extension
     if (extension.type !== 'process') continue
     for (const node of extension.nodes) {
       const id = `${extension.id}/${node.id}`
@@ -1154,6 +1165,34 @@ export async function listAgentCapabilities(options: {
       })),
     ],
   }
+}
+
+export type GovernedAgentProcessTarget = Readonly<{
+  capability: AgentCapabilitySnapshotV1
+  extensionDir: string
+  entry: string
+}>
+
+export async function resolveGovernedAgentProcessTarget(
+  options: { builtinDir: string, userExtensionsDir: string, trustedRepos: Set<string> },
+  capabilityId: string,
+): Promise<GovernedAgentProcessTarget> {
+  const result = await listVisibleResolvedExtensionsDetailed(options)
+  const matches: GovernedAgentProcessTarget[] = []
+  for (const resolved of result.extensions) {
+    if (resolved.extension.type !== 'process') continue
+    for (const node of resolved.extension.nodes) {
+      if (`${resolved.extension.id}/${node.id}` !== capabilityId) continue
+      const capability = await buildAgentCapabilitySnapshot(resolved.extension, node, resolved.extDir)
+      if (capability?.execution?.kind === 'process') {
+        matches.push({ capability, extensionDir: resolved.extDir, entry: resolved.extension.entry })
+      }
+    }
+  }
+  if (matches.length !== 1) {
+    throw new AgentProcessManifestError('runtime_stale', 'Governed process capability is missing or ambiguous')
+  }
+  return matches[0]
 }
 
 export function getUiOnlyNodes(): AutomationUiOnlyCapability[] {

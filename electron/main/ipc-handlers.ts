@@ -46,7 +46,7 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { activeExtensionInstalls, listAgentCapabilities, listVisibleExtensions, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { activeExtensionInstalls, listAgentCapabilities, listVisibleExtensions, resolveGovernedAgentProcessTarget, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { fetchTrustedRepos } from './trusted-repos'
@@ -99,9 +99,18 @@ import {
   createAgentMcpExecutor,
   createAgentMcpSandboxReadiness,
 } from './agent-mcp-broker'
+import {
+  AgentProcessExecutorError,
+  createAgentProcessExecutor,
+} from './agent-process-executor'
+import { RendererFilesystemAccess } from './renderer-filesystem-access'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
+
+function agentProcessPrivateTempRoot(userDataDir: string): string {
+  return join(userDataDir, 'agent-process-private')
+}
 
 // ─── Run an extension's setup.py directly (no FastAPI needed) ─────────────────
 
@@ -288,6 +297,24 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     stopRequested?: 'pause' | 'cancel'
   }
   const activeDownloads = new Map<string, ActiveDownload>()
+  const rendererFilesystemAccess = new RendererFilesystemAccess({
+    getConfiguredRoots: () => {
+      const settings = getSettings(app.getPath('userData'))
+      return {
+        modelsDir: settings.modelsDir,
+        workspaceDir: settings.workspaceDir,
+        workflowsDir: settings.workflowsDir,
+        extensionsDir: settings.extensionsDir,
+      }
+    },
+    getProtectedRoots: () => {
+      const userDataDir = app.getPath('userData')
+      return {
+        userDataDir,
+        agentPrivateTempDir: agentProcessPrivateTempRoot(userDataDir),
+      }
+    },
+  })
   const agentSessionStore = new AgentSessionStore({ rootDir: join(app.getPath('userData'), 'agent-sessions') })
   void agentSessionStore.list().catch((error) => logger.warn(`Agent session startup maintenance failed: ${error instanceof Error ? error.message : String(error)}`))
   ipcMain.handle('agentSessions:list', () => agentSessionStore.list())
@@ -360,6 +387,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   const LOCKED_MODEL_FILES_ERROR = 'Model files are still locked after several attempts. Close any programs using the model and try again.'
 
   const mcpSandboxReadiness = createAgentMcpSandboxReadiness()
+  const processExecutor = createAgentProcessExecutor({
+    getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
+    getPrivateTempRoot: () => agentProcessPrivateTempRoot(app.getPath('userData')),
+    resolveTarget: async (capabilityId) => {
+      const userData = app.getPath('userData')
+      return resolveGovernedAgentProcessTarget({
+        builtinDir: getBuiltinExtensionsDir(),
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        trustedRepos: await fetchTrustedRepos(),
+      }, capabilityId)
+    },
+    resolveCurrentModel: resolveCurrentOllamaModel,
+    resolvePythonExecutable: () => getVenvPythonExe(app.getPath('userData')),
+  })
   const agentActionsService = new AgentActionsService({
     resolveCapabilities: async () => {
       const userData = app.getPath('userData')
@@ -374,10 +415,38 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
     }),
     ensureExecutorReady: async (capability) => {
-      if (capability.execution?.kind !== 'mcp_tool') throw new AgentActionsServiceError('executor_unavailable')
-      if (!await mcpSandboxReadiness()) throw new AgentActionsServiceError('sandbox_unavailable')
+      if (capability.execution?.kind === 'mcp_tool') {
+        if (!await mcpSandboxReadiness()) throw new AgentActionsServiceError('sandbox_unavailable')
+        return
+      }
+      if (capability.execution?.kind === 'process') {
+        try {
+          await processExecutor.ensureReady(capability)
+          return
+        } catch (error) {
+          if (error instanceof AgentProcessExecutorError && error.code === 'capability_stale') {
+            throw new AgentActionsServiceError('capability_stale', error)
+          }
+          throw new AgentActionsServiceError('executor_unavailable', error)
+        }
+      }
+      throw new AgentActionsServiceError('executor_unavailable')
     },
     executor: async (request) => {
+      if (request.capability.execution?.kind === 'process') {
+        try {
+          return await processExecutor.execute(request)
+        } catch (error) {
+          if (!(error instanceof AgentProcessExecutorError)) throw error
+          if (error.code === 'unsupported_capability' || error.code === 'runtime_unavailable') throw new AgentActionsServiceError('executor_unavailable', error)
+          if (error.code === 'capability_stale') throw new AgentActionsServiceError('capability_stale', error)
+          if (error.code === 'model_stale') throw new AgentActionsServiceError('model_stale', error)
+          if (error.code === 'invalid_arguments') throw new AgentActionsServiceError('invalid_arguments', error)
+          if (error.code === 'artifact_too_large') throw new AgentActionsServiceError('artifact_too_large', error)
+          if (error.code === 'invalid_artifact') throw new AgentActionsServiceError('invalid_artifact', error)
+          throw new AgentActionsServiceError('execution_failed', error)
+        }
+      }
       if (request.capability.execution?.kind !== 'mcp_tool') {
         throw new AgentActionsServiceError('executor_unavailable')
       }
@@ -1311,7 +1380,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       properties: ['openDirectory', 'createDirectory'],
       ...(defaultPath && { defaultPath }),
     })
-    return result.canceled ? null : result.filePaths[0]
+    if (result.canceled || !result.filePaths[0]) return null
+    try {
+      return await rendererFilesystemAccess.grantSelectedDirectory(result.filePaths[0])
+    } catch {
+      return null
+    }
   })
 
   // Cache clear — deletes and recreates the gen-cache folder
@@ -1414,7 +1488,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // Directory utilities for settings
   ipcMain.handle('fs:listDir', async (_, dirPath: string) => {
     try {
-      const entries = await readdir(dirPath, { withFileTypes: true })
+      const safeDirectory = await rendererFilesystemAccess.resolveListDirectory(dirPath)
+      const entries = await readdir(safeDirectory, { withFileTypes: true })
       return entries.filter(e => e.isDirectory()).map(e => e.name)
     } catch {
       return []
@@ -1425,8 +1500,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // `extensions` are lowercase without the dot (e.g. ['txt', 'png']).
   ipcMain.handle('fs:listFiles', async (_, dirPath: string, extensions?: string[]) => {
     try {
+      if (extensions !== undefined && (!Array.isArray(extensions) || extensions.length > 32
+        || extensions.some((extension) => typeof extension !== 'string' || !/^[.]?[a-z0-9]{1,16}$/i.test(extension)))) {
+        return []
+      }
+      const safeDirectory = await rendererFilesystemAccess.resolveListFiles(dirPath)
       const wanted = extensions?.map(e => e.toLowerCase().replace(/^\./, ''))
-      const entries = await readdir(dirPath, { withFileTypes: true })
+      const entries = await readdir(safeDirectory, { withFileTypes: true })
       return entries
         .filter(e => e.isFile())
         .map(e => e.name)
@@ -1487,11 +1567,11 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  ipcMain.handle('fs:moveDirectory', async (_, { src, dest }: { src: string; dest: string }) => {
+  ipcMain.handle('fs:moveDirectory', async (_, request: { src: string; dest: string }) => {
     try {
-      await mkdir(dest, { recursive: true })
-      await cp(src, dest, { recursive: true })
-      await rmAsync(src, { recursive: true, force: true })
+      const { src, dest } = await rendererFilesystemAccess.resolveMoveDirectory(request)
+      await cp(src, dest, { recursive: true, force: false, errorOnExist: true })
+      await rmAsync(src, { recursive: true, force: false })
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -1499,21 +1579,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('fs:deleteDirectory', async (_, dirPath: string) => {
-    const userData = app.getPath('userData')
-    const settings = getSettings(userData)
-    const allowedRoots = [
-      settings.modelsDir,
-      settings.workspaceDir,
-      settings.extensionsDir,
-      join(userData, 'gen-cache'),
-    ]
-    const resolved = join(dirPath)
-    const isAllowed = allowedRoots.some((root) => resolved.startsWith(root))
-    if (!isAllowed) {
-      return { success: false, error: 'Path is outside allowed directories' }
-    }
     try {
-      await rmAsync(resolved, { recursive: true, force: true })
+      const safeDirectory = await rendererFilesystemAccess.resolveDeleteDirectory(dirPath)
+      await rmAsync(safeDirectory, { recursive: true, force: true })
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }

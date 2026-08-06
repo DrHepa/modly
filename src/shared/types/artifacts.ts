@@ -8,7 +8,10 @@ export interface ArtifactProvenance {
   [key: string]: unknown
 }
 
-export const ARTIFACT_KINDS = ['image', 'text', 'mesh', 'scene', 'audio', 'video'] as const
+export const ARTIFACT_KINDS = [
+  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+  'plan', 'source', 'step', 'glb', 'blend',
+] as const
 export const ARTIFACT_VERSION_ROLES = ['original', 'current', 'edited'] as const
 export const ARTIFACT_SUBSTITUTION_STATUSES = ['declared', 'applied', 'rejected'] as const
 export const ARTIFACT_REPLACEMENT_STATUSES = ['accepted', 'rejected', 'noop'] as const

@@ -31,7 +31,7 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { listVisibleExtensions } from './automation-capabilities'
+import { listAgentCapabilities, listVisibleExtensions } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { spawn, execFile } from 'child_process'
@@ -1066,6 +1066,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
+
+  ipcMain.handle('agentCapabilities:list', async () => {
+    const userData = app.getPath('userData')
+    return listAgentCapabilities({
+      builtinDir: getBuiltinExtensionsDir(),
+      userExtensionsDir: getSettings(userData).extensionsDir,
+      trustedRepos: await fetchTrustedRepos(),
+    })
+  })
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {

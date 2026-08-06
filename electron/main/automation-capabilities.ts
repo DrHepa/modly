@@ -10,6 +10,12 @@ import {
   type HttpsDownloadAsset,
 } from './https-download-manifest.ts'
 import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
+import { assertAgentCapabilitySnapshotV1, canonicalJson, normalizeAgentParamsSchema, sha256Canonical } from './agent-trust-contracts.ts'
+import type {
+  AgentCapabilityDeclarationV1,
+  AgentCapabilityInventoryResult,
+  AgentCapabilitySnapshotV1,
+} from '../../src/shared/types/agentActions.ts'
 
 export type ModelInputKind = ArtifactKind | string | 'none'
 export type ExtensionPortKind = ArtifactKind | string
@@ -227,6 +233,7 @@ export type ParsedManifest = {
     weight_owner_id?: string
     process_owner_id?: string
     automation?: PartialCapabilityAutomationMetadata
+    agent?: unknown
   }[]
   workflow_nodes?: {
     id: string
@@ -261,6 +268,7 @@ export type ListedExtensionNode<
   sharedOwner?: boolean
   legacyPaths?: string[]
   automation?: CapabilityAutomationMetadata
+  agent?: AgentCapabilityDeclarationV1
 }
 
 export type ListedWorkflowNode = {
@@ -292,6 +300,77 @@ type PartialCapabilityAutomationMetadata = {
 
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
+const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval'])
+const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
+
+function isPlainOwnRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
+function isSafeDisplayText(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= maxLength
+    && value.trim() === value
+    && !hasControlCharacter(value)
+    && !hasLoneSurrogate(value)
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x1f || code === 0x7f) return true
+  }
+  return false
+}
+
+function hasLoneSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true
+    }
+  }
+  return false
+}
+
+export function normalizeAgentCapabilityDeclaration(
+  input: unknown,
+  expectedCapabilityId: string,
+): AgentCapabilityDeclarationV1 | undefined {
+  try {
+    if (!isPlainOwnRecord(input) || !hasOnlyKeys(input, AGENT_DECLARATION_KEYS)) return undefined
+    if (input.schema !== 'modly.agent-capability-declaration.v1') return undefined
+    if (input.capability_id !== expectedCapabilityId) return undefined
+    const [extensionId, nodeId, ...extraSegments] = expectedCapabilityId.split('/')
+    if (!extensionId || !nodeId || extraSegments.length > 0) return undefined
+    assertSafeExtensionId(extensionId)
+    assertSafeOwnershipSegment(nodeId, 'Agent capability node id')
+    if (!isSafeDisplayText(input.display_name, 80) || !isSafeDisplayText(input.description, 500)) return undefined
+    if (!isPlainOwnRecord(input.approval) || !hasOnlyKeys(input.approval, AGENT_APPROVAL_KEYS)) return undefined
+    if (input.approval.required !== true || input.approval.scope !== 'single_action') return undefined
+    canonicalJson(input)
+    return {
+      schema: 'modly.agent-capability-declaration.v1',
+      capability_id: expectedCapabilityId,
+      display_name: input.display_name,
+      description: input.description,
+      approval: { required: true, scope: 'single_action' },
+    }
+  } catch {
+    return undefined
+  }
+}
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
   const pauseSupported = input?.pause?.supported === true
@@ -652,6 +731,11 @@ export function parseExtensionManifest(
     const automationMetadata = parsed.type === 'process' || node.automation
       ? { automation: normalizeCapabilityAutomationMetadata(node.automation) }
       : {}
+    const agentDeclaration = extensionType === 'process'
+      && isProcessPortType(node.input)
+      && isProcessPortType(node.output)
+      ? normalizeAgentCapabilityDeclaration(node.agent, capabilityId)
+      : undefined
 
     return {
       id: node.id,
@@ -671,6 +755,7 @@ export function parseExtensionManifest(
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
       ...automationMetadata,
+      ...(agentDeclaration ? { agent: agentDeclaration } : {}),
       ...modelOwnership,
     }
   })
@@ -1120,6 +1205,88 @@ export async function getManifestProcesses(options: {
   })
 
   return { processes, errors }
+}
+
+function buildAgentCapabilitySnapshot(
+  extension: ListedProcessExtension,
+  node: ListedExtensionNode<ArtifactKind>,
+): AgentCapabilitySnapshotV1 | undefined {
+  if (!node.agent) return undefined
+  try {
+    const paramsSchema = normalizeAgentParamsSchema(node.paramsSchema)
+    const inputs = node.inputs?.map((input) => ({ ...input }))
+    const unsigned = {
+      schema: 'modly.agent-capability.v1' as const,
+      version: 1 as const,
+      id: node.agent.capability_id,
+      displayName: node.agent.display_name,
+      description: node.agent.description,
+      extension: {
+        id: extension.id,
+        name: extension.name,
+        ...(extension.version ? { version: extension.version } : {}),
+      },
+      node: {
+        id: node.id,
+        input: node.input,
+        output: node.output,
+        ...(inputs ? { inputs } : {}),
+        paramsSchema,
+      },
+      approval: { ...node.agent.approval },
+    }
+    return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
+  } catch {
+    return undefined
+  }
+}
+
+export async function listAgentCapabilities(options: {
+  builtinDir: string
+  userExtensionsDir: string
+  trustedRepos: Set<string>
+}): Promise<AgentCapabilityInventoryResult> {
+  const result = await listVisibleExtensionsDetailed(options)
+  const candidates = result.extensions.flatMap((extension) => {
+    if (extension.type !== 'process') return []
+    return extension.nodes.flatMap((node) => {
+      const snapshot = buildAgentCapabilitySnapshot(extension, node)
+      return snapshot ? [snapshot] : []
+    })
+  })
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id))
+  const counts = new Map<string, number>()
+  for (const extension of result.extensions) {
+    if (extension.type !== 'process') continue
+    for (const node of extension.nodes) {
+      const id = `${extension.id}/${node.id}`
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+  }
+  const collisionIds = [...counts.entries()]
+    .filter(([id, count]) => count > 1 && candidateIds.has(id))
+    .map(([id]) => id)
+    .sort()
+  const collisionIdSet = new Set(collisionIds)
+  const capabilities = candidates
+    .filter((candidate) => !collisionIdSet.has(candidate.id))
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  return {
+    capabilities,
+    errors: [
+      ...result.errors.map(({ code }) => ({
+        code,
+        message: code === 'PROCESS_DISCOVERY_MANIFEST_INVALID'
+          ? 'An extension manifest is invalid and was excluded from Agent discovery.'
+          : 'Agent capability discovery could not inspect one or more extensions.',
+      })),
+      ...collisionIds.map((capabilityId) => ({
+        code: 'AGENT_CAPABILITY_ID_COLLISION',
+        message: 'An ambiguous Agent capability identifier was excluded from discovery.',
+        capabilityId,
+      })),
+    ],
+  }
 }
 
 export function getUiOnlyNodes(): AutomationUiOnlyCapability[] {

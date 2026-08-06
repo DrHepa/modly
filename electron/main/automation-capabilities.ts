@@ -16,6 +16,7 @@ import type {
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
 } from '../../src/shared/types/agentActions.ts'
+import { discoverGovernedMcpTools, type DiscoveredMcpTool } from './agent-mcp-manifest.ts'
 
 export type ModelInputKind = ArtifactKind | string | 'none'
 export type ExtensionPortKind = ArtifactKind | string
@@ -217,6 +218,7 @@ export type ParsedManifest = {
   generator_class?: string
   type?: 'model' | 'process'
   entry?: string
+  mcp?: unknown
   nodes?: {
     id: string
     name?: string
@@ -1241,19 +1243,59 @@ function buildAgentCapabilitySnapshot(
   }
 }
 
+function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCapabilitySnapshotV1 | undefined {
+  try {
+    const nodeId = candidate.tool.capabilityId.split('/')[1]
+    const unsigned = {
+      schema: 'modly.agent-capability.v1' as const,
+      version: 1 as const,
+      id: candidate.tool.capabilityId,
+      displayName: candidate.tool.displayName,
+      description: candidate.tool.description,
+      extension: candidate.extension,
+      node: {
+        id: nodeId,
+        input: 'text' as const,
+        output: candidate.tool.artifact.kind,
+        paramsSchema: [],
+      },
+      execution: {
+        kind: 'mcp_tool' as const,
+        inputSchema: candidate.tool.inputSchema,
+        inputSchemaHash: candidate.tool.inputSchemaHash,
+        ...(candidate.tool.outputSchemaHash ? { outputSchemaHash: candidate.tool.outputSchemaHash } : {}),
+        mutating: candidate.tool.mutating,
+        bindingHash: candidate.tool.capabilityBindingHash,
+      },
+      approval: candidate.tool.approval,
+    }
+    return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
+  } catch {
+    return undefined
+  }
+}
+
 export async function listAgentCapabilities(options: {
   builtinDir: string
   userExtensionsDir: string
   trustedRepos: Set<string>
 }): Promise<AgentCapabilityInventoryResult> {
-  const result = await listVisibleExtensionsDetailed(options)
-  const candidates = result.extensions.flatMap((extension) => {
+  const [result, mcpResult] = await Promise.all([
+    listVisibleExtensionsDetailed(options),
+    discoverGovernedMcpTools(options),
+  ])
+  const processCandidates = result.extensions.flatMap((extension) => {
     if (extension.type !== 'process') return []
     return extension.nodes.flatMap((node) => {
       const snapshot = buildAgentCapabilitySnapshot(extension, node)
       return snapshot ? [snapshot] : []
     })
   })
+  const mcpCandidates = mcpResult.tools.flatMap((candidate) => {
+    const snapshot = buildMcpAgentCapabilitySnapshot(candidate)
+    return snapshot ? [snapshot] : []
+  })
+  const candidates = [...processCandidates, ...mcpCandidates]
   const candidateIds = new Set(candidates.map((candidate) => candidate.id))
   const counts = new Map<string, number>()
   for (const extension of result.extensions) {
@@ -1262,6 +1304,9 @@ export async function listAgentCapabilities(options: {
       const id = `${extension.id}/${node.id}`
       counts.set(id, (counts.get(id) ?? 0) + 1)
     }
+  }
+  for (const candidate of mcpResult.tools) {
+    counts.set(candidate.tool.capabilityId, (counts.get(candidate.tool.capabilityId) ?? 0) + 1)
   }
   const collisionIds = [...counts.entries()]
     .filter(([id, count]) => count > 1 && candidateIds.has(id))
@@ -1279,6 +1324,11 @@ export async function listAgentCapabilities(options: {
         message: code === 'PROCESS_DISCOVERY_MANIFEST_INVALID'
           ? 'An extension manifest is invalid and was excluded from Agent discovery.'
           : 'Agent capability discovery could not inspect one or more extensions.',
+      })),
+      ...mcpResult.errors.map((error) => ({
+        code: error.code,
+        message: error.message,
+        ...(error.capabilityId ? { capabilityId: error.capabilityId } : {}),
       })),
       ...collisionIds.map((capabilityId) => ({
         code: 'AGENT_CAPABILITY_ID_COLLISION',

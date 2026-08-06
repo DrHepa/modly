@@ -34,6 +34,7 @@ const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1_000
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1_000
 const DEFAULT_MAX_TERMINAL_ACTIONS = 100
 const DEFAULT_MAX_ACTIONS = 250
+const DEFAULT_CANCELLATION_SETTLEMENT_TIMEOUT_MS = 2_000
 const MAX_ARGUMENT_BYTES = 1024 * 1024
 const MAX_TEXT_LENGTH = 200_000
 const MAX_OUTPUT_ARTIFACTS = 32
@@ -67,6 +68,7 @@ export interface AgentActionsServiceOptions {
   artifactVerifier?: AgentArtifactVerifier
   executor?: AgentActionExecutor
   isExecutorAvailable?: () => boolean
+  ensureExecutorReady?: (capability: AgentCapabilitySnapshotV1) => Promise<void>
   now?: () => Date
   createActionId?: () => string
   createLease?: () => string
@@ -74,6 +76,7 @@ export interface AgentActionsServiceOptions {
   terminalRetentionMs?: number
   maxTerminalActions?: number
   maxActions?: number
+  cancellationSettlementTimeoutMs?: number
 }
 
 interface PrivateActionRecord {
@@ -97,6 +100,20 @@ interface ApprovalLease {
 interface NormalizedArguments {
   arguments: JsonValue
   inputArtifacts: ArtifactRefV1[]
+}
+
+interface NormalizedExecutorResult {
+  artifacts: ArtifactRefV1[]
+  rollback?: () => Promise<void>
+}
+
+interface ExecutionSettlement {
+  promise: Promise<void>
+  resolve: () => void
+  settled: boolean
+  executorInvoked: boolean
+  cancellationRequested: boolean
+  rollback?: () => Promise<void>
 }
 
 function isPlainRecord(value: unknown): value is PlainRecord {
@@ -220,6 +237,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private readonly actions = new Map<string, PrivateActionRecord>()
   private readonly leases = new Map<string, ApprovalLease>()
   private readonly controllers = new Map<string, AbortController>()
+  private readonly executionSettlements = new Map<string, ExecutionSettlement>()
   private readonly actionLocks = new Map<string, Promise<void>>()
   private readonly now: () => Date
   private readonly createActionId: () => string
@@ -228,6 +246,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private readonly terminalRetentionMs: number
   private readonly maxTerminalActions: number
   private readonly maxActions: number
+  private readonly cancellationSettlementTimeoutMs: number
 
   constructor(options: AgentActionsServiceOptions) {
     this.options = options
@@ -238,6 +257,10 @@ export class AgentActionsService implements AgentActionsServiceLike {
     this.terminalRetentionMs = this.assertNonNegativeInteger(options.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS, 'terminalRetentionMs')
     this.maxTerminalActions = this.assertNonNegativeInteger(options.maxTerminalActions ?? DEFAULT_MAX_TERMINAL_ACTIONS, 'maxTerminalActions')
     this.maxActions = this.assertPositiveInteger(options.maxActions ?? DEFAULT_MAX_ACTIONS, 'maxActions')
+    this.cancellationSettlementTimeoutMs = this.assertPositiveInteger(
+      options.cancellationSettlementTimeoutMs ?? DEFAULT_CANCELLATION_SETTLEMENT_TIMEOUT_MS,
+      'cancellationSettlementTimeoutMs',
+    )
     if (this.maxTerminalActions > this.maxActions) throw new TypeError('maxTerminalActions must not exceed maxActions')
   }
 
@@ -373,6 +396,44 @@ export class AgentActionsService implements AgentActionsServiceLike {
   async execute(requestValue: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1> {
     const request = assertExactRecord(requestValue, ['actionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
+    const readinessSnapshot = await this.withActionLock(actionId, () => {
+      this.prune()
+      const record = this.requireRecord(actionId)
+      if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
+      if (record.action.status !== 'approved') throw new AgentActionsServiceError('invalid_state')
+      const lease = this.leases.get(actionId)
+      if (!lease) throw new AgentActionsServiceError('invalid_state')
+      this.assertLease(record.action, lease)
+      return { capability: cloneCanonical(record.action.capability), generation: record.generation }
+    })
+    let readinessFailure: AgentActionsServiceError | undefined
+    if (!this.options.executor || (this.options.isExecutorAvailable && !this.safeExecutorAvailability())) {
+      readinessFailure = new AgentActionsServiceError('executor_unavailable')
+    } else if (this.options.ensureExecutorReady) {
+      try {
+        deepFreeze(readinessSnapshot.capability)
+        await this.options.ensureExecutorReady(readinessSnapshot.capability)
+      } catch (error) {
+        readinessFailure = error instanceof AgentActionsServiceError
+          ? error
+          : new AgentActionsServiceError('executor_unavailable', error)
+      }
+    }
+    if (readinessFailure) {
+      return this.withActionLock(actionId, () => {
+        this.prune()
+        const record = this.requireRecord(actionId)
+        if (record.action.status === 'cancelled') return this.toPublic(record)
+        if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired', readinessFailure)
+        if (record.action.status !== 'approved' || record.generation !== readinessSnapshot.generation) {
+          throw new AgentActionsServiceError('invalid_state')
+        }
+        const lease = this.leases.get(actionId)
+        if (!lease) throw new AgentActionsServiceError('invalid_state')
+        this.assertLease(record.action, lease)
+        throw readinessFailure
+      })
+    }
     const prepared = await this.withActionLock(actionId, () => {
       this.prune()
       const record = this.requireRecord(actionId)
@@ -392,6 +453,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       this.leases.delete(actionId)
       const controller = new AbortController()
       this.controllers.set(actionId, controller)
+      this.executionSettlements.set(actionId, this.createExecutionSettlement())
       this.transition(record, 'executing')
       const executorRequest: AgentActionExecutorRequest = {
         actionId,
@@ -414,12 +476,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     })
 
     let preflightFailure: AgentActionsServiceError | undefined
-    const available = this.options.isExecutorAvailable
-      ? this.safeExecutorAvailability()
-      : this.options.executor !== undefined
-    if (!available || !this.options.executor) {
-      preflightFailure = new AgentActionsServiceError('executor_unavailable')
-    } else if (!this.options.artifactVerifier) {
+    if (!this.options.artifactVerifier) {
       preflightFailure = new AgentActionsServiceError('invalid_artifact')
     } else {
       try {
@@ -446,11 +503,22 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
 
     if (preflightFailure) {
-      return this.withActionLock(actionId, () => {
+      type PreflightResult =
+        | { summary: AgentActionPublicSummaryV1 }
+        | { failure: AgentActionsServiceError }
+      const preflightResult = await this.withActionLock(actionId, (): PreflightResult => {
         const record = this.requireRecord(actionId)
-        if (record.action.status === 'cancelled') return this.toPublic(record)
-        if (!this.isExecutionCurrent(actionId, prepared.executionGeneration, prepared.controller)) {
+        if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
+        if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
           throw new AgentActionsServiceError('invalid_state')
+        }
+        const settlement = this.requireExecutionSettlement(actionId)
+        if (settlement.cancellationRequested) {
+          this.transition(record, 'cancelled', 'cancelled_by_user')
+          this.deleteController(actionId, prepared.controller)
+          this.settleExecution(actionId, settlement)
+          this.prune()
+          return { summary: this.toPublic(record) }
         }
         const terminalStatus = preflightFailure.code === 'capability_stale'
           || preflightFailure.code === 'model_stale'
@@ -459,35 +527,64 @@ export class AgentActionsService implements AgentActionsServiceLike {
           : 'failed'
         this.transition(record, terminalStatus, preflightFailure.code)
         this.deleteController(actionId, prepared.controller)
-        throw preflightFailure
+        this.settleExecution(actionId, settlement)
+        return { failure: preflightFailure }
       })
+      if ('summary' in preflightResult) return preflightResult.summary
+      throw preflightResult.failure
     }
 
-    // No await is allowed between this authoritative state check and invoking
-    // the executor, so a completed cancellation can never race past this gate.
-    if (!this.isExecutionCurrent(actionId, prepared.executionGeneration, prepared.controller)) {
-      return this.cancelledViewOrThrow(actionId)
+    // No await is allowed between this authoritative ownership check, marking
+    // the executor invoked, and invoking it. Cancellation therefore observes
+    // either a known no-publication preflight or the shared settlement barrier.
+    const settlement = this.executionSettlements.get(actionId)
+    if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)
+      || !settlement || settlement.cancellationRequested || prepared.controller.signal.aborted) {
+      return this.withActionLock(actionId, () => {
+        const record = this.requireRecord(actionId)
+        if (record.action.status === 'cancelled') return this.toPublic(record)
+        if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
+          throw new AgentActionsServiceError('invalid_state')
+        }
+        const currentSettlement = this.requireExecutionSettlement(actionId)
+        this.transition(record, 'cancelled', 'cancelled_by_user')
+        this.deleteController(actionId, prepared.controller)
+        this.settleExecution(actionId, currentSettlement)
+        this.prune()
+        return this.toPublic(record)
+      })
     }
+    settlement.executorInvoked = true
     let result: unknown
     let failure: AgentActionsServiceError | undefined
     try {
       result = await this.options.executor?.(prepared.executorRequest)
     } catch (error) {
-      failure = new AgentActionsServiceError('execution_failed', error)
+      failure = error instanceof AgentActionsServiceError
+        ? error
+        : new AgentActionsServiceError('execution_failed', error)
     }
 
     let artifacts: ArtifactRefV1[] | undefined
+    let transaction: NormalizedExecutorResult | undefined
     if (!failure) {
       try {
-        const candidates = this.normalizeExecutorResult(result, prepared.action.capability)
-        artifacts = await this.verifyArtifacts(candidates, prepared.action.capability.node.output, prepared.controller.signal)
+        transaction = this.normalizeExecutorResult(result, prepared.action.capability)
+        settlement.rollback = transaction.rollback
+        if (!settlement.cancellationRequested && !prepared.controller.signal.aborted) {
+          artifacts = await this.verifyArtifacts(
+            transaction.artifacts,
+            prepared.action.capability.node.output,
+            prepared.controller.signal,
+          )
+        }
       } catch (error) {
         failure = error instanceof AgentActionsServiceError
           ? error
           : new AgentActionsServiceError('invalid_artifact', error)
       }
     }
-    if (!failure) {
+    if (!failure && !settlement.cancellationRequested && !prepared.controller.signal.aborted) {
       try {
         await this.assertCurrentBindings(prepared.action)
       } catch (error) {
@@ -495,41 +592,94 @@ export class AgentActionsService implements AgentActionsServiceLike {
       }
     }
 
-    return this.withActionLock(actionId, () => {
+    const cancellationRequested = settlement.cancellationRequested || prepared.controller.signal.aborted
+    let rollbackFailed = false
+    if (transaction?.rollback && (failure !== undefined || cancellationRequested)) {
+      try {
+        await transaction.rollback()
+      } catch (error) {
+        failure = new AgentActionsServiceError('execution_failed', error)
+        rollbackFailed = true
+      }
+    }
+
+    type FinalizedResult =
+      | { summary: AgentActionPublicSummaryV1 }
+      | { failure: AgentActionsServiceError }
+    const finalized = await this.withActionLock(actionId, (): FinalizedResult => {
       const record = this.requireRecord(actionId)
-      if (record.action.status === 'cancelled') return this.toPublic(record)
-      if (!this.isExecutionCurrent(actionId, prepared.executionGeneration, prepared.controller)) {
+      if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
+      if (!this.isExecutionOwned(actionId, prepared.executionGeneration, prepared.controller)) {
         throw new AgentActionsServiceError('invalid_state')
+      }
+      const currentSettlement = this.requireExecutionSettlement(actionId)
+      const cancelled = currentSettlement.cancellationRequested || prepared.controller.signal.aborted
+      if (cancelled && !rollbackFailed) {
+        this.transition(record, 'cancelled', 'cancelled_by_user')
+        this.deleteController(actionId, prepared.controller)
+        this.settleExecution(actionId, currentSettlement)
+        this.prune()
+        return { summary: this.toPublic(record) }
       }
       if (failure) {
         this.transition(record, 'failed', failure.code)
         this.deleteController(actionId, prepared.controller)
-        throw failure
+        this.settleExecution(actionId, currentSettlement)
+        return { failure }
       }
       this.transition(record, 'completed', undefined, artifacts)
       this.deleteController(actionId, prepared.controller)
+      this.settleExecution(actionId, currentSettlement)
       this.prune()
-      return this.toPublic(record)
+      return { summary: this.toPublic(record) }
     })
+    if ('summary' in finalized) return finalized.summary
+    throw finalized.failure
   }
 
   async cancel(requestValue: AgentActionIdRequest): Promise<AgentActionPublicSummaryV1> {
     const request = assertExactRecord(requestValue, ['actionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
-    return this.withActionLock(actionId, () => {
+    type CancellationStep =
+      | { summary: AgentActionPublicSummaryV1 }
+      | { settlement: Promise<void> }
+    const step = await this.withActionLock(actionId, (): CancellationStep => {
       this.prune()
       const record = this.requireRecord(actionId)
-      if (record.action.status === 'cancelled') return this.toPublic(record)
+      if (record.action.status === 'cancelled') return { summary: this.toPublic(record) }
       if (record.action.status !== 'proposed' && record.action.status !== 'approved' && record.action.status !== 'executing') {
         throw new AgentActionsServiceError('invalid_state')
       }
       this.leases.delete(actionId)
       const controller = this.controllers.get(actionId)
+      if (record.action.status !== 'executing') {
+        controller?.abort()
+        this.transition(record, 'cancelled', 'cancelled_by_user')
+        this.deleteController(actionId, controller)
+        this.prune()
+        return { summary: this.toPublic(record) }
+      }
+      const settlement = this.requireExecutionSettlement(actionId)
+      settlement.cancellationRequested = true
       controller?.abort()
-      this.transition(record, 'cancelled', 'cancelled_by_user')
-      this.deleteController(actionId, controller)
-      this.prune()
-      return this.toPublic(record)
+      if (!settlement.executorInvoked) {
+        this.transition(record, 'cancelled', 'cancelled_by_user')
+        this.deleteController(actionId, controller)
+        this.settleExecution(actionId, settlement)
+        this.prune()
+        return { settlement: settlement.promise }
+      }
+      return { settlement: settlement.promise }
+    })
+    if ('summary' in step) return step.summary
+    if (!await this.waitForExecutionSettlement(step.settlement)) {
+      throw new AgentActionsServiceError('cancellation_pending')
+    }
+    return this.withActionLock(actionId, () => {
+      const record = this.requireRecord(actionId)
+      if (record.action.status === 'cancelled') return this.toPublic(record)
+      if (record.action.status === 'failed') throw new AgentActionsServiceError('execution_failed')
+      throw new AgentActionsServiceError('cancellation_pending')
     })
   }
 
@@ -559,6 +709,19 @@ export class AgentActionsService implements AgentActionsServiceLike {
     } catch (error) {
       if (error instanceof AgentActionsServiceError) throw error
       throw new AgentActionsServiceError('invalid_arguments', error)
+    }
+    if (capability.execution?.kind === 'mcp_tool') {
+      try {
+        if (!isPlainRecord(value)) throw new AgentActionsServiceError('invalid_arguments')
+        const argumentsValue = normalizeJsonValue(value)
+        if (Buffer.byteLength(canonicalJson(argumentsValue), 'utf8') > MAX_ARGUMENT_BYTES) {
+          throw new AgentActionsServiceError('invalid_arguments')
+        }
+        return { arguments: argumentsValue, inputArtifacts: [] }
+      } catch (error) {
+        if (error instanceof AgentActionsServiceError) throw error
+        throw new AgentActionsServiceError('invalid_arguments', error)
+      }
     }
     const raw = assertExactRecord(value, ['input', 'params'], 'invalid_arguments')
     if (!Object.prototype.hasOwnProperty.call(raw, 'input')) throw new AgentActionsServiceError('invalid_arguments')
@@ -744,14 +907,17 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
   }
 
-  private normalizeExecutorResult(value: unknown, capability: AgentCapabilitySnapshotV1): ArtifactRefV1[] {
-    const result = assertExactRecord(value, ['artifacts'], 'invalid_artifact')
+  private normalizeExecutorResult(value: unknown, capability: AgentCapabilitySnapshotV1): NormalizedExecutorResult {
+    const result = assertExactRecord(value, ['artifacts', 'rollback'], 'invalid_artifact')
     if (!Array.isArray(result.artifacts) || result.artifacts.length < 1 || result.artifacts.length > MAX_OUTPUT_ARTIFACTS) {
+      throw new AgentActionsServiceError('invalid_artifact')
+    }
+    if (result.rollback !== undefined && typeof result.rollback !== 'function') {
       throw new AgentActionsServiceError('invalid_artifact')
     }
     const ids = new Set<string>()
     const paths = new Set<string>()
-    return result.artifacts.map((rawArtifact) => {
+    const artifacts = result.artifacts.map((rawArtifact) => {
       let artifact: ArtifactRefV1
       try {
         artifact = assertArtifactRefV1(rawArtifact)
@@ -765,6 +931,16 @@ export class AgentActionsService implements AgentActionsServiceLike {
       paths.add(artifact.workspacePath)
       return artifact
     })
+    if (result.rollback === undefined) return { artifacts }
+    const rawRollback = result.rollback as () => unknown
+    let rollbackPromise: Promise<void> | undefined
+    return {
+      artifacts,
+      rollback: () => {
+        rollbackPromise ??= Promise.resolve().then(async () => { await rawRollback() })
+        return rollbackPromise
+      },
+    }
   }
 
   private async verifyArtifacts(
@@ -794,7 +970,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     return verified
   }
 
-  private isExecutionCurrent(
+  private isExecutionOwned(
     actionId: string,
     generation: number,
     controller: AbortController,
@@ -803,13 +979,41 @@ export class AgentActionsService implements AgentActionsServiceLike {
     return record?.action.status === 'executing'
       && record.generation === generation
       && this.controllers.get(actionId) === controller
-      && !controller.signal.aborted
   }
 
-  private cancelledViewOrThrow(actionId: string): AgentActionPublicSummaryV1 {
-    const record = this.requireRecord(actionId)
-    if (record.action.status === 'cancelled') return this.toPublic(record)
-    throw new AgentActionsServiceError('invalid_state')
+  private createExecutionSettlement(): ExecutionSettlement {
+    let resolve!: () => void
+    const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise })
+    return {
+      promise,
+      resolve,
+      settled: false,
+      executorInvoked: false,
+      cancellationRequested: false,
+    }
+  }
+
+  private requireExecutionSettlement(actionId: string): ExecutionSettlement {
+    const settlement = this.executionSettlements.get(actionId)
+    if (!settlement) throw new AgentActionsServiceError('internal_error')
+    return settlement
+  }
+
+  private settleExecution(actionId: string, expected: ExecutionSettlement): void {
+    if (expected.settled) return
+    expected.settled = true
+    if (this.executionSettlements.get(actionId) === expected) this.executionSettlements.delete(actionId)
+    expected.resolve()
+  }
+
+  private waitForExecutionSettlement(settlement: Promise<void>): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), this.cancellationSettlementTimeoutMs)
+      void settlement.then(() => {
+        clearTimeout(timer)
+        resolve(true)
+      })
+    })
   }
 
   private requireRecord(actionId: string): PrivateActionRecord {
@@ -878,6 +1082,8 @@ export class AgentActionsService implements AgentActionsServiceLike {
     this.leases.delete(actionId)
     this.controllers.get(actionId)?.abort()
     this.controllers.delete(actionId)
+    const settlement = this.executionSettlements.get(actionId)
+    if (settlement) this.settleExecution(actionId, settlement)
     this.actions.delete(actionId)
   }
 

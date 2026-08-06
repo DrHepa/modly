@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -172,6 +172,79 @@ test('invalid normalized snapshot fields remove only Agent eligibility', async (
     assert.equal(ordinary.length, manifests.length)
     const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
     assert.deepEqual(inventory.capabilities, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('valid MCP tools join the governed inventory without exposing server, command, or executable details', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-mcp-capability-'))
+  const builtinDir = join(root, 'builtin')
+  const userDir = join(root, 'user')
+  const extensionDir = join(userDir, 'mcp-tools')
+  await mkdir(join(extensionDir, 'bin'), { recursive: true })
+  await mkdir(builtinDir, { recursive: true })
+  await writeFile(join(extensionDir, 'bin', 'server'), '#!/bin/sh\nexit 0\n')
+  await chmod(join(extensionDir, 'bin', 'server'), 0o755)
+  await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
+    id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0', type: 'process', entry: 'processor.js', nodes: [],
+    mcp: {
+      schema: 'modly.mcp-stdio.v1', transport: 'stdio', servers: [{
+        id: 'private-server',
+        runtimeFiles: [],
+        command: { executable: 'bin/server', args: ['--stdio'], env: {} },
+        tools: [{
+          name: 'private_tool_name', capability_id: 'mcp-tools/create-text',
+          display_name: 'Create text', description: 'Creates one text artifact.',
+          input_schema: {
+            type: 'object', additionalProperties: false,
+            properties: { text: { type: 'string', maxLength: 100 } }, required: ['text'],
+          },
+          mutating: true,
+          approval: { required: true, scope: 'single_action' },
+          artifact: { kind: 'text', media_types: ['text/plain'] },
+        }],
+      }],
+    },
+  }))
+
+  try {
+    const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
+    assert.equal(inventory.capabilities.length, 1)
+    const capability = inventory.capabilities[0]
+    assert.equal(capability.id, 'mcp-tools/create-text')
+    assert.equal(capability.execution?.kind, 'mcp_tool')
+    assert.equal(capability.execution?.inputSchemaHash.length, 64)
+    assert.equal(capability.execution?.bindingHash.length, 64)
+    assert.equal(capability.node.output, 'text')
+    const publicJson = JSON.stringify(capability)
+    assert.equal(publicJson.includes('private-server'), false)
+    assert.equal(publicJson.includes('private_tool_name'), false)
+    assert.equal(publicJson.includes('bin/server'), false)
+    assert.equal(publicJson.includes(extensionDir), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('invalid MCP metadata leaves the ordinary process visible but default-denies Agent execution', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-invalid-mcp-'))
+  const builtinDir = join(root, 'builtin')
+  const userDir = join(root, 'user')
+  const extensionDir = join(userDir, 'legacy-safe')
+  await mkdir(extensionDir, { recursive: true })
+  await mkdir(builtinDir, { recursive: true })
+  await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
+    id: 'legacy-safe', name: 'Legacy Safe', type: 'process', entry: 'processor.js',
+    nodes: [{ id: 'run', input: 'text', output: 'text' }],
+    mcp: { schema: 'modly.mcp-stdio.v1', transport: 'http', servers: [] },
+  }))
+  try {
+    const ordinary = await listVisibleExtensions({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
+    assert.equal(ordinary.find((extension) => extension.id === 'legacy-safe')?.type, 'process')
+    const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
+    assert.deepEqual(inventory.capabilities, [])
+    assert.ok(inventory.errors.some((error) => error.code === 'MCP_MANIFEST_INVALID'))
   } finally {
     await rm(root, { recursive: true, force: true })
   }

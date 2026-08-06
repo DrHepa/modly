@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -150,6 +150,51 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
   })
   assert.equal(captured?.model.endpoint, 'http://127.0.0.1:11434')
   assert.equal(JSON.stringify(completed).includes(validOutput.workspacePath), false)
+})
+
+test('MCP capability proposals preserve canonical schema-shaped arguments without workflow input wrappers', async () => {
+  const inputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { text: { type: 'string', maxLength: 80 } },
+    required: ['text'],
+  }
+  const capability = capabilityFixture({
+    id: 'mcp-tools/create-text',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'create-text', input: 'text', output: 'text', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool',
+      inputSchema,
+      inputSchemaHash: sha256Canonical(inputSchema),
+      mutating: true,
+      bindingHash: 'd'.repeat(64),
+    },
+  })
+  let captured: AgentActionExecutorRequest | undefined
+  const service = new AgentActionsService({
+    createActionId: () => 'action-mcp',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      captured = request
+      return { artifacts: [{ ...validOutput, kind: 'text', mediaType: 'text/plain' }] }
+    },
+  })
+  const proposed = await service.propose({
+    capabilityId: capability.id,
+    arguments: { text: 'hello' },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, decision: 'approve' })
+  await service.execute({ actionId: proposed.id })
+  assert.deepEqual(captured?.arguments, { text: 'hello' })
+  await rejectsCode(service.propose({
+    capabilityId: capability.id,
+    arguments: Object.assign(Object.create(null), { constructor: 'polluted' }),
+    model: selectedModel,
+  }), 'invalid_arguments')
 })
 
 test('artifact inputs are resolved from opaque ids and paths or hashes are never accepted from the renderer', async () => {
@@ -329,10 +374,12 @@ test('cancellation is idempotent and late executor success cannot overwrite canc
   const running = service.execute({ actionId: proposed.id })
   await didStart
 
-  assert.equal((await service.cancel({ actionId: proposed.id })).status, 'cancelled')
+  const cancelling = service.cancel({ actionId: proposed.id })
+  await new Promise<void>((resolve) => setImmediate(resolve))
   assert.equal(executorSignal?.aborted, true)
-  assert.equal((await service.cancel({ actionId: proposed.id })).status, 'cancelled')
   resolveExecution({ artifacts: [validOutput] })
+  assert.equal((await cancelling).status, 'cancelled')
+  assert.equal((await service.cancel({ actionId: proposed.id })).status, 'cancelled')
   assert.equal((await running).status, 'cancelled')
   assert.equal((await service.get({ actionId: proposed.id })).status, 'cancelled')
 })
@@ -361,7 +408,9 @@ test('executor output is fail-closed for unavailable executors, path escapes, wr
 
   const unavailable = await createApproved()
   await rejectsCode(service.execute({ actionId: unavailable }), 'executor_unavailable')
-  assert.equal((await service.get({ actionId: unavailable })).status, 'failed')
+  assert.equal((await service.get({ actionId: unavailable })).status, 'approved')
+  executor = async () => ({ artifacts: [validOutput] })
+  assert.equal((await service.execute({ actionId: unavailable })).status, 'completed')
 
   executor = async () => ({ artifacts: [{ ...validOutput, workspacePath: '../escape.glb' }] })
   const escape = await createApproved()
@@ -373,6 +422,73 @@ test('executor output is fail-closed for unavailable executors, path escapes, wr
 
   executor = async () => ({ artifacts: [validOutput, validOutput] })
   await rejectsCode(service.execute({ actionId: await createApproved() }), 'invalid_artifact')
+})
+
+test('a governed executor can return stable fail-closed sandbox_unavailable without exposing its cause', async () => {
+  const capability = capabilityFixture()
+  const service = new AgentActionsService({
+    createActionId: () => 'action-sandbox-unavailable',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => { throw new AgentActionsServiceError('sandbox_unavailable', new Error('/private/bwrap path')) },
+  })
+  const proposed = await service.propose({
+    capabilityId: capability.id,
+    arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: proposed.id }), 'sandbox_unavailable')
+  const failed = await service.get({ actionId: proposed.id })
+  assert.equal(failed.status, 'failed')
+  assert.equal(JSON.stringify(failed).includes('/private'), false)
+})
+
+test('sandbox readiness failure preserves the approval lease for a retry until expiry', async () => {
+  const capability = capabilityFixture()
+  const time = clock()
+  let ready = false
+  let executions = 0
+  let nextId = 0
+  const service = new AgentActionsService({
+    now: time.now,
+    approvalTtlMs: 1_000,
+    createActionId: () => `action-retry-readiness-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    ensureExecutorReady: async () => {
+      if (!ready) throw new AgentActionsServiceError('sandbox_unavailable')
+    },
+    executor: async () => { executions += 1; return { artifacts: [validOutput] } },
+  })
+  const proposed = await service.propose({
+    capabilityId: capability.id,
+    arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, decision: 'approve' })
+
+  await rejectsCode(service.execute({ actionId: proposed.id }), 'sandbox_unavailable')
+  assert.equal((await service.get({ actionId: proposed.id })).status, 'approved')
+  assert.equal(executions, 0)
+
+  ready = true
+  assert.equal((await service.execute({ actionId: proposed.id })).status, 'completed')
+  assert.equal(executions, 1)
+
+  ready = false
+  const expiring = await service.propose({
+    capabilityId: capability.id,
+    arguments: { input: 'table', params: {} },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: expiring.id, decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: expiring.id }), 'sandbox_unavailable')
+  time.advance(1_000)
+  await rejectsCode(service.execute({ actionId: expiring.id }), 'approval_expired')
+  assert.equal((await service.get({ actionId: expiring.id })).status, 'expired')
 })
 
 test('terminal actions are bounded, expired actions are pruned into terminal state, and restart restores nothing', async () => {
@@ -489,8 +605,175 @@ test('cancellation wins while final output verification is awaiting and cannot b
   await service.decide({ actionId: action.id, decision: 'approve' })
   const running = service.execute({ actionId: action.id })
   await didStartOutputVerification
-  assert.equal((await service.cancel({ actionId: action.id })).status, 'cancelled')
+  const cancelling = service.cancel({ actionId: action.id })
+  await new Promise<void>((resolve) => setImmediate(resolve))
   releaseOutputVerification()
+  assert.equal((await cancelling).status, 'cancelled')
+  assert.equal((await running).status, 'cancelled')
+  assert.equal((await service.get({ actionId: action.id })).status, 'cancelled')
+})
+
+test('transactional executor output is rolled back before post-publication verification failure becomes terminal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-rollback-failure-'))
+  const published = join(root, 'published.glb')
+  const capability = capabilityFixture()
+  const service = new AgentActionsService({
+    createActionId: () => 'action-rollback-failure',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: { async verify() { throw new Error('authoritative verification failed') } },
+    executor: async () => {
+      await writeFile(published, 'published bytes')
+      return {
+        artifacts: [validOutput],
+        rollback: async () => { await rm(published, { force: true }) },
+      }
+    },
+  })
+  try {
+    const action = await service.propose({
+      capabilityId: capability.id,
+      arguments: { input: 'chair', params: {} },
+      model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, decision: 'approve' })
+    await rejectsCode(service.execute({ actionId: action.id }), 'invalid_artifact')
+    await assert.rejects(readFile(published), { code: 'ENOENT' })
+    assert.equal((await service.get({ actionId: action.id })).status, 'failed')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('cancellation after executor publication awaits rollback before exposing cancelled state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-rollback-cancel-'))
+  const published = join(root, 'published.glb')
+  const capability = capabilityFixture()
+  let verificationStarted!: () => void
+  const didStartVerification = new Promise<void>((resolve) => { verificationStarted = resolve })
+  let releaseVerification!: () => void
+  const verificationBarrier = new Promise<void>((resolve) => { releaseVerification = resolve })
+  const service = new AgentActionsService({
+    createActionId: () => 'action-rollback-cancel',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: {
+      async verify(candidate) {
+        verificationStarted()
+        await verificationBarrier
+        return candidate
+      },
+    },
+    executor: async () => {
+      await writeFile(published, 'published bytes')
+      return {
+        artifacts: [validOutput],
+        rollback: async () => { await rm(published, { force: true }) },
+      }
+    },
+  })
+  try {
+    const action = await service.propose({
+      capabilityId: capability.id,
+      arguments: { input: 'chair', params: {} },
+      model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, decision: 'approve' })
+    const running = service.execute({ actionId: action.id })
+    await didStartVerification
+    const cancelling = service.cancel({ actionId: action.id })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(await readFile(published, 'utf8'), 'published bytes')
+    releaseVerification()
+    const cancelled = await cancelling
+    assert.equal(cancelled.status, 'cancelled')
+    await assert.rejects(readFile(published), { code: 'ENOENT' })
+    assert.equal((await running).status, 'cancelled')
+  } finally {
+    releaseVerification?.()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('cancellation between atomic publication and executor handoff waits for registered rollback cleanup', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-rollback-handoff-'))
+  const published = join(root, 'published.glb')
+  const capability = capabilityFixture()
+  let publishedReady!: () => void
+  const didPublish = new Promise<void>((resolve) => { publishedReady = resolve })
+  let releaseHandoff!: () => void
+  const handoffBarrier = new Promise<void>((resolve) => { releaseHandoff = resolve })
+  const service = new AgentActionsService({
+    createActionId: () => 'action-rollback-handoff',
+    cancellationSettlementTimeoutMs: 1_000,
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => {
+      await writeFile(published, 'published bytes')
+      publishedReady()
+      await handoffBarrier
+      return {
+        artifacts: [validOutput],
+        rollback: async () => { await rm(published, { force: true }) },
+      }
+    },
+  })
+  try {
+    const action = await service.propose({
+      capabilityId: capability.id,
+      arguments: { input: 'chair', params: {} },
+      model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, decision: 'approve' })
+    const running = service.execute({ actionId: action.id })
+    await didPublish
+    let cancelSettled = false
+    const cancelling = service.cancel({ actionId: action.id }).finally(() => { cancelSettled = true })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(cancelSettled, false)
+    assert.equal(await readFile(published, 'utf8'), 'published bytes')
+    releaseHandoff()
+    assert.equal((await cancelling).status, 'cancelled')
+    await assert.rejects(readFile(published), { code: 'ENOENT' })
+    assert.equal((await running).status, 'cancelled')
+  } finally {
+    releaseHandoff?.()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('cancellation timeout stays non-terminal when an executor ignores abort and replay shares settlement', async () => {
+  const capability = capabilityFixture()
+  let executorStarted!: () => void
+  const didStartExecutor = new Promise<void>((resolve) => { executorStarted = resolve })
+  let releaseExecutor!: () => void
+  const executorBarrier = new Promise<void>((resolve) => { releaseExecutor = resolve })
+  const service = new AgentActionsService({
+    createActionId: () => 'action-cancel-pending',
+    cancellationSettlementTimeoutMs: 20,
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => {
+      executorStarted()
+      await executorBarrier
+      throw new Error('executor eventually settled after ignoring abort')
+    },
+  })
+  const action = await service.propose({
+    capabilityId: capability.id,
+    arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: action.id, decision: 'approve' })
+  const running = service.execute({ actionId: action.id })
+  await didStartExecutor
+  await rejectsCode(service.cancel({ actionId: action.id }), 'cancellation_pending')
+  assert.equal((await service.get({ actionId: action.id })).status, 'executing')
+  await rejectsCode(service.cancel({ actionId: action.id }), 'cancellation_pending')
+  assert.equal((await service.get({ actionId: action.id })).status, 'executing')
+  releaseExecutor()
   assert.equal((await running).status, 'cancelled')
   assert.equal((await service.get({ actionId: action.id })).status, 'cancelled')
 })

@@ -30,6 +30,15 @@ export interface AgentCapabilityDeclarationV1 {
   approval: AgentApprovalPolicyV1
 }
 
+export interface AgentMcpToolExecutionV1 {
+  kind: 'mcp_tool'
+  inputSchema: JsonValue
+  inputSchemaHash: string
+  outputSchemaHash?: string
+  mutating: boolean
+  bindingHash: string
+}
+
 export interface AgentCapabilitySnapshotV1 {
   schema: 'modly.agent-capability.v1'
   version: 1
@@ -57,6 +66,7 @@ export interface AgentCapabilitySnapshotV1 {
     }>
     paramsSchema: JsonValue[]
   }
+  execution?: AgentMcpToolExecutionV1
   approval: AgentApprovalPolicyV1
   hash: string
 }
@@ -157,7 +167,10 @@ export type AgentActionPublicErrorCode =
   | 'approval_expired'
   | 'invalid_state'
   | 'executor_unavailable'
+  | 'sandbox_unavailable'
   | 'execution_failed'
+  | 'artifact_too_large'
+  | 'cancellation_pending'
   | 'invalid_artifact'
   | 'capacity_exceeded'
   | 'internal_error'

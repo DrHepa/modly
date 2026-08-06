@@ -47,10 +47,15 @@ import { updatesSupported } from './updater'
 import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
 import { importVideoInputToWorkspace } from './video-input-import'
 import { AgentSessionStore } from './agent-session-store'
-import { AgentActionsService } from './agent-actions-service'
+import { AgentActionsService, AgentActionsServiceError } from './agent-actions-service'
 import { registerAgentActionsIpcHandlers } from './agent-actions-ipc'
 import { WorkspaceAgentArtifactVerifier } from './agent-artifact-verifier'
 import type { AgentOllamaModelSnapshotV1 } from '../../src/shared/types/agentActions.ts'
+import {
+  AgentMcpBrokerError,
+  createAgentMcpExecutor,
+  createAgentMcpSandboxReadiness,
+} from './agent-mcp-broker'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -371,6 +376,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('agentSessions:removeAttachment', (_event, request) => agentSessionStore.removeAttachment(request))
   ipcMain.handle('agentSessions:readAttachment', (_event, request) => agentSessionStore.readAttachment(request))
 
+  const mcpSandboxReadiness = createAgentMcpSandboxReadiness()
   const agentActionsService = new AgentActionsService({
     resolveCapabilities: async () => {
       const userData = app.getPath('userData')
@@ -384,10 +390,35 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     artifactVerifier: new WorkspaceAgentArtifactVerifier({
       getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
     }),
-    // A governed production executor is introduced separately. Until then,
-    // execution consumes approval and fails closed as executor_unavailable.
-    isExecutorAvailable: () => false,
-    executor: async () => { throw new Error('Governed Agent executor is unavailable') },
+    ensureExecutorReady: async (capability) => {
+      if (capability.execution?.kind !== 'mcp_tool') throw new AgentActionsServiceError('executor_unavailable')
+      if (!await mcpSandboxReadiness()) throw new AgentActionsServiceError('sandbox_unavailable')
+    },
+    executor: async (request) => {
+      if (request.capability.execution?.kind !== 'mcp_tool') {
+        throw new AgentActionsServiceError('executor_unavailable')
+      }
+      try {
+        const userData = app.getPath('userData')
+        const mcpExecutor = createAgentMcpExecutor({
+          discovery: {
+            builtinDir: getBuiltinExtensionsDir(),
+            userExtensionsDir: getSettings(userData).extensionsDir,
+          },
+          getWorkspaceRoot: () => getSettings(userData).workspaceDir,
+          sandboxReadiness: mcpSandboxReadiness,
+        })
+        return await mcpExecutor(request)
+      } catch (error) {
+        if (!(error instanceof AgentMcpBrokerError)) throw error
+        if (error.code === 'unsupported_capability') throw new AgentActionsServiceError('executor_unavailable', error)
+        if (error.code === 'capability_stale') throw new AgentActionsServiceError('capability_stale', error)
+        if (error.code === 'invalid_arguments') throw new AgentActionsServiceError('invalid_arguments', error)
+        if (error.code === 'sandbox_unavailable') throw new AgentActionsServiceError('sandbox_unavailable', error)
+        if (error.code === 'artifact_too_large') throw new AgentActionsServiceError('artifact_too_large', error)
+        throw new AgentActionsServiceError('execution_failed', error)
+      }
+    },
   })
   registerAgentActionsIpcHandlers(ipcMain, agentActionsService)
 

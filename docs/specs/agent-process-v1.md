@@ -86,8 +86,31 @@ or throwing probe excludes only that Agent capability and reports
 `PROCESS_MODEL_ACCESS_UNAVAILABLE`. Main also fails immediately with
 `model_binding_unavailable` if an approved action cannot acquire or revalidate
 its action-scoped provider lease. There is no fallback to the selected raw
-Ollama endpoint, shared host networking, a cloud provider, or an undeclared
+Ollama endpoint, the ambient shared daemon, a cloud provider, or an undeclared
 model.
+
+The production provider is Linux-only and resolves configuration without
+`PATH`. `MODLY_AGENT_OLLAMA_BINARY` and `MODLY_AGENT_OLLAMA_MODELS_DIR`, when
+set, must be canonical absolute paths. The only executable default is
+`/usr/local/bin/ollama`; the only system-store default is
+`/usr/share/ollama/.ollama/models`, followed by the current user's canonical
+`~/.ollama/models` when present. `/usr/bin/ollama` is never an implicit
+fallback. The configured Ollama and bubblewrap executables are opened with
+`O_NOFOLLOW`, content-hashed, identity-bound, and revalidated around launch.
+Readiness uses a cached, bounded, non-inference private-daemon probe and
+requires a canonical store with at least one bounded manifest graph. Exact
+selected-model validation remains an action-acquisition check.
+
+Acquisition resolves the selected conservative `namespace/model:tag` to its
+OCI v2 manifest under `manifests/registry.ollama.ai`, verifies the approved raw
+manifest digest, strictly parses the bounded config/layer descriptors, and
+opens every referenced `blobs/sha256-...` file with `O_NOFOLLOW`. Each file is
+size-checked, SHA-256 hashed through the open handle, identity-checked before
+and after hashing, and revalidated before launch, before every request, and
+after the request. Symlinks, traversal, special files, unsafe descriptor
+fields, missing blobs, digest mismatches, mutation races, and graph/byte-limit
+violations fail closed. Model blobs are never copied, pulled, created,
+downloaded, renamed, or written in the canonical store.
 
 Optional non-code data files are declared separately in `resourceFiles`.
 Executable permissions and code/archive extensions are rejected for resources.
@@ -192,19 +215,48 @@ For a declared model-access action, main additionally inherits one already-open
 private gateway-directory FD and bubblewrap mounts only that directory read-only
 at `/run/modly/model` while retaining `--unshare-all`. The pathname AF_UNIX
 gateway accepts exactly one authenticated `POST /v1/responses`. Request and
-response bodies, idle time, and total time are bounded. V1 accepts only
+response bodies, request-body idle time, and total upstream time are bounded;
+the short body-idle timer is disabled before potentially long inference. V1 accepts only
 non-streaming, stateless requests without tools, rewrites the child sentinel
 model `approved` to the provider-private alias, and rejects replay. Cancellation,
 timeout, process failure, success, and shutdown revoke the lease, abort upstream
 work, destroy connections, and remove the socket directory.
 
 The gateway directory is `0700`, the socket is `0600`, and the bearer is random.
-Because the current Node runtime exposes no `SO_PEERCRED` API, this v1 guarantee
-is explicitly `pinned-local-cooperative-host`: it isolates the renderer,
-sandbox, and ordinary host network, but does not claim resistance to malicious
-same-UID or root host processes. A production provider must prove the approved
-digest-to-private-model binding before returning a lease; until such a provider
-is configured, model-access capabilities remain default-denied.
+For each action, main starts the exact pinned Ollama binary through pinned
+bubblewrap as an owned detached process group. The read-only host view shadows
+the canonical model-store path with a private tmpfs. A random unguessable alias
+manifest and only the verified manifest/blob handles are mounted into that
+shadow store with `--ro-bind-fd`, so multi-gigabyte blobs remain zero-copy and
+mutable host tag names are not used by the daemon. The daemon receives a
+cleared, fixed environment, `OLLAMA_NO_CLOUD=1`, one-model/one-request resource
+limits, and a collision-retried random loopback listener. Discovery readiness
+starts an empty private daemon and checks bounded `/api/version`; it does not
+load a model. Per-action daemon readiness additionally checks the exact alias
+and digest through bounded `/api/tags` and `/api/show`. Neither probe claims
+model loadability or successful inference. The extension never receives
+that TCP endpoint or alias: only the authenticated AF_UNIX gateway enters its
+network-isolated PROCESS sandbox.
+
+This v1 assurance is deliberately named
+`pinned-local-cooperative-host`. It protects the approved action from mutable
+tag races, cloud fallback, canonical-store replacement during cooperative use,
+renderer access, and accidental use of the ambient shared daemon. The private
+daemon listens only on host loopback, has cloud disabled, and receives inert
+proxy defaults, but its bubblewrap instance shares the host network so main can
+forward to it; this contract does **not** claim kernel-enforced denial of every
+possible daemon egress. Node also exposes no `SO_PEERCRED` API for the pathname
+gateway. Consequently the contract does not resist malicious same-UID, root,
+Ollama-service-account, or other local host actors able to discover and reach
+the transient loopback listener. Its random port is not an authentication
+mechanism; the bearer authenticates only the extension-facing AF_UNIX gateway.
+The daemon sandbox also retains a broad read-only host view for the pinned
+dynamically linked executable and drivers, while replacing `/home`, `/tmp`,
+`/run`, and the canonical model store with private mounts. The assurance trusts
+that pinned executable as cooperative and does not claim to contain a malicious
+configured binary. Missing configuration, binary/store drift, failed user
+namespaces, private-daemon probe failure, or selected-model verification
+failure remains default-deny with no local-to-cloud fallback.
 
 The sandbox also exposes bounded read-only host OS ABI, standard-library, and
 library trees needed by ordinary Python and native packages. Those mounts are
@@ -219,8 +271,9 @@ private app-owned `0700` root outside the workspace. That root and the workspace
 publication directory must be on the same filesystem so the complete verified
 artifact set can be published by one atomic rename. Readiness fails closed when
 this invariant is unavailable. Renderer filesystem IPC cannot list, grant,
-move, or delete the private action root, the Python snapshot root, their
-descendants, or a containing ancestor. Other operations remain limited to
+move, or delete the private action root, the Python snapshot root, the private
+model-access daemon/gateway root, their descendants, or a containing ancestor.
+Other operations remain limited to
 canonical configured storage roots or explicit directory-picker grants and
 reject symlinks.
 

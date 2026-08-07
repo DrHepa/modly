@@ -316,6 +316,10 @@ test('declared model access is default-denied without a provider and an injected
           proposalHash: input.proposalHash,
           capabilityHash: input.capability.hash,
           digest: input.model.digest,
+          approvedModelName: input.model.model,
+          declaration: input.capability.execution?.kind === 'process'
+            ? input.capability.execution.modelAccess!
+            : { schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1' },
           privateModelAlias: 'modly-private-test',
           signal: input.signal,
           forward: async () => ({ id: 'unused' }),

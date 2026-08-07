@@ -16,11 +16,13 @@ test('renderer filesystem access is limited to canonical configured roots and ex
   const agentPrivateTempDir = join(userDataDir, 'agent-private')
   const agentRuntimeSnapshotDir = join(userDataDir, 'agent-process-runtime-snapshots')
   const agentWorkspaceStagingDir = join(workspaceDir, 'Workflows', 'agent-actions', '.staging')
+  const agentModelAccessParent = join(root, 'provider-private')
+  const agentModelAccessDir = join(agentModelAccessParent, 'agent-model-access')
   const selectedDir = join(root, 'selected')
   const outsideDir = join(root, 'outside')
   const workspacePrefixTrap = `${workspaceDir}-evil`
   for (const path of [modelsDir, workspaceDir, workflowsDir, extensionsDir, userDataDir, agentPrivateTempDir,
-    agentRuntimeSnapshotDir, selectedDir, outsideDir, workspacePrefixTrap]) {
+    agentRuntimeSnapshotDir, agentModelAccessDir, selectedDir, outsideDir, workspacePrefixTrap]) {
     await mkdir(path, { recursive: true })
   }
   await mkdir(join(workspaceDir, 'tmp'))
@@ -32,7 +34,7 @@ test('renderer filesystem access is limited to canonical configured roots and ex
   const access = new RendererFilesystemAccess({
     getConfiguredRoots: () => ({ modelsDir, workspaceDir, workflowsDir, extensionsDir }),
     getProtectedRoots: () => ({
-      userDataDir, agentPrivateTempDir, agentRuntimeSnapshotDir, agentWorkspaceStagingDir,
+      userDataDir, agentPrivateTempDir, agentRuntimeSnapshotDir, agentWorkspaceStagingDir, agentModelAccessDir,
     }),
   })
 
@@ -46,6 +48,9 @@ test('renderer filesystem access is limited to canonical configured roots and ex
     await assert.rejects(access.grantSelectedDirectory(agentRuntimeSnapshotDir))
     await assert.rejects(access.resolveListFiles(agentWorkspaceStagingDir))
     await assert.rejects(access.grantSelectedDirectory(agentWorkspaceStagingDir))
+    await assert.rejects(access.resolveListFiles(agentModelAccessDir))
+    await assert.rejects(access.grantSelectedDirectory(agentModelAccessDir))
+    await assert.rejects(access.grantSelectedDirectory(agentModelAccessParent))
     await assert.rejects(access.resolveListDirectory(join(root, 'workspace-link')))
 
     assert.equal(await access.grantSelectedDirectory(selectedDir), selectedDir)

@@ -47,6 +47,8 @@ test('gateway exposes one authenticated bounded Responses request through a priv
     proposalHash: 'a'.repeat(64),
     capabilityHash: 'b'.repeat(64),
     digest: `sha256:${'c'.repeat(64)}`,
+    approvedModelName: 'qwen3.6:27b',
+    declaration: { schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1' },
     privateModelAlias: 'modly-private-action-1',
     signal: new AbortController().signal,
     forward: async (body) => {
@@ -54,6 +56,7 @@ test('gateway exposes one authenticated bounded Responses request through a priv
       return {
         id: 'response-1', object: 'response', model: 'modly-private-action-1',
         output: [{ type: 'message', content: 'served by modly-private-action-1' }],
+        metadata: { 'modly-private-action-1': 'modly-private-action-1' },
       }
     },
   })
@@ -76,6 +79,7 @@ test('gateway exposes one authenticated bounded Responses request through a priv
     assert.deepEqual(JSON.parse(accepted.body), {
       id: 'response-1', object: 'response', model: 'approved',
       output: [{ type: 'message', content: 'served by approved' }],
+      metadata: { approved: 'approved' },
     })
     assert.equal(accepted.body.includes('modly-private-action-1'), false)
     assert.deepEqual(forwarded, [{ model: 'modly-private-action-1', input: 'make a chair', stream: false, store: false }])
@@ -105,6 +109,8 @@ test('gateway rejects unsupported Responses modes without forwarding and closes 
     proposalHash: 'd'.repeat(64),
     capabilityHash: 'e'.repeat(64),
     digest: `sha256:${'f'.repeat(64)}`,
+    approvedModelName: 'qwen3.6:27b',
+    declaration: { schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1' },
     privateModelAlias: 'modly-private-action-2',
     signal: controller.signal,
     forward: async () => { calls += 1; return {} },
@@ -120,6 +126,39 @@ test('gateway rejects unsupported Responses modes without forwarding and closes 
     controller.abort()
     await new Promise((resolve) => setTimeout(resolve, 20))
     await assert.rejects(stat(lease.hostSocketPath))
+  } finally {
+    await lease.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('gateway body idle timeout does not truncate a slower bounded inference response', async (t) => {
+  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-slow-test-'))
+  const lease = await acquireAgentModelAccessGateway({
+    root,
+    actionId: 'action-slow',
+    proposalHash: '1'.repeat(64),
+    capabilityHash: '2'.repeat(64),
+    digest: `sha256:${'3'.repeat(64)}`,
+    approvedModelName: 'qwen3.6:27b',
+    declaration: { schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1' },
+    privateModelAlias: 'modly-private-slow',
+    signal: new AbortController().signal,
+    limits: { idleMs: 10, totalMs: 1_000 },
+    forward: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      return { model: 'modly-private-slow', output_text: 'ok' }
+    },
+  })
+  try {
+    const response = await unixRequest({
+      socketPath: lease.hostSocketPath,
+      token: lease.bearerToken,
+      body: JSON.stringify({ model: 'approved', input: 'chair' }),
+    })
+    assert.equal(response.status, 200)
+    assert.deepEqual(JSON.parse(response.body), { model: 'approved', output_text: 'ok' })
   } finally {
     await lease.close()
     await rm(root, { recursive: true, force: true })

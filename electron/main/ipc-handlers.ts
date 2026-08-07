@@ -106,6 +106,7 @@ import {
 } from './agent-process-executor'
 import { RendererFilesystemAccess } from './renderer-filesystem-access'
 import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime'
+import { createAgentModelAccessRuntime } from './agent-model-access-runtime'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -116,6 +117,10 @@ function agentProcessPrivateTempRoot(userDataDir: string): string {
 
 function agentProcessRuntimeSnapshotRoot(userDataDir: string): string {
   return join(userDataDir, 'agent-process-runtime-snapshots')
+}
+
+function agentModelAccessRoot(userDataDir: string): string {
+  return join(userDataDir, 'agent-model-access')
 }
 
 // ─── Run an extension's setup.py directly (no FastAPI needed) ─────────────────
@@ -324,6 +329,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         agentPrivateTempDir: agentProcessPrivateTempRoot(userDataDir),
         agentRuntimeSnapshotDir: agentProcessRuntimeSnapshotRoot(userDataDir),
         agentWorkspaceStagingDir: agentMcpWorkspaceStagingRoot(getSettings(userDataDir).workspaceDir),
+        agentModelAccessDir: agentModelAccessRoot(userDataDir),
       }
     },
   })
@@ -402,6 +408,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
   })
   const agentHostRuntimes = createDefaultAgentHostRuntimeRegistry()
+  const agentModelAccess = createAgentModelAccessRuntime({
+    root: agentModelAccessRoot(app.getPath('userData')),
+  })
   const processExecutor = createAgentProcessExecutor({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
     getPrivateTempRoot: () => agentProcessPrivateTempRoot(app.getPath('userData')),
@@ -418,6 +427,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     resolvePythonExecutable: () => getVenvPythonExe(app.getPath('userData')),
     getRuntimeSnapshotRoot: () => agentProcessRuntimeSnapshotRoot(app.getPath('userData')),
     pythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
+    modelAccessReadiness: (declaration) => agentModelAccess.readiness(declaration),
+    acquireModelAccess: (input) => agentModelAccess.acquire(input),
   })
   const agentActionsService = new AgentActionsService({
     resolveCapabilities: async () => {
@@ -429,6 +440,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         hostRuntimes: agentHostRuntimes,
         mcpSandboxReadiness,
         processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
+        processModelAccessReadiness: (declaration) => agentModelAccess.readiness(declaration),
         processPythonExecutable: () => getVenvPythonExe(userData),
       })
     },
@@ -2183,6 +2195,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   return {
-    shutdown: () => agentActionsService.shutdown(),
+    shutdown: async () => {
+      try {
+        await agentActionsService.shutdown()
+      } finally {
+        await agentModelAccess.shutdown()
+      }
+    },
   }
 }

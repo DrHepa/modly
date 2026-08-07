@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { join, resolve } from 'node:path'
 import type { Socket } from 'node:net'
 
-import type { JsonValue } from '../../src/shared/types/agentActions.ts'
+import type { AgentProcessModelAccessDeclarationV1, JsonValue } from '../../src/shared/types/agentActions.ts'
 import { normalizeJsonValue, sha256Canonical } from './agent-trust-contracts.ts'
 
 export const AGENT_MODEL_ACCESS_SANDBOX_DIRECTORY = '/run/modly/model' as const
@@ -16,7 +16,7 @@ export const AGENT_MODEL_ACCESS_MODEL_SENTINEL = 'approved' as const
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const DIGEST = /^sha256:[a-f0-9]{64}$/
-const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,31})?$/
 const RESPONSES_REQUEST_KEYS = new Set([
   'model', 'input', 'instructions', 'max_output_tokens', 'temperature', 'top_p',
   'text', 'reasoning', 'stream', 'store', 'background', 'previous_response_id', 'tools',
@@ -59,6 +59,8 @@ export interface AcquireAgentModelAccessGatewayOptions {
   proposalHash: string
   capabilityHash: string
   digest: string
+  approvedModelName: string
+  declaration: AgentProcessModelAccessDeclarationV1
   privateModelAlias: string
   signal: AbortSignal
   forward: (request: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<unknown>
@@ -73,6 +75,8 @@ const DEFAULT_LIMITS: Readonly<AgentModelAccessLimits> = Object.freeze({
   idleMs: 30_000,
   totalMs: 180_000,
 })
+
+const APPROVED_MODEL = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*){0,2}(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/
 
 class GatewayHttpError extends Error {
   readonly status: number
@@ -162,7 +166,13 @@ function redactPrivateAlias(value: JsonValue, alias: string): JsonValue {
   if (typeof value === 'string') return value.split(alias).join(AGENT_MODEL_ACCESS_MODEL_SENTINEL)
   if (Array.isArray(value)) return value.map((entry) => redactPrivateAlias(entry, alias))
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactPrivateAlias(entry, alias)]))
+    const redacted: Record<string, JsonValue> = {}
+    for (const [key, entry] of Object.entries(value)) {
+      const redactedKey = key.split(alias).join(AGENT_MODEL_ACCESS_MODEL_SENTINEL)
+      if (Object.hasOwn(redacted, redactedKey)) throw new GatewayHttpError(502, 'invalid_upstream_response')
+      redacted[redactedKey] = redactPrivateAlias(entry, alias)
+    }
+    return redacted
   }
   return value
 }
@@ -198,6 +208,10 @@ export async function acquireAgentModelAccessGateway(
 ): Promise<AgentModelExecutionLeaseV1> {
   if (process.platform !== 'linux' || !SAFE_ID.test(options.actionId) || !SHA256.test(options.proposalHash)
     || !SHA256.test(options.capabilityHash) || !DIGEST.test(options.digest)
+    || !APPROVED_MODEL.test(options.approvedModelName)
+    || Reflect.ownKeys(options.declaration).length !== 2
+    || options.declaration.schema !== 'modly.agent-model-access.v1'
+    || options.declaration.profile !== 'ollama-responses-json-v1'
     || !MODEL_ALIAS.test(options.privateModelAlias) || options.signal.aborted) {
     throw new TypeError('Agent model access gateway binding is invalid')
   }
@@ -212,6 +226,8 @@ export async function acquireAgentModelAccessGateway(
   const expiresAt = new Date(now().getTime() + limits.totalMs).toISOString()
   const tokenHash = createHash('sha256').update(bearerToken).digest('hex')
   const privateModelAliasHash = createHash('sha256').update(options.privateModelAlias).digest('hex')
+  const approvedModelNameHash = createHash('sha256').update(options.approvedModelName).digest('hex')
+  const declarationHash = sha256Canonical(options.declaration)
   const bindingHash = sha256Canonical({
     schema: 'modly.agent-model-execution-lease.v1',
     leaseId,
@@ -219,6 +235,8 @@ export async function acquireAgentModelAccessGateway(
     proposalHash: options.proposalHash,
     capabilityHash: options.capabilityHash,
     digest,
+    approvedModelNameHash,
+    declarationHash,
     assurance: 'pinned-local-cooperative-host',
     transport: 'unix-http',
     socketPath: AGENT_MODEL_ACCESS_SANDBOX_SOCKET,
@@ -252,7 +270,12 @@ export async function acquireAgentModelAccessGateway(
           throw new GatewayHttpError(415, 'unsupported_media_type')
         }
         request.setTimeout(limits.idleMs, () => request.destroy(new Error('request_idle_timeout')))
-        const raw = await readBoundedBody(request, limits.maxRequestBytes)
+        let raw: Buffer
+        try {
+          raw = await readBoundedBody(request, limits.maxRequestBytes)
+        } finally {
+          request.setTimeout(0)
+        }
         let parsed: unknown
         try { parsed = JSON.parse(raw.toString('utf8')) } catch { throw new GatewayHttpError(400, 'invalid_json') }
         const body = normalizeResponsesRequest(parsed, options.privateModelAlias)

@@ -8,6 +8,7 @@ import {
   assertWorkspaceRelativePath,
   canonicalJson,
   createAgentActionProposal,
+  requiresLiveProviderModelRevalidation,
   sha256Canonical,
   toAgentActionPublicSummary,
   transitionAgentAction,
@@ -157,6 +158,7 @@ test('extension Python runtime and model access bindings are exact and transitiv
   }
   const snapshot = { ...unsigned, hash: sha256Canonical(unsigned) }
   assert.equal(assertAgentCapabilitySnapshotV1(snapshot).execution?.kind, 'process')
+  assert.equal(requiresLiveProviderModelRevalidation(snapshot), true)
 
   const runtimeHashWithoutModelAccess = sha256Canonical({ runtimeFiles, resourceFiles, runtime })
   const executionWithoutModelAccess = {
@@ -175,6 +177,7 @@ test('extension Python runtime and model access bindings are exact and transitiv
     hash: sha256Canonical(unsignedWithoutModelAccess),
   }
   assert.equal(assertAgentCapabilitySnapshotV1(snapshotWithoutModelAccess).execution?.kind, 'process')
+  assert.equal(requiresLiveProviderModelRevalidation(snapshotWithoutModelAccess), false)
   assert.notEqual(snapshot.hash, snapshotWithoutModelAccess.hash)
 
   const withRuntime = (changedRuntime: Record<string, unknown>) => {
@@ -194,6 +197,10 @@ test('extension Python runtime and model access bindings are exact and transitiv
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, interpreter: '/usr/bin/python' })), /Python runtime/i)
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, unknown: true })), /unknown field/i)
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, treeDigest: '4'.repeat(64) })), /binding hash/i)
+  assert.throws(
+    () => requiresLiveProviderModelRevalidation({ ...snapshotWithoutModelAccess, hash: '0'.repeat(64) }),
+    /capability hash/i,
+  )
   assert.throws(() => assertAgentCapabilitySnapshotV1({
     ...snapshot,
     execution: { ...execution, modelAccess: { ...modelAccess, profile: 'unsupported' } },

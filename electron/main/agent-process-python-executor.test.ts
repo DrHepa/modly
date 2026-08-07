@@ -284,6 +284,7 @@ test('declared model access is default-denied without a provider and an injected
   if (process.platform !== 'linux') return t.skip('Linux proc-fd and pathname AF_UNIX semantics are required')
   const value = await fixture(true)
   let hostSocketPath = ''
+  let modelResolverCalls = 0
   try {
     const common: AgentProcessExecutorOptions = {
       getWorkspaceRoot: () => value.workspaceDir,
@@ -309,6 +310,7 @@ test('declared model access is default-denied without a provider and an injected
     const executor = createAgentProcessExecutor({
       ...common,
       modelAccessReadiness: async () => true,
+      resolveCurrentModel: async () => { modelResolverCalls += 1; return model },
       acquireModelAccess: async (input) => {
         const lease = await acquireAgentModelAccessGateway({
           root: input.privateTempRoot,
@@ -330,9 +332,47 @@ test('declared model access is default-denied without a provider and an injected
     })
     await executor.ensureReady(value.capability)
     const result = await executor.execute(request(value.capability, value.input, 'action-python-model', 'success'))
+    assert.equal(modelResolverCalls, 2)
     assert.equal(await readFile(join(value.workspaceDir, result.artifacts[0].workspacePath), 'utf8'), 'resource:input')
     await assert.rejects(access(hostSocketPath))
     await result.rollback()
+  } finally {
+    await makeWritableAndRemove(value.root)
+  }
+})
+
+test('declared model access revalidates the provider model before acquiring a gateway lease', async (t) => {
+  if (process.platform !== 'linux') return t.skip('Linux proc-fd and pathname AF_UNIX semantics are required')
+  const value = await fixture(true)
+  let modelResolverCalls = 0
+  let acquisitionCalls = 0
+  try {
+    const executor = createAgentProcessExecutor({
+      getWorkspaceRoot: () => value.workspaceDir,
+      getPrivateTempRoot: () => value.privateTempRoot,
+      getRuntimeSnapshotRoot: () => value.snapshotRoot,
+      pythonSandboxReadiness: async () => true,
+      modelAccessReadiness: async () => true,
+      bwrapPath: value.bwrapPath,
+      systemPaths: ['/usr'],
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveCurrentModel: async () => {
+        modelResolverCalls += 1
+        throw new Error('selected model provider is unavailable')
+      },
+      resolvePythonExecutable: () => value.baseInterpreter,
+      acquireModelAccess: async () => {
+        acquisitionCalls += 1
+        throw new Error('gateway acquisition must not be reached')
+      },
+      limits: processTestLimits,
+    })
+    await assert.rejects(
+      executor.execute(request(value.capability, value.input, 'action-python-stale-model', 'success')),
+      (error: unknown) => error instanceof AgentProcessExecutorError && error.code === 'model_stale',
+    )
+    assert.equal(modelResolverCalls, 1)
+    assert.equal(acquisitionCalls, 0)
   } finally {
     await makeWritableAndRemove(value.root)
   }

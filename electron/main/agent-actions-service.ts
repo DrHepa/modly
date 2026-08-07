@@ -23,6 +23,7 @@ import {
   canonicalJson,
   createAgentActionProposal,
   normalizeJsonValue,
+  requiresLiveProviderModelRevalidation,
   sha256Canonical,
   toAgentActionPublicSummary,
   transitionAgentAction,
@@ -299,7 +300,9 @@ export class AgentActionsService implements AgentActionsServiceLike {
     } catch (error) {
       throw new AgentActionsServiceError('invalid_request', error)
     }
-    await this.assertCurrentModel(proposedModel)
+    if (requiresLiveProviderModelRevalidation(capability)) {
+      await this.assertCurrentModel(proposedModel)
+    }
     const normalized = await this.normalizeArguments(capability, request.arguments, originSessionId)
     if (capability.execution?.kind === 'mcp_tool') {
       try {
@@ -990,7 +993,9 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
     const capability = await this.resolveCapability(normalized.capability.id, 'capability_stale')
     if (capability.hash !== normalized.capability.hash) throw new AgentActionsServiceError('capability_stale')
-    await this.assertCurrentModel(normalized.model)
+    if (requiresLiveProviderModelRevalidation(capability)) {
+      await this.assertCurrentModel(normalized.model)
+    }
   }
 
   private asBindingError(error: unknown): AgentActionsServiceError {

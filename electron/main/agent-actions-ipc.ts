@@ -222,34 +222,16 @@ export function registerAgentActionsIpcHandlers(
     if (lease.proposals >= maxProposalsPerModelLease) {
       throw new AgentActionsServiceError('capacity_exceeded')
     }
-    // Reserve before awaiting the model recheck so concurrent proposals cannot
-    // oversubscribe a lease.
+    // Reserve before dispatch so concurrent proposals cannot oversubscribe a
+    // lease. The stored snapshot was minted by main; AgentActionsService owns
+    // the central capability-specific live-model revalidation policy.
     lease.proposals += 1
-    let model: AgentOllamaModelSnapshotV1
-    try {
-      model = assertAgentOllamaModelSnapshotV1(await options.resolveSelectedModel({
-        provider: lease.model.provider,
-        endpoint: lease.model.endpoint,
-        model: lease.model.model,
-      }))
-    } catch (error) {
-      if (error instanceof AgentActionsServiceError) throw error
-      throw new AgentActionsServiceError('model_stale', error)
-    }
-    if (
-      model.provider !== lease.model.provider
-      || model.endpoint !== lease.model.endpoint
-      || model.model !== lease.model.model
-      || model.digest !== lease.model.digest
-    ) {
-      throw new AgentActionsServiceError('model_stale')
-    }
     return service.propose({
       originSessionId: proposal.originSessionId,
       capabilityId: proposal.capabilityId,
       capabilityHash: proposal.capabilityHash,
       arguments: proposal.arguments,
-      model,
+      model: { ...lease.model },
     })
   }))
   ipcMain.handle('agentActions:get', (_event, request) => mutate(() => service.get(sessionAction(request))))

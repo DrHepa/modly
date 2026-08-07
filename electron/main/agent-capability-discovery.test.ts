@@ -61,6 +61,22 @@ test('manifest Agent process declarations are strict opt-in and legacy processes
   const valid = parseExtensionManifest(processManifest(), 'fallback', new Set())
   assert.deepEqual(valid.nodes[0].agent, declaration())
 
+  const withModelAccess = declaration({
+    process: {
+      ...declaration().process,
+      runtimeFiles: ['processor.pyz'],
+      runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
+      modelAccess: {
+        schema: 'modly.agent-model-access.v1',
+        profile: 'ollama-responses-json-v1',
+      },
+    },
+  })
+  assert.deepEqual(
+    parseExtensionManifest({ ...processManifest(withModelAccess), entry: 'processor.pyz' }, 'fallback', new Set()).nodes[0].agent,
+    withModelAccess,
+  )
+
   const missingProcess = parseExtensionManifest(processManifest(declaration({ process: undefined })), 'fallback', new Set())
   assert.equal(missingProcess.nodes[0].agent, undefined)
 
@@ -77,6 +93,16 @@ test('malformed, inherited, polluted, and unknown Agent declarations fail closed
     declaration({ approval: { required: true, scope: 'session' } }),
     declaration({ approval: { required: true, scope: 'single_action', token: 'leak' } }),
     declaration({ command: 'bash' }),
+    declaration({ process: {
+      ...declaration().process,
+      modelAccess: { schema: 'modly.agent-model-access.v1', profile: 'unsupported' },
+    } }),
+    declaration({ process: {
+      ...declaration().process,
+      modelAccess: {
+        schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1', endpoint: 'http://127.0.0.1:11434',
+      },
+    } }),
     declaration({ process: {
       schema: 'modly.agent-process.v1',
       runtimeFiles: ['processor.js', '../escape.js'],

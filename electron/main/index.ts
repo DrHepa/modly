@@ -1,7 +1,7 @@
 import { app, BrowserWindow, shell, session } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { setupIpcHandlers } from './ipc-handlers'
+import { setupIpcHandlers, type IpcHandlersLifecycle } from './ipc-handlers'
 import { AutomationHttpBridge } from './automation-http-bridge'
 import { PythonBridge } from './python-bridge'
 import { logger, archiveCurrentSession } from './logger'
@@ -11,6 +11,7 @@ import { syncBuiltinExtensions } from './builtin-sync'
 let mainWindow: BrowserWindow | null = null
 let pythonBridge: PythonBridge | null = null
 let automationHttpBridge: AutomationHttpBridge | null = null
+let ipcHandlersLifecycle: IpcHandlersLifecycle | null = null
 let isQuitting = false
 
 // When the launching terminal closes, stdout/stderr become broken pipes and
@@ -107,7 +108,7 @@ app.whenReady().then(async () => {
   // Start Python FastAPI backend
   pythonBridge = new PythonBridge()
   pythonBridge.setWindowGetter(() => mainWindow)
-  setupIpcHandlers(pythonBridge, () => mainWindow)
+  ipcHandlersLifecycle = setupIpcHandlers(pythonBridge, () => mainWindow)
   automationHttpBridge = new AutomationHttpBridge()
   void automationHttpBridge.start().catch((error) => {
     logger.warn(`Automation HTTP bridge failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
@@ -129,13 +130,16 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
-  if (isQuitting || (!pythonBridge && !automationHttpBridge)) return
+  if (isQuitting || (!pythonBridge && !automationHttpBridge && !ipcHandlersLifecycle)) return
 
   event.preventDefault()
 
   isQuitting = true
 
   void Promise.allSettled([
+    ipcHandlersLifecycle?.shutdown().catch((error) => {
+      logger.warn(`Agent action lifecycle failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+    }),
     automationHttpBridge?.stop().catch((error) => {
       logger.warn(`Automation HTTP bridge failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
     }),
@@ -145,6 +149,7 @@ app.on('before-quit', (event) => {
   ]).finally(() => {
     automationHttpBridge = null
     pythonBridge = null
+    ipcHandlersLifecycle = null
     app.quit()
   })
 })

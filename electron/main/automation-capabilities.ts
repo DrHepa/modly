@@ -16,6 +16,7 @@ import type {
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
   AgentMcpArtifactOutputContractV1,
+  AgentProcessModelAccessDeclarationV1,
 } from '../../src/shared/types/agentActions.ts'
 import { discoverGovernedMcpTools, type DiscoveredMcpTool } from './agent-mcp-manifest.ts'
 import {
@@ -1351,6 +1352,7 @@ export async function listAgentCapabilities(options: {
   mcpSandboxReady?: boolean | Readonly<Record<AgentMcpArtifactOutputContractV1['profile'], boolean>>
   mcpSandboxReadiness?: (profile: AgentMcpArtifactOutputContractV1['profile']) => Promise<boolean>
   processPythonSandboxReadiness?: () => Promise<boolean>
+  processModelAccessReadiness?: (declaration: AgentProcessModelAccessDeclarationV1) => Promise<boolean>
   processPythonExecutable?: () => string | null | Promise<string | null>
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
@@ -1376,11 +1378,26 @@ export async function listAgentCapabilities(options: {
   if (hasPythonRuntime && options.processPythonSandboxReadiness) {
     pythonSandboxReady = await options.processPythonSandboxReadiness().then((ready) => ready === true).catch(() => false)
   }
+  const modelAccessDeclaration = discoveredProcessCandidates.find((candidate) => (
+    candidate.execution?.kind === 'process' && candidate.execution.modelAccess !== undefined
+  ))?.execution
+  const modelAccess = modelAccessDeclaration?.kind === 'process' ? modelAccessDeclaration.modelAccess : undefined
+  let modelAccessReady = modelAccess === undefined
+  if (modelAccess && options.processModelAccessReadiness) {
+    modelAccessReady = await options.processModelAccessReadiness(modelAccess)
+      .then((ready) => ready === true)
+      .catch(() => false)
+  }
   const processCandidates = discoveredProcessCandidates.filter((candidate) => (
-    candidate.execution?.kind !== 'process' || candidate.execution.runtime === undefined || pythonSandboxReady
+    candidate.execution?.kind !== 'process'
+      || ((candidate.execution.runtime === undefined || pythonSandboxReady)
+        && (candidate.execution.modelAccess === undefined || modelAccessReady))
   ))
   const unavailablePythonCapabilities = pythonSandboxReady ? [] : discoveredProcessCandidates.flatMap((candidate) => (
     candidate.execution?.kind === 'process' && candidate.execution.runtime !== undefined ? [candidate.id] : []
+  ))
+  const unavailableModelAccessCapabilities = modelAccessReady ? [] : discoveredProcessCandidates.flatMap((candidate) => (
+    candidate.execution?.kind === 'process' && candidate.execution.modelAccess !== undefined ? [candidate.id] : []
   ))
   const profileReadiness = new Map<AgentMcpArtifactOutputContractV1['profile'], boolean>()
   const readinessProbe = options.mcpSandboxReadiness
@@ -1438,6 +1455,11 @@ export async function listAgentCapabilities(options: {
       ...unavailablePythonCapabilities.map((capabilityId) => ({
         code: 'PROCESS_PYTHON_SANDBOX_UNAVAILABLE',
         message: 'An extension Python Agent capability is unavailable because its production sandbox readiness probe failed.',
+        capabilityId,
+      })),
+      ...unavailableModelAccessCapabilities.map((capabilityId) => ({
+        code: 'PROCESS_MODEL_ACCESS_UNAVAILABLE',
+        message: 'An Agent process model-access capability is unavailable because its production provider readiness probe failed.',
         capabilityId,
       })),
       ...mcpResult.errors.map((error) => ({

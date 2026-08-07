@@ -844,12 +844,14 @@ export function buildExtensionPythonSandboxLaunch(input: {
   resourceFds: readonly number[]
   inputFds: readonly number[]
   outputDirFd: number
+  modelAccessDirectoryFd?: number
   systemPaths: readonly string[]
 }): ExtensionPythonSandboxLaunch {
   const interpreter = normalizeInterpreter(input.interpreter)
   const fds = [
     input.bwrapFd, input.entryFd, ...input.resourceFds, ...input.inputFds,
     input.snapshotRootFd, input.outputDirFd,
+    ...(input.modelAccessDirectoryFd === undefined ? [] : [input.modelAccessDirectoryFd]),
   ]
   if (input.platform !== 'linux' || fds.some((fd) => !Number.isSafeInteger(fd) || fd < 3)
     || new Set(fds).size !== fds.length) {
@@ -869,6 +871,12 @@ export function buildExtensionPythonSandboxLaunch(input: {
   args.push('--ro-bind-fd', String(input.entryFd), '/app/process.pyz')
   input.resourceFds.forEach((fd, index) => args.push('--ro-bind-fd', String(fd), `/resources/${index}`))
   input.inputFds.forEach((fd, index) => args.push('--ro-bind-fd', String(fd), `/input/${index}`))
+  if (input.modelAccessDirectoryFd !== undefined) {
+    args.push(
+      '--dir', '/run', '--dir', '/run/modly', '--dir', '/run/modly/model',
+      '--ro-bind', `/proc/self/fd/${input.modelAccessDirectoryFd}`, '/run/modly/model',
+    )
+  }
   args.push(
     '--ro-bind', `/proc/self/fd/${input.snapshotRootFd}`, '/runtime',
     '--bind', `/proc/self/fd/${input.outputDirFd}`, '/output',

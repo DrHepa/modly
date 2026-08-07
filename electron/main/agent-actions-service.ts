@@ -48,6 +48,7 @@ type PlainRecord = Record<string, unknown>
 export type AgentActionExecutorRequest = Readonly<{
   actionId: string
   originSessionId: string
+  proposalHash: string
   capability: AgentCapabilitySnapshotV1
   arguments: JsonValue
   model: AgentOllamaModelSnapshotV1
@@ -256,6 +257,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private readonly controllers = new Map<string, AbortController>()
   private readonly executionSettlements = new Map<string, ExecutionSettlement>()
   private readonly actionLocks = new Map<string, Promise<void>>()
+  private shuttingDown = false
   private readonly now: () => Date
   private readonly createActionId: () => string
   private readonly createLease: () => string
@@ -282,6 +284,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   }
 
   async propose(requestValue: AgentActionResolvedProposeRequest): Promise<AgentActionPublicSummaryV1> {
+    this.assertRunning()
     this.prune()
     if (this.actions.size >= this.maxActions) throw new AgentActionsServiceError('capacity_exceeded')
     const request = assertExactRecord(requestValue, ['originSessionId', 'capabilityId', 'capabilityHash', 'arguments', 'model'], 'invalid_request')
@@ -308,6 +311,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     const currentCapability = await this.resolveCapability(capabilityId, 'capability_stale')
     if (currentCapability.hash !== capabilityHash) throw new AgentActionsServiceError('capability_stale')
 
+    this.assertRunning()
     this.prune()
     if (this.actions.size >= this.maxActions) throw new AgentActionsServiceError('capacity_exceeded')
 
@@ -351,6 +355,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   }
 
   async decide(requestValue: AgentActionDecisionRequest): Promise<AgentActionPublicSummaryV1> {
+    this.assertRunning()
     const request = assertExactRecord(requestValue, ['actionId', 'originSessionId', 'decision'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
     const originSessionId = assertSafeActionId(request.originSessionId)
@@ -359,6 +364,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
     if (request.decision === 'reject') {
       return this.withActionLock(actionId, () => {
+        this.assertRunning()
         this.prune()
         const record = this.requireOwnedRecord(actionId, originSessionId)
         if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
@@ -384,6 +390,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
     }
 
     return this.withActionLock(actionId, () => {
+      this.assertRunning()
       this.prune()
       const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'cancelled') return this.toPublic(record)
@@ -428,6 +435,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   }
 
   async execute(requestValue: AgentActionSessionGetRequest): Promise<AgentActionPublicSummaryV1> {
+    this.assertRunning()
     const request = assertExactRecord(requestValue, ['actionId', 'originSessionId'], 'invalid_request')
     const actionId = assertSafeActionId(request.actionId)
     const originSessionId = assertSafeActionId(request.originSessionId)
@@ -470,6 +478,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       })
     }
     const prepared = await this.withActionLock(actionId, () => {
+      this.assertRunning()
       this.prune()
       const record = this.requireOwnedRecord(actionId, originSessionId)
       if (record.action.status === 'expired') throw new AgentActionsServiceError('approval_expired')
@@ -493,6 +502,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
       const executorRequest: AgentActionExecutorRequest = {
         actionId,
         originSessionId,
+        proposalHash: record.action.proposalHash,
         capability: cloneCanonical(record.action.capability),
         arguments: cloneCanonical(record.action.arguments),
         model: cloneCanonical(record.action.model),
@@ -722,6 +732,33 @@ export class AgentActionsService implements AgentActionsServiceLike {
     })
   }
 
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true
+    const steps = await Promise.all([...this.actions.keys()].map((actionId) => (
+      this.withActionLock(actionId, (): { settlement?: Promise<void> } => {
+        const record = this.actions.get(actionId)
+        if (!record) return {}
+        this.leases.delete(actionId)
+        if (record.action.status === 'proposed' || record.action.status === 'approved') {
+          this.transition(record, 'cancelled', 'application_shutdown')
+          return {}
+        }
+        if (record.action.status !== 'executing') return {}
+        const controller = this.controllers.get(actionId)
+        const settlement = this.executionSettlements.get(actionId)
+        if (!settlement) {
+          controller?.abort()
+          return {}
+        }
+        settlement.cancellationRequested = true
+        controller?.abort()
+        return { settlement: settlement.promise }
+      })
+    )))
+    const settlements = steps.flatMap((step) => step.settlement ? [step.settlement] : [])
+    await Promise.all(settlements.map((settlement) => this.waitForExecutionSettlement(settlement)))
+  }
+
   private assertPositiveInteger(value: number, name: string): number {
     if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive safe integer`)
     return value
@@ -730,6 +767,10 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private assertNonNegativeInteger(value: number, name: string): number {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer`)
     return value
+  }
+
+  private assertRunning(): void {
+    if (this.shuttingDown) throw new AgentActionsServiceError('executor_unavailable')
   }
 
   private safeExecutorAvailability(): boolean {

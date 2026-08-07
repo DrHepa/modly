@@ -8,6 +8,7 @@ import type {
   AgentProcessArtifactContractV1,
   AgentProcessDeclarationV1,
   AgentProcessExecutionV1,
+  AgentProcessModelAccessDeclarationV1,
   AgentProcessPythonRuntimeDeclarationV1,
   AgentProcessRuntimeFileIdentityV1,
 } from '../../src/shared/types/agentActions.ts'
@@ -124,9 +125,22 @@ function normalizePythonRuntime(value: unknown): AgentProcessPythonRuntimeDeclar
   return { kind: 'extension-python-venv-v1', interpreter: 'bin/python' }
 }
 
+function normalizeModelAccess(value: unknown): AgentProcessModelAccessDeclarationV1 {
+  const modelAccess = record(value, 'Agent process modelAccess')
+  exactKeys(modelAccess, ['schema', 'profile'], 'Agent process modelAccess')
+  if (modelAccess.schema !== 'modly.agent-model-access.v1'
+    || modelAccess.profile !== 'ollama-responses-json-v1') {
+    throw new AgentProcessManifestError('invalid_metadata', 'Agent process modelAccess profile is invalid')
+  }
+  return {
+    schema: 'modly.agent-model-access.v1',
+    profile: 'ollama-responses-json-v1',
+  }
+}
+
 export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unknown): AgentProcessDeclarationV1 {
   const process = record(value, 'Agent process metadata')
-  exactKeys(process, ['schema', 'runtimeFiles', 'resourceFiles', 'runtime', 'artifacts'], 'Agent process metadata')
+  exactKeys(process, ['schema', 'runtimeFiles', 'resourceFiles', 'runtime', 'modelAccess', 'artifacts'], 'Agent process metadata')
   if (process.schema !== PROCESS_SCHEMA) throw new AgentProcessManifestError('invalid_metadata', 'Agent process schema is invalid')
   const entry = normalizeAgentProcessRelativePath(entryValue, 'Process entry')
   if (!/\.(?:js|mjs|pyz)$/i.test(entry)) {
@@ -143,6 +157,10 @@ export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unk
   if (runtime !== undefined && !/\.pyz$/i.test(entry)) {
     throw new AgentProcessManifestError('invalid_metadata', 'Extension Python runtime may execute only a Python zipapp')
   }
+  const modelAccess = process.modelAccess === undefined ? undefined : normalizeModelAccess(process.modelAccess)
+  if (modelAccess !== undefined && runtime === undefined) {
+    throw new AgentProcessManifestError('invalid_metadata', 'Agent process modelAccess requires the extension Python sandbox runtime')
+  }
   if (!Array.isArray(process.resourceFiles) || process.resourceFiles.length > MAX_RESOURCE_FILES) {
     throw new AgentProcessManifestError('invalid_metadata', 'Agent process resourceFiles must be an explicitly bounded array')
   }
@@ -158,6 +176,7 @@ export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unk
     runtimeFiles,
     resourceFiles,
     ...(runtime ? { runtime } : {}),
+    ...(modelAccess ? { modelAccess } : {}),
     artifacts: normalizeArtifacts(process.artifacts),
   }
   canonicalJson(normalized)
@@ -277,12 +296,19 @@ export async function bindAgentProcessExecution(
         baseInterpreterPath ?? (() => { throw new AgentProcessPythonRuntimeError('runtime_unavailable', 'Trusted base interpreter is unavailable') })(),
       )
       : undefined
-    const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}) })
+    const modelAccess = declaration.modelAccess
+    const runtimeHash = sha256Canonical({
+      runtimeFiles,
+      resourceFiles,
+      ...(runtime ? { runtime } : {}),
+      ...(modelAccess ? { modelAccess } : {}),
+    })
     const artifacts = declaration.artifacts
     const bindingHash = sha256Canonical({ schema: EXECUTION_SCHEMA, entry, runtimeHash, artifacts })
     return {
       kind: 'process', schema: EXECUTION_SCHEMA, entry,
-      runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), runtimeHash, artifacts, bindingHash,
+      runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), ...(modelAccess ? { modelAccess } : {}),
+      runtimeHash, artifacts, bindingHash,
     }
   } catch (error) {
     if (error instanceof AgentProcessManifestError) throw error

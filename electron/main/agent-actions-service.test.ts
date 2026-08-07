@@ -12,7 +12,7 @@ import {
 } from './agent-actions-service.ts'
 import { WorkspaceAgentArtifactVerifier, type AgentArtifactVerifier } from './agent-artifact-verifier.ts'
 import { AgentProcessTerminalError } from './agent-process-executor.ts'
-import { sha256Canonical } from './agent-trust-contracts.ts'
+import { createAgentActionProposal, sha256Canonical } from './agent-trust-contracts.ts'
 import type {
   AgentCapabilitySnapshotV1,
   AgentOllamaModelSnapshotV1,
@@ -161,6 +161,16 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
   })
   assert.equal(captured?.originSessionId, 'test-session')
   assert.equal(captured?.model.endpoint, 'http://127.0.0.1:11434')
+  const expectedProposal = createAgentActionProposal({
+    id: proposed.id,
+    capability,
+    arguments: { input: 'chair', params: { iterations: 2, quality: 'draft' } },
+    model: selectedModel,
+    inputArtifacts: [],
+    approval: proposed.approval,
+    createdAt: proposed.createdAt,
+  })
+  assert.equal(captured?.proposalHash, expectedProposal.proposalHash)
   assert.equal(JSON.stringify(completed).includes(validOutput.workspacePath), false)
 })
 
@@ -685,6 +695,39 @@ test('cancellation is idempotent and late executor success cannot overwrite canc
   assert.equal((await service.cancel({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'cancelled')
   assert.equal((await running).status, 'cancelled')
   assert.equal((await service.get({ actionId: proposed.id, originSessionId: 'test-session' })).status, 'cancelled')
+})
+
+test('shutdown aborts and awaits running executors and rejects new work', async () => {
+  const capability = capabilityFixture()
+  let started!: () => void
+  const didStart = new Promise<void>((resolve) => { started = resolve })
+  let executorSignal: AbortSignal | undefined
+  const service = new AgentActionsService({
+    createActionId: () => 'action-shutdown',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      executorSignal = request.signal
+      started()
+      await new Promise<void>((resolve) => request.signal.addEventListener('abort', () => resolve(), { once: true }))
+      return { artifacts: [validOutput] }
+    },
+  })
+  const proposed = await service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
+  const running = service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
+  await didStart
+  await service.shutdown()
+  assert.equal(executorSignal?.aborted, true)
+  assert.equal((await running).status, 'cancelled')
+  await rejectsCode(service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'table', params: {} }, model: selectedModel,
+  }), 'executor_unavailable')
 })
 
 test('executor output is fail-closed for unavailable executors, path escapes, wrong kinds, and duplicate artifacts', async () => {

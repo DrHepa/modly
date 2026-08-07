@@ -23,10 +23,17 @@ import type {
   AgentCapabilitySnapshotV1,
   AgentOllamaModelSnapshotV1,
   AgentProcessExecutionV1,
+  AgentProcessModelAccessDeclarationV1,
   ArtifactRefV1,
   JsonValue,
 } from '../../src/shared/types/agentActions.ts'
 import type { AgentActionExecutorRequest } from './agent-actions-service.ts'
+import {
+  AGENT_MODEL_ACCESS_MODEL_SENTINEL,
+  AGENT_MODEL_ACCESS_RESPONSES_PATH,
+  AGENT_MODEL_ACCESS_SANDBOX_SOCKET,
+  type AgentModelExecutionLeaseV1,
+} from './agent-model-access-gateway.ts'
 import type { GovernedAgentProcessTarget } from './automation-capabilities.ts'
 import {
   AgentProcessManifestError,
@@ -59,6 +66,7 @@ const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i
 const RESERVED_ARGUMENT_KEYS = new Set([
   'trustedContext', 'actionId', 'originSessionId', 'model', 'inputArtifacts',
   'resources', 'fdPath', 'dirs', 'capabilityHash', 'runtimeHash',
+  'proposalHash', 'modelAccess', 'bearerToken', 'socketPath',
 ])
 const MAX_INPUT_ARTIFACTS = 100
 const MAX_INPUT_BYTES = 512 * 1024 * 1024
@@ -90,6 +98,7 @@ export type AgentProcessExecutorErrorCode =
   | 'unsupported_capability'
   | 'capability_stale'
   | 'model_stale'
+  | 'model_binding_unavailable'
   | 'invalid_arguments'
   | 'invalid_artifact'
   | 'artifact_too_large'
@@ -145,6 +154,17 @@ export interface AgentProcessExecutorOptions {
   resolvePythonExecutable?: (extensionDir: string) => string | null | Promise<string | null>
   getRuntimeSnapshotRoot?: () => string | Promise<string>
   pythonSandboxReadiness?: () => boolean | Promise<boolean>
+  modelAccessReadiness?: (
+    declaration: AgentProcessModelAccessDeclarationV1,
+  ) => boolean | Promise<boolean>
+  acquireModelAccess?: (input: Readonly<{
+    actionId: string
+    proposalHash: string
+    capability: AgentCapabilitySnapshotV1
+    model: AgentOllamaModelSnapshotV1
+    privateTempRoot: string
+    signal: AbortSignal
+  }>) => Promise<AgentModelExecutionLeaseV1>
   bwrapPath?: string
   systemPaths?: readonly string[]
   limits?: Partial<AgentProcessExecutorLimits>
@@ -1026,6 +1046,16 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
     if ((options.platform ?? process.platform) !== 'linux') throw new AgentProcessExecutorError('runtime_unavailable')
     const target = await resolveBoundTarget(capability)
     if (target.capability.execution?.kind !== 'process') throw new AgentProcessExecutorError('unsupported_capability')
+    if (target.capability.execution.modelAccess) {
+      try {
+        if (!options.acquireModelAccess || !options.modelAccessReadiness
+          || await options.modelAccessReadiness(target.capability.execution.modelAccess) !== true) {
+          throw new Error('Agent model access provider is unavailable')
+        }
+      } catch (error) {
+        throw new AgentProcessExecutorError('model_binding_unavailable', error)
+      }
+    }
     const workspaceRoot = await canonicalDirectory(await options.getWorkspaceRoot(), 'Workspace')
     const publicationRoot = await ensurePublicationRoot(workspaceRoot)
     await ensurePrivateTempRoot(await options.getPrivateTempRoot(workspaceRoot), workspaceRoot, publicationRoot)
@@ -1052,11 +1082,15 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
     if ((options.platform ?? process.platform) !== 'linux') throw new AgentProcessExecutorError('runtime_unavailable')
     const actionId = assertActionId(request.actionId)
     assertActionId(request.originSessionId)
+    if (!SHA256.test(request.proposalHash)) throw new AgentProcessExecutorError('invalid_arguments')
     assertNoReservedArgumentKeys(request.arguments)
     if (request.signal.aborted) throw new AgentProcessExecutorError('aborted')
     const target = await resolveBoundTarget(request.capability)
     const execution = target.capability.execution
     if (execution?.kind !== 'process') throw new AgentProcessExecutorError('unsupported_capability')
+    if (execution.modelAccess && !options.acquireModelAccess) {
+      throw new AgentProcessExecutorError('model_binding_unavailable')
+    }
     let currentModel: AgentOllamaModelSnapshotV1
     try { currentModel = assertAgentOllamaModelSnapshotV1(await options.resolveCurrentModel(request.model)) } catch (error) {
       throw new AgentProcessExecutorError('model_stale', error)
@@ -1083,6 +1117,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
     let inputs: OpenInput[] = []
     let outputDirectory: OpenPinnedDirectory | undefined
     let pythonSandbox: PreparedPythonSandbox | undefined
+    let modelAccessLease: AgentModelExecutionLeaseV1 | undefined
     let published = false
     try {
       stageDir = await mkdtemp(join(privateTempRoot, `${actionId}-`))
@@ -1105,9 +1140,38 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
         pythonSandbox = await preparePythonSandbox(target, execution, workspaceRoot, options)
         if (!pythonSandbox) throw new AgentProcessExecutorError('runtime_unavailable')
         outputDirectory = await openPinnedDirectory(outputDir, 'invalid_artifact')
+        if (execution.modelAccess) {
+          try {
+            modelAccessLease = await options.acquireModelAccess!({
+              actionId,
+              proposalHash: request.proposalHash,
+              capability: request.capability,
+              model: request.model,
+              privateTempRoot,
+              signal: request.signal,
+            })
+            if (modelAccessLease.schema !== 'modly.agent-model-execution-lease.v1'
+              || modelAccessLease.assurance !== 'pinned-local-cooperative-host'
+              || modelAccessLease.transport !== 'unix-http'
+              || modelAccessLease.socketPath !== AGENT_MODEL_ACCESS_SANDBOX_SOCKET
+              || modelAccessLease.responsesPath !== AGENT_MODEL_ACCESS_RESPONSES_PATH
+              || modelAccessLease.model !== AGENT_MODEL_ACCESS_MODEL_SENTINEL
+              || modelAccessLease.digest !== request.model.digest
+              || typeof modelAccessLease.bearerToken !== 'string' || modelAccessLease.bearerToken.length < 32
+              || modelAccessLease.directoryHandle.fd < 0) {
+              throw new Error('Agent model access lease is invalid')
+            }
+            await modelAccessLease.revalidate()
+          } catch (error) {
+            await modelAccessLease?.close().catch(() => undefined)
+            modelAccessLease = undefined
+            throw new AgentProcessExecutorError('model_binding_unavailable', error)
+          }
+        }
         const snapshotRootFd = inputFdBase + inputs.length
         const outputDirFd = snapshotRootFd + 1
         const bwrapFd = outputDirFd + 1
+        const modelAccessDirectoryFd = modelAccessLease ? bwrapFd + 1 : undefined
         const sandboxLaunch = buildExtensionPythonSandboxLaunch({
           platform: options.platform ?? process.platform,
           bwrapFd,
@@ -1117,6 +1181,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
           resourceFds: resources.map((_, index) => resourceFdBase + index),
           inputFds: inputs.map((_, index) => inputFdBase + index),
           outputDirFd,
+          modelAccessDirectoryFd,
           systemPaths: pythonSandbox.systemPaths,
         })
         launch = {
@@ -1130,6 +1195,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
             pythonSandbox.snapshotDirectory.handle.fd,
             outputDirectory.handle.fd,
             pythonSandbox.bwrap.handle.fd,
+            ...(modelAccessLease ? [modelAccessLease.directoryHandle.fd] : []),
           ],
         }
       } else {
@@ -1151,12 +1217,29 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
       if (pythonSandbox) {
         await revalidatePythonSandbox(target, pythonSandbox, options)
         await revalidatePinnedDirectory(outputDirectory!, 'invalid_artifact')
+        await modelAccessLease?.revalidate().catch((error) => {
+          throw new AgentProcessExecutorError('model_binding_unavailable', error)
+        })
       }
 
       const trustedContext = Object.freeze({
         actionId,
         originSessionId: request.originSessionId,
-        model: Object.freeze({ ...request.model }),
+        proposalHash: request.proposalHash,
+        ...(modelAccessLease ? {
+          modelAccess: Object.freeze({
+            schema: modelAccessLease.schema,
+            assurance: modelAccessLease.assurance,
+            transport: modelAccessLease.transport,
+            socketPath: modelAccessLease.socketPath,
+            responsesPath: modelAccessLease.responsesPath,
+            model: modelAccessLease.model,
+            digest: modelAccessLease.digest,
+            bearerToken: modelAccessLease.bearerToken,
+            expiresAt: modelAccessLease.expiresAt,
+            bindingHash: modelAccessLease.bindingHash,
+          }),
+        } : { model: Object.freeze({ ...request.model }) }),
         inputArtifacts: Object.freeze(inputs.map((input, index) => Object.freeze({
           artifact: Object.freeze({ ...input.ref }),
           fdPath: pythonSandbox ? `/input/${index}` : `/proc/self/fd/${inputFdBase + index}`,
@@ -1183,6 +1266,9 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
       if (pythonSandbox) {
         await revalidatePythonSandbox(target, pythonSandbox, options)
         await revalidatePinnedDirectory(outputDirectory!, 'invalid_artifact')
+        await modelAccessLease?.revalidate().catch((error) => {
+          throw new AgentProcessExecutorError('model_binding_unavailable', error)
+        })
       }
       await revalidateDirectoryIdentities(directoryIdentities)
       const artifacts = await verifyAndPublish(
@@ -1208,6 +1294,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
       await Promise.all(runtime.map(({ handle }) => handle.close().catch(() => undefined)))
       await Promise.all(inputs.map(({ handle }) => handle.close().catch(() => undefined)))
       await outputDirectory?.handle.close().catch(() => undefined)
+      await modelAccessLease?.close().catch(() => undefined)
       await closePythonSandbox(pythonSandbox)
       if (stageDir) await rm(stageDir, { recursive: true, force: true }).catch(() => undefined)
     }

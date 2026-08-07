@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -65,6 +65,23 @@ const relativeFileOutputSchema = {
   },
   required: ['artifacts'],
 }
+const dualRelativeFileOutputSchema = {
+  type: 'object' as const, additionalProperties: false,
+  properties: {
+    artifacts: {
+      type: 'array' as const, minItems: 2, maxItems: 2,
+      items: {
+        type: 'object' as const, additionalProperties: false,
+        properties: {
+          id: { type: 'string' as const }, name: { type: 'string' as const },
+          kind: { type: 'string' as const }, mediaType: { type: 'string' as const },
+        },
+        required: ['id', 'name', 'kind', 'mediaType'],
+      },
+    },
+  },
+  required: ['artifacts'],
+}
 
 interface Fixture {
   root: string
@@ -111,8 +128,9 @@ async function fixture(): Promise<Fixture> {
   return { root, builtinDir, userDir, workspaceDir, capability: inventory.capabilities[0] }
 }
 
-async function fileFixture(): Promise<FileFixture> {
+async function fileFixture(options: { outputCount?: 1 | 2 } = {}): Promise<FileFixture> {
   const target = await fixture()
+  const outputCount = options.outputCount ?? 1
   const extensionDir = join(target.userDir, 'fixture-mcp')
   const privateDir = join(target.root, 'private')
   await mkdir(privateDir, { mode: 0o700 })
@@ -135,8 +153,8 @@ async function fileFixture(): Promise<FileFixture> {
       schema: 'modly.mcp-stdio.v1', transport: 'stdio', servers: [{
         id: 'fixture-server', runtimeFiles: ['server.mjs'],
         artifactOutput: {
-          profile: 'relative-files-v1', maxCount: 1,
-          maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024,
+          profile: 'relative-files-v1', maxCount: outputCount,
+          maxArtifactBytes: 32 * 1024 * 1024, maxTotalBytes: outputCount * 32 * 1024 * 1024,
         },
         command: { executable: 'bin/server', entrypoint: 'server.mjs', args: ['--stdio'], env: {} },
         tools: [{
@@ -144,12 +162,18 @@ async function fileFixture(): Promise<FileFixture> {
           description: 'Reads one bound scene and emits one broker-owned file.',
           input_schema: fileInputSchema,
           input_artifacts: [{ argument: 'sceneArtifact', kind: 'blend', media_types: ['application/x-blender'] }],
-          output_schema: relativeFileOutputSchema,
+          output_schema: outputCount === 1 ? relativeFileOutputSchema : dualRelativeFileOutputSchema,
           mutating: true, approval: { required: true, scope: 'single_action' },
-          artifact: { outputs: [{
-            path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'],
-            max_bytes: 32 * 1024 * 1024, required: true,
-          }] },
+          artifact: { outputs: [
+            {
+              path: 'scene.blend', kind: 'blend', media_types: ['application/x-blender'],
+              max_bytes: 32 * 1024 * 1024, required: true,
+            },
+            ...(outputCount === 2 ? [{
+              path: 'preview.png', kind: 'image', media_types: ['image/png'],
+              max_bytes: 32 * 1024 * 1024, required: true,
+            }] : []),
+          ] },
         }],
       }],
     },
@@ -321,6 +345,74 @@ test('relative-file output rejects hardlinks and rolls back the whole publicatio
       transportFactory: async (context) => { outputFile = context.outputFiles?.[0]?.hostPath ?? ''; return baseFactory(context) },
     })
     await assert.rejects(executor(fileRequest(target)), AgentMcpBrokerError)
+    await assert.rejects(readdir(join(target.workspaceDir, 'Workflows/agent-actions/action-mcp-fixture')), { code: 'ENOENT' })
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('production relative-files launch gives two 32 MiB slots the declared 64 MiB process ceiling', async () => {
+  const target = await fileFixture({ outputCount: 2 })
+  const recordedArgs = join(target.root, 'prlimit-args.txt')
+  const bwrapPath = join(target.root, 'fake-bwrap')
+  const prlimitPath = join(target.root, 'fake-prlimit')
+  try {
+    await writeFile(bwrapPath, '#!/bin/sh\nexit 97\n')
+    await writeFile(prlimitPath, `#!/bin/sh\nprintf '%s\\n' "$@" > "${recordedArgs}"\nexit 97\n`)
+    await chmod(bwrapPath, 0o755)
+    await chmod(prlimitPath, 0o755)
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: () => target.workspaceDir,
+      bwrapPath,
+      prlimitPath,
+      sandboxReadiness: async () => true,
+      initializeTimeoutMs: 1_000,
+    })
+    await assert.rejects(executor(fileRequest(target)), AgentMcpBrokerError)
+    const args = (await readFile(recordedArgs, 'utf8')).trim().split('\n')
+    assert.deepEqual(args.slice(0, 3), [
+      `--fsize=${64 * 1024 * 1024}:${64 * 1024 * 1024}`,
+      '--',
+      '/proc/self/fd/3',
+    ])
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('relative-file output still rejects a post-exit file larger than its 32 MiB slot', async () => {
+  const target = await fileFixture()
+  let outputFile = ''
+  const fileInputSchema = target.capability.execution?.kind === 'mcp_tool'
+    ? target.capability.execution.inputSchema as typeof inputSchema
+    : inputSchema
+  try {
+    const baseFactory = serverFactory({
+      tools: [{ name: 'render_scene', inputSchema: fileInputSchema, outputSchema: relativeFileOutputSchema as never }],
+      onCall: async () => {
+        await truncate(outputFile, (32 * 1024 * 1024) + 1)
+        return {
+          content: [{ type: 'text', text: 'created' }],
+          structuredContent: { artifacts: [{
+            id: 'rendered-scene', name: 'scene.blend', kind: 'blend', mediaType: 'application/x-blender',
+          }] },
+        }
+      },
+    })
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: () => target.workspaceDir,
+      transportFactory: async (context) => {
+        outputFile = context.outputFiles?.[0]?.hostPath ?? ''
+        return baseFactory(context)
+      },
+    })
+    await assert.rejects(executor(fileRequest(target)), (error: unknown) => {
+      assert.ok(error instanceof AgentMcpBrokerError)
+      assert.equal(error.code, 'artifact_too_large')
+      return true
+    })
     await assert.rejects(readdir(join(target.workspaceDir, 'Workflows/agent-actions/action-mcp-fixture')), { code: 'ENOENT' })
   } finally {
     await rm(target.root, { recursive: true, force: true })
@@ -574,18 +666,25 @@ test('bubblewrap launch is direct, no-network, read-only, minimal-env, and fail-
       platform: 'darwin', bwrapFd: 3, executableFd: 4, runtimeFiles: [],
       executable: 'bin/server', args: [], env: {}, systemPaths: [],
     }), (error: unknown) => error instanceof AgentMcpBrokerError && error.code === 'sandbox_unavailable')
+    const embeddedLaunch = buildBubblewrapLaunch({
+      platform: 'linux', bwrapFd: 3, executableFd: 4,
+      runtimeFiles: [{ path: 'server.mjs', fd: 5 }],
+      executable: 'bin/server', entrypoint: 'server.mjs', args: ['--stdio'], env: {}, systemPaths: ['/usr'],
+    })
+    assert.equal(embeddedLaunch.command, '/proc/self/fd/3')
+    assert.equal(embeddedLaunch.args.some((argument) => argument.startsWith('--fsize=')), false)
     const launch = buildBubblewrapLaunch({
       platform: 'linux', bwrapFd: 3, executableFd: 4,
       runtimeFiles: [{ path: 'server.mjs', fd: 5 }],
-      outputFiles: [{ path: 'scene.blend', fd: 6 }],
-      prlimitFd: 7,
-      outputFileSizeLimitBytes: 32 * 1024 * 1024,
+      outputFiles: [{ path: 'scene.blend', fd: 6 }, { path: 'preview.png', fd: 7 }],
+      prlimitFd: 8,
+      processFileSizeLimitBytes: 64 * 1024 * 1024,
       executable: 'bin/server',
       entrypoint: 'server.mjs', args: ['--stdio'], env: { FIXTURE_MODE: 'honest' }, systemPaths: ['/usr', '/bin', '/lib'],
     })
-    assert.equal(launch.command, '/proc/self/fd/7')
+    assert.equal(launch.command, '/proc/self/fd/8')
     assert.deepEqual(launch.args.slice(0, 3), [
-      `--fsize=${32 * 1024 * 1024}:${32 * 1024 * 1024}`,
+      `--fsize=${64 * 1024 * 1024}:${64 * 1024 * 1024}`,
       '--',
       '/proc/self/fd/3',
     ])

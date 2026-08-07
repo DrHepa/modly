@@ -64,7 +64,6 @@ const MAX_ARTIFACT_BYTES = 256 * 1024
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const ARTIFACT_COPY_CHUNK_BYTES = 64 * 1024
 const SANDBOX_TMPFS_BYTES = 64 * 1024 * 1024
-const MAX_FILE_OUTPUT_BYTES = 32 * 1024 * 1024
 const PROCESS_TERMINATION_GRACE_MS = 250
 const PROCESS_REAP_TIMEOUT_MS = 2_000
 const DEFAULT_READINESS_CACHE_TTL_MS = 30_000
@@ -751,7 +750,7 @@ export function buildBubblewrapLaunch(input: {
   hostRuntime?: Readonly<{ rootFd: number, executable: string }>
   outputFiles?: readonly Readonly<{ path: string, fd: number }>[]
   prlimitFd?: number
-  outputFileSizeLimitBytes?: number
+  processFileSizeLimitBytes?: number
   executable: string
   entrypoint?: string
   args: readonly string[]
@@ -788,15 +787,16 @@ export function buildBubblewrapLaunch(input: {
     ...(input.prlimitFd === undefined ? [] : [input.prlimitFd]),
   ]
   const hasBoundOutputs = outputFiles.length > 0
-  const outputLimit = input.outputFileSizeLimitBytes
+  const processFileSizeLimit = input.processFileSizeLimitBytes
   if (input.platform !== 'linux' || inheritedFds.some((fd) => !Number.isSafeInteger(fd) || fd < 3)
     || new Set(inheritedFds).size !== inheritedFds.length
     || inheritedFds.length > MCP_MAX_INHERITED_FDS
     || new Set(runtimeFiles.map((file) => file.path)).size !== runtimeFiles.length
     || new Set(outputFiles.map((file) => file.path)).size !== outputFiles.length
     || hasBoundOutputs !== (input.prlimitFd !== undefined)
-    || hasBoundOutputs !== (outputLimit !== undefined)
-    || (outputLimit !== undefined && (!Number.isSafeInteger(outputLimit) || outputLimit < 1 || outputLimit > MAX_FILE_OUTPUT_BYTES))
+    || hasBoundOutputs !== (processFileSizeLimit !== undefined)
+    || (processFileSizeLimit !== undefined && (!Number.isSafeInteger(processFileSizeLimit)
+      || processFileSizeLimit < 1 || processFileSizeLimit > SANDBOX_TMPFS_BYTES))
     || (input.entrypoint !== undefined && !runtimeFiles.some((file) => file.path === input.entrypoint))) {
     throw new AgentMcpBrokerError('sandbox_unavailable')
   }
@@ -868,10 +868,17 @@ export function buildBubblewrapLaunch(input: {
     ...(entrypoint ? [`/app/${entrypoint}`] : []),
     ...input.args,
   )
-  if (input.prlimitFd !== undefined && outputLimit !== undefined) {
+  if (input.prlimitFd !== undefined && processFileSizeLimit !== undefined) {
+    // RLIMIT_FSIZE is one process-wide ceiling applied uniformly to every file
+    // the server writes; it cannot encode the authoritative maxBytes of each
+    // declared output slot. The aggregate contract provides the early hard
+    // ceiling, while post-exit slot and aggregate checks decide acceptance.
     return {
       command: `/proc/self/fd/${input.prlimitFd}`,
-      args: [`--fsize=${outputLimit}:${outputLimit}`, '--', `/proc/self/fd/${input.bwrapFd}`, ...args],
+      args: [
+        `--fsize=${processFileSizeLimit}:${processFileSizeLimit}`,
+        '--', `/proc/self/fd/${input.bwrapFd}`, ...args,
+      ],
       env: { ...FIXED_HOST_ENV }, cwd: '/', shell: false,
     }
   }
@@ -1133,9 +1140,11 @@ async function runRelativeFilesSandboxProbe(options: AgentMcpSandboxReadinessOpt
     cleanupDirectories = await missingReadinessDirectories(workspaceValue)
     const actionId = `readiness-probe-${process.pid}-${Date.now()}`
     const paths = await createActionOutputPaths(workspaceValue, actionId)
-    stage = await createRelativeOutputStageForPolicies(paths, [{ path: 'probe-output', maxBytes: 1_024 }], actionId)
-    const output = stage.slots[0]
-    if (!output) return false
+    stage = await createRelativeOutputStageForPolicies(paths, [
+      { path: 'probe-output-a', maxBytes: 1_024 },
+      { path: 'probe-output-b', maxBytes: 1_024 },
+    ], actionId)
+    if (stage.slots.length !== 2) return false
 
     const systemPaths = await existingSystemPaths(options.systemPaths ?? ['/usr', '/bin', '/lib', '/lib64'])
     const bwrapHandle = await openTrustedExecutable(options.bwrapPath ?? '/usr/bin/bwrap')
@@ -1144,17 +1153,17 @@ async function runRelativeFilesSandboxProbe(options: AgentMcpSandboxReadinessOpt
     const truePath = await realpath('/usr/bin/true').catch(async () => realpath('/bin/true'))
     const resourceHandle = await openTrustedExecutable(truePath)
     const prlimitHandle = await openTrustedExecutable(options.prlimitPath ?? '/usr/bin/prlimit')
-    handles.push(bwrapHandle, shellHandle, resourceHandle, output.handle, prlimitHandle)
+    handles.push(bwrapHandle, shellHandle, resourceHandle, ...stage.slots.map((slot) => slot.handle), prlimitHandle)
     const launch = buildBubblewrapLaunch({
       platform: 'linux',
       bwrapFd: 3,
       executableFd: 4,
       runtimeFiles: [{ path: 'probe-resource', fd: 5 }],
-      outputFiles: [{ path: output.path, fd: 6 }],
-      prlimitFd: 7,
-      outputFileSizeLimitBytes: output.maxBytes,
+      outputFiles: stage.slots.map((slot, index) => ({ path: slot.path, fd: index + 6 })),
+      prlimitFd: 8,
+      processFileSizeLimitBytes: stage.slots.reduce((total, slot) => total + slot.maxBytes, 0),
       executable: 'probe',
-      args: ['-c', 'printf x > /output/probe-output'],
+      args: ['-c', 'printf x > /output/probe-output-a; printf y > /output/probe-output-b'],
       env: {},
       systemPaths,
     })
@@ -1165,11 +1174,14 @@ async function runRelativeFilesSandboxProbe(options: AgentMcpSandboxReadinessOpt
       async () => {
         if (!stage) return false
         await revalidateRelativeOutputSlots(stage)
-        const info = await output.handle.stat({ bigint: true })
-        if (info.size !== 1n) return false
-        const byte = Buffer.alloc(1)
-        const { bytesRead } = await output.handle.read(byte, 0, 1, 0)
-        return bytesRead === 1 && byte[0] === 0x78
+        for (const [index, output] of stage.slots.entries()) {
+          const info = await output.handle.stat({ bigint: true })
+          if (info.size !== 1n) return false
+          const byte = Buffer.alloc(1)
+          const { bytesRead } = await output.handle.read(byte, 0, 1, 0)
+          if (bytesRead !== 1 || byte[0] !== 0x78 + index) return false
+        }
+        return true
       },
     )
   } catch {
@@ -1277,7 +1289,7 @@ function productionTransportFactory(options: AgentMcpExecutorOptions): McpTransp
         ...(outputLaunch.length ? {
           outputFiles: outputLaunch,
           prlimitFd,
-          outputFileSizeLimitBytes: binding.server.artifactOutput.maxArtifactBytes,
+          processFileSizeLimitBytes: binding.server.artifactOutput.maxTotalBytes,
         } : {}),
         executable: binding.server.command.executable,
         entrypoint: binding.server.command.entrypoint,

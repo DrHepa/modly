@@ -75,11 +75,19 @@ declared slot count multiplied by that bound; heterogeneous file-size limits or
 independent aggregate declarations are rejected before discovery. The broker mounts only a private main-owned staging child
 on the final workspace filesystem, pre-creates the exact output files, and
 writable-binds only those file descriptors at their declared `/output` paths.
-The server runs under a hard `RLIMIT_FSIZE` equal to the profile per-file cap;
-no writable host directory is mounted. The staging root is denied to renderer
-filesystem IPC. The broker waits for server exit, rejects undeclared entries, symlinks,
-hardlinks, special files, escapes and unstable identities, then hashes/copies
-and atomically publishes the complete set. Any failure rolls back the set.
+The server process runs under a hard `RLIMIT_FSIZE` equal to the declared
+`maxTotalBytes`; no writable host directory is mounted. This is a process-wide
+early ceiling applied uniformly to files written by the server, not an
+authoritative per-output-slot limit and not a kernel-enforced aggregate byte
+counter. After server exit, the broker still enforces each declared slot's
+`maxBytes`, exact path/inode/ownership/mode identity, and the aggregate
+`maxTotalBytes` before publication. The staging root is denied to renderer
+filesystem IPC. The broker rejects undeclared entries, symlinks, hardlinks,
+special files, escapes and unstable identities, then hashes/copies and
+atomically publishes the complete set. Any failure rolls back the set. The
+complete `artifactOutput` contract, including `maxTotalBytes`, is already bound
+into the server, capability, proposal, and action profiles through the existing
+binding hashes.
 
 Capability metadata reports enforced maximums: initialization 10 s, tool-list
 10 s, call 300 s, termination grace 250 ms, transport 4 MiB, message 2 MiB,
@@ -87,8 +95,9 @@ text content 64 KiB, plus the selected output profile. Inventory presence still
 requires Linux and a successful activation probe for that output profile.
 `artifact-v1` uses the bounded basic bubblewrap probe. `relative-files-v1`
 additionally opens the trusted `prlimit`, creates and removes a real private
-workspace-staging output slot, and proves that the production launch shape can
-writable-bind that exact file descriptor. CPU and memory are not advertised
+workspace-staging pair of output slots, and proves that the production launch shape can
+writable-bind those exact file descriptors with their aggregate-derived process
+ceiling. CPU and memory are not advertised
 because this contract does not enforce them. Renderer inventory uses those
 same production readiness profiles. When a required profile is unavailable,
 only its MCP capabilities are omitted and the inventory returns

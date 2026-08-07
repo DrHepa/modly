@@ -20,6 +20,7 @@ const hash = (value: Buffer | string) => `sha256:${createHash('sha256').update(v
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'modly-model-runtime-'))
   const modelsDir = join(root, 'models')
+  const runtimeDir = join(root, 'ollama-runtime')
   const layer = Buffer.from('model')
   const config = Buffer.from('{}')
   const layerDigest = hash(layer)
@@ -37,7 +38,9 @@ async function fixture() {
   await writeFile(manifestPath, manifest, { mode: 0o644 })
   await writeFile(join(modelsDir, 'blobs', configDigest.replace(':', '-')), config, { mode: 0o644 })
   await writeFile(join(modelsDir, 'blobs', layerDigest.replace(':', '-')), layer, { mode: 0o644 })
-  return { root, modelsDir, manifestDigest }
+  await mkdir(runtimeDir, { mode: 0o755 })
+  await writeFile(join(runtimeDir, 'llama-server'), 'runner', { mode: 0o755 })
+  return { root, modelsDir, runtimeDir, manifestDigest }
 }
 
 function capability(): AgentCapabilitySnapshotV1 {
@@ -78,24 +81,66 @@ test('Ollama configuration is explicit, canonical, and never resolves mutable PA
   const fixtureRoot = await fixture()
   const binary = await realpath(process.execPath)
   const config = await resolveAgentOllamaConfiguration({
-    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     homeDir: fixtureRoot.root,
   })
   assert.equal(config.binaryPath, binary)
   assert.equal(config.modelsDir, fixtureRoot.modelsDir)
+  assert.equal(config.runtimeDir, fixtureRoot.runtimeDir)
+  const prefix = join(fixtureRoot.root, 'portable-prefix')
+  const derivedBinary = join(prefix, 'bin', 'ollama')
+  const derivedRuntime = join(prefix, 'lib', 'ollama')
+  await mkdir(join(prefix, 'bin'), { recursive: true, mode: 0o755 })
+  await mkdir(derivedRuntime, { recursive: true, mode: 0o755 })
+  await writeFile(derivedBinary, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  await writeFile(join(derivedRuntime, 'llama-server'), 'runner', { mode: 0o755 })
+  const derived = await resolveAgentOllamaConfiguration({
+    env: { MODLY_AGENT_OLLAMA_BINARY: derivedBinary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    bwrapPath: binary,
+  })
+  assert.equal(derived.runtimeDir, derivedRuntime)
   await assert.rejects(resolveAgentOllamaConfiguration({
-    env: { MODLY_AGENT_OLLAMA_BINARY: 'ollama', MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    bwrapPath: binary,
+  }), (error: unknown) => Boolean(error && typeof error === 'object' && 'code' in error
+    && error.code === 'invalid_configuration'))
+  await assert.rejects(resolveAgentOllamaConfiguration({
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: 'ollama',
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     homeDir: fixtureRoot.root,
-  }), (error: unknown) => Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'invalid_configuration'))
+  }), (error: unknown) => Boolean(error && typeof error === 'object' && 'code' in error
+    && error.code === 'invalid_configuration'))
   const modelsLink = join(fixtureRoot.root, 'models-link')
   await symlink(fixtureRoot.modelsDir, modelsLink)
   await assert.rejects(resolveAgentOllamaConfiguration({
-    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: modelsLink },
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: modelsLink,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     homeDir: fixtureRoot.root,
   }), (error: unknown) => Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'invalid_configuration'))
+  const runtimeLink = join(fixtureRoot.root, 'runtime-link')
+  await symlink(fixtureRoot.runtimeDir, runtimeLink)
+  await assert.rejects(resolveAgentOllamaConfiguration({
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: runtimeLink,
+    },
+    bwrapPath: binary,
+  }), (error: unknown) => Boolean(error && typeof error === 'object' && 'code' in error
+    && error.code === 'invalid_configuration' && !String(error).includes(runtimeLink)))
   await rm(fixtureRoot.root, { recursive: true, force: true })
 })
 
@@ -108,12 +153,18 @@ test('model access runtime keeps readiness/acquisition aligned and binds a one-s
   let aliasSeen = ''
   const runtime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private'),
-    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     homeDir: fixtureRoot.root,
     readinessProbe: async () => true,
     startPrivateDaemon: async (options): Promise<AgentPrivateOllamaDaemon> => {
       aliasSeen = options.alias
+      assert.equal(options.runtime.path, fixtureRoot.runtimeDir)
+      await options.runtime.revalidate()
       let closed = false
       return {
         alias: options.alias,
@@ -138,6 +189,7 @@ test('model access runtime keeps readiness/acquisition aligned and binds a one-s
     })
     assert.notEqual(aliasSeen, '')
     assert.equal(lease.bindingHash.length, 64)
+    assert.equal(JSON.stringify(lease).includes(fixtureRoot.runtimeDir), false)
     const response = await unixRequest(lease.hostSocketPath, lease.bearerToken, { model: 'approved', input: 'chair' })
     assert.equal(response.status, 200)
     assert.deepEqual(response.body, { model: 'approved', output_text: 'ok' })
@@ -173,7 +225,11 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
   const readinessEntered = new Promise<void>((resolve) => { readinessStarted = resolve })
   const readinessRuntime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private-readiness'),
-    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     readinessProbe: async () => {
       readinessStarted()
@@ -198,7 +254,11 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
   let daemonClosed = 0
   const acquisitionRuntime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private-acquisition'),
-    env: { MODLY_AGENT_OLLAMA_BINARY: binary, MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir },
+    env: {
+      MODLY_AGENT_OLLAMA_BINARY: binary,
+      MODLY_AGENT_OLLAMA_MODELS_DIR: fixtureRoot.modelsDir,
+      MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
+    },
     bwrapPath: binary,
     readinessProbe: async () => true,
     startPrivateDaemon: async (options): Promise<AgentPrivateOllamaDaemon> => {

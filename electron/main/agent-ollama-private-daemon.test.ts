@@ -9,10 +9,12 @@ import { openPinnedAgentExecutable, type AgentOwnedProcess } from './agent-owned
 import {
   AgentPrivateOllamaDaemonError,
   buildAgentPrivateOllamaLaunch,
+  normalizeAgentOllamaDigest,
   probeAgentPrivateOllamaDaemon,
   startAgentPrivateOllamaDaemon,
 } from './agent-ollama-private-daemon.ts'
 import type { OpenVerifiedOllamaModel } from './agent-ollama-model-store.ts'
+import type { OpenAgentOllamaRuntimeTree } from './agent-ollama-runtime-tree.ts'
 
 function fakeModel(root: string): OpenVerifiedOllamaModel {
   let closed = false
@@ -45,6 +47,17 @@ function fakeModel(root: string): OpenVerifiedOllamaModel {
   }
 }
 
+function fakeRuntime(root: string): OpenAgentOllamaRuntimeTree {
+  let closed = false
+  return {
+    path: `${root}-ollama-runtime`,
+    handle: { fd: 12 } as never,
+    identity: { entryCount: 1 } as never,
+    revalidate: async () => { if (closed) throw new Error('closed') },
+    close: async () => { closed = true },
+  }
+}
+
 function fakeOwned(server: Server): AgentOwnedProcess {
   let resolveExit!: (value: { code: number | null, signal: NodeJS.Signals | null }) => void
   const exited = new Promise<{ code: number | null, signal: NodeJS.Signals | null }>((resolve) => { resolveExit = resolve })
@@ -72,9 +85,11 @@ test('private Ollama launch is cloud-disabled and mounts only the alias model gr
     alias: 'modly-private-0123456789abcdef:latest',
     port: 43123,
     storeRoot: root,
+    runtimeSourceRoot: '/usr/local/lib/ollama',
     ollamaFd: 4,
-    manifestFd: 5,
-    blobFds: [6],
+    runtimeDirFd: 5,
+    manifestFd: 6,
+    blobFds: [7],
   })
   assert.deepEqual(plan.args.slice(0, 5), ['--die-with-parent', '--unshare-all', '--unshare-user', '--disable-userns', '--share-net'])
   const hasEnv = (name: string, value: string) => plan.args.some((entry, index) => (
@@ -84,10 +99,91 @@ test('private Ollama launch is cloud-disabled and mounts only the alias model gr
   assert.equal(hasEnv('OLLAMA_HOST', '127.0.0.1:43123'), true)
   assert.equal(plan.args.join('\0').includes(join(root, 'manifests/registry.ollama.ai/library/modly-private-0123456789abcdef/latest')), true)
   assert.equal(plan.args.join('\0').includes(join(root, '/blobs/sha256-' + 'b'.repeat(64))), true)
-  const maskIndex = plan.args.findIndex((entry, index) => entry === '--tmpfs' && plan.args[index + 1] === root)
-  assert.notEqual(maskIndex, -1, 'the canonical store is shadowed before exact FD mounts')
-  assert.equal(plan.args.filter((entry) => entry === '--ro-bind-fd').length, 3)
+  const maskIndex = plan.args.findIndex((entry, index) => entry === '--tmpfs' && plan.args[index + 1] === '/tmp')
+  const runtimeSourceMaskIndex = plan.args.findIndex((entry, index) => (
+    entry === '--tmpfs' && plan.args[index + 1] === '/usr/local/lib/ollama'
+  ))
+  const storeIndex = plan.args.findIndex((entry, index) => entry === '--dir' && plan.args[index + 1] === root)
+  const firstStoreBind = plan.args.findIndex((entry, index) => entry === '--ro-bind-fd'
+    && plan.args[index + 2]?.startsWith(`${root}/`))
+  assert.equal(maskIndex < storeIndex && storeIndex < firstStoreBind, true, 'the canonical store is privately shadowed before exact FD mounts')
+  assert.equal(runtimeSourceMaskIndex > plan.args.indexOf('--ro-bind'), true)
+  assert.equal(runtimeSourceMaskIndex < plan.args.findIndex((entry, index) => (
+    entry === '--ro-bind-fd' && plan.args[index + 1] === '5'
+  )), true, 'the canonical runner tree is hidden before its exact directory FD mount')
+  assert.equal(plan.args.filter((entry) => entry === '--ro-bind-fd').length, 4)
   await rm(root, { recursive: true, force: true })
+})
+
+test('private Ollama launch creates runtime and nested store paths only below writable private mounts', async (t) => {
+  if (process.platform !== 'linux') return t.skip('bubblewrap plan is Linux-only')
+  const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-topology-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const plan = buildAgentPrivateOllamaLaunch({
+    model: fakeModel(root),
+    alias: 'modly-private-0123456789abcdef:latest',
+    port: 43123,
+    storeRoot: root,
+    runtimeSourceRoot: '/usr/local/lib/ollama',
+    ollamaFd: 4,
+    runtimeDirFd: 5,
+    manifestFd: 6,
+    blobFds: [7],
+  })
+  const optionIndex = (flag: string, value: string) => plan.args.findIndex((entry, index) => (
+    entry === flag && plan.args[index + 1] === value
+  ))
+  const privateRunIndex = optionIndex('--tmpfs', '/run')
+  const runtimeRoot = '/run/modly-ollama-runtime'
+  const runtimeRootIndex = optionIndex('--dir', runtimeRoot)
+  const runtimeBinIndex = optionIndex('--dir', join(runtimeRoot, 'bin'))
+  const ollamaBindIndex = optionIndex('--ro-bind-fd', '4')
+  assert.notEqual(privateRunIndex, -1)
+  assert.equal(privateRunIndex < runtimeRootIndex && runtimeRootIndex < runtimeBinIndex, true)
+  assert.equal(runtimeBinIndex < ollamaBindIndex, true)
+  assert.equal(plan.args[ollamaBindIndex + 2], join(runtimeRoot, 'bin', 'ollama'))
+  const runnerTreeBindIndex = optionIndex('--ro-bind-fd', '5')
+  assert.equal(runtimeBinIndex < runnerTreeBindIndex, true)
+  assert.equal(plan.args[runnerTreeBindIndex + 2], join(runtimeRoot, 'lib', 'ollama'))
+  assert.deepEqual(plan.args.slice(-4), ['--chdir', '/', join(runtimeRoot, 'bin', 'ollama'), 'serve'])
+  assert.equal(plan.args.includes('/runtime'), false)
+
+  const privateTmpIndex = optionIndex('--tmpfs', '/tmp')
+  const storeRootIndex = optionIndex('--dir', root)
+  assert.equal(privateTmpIndex < storeRootIndex, true)
+  assert.equal(optionIndex('--tmpfs', root), -1, 'a parent private tmpfs must not hide an earlier nested store mount')
+
+  assert.throws(() => buildAgentPrivateOllamaLaunch({
+    model: fakeModel('/'),
+    alias: 'modly-private-0123456789abcdef:latest',
+    port: 43123,
+    storeRoot: '/',
+    runtimeSourceRoot: '/usr/local/lib/ollama',
+    ollamaFd: 4,
+    runtimeDirFd: 5,
+    manifestFd: 6,
+    blobFds: [7],
+  }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'invalid_binding')
+  assert.throws(() => buildAgentPrivateOllamaLaunch({
+    model: fakeModel(root),
+    alias: 'modly-private-0123456789abcdef:latest',
+    port: 43123,
+    storeRoot: root,
+    runtimeSourceRoot: join(root, 'runtime'),
+    ollamaFd: 4,
+    runtimeDirFd: 5,
+    manifestFd: 6,
+    blobFds: [7],
+  }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'invalid_binding')
+})
+
+test('Ollama readiness digest normalization accepts only exact lowercase SHA-256 forms', () => {
+  const raw = 'a'.repeat(64)
+  assert.equal(normalizeAgentOllamaDigest(raw), `sha256:${raw}`)
+  assert.equal(normalizeAgentOllamaDigest(`sha256:${raw}`), `sha256:${raw}`)
+  for (const rejected of [raw.toUpperCase(), `sha256:${raw.toUpperCase()}`, `sha512:${raw}`, ` ${raw}`, `${raw} `, 'a'.repeat(63)]) {
+    assert.equal(normalizeAgentOllamaDigest(rejected), undefined)
+  }
 })
 
 test('private Ollama daemon verifies version and exact alias before forwarding bounded Responses', async (t) => {
@@ -95,17 +191,24 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
   const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-test-'))
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
+  const runtime = fakeRuntime(root)
   const originalRevalidate = model.revalidate.bind(model)
+  const originalRuntimeRevalidate = runtime.revalidate.bind(runtime)
   let modelRevalidations = 0
+  let runtimeRevalidations = 0
   model.revalidate = async () => { modelRevalidations += 1; await originalRevalidate() }
+  runtime.revalidate = async () => { runtimeRevalidations += 1; await originalRuntimeRevalidate() }
   const seen: unknown[] = []
   let failResponses = false
   let launchArgs: readonly string[] = []
   let inheritedCount = 0
+  let readinessRequests = 0
+  const showBodies: unknown[] = []
   const daemon = await startAgentPrivateOllamaDaemon({
     root,
     bwrap: executable,
     ollama: executable,
+    runtime,
     model,
     alias: 'modly-private-0123456789abcdef:latest',
     signal: new AbortController().signal,
@@ -116,17 +219,26 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
       inheritedCount = input.inheritedHandles?.length ?? 0
       const server = createServer((request, response) => {
         if (request.url === '/api/version') {
+          readinessRequests += 1
           response.end('{"version":"0.32.5"}')
           return
         }
         if (request.url === '/api/tags') {
+          readinessRequests += 1
           response.setHeader('content-type', 'application/json')
-          response.end(JSON.stringify({ models: [{ name: 'modly-private-0123456789abcdef:latest', digest: model.digest }] }))
+          response.end(JSON.stringify({ models: [{ name: 'modly-private-0123456789abcdef:latest', digest: model.digest.slice('sha256:'.length) }] }))
           return
         }
         if (request.url === '/api/show') {
-          response.setHeader('content-type', 'application/json')
-          response.end('{"details":{"format":"gguf"}}')
+          readinessRequests += 1
+          let body = ''
+          request.setEncoding('utf8')
+          request.on('data', (chunk) => { body += chunk })
+          request.on('end', () => {
+            showBodies.push(JSON.parse(body))
+            response.setHeader('content-type', 'application/json')
+            response.end('{"details":{"format":"gguf"}}')
+          })
           return
         }
         if (request.url === '/v1/responses') {
@@ -156,14 +268,19 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
     assert.equal(launchArgs.some((entry, index) => (
       entry === '--setenv' && launchArgs[index + 1] === 'OLLAMA_NO_CLOUD' && launchArgs[index + 2] === '1'
     )), true)
-    assert.equal(inheritedCount, 3, 'Ollama, alias manifest, and exact blob remain inherited authorities')
+    assert.equal(inheritedCount, 4, 'Ollama, runner tree, alias manifest, and exact blob remain inherited authorities')
+    assert.equal(runtimeRevalidations >= 3, true, 'runner tree is checked before launch and after readiness')
+    assert.equal(readinessRequests, 3, 'one successful readiness pass must issue only version, tags, and show')
+    assert.deepEqual(showBodies, [{ model: daemon.alias, verbose: false }])
     const result = await daemon.responses({ model: daemon.alias, input: 'chair' }, new AbortController().signal)
     assert.deepEqual(result, { model: daemon.alias, output_text: 'ok' })
     assert.deepEqual(seen, [{ model: daemon.alias, input: 'chair' }])
     const beforeFailure = modelRevalidations
+    const runtimeBeforeFailure = runtimeRevalidations
     failResponses = true
     await assert.rejects(daemon.responses({ model: daemon.alias, input: 'table' }, new AbortController().signal))
     assert.equal(modelRevalidations - beforeFailure, 2, 'model authority is checked before and after a failed request')
+    assert.equal(runtimeRevalidations - runtimeBeforeFailure, 2, 'runner tree is checked before and after a failed request')
     await daemon.revalidate()
   } finally {
     await daemon.close()
@@ -184,6 +301,7 @@ test('private Ollama daemon retries a collided random loopback port without shar
     root,
     bwrap: executable,
     ollama: executable,
+    runtime: fakeRuntime(root),
     model,
     alias: 'modly-private-0011223344556677:latest',
     signal: new AbortController().signal,
@@ -222,6 +340,7 @@ test('private Ollama daemon fails closed on early non-zero exit', async (t) => {
     root,
     bwrap: executable,
     ollama: executable,
+    runtime: fakeRuntime(root),
     model,
     alias: 'modly-private-fedcba9876543210:latest',
     signal: new AbortController().signal,
@@ -242,15 +361,17 @@ test('private Ollama daemon bounds readiness and cleans every timed-out attempt'
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
   let closes = 0
+  let requests = 0
   try {
     await assert.rejects(startAgentPrivateOllamaDaemon({
       root,
       bwrap: executable,
       ollama: executable,
+      runtime: fakeRuntime(root),
       model,
       alias: 'modly-private-abcdef0123456789:latest',
       signal: new AbortController().signal,
-      readinessMs: 25,
+      readinessMs: 250,
       choosePort: () => 43129,
       startProcess: async () => ({
         pid: 12345,
@@ -259,9 +380,20 @@ test('private Ollama daemon bounds readiness and cleans every timed-out attempt'
         revalidate: async () => undefined,
         close: async () => { closes += 1 },
       }),
-      fetch: async () => { throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' }) },
+      fetch: async (input) => {
+        requests += 1
+        const url = String(input)
+        if (url.endsWith('/api/version')) return new Response('{"version":"0.32.5"}', { status: 200 })
+        if (url.endsWith('/api/tags')) {
+          return new Response(JSON.stringify({
+            models: [{ name: 'modly-private-abcdef0123456789:latest', digest: model.digest.toUpperCase() }],
+          }), { status: 200 })
+        }
+        throw new Error('unexpected readiness request')
+      },
     }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'daemon_timeout')
     assert.equal(closes, 3)
+    assert.equal(requests > 0 && requests <= 18, true, 'bounded backoff must prevent a hot-loop request storm')
     assert.deepEqual(await readdir(root), [])
   } finally {
     await executable.close()
@@ -281,23 +413,35 @@ test('private Ollama probe never mistakes a colliding shared endpoint for its ow
   })
   await new Promise<void>((resolve) => decoy.listen(port, '127.0.0.1', resolve))
   let closes = 0
+  let probeArgs: readonly string[] = []
   try {
     await assert.rejects(probeAgentPrivateOllamaDaemon({
       root,
       bwrap: executable,
       ollama: executable,
+      runtime: fakeRuntime(root),
       signal: new AbortController().signal,
       readinessMs: 50,
       choosePort: () => port,
-      startProcess: async () => ({
-        pid: 12345,
-        stderr: '',
-        exited: Promise.resolve({ code: 98, signal: null }),
-        revalidate: async () => { throw new Error('owned process exited') },
-        close: async () => { closes += 1 },
-      }),
+      startProcess: async (input) => {
+        probeArgs = input.args
+        return {
+          pid: 12345,
+          stderr: '',
+          exited: Promise.resolve({ code: 98, signal: null }),
+          revalidate: async () => { throw new Error('owned process exited') },
+          close: async () => { closes += 1 },
+        }
+      },
     }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError)
     assert.equal(closes, 3)
+    const privateRunIndex = probeArgs.findIndex((entry, index) => entry === '--tmpfs' && probeArgs[index + 1] === '/run')
+    const runtimeIndex = probeArgs.findIndex((entry, index) => entry === '--dir' && probeArgs[index + 1] === '/run/modly-ollama-runtime')
+    const binaryIndex = probeArgs.findIndex((entry, index) => entry === '--ro-bind-fd'
+      && probeArgs[index + 2] === '/run/modly-ollama-runtime/bin/ollama')
+    const runnerTreeIndex = probeArgs.findIndex((entry, index) => entry === '--ro-bind-fd'
+      && probeArgs[index + 2] === '/run/modly-ollama-runtime/lib/ollama')
+    assert.equal(privateRunIndex < runtimeIndex && runtimeIndex < binaryIndex && binaryIndex < runnerTreeIndex, true)
   } finally {
     await new Promise<void>((resolve) => decoy.close(() => resolve()))
     await executable.close()

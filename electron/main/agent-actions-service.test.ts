@@ -51,6 +51,79 @@ function capabilityFixture(overrides: Partial<AgentCapabilitySnapshotV1> = {}): 
   return { ...unsigned, hash: sha256Canonical(unsigned) }
 }
 
+function modelFreeProcessCapabilityFixture(runtimeSha256 = 'c'.repeat(64)): AgentCapabilitySnapshotV1 {
+  const runtimeFiles = [{
+    path: 'processor.mjs', device: '1', inode: '2', uid: 1000, gid: 1000,
+    mode: 0o644, size: 12, mtimeNs: '3', sha256: runtimeSha256,
+  }]
+  const resourceFiles: typeof runtimeFiles = []
+  const artifacts = {
+    maxCount: 2,
+    maxTotalBytes: 2048,
+    allowed: [
+      { kind: 'glb' as const, mediaTypes: ['model/gltf-binary'], maxBytes: 1536 },
+      { kind: 'plan' as const, mediaTypes: ['text/markdown'], maxBytes: 512 },
+    ],
+  }
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles })
+  const execution = {
+    kind: 'process' as const,
+    schema: 'modly.agent-process-execution.v1' as const,
+    entry: 'processor.mjs',
+    runtimeFiles,
+    resourceFiles,
+    runtimeHash,
+    artifacts,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.mjs', runtimeHash, artifacts,
+    }),
+  }
+  return capabilityFixture({ execution })
+}
+
+function modelAccessProcessCapabilityFixture(): AgentCapabilitySnapshotV1 {
+  const runtimeFiles = [{
+    path: 'processor.pyz', device: '1', inode: '2', uid: 1000, gid: 1000,
+    mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
+  }]
+  const resourceFiles: never[] = []
+  const runtimeUnsigned = {
+    kind: 'extension-python-venv-v1' as const,
+    interpreter: 'bin/python' as const,
+    baseInterpreter: {
+      device: '9', inode: '10', uid: 0, gid: 0, mode: 0o755, size: 1024, nlink: 1,
+      mtimeNs: '11', ctimeNs: '12', sha256: 'f'.repeat(64),
+    },
+    treeDigest: '1'.repeat(64),
+    sourceIdentityHash: '2'.repeat(64),
+    entryCount: 8,
+    logicalBytes: 4096,
+  }
+  const runtime = {
+    ...runtimeUnsigned,
+    bindingHash: sha256Canonical({ schema: 'modly.extension-python-runtime-binding.v1', ...runtimeUnsigned }),
+  }
+  const modelAccess = {
+    schema: 'modly.agent-model-access.v1' as const,
+    profile: 'ollama-responses-json-v1' as const,
+  }
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime, modelAccess })
+  const artifacts = {
+    maxCount: 1,
+    maxTotalBytes: 1024,
+    allowed: [{ kind: 'text' as const, mediaTypes: ['text/plain'], maxBytes: 1024 }],
+  }
+  return capabilityFixture({
+    execution: {
+      kind: 'process', schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+      runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
+      bindingHash: sha256Canonical({
+        schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
+      }),
+    },
+  })
+}
+
 const selectedModel: AgentOllamaModelSnapshotV1 = {
   provider: 'ollama',
   endpoint: 'http://127.0.0.1:11434/',
@@ -175,33 +248,7 @@ test('proposal is default-deny, normalizes only declared arguments, and keeps pr
 })
 
 test('process execution accepts only its declared multi-artifact policy and keeps trusted context main-owned', async () => {
-  const runtimeFiles = [{
-    path: 'processor.mjs', device: '1', inode: '2', uid: 1000, gid: 1000,
-    mode: 0o644, size: 12, mtimeNs: '3', sha256: 'c'.repeat(64),
-  }]
-  const resourceFiles: typeof runtimeFiles = []
-  const artifacts = {
-    maxCount: 2,
-    maxTotalBytes: 2048,
-    allowed: [
-      { kind: 'glb' as const, mediaTypes: ['model/gltf-binary'], maxBytes: 1536 },
-      { kind: 'plan' as const, mediaTypes: ['text/markdown'], maxBytes: 512 },
-    ],
-  }
-  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles })
-  const processExecution = {
-    kind: 'process' as const,
-    schema: 'modly.agent-process-execution.v1' as const,
-    entry: 'processor.mjs',
-    runtimeFiles,
-    resourceFiles,
-    runtimeHash,
-    artifacts,
-    bindingHash: sha256Canonical({
-      schema: 'modly.agent-process-execution.v1', entry: 'processor.mjs', runtimeHash, artifacts,
-    }),
-  }
-  const capability = capabilityFixture({ execution: processExecution })
+  const capability = modelFreeProcessCapabilityFixture()
   const plan: ArtifactRefV1 = {
     ...validOutput, id: 'generated-plan', kind: 'plan', mediaType: 'text/markdown',
     workspacePath: 'Workflows/agent-actions/action-process/plan.md', sizeBytes: 64,
@@ -211,10 +258,14 @@ test('process execution accepts only its declared multi-artifact policy and keep
     workspacePath: 'Workflows/agent-actions/action-process/model.glb', sizeBytes: 128,
   }
   let captured: AgentActionExecutorRequest | undefined
+  let modelResolverCalls = 0
   const service = new AgentActionsService({
     createActionId: () => 'action-process',
     resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
-    resolveCurrentModel: async () => selectedModel,
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      throw new Error('the provider must not be consulted for a model-free process')
+    },
     artifactVerifier: passThroughArtifactVerifier,
     executor: async (value) => { captured = value; return { artifacts: [plan, glb] } },
   })
@@ -230,8 +281,97 @@ test('process execution accepts only its declared multi-artifact policy and keep
   await service.decide({ actionId: proposed.id, originSessionId: 'session-process', decision: 'approve' })
   const completed = await service.execute({ actionId: proposed.id, originSessionId: 'session-process' })
   assert.equal(completed.status, 'completed')
+  assert.equal(modelResolverCalls, 0)
   assert.equal(captured?.originSessionId, 'session-process')
+  assert.deepEqual(captured?.model, { ...selectedModel, endpoint: 'http://127.0.0.1:11434' })
   assert.deepEqual(completed.outputs.map((output) => output.kind), ['plan', 'glb'])
+})
+
+test('model-free process still rejects a changed runtime binding without consulting the model provider', async () => {
+  const initialCapability = modelFreeProcessCapabilityFixture()
+  let currentCapability = initialCapability
+  let modelResolverCalls = 0
+  const service = new AgentActionsService({
+    createActionId: () => 'action-process-runtime-swap',
+    resolveCapabilities: async () => ({ capabilities: [currentCapability], errors: [] }),
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      throw new Error('the provider must not be consulted for a model-free process')
+    },
+  })
+  const proposed = await service.propose({
+    originSessionId: 'session-process', capabilityId: initialCapability.id,
+    capabilityHash: initialCapability.hash, arguments: { input: 'chair', params: {} },
+    model: selectedModel,
+  })
+  currentCapability = modelFreeProcessCapabilityFixture('d'.repeat(64))
+  await rejectsCode(
+    service.decide({ actionId: proposed.id, originSessionId: 'session-process', decision: 'approve' }),
+    'capability_stale',
+  )
+  assert.equal(modelResolverCalls, 0)
+  assert.equal((await service.get({ actionId: proposed.id, originSessionId: 'session-process' })).status, 'cancelled')
+})
+
+test('model-free process still rejects approval lease hash tampering without consulting the model provider', async () => {
+  const capability = modelFreeProcessCapabilityFixture()
+  let modelResolverCalls = 0
+  const service = new AgentActionsService({
+    now: clock().now,
+    createActionId: () => 'action-process-tampered-approval',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      throw new Error('the provider must not be consulted for a model-free process')
+    },
+  })
+  const proposed = await service.propose({
+    originSessionId: 'session-process', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'session-process', decision: 'approve' })
+  const privateLeases = (service as unknown as {
+    leases: Map<string, { bindingHash: string }>
+  }).leases
+  const lease = privateLeases.get(proposed.id)
+  assert.ok(lease)
+  lease.bindingHash = '0'.repeat(64)
+  await rejectsCode(
+    service.execute({ actionId: proposed.id, originSessionId: 'session-process' }),
+    'capability_stale',
+  )
+  assert.equal(modelResolverCalls, 0)
+})
+
+test('model-access process keeps live provider-model revalidation at every service boundary', async () => {
+  const capability = modelAccessProcessCapabilityFixture()
+  let modelResolverCalls = 0
+  const output: ArtifactRefV1 = {
+    ...validOutput,
+    id: 'model-plan',
+    kind: 'text',
+    mediaType: 'text/plain',
+    workspacePath: 'Workflows/agent-actions/action-model-access/plan.txt',
+    sizeBytes: 64,
+  }
+  const service = new AgentActionsService({
+    createActionId: () => 'action-model-access',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      return selectedModel
+    },
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => ({ artifacts: [output] }),
+  })
+  const proposed = await service.propose({
+    originSessionId: 'session-model-access', capabilityId: capability.id,
+    capabilityHash: capability.hash, arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'session-model-access', decision: 'approve' })
+  const completed = await service.execute({ actionId: proposed.id, originSessionId: 'session-model-access' })
+  assert.equal(completed.status, 'completed')
+  assert.equal(modelResolverCalls, 4)
 })
 
 test('main binds actions to an origin session and generates a bounded redacted approval preview', async () => {
@@ -301,10 +441,16 @@ test('MCP capability proposals preserve canonical schema-shaped arguments withou
     },
   })
   let captured: AgentActionExecutorRequest | undefined
+  let modelResolverCalls = 0
+  let modelProviderAvailable = true
   const service = new AgentActionsService({
     createActionId: () => 'action-mcp',
     resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
-    resolveCurrentModel: async () => selectedModel,
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      if (!modelProviderAvailable) throw new Error('model provider unavailable')
+      return selectedModel
+    },
     artifactVerifier: passThroughArtifactVerifier,
     executor: async (request) => {
       captured = request
@@ -321,6 +467,14 @@ test('MCP capability proposals preserve canonical schema-shaped arguments withou
   await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
   await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.deepEqual(captured?.arguments, { text: 'hello' })
+  assert.equal(modelResolverCalls, 4)
+  modelProviderAvailable = false
+  await rejectsCode(service.propose({
+    originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
+    arguments: { text: 'provider must be live' }, model: selectedModel,
+  }), 'model_stale')
+  assert.equal(modelResolverCalls, 5)
+  modelProviderAvailable = true
   await rejectsCode(service.propose({
     originSessionId: 'test-session',
     capabilityId: capability.id,
@@ -1154,10 +1308,12 @@ test('input artifact mutation is detected immediately before start and never rea
   const original = Buffer.from('original mesh')
   await mkdir(workflows, { recursive: true })
   await writeFile(join(workflows, 'source.glb'), original)
+  const processExecution = modelFreeProcessCapabilityFixture().execution
   const capability = capabilityFixture({
     id: 'mesh-tools/optimize',
     extension: { id: 'mesh-tools', name: 'Mesh Tools', version: '1.0.0' },
     node: { id: 'optimize', input: 'mesh', output: 'mesh', paramsSchema: [] },
+    execution: processExecution,
   })
   const source: ArtifactRefV1 = {
     ...validOutput,
@@ -1167,10 +1323,14 @@ test('input artifact mutation is detected immediately before start and never rea
     sizeBytes: original.byteLength,
   }
   let executions = 0
+  let modelResolverCalls = 0
   const service = new AgentActionsService({
     createActionId: () => 'action-mutated-input',
     resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
-    resolveCurrentModel: async () => selectedModel,
+    resolveCurrentModel: async () => {
+      modelResolverCalls += 1
+      throw new Error('model-free execution must not resolve a provider model')
+    },
     resolveArtifact: async () => source,
     artifactVerifier: new WorkspaceAgentArtifactVerifier({ getWorkspaceRoot: () => root }),
     executor: async () => { executions += 1; return { artifacts: [validOutput] } },
@@ -1187,6 +1347,7 @@ test('input artifact mutation is detected immediately before start and never rea
     await writeFile(join(workflows, 'source.glb'), Buffer.from('mutated mesh!'))
     await rejectsCode(service.execute({ actionId: action.id, originSessionId: 'test-session' }), 'invalid_artifact')
     assert.equal(executions, 0)
+    assert.equal(modelResolverCalls, 0)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -47,6 +47,7 @@ import {
   assertAgentCapabilitySnapshotV1,
   assertAgentOllamaModelSnapshotV1,
   assertArtifactRefV1,
+  requiresLiveProviderModelRevalidation,
   sha256Canonical,
 } from './agent-trust-contracts.ts'
 import {
@@ -1042,6 +1043,16 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
     return target
   }
 
+  const assertCurrentProviderModel = async (expected: AgentOllamaModelSnapshotV1): Promise<void> => {
+    let current: AgentOllamaModelSnapshotV1
+    try { current = assertAgentOllamaModelSnapshotV1(await options.resolveCurrentModel({ ...expected })) } catch (error) {
+      throw new AgentProcessExecutorError('model_stale', error)
+    }
+    if (sha256Canonical(current) !== sha256Canonical(expected)) {
+      throw new AgentProcessExecutorError('model_stale')
+    }
+  }
+
   const ensureReady = async (capability: AgentCapabilitySnapshotV1): Promise<void> => {
     if ((options.platform ?? process.platform) !== 'linux') throw new AgentProcessExecutorError('runtime_unavailable')
     const target = await resolveBoundTarget(capability)
@@ -1088,15 +1099,13 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
     const target = await resolveBoundTarget(request.capability)
     const execution = target.capability.execution
     if (execution?.kind !== 'process') throw new AgentProcessExecutorError('unsupported_capability')
-    if (execution.modelAccess && !options.acquireModelAccess) {
-      throw new AgentProcessExecutorError('model_binding_unavailable')
-    }
-    let currentModel: AgentOllamaModelSnapshotV1
-    try { currentModel = assertAgentOllamaModelSnapshotV1(await options.resolveCurrentModel(request.model)) } catch (error) {
+    let approvedModel: AgentOllamaModelSnapshotV1
+    try { approvedModel = Object.freeze(assertAgentOllamaModelSnapshotV1(request.model)) } catch (error) {
       throw new AgentProcessExecutorError('model_stale', error)
     }
-    if (sha256Canonical(currentModel) !== sha256Canonical(assertAgentOllamaModelSnapshotV1(request.model))) {
-      throw new AgentProcessExecutorError('model_stale')
+    const requiresLiveModel = requiresLiveProviderModelRevalidation(target.capability)
+    if (execution.modelAccess && !options.acquireModelAccess) {
+      throw new AgentProcessExecutorError('model_binding_unavailable')
     }
 
     const workspaceRoot = await canonicalDirectory(await options.getWorkspaceRoot(), 'Workspace')
@@ -1141,12 +1150,13 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
         if (!pythonSandbox) throw new AgentProcessExecutorError('runtime_unavailable')
         outputDirectory = await openPinnedDirectory(outputDir, 'invalid_artifact')
         if (execution.modelAccess) {
+          await assertCurrentProviderModel(approvedModel)
           try {
             modelAccessLease = await options.acquireModelAccess!({
               actionId,
               proposalHash: request.proposalHash,
               capability: request.capability,
-              model: request.model,
+              model: approvedModel,
               privateTempRoot,
               signal: request.signal,
             })
@@ -1156,7 +1166,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
               || modelAccessLease.socketPath !== AGENT_MODEL_ACCESS_SANDBOX_SOCKET
               || modelAccessLease.responsesPath !== AGENT_MODEL_ACCESS_RESPONSES_PATH
               || modelAccessLease.model !== AGENT_MODEL_ACCESS_MODEL_SENTINEL
-              || modelAccessLease.digest !== request.model.digest
+              || modelAccessLease.digest !== approvedModel.digest
               || typeof modelAccessLease.bearerToken !== 'string' || modelAccessLease.bearerToken.length < 32
               || modelAccessLease.directoryHandle.fd < 0) {
               throw new Error('Agent model access lease is invalid')
@@ -1207,11 +1217,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
 
       const currentTarget = await resolveBoundTarget(request.capability)
       if (currentTarget.extensionDir !== target.extensionDir || currentTarget.entry !== target.entry) throw new AgentProcessExecutorError('capability_stale')
-      let finalModel: AgentOllamaModelSnapshotV1
-      try { finalModel = assertAgentOllamaModelSnapshotV1(await options.resolveCurrentModel(request.model)) } catch (error) {
-        throw new AgentProcessExecutorError('model_stale', error)
-      }
-      if (sha256Canonical(finalModel) !== sha256Canonical(request.model)) throw new AgentProcessExecutorError('model_stale')
+      if (requiresLiveModel) await assertCurrentProviderModel(approvedModel)
       await revalidateInputs(inputs)
       await revalidateOpenAgentProcessRuntime(runtime)
       if (pythonSandbox) {
@@ -1239,7 +1245,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
             expiresAt: modelAccessLease.expiresAt,
             bindingHash: modelAccessLease.bindingHash,
           }),
-        } : { model: Object.freeze({ ...request.model }) }),
+        } : { model: Object.freeze({ ...approvedModel }) }),
         inputArtifacts: Object.freeze(inputs.map((input, index) => Object.freeze({
           artifact: Object.freeze({ ...input.ref }),
           fdPath: pythonSandbox ? `/input/${index}` : `/proc/self/fd/${inputFdBase + index}`,

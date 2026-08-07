@@ -862,6 +862,16 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   return capability
 }
 
+/**
+ * Returns whether executing this authoritative capability requires the
+ * selected provider model to be live-resolved. The only model-free execution
+ * contract is a governed PROCESS that did not declare modelAccess.
+ */
+export function requiresLiveProviderModelRevalidation(value: unknown): boolean {
+  const capability = assertAgentCapabilitySnapshotV1(value)
+  return capability.execution?.kind !== 'process' || capability.execution.modelAccess !== undefined
+}
+
 export function assertAgentOllamaModelSnapshotV1(value: unknown): AgentOllamaModelSnapshotV1 {
   assertPlainRecord(value, 'Agent Ollama model snapshot')
   assertExactKeys(value, ['provider', 'endpoint', 'model', 'digest'], 'Agent Ollama model snapshot')

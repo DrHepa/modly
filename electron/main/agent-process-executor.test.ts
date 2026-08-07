@@ -41,6 +41,7 @@ const request = JSON.parse(await new Promise((resolve) => {
   process.stdin.on('end', () => resolve(value))
 }))
 if (!process.argv[1]?.startsWith('/proc/self/fd/')) throw new Error('runtime was not launched from an inherited fd')
+if ('modelAccess' in request.trustedContext || 'socketPath' in request.trustedContext || 'bearerToken' in request.trustedContext || 'responsesPath' in request.trustedContext) throw new Error('model or network authority was exposed')
 if ('copyPath' in (request.trustedContext.inputArtifacts[0] ?? {})) throw new Error('copied input path was exposed')
 if ('inputs' in request.trustedContext.dirs || 'runtime' in request.trustedContext.dirs) throw new Error('mutable staging dirs were exposed')
 const resource = JSON.parse(await readFile(request.trustedContext.resources[0].fdPath, 'utf8'))
@@ -190,12 +191,16 @@ async function rejectsProcess(promise: Promise<unknown>, code: AgentProcessExecu
 
 test('governed process publishes verified multiple artifacts atomically and rollback is idempotent', async () => {
   const value = await fixture()
+  let modelResolverCalls = 0
   try {
     const executor = createAgentProcessExecutor({
       getWorkspaceRoot: () => value.workspaceDir,
       getPrivateTempRoot: () => value.privateTempRoot,
       resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }),
-      resolveCurrentModel: async () => model,
+      resolveCurrentModel: async () => {
+        modelResolverCalls += 1
+        throw new Error('model-free execution must not resolve a provider model')
+      },
     })
     await executor.ensureReady(value.capability)
     const result = await executor.execute(request(value.capability, value.inputArtifact, 'action-honest', 'honest'))
@@ -204,9 +209,34 @@ test('governed process publishes verified multiple artifacts atomically and roll
     ])
     assert.equal(await readFile(join(value.workspaceDir, result.artifacts[0].workspacePath), 'utf8'), '# Plan\napproved input\n')
     assert.equal(result.artifacts[1].sha256, createHash('sha256').update('glTF').digest('hex'))
+    assert.equal(modelResolverCalls, 0)
     await result.rollback()
     await result.rollback()
     await assert.rejects(access(join(value.workspaceDir, 'Workflows', 'agent-actions', 'action-honest')))
+  } finally {
+    await rm(value.root, { recursive: true, force: true })
+  }
+})
+
+test('model-free process validates immutable model attribution without consulting the provider', async () => {
+  const value = await fixture()
+  let modelResolverCalls = 0
+  try {
+    const executor = createAgentProcessExecutor({
+      getWorkspaceRoot: () => value.workspaceDir,
+      getPrivateTempRoot: () => value.privateTempRoot,
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }),
+      resolveCurrentModel: async () => {
+        modelResolverCalls += 1
+        throw new Error('model-free execution must not resolve a provider model')
+      },
+    })
+    const invalid = {
+      ...request(value.capability, value.inputArtifact, 'action-invalid-model-attribution', 'honest'),
+      model: { ...model, endpoint: 'https://cloud.invalid' },
+    } as AgentActionExecutorRequest
+    await rejectsProcess(executor.execute(invalid), 'model_stale')
+    assert.equal(modelResolverCalls, 0)
   } finally {
     await rm(value.root, { recursive: true, force: true })
   }
@@ -331,21 +361,17 @@ test('governed process rejects reserved context, descriptor forgery, output abus
             const resourceReplacement = join(value.extensionDir, 'replacement-resource.json')
             await writeFile(resourceReplacement, '{"runtime":false}\n')
             await rename(resourceReplacement, join(value.extensionDir, 'assets', 'runtime-data.json'))
+            const inputReplacement = join(value.workspaceDir, 'replacement-input.txt')
+            await writeFile(inputReplacement, 'attacker input\n')
+            await rename(inputReplacement, value.inputPath)
           }
           return { capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.mjs' }
         },
-        resolveCurrentModel: async () => {
-          modelResolutions += 1
-          if (modelResolutions === 2) {
-            const replacement = join(value.workspaceDir, 'replacement-input.txt')
-            await writeFile(replacement, 'attacker input\n')
-            await rename(replacement, value.inputPath)
-          }
-          return model
-        },
+        resolveCurrentModel: async () => { modelResolutions += 1; throw new Error('must not resolve') },
       })
       const result = await executor.execute(request(value.capability, value.inputArtifact, 'action-fd-authority', 'honest'))
       assert.equal(await readFile(join(value.workspaceDir, result.artifacts[0].workspacePath), 'utf8'), '# Plan\napproved input\n')
+      assert.equal(modelResolutions, 0)
       await result.rollback()
     } finally {
       await rm(value.root, { recursive: true, force: true })

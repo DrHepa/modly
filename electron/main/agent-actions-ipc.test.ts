@@ -74,7 +74,7 @@ test('Agent action IPC mints opaque session leases and validates every request b
     modelLeaseId: 'model-lease-1',
   }
   assert.deepEqual(await handlers.get('agentActions:propose')?.({}, proposal), { ok: true, action: summary })
-  assert.deepEqual(modelSelections, [model, model])
+  assert.deepEqual(modelSelections, [model])
   assert.deepEqual(calls[0], {
     operation: 'propose',
     request: {
@@ -130,7 +130,9 @@ test('Agent action IPC mints opaque session leases and validates every request b
   currentDigest = `sha256:${'c'.repeat(64)}`
   assert.deepEqual(await handlers.get('agentActions:propose')?.({}, {
     ...proposal, modelLeaseId: drifting.lease.id,
-  }), { ok: false, error: { code: 'model_stale' } })
+  }), { ok: true, action: summary })
+  assert.equal((calls.at(-1)?.request as { model: { digest: string } }).model.digest, resolvedModel.digest)
+  assert.deepEqual(modelSelections, [model, model, model])
 })
 
 test('governed Agent action modules are statically isolated from the legacy user-driven process runner', async () => {

@@ -138,13 +138,18 @@ handle, records its file identity, and binds the categorized identities,
 artifact policy, and entry to the public capability hash. Absolute host paths
 are never exposed in the renderer inventory.
 
-Before launch, main re-resolves the capability and local Ollama model lease,
-opens the bound bundle/resources and input artifacts with `O_NOFOLLOW`, and
-fstat/hash-validates those same read-only handles. The handles themselves are
-inherited into the child and referenced as `/proc/self/fd/N`; runtime and input
-bytes are never consumed from mutable copied workspace paths. Main revalidates
-the same handles immediately before spawn and after process exit. Runtime
-changes fail as `capability_stale`; input changes fail as `invalid_artifact`.
+Before launch, main re-resolves the capability. A PROCESS declaring
+`modelAccess` also re-resolves the exact local Ollama model immediately before
+gateway acquisition and again before spawn; MCP actions retain their own live
+provider-model revalidation. A PROCESS without `modelAccess` performs no live
+provider lookup and uses only its main-minted model snapshot as approval
+attribution. Main opens the bound bundle/resources and input artifacts with
+`O_NOFOLLOW` and fstat/hash-validates those same read-only handles. The handles
+themselves are inherited into the child and referenced as `/proc/self/fd/N`;
+runtime and input bytes are never consumed from mutable copied workspace paths.
+Main revalidates the same handles immediately before spawn and after process
+exit. Runtime changes fail as `capability_stale`; input changes fail as
+`invalid_artifact`.
 
 ## Launch and trusted request
 
@@ -159,6 +164,7 @@ single bounded JSON document on stdin:
   "trustedContext": {
     "actionId": "...",
     "originSessionId": "...",
+    "proposalHash": "...",
     "model": { "provider": "ollama", "endpoint": "http://127.0.0.1:11434", "model": "...", "digest": "sha256:..." },
     "inputArtifacts": [{ "artifact": {}, "fdPath": "/proc/self/fd/5" }],
     "resources": [{ "path": "assets/prompt-template.json", "fdPath": "/proc/self/fd/4" }],
@@ -169,10 +175,24 @@ single bounded JSON document on stdin:
 }
 ```
 
-The `model` object above is the legacy trusted context for a PROCESS that did
-not declare `modelAccess`. A declared model-access PROCESS never receives the
-raw host endpoint or mutable model name. After main revalidates the capability,
-proposal, and selected model, it acquires one private lease and instead passes:
+The `model` object above is the wire-compatible approval attribution for a
+PROCESS that did not declare `modelAccess`. Main validates its immutable shape
+and keeps it bound into the proposal, approval lease, and action hashes, but
+does not contact a live model provider for proposal or execution. The object is
+not inference authority: it grants no model gateway, bearer, socket mount, or
+additional network access, and extensions must not treat its legacy endpoint
+field as authorization. Capability/runtime hashes, approval leases, and input
+artifact identities remain revalidated normally.
+
+Renderer proposal IPC supplies only an opaque model-lease ID. Main uses the
+snapshot it minted into that lease; the renderer cannot submit replacement
+model metadata. The action service, not IPC, applies the capability-specific
+live-provider policy, so MCP and declared `modelAccess` actions still fail
+closed on exact current-model drift.
+
+A declared model-access PROCESS never receives the raw host endpoint or mutable
+model name. After main revalidates the capability, `proposalHash`, and exact
+selected model, it acquires one private lease and instead passes:
 
 ```json
 {

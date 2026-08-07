@@ -270,12 +270,23 @@ For a declared model-access action, main additionally inherits one already-open
 private gateway-directory FD and bubblewrap mounts only that directory read-only
 at `/run/modly/model` while retaining `--unshare-all`. The pathname AF_UNIX
 gateway accepts exactly one authenticated `POST /v1/responses`. Request and
-response bodies, request-body idle time, and total upstream time are bounded;
-the short body-idle timer is disabled before potentially long inference. V1
-accepts only non-streaming, stateless requests without tools, rewrites the child
-sentinel model `approved` to the provider-private alias, and rejects replay.
-Cancellation, timeout, process failure, success, and shutdown revoke the lease,
-abort upstream work, destroy connections, and remove the socket directory.
+response bodies and request-body idle time are bounded. The lease lifetime and
+active upstream request budget are separate: production leases expire after at
+most 270 seconds, while one accepted forward receives at most 210 seconds. A
+five-second minimum start budget and ten-second gateway cleanup reserve keep the
+gateway bounded below the Agent PROCESS independent 300-second outer watchdog;
+that watchdog can still abort the lease first. `expiresAt` describes the actual
+lease lifetime; immediately before forwarding, main caps the request budget by
+the remaining lease minus its cleanup reserve and rejects a request that starts
+too late. These constants remain main-private and are not copied to renderer or
+extension context. The short body-idle timer is disabled before
+potentially long inference. V1 accepts only non-streaming, stateless requests
+without tools, rewrites the child sentinel model `approved` to the
+provider-private alias, and rejects replay. Lease or request deadline expiry
+aborts upstream work and attempts one bounded structured `504` before socket
+teardown; cancellation, process failure, success, and shutdown still revoke the
+lease, destroy connections, and remove the socket directory without replay or
+double responses.
 
 The gateway directory is `0700`, the socket is `0600`, and the bearer is random.
 For each action, main starts the exact pinned Ollama binary through pinned

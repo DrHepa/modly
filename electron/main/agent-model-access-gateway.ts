@@ -27,7 +27,10 @@ export interface AgentModelAccessLimits {
   maxRequestBytes: number
   maxResponseBytes: number
   idleMs: number
-  totalMs: number
+  leaseMs: number
+  requestMs: number
+  minimumRequestMs: number
+  cleanupMs: number
 }
 
 export interface AgentModelExecutionLeaseV1 {
@@ -73,8 +76,14 @@ const DEFAULT_LIMITS: Readonly<AgentModelAccessLimits> = Object.freeze({
   maxRequestBytes: 1024 * 1024,
   maxResponseBytes: 4 * 1024 * 1024,
   idleMs: 30_000,
-  totalMs: 180_000,
+  leaseMs: 270_000,
+  requestMs: 210_000,
+  minimumRequestMs: 5_000,
+  cleanupMs: 10_000,
 })
+const MAX_LEASE_MS = 270_000
+const MAX_REQUEST_MS = 210_000
+const MAX_RESPONSE_DRAIN_MS = 1_000
 
 const APPROVED_MODEL = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*){0,2}(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/
 
@@ -98,13 +107,27 @@ function normalizeBound(value: unknown, fallback: number, maximum: number): numb
 }
 
 function normalizeLimits(value: AcquireAgentModelAccessGatewayOptions['limits']): Readonly<AgentModelAccessLimits> {
-  return Object.freeze({
+  if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value)
+    || Reflect.ownKeys(value).some((key) => typeof key !== 'string' || ![
+      'maxRequestBytes', 'maxResponseBytes', 'idleMs', 'leaseMs', 'requestMs', 'minimumRequestMs', 'cleanupMs',
+    ].includes(key)))) {
+    throw new TypeError('Agent model access limit is invalid')
+  }
+  const normalized: AgentModelAccessLimits = {
     maxRequests: 1,
     maxRequestBytes: normalizeBound(value?.maxRequestBytes, DEFAULT_LIMITS.maxRequestBytes, 8 * 1024 * 1024),
     maxResponseBytes: normalizeBound(value?.maxResponseBytes, DEFAULT_LIMITS.maxResponseBytes, 16 * 1024 * 1024),
     idleMs: normalizeBound(value?.idleMs, DEFAULT_LIMITS.idleMs, 120_000),
-    totalMs: normalizeBound(value?.totalMs, DEFAULT_LIMITS.totalMs, 10 * 60_000),
-  })
+    leaseMs: normalizeBound(value?.leaseMs, DEFAULT_LIMITS.leaseMs, MAX_LEASE_MS),
+    requestMs: normalizeBound(value?.requestMs, DEFAULT_LIMITS.requestMs, MAX_REQUEST_MS),
+    minimumRequestMs: normalizeBound(value?.minimumRequestMs, DEFAULT_LIMITS.minimumRequestMs, 30_000),
+    cleanupMs: normalizeBound(value?.cleanupMs, DEFAULT_LIMITS.cleanupMs, 30_000),
+  }
+  if (normalized.minimumRequestMs > normalized.requestMs
+    || normalized.minimumRequestMs + normalized.cleanupMs >= normalized.leaseMs) {
+    throw new TypeError('Agent model access limit is invalid')
+  }
+  return Object.freeze(normalized)
 }
 
 function authorized(value: string | undefined, token: string): boolean {
@@ -114,8 +137,8 @@ function authorized(value: string | undefined, token: string): boolean {
   return candidate.length === expected.length && timingSafeEqual(candidate, expected)
 }
 
-function sendJson(response: ServerResponse, status: number, value: unknown): void {
-  if (response.headersSent || response.destroyed) return
+function sendJson(response: ServerResponse, status: number, value: unknown): boolean {
+  if (response.headersSent || response.destroyed) return false
   const body = JSON.stringify(value)
   response.writeHead(status, {
     'content-type': 'application/json',
@@ -124,6 +147,24 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
     connection: 'close',
   })
   response.end(body)
+  return true
+}
+
+async function raceForward<T>(forward: Promise<T>, signal: AbortSignal): Promise<T> {
+  const abortFailure = () => signal.reason instanceof GatewayHttpError
+    ? signal.reason
+    : new GatewayHttpError(504, 'gateway_timeout')
+  if (signal.aborted) throw abortFailure()
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortFailure())
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([forward, aborted])
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+  }
 }
 
 async function readBoundedBody(request: IncomingMessage, maximum: number): Promise<Buffer> {
@@ -223,7 +264,8 @@ export async function acquireAgentModelAccessGateway(
   const hostSocketPath = join(directoryPath, 'gateway.sock')
   const bearerToken = randomBytes(32).toString('base64url')
   const leaseId = randomUUID()
-  const expiresAt = new Date(now().getTime() + limits.totalMs).toISOString()
+  const expiresAt = new Date(now().getTime() + limits.leaseMs).toISOString()
+  const leaseDeadline = Date.parse(expiresAt)
   const tokenHash = createHash('sha256').update(bearerToken).digest('hex')
   const privateModelAliasHash = createHash('sha256').update(options.privateModelAlias).digest('hex')
   const approvedModelNameHash = createHash('sha256').update(options.approvedModelName).digest('hex')
@@ -252,7 +294,53 @@ export async function acquireAgentModelAccessGateway(
   let socketIdentity: Awaited<ReturnType<typeof lstat>> | undefined
   let closePromise: Promise<void> | undefined
   let leaseTimer: NodeJS.Timeout | undefined
+  let responseDrainTimer: NodeJS.Timeout | undefined
+  let leaseExpired = false
   const requestAbortControllers = new Set<AbortController>()
+  const activeResponses = new Set<ServerResponse>()
+
+  const closeExpiredLeaseWhenSettled = () => {
+    if (leaseExpired && requestAbortControllers.size === 0 && activeResponses.size === 0) void close()
+  }
+
+  const scheduleResponseDrain = () => {
+    responseDrainTimer ??= setTimeout(
+      () => { void close() },
+      Math.min(limits.cleanupMs, MAX_RESPONSE_DRAIN_MS),
+    )
+    responseDrainTimer.unref()
+  }
+
+  const trackResponse = (response: ServerResponse) => {
+    if (activeResponses.has(response)) return
+    activeResponses.add(response)
+    const settle = () => {
+      response.off('finish', settle)
+      response.off('close', settle)
+      activeResponses.delete(response)
+      closeExpiredLeaseWhenSettled()
+    }
+    response.once('finish', settle)
+    response.once('close', settle)
+  }
+
+  const sendTrackedJson = (response: ServerResponse, status: number, value: unknown): boolean => {
+    if (response.headersSent || response.destroyed) return false
+    trackResponse(response)
+    const sent = sendJson(response, status, value)
+    if (sent && leaseExpired) scheduleResponseDrain()
+    return sent
+  }
+
+  const remainingLeaseMs = (): number => leaseDeadline - now().getTime()
+
+  const requestBudgetMs = (): number => {
+    const available = remainingLeaseMs() - limits.cleanupMs
+    if (leaseExpired || available < limits.minimumRequestMs) {
+      throw new GatewayHttpError(504, 'insufficient_lease_time')
+    }
+    return Math.min(limits.requestMs, available)
+  }
 
   const server = createServer((request, response) => {
     void (async () => {
@@ -266,6 +354,7 @@ export async function acquireAgentModelAccessGateway(
         }
         if (consumed) throw new GatewayHttpError(409, 'lease_consumed')
         consumed = true
+        requestBudgetMs()
         if (!/^application\/json(?:\s*;|$)/i.test(String(request.headers['content-type'] ?? ''))) {
           throw new GatewayHttpError(415, 'unsupported_media_type')
         }
@@ -279,27 +368,40 @@ export async function acquireAgentModelAccessGateway(
         let parsed: unknown
         try { parsed = JSON.parse(raw.toString('utf8')) } catch { throw new GatewayHttpError(400, 'invalid_json') }
         const body = normalizeResponsesRequest(parsed, options.privateModelAlias)
+        const activeRequestMs = requestBudgetMs()
         const controller = new AbortController()
         requestAbortControllers.add(controller)
-        const abort = () => controller.abort()
+        const abort = () => controller.abort(new GatewayHttpError(503, 'gateway_cancelled'))
         options.signal.addEventListener('abort', abort, { once: true })
-        const timeout = setTimeout(abort, limits.totalMs)
+        const timeout = setTimeout(expireLease, activeRequestMs)
         timeout.unref()
         try {
-          const forwarded = await options.forward(body, controller.signal)
-          if (controller.signal.aborted) throw new GatewayHttpError(504, 'gateway_timeout')
+          const forwarded = await raceForward(
+            Promise.resolve().then(() => options.forward(body, controller.signal)),
+            controller.signal,
+          )
+          if (controller.signal.aborted) throw controller.signal.reason
           const result = redactPrivateAlias(normalizeJsonValue(forwarded), options.privateModelAlias)
           const bytes = Buffer.from(JSON.stringify(result), 'utf8')
           if (bytes.length > limits.maxResponseBytes) throw new GatewayHttpError(502, 'response_too_large')
-          sendJson(response, 200, result)
+          if (controller.signal.aborted || leaseExpired) {
+            throw controller.signal.reason instanceof GatewayHttpError
+              ? controller.signal.reason
+              : new GatewayHttpError(504, 'gateway_timeout')
+          }
+          sendTrackedJson(response, 200, result)
         } finally {
           clearTimeout(timeout)
           options.signal.removeEventListener('abort', abort)
           requestAbortControllers.delete(controller)
         }
       } catch (error) {
-        const failure = error instanceof GatewayHttpError ? error : new GatewayHttpError(502, 'upstream_unavailable')
-        sendJson(response, failure.status, { error: { code: failure.code } })
+        const failure = leaseExpired
+          ? new GatewayHttpError(504, 'gateway_timeout')
+          : error instanceof GatewayHttpError ? error : new GatewayHttpError(502, 'upstream_unavailable')
+        sendTrackedJson(response, failure.status, { error: { code: failure.code } })
+      } finally {
+        closeExpiredLeaseWhenSettled()
       }
     })()
   })
@@ -312,7 +414,10 @@ export async function acquireAgentModelAccessGateway(
     closePromise ??= (async () => {
       options.signal.removeEventListener('abort', abortLease)
       clearTimeout(leaseTimer)
-      for (const controller of requestAbortControllers) controller.abort()
+      clearTimeout(responseDrainTimer)
+      for (const controller of requestAbortControllers) {
+        controller.abort(new GatewayHttpError(503, 'gateway_cancelled'))
+      }
       for (const socket of connections) socket.destroy()
       await new Promise<void>((resolveClose) => {
         if (!server.listening) return resolveClose()
@@ -324,6 +429,14 @@ export async function acquireAgentModelAccessGateway(
     return closePromise
   }
   const abortLease = () => { void close() }
+  const expireLease = () => {
+    leaseExpired = true
+    for (const controller of requestAbortControllers) {
+      controller.abort(new GatewayHttpError(504, 'gateway_timeout'))
+    }
+    if (activeResponses.size > 0) scheduleResponseDrain()
+    closeExpiredLeaseWhenSettled()
+  }
 
   try {
     await new Promise<void>((resolveListen, rejectListen) => {
@@ -337,7 +450,9 @@ export async function acquireAgentModelAccessGateway(
     socketIdentity = await lstat(hostSocketPath)
     if (!socketIdentity.isSocket()) throw new TypeError('Agent model access socket is not a Unix socket')
     options.signal.addEventListener('abort', abortLease, { once: true })
-    leaseTimer = setTimeout(abortLease, limits.totalMs)
+    const remaining = remainingLeaseMs()
+    if (remaining <= 0) throw new Error('Agent model access gateway lease expired before listening')
+    leaseTimer = setTimeout(expireLease, remaining)
     leaseTimer.unref()
     if (options.signal.aborted) {
       await close()
@@ -361,7 +476,7 @@ export async function acquireAgentModelAccessGateway(
       hostSocketPath,
       directoryHandle,
       revalidate: async () => {
-        if (closePromise || !server.listening || options.signal.aborted || now().getTime() >= Date.parse(expiresAt)) {
+        if (closePromise || leaseExpired || !server.listening || options.signal.aborted || now().getTime() >= leaseDeadline) {
           throw new Error('Agent model access lease is unavailable')
         }
         const directory = await directoryHandle.stat({ bigint: true })

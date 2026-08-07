@@ -13,6 +13,7 @@ import {
   probeAgentPrivateOllamaDaemon,
   startAgentPrivateOllamaDaemon,
 } from './agent-ollama-private-daemon.ts'
+import type { OpenAgentOllamaGpuDeviceAuthority } from './agent-ollama-gpu-device-authority.ts'
 import type { OpenVerifiedOllamaModel } from './agent-ollama-model-store.ts'
 import type { OpenAgentOllamaRuntimeTree } from './agent-ollama-runtime-tree.ts'
 
@@ -58,6 +59,21 @@ function fakeRuntime(root: string): OpenAgentOllamaRuntimeTree {
   }
 }
 
+function fakeAccelerator(mode: 'cpu' | 'nvidia' = 'cpu'): OpenAgentOllamaGpuDeviceAuthority {
+  let closed = false
+  return {
+    mode,
+    devicePaths: mode === 'nvidia'
+      ? ['/dev/nvidiactl', '/dev/nvidia0', '/dev/nvidia2', '/dev/nvidia-uvm']
+      : [],
+    sysfsPaths: mode === 'nvidia'
+      ? ['/sys/module/nvidia/initstate', '/sys/module/nvidia_uvm/initstate']
+      : [],
+    revalidate: async () => { if (closed) throw new Error('closed') },
+    close: async () => { closed = true },
+  }
+}
+
 function fakeOwned(server: Server): AgentOwnedProcess {
   let resolveExit!: (value: { code: number | null, signal: NodeJS.Signals | null }) => void
   const exited = new Promise<{ code: number | null, signal: NodeJS.Signals | null }>((resolve) => { resolveExit = resolve })
@@ -82,6 +98,7 @@ test('private Ollama launch is cloud-disabled and mounts only the alias model gr
   const model = fakeModel(root)
   const plan = buildAgentPrivateOllamaLaunch({
     model,
+    accelerator: fakeAccelerator('nvidia'),
     alias: 'modly-private-0123456789abcdef:latest',
     port: 43123,
     storeRoot: root,
@@ -112,6 +129,28 @@ test('private Ollama launch is cloud-disabled and mounts only the alias model gr
     entry === '--ro-bind-fd' && plan.args[index + 1] === '5'
   )), true, 'the canonical runner tree is hidden before its exact directory FD mount')
   assert.equal(plan.args.filter((entry) => entry === '--ro-bind-fd').length, 4)
+  const rootBindIndex = plan.args.findIndex((entry, index) => (
+    entry === '--ro-bind' && plan.args[index + 1] === '/' && plan.args[index + 2] === '/'
+  ))
+  const procIndex = plan.args.findIndex((entry, index) => entry === '--proc' && plan.args[index + 1] === '/proc')
+  const devIndex = plan.args.findIndex((entry, index) => entry === '--dev' && plan.args[index + 1] === '/dev')
+  const sysIndex = plan.args.findIndex((entry, index) => entry === '--tmpfs' && plan.args[index + 1] === '/sys')
+  assert.equal(rootBindIndex < procIndex && procIndex < devIndex && devIndex < sysIndex, true)
+  const exactPairs = (flag: string) => plan.args.flatMap((entry, index) => entry === flag
+    ? [[plan.args[index + 1], plan.args[index + 2]]]
+    : [])
+  assert.deepEqual(exactPairs('--dev-bind'), [
+    ['/dev/nvidiactl', '/dev/nvidiactl'],
+    ['/dev/nvidia0', '/dev/nvidia0'],
+    ['/dev/nvidia2', '/dev/nvidia2'],
+    ['/dev/nvidia-uvm', '/dev/nvidia-uvm'],
+  ])
+  assert.deepEqual(exactPairs('--ro-bind').filter(([source]) => source?.startsWith('/sys/')), [
+    ['/sys/module/nvidia/initstate', '/sys/module/nvidia/initstate'],
+    ['/sys/module/nvidia_uvm/initstate', '/sys/module/nvidia_uvm/initstate'],
+  ])
+  assert.equal(plan.args.includes('/dev/nvidia-modeset'), false)
+  assert.equal(plan.args.includes('/dev/dri'), false)
   await rm(root, { recursive: true, force: true })
 })
 
@@ -121,6 +160,7 @@ test('private Ollama launch creates runtime and nested store paths only below wr
   t.after(() => rm(root, { recursive: true, force: true }))
   const plan = buildAgentPrivateOllamaLaunch({
     model: fakeModel(root),
+    accelerator: fakeAccelerator(),
     alias: 'modly-private-0123456789abcdef:latest',
     port: 43123,
     storeRoot: root,
@@ -147,6 +187,14 @@ test('private Ollama launch creates runtime and nested store paths only below wr
   assert.equal(plan.args[runnerTreeBindIndex + 2], join(runtimeRoot, 'lib', 'ollama'))
   assert.deepEqual(plan.args.slice(-4), ['--chdir', '/', join(runtimeRoot, 'bin', 'ollama'), 'serve'])
   assert.equal(plan.args.includes('/runtime'), false)
+  assert.equal(plan.args.includes('--dev-bind'), false)
+  assert.equal(plan.args.some((entry, index) => entry === '--ro-bind'
+    && (plan.args[index + 1] === '/dev' || plan.args[index + 1] === '/sys')), false)
+  const cpuRootIndex = optionIndex('--ro-bind', '/')
+  const cpuProcIndex = optionIndex('--proc', '/proc')
+  const cpuDevIndex = optionIndex('--dev', '/dev')
+  const cpuSysIndex = optionIndex('--tmpfs', '/sys')
+  assert.equal(cpuRootIndex < cpuProcIndex && cpuProcIndex < cpuDevIndex && cpuDevIndex < cpuSysIndex, true)
 
   const privateTmpIndex = optionIndex('--tmpfs', '/tmp')
   const storeRootIndex = optionIndex('--dir', root)
@@ -155,6 +203,7 @@ test('private Ollama launch creates runtime and nested store paths only below wr
 
   assert.throws(() => buildAgentPrivateOllamaLaunch({
     model: fakeModel('/'),
+    accelerator: fakeAccelerator(),
     alias: 'modly-private-0123456789abcdef:latest',
     port: 43123,
     storeRoot: '/',
@@ -166,6 +215,7 @@ test('private Ollama launch creates runtime and nested store paths only below wr
   }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'invalid_binding')
   assert.throws(() => buildAgentPrivateOllamaLaunch({
     model: fakeModel(root),
+    accelerator: fakeAccelerator(),
     alias: 'modly-private-0123456789abcdef:latest',
     port: 43123,
     storeRoot: root,
@@ -192,12 +242,16 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
   const runtime = fakeRuntime(root)
+  const accelerator = fakeAccelerator('nvidia')
   const originalRevalidate = model.revalidate.bind(model)
   const originalRuntimeRevalidate = runtime.revalidate.bind(runtime)
+  const originalAcceleratorRevalidate = accelerator.revalidate.bind(accelerator)
   let modelRevalidations = 0
   let runtimeRevalidations = 0
+  let acceleratorRevalidations = 0
   model.revalidate = async () => { modelRevalidations += 1; await originalRevalidate() }
   runtime.revalidate = async () => { runtimeRevalidations += 1; await originalRuntimeRevalidate() }
+  accelerator.revalidate = async () => { acceleratorRevalidations += 1; await originalAcceleratorRevalidate() }
   const seen: unknown[] = []
   let failResponses = false
   let launchArgs: readonly string[] = []
@@ -209,6 +263,7 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
     bwrap: executable,
     ollama: executable,
     runtime,
+    accelerator,
     model,
     alias: 'modly-private-0123456789abcdef:latest',
     signal: new AbortController().signal,
@@ -270,6 +325,7 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
     )), true)
     assert.equal(inheritedCount, 4, 'Ollama, runner tree, alias manifest, and exact blob remain inherited authorities')
     assert.equal(runtimeRevalidations >= 3, true, 'runner tree is checked before launch and after readiness')
+    assert.equal(acceleratorRevalidations >= 3, true, 'device authority is checked before launch and after readiness')
     assert.equal(readinessRequests, 3, 'one successful readiness pass must issue only version, tags, and show')
     assert.deepEqual(showBodies, [{ model: daemon.alias, verbose: false }])
     const result = await daemon.responses({ model: daemon.alias, input: 'chair' }, new AbortController().signal)
@@ -277,10 +333,12 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
     assert.deepEqual(seen, [{ model: daemon.alias, input: 'chair' }])
     const beforeFailure = modelRevalidations
     const runtimeBeforeFailure = runtimeRevalidations
+    const acceleratorBeforeFailure = acceleratorRevalidations
     failResponses = true
     await assert.rejects(daemon.responses({ model: daemon.alias, input: 'table' }, new AbortController().signal))
     assert.equal(modelRevalidations - beforeFailure, 2, 'model authority is checked before and after a failed request')
     assert.equal(runtimeRevalidations - runtimeBeforeFailure, 2, 'runner tree is checked before and after a failed request')
+    assert.equal(acceleratorRevalidations - acceleratorBeforeFailure, 2, 'device authority is checked before and after a failed request')
     await daemon.revalidate()
   } finally {
     await daemon.close()
@@ -302,6 +360,7 @@ test('private Ollama daemon retries a collided random loopback port without shar
     bwrap: executable,
     ollama: executable,
     runtime: fakeRuntime(root),
+    accelerator: fakeAccelerator(),
     model,
     alias: 'modly-private-0011223344556677:latest',
     signal: new AbortController().signal,
@@ -341,6 +400,7 @@ test('private Ollama daemon fails closed on early non-zero exit', async (t) => {
     bwrap: executable,
     ollama: executable,
     runtime: fakeRuntime(root),
+    accelerator: fakeAccelerator(),
     model,
     alias: 'modly-private-fedcba9876543210:latest',
     signal: new AbortController().signal,
@@ -368,6 +428,7 @@ test('private Ollama daemon bounds readiness and cleans every timed-out attempt'
       bwrap: executable,
       ollama: executable,
       runtime: fakeRuntime(root),
+      accelerator: fakeAccelerator(),
       model,
       alias: 'modly-private-abcdef0123456789:latest',
       signal: new AbortController().signal,
@@ -420,6 +481,7 @@ test('private Ollama probe never mistakes a colliding shared endpoint for its ow
       bwrap: executable,
       ollama: executable,
       runtime: fakeRuntime(root),
+      accelerator: fakeAccelerator('nvidia'),
       signal: new AbortController().signal,
       readinessMs: 50,
       choosePort: () => port,
@@ -442,6 +504,16 @@ test('private Ollama probe never mistakes a colliding shared endpoint for its ow
     const runnerTreeIndex = probeArgs.findIndex((entry, index) => entry === '--ro-bind-fd'
       && probeArgs[index + 2] === '/run/modly-ollama-runtime/lib/ollama')
     assert.equal(privateRunIndex < runtimeIndex && runtimeIndex < binaryIndex && binaryIndex < runnerTreeIndex, true)
+    assert.deepEqual(probeArgs.flatMap((entry, index) => entry === '--dev-bind'
+      ? [[probeArgs[index + 1], probeArgs[index + 2]]]
+      : []), [
+      ['/dev/nvidiactl', '/dev/nvidiactl'],
+      ['/dev/nvidia0', '/dev/nvidia0'],
+      ['/dev/nvidia2', '/dev/nvidia2'],
+      ['/dev/nvidia-uvm', '/dev/nvidia-uvm'],
+    ])
+    assert.equal(probeArgs.some((entry, index) => entry === '--proc' && probeArgs[index + 1] === '/proc'), true)
+    assert.equal(probeArgs.some((entry, index) => entry === '--dev' && probeArgs[index + 1] === '/dev'), true)
   } finally {
     await new Promise<void>((resolve) => decoy.close(() => resolve()))
     await executable.close()

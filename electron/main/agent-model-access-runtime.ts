@@ -17,6 +17,10 @@ import {
   type PinnedAgentExecutable,
 } from './agent-owned-process.ts'
 import {
+  openAgentOllamaGpuDeviceAuthority,
+  type OpenAgentOllamaGpuDeviceAuthority,
+} from './agent-ollama-gpu-device-authority.ts'
+import {
   openVerifiedOllamaModel,
   probeOllamaModelStore,
   type OpenVerifiedOllamaModel,
@@ -78,6 +82,7 @@ interface AgentModelAccessReadinessProbeInput {
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
   runtime: OpenAgentOllamaRuntimeTree
+  accelerator: OpenAgentOllamaGpuDeviceAuthority
   signal: AbortSignal
 }
 
@@ -86,6 +91,7 @@ export interface CreateAgentModelAccessRuntimeOptions extends ResolveAgentOllama
   readinessCacheMs?: number
   staleMs?: number
   readinessProbe?: (input: Readonly<AgentModelAccessReadinessProbeInput>) => boolean | Promise<boolean | void> | void
+  openGpuDeviceAuthority?: () => Promise<OpenAgentOllamaGpuDeviceAuthority>
   startPrivateDaemon?: (options: StartAgentPrivateOllamaDaemonOptions) => Promise<AgentPrivateOllamaDaemon>
   probePrivateDaemon?: (options: ProbeAgentPrivateOllamaDaemonOptions) => Promise<void>
 }
@@ -226,21 +232,27 @@ async function cleanStaleDirectories(root: string, staleMs: number): Promise<voi
   }
 }
 
-async function openAuthorities(configuration: Readonly<AgentOllamaConfiguration>): Promise<{
+async function openAuthorities(
+  configuration: Readonly<AgentOllamaConfiguration>,
+  openGpuDeviceAuthority: () => Promise<OpenAgentOllamaGpuDeviceAuthority>,
+): Promise<{
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
   runtime: OpenAgentOllamaRuntimeTree
+  accelerator: OpenAgentOllamaGpuDeviceAuthority
 }> {
   let bwrap: PinnedAgentExecutable | undefined
   let ollama: PinnedAgentExecutable | undefined
   let runtime: OpenAgentOllamaRuntimeTree | undefined
+  let accelerator: OpenAgentOllamaGpuDeviceAuthority | undefined
   try {
     bwrap = await openPinnedAgentExecutable(configuration.bwrapPath, 'bubblewrap executable')
     ollama = await openPinnedAgentExecutable(configuration.binaryPath, 'Ollama executable')
     runtime = await openAgentOllamaRuntimeTree(configuration.runtimeDir)
-    return { bwrap, ollama, runtime }
+    accelerator = await openGpuDeviceAuthority()
+    return { bwrap, ollama, runtime, accelerator }
   } catch (error) {
-    await Promise.all([bwrap?.close(), ollama?.close(), runtime?.close()])
+    await Promise.all([bwrap?.close(), ollama?.close(), runtime?.close(), accelerator?.close()])
     throw error
   }
 }
@@ -263,6 +275,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
   const inFlightOperations = new Set<Promise<unknown>>()
   const startPrivateDaemon = options.startPrivateDaemon ?? startAgentPrivateOllamaDaemon
   const probePrivateDaemon = options.probePrivateDaemon ?? probeAgentPrivateOllamaDaemon
+  const openGpuDeviceAuthority = options.openGpuDeviceAuthority ?? openAgentOllamaGpuDeviceAuthority
 
   const initialize = (): Promise<string> => {
     initialized ??= (async () => {
@@ -301,7 +314,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
       try {
         const [root, resolved] = await Promise.all([initialize(), configuration()])
         if (!await probeOllamaModelStore(resolved.modelsDir)) return false
-        authorities = await openAuthorities(resolved)
+        authorities = await openAuthorities(resolved, openGpuDeviceAuthority)
         if (options.readinessProbe) {
           const result = await options.readinessProbe({
             root, configuration: resolved, ...authorities, signal: controller.signal,
@@ -314,7 +327,10 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
         return false
       } finally {
         readinessControllers.delete(controller)
-        await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close()])
+        await Promise.all([
+          authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close(),
+          authorities?.accelerator.close(),
+        ])
       }
     })()
     const tracked = trackOperation(promise)
@@ -354,7 +370,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
     let gateway: AgentModelExecutionLeaseV1 | undefined
     try {
       const [root, resolved] = await Promise.all([initialize(), configuration()])
-      authorities = await openAuthorities(resolved)
+      authorities = await openAuthorities(resolved, openGpuDeviceAuthority)
       verified = await openVerifiedOllamaModel({
         modelsDir: resolved.modelsDir,
         model: model.model,
@@ -392,7 +408,10 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
           await gateway!.close().catch(() => undefined)
           await daemon!.close().catch(() => undefined)
           await verified!.close().catch(() => undefined)
-          await Promise.all([authorities!.bwrap.close(), authorities!.ollama.close(), authorities!.runtime.close()])
+          await Promise.all([
+            authorities!.bwrap.close(), authorities!.ollama.close(), authorities!.runtime.close(),
+            authorities!.accelerator.close(),
+          ])
         })()
         return closePromise
       }
@@ -422,7 +441,10 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
       await gateway?.close().catch(() => undefined)
       await daemon?.close().catch(() => undefined)
       await verified?.close().catch(() => undefined)
-      await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close()])
+      await Promise.all([
+        authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close(),
+        authorities?.accelerator.close(),
+      ])
       if (error instanceof AgentModelAccessRuntimeError) throw error
       throw new AgentModelAccessRuntimeError('provider_unavailable', error)
     }

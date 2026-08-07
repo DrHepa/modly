@@ -112,6 +112,26 @@ identity, opens the canonical root with `O_DIRECTORY|O_NOFOLLOW`, and
 revalidates the snapshot before launch and governed requests. Errors and public
 contracts never contain its host path or metadata digest.
 
+GPU/device access is another main-only authority. Every daemon gets a fresh
+procfs, a private minimal `/dev`, and a private `/sys`; broad host `/dev` and
+sysfs are never mounted. A genuinely NVIDIA-free host uses the CPU-only profile
+with no device or sysfs bindings. Any NVIDIA evidence must instead form one
+complete bounded set: root-owned safe character devices for `nvidiactl`,
+`nvidia-uvm`, and at least one numerically ordered `nvidiaN`, with the expected
+control/GPU/UVM major-minor relationships, plus the exact safe regular
+`nvidia` and `nvidia_uvm` module `initstate` files in the live state. Partial,
+aliased, malformed, unsafe, oversized, or mutated topology fails closed rather
+than silently selecting CPU. Main snapshots and revalidates this identity
+immediately before launch, after readiness, and around governed requests. No
+device path, number, identity, or readiness cause enters renderer, persistence,
+extension context, or public errors.
+
+The CPU-only profile exposes an empty private sysfs. It remains available only
+when the same non-inference private-daemon metadata probe starts successfully;
+a failure stays internal and default-denied rather than restoring broad sysfs.
+Neither the CPU nor NVIDIA profile proves inference readiness. NVIDIA binding
+proves only that the verified daemon discovered the permitted device topology.
+
 Readiness uses a cached, bounded, non-inference private-daemon probe and
 requires a canonical store with at least one bounded manifest graph. Exact
 selected-model validation remains an action-acquisition check.
@@ -251,11 +271,11 @@ private gateway-directory FD and bubblewrap mounts only that directory read-only
 at `/run/modly/model` while retaining `--unshare-all`. The pathname AF_UNIX
 gateway accepts exactly one authenticated `POST /v1/responses`. Request and
 response bodies, request-body idle time, and total upstream time are bounded;
-the short body-idle timer is disabled before potentially long inference. V1 accepts only
-non-streaming, stateless requests without tools, rewrites the child sentinel
-model `approved` to the provider-private alias, and rejects replay. Cancellation,
-timeout, process failure, success, and shutdown revoke the lease, abort upstream
-work, destroy connections, and remove the socket directory.
+the short body-idle timer is disabled before potentially long inference. V1
+accepts only non-streaming, stateless requests without tools, rewrites the child
+sentinel model `approved` to the provider-private alias, and rejects replay.
+Cancellation, timeout, process failure, success, and shutdown revoke the lease,
+abort upstream work, destroy connections, and remove the socket directory.
 
 The gateway directory is `0700`, the socket is `0600`, and the bearer is random.
 For each action, main starts the exact pinned Ollama binary through pinned
@@ -267,17 +287,21 @@ mutable host tag names are not used by the daemon. The pinned runner-directory
 FD is independently mounted read-only and zero-copy at
 `/run/modly-ollama-runtime/lib/ollama`, matching the relocated executable's
 private prefix without copying or exposing the host runner tree. The daemon
-receives a cleared, fixed environment, `OLLAMA_NO_CLOUD=1`, one-model/one-request
-resource limits, and a collision-retried random loopback listener. Discovery
-readiness starts an empty private daemon and checks bounded `/api/version`; it
-does not load a model. Per-action daemon readiness additionally checks the exact
-alias and digest through bounded `/api/tags` and `/api/show`. Ollama's exact
-lowercase raw 64-hex and `sha256:<64-hex>` tag digests normalize to the same
-canonical binding; uppercase, malformed, or other-algorithm values fail closed.
-Bounded exponential backoff and an attempt ceiling prevent readiness request
-storms. Neither probe claims model loadability or successful inference. The
-extension never receives that TCP endpoint or alias: only the authenticated
-AF_UNIX gateway enters its network-isolated PROCESS sandbox.
+uses fresh procfs and private device/sysfs mounts. The NVIDIA profile binds only
+the verified `nvidiactl`, numeric GPU, and `nvidia-uvm` device paths plus the two
+module state files. It does not bind `nvidia-modeset`, `nvidia-uvm-tools`, NVIDIA
+caps, DRI, or broad host device/sysfs trees. The daemon receives a cleared,
+fixed environment, `OLLAMA_NO_CLOUD=1`, one-model/one-request resource limits,
+and a collision-retried random loopback listener. Discovery readiness starts an
+empty private daemon and checks bounded `/api/version`; it does not load a
+model. Per-action daemon readiness additionally checks the exact alias and
+digest through bounded `/api/tags` and `/api/show`. Ollama's exact lowercase raw
+64-hex and `sha256:<64-hex>` tag digests normalize to the same canonical binding;
+uppercase, malformed, or other-algorithm values fail closed. Bounded exponential
+backoff and an attempt ceiling prevent readiness request storms. Neither probe
+claims model loadability or successful inference. The extension never receives
+that TCP endpoint or alias: only the authenticated AF_UNIX gateway enters its
+network-isolated PROCESS sandbox.
 
 This v1 assurance is deliberately named
 `pinned-local-cooperative-host`. It protects the approved action from mutable
@@ -293,12 +317,12 @@ the transient loopback listener. Its random port is not an authentication
 mechanism; the bearer authenticates only the extension-facing AF_UNIX gateway.
 The daemon sandbox also retains a broad read-only host view for the pinned
 dynamically linked executable and drivers, while replacing `/home`, `/tmp`,
-`/run`, the canonical model store, and the canonical runner directory with
-private mounts. The assurance trusts that pinned executable as cooperative and
-does not claim to contain a malicious configured binary. Missing configuration,
-binary/store/runtime drift, failed user namespaces, private-daemon probe
-failure, or selected-model verification failure remains default-deny with no
-local-to-cloud fallback.
+`/run`, `/dev`, `/sys`, procfs, the canonical model store, and the canonical
+runner directory with private or freshly mounted views. The assurance trusts
+that pinned executable as cooperative and does not claim to contain a malicious
+configured binary. Missing configuration, binary/store/runtime/device drift,
+failed user namespaces, private-daemon probe failure, or selected-model
+verification failure remains default-deny with no local-to-cloud fallback.
 
 The sandbox also exposes bounded read-only host OS ABI, standard-library, and
 library trees needed by ordinary Python and native packages. Those mounts are

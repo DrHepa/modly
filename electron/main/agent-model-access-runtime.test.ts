@@ -8,6 +8,7 @@ import test from 'node:test'
 
 import { createAgentModelAccessRuntime, resolveAgentOllamaConfiguration } from './agent-model-access-runtime.ts'
 import type { AgentPrivateOllamaDaemon } from './agent-ollama-private-daemon.ts'
+import type { OpenAgentOllamaGpuDeviceAuthority } from './agent-ollama-gpu-device-authority.ts'
 import type { AgentProcessModelAccessDeclarationV1, AgentCapabilitySnapshotV1 } from '../../src/shared/types/agentActions.ts'
 
 const declaration: AgentProcessModelAccessDeclarationV1 = {
@@ -16,6 +17,25 @@ const declaration: AgentProcessModelAccessDeclarationV1 = {
 }
 
 const hash = (value: Buffer | string) => `sha256:${createHash('sha256').update(value).digest('hex')}` as const
+
+function fakeAccelerator(counters?: { opened: number, closed: number, revalidated: number }): OpenAgentOllamaGpuDeviceAuthority {
+  if (counters) counters.opened += 1
+  let closed = false
+  return {
+    mode: 'nvidia',
+    devicePaths: ['/dev/nvidiactl', '/dev/nvidia0', '/dev/nvidia-uvm'],
+    sysfsPaths: ['/sys/module/nvidia/initstate', '/sys/module/nvidia_uvm/initstate'],
+    revalidate: async () => {
+      if (closed) throw new Error('closed')
+      if (counters) counters.revalidated += 1
+    },
+    close: async () => {
+      if (closed) return
+      closed = true
+      if (counters) counters.closed += 1
+    },
+  }
+}
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'modly-model-runtime-'))
@@ -151,6 +171,7 @@ test('model access runtime keeps readiness/acquisition aligned and binds a one-s
   const calls: unknown[] = []
   let daemonClosed = 0
   let aliasSeen = ''
+  const acceleratorCounters = { opened: 0, closed: 0, revalidated: 0 }
   const runtime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private'),
     env: {
@@ -160,10 +181,17 @@ test('model access runtime keeps readiness/acquisition aligned and binds a one-s
     },
     bwrapPath: binary,
     homeDir: fixtureRoot.root,
-    readinessProbe: async () => true,
+    openGpuDeviceAuthority: async () => fakeAccelerator(acceleratorCounters),
+    readinessProbe: async (input) => {
+      assert.equal(input.accelerator.mode, 'nvidia')
+      await input.accelerator.revalidate()
+      return true
+    },
     startPrivateDaemon: async (options): Promise<AgentPrivateOllamaDaemon> => {
       aliasSeen = options.alias
       assert.equal(options.runtime.path, fixtureRoot.runtimeDir)
+      assert.equal(options.accelerator.mode, 'nvidia')
+      await options.accelerator.revalidate()
       await options.runtime.revalidate()
       let closed = false
       return {
@@ -190,12 +218,16 @@ test('model access runtime keeps readiness/acquisition aligned and binds a one-s
     assert.notEqual(aliasSeen, '')
     assert.equal(lease.bindingHash.length, 64)
     assert.equal(JSON.stringify(lease).includes(fixtureRoot.runtimeDir), false)
+    assert.equal(JSON.stringify(lease).includes('/dev/nvidia'), false)
     const response = await unixRequest(lease.hostSocketPath, lease.bearerToken, { model: 'approved', input: 'chair' })
     assert.equal(response.status, 200)
     assert.deepEqual(response.body, { model: 'approved', output_text: 'ok' })
     assert.deepEqual(calls, [{ model: aliasSeen, input: 'chair' }])
     await runtime.shutdown()
     assert.equal(daemonClosed, 1)
+    assert.equal(acceleratorCounters.opened, 2)
+    assert.equal(acceleratorCounters.closed, 2)
+    assert.equal(acceleratorCounters.revalidated >= 2, true)
     await assert.rejects(lease.revalidate())
     await lease.close()
     assert.deepEqual(await readdir(join(fixtureRoot.root, 'private')), [])
@@ -223,6 +255,7 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
   const readinessGate = new Promise<void>((resolve) => { releaseReadiness = resolve })
   let readinessStarted!: () => void
   const readinessEntered = new Promise<void>((resolve) => { readinessStarted = resolve })
+  const readinessAcceleratorCounters = { opened: 0, closed: 0, revalidated: 0 }
   const readinessRuntime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private-readiness'),
     env: {
@@ -231,6 +264,7 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
       MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
     },
     bwrapPath: binary,
+    openGpuDeviceAuthority: async () => fakeAccelerator(readinessAcceleratorCounters),
     readinessProbe: async () => {
       readinessStarted()
       await readinessGate
@@ -246,12 +280,15 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
   releaseReadiness()
   await readinessShutdown
   assert.equal(await readiness, false)
+  assert.equal(readinessAcceleratorCounters.opened, 1)
+  assert.equal(readinessAcceleratorCounters.closed, 1)
 
   let releaseDaemon!: () => void
   const daemonGate = new Promise<void>((resolve) => { releaseDaemon = resolve })
   let daemonStarted!: () => void
   const daemonEntered = new Promise<void>((resolve) => { daemonStarted = resolve })
   let daemonClosed = 0
+  const acquisitionAcceleratorCounters = { opened: 0, closed: 0, revalidated: 0 }
   const acquisitionRuntime = createAgentModelAccessRuntime({
     root: join(fixtureRoot.root, 'private-acquisition'),
     env: {
@@ -260,6 +297,7 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
       MODLY_AGENT_OLLAMA_RUNTIME_DIR: fixtureRoot.runtimeDir,
     },
     bwrapPath: binary,
+    openGpuDeviceAuthority: async () => fakeAccelerator(acquisitionAcceleratorCounters),
     readinessProbe: async () => true,
     startPrivateDaemon: async (options): Promise<AgentPrivateOllamaDaemon> => {
       daemonStarted()
@@ -289,6 +327,8 @@ test('model access shutdown awaits in-flight readiness and acquisition cleanup',
   await acquisitionShutdown
   await assert.rejects(acquisition)
   assert.equal(daemonClosed, 1)
+  assert.equal(acquisitionAcceleratorCounters.opened, 2)
+  assert.equal(acquisitionAcceleratorCounters.closed, 2)
   assert.deepEqual(await readdir(join(fixtureRoot.root, 'private-readiness')), [])
   assert.deepEqual(await readdir(join(fixtureRoot.root, 'private-acquisition')), [])
   await rm(fixtureRoot.root, { recursive: true, force: true })

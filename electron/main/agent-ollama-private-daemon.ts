@@ -10,6 +10,7 @@ import {
   type PinnedAgentExecutable,
   type StartAgentOwnedProcessOptions,
 } from './agent-owned-process.ts'
+import type { OpenAgentOllamaGpuDeviceAuthority } from './agent-ollama-gpu-device-authority.ts'
 import type { OpenVerifiedOllamaModel } from './agent-ollama-model-store.ts'
 import type { OpenAgentOllamaRuntimeTree } from './agent-ollama-runtime-tree.ts'
 
@@ -32,6 +33,7 @@ export interface AgentPrivateOllamaLaunch {
 
 export interface BuildAgentPrivateOllamaLaunchOptions {
   model: OpenVerifiedOllamaModel
+  accelerator: OpenAgentOllamaGpuDeviceAuthority
   alias: string
   port: number
   storeRoot: string
@@ -55,6 +57,7 @@ export interface StartAgentPrivateOllamaDaemonOptions {
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
   runtime: OpenAgentOllamaRuntimeTree
+  accelerator: OpenAgentOllamaGpuDeviceAuthority
   model: OpenVerifiedOllamaModel
   alias: string
   signal: AbortSignal
@@ -70,6 +73,7 @@ export interface ProbeAgentPrivateOllamaDaemonOptions {
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
   runtime: OpenAgentOllamaRuntimeTree
+  accelerator: OpenAgentOllamaGpuDeviceAuthority
   signal: AbortSignal
   readinessMs?: number
   choosePort?: () => number
@@ -151,7 +155,43 @@ function pathContains(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(root === '/' ? '/' : `${root}/`)
 }
 
-function basePrivateLaunch(port: number, storeRoot: string, runtimeSourceRoot: string): string[] {
+function validAcceleratorBinding(accelerator: OpenAgentOllamaGpuDeviceAuthority): boolean {
+  if (!accelerator || typeof accelerator !== 'object' || !Array.isArray(accelerator.devicePaths)
+    || !Array.isArray(accelerator.sysfsPaths)) return false
+  if (accelerator.mode === 'cpu') return accelerator.devicePaths.length === 0 && accelerator.sysfsPaths.length === 0
+  if (accelerator.mode !== 'nvidia' || accelerator.devicePaths.length < 3 || accelerator.devicePaths.length > 34
+    || accelerator.devicePaths[0] !== '/dev/nvidiactl'
+    || accelerator.devicePaths.at(-1) !== '/dev/nvidia-uvm'
+    || accelerator.sysfsPaths.length !== 2
+    || accelerator.sysfsPaths[0] !== '/sys/module/nvidia/initstate'
+    || accelerator.sysfsPaths[1] !== '/sys/module/nvidia_uvm/initstate') return false
+  let previous = -1
+  for (const path of accelerator.devicePaths.slice(1, -1)) {
+    const match = /^\/dev\/nvidia(0|[1-9][0-9]*)$/.exec(path)
+    const index = match ? Number(match[1]) : Number.NaN
+    if (!Number.isSafeInteger(index) || index < 0 || index > 254 || index <= previous) return false
+    previous = index
+  }
+  return true
+}
+
+function appendPrivateAccelerator(args: string[], accelerator: OpenAgentOllamaGpuDeviceAuthority): void {
+  if (!validAcceleratorBinding(accelerator)) throw new AgentPrivateOllamaDaemonError('invalid_binding')
+  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/sys')
+  if (accelerator.mode === 'cpu') return
+  for (const path of accelerator.devicePaths) args.push('--dev-bind', path, path)
+  appendDirectory(args, '/sys/module')
+  appendDirectory(args, '/sys/module/nvidia')
+  appendDirectory(args, '/sys/module/nvidia_uvm')
+  for (const path of accelerator.sysfsPaths) args.push('--ro-bind', path, path)
+}
+
+function basePrivateLaunch(
+  port: number,
+  storeRoot: string,
+  runtimeSourceRoot: string,
+  accelerator: OpenAgentOllamaGpuDeviceAuthority,
+): string[] {
   if (!isAbsolute(storeRoot) || resolve(storeRoot) !== storeRoot
     || !isAbsolute(runtimeSourceRoot) || resolve(runtimeSourceRoot) !== runtimeSourceRoot
     || runtimeSourceRoot === '/'
@@ -168,6 +208,7 @@ function basePrivateLaunch(port: number, storeRoot: string, runtimeSourceRoot: s
     '--hostname', 'modly-ollama',
     '--ro-bind', '/', '/',
   ]
+  appendPrivateAccelerator(args, accelerator)
   if (!PRIVATE_TMPFS_ROOTS.some((root) => pathContains(root, runtimeSourceRoot))) {
     args.push('--tmpfs', runtimeSourceRoot)
   }
@@ -197,7 +238,7 @@ export function buildAgentPrivateOllamaLaunch(options: BuildAgentPrivateOllamaLa
     throw new AgentPrivateOllamaDaemonError('invalid_binding')
   }
   const aliasName = options.alias.slice(0, -':latest'.length)
-  const args = basePrivateLaunch(port, options.storeRoot, options.runtimeSourceRoot)
+  const args = basePrivateLaunch(port, options.storeRoot, options.runtimeSourceRoot, options.accelerator)
   args.push(
     '--dir', join(options.storeRoot, 'manifests', 'registry.ollama.ai', 'library', aliasName),
     '--ro-bind-fd', String(options.ollamaFd), PRIVATE_OLLAMA_PATH,
@@ -220,8 +261,9 @@ function buildProbeLaunch(
   runtimeDirFd: number,
   storeRoot: string,
   runtimeSourceRoot: string,
+  accelerator: OpenAgentOllamaGpuDeviceAuthority,
 ): Readonly<AgentPrivateOllamaLaunch> {
-  const args = basePrivateLaunch(normalizePort(port), storeRoot, runtimeSourceRoot)
+  const args = basePrivateLaunch(normalizePort(port), storeRoot, runtimeSourceRoot, accelerator)
   args.push(
     '--ro-bind-fd', String(ollamaFd), PRIVATE_OLLAMA_PATH,
     '--ro-bind-fd', String(runtimeDirFd), PRIVATE_RUNTIME_TREE_PATH,
@@ -434,7 +476,8 @@ export async function startAgentPrivateOllamaDaemon(
   }
   try {
     await Promise.all([
-      options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate(), options.model.revalidate(),
+      options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate(),
+      options.accelerator.revalidate(), options.model.revalidate(),
     ])
     aliasManifest = await createAliasManifest(root, options.model.manifest.bytes)
     const ollamaFd = 4
@@ -448,6 +491,7 @@ export async function startAgentPrivateOllamaDaemon(
       const candidateEndpoint = `http://127.0.0.1:${port}`
       const plan = buildAgentPrivateOllamaLaunch({
         model: options.model,
+        accelerator: options.accelerator,
         alias: options.alias,
         port,
         storeRoot: options.model.modelsDir,
@@ -462,6 +506,7 @@ export async function startAgentPrivateOllamaDaemon(
           options.bwrap.revalidate(),
           options.ollama.revalidate(),
           options.runtime.revalidate(),
+          options.accelerator.revalidate(),
           options.model.revalidate(),
           revalidateAliasManifest(aliasManifest.path, aliasManifest.handle, aliasManifest.identity),
         ])
@@ -493,6 +538,7 @@ export async function startAgentPrivateOllamaDaemon(
         await Promise.all([
           owned.revalidate(),
           options.runtime.revalidate(),
+          options.accelerator.revalidate(),
           options.model.revalidate(),
           revalidateAliasManifest(aliasManifest.path, aliasManifest.handle, aliasManifest.identity),
         ])
@@ -515,6 +561,7 @@ export async function startAgentPrivateOllamaDaemon(
         await Promise.all([
           options.model.revalidate(),
           options.runtime.revalidate(),
+          options.accelerator.revalidate(),
           owned!.revalidate(),
           revalidateAliasManifest(aliasManifest!.path, aliasManifest!.handle, aliasManifest!.identity),
         ])
@@ -530,7 +577,9 @@ export async function startAgentPrivateOllamaDaemon(
           if (error instanceof AgentPrivateOllamaDaemonError) throw error
           throw new AgentPrivateOllamaDaemonError('daemon_unavailable', error)
         } finally {
-          await Promise.all([options.model.revalidate(), options.runtime.revalidate()])
+          await Promise.all([
+            options.model.revalidate(), options.runtime.revalidate(), options.accelerator.revalidate(),
+          ])
         }
         return result
       },
@@ -540,6 +589,7 @@ export async function startAgentPrivateOllamaDaemon(
           options.bwrap.revalidate(),
           options.ollama.revalidate(),
           options.runtime.revalidate(),
+          options.accelerator.revalidate(),
           options.model.revalidate(),
           owned!.revalidate(),
           revalidateAliasManifest(aliasManifest!.path, aliasManifest!.handle, aliasManifest!.identity),
@@ -565,13 +615,18 @@ export async function probeAgentPrivateOllamaDaemon(options: ProbeAgentPrivateOl
   let owned: AgentOwnedProcess | undefined
   try {
     await chmod(directory, 0o700)
-    await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate()])
+    await Promise.all([
+      options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate(), options.accelerator.revalidate(),
+    ])
     let lastError: unknown
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const port = normalizePort(choosePort())
-      const plan = buildProbeLaunch(port, 4, 5, directory, options.runtime.path)
+      const plan = buildProbeLaunch(port, 4, 5, directory, options.runtime.path, options.accelerator)
       try {
-        await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate()])
+        await Promise.all([
+          options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate(),
+          options.accelerator.revalidate(),
+        ])
         owned = await startProcess({
           executable: options.bwrap,
           args: plan.args,
@@ -590,7 +645,7 @@ export async function probeAgentPrivateOllamaDaemon(options: ProbeAgentPrivateOl
           signal: options.signal,
           fetchImpl: options.fetch ?? globalThis.fetch,
         })
-        await Promise.all([owned.revalidate(), options.runtime.revalidate()])
+        await Promise.all([owned.revalidate(), options.runtime.revalidate(), options.accelerator.revalidate()])
         lastError = undefined
         break
       } catch (error) {

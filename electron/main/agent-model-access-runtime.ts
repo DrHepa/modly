@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import type {
   AgentCapabilitySnapshotV1,
@@ -21,6 +21,10 @@ import {
   probeOllamaModelStore,
   type OpenVerifiedOllamaModel,
 } from './agent-ollama-model-store.ts'
+import {
+  openAgentOllamaRuntimeTree,
+  type OpenAgentOllamaRuntimeTree,
+} from './agent-ollama-runtime-tree.ts'
 import {
   probeAgentPrivateOllamaDaemon,
   startAgentPrivateOllamaDaemon,
@@ -42,6 +46,7 @@ const OWNED_DIRECTORY = /^(?:model-access|ollama-daemon|ollama-probe)-[A-Za-z0-9
 export interface AgentOllamaConfiguration {
   binaryPath: string
   modelsDir: string
+  runtimeDir: string
   bwrapPath: string
 }
 
@@ -72,6 +77,7 @@ interface AgentModelAccessReadinessProbeInput {
   configuration: Readonly<AgentOllamaConfiguration>
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
+  runtime: OpenAgentOllamaRuntimeTree
   signal: AbortSignal
 }
 
@@ -137,6 +143,27 @@ async function resolveModelsCandidate(path: string): Promise<string | undefined>
   }
 }
 
+function deriveRuntimeDirectory(binaryPath: string): string {
+  const binDirectory = dirname(binaryPath)
+  if (basename(binaryPath) !== 'ollama' || basename(binDirectory) !== 'bin') {
+    throw new AgentModelAccessRuntimeError('invalid_configuration')
+  }
+  return join(dirname(binDirectory), 'lib', 'ollama')
+}
+
+async function validateRuntimeDirectory(path: string): Promise<string> {
+  let runtime: OpenAgentOllamaRuntimeTree | undefined
+  try {
+    runtime = await openAgentOllamaRuntimeTree(path)
+    await runtime.revalidate()
+    return runtime.path
+  } catch (error) {
+    throw new AgentModelAccessRuntimeError('invalid_configuration', error)
+  } finally {
+    await runtime?.close()
+  }
+}
+
 export async function resolveAgentOllamaConfiguration(
   options: ResolveAgentOllamaConfigurationOptions = {},
 ): Promise<Readonly<AgentOllamaConfiguration>> {
@@ -146,12 +173,15 @@ export async function resolveAgentOllamaConfiguration(
   const env = options.env ?? process.env
   const configuredBinary = env.MODLY_AGENT_OLLAMA_BINARY
   const configuredModels = env.MODLY_AGENT_OLLAMA_MODELS_DIR
+  const configuredRuntime = env.MODLY_AGENT_OLLAMA_RUNTIME_DIR
   if (configuredBinary !== undefined && configuredBinary.length === 0
-    || configuredModels !== undefined && configuredModels.length === 0) {
+    || configuredModels !== undefined && configuredModels.length === 0
+    || configuredRuntime !== undefined && configuredRuntime.length === 0) {
     throw new AgentModelAccessRuntimeError('invalid_configuration')
   }
   const binaryPath = await validateExecutablePath(configuredBinary ?? DEFAULT_BINARY, 'Ollama executable')
   const bwrapPath = await validateExecutablePath(options.bwrapPath ?? DEFAULT_BWRAP, 'bubblewrap executable')
+  const runtimeDir = await validateRuntimeDirectory(configuredRuntime ?? deriveRuntimeDirectory(binaryPath))
   let modelsDir: string | undefined
   if (configuredModels !== undefined) {
     modelsDir = await resolveModelsCandidate(configuredModels)
@@ -163,7 +193,7 @@ export async function resolveAgentOllamaConfiguration(
     }
     if (!modelsDir) throw new AgentModelAccessRuntimeError('invalid_configuration')
   }
-  return Object.freeze({ binaryPath, modelsDir, bwrapPath })
+  return Object.freeze({ binaryPath, modelsDir, runtimeDir, bwrapPath })
 }
 
 async function ensurePrivateRoot(root: string): Promise<string> {
@@ -199,15 +229,18 @@ async function cleanStaleDirectories(root: string, staleMs: number): Promise<voi
 async function openAuthorities(configuration: Readonly<AgentOllamaConfiguration>): Promise<{
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
+  runtime: OpenAgentOllamaRuntimeTree
 }> {
   let bwrap: PinnedAgentExecutable | undefined
   let ollama: PinnedAgentExecutable | undefined
+  let runtime: OpenAgentOllamaRuntimeTree | undefined
   try {
     bwrap = await openPinnedAgentExecutable(configuration.bwrapPath, 'bubblewrap executable')
     ollama = await openPinnedAgentExecutable(configuration.binaryPath, 'Ollama executable')
-    return { bwrap, ollama }
+    runtime = await openAgentOllamaRuntimeTree(configuration.runtimeDir)
+    return { bwrap, ollama, runtime }
   } catch (error) {
-    await Promise.all([bwrap?.close(), ollama?.close()])
+    await Promise.all([bwrap?.close(), ollama?.close(), runtime?.close()])
     throw error
   }
 }
@@ -281,7 +314,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
         return false
       } finally {
         readinessControllers.delete(controller)
-        await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close()])
+        await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close()])
       }
     })()
     const tracked = trackOperation(promise)
@@ -359,7 +392,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
           await gateway!.close().catch(() => undefined)
           await daemon!.close().catch(() => undefined)
           await verified!.close().catch(() => undefined)
-          await Promise.all([authorities!.bwrap.close(), authorities!.ollama.close()])
+          await Promise.all([authorities!.bwrap.close(), authorities!.ollama.close(), authorities!.runtime.close()])
         })()
         return closePromise
       }
@@ -389,7 +422,7 @@ export function createAgentModelAccessRuntime(options: CreateAgentModelAccessRun
       await gateway?.close().catch(() => undefined)
       await daemon?.close().catch(() => undefined)
       await verified?.close().catch(() => undefined)
-      await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close()])
+      await Promise.all([authorities?.bwrap.close(), authorities?.ollama.close(), authorities?.runtime.close()])
       if (error instanceof AgentModelAccessRuntimeError) throw error
       throw new AgentModelAccessRuntimeError('provider_unavailable', error)
     }

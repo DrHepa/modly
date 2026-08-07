@@ -1,7 +1,7 @@
 import { randomInt } from 'node:crypto'
 import type { BigIntStats } from 'node:fs'
 import { chmod, lstat, mkdtemp, open, realpath, rm, writeFile, type FileHandle } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 
 import type { JsonValue } from '../../src/shared/types/agentActions.ts'
 import {
@@ -11,11 +11,19 @@ import {
   type StartAgentOwnedProcessOptions,
 } from './agent-owned-process.ts'
 import type { OpenVerifiedOllamaModel } from './agent-ollama-model-store.ts'
+import type { OpenAgentOllamaRuntimeTree } from './agent-ollama-runtime-tree.ts'
 
 const PRIVATE_ALIAS = /^modly-private-[a-f0-9]{16,64}:latest$/
 const DEFAULT_READINESS_MS = 15_000
 const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_READINESS_BYTES = 1024 * 1024
+const MAX_READINESS_ATTEMPTS = 64
+const RAW_SHA256 = /^[a-f0-9]{64}$/
+const PREFIXED_SHA256 = /^sha256:[a-f0-9]{64}$/
+const PRIVATE_RUNTIME_ROOT = '/run/modly-ollama-runtime'
+const PRIVATE_OLLAMA_PATH = '/run/modly-ollama-runtime/bin/ollama'
+const PRIVATE_RUNTIME_TREE_PATH = '/run/modly-ollama-runtime/lib/ollama'
+const PRIVATE_TMPFS_ROOTS = ['/tmp', '/run', '/home'] as const
 
 export interface AgentPrivateOllamaLaunch {
   args: readonly string[]
@@ -27,7 +35,9 @@ export interface BuildAgentPrivateOllamaLaunchOptions {
   alias: string
   port: number
   storeRoot: string
+  runtimeSourceRoot: string
   ollamaFd: number
+  runtimeDirFd: number
   manifestFd: number
   blobFds: readonly number[]
 }
@@ -44,6 +54,7 @@ export interface StartAgentPrivateOllamaDaemonOptions {
   root: string
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
+  runtime: OpenAgentOllamaRuntimeTree
   model: OpenVerifiedOllamaModel
   alias: string
   signal: AbortSignal
@@ -58,6 +69,7 @@ export interface ProbeAgentPrivateOllamaDaemonOptions {
   root: string
   bwrap: PinnedAgentExecutable
   ollama: PinnedAgentExecutable
+  runtime: OpenAgentOllamaRuntimeTree
   signal: AbortSignal
   readinessMs?: number
   choosePort?: () => number
@@ -73,6 +85,13 @@ export class AgentPrivateOllamaDaemonError extends Error {
     this.name = 'AgentPrivateOllamaDaemonError'
     this.code = code
   }
+}
+
+export function normalizeAgentOllamaDigest(value: unknown): `sha256:${string}` | undefined {
+  if (typeof value !== 'string') return undefined
+  if (RAW_SHA256.test(value)) return `sha256:${value}`
+  if (PREFIXED_SHA256.test(value)) return value as `sha256:${string}`
+  return undefined
 }
 
 function boundedInteger(value: unknown, fallback: number, maximum: number): number {
@@ -109,7 +128,37 @@ function appendPrivateEnvironment(args: string[], port: number): void {
   )
 }
 
-function basePrivateLaunch(port: number, storeRoot: string): string[] {
+function appendDirectory(args: string[], path: string): void {
+  if (!args.some((entry, index) => entry === '--dir' && args[index + 1] === path)) {
+    args.push('--dir', path)
+  }
+}
+
+function appendPrivateStoreRoot(args: string[], storeRoot: string): void {
+  const privateParent = PRIVATE_TMPFS_ROOTS.find((root) => storeRoot === root || storeRoot.startsWith(`${root}/`))
+  if (!privateParent) {
+    args.push('--tmpfs', storeRoot)
+    return
+  }
+  let current: string = privateParent
+  for (const segment of storeRoot.slice(privateParent.length).split('/').filter(Boolean)) {
+    current = join(current, segment)
+    appendDirectory(args, current)
+  }
+}
+
+function pathContains(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(root === '/' ? '/' : `${root}/`)
+}
+
+function basePrivateLaunch(port: number, storeRoot: string, runtimeSourceRoot: string): string[] {
+  if (!isAbsolute(storeRoot) || resolve(storeRoot) !== storeRoot
+    || !isAbsolute(runtimeSourceRoot) || resolve(runtimeSourceRoot) !== runtimeSourceRoot
+    || runtimeSourceRoot === '/'
+    || pathContains(storeRoot, runtimeSourceRoot) || pathContains(runtimeSourceRoot, storeRoot)
+    || pathContains(storeRoot, PRIVATE_RUNTIME_ROOT) || pathContains(PRIVATE_RUNTIME_ROOT, storeRoot)) {
+    throw new AgentPrivateOllamaDaemonError('invalid_binding')
+  }
   const args = [
     '--die-with-parent',
     '--unshare-all',
@@ -118,18 +167,20 @@ function basePrivateLaunch(port: number, storeRoot: string): string[] {
     '--share-net',
     '--hostname', 'modly-ollama',
     '--ro-bind', '/', '/',
-    '--tmpfs', storeRoot,
-    '--tmpfs', '/tmp',
-    '--tmpfs', '/run',
-    '--tmpfs', '/home',
-    '--dir', '/home/modly',
-    '--dir', '/runtime',
-    '--dir', '/runtime/bin',
-    '--dir', join(storeRoot, 'blobs'),
-    '--dir', join(storeRoot, 'manifests'),
-    '--dir', join(storeRoot, 'manifests', 'registry.ollama.ai'),
-    '--dir', join(storeRoot, 'manifests', 'registry.ollama.ai', 'library'),
   ]
+  if (!PRIVATE_TMPFS_ROOTS.some((root) => pathContains(root, runtimeSourceRoot))) {
+    args.push('--tmpfs', runtimeSourceRoot)
+  }
+  args.push('--tmpfs', '/tmp', '--tmpfs', '/run', '--tmpfs', '/home', '--dir', '/home/modly')
+  appendDirectory(args, PRIVATE_RUNTIME_ROOT)
+  appendDirectory(args, join(PRIVATE_RUNTIME_ROOT, 'bin'))
+  appendDirectory(args, join(PRIVATE_RUNTIME_ROOT, 'lib'))
+  appendDirectory(args, PRIVATE_RUNTIME_TREE_PATH)
+  appendPrivateStoreRoot(args, storeRoot)
+  appendDirectory(args, join(storeRoot, 'blobs'))
+  appendDirectory(args, join(storeRoot, 'manifests'))
+  appendDirectory(args, join(storeRoot, 'manifests', 'registry.ollama.ai'))
+  appendDirectory(args, join(storeRoot, 'manifests', 'registry.ollama.ai', 'library'))
   appendPrivateEnvironment(args, port)
   args.push('--setenv', 'OLLAMA_MODELS', storeRoot)
   return args
@@ -139,33 +190,42 @@ export function buildAgentPrivateOllamaLaunch(options: BuildAgentPrivateOllamaLa
   const port = normalizePort(options.port)
   if (!PRIVATE_ALIAS.test(options.alias) || options.blobFds.length !== options.model.blobs.length
     || !Number.isSafeInteger(options.ollamaFd) || options.ollamaFd < 3
-    || !Number.isSafeInteger(options.manifestFd) || options.manifestFd <= options.ollamaFd
+    || !Number.isSafeInteger(options.runtimeDirFd) || options.runtimeDirFd <= options.ollamaFd
+    || !Number.isSafeInteger(options.manifestFd) || options.manifestFd <= options.runtimeDirFd
     || options.blobFds.some((fd) => !Number.isSafeInteger(fd) || fd <= options.manifestFd)
     || options.storeRoot !== options.model.modelsDir) {
     throw new AgentPrivateOllamaDaemonError('invalid_binding')
   }
   const aliasName = options.alias.slice(0, -':latest'.length)
-  const args = basePrivateLaunch(port, options.storeRoot)
+  const args = basePrivateLaunch(port, options.storeRoot, options.runtimeSourceRoot)
   args.push(
     '--dir', join(options.storeRoot, 'manifests', 'registry.ollama.ai', 'library', aliasName),
-    '--ro-bind-fd', String(options.ollamaFd), '/runtime/bin/ollama',
+    '--ro-bind-fd', String(options.ollamaFd), PRIVATE_OLLAMA_PATH,
+    '--ro-bind-fd', String(options.runtimeDirFd), PRIVATE_RUNTIME_TREE_PATH,
     '--ro-bind-fd', String(options.manifestFd), join(options.storeRoot, 'manifests', 'registry.ollama.ai', 'library', aliasName, 'latest'),
   )
   options.model.blobs.forEach((blob, index) => {
     args.push('--ro-bind-fd', String(options.blobFds[index]), join(options.storeRoot, 'blobs', blob.digest.replace(':', '-')))
   })
-  args.push('--chdir', '/', '/runtime/bin/ollama', 'serve')
+  args.push('--chdir', '/', PRIVATE_OLLAMA_PATH, 'serve')
   return Object.freeze({
     args: Object.freeze(args),
     env: Object.freeze({ LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' }),
   })
 }
 
-function buildProbeLaunch(port: number, ollamaFd: number, storeRoot: string): Readonly<AgentPrivateOllamaLaunch> {
-  const args = basePrivateLaunch(normalizePort(port), storeRoot)
+function buildProbeLaunch(
+  port: number,
+  ollamaFd: number,
+  runtimeDirFd: number,
+  storeRoot: string,
+  runtimeSourceRoot: string,
+): Readonly<AgentPrivateOllamaLaunch> {
+  const args = basePrivateLaunch(normalizePort(port), storeRoot, runtimeSourceRoot)
   args.push(
-    '--ro-bind-fd', String(ollamaFd), '/runtime/bin/ollama',
-    '--chdir', '/', '/runtime/bin/ollama', 'serve',
+    '--ro-bind-fd', String(ollamaFd), PRIVATE_OLLAMA_PATH,
+    '--ro-bind-fd', String(runtimeDirFd), PRIVATE_RUNTIME_TREE_PATH,
+    '--chdir', '/', PRIVATE_OLLAMA_PATH, 'serve',
   )
   return Object.freeze({ args: Object.freeze(args), env: Object.freeze({ LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' }) })
 }
@@ -247,10 +307,17 @@ async function waitForReadiness(input: {
   signal: AbortSignal
   fetchImpl: typeof globalThis.fetch
 }): Promise<void> {
+  const approvedDigest = input.alias === undefined ? undefined : normalizeAgentOllamaDigest(input.digest)
+  if (input.alias !== undefined && (!approvedDigest || approvedDigest !== input.digest)) {
+    throw new AgentPrivateOllamaDaemonError('invalid_binding')
+  }
   const deadline = Date.now() + input.readinessMs
+  let attempts = 0
+  let backoffMs = 50
   let exited: { code: number | null, signal: NodeJS.Signals | null } | undefined
   void input.process.exited.then((value) => { exited = value })
-  while (Date.now() < deadline && !input.signal.aborted) {
+  while (Date.now() < deadline && attempts < MAX_READINESS_ATTEMPTS && !input.signal.aborted) {
+    attempts += 1
     if (exited) throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
     const attempt = new AbortController()
     const timeout = setTimeout(() => attempt.abort(), Math.min(500, Math.max(1, deadline - Date.now())))
@@ -268,7 +335,7 @@ async function waitForReadiness(input: {
         if (!Array.isArray(models) || models.length !== 1 || !models.some((candidate) => candidate && typeof candidate === 'object'
           && !Array.isArray(candidate) && ((candidate as { name?: unknown }).name === input.alias
             || (candidate as { model?: unknown }).model === input.alias)
-          && (candidate as { digest?: unknown }).digest === input.digest)) {
+          && normalizeAgentOllamaDigest((candidate as { digest?: unknown }).digest) === approvedDigest)) {
           throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
         }
         const shown = await fetchJson(input.fetchImpl, input.endpoint, '/api/show', {
@@ -277,7 +344,11 @@ async function waitForReadiness(input: {
           body: JSON.stringify({ model: input.alias, verbose: false }),
           signal: attempt.signal,
         }, MAX_READINESS_BYTES)
-        if (!shown || typeof shown !== 'object' || Array.isArray(shown) || Object.hasOwn(shown, 'error')) {
+        const details = shown && typeof shown === 'object' && !Array.isArray(shown)
+          ? (shown as { details?: unknown }).details
+          : undefined
+        if (!shown || typeof shown !== 'object' || Array.isArray(shown) || Object.hasOwn(shown, 'error')
+          || !details || typeof details !== 'object' || Array.isArray(details)) {
           throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
         }
       }
@@ -289,7 +360,9 @@ async function waitForReadiness(input: {
     } finally {
       clearTimeout(timeout)
     }
-    await delay(25, input.signal).catch(() => undefined)
+    const remaining = deadline - Date.now()
+    if (remaining > 0) await delay(Math.min(backoffMs, remaining), input.signal).catch(() => undefined)
+    backoffMs = Math.min(backoffMs * 2, 500)
   }
   if (input.signal.aborted) throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
   throw new AgentPrivateOllamaDaemonError('daemon_timeout')
@@ -360,11 +433,14 @@ export async function startAgentPrivateOllamaDaemon(
     return closePromise
   }
   try {
-    await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate(), options.model.revalidate()])
+    await Promise.all([
+      options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate(), options.model.revalidate(),
+    ])
     aliasManifest = await createAliasManifest(root, options.model.manifest.bytes)
     const ollamaFd = 4
-    const manifestFd = 5
-    const blobFds = options.model.blobs.map((_, index) => 6 + index)
+    const runtimeDirFd = 5
+    const manifestFd = 6
+    const blobFds = options.model.blobs.map((_, index) => 7 + index)
     options.signal.addEventListener('abort', abort, { once: true })
     let lastError: unknown
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -375,7 +451,9 @@ export async function startAgentPrivateOllamaDaemon(
         alias: options.alias,
         port,
         storeRoot: options.model.modelsDir,
+        runtimeSourceRoot: options.runtime.path,
         ollamaFd,
+        runtimeDirFd,
         manifestFd,
         blobFds,
       })
@@ -383,6 +461,7 @@ export async function startAgentPrivateOllamaDaemon(
         await Promise.all([
           options.bwrap.revalidate(),
           options.ollama.revalidate(),
+          options.runtime.revalidate(),
           options.model.revalidate(),
           revalidateAliasManifest(aliasManifest.path, aliasManifest.handle, aliasManifest.identity),
         ])
@@ -391,7 +470,12 @@ export async function startAgentPrivateOllamaDaemon(
           args: plan.args,
           env: plan.env,
           cwd: '/',
-          inheritedHandles: [options.ollama.handle, aliasManifest.handle, ...options.model.blobs.map((blob) => blob.handle)],
+          inheritedHandles: [
+            options.ollama.handle,
+            options.runtime.handle,
+            aliasManifest.handle,
+            ...options.model.blobs.map((blob) => blob.handle),
+          ],
           signal: options.signal,
           stderrBytes: 64 * 1024,
           terminationGraceMs: 500,
@@ -408,6 +492,7 @@ export async function startAgentPrivateOllamaDaemon(
         })
         await Promise.all([
           owned.revalidate(),
+          options.runtime.revalidate(),
           options.model.revalidate(),
           revalidateAliasManifest(aliasManifest.path, aliasManifest.handle, aliasManifest.identity),
         ])
@@ -429,6 +514,7 @@ export async function startAgentPrivateOllamaDaemon(
         if (closePromise || signal.aborted || options.signal.aborted) throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
         await Promise.all([
           options.model.revalidate(),
+          options.runtime.revalidate(),
           owned!.revalidate(),
           revalidateAliasManifest(aliasManifest!.path, aliasManifest!.handle, aliasManifest!.identity),
         ])
@@ -444,7 +530,7 @@ export async function startAgentPrivateOllamaDaemon(
           if (error instanceof AgentPrivateOllamaDaemonError) throw error
           throw new AgentPrivateOllamaDaemonError('daemon_unavailable', error)
         } finally {
-          await options.model.revalidate()
+          await Promise.all([options.model.revalidate(), options.runtime.revalidate()])
         }
         return result
       },
@@ -453,6 +539,7 @@ export async function startAgentPrivateOllamaDaemon(
         await Promise.all([
           options.bwrap.revalidate(),
           options.ollama.revalidate(),
+          options.runtime.revalidate(),
           options.model.revalidate(),
           owned!.revalidate(),
           revalidateAliasManifest(aliasManifest!.path, aliasManifest!.handle, aliasManifest!.identity),
@@ -478,19 +565,19 @@ export async function probeAgentPrivateOllamaDaemon(options: ProbeAgentPrivateOl
   let owned: AgentOwnedProcess | undefined
   try {
     await chmod(directory, 0o700)
-    await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate()])
+    await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate()])
     let lastError: unknown
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const port = normalizePort(choosePort())
-      const plan = buildProbeLaunch(port, 4, directory)
+      const plan = buildProbeLaunch(port, 4, 5, directory, options.runtime.path)
       try {
-        await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate()])
+        await Promise.all([options.bwrap.revalidate(), options.ollama.revalidate(), options.runtime.revalidate()])
         owned = await startProcess({
           executable: options.bwrap,
           args: plan.args,
           env: plan.env,
           cwd: '/',
-          inheritedHandles: [options.ollama.handle],
+          inheritedHandles: [options.ollama.handle, options.runtime.handle],
           signal: options.signal,
           stderrBytes: 64 * 1024,
           terminationGraceMs: 500,
@@ -503,6 +590,7 @@ export async function probeAgentPrivateOllamaDaemon(options: ProbeAgentPrivateOl
           signal: options.signal,
           fetchImpl: options.fetch ?? globalThis.fetch,
         })
+        await Promise.all([owned.revalidate(), options.runtime.revalidate()])
         lastError = undefined
         break
       } catch (error) {

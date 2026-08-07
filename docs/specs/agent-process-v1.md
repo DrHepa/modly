@@ -90,13 +90,28 @@ Ollama endpoint, the ambient shared daemon, a cloud provider, or an undeclared
 model.
 
 The production provider is Linux-only and resolves configuration without
-`PATH`. `MODLY_AGENT_OLLAMA_BINARY` and `MODLY_AGENT_OLLAMA_MODELS_DIR`, when
-set, must be canonical absolute paths. The only executable default is
-`/usr/local/bin/ollama`; the only system-store default is
-`/usr/share/ollama/.ollama/models`, followed by the current user's canonical
-`~/.ollama/models` when present. `/usr/bin/ollama` is never an implicit
-fallback. The configured Ollama and bubblewrap executables are opened with
-`O_NOFOLLOW`, content-hashed, identity-bound, and revalidated around launch.
+`PATH`. `MODLY_AGENT_OLLAMA_BINARY`, `MODLY_AGENT_OLLAMA_MODELS_DIR`, and
+`MODLY_AGENT_OLLAMA_RUNTIME_DIR`, when set, must be canonical absolute paths.
+The only executable default is `/usr/local/bin/ollama`; the only system-store
+default is `/usr/share/ollama/.ollama/models`, followed by the current user's
+canonical `~/.ollama/models` when present. When the runtime directory is not
+explicit, it is derived only from a canonical `<prefix>/bin/ollama` as
+`<prefix>/lib/ollama`; `/usr/bin/ollama`, `PATH`, and guessed runner locations
+are never implicit fallbacks. The configured Ollama and bubblewrap executables
+are opened with `O_NOFOLLOW`, content-hashed, identity-bound, and revalidated
+around launch.
+
+The runner directory is a separate bounded complete-tree authority. Its root
+and entries must be owned consistently by root or the current process user and
+must not be group/world writable. Only regular single-link files, directories,
+and relative symlinks resolving to regular files inside the same tree and
+filesystem are accepted. Entry, depth, path, metadata, per-file, and aggregate
+byte ceilings reject traversal, aliases, devices, sockets, FIFOs, escaping or
+dangling links, and oversized trees. Main records complete-tree filesystem
+identity, opens the canonical root with `O_DIRECTORY|O_NOFOLLOW`, and
+revalidates the snapshot before launch and governed requests. Errors and public
+contracts never contain its host path or metadata digest.
+
 Readiness uses a cached, bounded, non-inference private-daemon probe and
 requires a canonical store with at least one bounded manifest graph. Exact
 selected-model validation remains an action-acquisition check.
@@ -228,15 +243,21 @@ bubblewrap as an owned detached process group. The read-only host view shadows
 the canonical model-store path with a private tmpfs. A random unguessable alias
 manifest and only the verified manifest/blob handles are mounted into that
 shadow store with `--ro-bind-fd`, so multi-gigabyte blobs remain zero-copy and
-mutable host tag names are not used by the daemon. The daemon receives a
-cleared, fixed environment, `OLLAMA_NO_CLOUD=1`, one-model/one-request resource
-limits, and a collision-retried random loopback listener. Discovery readiness
-starts an empty private daemon and checks bounded `/api/version`; it does not
-load a model. Per-action daemon readiness additionally checks the exact alias
-and digest through bounded `/api/tags` and `/api/show`. Neither probe claims
-model loadability or successful inference. The extension never receives
-that TCP endpoint or alias: only the authenticated AF_UNIX gateway enters its
-network-isolated PROCESS sandbox.
+mutable host tag names are not used by the daemon. The pinned runner-directory
+FD is independently mounted read-only and zero-copy at
+`/run/modly-ollama-runtime/lib/ollama`, matching the relocated executable's
+private prefix without copying or exposing the host runner tree. The daemon
+receives a cleared, fixed environment, `OLLAMA_NO_CLOUD=1`, one-model/one-request
+resource limits, and a collision-retried random loopback listener. Discovery
+readiness starts an empty private daemon and checks bounded `/api/version`; it
+does not load a model. Per-action daemon readiness additionally checks the exact
+alias and digest through bounded `/api/tags` and `/api/show`. Ollama's exact
+lowercase raw 64-hex and `sha256:<64-hex>` tag digests normalize to the same
+canonical binding; uppercase, malformed, or other-algorithm values fail closed.
+Bounded exponential backoff and an attempt ceiling prevent readiness request
+storms. Neither probe claims model loadability or successful inference. The
+extension never receives that TCP endpoint or alias: only the authenticated
+AF_UNIX gateway enters its network-isolated PROCESS sandbox.
 
 This v1 assurance is deliberately named
 `pinned-local-cooperative-host`. It protects the approved action from mutable
@@ -252,11 +273,12 @@ the transient loopback listener. Its random port is not an authentication
 mechanism; the bearer authenticates only the extension-facing AF_UNIX gateway.
 The daemon sandbox also retains a broad read-only host view for the pinned
 dynamically linked executable and drivers, while replacing `/home`, `/tmp`,
-`/run`, and the canonical model store with private mounts. The assurance trusts
-that pinned executable as cooperative and does not claim to contain a malicious
-configured binary. Missing configuration, binary/store drift, failed user
-namespaces, private-daemon probe failure, or selected-model verification
-failure remains default-deny with no local-to-cloud fallback.
+`/run`, the canonical model store, and the canonical runner directory with
+private mounts. The assurance trusts that pinned executable as cooperative and
+does not claim to contain a malicious configured binary. Missing configuration,
+binary/store/runtime drift, failed user namespaces, private-daemon probe
+failure, or selected-model verification failure remains default-deny with no
+local-to-cloud fallback.
 
 The sandbox also exposes bounded read-only host OS ABI, standard-library, and
 library trees needed by ordinary Python and native packages. Those mounts are

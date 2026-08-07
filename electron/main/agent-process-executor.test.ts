@@ -171,6 +171,7 @@ function request(
   return Object.freeze({
     actionId,
     originSessionId: 'session-governed',
+    proposalHash: 'f'.repeat(64),
     capability,
     arguments: { input: 'chair', params: { mode } },
     model,

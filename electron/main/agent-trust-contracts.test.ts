@@ -106,7 +106,7 @@ test('ArtifactRef v1 validates hashes, sizes, media kinds, exact keys, and works
   assert.throws(() => assertArtifactRefV1({ ...artifact, unexpected: true }), /unknown field/i)
 })
 
-test('extension Python runtime bindings are exact and transitively hash-bound', () => {
+test('extension Python runtime and model access bindings are exact and transitively hash-bound', () => {
   const runtimeUnsigned = {
     kind: 'extension-python-venv-v1' as const,
     interpreter: 'bin/python' as const,
@@ -128,7 +128,11 @@ test('extension Python runtime bindings are exact and transitively hash-bound', 
     mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
   }]
   const resourceFiles: never[] = []
-  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime })
+  const modelAccess = {
+    schema: 'modly.agent-model-access.v1' as const,
+    profile: 'ollama-responses-json-v1' as const,
+  }
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime, modelAccess })
   const artifacts = {
     maxCount: 1,
     maxTotalBytes: 1024,
@@ -137,7 +141,7 @@ test('extension Python runtime bindings are exact and transitively hash-bound', 
   const execution = {
     kind: 'process' as const,
     schema: 'modly.agent-process-execution.v1' as const,
-    entry: 'processor.pyz', runtimeFiles, resourceFiles, runtime, runtimeHash, artifacts,
+    entry: 'processor.pyz', runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
     bindingHash: sha256Canonical({
       schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
     }),
@@ -153,6 +157,25 @@ test('extension Python runtime bindings are exact and transitively hash-bound', 
   }
   const snapshot = { ...unsigned, hash: sha256Canonical(unsigned) }
   assert.equal(assertAgentCapabilitySnapshotV1(snapshot).execution?.kind, 'process')
+
+  const runtimeHashWithoutModelAccess = sha256Canonical({ runtimeFiles, resourceFiles, runtime })
+  const executionWithoutModelAccess = {
+    ...execution,
+    modelAccess: undefined,
+    runtimeHash: runtimeHashWithoutModelAccess,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+      runtimeHash: runtimeHashWithoutModelAccess, artifacts,
+    }),
+  }
+  delete (executionWithoutModelAccess as { modelAccess?: unknown }).modelAccess
+  const unsignedWithoutModelAccess = { ...unsigned, execution: executionWithoutModelAccess }
+  const snapshotWithoutModelAccess = {
+    ...unsignedWithoutModelAccess,
+    hash: sha256Canonical(unsignedWithoutModelAccess),
+  }
+  assert.equal(assertAgentCapabilitySnapshotV1(snapshotWithoutModelAccess).execution?.kind, 'process')
+  assert.notEqual(snapshot.hash, snapshotWithoutModelAccess.hash)
 
   const withRuntime = (changedRuntime: Record<string, unknown>) => {
     const changedRuntimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime: changedRuntime })
@@ -171,6 +194,10 @@ test('extension Python runtime bindings are exact and transitively hash-bound', 
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, interpreter: '/usr/bin/python' })), /Python runtime/i)
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, unknown: true })), /unknown field/i)
   assert.throws(() => assertAgentCapabilitySnapshotV1(withRuntime({ ...runtime, treeDigest: '4'.repeat(64) })), /binding hash/i)
+  assert.throws(() => assertAgentCapabilitySnapshotV1({
+    ...snapshot,
+    execution: { ...execution, modelAccess: { ...modelAccess, profile: 'unsupported' } },
+  }), /modelAccess/i)
 })
 
 test('action hashes bind normalized arguments, capability, model, artifacts, scope, and expiry', () => {

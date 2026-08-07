@@ -70,11 +70,17 @@ export interface AgentProcessPythonRuntimeBindingV1 extends AgentProcessPythonRu
   bindingHash: string
 }
 
+export interface AgentProcessModelAccessDeclarationV1 {
+  schema: 'modly.agent-model-access.v1'
+  profile: 'ollama-responses-json-v1'
+}
+
 export interface AgentProcessDeclarationV1 {
   schema: 'modly.agent-process.v1'
   runtimeFiles: string[]
   resourceFiles: string[]
   runtime?: AgentProcessPythonRuntimeDeclarationV1
+  modelAccess?: AgentProcessModelAccessDeclarationV1
   artifacts: AgentProcessArtifactContractV1
 }
 
@@ -97,6 +103,7 @@ export interface AgentProcessExecutionV1 {
   runtimeFiles: AgentProcessRuntimeFileIdentityV1[]
   resourceFiles: AgentProcessRuntimeFileIdentityV1[]
   runtime?: AgentProcessPythonRuntimeBindingV1
+  modelAccess?: AgentProcessModelAccessDeclarationV1
   runtimeHash: string
   artifacts: AgentProcessArtifactContractV1
   bindingHash: string

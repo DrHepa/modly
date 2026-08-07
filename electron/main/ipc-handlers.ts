@@ -293,7 +293,11 @@ async function resolveSelectedOllamaModel(selection: AgentOllamaModelSelectionV1
   })
 }
 
-export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
+export interface IpcHandlersLifecycle {
+  shutdown(): Promise<void>
+}
+
+export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): IpcHandlersLifecycle {
   type ActiveDownload = {
     progress: DownloadProgress & { variantId?: string }
     done: Promise<void>
@@ -459,7 +463,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           return await processExecutor.execute(request)
         } catch (error) {
           if (!(error instanceof AgentProcessExecutorError)) throw error
-          if (error.code === 'unsupported_capability' || error.code === 'runtime_unavailable') throw new AgentActionsServiceError('executor_unavailable', error)
+          if (error.code === 'unsupported_capability' || error.code === 'runtime_unavailable'
+            || error.code === 'model_binding_unavailable') {
+            throw new AgentActionsServiceError('executor_unavailable', error)
+          }
           if (error.code === 'capability_stale') throw new AgentActionsServiceError('capability_stale', error)
           if (error.code === 'model_stale') throw new AgentActionsServiceError('model_stale', error)
           if (error.code === 'invalid_arguments') throw new AgentActionsServiceError('invalid_arguments', error)
@@ -2174,4 +2181,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return { success: false, error: String(err) }
     }
   })
+
+  return {
+    shutdown: () => agentActionsService.shutdown(),
+  }
 }

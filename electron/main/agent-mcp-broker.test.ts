@@ -185,7 +185,7 @@ async function fileFixture(options: { outputCount?: 1 | 2 } = {}): Promise<FileF
 
 function request(capability: AgentCapabilitySnapshotV1, signal = new AbortController().signal): AgentActionExecutorRequest {
   return {
-    actionId: 'action-mcp-fixture', originSessionId: 'session-mcp-fixture',
+    actionId: 'action-mcp-fixture', originSessionId: 'session-mcp-fixture', proposalHash: 'f'.repeat(64),
     capability, arguments: { text: 'hello' }, inputArtifacts: [], signal,
     model: {
       provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'qwen3.6:latest',

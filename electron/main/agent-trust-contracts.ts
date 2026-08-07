@@ -10,6 +10,7 @@ import {
   type AgentCapabilitySnapshotV1,
   type AgentOllamaModelSnapshotV1,
   type AgentProcessArtifactContractV1,
+  type AgentProcessModelAccessDeclarationV1,
   type AgentProcessPythonRuntimeBindingV1,
   type ArtifactRefV1,
   type JsonPrimitive,
@@ -272,7 +273,10 @@ function normalizeProcessArtifactContract(value: unknown): AgentProcessArtifactC
 }
 
 function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabilitySnapshotV1['execution'] {
-  assertExactKeys(value, ['kind', 'schema', 'entry', 'runtimeFiles', 'resourceFiles', 'runtime', 'runtimeHash', 'artifacts', 'bindingHash'], 'Agent capability process execution')
+  assertExactKeys(value, [
+    'kind', 'schema', 'entry', 'runtimeFiles', 'resourceFiles', 'runtime', 'modelAccess',
+    'runtimeHash', 'artifacts', 'bindingHash',
+  ], 'Agent capability process execution')
   if (value.kind !== 'process' || value.schema !== 'modly.agent-process-execution.v1') {
     throw new TypeError('Agent capability process execution schema is invalid')
   }
@@ -382,8 +386,26 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
     }
     runtime = { ...unsignedRuntime, bindingHash }
   }
+  let modelAccess: AgentProcessModelAccessDeclarationV1 | undefined
+  if (value.modelAccess !== undefined) {
+    assertPlainRecord(value.modelAccess, 'Agent capability process modelAccess')
+    assertExactKeys(value.modelAccess, ['schema', 'profile'], 'Agent capability process modelAccess')
+    if (value.modelAccess.schema !== 'modly.agent-model-access.v1'
+      || value.modelAccess.profile !== 'ollama-responses-json-v1' || runtime === undefined) {
+      throw new TypeError('Agent capability process modelAccess profile is invalid')
+    }
+    modelAccess = {
+      schema: 'modly.agent-model-access.v1',
+      profile: 'ollama-responses-json-v1',
+    }
+  }
   const runtimeHash = normalizeSha256(value.runtimeHash, 'Agent capability process runtimeHash')
-  if (sha256Canonical({ runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}) }) !== runtimeHash) {
+  if (sha256Canonical({
+    runtimeFiles,
+    resourceFiles,
+    ...(runtime ? { runtime } : {}),
+    ...(modelAccess ? { modelAccess } : {}),
+  }) !== runtimeHash) {
     throw new TypeError('Agent capability process runtime hash does not match')
   }
   const artifacts = normalizeProcessArtifactContract(value.artifacts)
@@ -393,7 +415,8 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
   }
   return {
     kind: 'process', schema: 'modly.agent-process-execution.v1', entry,
-    runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), runtimeHash, artifacts, bindingHash,
+    runtimeFiles, resourceFiles, ...(runtime ? { runtime } : {}), ...(modelAccess ? { modelAccess } : {}),
+    runtimeHash, artifacts, bindingHash,
   }
 }
 

@@ -19,6 +19,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import type { AgentActionExecutorRequest } from './agent-actions-service.ts'
+import { acquireAgentModelAccessGateway } from './agent-model-access-gateway.ts'
 import { listAgentCapabilities } from './automation-capabilities.ts'
 import {
   AgentProcessExecutorError,
@@ -49,7 +50,7 @@ const processTestLimits = {
 
 const fakeBubblewrap = String.raw`#!${process.execPath}
 const { createHash } = require('node:crypto')
-const { existsSync, readFileSync, readlinkSync, writeFileSync } = require('node:fs')
+const { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync } = require('node:fs')
 const { join } = require('node:path')
 const args = process.argv.slice(2)
 const triple = (flag, destination) => {
@@ -77,6 +78,15 @@ process.stdin.on('end', async () => {
     if (request.trustedContext.dirs.output !== '/output') throw new Error('host output path leaked')
     if (request.trustedContext.resources[0].fdPath !== '/resources/0') throw new Error('resource mount changed')
     if (request.trustedContext.inputArtifacts[0].fdPath !== '/input/0') throw new Error('input mount changed')
+    if (request.trustedContext.modelAccess) {
+      const gatewaySource = triple('--ro-bind', '/run/modly/model')
+      if (!lstatSync(gatewaySource + '/gateway.sock').isSocket()) throw new Error('model gateway socket was not FD-mounted')
+      if (request.trustedContext.modelAccess.socketPath !== '/run/modly/model/gateway.sock') throw new Error('sandbox socket path changed')
+      if (request.trustedContext.modelAccess.model !== 'approved') throw new Error('model sentinel changed')
+      if (!request.trustedContext.modelAccess.bearerToken) throw new Error('model bearer missing')
+      if ('endpoint' in request.trustedContext || JSON.stringify(request.trustedContext).includes('127.0.0.1')) throw new Error('raw model endpoint leaked')
+      if (!request.trustedContext.proposalHash) throw new Error('proposal binding missing')
+    }
     const resource = readFileSync('/proc/self/fd/' + resourceFd, 'utf8').trim()
     const input = readFileSync('/proc/self/fd/' + inputFd, 'utf8').trim()
     writeFileSync(join(outputSource, 'started'), 'ready')
@@ -114,7 +124,7 @@ async function makeWritableAndRemove(root: string): Promise<void> {
   await rm(root, { recursive: true, force: true })
 }
 
-async function fixture() {
+async function fixture(withModelAccess = false) {
   const root = await mkdtemp(join(tmpdir(), 'modly-agent-python-executor-'))
   const builtinDir = join(root, 'builtin')
   const userDir = join(root, 'extensions')
@@ -161,6 +171,9 @@ async function fixture() {
         process: {
           schema: 'modly.agent-process.v1', runtimeFiles: ['processor.pyz'], resourceFiles: ['assets/runtime.txt'],
           runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
+          ...(withModelAccess ? { modelAccess: {
+            schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1',
+          } } : {}),
           artifacts: {
             maxCount: 1, maxTotalBytes: 1024,
             allowed: [{ kind: 'text', mediaTypes: ['text/plain'], maxBytes: 1024 }],
@@ -173,6 +186,7 @@ async function fixture() {
     builtinDir, userExtensionsDir: userDir, trustedRepos: new Set(),
     processPythonSandboxReadiness: async () => true,
     processPythonExecutable: () => baseInterpreter,
+    ...(withModelAccess ? { processModelAccessReadiness: async () => true } : {}),
   })
   assert.deepEqual(inventory.errors, [])
   assert.equal(inventory.capabilities.length, 1)
@@ -260,11 +274,65 @@ function request(
   mode: 'success' | 'delay',
 ): AgentActionExecutorRequest {
   return Object.freeze({
-    actionId, originSessionId: 'session-python', capability,
+    actionId, originSessionId: 'session-python', proposalHash: 'a'.repeat(64), capability,
     arguments: { input: 'approved', params: { mode } }, model, inputArtifacts: [input],
     signal: new AbortController().signal,
   })
 }
+
+test('declared model access is default-denied without a provider and an injected lease is FD-mounted then revoked', async (t) => {
+  if (process.platform !== 'linux') return t.skip('Linux proc-fd and pathname AF_UNIX semantics are required')
+  const value = await fixture(true)
+  let hostSocketPath = ''
+  try {
+    const common: AgentProcessExecutorOptions = {
+      getWorkspaceRoot: () => value.workspaceDir,
+      getPrivateTempRoot: () => value.privateTempRoot,
+      getRuntimeSnapshotRoot: () => value.snapshotRoot,
+      pythonSandboxReadiness: async () => true,
+      bwrapPath: value.bwrapPath,
+      systemPaths: ['/usr'],
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveCurrentModel: async () => model,
+      resolvePythonExecutable: () => value.baseInterpreter,
+      limits: processTestLimits,
+    }
+    await assert.rejects(
+      createAgentProcessExecutor(common).ensureReady(value.capability),
+      (error: unknown) => error instanceof AgentProcessExecutorError && error.code === 'model_binding_unavailable',
+    )
+    await assert.rejects(
+      createAgentProcessExecutor({ ...common, modelAccessReadiness: async () => true }).ensureReady(value.capability),
+      (error: unknown) => error instanceof AgentProcessExecutorError && error.code === 'model_binding_unavailable',
+    )
+
+    const executor = createAgentProcessExecutor({
+      ...common,
+      modelAccessReadiness: async () => true,
+      acquireModelAccess: async (input) => {
+        const lease = await acquireAgentModelAccessGateway({
+          root: input.privateTempRoot,
+          actionId: input.actionId,
+          proposalHash: input.proposalHash,
+          capabilityHash: input.capability.hash,
+          digest: input.model.digest,
+          privateModelAlias: 'modly-private-test',
+          signal: input.signal,
+          forward: async () => ({ id: 'unused' }),
+        })
+        hostSocketPath = lease.hostSocketPath
+        return lease
+      },
+    })
+    await executor.ensureReady(value.capability)
+    const result = await executor.execute(request(value.capability, value.input, 'action-python-model', 'success'))
+    assert.equal(await readFile(join(value.workspaceDir, result.artifacts[0].workspacePath), 'utf8'), 'resource:input')
+    await assert.rejects(access(hostSocketPath))
+    await result.rollback()
+  } finally {
+    await makeWritableAndRemove(value.root)
+  }
+})
 
 test('declared Python runtime executes only through the snapshotted zipapp sandbox with FD authority', async (t) => {
   if (process.platform !== 'linux') return t.skip('Linux proc-fd semantics are required')

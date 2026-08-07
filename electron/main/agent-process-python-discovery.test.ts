@@ -6,7 +6,7 @@ import test from 'node:test'
 
 import { listAgentCapabilities, listVisibleExtensions } from './automation-capabilities.ts'
 
-async function fixture() {
+async function fixture(withModelAccess = false) {
   const root = await mkdtemp(join(tmpdir(), 'modly-agent-python-discovery-'))
   const builtinDir = join(root, 'builtin')
   const userExtensionsDir = join(root, 'extensions')
@@ -37,6 +37,9 @@ async function fixture() {
         process: {
           schema: 'modly.agent-process.v1', runtimeFiles: ['processor.pyz'], resourceFiles: [],
           runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
+          ...(withModelAccess ? { modelAccess: {
+            schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1',
+          } } : {}),
           artifacts: {
             maxCount: 1, maxTotalBytes: 1024,
             allowed: [{ kind: 'text', mediaTypes: ['text/plain'], maxBytes: 1024 }],
@@ -47,6 +50,39 @@ async function fixture() {
   }))
   return { root, builtinDir, userExtensionsDir, extensionDir, venvDir, baseInterpreter }
 }
+
+test('model access readiness is independently default-deny and excludes only Agent eligibility', async () => {
+  const value = await fixture(true)
+  try {
+    for (const probe of [undefined, async () => false, async () => { throw new Error('unavailable') }]) {
+      const inventory = await listAgentCapabilities({
+        builtinDir: value.builtinDir,
+        userExtensionsDir: value.userExtensionsDir,
+        trustedRepos: new Set(),
+        processPythonSandboxReadiness: async () => true,
+        processPythonExecutable: () => value.baseInterpreter,
+        ...(probe ? { processModelAccessReadiness: probe } : {}),
+      })
+      assert.deepEqual(inventory.capabilities, [])
+      assert.equal(inventory.errors.some((error) => error.code === 'PROCESS_MODEL_ACCESS_UNAVAILABLE'), true)
+    }
+    const ready = await listAgentCapabilities({
+      builtinDir: value.builtinDir,
+      userExtensionsDir: value.userExtensionsDir,
+      trustedRepos: new Set(),
+      processPythonSandboxReadiness: async () => true,
+      processPythonExecutable: () => value.baseInterpreter,
+      processModelAccessReadiness: async () => true,
+    })
+    assert.equal(ready.capabilities.length, 1)
+    assert.deepEqual(ready.capabilities[0].execution?.kind === 'process'
+      ? ready.capabilities[0].execution.modelAccess : undefined, {
+      schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1',
+    })
+  } finally {
+    await rm(value.root, { recursive: true, force: true })
+  }
+})
 
 test('Python runtime discovery binds the complete venv identity only when sandbox readiness is true', async () => {
   const value = await fixture()

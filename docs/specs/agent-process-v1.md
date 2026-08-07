@@ -62,6 +62,33 @@ or changing venv or selected base removes Agent eligibility with an actionable
 runtime error. A failed production sandbox readiness probe removes the
 capability from the runnable inventory.
 
+### Optional governed local-model access
+
+A Python zipapp may request this exact profile:
+
+```json
+{
+  "modelAccess": {
+    "schema": "modly.agent-model-access.v1",
+    "profile": "ollama-responses-json-v1"
+  }
+}
+```
+
+No other fields or profiles are accepted. `modelAccess` is valid only with
+`extension-python-venv-v1`; JavaScript and otherwise unsandboxed PROCESS
+entries cannot request it. The normalized declaration participates in
+`runtimeHash`, and therefore in the execution binding, capability hash,
+proposal hash, approval lease, and action state hash.
+
+Model access has an independent production readiness probe. A missing, false,
+or throwing probe excludes only that Agent capability and reports
+`PROCESS_MODEL_ACCESS_UNAVAILABLE`. Main also fails immediately with
+`model_binding_unavailable` if an approved action cannot acquire or revalidate
+its action-scoped provider lease. There is no fallback to the selected raw
+Ollama endpoint, shared host networking, a cloud provider, or an undeclared
+model.
+
 Optional non-code data files are declared separately in `resourceFiles`.
 Executable permissions and code/archive extensions are rejected for resources.
 Each resource is consumed only through its exact inherited read-only FD; it is
@@ -104,6 +131,33 @@ single bounded JSON document on stdin:
 }
 ```
 
+The `model` object above is the legacy trusted context for a PROCESS that did
+not declare `modelAccess`. A declared model-access PROCESS never receives the
+raw host endpoint or mutable model name. After main revalidates the capability,
+proposal, and selected model, it acquires one private lease and instead passes:
+
+```json
+{
+  "proposalHash": "...",
+  "modelAccess": {
+    "schema": "modly.agent-model-execution-lease.v1",
+    "assurance": "pinned-local-cooperative-host",
+    "transport": "unix-http",
+    "socketPath": "/run/modly/model/gateway.sock",
+    "responsesPath": "/v1/responses",
+    "model": "approved",
+    "digest": "sha256:...",
+    "bearerToken": "...",
+    "expiresAt": "...",
+    "bindingHash": "..."
+  }
+}
+```
+
+The bearer and lease metadata exist only in the main-to-child request. They are
+not exposed through renderer IPC, public action summaries, or session
+persistence.
+
 The child is started with direct argv, `shell: false`, a detached owned process
 group, inherited read-only file descriptors, a minimal environment, and the
 private output directory as cwd/HOME/TMP. JavaScript uses the packaged runtime
@@ -133,6 +187,24 @@ unshares the network and other namespaces, clears the environment, and executes
 completed snapshot, trusted bubblewrap executable, bundle/resources, inputs,
 and private output directory immediately before launch and again after a
 successful child exit, before publication.
+
+For a declared model-access action, main additionally inherits one already-open
+private gateway-directory FD and bubblewrap mounts only that directory read-only
+at `/run/modly/model` while retaining `--unshare-all`. The pathname AF_UNIX
+gateway accepts exactly one authenticated `POST /v1/responses`. Request and
+response bodies, idle time, and total time are bounded. V1 accepts only
+non-streaming, stateless requests without tools, rewrites the child sentinel
+model `approved` to the provider-private alias, and rejects replay. Cancellation,
+timeout, process failure, success, and shutdown revoke the lease, abort upstream
+work, destroy connections, and remove the socket directory.
+
+The gateway directory is `0700`, the socket is `0600`, and the bearer is random.
+Because the current Node runtime exposes no `SO_PEERCRED` API, this v1 guarantee
+is explicitly `pinned-local-cooperative-host`: it isolates the renderer,
+sandbox, and ordinary host network, but does not claim resistance to malicious
+same-UID or root host processes. A production provider must prove the approved
+digest-to-private-model binding before returning a lease; until such a provider
+is configured, model-access capabilities remain default-denied.
 
 The sandbox also exposes bounded read-only host OS ABI, standard-library, and
 library trees needed by ordinary Python and native packages. Those mounts are

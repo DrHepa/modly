@@ -296,6 +296,7 @@ test('Python sandbox launch selects only the snapshotted interpreter and isolate
     platform: 'linux', bwrapFd: 9,
     snapshotRootFd: 6, interpreter: 'bin/python',
     entryFd: 3, resourceFds: [4], inputFds: [5], outputDirFd: 7,
+    modelAccessDirectoryFd: 8,
     systemPaths: ['/usr', '/bin', '/lib'],
   })
   assert.equal(launch.command, '/proc/self/fd/9')
@@ -306,6 +307,9 @@ test('Python sandbox launch selects only the snapshotted interpreter and isolate
     && launch.args[index + 1] === '/proc/self/fd/6' && launch.args[index + 2] === '/runtime'))
   assert.ok(launch.args.some((value, index) => value === '--bind'
     && launch.args[index + 1] === '/proc/self/fd/7' && launch.args[index + 2] === '/output'))
+  assert.ok(launch.args.some((value, index) => value === '--ro-bind'
+    && launch.args[index + 1] === '/proc/self/fd/8' && launch.args[index + 2] === '/run/modly/model'))
+  assert.ok(launch.args.includes('--unshare-all'))
   assert.ok(launch.args.some((value, index) => value === '--ro-bind-fd'
     && launch.args[index + 1] === '3' && launch.args[index + 2] === '/app/process.pyz'))
   assert.deepEqual(launch.args.slice(-2), ['/runtime/bin/python', '/app/process.pyz'])

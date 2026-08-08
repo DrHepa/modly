@@ -4,7 +4,10 @@ import { useAgentStore, PROVIDERS, providerBaseUrl } from '@shared/stores/agentS
 import { useLlmModels } from '@shared/stores/llmModelsStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'
+import { parseOllamaModelNames } from '@shared/utils/agentModels'
 import AgentSessionHistory from './AgentSessionHistory'
+
+export { parseOllamaModelNames }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -104,7 +107,6 @@ const UNSAFE_JSON_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const HASH_PATTERN = /^[a-f0-9]{64}$/
-const OLLAMA_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/
 const GOVERNED_TERMINAL_STATUSES = new Set<AgentActionStatus>([
   'rejected', 'expired', 'completed', 'failed', 'cancelled',
 ])
@@ -853,17 +855,6 @@ export function planGovernedSessionSwitch<T extends {
           .map((entry) => entry.action.id),
     retained: nextSessionId === null ? [] : entries.filter((entry) => entry.originSessionId === nextSessionId),
   }
-}
-
-export function parseOllamaModelNames(value: unknown): string[] {
-  if (!isRecord(value) || !Array.isArray(value.models) || value.models.length > 256) return []
-  const names = value.models.flatMap((entry) => {
-    if (!isRecord(entry) || !hasExactKeys(entry, ['name', 'digest'])) return []
-    const name = displayText(entry.name, 200)
-    if (!name || typeof entry.digest !== 'string' || !OLLAMA_DIGEST_PATTERN.test(entry.digest)) return []
-    return [name]
-  })
-  return [...new Set(names)].sort((left, right) => left.localeCompare(right))
 }
 
 export function createSubmissionGate() {

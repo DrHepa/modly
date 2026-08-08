@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useAgentStore, type ThinkingMode } from '@shared/stores/agentStore'
 import { useAppStore } from '@shared/stores/appStore'
+import { parseOllamaModelNames } from '@shared/utils/agentModels'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -53,8 +54,8 @@ export function AgentSection(): JSX.Element {
   async function fetchModels(url: string) {
     try {
       const res = await fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(url)}`)
-      const data = await res.json()
-      applyAvailableModels(data.models ?? [])
+      const data: unknown = await res.json()
+      applyAvailableModels(parseOllamaModelNames(data))
     } catch {
       setModels([])
     }
@@ -65,10 +66,11 @@ export function AgentSection(): JSX.Element {
     setTestResult(null)
     try {
       const res = await fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(urlDraft)}`)
-      const data = await res.json()
-      const found = (data.models ?? []).length > 0
+      const data: unknown = await res.json()
+      const nextModels = parseOllamaModelNames(data)
+      const found = nextModels.length > 0
       setTestResult(found ? 'ok' : 'error')
-      if (found) applyAvailableModels(data.models)
+      applyAvailableModels(nextModels)
     } catch {
       setTestResult('error')
     } finally {

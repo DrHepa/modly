@@ -892,21 +892,45 @@ export function createOriginBoundUiGate(getActiveSessionId: () => string | null)
   }
 }
 
-export function createSessionRestoreCoordinator<T>(update: (messages: T[]) => void) {
+export function createSessionRestoreCoordinator<T>(
+  update: (messages: T[]) => void,
+  reconcile: (restored: T[]) => T[] = (restored) => restored,
+) {
   let generation = 0
+  let currentSessionId: string | null = null
   return {
-    async restore(sessionId: string | null, hydrate: () => Promise<T[]>): Promise<void> {
+    async restore(sessionId: string | null, hydrate: () => Promise<T[]>): Promise<boolean> {
       const restoreGeneration = ++generation
-      update([])
-      if (!sessionId) return
+      if (sessionId !== currentSessionId) {
+        currentSessionId = sessionId
+        update([])
+      }
+      if (!sessionId) return true
       const restored = await hydrate()
-      if (restoreGeneration === generation) update(restored)
+      if (restoreGeneration !== generation || currentSessionId !== sessionId) return false
+      update(reconcile(restored))
+      return true
     },
     cancel(): void {
       generation += 1
-      update([])
     },
   }
+}
+
+export function mergeRestoredMessages(current: readonly Message[], restored: readonly Message[]): Message[] {
+  const currentById = new Map(current.map((message) => [message.id, message]))
+  const restoredIds = new Set(restored.map((message) => message.id))
+  const reconciled = restored.map((persisted) => {
+    const transient = currentById.get(persisted.id)
+    if (!transient) return persisted
+    return {
+      ...persisted,
+      ...(transient.thinking !== undefined ? { thinking: transient.thinking } : {}),
+      ...(transient.actions !== undefined ? { actions: transient.actions } : {}),
+      ...(transient.imageDataUrls !== undefined ? { imageDataUrls: transient.imageDataUrls } : {}),
+    }
+  })
+  return [...reconciled, ...current.filter((message) => !restoredIds.has(message.id))]
 }
 
 export async function restorePersistedMessage(
@@ -915,7 +939,7 @@ export async function restorePersistedMessage(
   readAttachment: (attachmentId: string) => Promise<Uint8Array>,
   existing?: Message,
 ): Promise<Message> {
-  const imageDataUrls = (await Promise.all(persisted.attachmentIds.map(async (attachmentId) => {
+  const restoredImageDataUrls = (await Promise.all(persisted.attachmentIds.map(async (attachmentId) => {
     const ref = attachments.find((attachment) => attachment.id === attachmentId)
     if (!ref) return null
     try {
@@ -926,6 +950,7 @@ export async function restorePersistedMessage(
       return null
     }
   }))).filter((value): value is string => Boolean(value))
+  const imageDataUrls = existing?.imageDataUrls ?? restoredImageDataUrls
   return {
     id: persisted.id,
     role: persisted.role,
@@ -939,6 +964,24 @@ export async function restorePersistedMessage(
 
 export function appendSubmittedMessage<T>(messages: readonly T[], message: T): T[] {
   return [...messages, message]
+}
+
+export function captureAgentHistorySnapshot<T>(messages: readonly T[]): T[] {
+  return [...messages]
+}
+
+export function appendOrReplaceMessage<T extends { id: string }>(messages: readonly T[], message: T): T[] {
+  const existingIndex = messages.findIndex((candidate) => candidate.id === message.id)
+  if (existingIndex < 0) return [...messages, message]
+  return messages.map((candidate, index) => index === existingIndex ? { ...candidate, ...message } : candidate)
+}
+
+export function isAgentSessionReady(
+  initialized: boolean,
+  hydratedSessionId: string | null,
+  activeSessionId: string | null,
+): boolean {
+  return initialized && activeSessionId !== null && hydratedSessionId === activeSessionId
 }
 
 export async function withAgentLoading<T>(
@@ -1338,6 +1381,7 @@ export default function ChatPanel(): JSX.Element {
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
   const [governedActions, setGovernedActions] = useState<SessionGovernedAction[]>([])
+  const [hydratedSessionId, setHydratedSessionId] = useState<string | null>(null)
   const endRef                                = useRef<HTMLDivElement>(null)
   const textareaRef                           = useRef<HTMLTextAreaElement>(null)
   const modelPickerRef                        = useRef<HTMLDivElement>(null)
@@ -1350,13 +1394,14 @@ export default function ChatPanel(): JSX.Element {
   const persistedActionIdsRef                 = useRef(new Set<string>())
   const terminalMessageCounterRef             = useRef(0)
   const mountedRef                            = useRef(true)
+  const hydratedSessionIdRef                  = useRef<string | null>(null)
   const originUiGateRef                       = useRef(createOriginBoundUiGate(
     () => useAgentSessionsStore.getState().activeSession?.id ?? null,
   ))
   const sessionRestoreRef                     = useRef(createSessionRestoreCoordinator<Message>((nextMessages) => {
     messagesRef.current = nextMessages
     setMessages(nextMessages)
-  }))
+  }, (restored) => mergeRestoredMessages(messagesRef.current, restored)))
   const transientSessionIdRef                 = useRef<string | null>(null)
   messagesRef.current = messages
   governedActionsRef.current = governedActions
@@ -1381,6 +1426,8 @@ export default function ChatPanel(): JSX.Element {
     governedActionsRef.current = switchPlan.retained
     setGovernedActions(switchPlan.retained)
     transientSessionIdRef.current = nextSessionId
+    hydratedSessionIdRef.current = null
+    setHydratedSessionId(null)
     setInput('')
     setAttachments([])
     setError(null)
@@ -1404,7 +1451,8 @@ export default function ChatPanel(): JSX.Element {
 
   useLayoutEffect(() => {
     const session = activeSession
-    void sessionRestoreRef.current.restore(session?.id ?? null, async () => {
+    const restoringSessionId = session?.id ?? null
+    void sessionRestoreRef.current.restore(restoringSessionId, async () => {
       if (!session) return []
       return Promise.all(session.messages.map((persisted) => restorePersistedMessage(
         persisted,
@@ -1412,6 +1460,10 @@ export default function ChatPanel(): JSX.Element {
         (attachmentId) => window.electron.agentSessions.readAttachment({ sessionId: session.id, attachmentId }),
         messagesRef.current.find((message) => message.id === persisted.id),
       )))
+    }).then((applied) => {
+      if (!applied || !restoringSessionId || transientSessionIdRef.current !== restoringSessionId) return
+      hydratedSessionIdRef.current = restoringSessionId
+      setHydratedSessionId(restoringSessionId)
     })
     return () => sessionRestoreRef.current.cancel()
   }, [activeSession?.id, activeSession?.revision])
@@ -1765,7 +1817,9 @@ export default function ChatPanel(): JSX.Element {
           .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
       })
       uiToken.run(() => {
-        setMessages((prev) => [...prev, assistantMessage])
+        const nextMessages = appendOrReplaceMessage(messagesRef.current, assistantMessage)
+        messagesRef.current = nextMessages
+        setMessages(nextMessages)
         if (proposalErrors.length > 0) setError(proposalErrors.map((failure) => failure.message).join(' '))
       })
 
@@ -1852,9 +1906,15 @@ export default function ChatPanel(): JSX.Element {
 
   async function handleSend() {
     await submissionGateRef.current.run(async () => {
-      const text = input.trim()
+      const text = input
       const originatingSessionId = activeSession?.id
-      if (!text || isLoading || !initializedSessions || !originatingSessionId) return
+      if (
+        !text.trim()
+        || isLoading
+        || !originatingSessionId
+        || !isAgentSessionReady(initializedSessions, hydratedSessionIdRef.current, originatingSessionId)
+      ) return
+      const historySnapshot = captureAgentHistorySnapshot(messagesRef.current)
       const uiToken = originUiGateRef.current.begin(originatingSessionId)
 
       const attachmentIds: string[] = []
@@ -1882,8 +1942,9 @@ export default function ChatPanel(): JSX.Element {
           attachmentIds,
         })
         userPersisted = true
-        const nextMessages = appendSubmittedMessage(messagesRef.current, userMsg)
+        const nextMessages = appendSubmittedMessage(historySnapshot, userMsg)
         uiToken.run(() => {
+          messagesRef.current = nextMessages
           setMessages(nextMessages)
           setInput('')
           setAttachments([])
@@ -2134,7 +2195,11 @@ export default function ChatPanel(): JSX.Element {
 
             <button
               onClick={handleSend}
-              disabled={!input.trim() || isLoading || !initializedSessions}
+              disabled={
+                !input.trim()
+                || isLoading
+                || !isAgentSessionReady(initializedSessions, hydratedSessionId, activeSession?.id ?? null)
+              }
               className="w-6 h-6 rounded-full bg-accent hover:bg-accent-dark disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors shrink-0"
             >
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

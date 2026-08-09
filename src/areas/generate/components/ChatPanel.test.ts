@@ -774,6 +774,37 @@ test('submitted messages remain in history and loading clears after request fail
   }
 })
 
+test('request history is captured once so turn two is exactly user one, assistant one, user two', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const liveHistory = [
+      { id: 'u1', role: 'user', content: 'First question' },
+      { id: 'a1', role: 'assistant', content: 'First answer' },
+    ]
+    const snapshot = module.captureAgentHistorySnapshot(liveHistory)
+    liveHistory.splice(0, liveHistory.length)
+    const request = module.appendSubmittedMessage(snapshot, {
+      id: 'u2', role: 'user', content: 'Follow-up question',
+    })
+    assert.deepEqual(request.map((message: { id: string }) => message.id), ['u1', 'a1', 'u2'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('send readiness requires hydration of the exact active session', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    assert.equal(module.isAgentSessionReady(false, 's1', 's1'), false)
+    assert.equal(module.isAgentSessionReady(true, null, 's1'), false)
+    assert.equal(module.isAgentSessionReady(true, 's2', 's1'), false)
+    assert.equal(module.isAgentSessionReady(true, 's1', 's1'), true)
+    assert.equal(module.isAgentSessionReady(true, null, null), false)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('restoring history retains safe summaries and degrades only a failed attachment', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
@@ -794,6 +825,20 @@ test('restoring history retains safe summaries and degrades only a failed attach
     )
     assert.deepEqual(restored.summaries, [{ kind: 'action', label: 'Ran workflow' }])
     assert.equal(restored.imageDataUrls.length, 1)
+    assert.equal(Object.hasOwn(restored, 'actions'), false)
+
+    const refreshed = await module.restorePersistedMessage(
+      {
+        id: 'm1', role: 'assistant', content: 'Completed.',
+        attachmentIds: ['good'], summaries: [{ kind: 'action', label: 'Ran workflow' }],
+      },
+      [{ id: 'good', name: 'good.png', mimeType: 'image/png', sizeBytes: 12 }],
+      async () => { throw new Error('transient read failure') },
+      { ...restored, thinking: 'keep', actions: [{ tool: 'list_models', result: 'done' }] },
+    )
+    assert.deepEqual(refreshed.imageDataUrls, restored.imageDataUrls)
+    assert.equal(refreshed.thinking, 'keep')
+    assert.deepEqual(refreshed.actions, [{ tool: 'list_models', result: 'done' }])
   } finally {
     await cleanup()
   }
@@ -814,7 +859,50 @@ test('submission gate rejects rapid duplicate sends and recovers after completio
   }
 })
 
-test('session restore clears immediately and stale hydration cannot re-inject prior messages', async () => {
+test('same-session revision hydration merges by id without clearing transient state', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    let current: Array<{
+      id: string
+      role: string
+      content: string
+      thinking?: string
+      actions?: Array<{ tool: string, result: string }>
+      imageDataUrls?: string[]
+      summaries?: Array<{ kind: string, label: string }>
+    }> = []
+    const views: string[][] = []
+    const coordinator = module.createSessionRestoreCoordinator(
+      (messages: typeof current) => { current = messages; views.push(messages.map((message) => message.id)) },
+      (restored: typeof current) => module.mergeRestoredMessages(current, restored),
+    )
+    await coordinator.restore('same', async () => [{ id: 'm1', role: 'assistant', content: 'Persisted answer' }])
+    current = [{
+      id: 'm1', role: 'assistant', content: 'Live answer', thinking: 'live reasoning',
+      actions: [{ tool: 'list_models', result: 'done' }], imageDataUrls: ['data:image/png;base64,live'],
+    }]
+    views.length = 0
+    let releaseRefresh!: (messages: typeof current) => void
+    const refresh = coordinator.restore('same', () => new Promise((resolve) => { releaseRefresh = resolve }))
+    assert.deepEqual(views, [])
+    releaseRefresh([{
+      id: 'm1', role: 'assistant', content: 'Persisted answer',
+      summaries: [{ kind: 'action', label: 'Listed models' }],
+    }])
+    assert.equal(await refresh, true)
+    assert.deepEqual(views, [['m1']])
+    assert.deepEqual(current[0], {
+      id: 'm1', role: 'assistant', content: 'Persisted answer',
+      summaries: [{ kind: 'action', label: 'Listed models' }],
+      thinking: 'live reasoning', actions: [{ tool: 'list_models', result: 'done' }],
+      imageDataUrls: ['data:image/png;base64,live'],
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('session switching clears immediately and stale hydration cannot re-inject prior messages', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
     const views: string[][] = []

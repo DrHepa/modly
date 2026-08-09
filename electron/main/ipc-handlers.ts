@@ -68,6 +68,7 @@ import {
 import { RendererFilesystemAccess } from './renderer-filesystem-access'
 import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime'
 import { createAgentModelAccessRuntime } from './agent-model-access-runtime'
+import { createSharedAgentCapabilityResolver } from './agent-capability-resolver'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -443,6 +444,17 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   const agentModelAccess = createAgentModelAccessRuntime({
     root: agentModelAccessRoot(app.getPath('userData')),
   })
+  const sharedAgentCapabilityResolver = createSharedAgentCapabilityResolver({
+    discoverCapabilities: listAgentCapabilities,
+    getBuiltinDir: getBuiltinExtensionsDir,
+    getUserExtensionsDir: () => getSettings(app.getPath('userData')).extensionsDir,
+    fetchTrustedRepos,
+    hostRuntimes: agentHostRuntimes,
+    mcpSandboxReadiness,
+    processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
+    processModelAccessReadiness: (declaration) => agentModelAccess.readiness(declaration),
+    processPythonExecutable: () => getVenvPythonExe(app.getPath('userData')),
+  })
   const processExecutor = createAgentProcessExecutor({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
     getPrivateTempRoot: () => agentProcessPrivateTempRoot(app.getPath('userData')),
@@ -463,19 +475,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     acquireModelAccess: (input) => agentModelAccess.acquire(input),
   })
   const agentActionsService = new AgentActionsService({
-    resolveCapabilities: async () => {
-      const userData = app.getPath('userData')
-      return listAgentCapabilities({
-        builtinDir: getBuiltinExtensionsDir(),
-        userExtensionsDir: getSettings(userData).extensionsDir,
-        trustedRepos: await fetchTrustedRepos(),
-        hostRuntimes: agentHostRuntimes,
-        mcpSandboxReadiness,
-        processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
-        processModelAccessReadiness: (declaration) => agentModelAccess.readiness(declaration),
-        processPythonExecutable: () => getVenvPythonExe(userData),
-      })
-    },
+    resolveCapabilities: sharedAgentCapabilityResolver.forAgentActions,
     resolveCurrentModel: resolveCurrentOllamaModel,
     artifactVerifier: new WorkspaceAgentArtifactVerifier({
       getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
@@ -1267,18 +1267,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('automation:capabilities', () => getAutomationCapabilities())
 
-  ipcMain.handle('agentCapabilities:list', async () => {
-    const userData = app.getPath('userData')
-    return listAgentCapabilities({
-      builtinDir: getBuiltinExtensionsDir(),
-      userExtensionsDir: getSettings(userData).extensionsDir,
-      trustedRepos: await fetchTrustedRepos(),
-      hostRuntimes: agentHostRuntimes,
-      mcpSandboxReadiness,
-      processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
-      processPythonExecutable: () => getVenvPythonExe(userData),
-    })
-  })
+  ipcMain.handle('agentCapabilities:list', sharedAgentCapabilityResolver.forRendererIpc)
 
   // Install an extension from a GitHub repo URL
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {

@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { listAgentCapabilities, listVisibleExtensions } from './automation-capabilities.ts'
+import { createSharedAgentCapabilityResolver } from './agent-capability-resolver.ts'
+import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime.ts'
 
 async function fixture(withModelAccess = false) {
   const root = await mkdtemp(join(tmpdir(), 'modly-agent-python-discovery-'))
@@ -79,6 +81,79 @@ test('model access readiness is independently default-deny and excludes only Age
       ? ready.capabilities[0].execution.modelAccess : undefined, {
       schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1',
     })
+  } finally {
+    await rm(value.root, { recursive: true, force: true })
+  }
+})
+
+test('renderer inventory and Agent actions share one fresh capability discovery resolver with every runtime readiness input', async () => {
+  const hostRuntimes = createDefaultAgentHostRuntimeRegistry()
+  const mcpSandboxReadiness = async () => true
+  const processPythonSandboxReadiness = async () => true
+  const processModelAccessReadiness = async () => true
+  const processPythonExecutable = () => '/trusted/python'
+  const calls: Array<Parameters<typeof listAgentCapabilities>[0]> = []
+  let extensionRevision = 0
+  let trustRevision = 0
+
+  const shared = createSharedAgentCapabilityResolver({
+    discoverCapabilities: async (options) => {
+      calls.push(options)
+      return { capabilities: [], errors: [] }
+    },
+    getBuiltinDir: () => '/builtin',
+    getUserExtensionsDir: () => `/extensions/${++extensionRevision}`,
+    fetchTrustedRepos: async () => new Set([`trusted-${++trustRevision}`]),
+    hostRuntimes,
+    mcpSandboxReadiness,
+    processPythonSandboxReadiness,
+    processModelAccessReadiness,
+    processPythonExecutable,
+  })
+
+  assert.equal(shared.forAgentActions, shared.forRendererIpc)
+  await shared.forAgentActions()
+  await shared.forRendererIpc()
+
+  assert.equal(calls.length, 2)
+  assert.notEqual(calls[0], calls[1])
+  assert.deepEqual(calls.map((options) => options.userExtensionsDir), ['/extensions/1', '/extensions/2'])
+  assert.deepEqual(calls.map((options) => [...options.trustedRepos]), [['trusted-1'], ['trusted-2']])
+  for (const options of calls) {
+    assert.equal(options.hostRuntimes, hostRuntimes)
+    assert.equal(options.mcpSandboxReadiness, mcpSandboxReadiness)
+    assert.equal(options.processPythonSandboxReadiness, processPythonSandboxReadiness)
+    assert.equal(options.processModelAccessReadiness, processModelAccessReadiness)
+    assert.equal(options.processPythonExecutable, processPythonExecutable)
+  }
+})
+
+test('shared renderer inventory exposes model-backed PROCESS capabilities only while private model readiness is true', async () => {
+  const value = await fixture(true)
+  try {
+    const makeResolver = (processModelAccessReadiness: () => Promise<boolean>) => createSharedAgentCapabilityResolver({
+      discoverCapabilities: listAgentCapabilities,
+      getBuiltinDir: () => value.builtinDir,
+      getUserExtensionsDir: () => value.userExtensionsDir,
+      fetchTrustedRepos: async () => new Set(),
+      hostRuntimes: createDefaultAgentHostRuntimeRegistry(),
+      mcpSandboxReadiness: async () => true,
+      processPythonSandboxReadiness: async () => true,
+      processModelAccessReadiness,
+      processPythonExecutable: () => value.baseInterpreter,
+    }).forRendererIpc
+
+    for (const readiness of [async () => false, async () => { throw new Error('private model unavailable') }]) {
+      const unavailable = await makeResolver(readiness)()
+      assert.deepEqual(unavailable.capabilities, [])
+      assert.equal(unavailable.errors.some((error) => error.code === 'PROCESS_MODEL_ACCESS_UNAVAILABLE'), true)
+    }
+
+    const ready = await makeResolver(async () => true)()
+    assert.deepEqual(ready.errors, [])
+    assert.deepEqual(ready.capabilities.map((capability) => capability.id), ['python-tools/run'])
+    assert.equal(JSON.stringify(ready).includes(value.userExtensionsDir), false)
+    assert.equal(JSON.stringify(ready).includes(value.baseInterpreter), false)
   } finally {
     await rm(value.root, { recursive: true, force: true })
   }

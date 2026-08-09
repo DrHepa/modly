@@ -193,7 +193,7 @@ function parseAttachment(value: unknown): AgentAttachmentRef | null {
 
 function parseMessage(value: unknown): AgentSessionMessage | null {
   if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'role', 'content', 'attachmentIds', 'summaries'])) return null
-  if (!safeId(value.id) || (value.role !== 'user' && value.role !== 'assistant') || !safePersistedText(value.content, 100_000)) return null
+  if (!safeId(value.id) || (value.role !== 'user' && value.role !== 'assistant') || !nonEmptyString(value.content, 100_000)) return null
   if (!Array.isArray(value.attachmentIds) || value.attachmentIds.length > AGENT_SESSION_MAX_ATTACHMENTS || !value.attachmentIds.every(safeId)) return null
   if (new Set(value.attachmentIds).size !== value.attachmentIds.length) return null
   if (!Array.isArray(value.summaries) || value.summaries.length > 32) return null
@@ -276,6 +276,47 @@ export class AgentSessionStore {
   private attachmentsRoot(): string { return path.join(this.rootDir, ATTACHMENTS_DIR) }
   private attachmentPath(sessionId: string, attachment: AgentAttachmentRef): string {
     return path.join(this.attachmentsRoot(), sessionId, `${attachment.id}${MIME_EXTENSIONS[attachment.mimeType]}`)
+  }
+
+  private async secureOpenedPath(
+    target: string,
+    expected: 'directory' | 'file',
+    mode: number,
+    missingAllowed = false,
+  ): Promise<boolean> {
+    let pathInfo
+    try {
+      pathInfo = await lstat(target)
+    } catch (error) {
+      if (missingAllowed && isMissingError(error)) return false
+      throw error
+    }
+    const validType = expected === 'directory' ? pathInfo.isDirectory() : pathInfo.isFile()
+    if (pathInfo.isSymbolicLink() || !validType) {
+      throw new Error(`Agent session ${expected === 'directory' ? 'root' : 'document'} must be a real ${expected}.`)
+    }
+    const directoryFlag = expected === 'directory' ? (constants.O_DIRECTORY ?? 0) : 0
+    const handle = await open(target, constants.O_RDONLY | directoryFlag | (constants.O_NOFOLLOW ?? 0))
+    try {
+      const openedInfo = await handle.stat()
+      const openedType = expected === 'directory' ? openedInfo.isDirectory() : openedInfo.isFile()
+      if (!openedType || openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+        throw new Error(`Agent session ${expected === 'directory' ? 'root' : 'document'} changed during validation.`)
+      }
+      await handle.chmod(mode)
+    } finally {
+      await handle.close()
+    }
+    return true
+  }
+
+  private async requireSecureRoot(): Promise<void> {
+    await mkdir(this.rootDir, { recursive: true, mode: 0o700 })
+    await this.secureOpenedPath(this.rootDir, 'directory', 0o700)
+  }
+
+  private async secureDocumentIfPresent(): Promise<void> {
+    await this.secureOpenedPath(this.documentPath(), 'file', 0o600, true)
   }
 
   private async removeForCleanup(
@@ -461,6 +502,8 @@ export class AgentSessionStore {
   }
 
   private async load(): Promise<{ document: AgentSessionDocumentV1, readOnly: false } | { document: null, readOnly: true }> {
+    await this.requireSecureRoot()
+    await this.secureDocumentIfPresent()
     let raw: unknown
     try { raw = await this.readRaw() }
     catch {
@@ -472,7 +515,6 @@ export class AgentSessionStore {
       return { document: fresh, readOnly: false }
     }
     if (raw === null) {
-      await mkdir(this.rootDir, { recursive: true })
       await this.pruneTempFiles()
       await this.pruneCorruptBackups()
       const fresh = this.freshDocument()
@@ -511,7 +553,7 @@ export class AgentSessionStore {
   }
 
   private async writeDocument(document: AgentSessionDocumentV1): Promise<void> {
-    await mkdir(this.rootDir, { recursive: true })
+    await this.requireSecureRoot()
     const temp = path.join(this.rootDir, `${DOCUMENT_FILE}.${this.randomId()}.tmp`)
     await writeFile(temp, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 })
     await rename(temp, this.documentPath())
@@ -637,13 +679,12 @@ export class AgentSessionStore {
     return this.exclusive(async () => {
       if (!isRecord(request) || !hasOnlyKeys(request, ['sessionId', 'expectedRevision', 'message']) || !isRecord(request.message)) throw new Error('Invalid agent session message request.')
       if (!hasOnlyKeys(request.message, ['id', 'role', 'content', 'attachmentIds', 'summaries'])) throw new Error('Agent messages may contain only allowed fields.')
-      const content = redactPersistedText(request.message.content, 100_000)
       const summaries = Array.isArray(request.message.summaries)
         ? request.message.summaries.map((summary) => isRecord(summary) && typeof summary.label === 'string'
           ? { ...summary, label: redactPersistedText(summary.label, 300) }
           : summary)
         : []
-      const message = parseMessage({ ...request.message, content, attachmentIds: request.message.attachmentIds ?? [], summaries })
+      const message = parseMessage({ ...request.message, attachmentIds: request.message.attachmentIds ?? [], summaries })
       if (!message) throw new Error('Invalid agent session message.')
       const loaded = await this.load(); const document = this.requireWritable(loaded); const session = this.find(document, request.sessionId)
       this.checkRevision(session, request.expectedRevision)

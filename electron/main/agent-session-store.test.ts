@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -61,7 +61,7 @@ test('semantic no-op rename preserves revision and TTL', async () => {
   })
 })
 
-test('message persistence is allowlisted and rejects runtime or secret-bearing fields', async () => {
+test('message persistence is allowlisted while visible content remains exact byte-for-byte', async () => {
   await withStore(async (store) => {
     const session = await store.create({})
     await assert.rejects(
@@ -79,68 +79,62 @@ test('message persistence is allowlisted and rejects runtime or secret-bearing f
     })
     assert.deepEqual(appended.messages, [{ id: 'm1', role: 'assistant', content: 'Safe answer', attachmentIds: [], summaries: [] }])
 
-    const redacted = await store.appendMessage({
+    const exactPrivateLookingContent = [
+      '  token=https://example.test/private password=hunter2 file:///home/user/key  ',
+      String.raw`preview=data:image/png;base64,AAAA path=/home/alice/private.txt win=C:\Users\Alice\secret.txt unc=\\server\share\secret.txt`,
+      'Authorization: Bearer bearer-value',
+      'api_key->arrow-value',
+      'Unicode survives too: cañón 🧰',
+    ].join('\n')
+    const exact = await store.appendMessage({
       sessionId: session.id,
       expectedRevision: appended.revision,
-      message: { id: 'm2', role: 'user', content: 'token=https://example.test/private password=hunter2 file:///home/user/key' },
+      message: { id: 'm2', role: 'user', content: exactPrivateLookingContent },
     })
-    assert.equal(redacted.messages[1].content.includes('hunter2'), false)
-    assert.equal(redacted.messages[1].content.includes('example.test'), false)
-    assert.equal(redacted.messages[1].content.includes('/home/user'), false)
-
-    const adversarial = await store.appendMessage({
-      sessionId: session.id,
-      expectedRevision: redacted.revision,
-      message: {
-        id: 'm3',
-        role: 'user',
-        content: String.raw`preview=data:image/png;base64,AAAA path=/home/alice/private.txt uri=file:///home/alice/key win=C:\Users\Alice\secret.txt unc=\\server\share\secret.txt`,
-      },
-    })
-    const persisted = adversarial.messages[2].content
-    for (const secretFragment of ['data:image', '/home/alice', 'C:\\Users\\Alice', '\\\\server\\share']) {
-      assert.equal(persisted.includes(secretFragment), false, `persisted privacy fragment: ${secretFragment}`)
-    }
-
-    const delimiterProbes = [
-      String.raw`quoted="/home/alice/private.txt"`,
-      String.raw`colon:C:\Users\Alice\private.txt`,
-      String.raw`quoted="\\server\share\private.txt"`,
-      String.raw`uri=file:/home/alice/private.txt`,
-      String.raw`winuri=file:C:\Users\Alice\private.txt`,
-    ]
-    let current = adversarial
-    for (const [index, probe] of delimiterProbes.entries()) {
-      current = await store.appendMessage({
-        sessionId: session.id,
-        expectedRevision: current.revision,
-        message: { id: `delimiter-${index}`, role: 'user', content: probe },
-      })
-      assert.equal(current.messages.at(-1)?.content, '[redacted private content]', probe)
-    }
-
-    const credentialProbes = [
-      'Authorization: Bearer bearer-value',
-      'password whitespace-value',
-      'passwd: colon-value',
-      'token=equals-value',
-      'api_key->arrow-value',
-      'apikey|pipe-value',
-      'secret whitespace-value',
-    ]
-    for (const [index, probe] of credentialProbes.entries()) {
-      current = await store.appendMessage({
-        sessionId: session.id,
-        expectedRevision: current.revision,
-        message: { id: `credential-${index}`, role: 'user', content: probe },
-      })
-      assert.equal(current.messages.at(-1)?.content, '[redacted private content]', probe)
-    }
+    assert.equal(exact.messages[1].content, exactPrivateLookingContent)
+    assert.equal((await store.read({ sessionId: session.id })).messages[1].content, exactPrivateLookingContent)
     await assert.rejects(
       store.create({ title: 'preview=data:image/png;base64,AAAA' }),
       /invalid agent session create/i,
     )
   })
+})
+
+test('session storage repairs root and document permissions without following a symlinked root', async () => {
+  await withStore(async (store, root) => {
+    await store.list()
+    const documentPath = path.join(root, 'agent-sessions.json')
+    await chmod(root, 0o775)
+    await chmod(documentPath, 0o664)
+
+    await store.list()
+
+    assert.equal((await stat(root)).mode & 0o777, 0o700)
+    assert.equal((await stat(documentPath)).mode & 0o777, 0o600)
+
+    const decoyDocument = path.join(root, 'decoy.json')
+    await writeFile(decoyDocument, 'do not follow', { mode: 0o666 })
+    await chmod(decoyDocument, 0o666)
+    await rm(documentPath)
+    await symlink(decoyDocument, documentPath, 'file')
+    await assert.rejects(store.list(), /document.*(?:real file|symlink)|symlink.*document/i)
+    assert.equal(await readFile(decoyDocument, 'utf8'), 'do not follow')
+    assert.equal((await stat(decoyDocument)).mode & 0o777, 0o666)
+  })
+
+  const parent = await mkdtemp(path.join(tmpdir(), 'modly-agent-session-root-link-'))
+  const target = path.join(parent, 'target')
+  const linkedRoot = path.join(parent, 'linked-root')
+  try {
+    await mkdir(target, { mode: 0o700 })
+    await chmod(target, 0o777)
+    await symlink(target, linkedRoot, 'dir')
+    const store = new AgentSessionStore({ rootDir: linkedRoot })
+    await assert.rejects(store.list(), /root.*(?:real directory|symlink)|symlink.*root/i)
+    assert.equal((await stat(target)).mode & 0o777, 0o777)
+  } finally {
+    await rm(parent, { recursive: true, force: true })
+  }
 })
 
 test('terminal governed action summaries persist only minimal safe public evidence', async () => {

@@ -3,6 +3,17 @@ import { useAppStore } from '@shared/stores/appStore'
 import { useAgentStore } from '@shared/stores/agentStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'
+import { useExtensionsStore } from '@shared/stores/extensionsStore'
+import { useApi } from '@shared/hooks/useApi'
+import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
+import { buildAllWorkflowExtensions } from '@areas/workflows/mockExtensions'
+import { validateWorkflowPreflight } from '@areas/workflows/preflight'
+import {
+  applyAgentResponseActions,
+  canonicalWorkspaceAssetRef,
+  createAppliedDirectActionIds,
+  parseAgentResponseActions,
+} from '../agentDirectActions'
 import { parseOllamaModelNames } from '@shared/utils/agentModels'
 import AgentSessionHistory from './AgentSessionHistory'
 
@@ -11,7 +22,6 @@ export { parseOllamaModelNames }
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 import type { ThinkingMode } from '@shared/stores/agentStore'
-import type { Workflow } from '@shared/types/electron.d'
 import type {
   AgentAttachmentRef,
   AgentGovernedActionTerminalSummary,
@@ -31,6 +41,10 @@ import type {
   AgentOllamaModelSelectionV1,
   JsonValue,
 } from '@shared/types/agentActions'
+import type {
+  AgentReflectedAction,
+  AgentResponseAction,
+} from '../agentDirectActions'
 
 interface Message {
   id: string
@@ -38,7 +52,7 @@ interface Message {
   content: string
   thinking?: string
   imageDataUrls?: string[]
-  actions?: ActionDone[]
+  actions?: AgentReflectedAction[]
   summaries?: AgentSessionSummary[]
 }
 
@@ -54,22 +68,11 @@ export interface SessionGovernedAction {
   error?: string
 }
 
-type WorkflowDraft = Omit<Workflow, 'id' | 'createdAt' | 'updatedAt'>
-
-type ActionPayload =
-  | { type: 'mesh_update'; url: string; face_count?: number }
-  | { type: 'run_workflow'; workflow_id: string; workflow_name: string }
-  | { type: 'create_workflow'; workflow: WorkflowDraft }
-
-export interface ActionDone {
-  tool: string
-  result: string
-  payload?: ActionPayload | null
-}
+export type ActionDone = AgentReflectedAction
 
 interface AgentChatData {
   message: string
-  actions: ActionDone[]
+  actions: AgentResponseAction[]
   proposals: AgentActionProposal[]
   thinking?: string
 }
@@ -150,81 +153,6 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
     && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
 }
 
-function isWorkflowDraft(value: unknown): value is WorkflowDraft {
-  return isRecord(value)
-    && typeof value.name === 'string'
-    && typeof value.description === 'string'
-    && Array.isArray(value.nodes)
-    && Array.isArray(value.edges)
-}
-
-function parseAction(value: unknown): ActionDone | null {
-  if (!isRecord(value) || typeof value.tool !== 'string' || !value.tool.trim() || typeof value.result !== 'string') {
-    return null
-  }
-
-  if (value.payload === undefined) return { tool: value.tool, result: value.result }
-  if (value.payload === null) return { tool: value.tool, result: value.result, payload: null }
-  if (!isRecord(value.payload) || typeof value.payload.type !== 'string') return null
-
-  const payload = value.payload
-  if (payload.type === 'mesh_update') {
-    if (
-      typeof payload.url !== 'string'
-      || !payload.url.trim()
-      || (payload.face_count !== undefined && (typeof payload.face_count !== 'number' || !Number.isFinite(payload.face_count)))
-    ) return null
-    return {
-      tool: value.tool,
-      result: value.result,
-      payload: {
-        type: 'mesh_update',
-        url: payload.url,
-        ...(typeof payload.face_count === 'number' ? { face_count: payload.face_count } : {}),
-      },
-    }
-  }
-  if (payload.type === 'run_workflow') {
-    if (
-      typeof payload.workflow_id !== 'string'
-      || !payload.workflow_id.trim()
-      || typeof payload.workflow_name !== 'string'
-      || !payload.workflow_name.trim()
-    ) return null
-    return {
-      tool: value.tool,
-      result: value.result,
-      payload: {
-        type: 'run_workflow',
-        workflow_id: payload.workflow_id,
-        workflow_name: payload.workflow_name,
-      },
-    }
-  }
-  if (payload.type === 'create_workflow' && isWorkflowDraft(payload.workflow)) {
-    return {
-      tool: value.tool,
-      result: value.result,
-      payload: { type: 'create_workflow', workflow: payload.workflow },
-    }
-  }
-  return null
-}
-
-function parseActions(value: unknown): { actions: ActionDone[]; valid: boolean } {
-  if (value === undefined) return { actions: [], valid: true }
-  if (!Array.isArray(value)) return { actions: [], valid: false }
-
-  const actions: ActionDone[] = []
-  let valid = true
-  for (const valueAction of value) {
-    const action = parseAction(valueAction)
-    if (action) actions.push(action)
-    else valid = false
-  }
-  return { actions, valid }
-}
-
 function parseProposal(value: unknown): AgentActionProposal | null {
   if (!isRecord(value) || !hasExactKeys(value, [
     'type', 'capabilityId', 'capabilityHash', 'modelLeaseId', 'arguments',
@@ -258,10 +186,10 @@ function parseProposals(value: unknown): { proposals: AgentActionProposal[]; val
 }
 
 export class AgentApiError extends Error {
-  readonly actions: ActionDone[]
+  readonly actions: AgentResponseAction[]
   readonly proposals: AgentActionProposal[]
 
-  constructor(message: string, actions: ActionDone[], proposals: AgentActionProposal[] = []) {
+  constructor(message: string, actions: AgentResponseAction[], proposals: AgentActionProposal[] = []) {
     super(message)
     this.name = 'AgentApiError'
     this.actions = actions
@@ -309,9 +237,10 @@ export async function parseAgentChatResponse(
     const safeMessage = detail && typeof detail.message === 'string' && detail.message.trim()
       ? detail.message.trim().slice(0, 500)
       : 'Modly could not complete the request. Please try again.'
+    const parsedActions = parseAgentResponseActions(detail?.actions)
     throw new AgentApiError(
       safeMessage,
-      parseActions(detail?.actions).actions,
+      parsedActions.valid ? parsedActions.actions : [],
       parseProposals(detail?.proposals).proposals,
     )
   }
@@ -322,7 +251,7 @@ export async function parseAgentChatResponse(
   if (body.thinking !== undefined && body.thinking !== null && typeof body.thinking !== 'string') {
     throw new Error('Modly returned an invalid agent response.')
   }
-  const parsedActions = parseActions(body.actions)
+  const parsedActions = parseAgentResponseActions(body.actions)
   const parsedProposals = parseProposals(body.proposals)
   if (!parsedActions.valid || !parsedProposals.valid) throw new Error('Modly returned an invalid agent response.')
 
@@ -334,16 +263,16 @@ export async function parseAgentChatResponse(
   }
 }
 
-export interface AgentActionFailure {
-  action: ActionDone
+export interface AgentActionFailure<T> {
+  action: T
   error: unknown
 }
 
-export async function applyAgentActions(
-  actions: ActionDone[],
-  applyAction: (action: ActionDone) => void | Promise<void>,
-): Promise<AgentActionFailure[]> {
-  const failures: AgentActionFailure[] = []
+export async function applyAgentActions<T>(
+  actions: T[],
+  applyAction: (action: T) => void | Promise<void>,
+): Promise<AgentActionFailure<T>[]> {
+  const failures: AgentActionFailure<T>[] = []
   for (const action of actions) {
     try {
       await applyAction(action)
@@ -354,34 +283,9 @@ export async function applyAgentActions(
   return failures
 }
 
-export const GOVERNED_ACTION_REQUIRED_CODE = 'governed_action_required'
-export const GOVERNED_ACTION_REQUIRED_MESSAGE = 'This action requires approval before Modly can apply it.'
-
-export class GovernedActionRequiredError extends Error {
-  readonly code = GOVERNED_ACTION_REQUIRED_CODE
-  readonly recoverable = true
-
-  constructor() {
-    super(GOVERNED_ACTION_REQUIRED_MESSAGE)
-    this.name = 'GovernedActionRequiredError'
-  }
-}
-
-export function rejectUngovernedAgentAction(action: ActionDone): void {
-  if (action.payload) throw new GovernedActionRequiredError()
-}
-
-function governedActionFailure(failures: AgentActionFailure[]): GovernedActionRequiredError | null {
-  const failure = failures.find(({ error }) => (
-    error instanceof GovernedActionRequiredError
-    || (isRecord(error) && error.code === GOVERNED_ACTION_REQUIRED_CODE)
-  ))
-  return failure ? new GovernedActionRequiredError() : null
-}
-
 export function withActionFailureSummary(message: string, failureCount: number): string {
   if (failureCount <= 0) return message
-  return `${message} ${failureCount} completed action${failureCount === 1 ? '' : 's'} could not be reflected locally.`
+  return `${message} ${failureCount} action${failureCount === 1 ? '' : 's'} could not be applied locally.`
 }
 
 function displayText(value: unknown, maxLength: number): string | null {
@@ -1042,7 +946,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_mesh_info:        'Inspected mesh',
   get_generation_status:'Checked generation',
   list_workflows:       'Listed workflows',
-  run_workflow:         'Ran workflow',
+  run_workflow:         'Started workflow',
   create_workflow:      'Created workflow',
 }
 
@@ -1111,8 +1015,8 @@ function ActionsCard({ actions, onUndo }: { actions: ActionDone[]; onUndo?: () =
               {a.payload?.type === 'run_workflow' && (
                 <span className="text-violet-400">{a.payload.workflow_name}</span>
               )}
-              {a.payload?.type === 'create_workflow' && a.payload.workflow && (
-                <span className="text-violet-400">{a.payload.workflow.name}</span>
+              {a.payload?.type === 'create_workflow' && (
+                <span className="text-violet-400">{a.payload.workflow_name}</span>
               )}
             </div>
           ))}
@@ -1391,6 +1295,7 @@ export default function ChatPanel(): JSX.Element {
   const submissionGateRef                     = useRef(createSubmissionGate())
   const actionOperationGateRef                = useRef(createKeyedOperationGate())
   const proposalTrackerRef                    = useRef(createGovernedProposalTracker())
+  const appliedDirectActionIdsRef             = useRef(createAppliedDirectActionIds())
   const persistedActionIdsRef                 = useRef(new Set<string>())
   const terminalMessageCounterRef             = useRef(0)
   const mountedRef                            = useRef(true)
@@ -1471,9 +1376,12 @@ export default function ChatPanel(): JSX.Element {
   const apiUrl           = useAppStore((s) => s.apiUrl)
   const currentJob       = useAppStore((s) => s.currentJob)
   const meshStats        = useAppStore((s) => s.meshStats)
+  const updateCurrentJob = useAppStore((s) => s.updateCurrentJob)
+  const pushMeshUrl      = useAppStore((s) => s.pushMeshUrl)
   const undoMesh         = useAppStore((s) => s.undoMesh)
 
   const workflows = useWorkflowsStore((s) => s.workflows)
+  const { optimizeMesh, smoothMesh } = useApi()
 
   useEffect(() => {
     setModel(defaultModel)
@@ -1500,7 +1408,8 @@ export default function ChatPanel(): JSX.Element {
 
   function buildContext(): Record<string, unknown> {
     const ctx: Record<string, unknown> = {}
-    if (currentJob?.outputUrl) ctx.currentMeshPath = currentJob.outputUrl.replace('/workspace/', '')
+    const currentMeshRef = canonicalWorkspaceAssetRef(currentJob?.outputUrl)
+    if (currentMeshRef) ctx.currentMeshRef = currentMeshRef
     if (meshStats?.triangles)  ctx.meshTriangles   = meshStats.triangles
     if (workflows.length > 0)  ctx.workflows       = workflows.map((w) => ({ id: w.id, name: w.name }))
     return ctx
@@ -1721,16 +1630,60 @@ export default function ChatPanel(): JSX.Element {
   }
 
   async function applyCompletedActions(
-    actions: ActionDone[],
-  ): Promise<AgentActionFailure[]> {
-    return applyAgentActions(actions, rejectUngovernedAgentAction)
+    actions: AgentResponseAction[],
+    originatingSessionId: string,
+    uiToken: OriginBoundUiToken,
+    msgs: Message[],
+  ) {
+    const latestImageDataUrl = [...msgs].reverse()
+      .find((message) => message.role === 'user' && message.imageDataUrls?.length)
+      ?.imageDataUrls?.[0]
+    const overrideImageData = latestImageDataUrl?.split(',')[1]
+
+    return applyAgentResponseActions(actions, {
+      originSessionId: originatingSessionId,
+      isCurrent: uiToken.isCurrent,
+      appliedIds: appliedDirectActionIdsRef.current,
+      createWorkflow: (request) => window.electron.agentWorkflows.create(request),
+      reloadWorkflows: () => useWorkflowsStore.getState().load(),
+      openWorkflow: (workflowId) => useWorkflowsStore.getState().openWorkflow(workflowId),
+      getWorkflows: () => useWorkflowsStore.getState().workflows,
+      isWorkflowBusy: () => {
+        const status = useWorkflowRunStore.getState().runState.status
+        const jobStatus = useAppStore.getState().currentJob?.status
+        return status === 'running' || status === 'paused' || jobStatus === 'uploading' || jobStatus === 'generating'
+      },
+      loadExtensions: () => useExtensionsStore.getState().loadExtensions(),
+      getWorkflowExtensions: () => {
+        const state = useExtensionsStore.getState()
+        return buildAllWorkflowExtensions(state.modelExtensions, state.processExtensions)
+      },
+      preflightWorkflow: (workflow, extensions) => validateWorkflowPreflight(
+        workflow,
+        extensions,
+        { currentMeshUrl: canonicalWorkspaceAssetRef(useAppStore.getState().currentJob?.outputUrl) },
+      ).map((issue) => issue.message),
+      startWorkflow: (workflow, extensions) => useWorkflowRunStore.getState().run(
+        workflow,
+        extensions,
+        overrideImageData,
+      ),
+      currentMeshRef: () => canonicalWorkspaceAssetRef(useAppStore.getState().currentJob?.outputUrl),
+      smoothMesh,
+      decimateMesh: optimizeMesh,
+      updateMesh: (url) => {
+        updateCurrentJob({ outputUrl: url })
+        pushMeshUrl(url)
+      },
+      unloadModels: () => window.electron.model.unloadAll(),
+    })
   }
 
   async function callAgent(
     originatingSessionId: string,
     msgs: Message[],
+    uiToken: OriginBoundUiToken,
     extraContext: Record<string, unknown> = {},
-    uiToken = originUiGateRef.current.begin(originatingSessionId),
   ) {
     const selectedModel: AgentOllamaModelSelectionV1 = {
       provider: 'ollama',
@@ -1799,9 +1752,9 @@ export default function ChatPanel(): JSX.Element {
         uiToken,
       )
 
-      const actionFailures = await applyCompletedActions(data.actions)
-      const failedActions = new Set(actionFailures.map((failure) => failure.action))
-      const reflectedActions = data.actions.filter((action) => !failedActions.has(action))
+      const actionApplication = await applyCompletedActions(data.actions, originatingSessionId, uiToken, msgs)
+      const actionFailures = actionApplication.failures
+      const reflectedActions = actionApplication.reflectedActions
       const assistantMessage: Message = {
         id: `a-${Date.now()}`,
         role: 'assistant',
@@ -1824,14 +1777,12 @@ export default function ChatPanel(): JSX.Element {
       })
 
       if (actionFailures.length > 0) {
-        const approvalRequired = governedActionFailure(actionFailures)
-        if (approvalRequired) throw approvalRequired
         throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
       }
     } catch (e: unknown) {
       let actionFailureCount = 0
-      let approvalRequired: GovernedActionRequiredError | null = null
       let proposalErrors: GovernedActionHandoffError[] = []
+      let partialSummaryError: string | null = null
       if (e instanceof AgentApiError && modelLeaseId) {
         proposalErrors = await handoffGovernedProposals(
           e.proposals,
@@ -1840,17 +1791,42 @@ export default function ChatPanel(): JSX.Element {
           uiToken,
         )
         if (e.actions.length > 0) {
-          const actionFailures = await applyCompletedActions(e.actions)
-          actionFailureCount = actionFailures.length
-          approvalRequired = governedActionFailure(actionFailures)
+          const application = await applyCompletedActions(e.actions, originatingSessionId, uiToken, msgs)
+          actionFailureCount = application.failures.length
+          if (application.reflectedActions.length > 0) {
+            const partialMessage: Message = {
+              id: `a-partial-${Date.now()}`,
+              role: 'assistant',
+              content: 'Completed local actions before the Agent request stopped.',
+              actions: application.reflectedActions,
+            }
+            try {
+              await appendPersistedMessage(originatingSessionId, {
+                id: partialMessage.id,
+                role: partialMessage.role,
+                content: partialMessage.content,
+                summaries: application.reflectedActions.map((action, index) => (
+                  completedActionSummary(action, partialMessage.id, index)
+                )),
+              })
+              uiToken.run(() => {
+                const nextMessages = appendOrReplaceMessage(messagesRef.current, partialMessage)
+                messagesRef.current = nextMessages
+                setMessages(nextMessages)
+              })
+            } catch {
+              partialSummaryError = 'Completed actions could not be saved to this chat session.'
+            }
+          }
         }
       }
       const msg = e instanceof Error ? e.message : String(e)
       const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
-      const primaryMessage = approvalRequired?.message
-        ?? (e instanceof GovernedActionRequiredError ? e.message : withActionFailureSummary(safeMessage, actionFailureCount))
+      const primaryMessage = withActionFailureSummary(safeMessage, actionFailureCount)
       uiToken.run(() => setError(
-        [primaryMessage, ...proposalErrors.map((failure) => failure.message)].join(' '),
+        [primaryMessage, partialSummaryError, ...proposalErrors.map((failure) => failure.message)]
+          .filter((message): message is string => Boolean(message))
+          .join(' '),
       ))
     } finally {
       uiToken.run(() => setIsLoading(false))
@@ -1950,7 +1926,7 @@ export default function ChatPanel(): JSX.Element {
           setAttachments([])
           if (textareaRef.current) textareaRef.current.style.height = 'auto'
         })
-        await callAgent(originatingSessionId, nextMessages, {}, uiToken)
+        await callAgent(originatingSessionId, nextMessages, uiToken)
       } catch (failure) {
         let visibleFailure = failure
         if (!userPersisted && attachmentIds.length > 0) {

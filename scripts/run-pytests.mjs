@@ -70,6 +70,7 @@ const pytestResult = spawnSync(cmd, [
   '-m',
   'pytest',
   'tests/test_agent.py',
+  'tests/test_agent_direct_actions.py',
   'tests/test_collection_safety.py',
   'tests/test_generation_inputs.py',
   'tests/test_video_generation.py',

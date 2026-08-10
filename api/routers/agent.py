@@ -7,12 +7,13 @@ import logging
 import math
 import os
 import re
+import secrets
 import time
-from typing import Literal, NoReturn
+from typing import Annotated, Literal, NoReturn
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -31,18 +32,30 @@ MAX_CAPABILITY_INPUT_HINTS = 32
 MAX_TOOL_CALLS_PER_ROUND = 8
 MAX_TOOL_ARGUMENT_BYTES = 16 * 1024
 MAX_JSON_DEPTH = 4
+MAX_DIRECT_TOOL_JSON_DEPTH = 5
 MAX_PROPOSALS_PER_CHAT = 4
+MAX_DIRECT_GRAPH_NODES = 64
+MAX_DIRECT_GRAPH_EDGES = 128
+MAX_DIRECT_TOOL_ARGUMENT_BYTES = 256 * 1024
+MAX_AGENT_ACTION_BATCH_BYTES = 512 * 1024
+MAX_AGENT_ACTIONS_PER_RESPONSE = MAX_TOOL_CALLS_PER_ROUND * 10
 MAX_OLLAMA_ROUND_DEADLINE_SECONDS = 30 * 60.0
 DEFAULT_OLLAMA_ROUND_DEADLINE_SECONDS = MAX_OLLAMA_ROUND_DEADLINE_SECONDS
 MAX_OLLAMA_STREAM_RAW_BYTES = 8 * 1024 * 1024
 MAX_OLLAMA_STREAM_FRAMES = 4096
 MAX_OLLAMA_CONTENT_BYTES = 2 * 1024 * 1024
 MAX_OLLAMA_THINKING_BYTES = 4 * 1024 * 1024
-MAX_TOOL_ARGUMENT_BYTES_PER_ROUND = MAX_TOOL_CALLS_PER_ROUND * MAX_TOOL_ARGUMENT_BYTES
+MAX_TOOL_ARGUMENT_BYTES_PER_ROUND = MAX_DIRECT_TOOL_ARGUMENT_BYTES + (MAX_TOOL_CALLS_PER_ROUND - 1) * MAX_TOOL_ARGUMENT_BYTES
 UNSAFE_JSON_KEYS = {"__proto__", "prototype", "constructor"}
 CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CAPABILITY_HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 MODEL_LEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+DIRECT_ACTION_ID_PATTERN = re.compile(r"^direct-[a-f0-9]{32}$")
+WORKFLOW_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+WORKFLOW_GRAPH_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+WORKFLOW_NODE_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$")
+WORKFLOW_PARAM_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+MESH_ASSET_SUFFIXES = frozenset({".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx"})
 INPUT_HINT_PATH_PATTERN = re.compile(
     r"^(?:input(?:\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127})?|params\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|arguments\.[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$"
 )
@@ -62,9 +75,19 @@ OLLAMA_ROUND_DEADLINE_SECONDS = _bounded_ollama_round_deadline_seconds(
     os.environ.get("MODLY_AGENT_OLLAMA_ROUND_DEADLINE_SECONDS", DEFAULT_OLLAMA_ROUND_DEADLINE_SECONDS)
 )
 
+
+def _is_valid_ollama_base_url(value: object) -> bool:
+    if not isinstance(value, str) or value != value.strip() or not value or len(value) > 2048:
+        return False
+    try:
+        parsed = httpx.URL(value)
+    except (TypeError, httpx.InvalidURL):
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.host) and not parsed.query and not parsed.fragment
+
 SYSTEM_PROMPT = """\
-You are Modly's built-in AI assistant, specialized in explaining local 3D capabilities and proposing governed actions.
-You may inspect read-only Modly inventory. You must never claim that a proposed action has already executed.
+You are Modly's built-in AI assistant, specialized in local 3D work and governed extension capabilities.
+You may inspect read-only Modly inventory and request the five explicitly listed local private direct actions. A governed proposal is never an execution.
 
 ## Available tools
 
@@ -73,17 +96,28 @@ You may inspect read-only Modly inventory. You must never claim that a proposed 
 - **get_mesh_info** — Get info about the current mesh in the 3D viewer (path, triangle count).
 - **get_generation_status(job_id)** — Poll the status of an ongoing 3D generation job.
 - **list_workflows** — List all available workflows in Modly.
+- **unload_models()** — Directly unload local generation models from memory.
+- **smooth_mesh(asset_ref, iterations)** — Directly smooth the current workspace mesh. `asset_ref` must be the exact canonical `/workspace/...` reference returned by get_mesh_info; iterations are 1 through 20.
+- **decimate_mesh(asset_ref, target_faces)** — Directly decimate the current workspace mesh to 100 through 500000 faces.
+- **run_workflow(workflow_id)** — Directly start one exact workflow returned by list_workflows.
+- **create_workflow(graph)** — Directly create one validated `modly.agent-workflow-graph` version 1 DAG. Preserve every branch and repeated node. Use logical node keys, exact builtin types or exact `extension/node` ids from inventory, and explicit edges. This creates only; it never runs the workflow in the same action.
 - **propose_capability_action(capability_id, arguments)** — Request explicit user approval for one governed capability. This records a proposal only; it does not execute, approve, or change Modly.
 
 ## Rules
 
-- Never execute, approve, reject, cancel, unload, edit, create, or run anything directly.
+- Only unload_models, smooth_mesh, decimate_mesh, run_workflow, and create_workflow are direct local private actions. Never use them as aliases for extension PROCESS or MCP capabilities.
+- Use a direct action only when the user's current request explicitly asks for that exact local mutation. Inventory, explanation, and capability questions must remain read-only.
+- Request at most one direct action in one response. A second direct tool call in the same user turn invalidates every direct action in that response; wait for a later user turn for another mutation. Governed proposals do not count as direct actions.
+- Every manifest PROCESS or MCP capability, including Text-to-CAD and Blender, remains exclusive to propose_capability_action and explicit user approval.
+- Never invent a workflow, extension, asset, or capability id. Use exact ids from current Modly inventory.
+- Never put a host filesystem path in a tool call. Mesh tools accept only the exact canonical `/workspace/...` reference returned by get_mesh_info.
+- Creating a workflow never runs it. Use run_workflow only in a separate later user turn that explicitly asks to run the exact created workflow.
 - For inventory questions about available Modly capabilities, call both list_models and list_processes.
 - Only the tools exposed in this prompt are capabilities you can use. Never claim an unexposed capability.
 - A downloaded model or discovered process is not necessarily runtime-ready. Treat unknown readiness as unknown and say so.
 - Use propose_capability_action only with an exact capability id from the governed inventory and arguments matching its input hints.
-- After proposing, explicitly state that approval is required and that nothing has run yet.
-- After each read-only tool call, give a short one-sentence summary of what was inspected.
+- After proposing a governed action, explicitly state that approval is required and that nothing has run yet.
+- After each tool call, give a short one-sentence summary of what was inspected, recorded, or requested.
 - Always reply in the same language the user is writing in.
 - Be concise. No unnecessary explanations.\
 """
@@ -141,9 +175,159 @@ READ_ONLY_TOOLS = [
 ]
 
 READ_ONLY_TOOL_NAMES = frozenset(tool["function"]["name"] for tool in READ_ONLY_TOOLS)
+DIRECT_ACTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "unload_models",
+            "description": "Directly unload all local 3D generation models from memory.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "smooth_mesh",
+            "description": "Directly smooth the current workspace mesh.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_ref": {
+                        "type": "string",
+                        "description": "Exact canonical /workspace/... mesh reference returned by get_mesh_info.",
+                    },
+                    "iterations": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "required": ["asset_ref", "iterations"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "decimate_mesh",
+            "description": "Directly reduce the current workspace mesh face count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_ref": {
+                        "type": "string",
+                        "description": "Exact canonical /workspace/... mesh reference returned by get_mesh_info.",
+                    },
+                    "target_faces": {"type": "integer", "minimum": 100, "maximum": 500000},
+                },
+                "required": ["asset_ref", "target_faces"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_workflow",
+            "description": "Directly start one exact workflow returned by list_workflows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {"type": "string", "description": "Exact current workflow id."},
+                },
+                "required": ["workflow_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_workflow",
+            "description": "Directly create one complete validated arbitrary DAG without running it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "graph": {
+                        "type": "object",
+                        "properties": {
+                            "schema": {"type": "string", "enum": ["modly.agent-workflow-graph"]},
+                            "version": {"type": "integer", "enum": [1]},
+                            "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "description": {"type": "string", "maxLength": 2000},
+                            "nodes": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_DIRECT_GRAPH_NODES,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "kind": {"type": "string", "enum": ["builtin", "extension"]},
+                                        "type": {"type": "string", "minLength": 1, "maxLength": 256},
+                                        "enabled": {"type": "boolean"},
+                                        "showInGenerate": {"type": "boolean"},
+                                        "params": {
+                                            "type": "object",
+                                            "maxProperties": 64,
+                                            "additionalProperties": {
+                                                "oneOf": [
+                                                    {"type": "boolean"},
+                                                    {"type": "number"},
+                                                    {"type": "string", "maxLength": 8192},
+                                                ]
+                                            },
+                                        },
+                                        "position": {
+                                            "type": "object",
+                                            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                                            "required": ["x", "y"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                    "required": ["key", "kind", "type", "enabled", "showInGenerate", "params"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "edges": {
+                                "type": "array",
+                                "maxItems": MAX_DIRECT_GRAPH_EDGES,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "target": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "sourceHandle": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "targetHandle": {"type": "string", "minLength": 1, "maxLength": 64},
+                                    },
+                                    "required": ["source", "target"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["schema", "version", "name", "description", "nodes", "edges"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["graph"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+DIRECT_ACTION_TOOL_NAMES = frozenset(tool["function"]["name"] for tool in DIRECT_ACTION_TOOLS)
 GOVERNED_ACTION_REQUIRED_RESULT = {
     "code": "governed_action_required",
     "message": "This tool cannot change Modly directly. A governed capability proposal is required.",
+}
+DIRECT_ACTION_RECORDED_RESULT = {
+    "code": "direct_action_recorded",
+    "message": "The local direct action was recorded for Modly to apply exactly once after this response.",
+}
+INVALID_DIRECT_ACTION_RESULT = {
+    "code": "invalid_direct_action",
+    "message": "The local direct action is invalid or stale and was not recorded.",
+}
+DIRECT_ACTION_BATCH_REJECTED_RESULT = {
+    "code": "direct_action_batch_rejected",
+    "message": "This turn requested more than one direct action, so no direct action was retained.",
 }
 
 
@@ -473,7 +657,9 @@ def _normalize_process_inventory(value: object) -> dict:
 
 
 async def execute_tool(name: str, arguments: dict, context: dict) -> tuple[str, dict | None]:
-    """Execute only the fixed read-only tool allowlist."""
+    """Read inventory or emit one typed local direct-action intent without mutating Modly."""
+    if name in DIRECT_ACTION_TOOL_NAMES:
+        return _build_direct_action_intent(name, arguments, context)
     if name not in READ_ONLY_TOOL_NAMES:
         return _compact_json(GOVERNED_ACTION_REQUIRED_RESULT), None
 
@@ -518,12 +704,12 @@ async def execute_tool(name: str, arguments: dict, context: dict) -> tuple[str, 
                 return _compact_json(inventory), None
 
             elif name == "get_mesh_info":
-                mesh_path = context.get("currentMeshPath")
+                mesh_path = _canonical_workspace_asset_ref(context.get("currentMeshRef"))
                 mesh_triangles = context.get("meshTriangles")
                 if not mesh_path:
                     return "No mesh currently loaded in the viewer.", None
-                info = f"Current mesh: {mesh_path}"
-                if mesh_triangles:
+                info = f"Current mesh reference: {mesh_path}"
+                if isinstance(mesh_triangles, int) and not isinstance(mesh_triangles, bool) and mesh_triangles > 0:
                     info += f" ({mesh_triangles:,} triangles)"
                 return info, None
 
@@ -539,7 +725,18 @@ async def execute_tool(name: str, arguments: dict, context: dict) -> tuple[str, 
                 return text, None
 
             elif name == "list_workflows":
-                workflows = context.get("workflows", [])
+                raw_workflows = context.get("workflows", [])
+                workflows = []
+                if isinstance(raw_workflows, list):
+                    for value in raw_workflows:
+                        if not isinstance(value, dict):
+                            continue
+                        workflow_id = value.get("id")
+                        if not isinstance(workflow_id, str):
+                            continue
+                        workflow = _resolve_context_workflow({"workflows": [value]}, workflow_id)
+                        if workflow is not None:
+                            workflows.append({"id": workflow[0], "name": workflow[1]})
                 if not workflows:
                     return "No workflows found. Create one in the Workflows tab.", None
                 lines = "\n".join(f"- {w['id']}: {w['name']}" for w in workflows)
@@ -562,8 +759,8 @@ def _assert_safe_text(value: str, label: str, max_length: int) -> str:
     return value
 
 
-def _validate_json_value(value: object, *, depth: int = 0) -> None:
-    if depth > MAX_JSON_DEPTH:
+def _validate_json_value(value: object, *, depth: int = 0, max_depth: int = MAX_JSON_DEPTH) -> None:
+    if depth > max_depth:
         raise ValueError("JSON value exceeds maximum depth")
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -573,22 +770,27 @@ def _validate_json_value(value: object, *, depth: int = 0) -> None:
         return
     if isinstance(value, list):
         for item in value:
-            _validate_json_value(item, depth=depth + 1)
+            _validate_json_value(item, depth=depth + 1, max_depth=max_depth)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str) or key in UNSAFE_JSON_KEYS:
                 raise ValueError("JSON object contains an unsafe key")
             _assert_safe_text(key, "JSON object key", 128)
-            _validate_json_value(item, depth=depth + 1)
+            _validate_json_value(item, depth=depth + 1, max_depth=max_depth)
         return
     raise ValueError("Value is not JSON-compatible")
 
 
-def _normalize_bounded_json_object(value: object, max_bytes: int) -> dict:
+def _normalize_bounded_json_object(
+    value: object,
+    max_bytes: int,
+    *,
+    max_depth: int = MAX_JSON_DEPTH,
+) -> dict:
     if not isinstance(value, dict):
         raise ValueError("Expected a JSON object")
-    _validate_json_value(value)
+    _validate_json_value(value, max_depth=max_depth)
     encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
     if len(encoded.encode("utf-8")) > max_bytes:
         raise ValueError("JSON object exceeds maximum encoded size")
@@ -597,6 +799,351 @@ def _normalize_bounded_json_object(value: object, max_bytes: int) -> dict:
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def _canonical_workspace_asset_ref(value: object) -> str | None:
+    if not isinstance(value, str) or value != value.strip() or len(value) > 2048:
+        return None
+    if not value.startswith("/workspace/") or "\\" in value or "%" in value or "?" in value or "#" in value:
+        return None
+    suffix = value[len("/workspace/"):]
+    if not suffix or any(
+        ord(character) < 32 or ord(character) == 0x7F or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        return None
+    segments = suffix.split("/")
+    if any(not segment or segment in {".", ".."} for segment in segments):
+        return None
+    if not any(suffix.lower().endswith(extension) for extension in MESH_ASSET_SUFFIXES):
+        return None
+    return value
+
+
+def _validate_graph_text(value: str, label: str, max_length: int, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or value != value.strip() or len(value) > max_length or (not allow_empty and not value):
+        raise ValueError(f"{label} is invalid")
+    if any((ord(character) < 32 and character not in "\t\n\r") or ord(character) == 0x7F for character in value):
+        raise ValueError(f"{label} contains an unsafe character")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ValueError(f"{label} contains an unsafe character")
+    return value
+
+
+class AgentWorkflowPositionV1(StrictModel):
+    x: float
+    y: float
+
+    @model_validator(mode="after")
+    def validate_finite_position(self):
+        if not math.isfinite(self.x) or not math.isfinite(self.y) or abs(self.x) > 1_000_000 or abs(self.y) > 1_000_000:
+            raise ValueError("Workflow position is invalid")
+        return self
+
+
+class AgentWorkflowGraphNodeV1(StrictModel):
+    key: str
+    kind: Literal["builtin", "extension"]
+    type: str
+    enabled: bool
+    showInGenerate: bool
+    params: dict[str, bool | int | float | str]
+    position: AgentWorkflowPositionV1 | None = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        if not WORKFLOW_GRAPH_KEY_PATTERN.fullmatch(value) or value in UNSAFE_JSON_KEYS:
+            raise ValueError("Workflow node key is invalid")
+        return value
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, value: str) -> str:
+        if (
+            len(value) > 256
+            or not WORKFLOW_NODE_TYPE_PATTERN.fullmatch(value)
+            or any(part in UNSAFE_JSON_KEYS for part in value.split("/"))
+        ):
+            raise ValueError("Workflow node type is invalid")
+        return value
+
+    @field_validator("params")
+    @classmethod
+    def validate_params(cls, value: dict[str, bool | int | float | str]) -> dict[str, bool | int | float | str]:
+        if len(value) > 64:
+            raise ValueError("Workflow node has too many params")
+        normalized: dict[str, bool | int | float | str] = {}
+        for key, item in value.items():
+            if not WORKFLOW_PARAM_KEY_PATTERN.fullmatch(key) or key in UNSAFE_JSON_KEYS:
+                raise ValueError("Workflow param key is invalid")
+            if isinstance(item, str):
+                normalized[key] = _validate_graph_text(item, "Workflow param string", 8192, allow_empty=True)
+            elif isinstance(item, bool) or isinstance(item, int):
+                normalized[key] = item
+            elif isinstance(item, float) and math.isfinite(item):
+                normalized[key] = item
+            else:
+                raise ValueError("Workflow param value is invalid")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_kind_type_correlation(self):
+        has_separator = "/" in self.type
+        if (self.kind == "extension") != has_separator:
+            raise ValueError("Workflow node kind and type do not correlate")
+        return self
+
+
+class AgentWorkflowGraphEdgeV1(StrictModel):
+    source: str
+    target: str
+    sourceHandle: str | None = None
+    targetHandle: str | None = None
+
+    @field_validator("source", "target")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        if not WORKFLOW_GRAPH_KEY_PATTERN.fullmatch(value) or value in UNSAFE_JSON_KEYS:
+            raise ValueError("Workflow edge endpoint is invalid")
+        return value
+
+    @field_validator("sourceHandle", "targetHandle")
+    @classmethod
+    def validate_handle(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not WORKFLOW_PARAM_KEY_PATTERN.fullmatch(value) or value in UNSAFE_JSON_KEYS:
+            raise ValueError("Workflow edge handle is invalid")
+        return value
+
+
+class AgentWorkflowGraphV1(StrictModel):
+    schema_: Literal["modly.agent-workflow-graph"] = Field(alias="schema")
+    version: Literal[1]
+    name: str
+    description: str
+    nodes: list[AgentWorkflowGraphNodeV1] = Field(min_length=1, max_length=MAX_DIRECT_GRAPH_NODES)
+    edges: list[AgentWorkflowGraphEdgeV1] = Field(max_length=MAX_DIRECT_GRAPH_EDGES)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validate_graph_text(value, "Workflow name", 120)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        return _validate_graph_text(value, "Workflow description", 2000, allow_empty=True)
+
+    @model_validator(mode="after")
+    def validate_identity_and_size(self):
+        node_keys = [node.key for node in self.nodes]
+        if len(set(node_keys)) != len(node_keys):
+            raise ValueError("Workflow node keys collide")
+        encoded = json.dumps(
+            self.model_dump(by_alias=True, exclude_none=True),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > MAX_DIRECT_TOOL_ARGUMENT_BYTES:
+            raise ValueError("Workflow graph exceeds maximum encoded size")
+        return self
+
+
+class UnloadModelsArguments(StrictModel):
+    pass
+
+
+class SmoothMeshArguments(StrictModel):
+    asset_ref: str
+    iterations: int = Field(ge=1, le=20)
+
+    @field_validator("asset_ref")
+    @classmethod
+    def validate_asset_ref(cls, value: str) -> str:
+        normalized = _canonical_workspace_asset_ref(value)
+        if normalized is None:
+            raise ValueError("Mesh asset reference is invalid")
+        return normalized
+
+
+class DecimateMeshArguments(StrictModel):
+    asset_ref: str
+    target_faces: int = Field(ge=100, le=500_000)
+
+    @field_validator("asset_ref")
+    @classmethod
+    def validate_asset_ref(cls, value: str) -> str:
+        normalized = _canonical_workspace_asset_ref(value)
+        if normalized is None:
+            raise ValueError("Mesh asset reference is invalid")
+        return normalized
+
+
+class RunWorkflowArguments(StrictModel):
+    workflow_id: str
+
+    @field_validator("workflow_id")
+    @classmethod
+    def validate_workflow_id(cls, value: str) -> str:
+        if not WORKFLOW_ID_PATTERN.fullmatch(value) or value in UNSAFE_JSON_KEYS:
+            raise ValueError("Workflow id is invalid")
+        return value
+
+
+class CreateWorkflowArguments(StrictModel):
+    graph: AgentWorkflowGraphV1
+
+
+class DirectActionIntentBase(StrictModel):
+    actionId: str
+
+    @field_validator("actionId")
+    @classmethod
+    def validate_action_id(cls, value: str) -> str:
+        if not DIRECT_ACTION_ID_PATTERN.fullmatch(value):
+            raise ValueError("Direct action id is invalid")
+        return value
+
+
+class ModelsUnloadedIntent(DirectActionIntentBase):
+    type: Literal["models_unloaded"] = "models_unloaded"
+
+
+class MeshOperationIntent(DirectActionIntentBase):
+    type: Literal["mesh_operation"] = "mesh_operation"
+    operation: Literal["smooth", "decimate"]
+    assetRef: str
+    iterations: int | None = Field(default=None, ge=1, le=20)
+    targetFaces: int | None = Field(default=None, ge=100, le=500_000)
+
+    @field_validator("assetRef")
+    @classmethod
+    def validate_asset_ref(cls, value: str) -> str:
+        normalized = _canonical_workspace_asset_ref(value)
+        if normalized is None:
+            raise ValueError("Mesh asset reference is invalid")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_operation_fields(self):
+        if self.operation == "smooth" and (self.iterations is None or self.targetFaces is not None):
+            raise ValueError("Smooth intent fields are invalid")
+        if self.operation == "decimate" and (self.targetFaces is None or self.iterations is not None):
+            raise ValueError("Decimate intent fields are invalid")
+        return self
+
+
+class RunWorkflowIntent(DirectActionIntentBase):
+    type: Literal["run_workflow"] = "run_workflow"
+    workflowId: str
+    workflowName: str
+
+    @field_validator("workflowId")
+    @classmethod
+    def validate_workflow_id(cls, value: str) -> str:
+        if not WORKFLOW_ID_PATTERN.fullmatch(value) or value in UNSAFE_JSON_KEYS:
+            raise ValueError("Workflow id is invalid")
+        return value
+
+    @field_validator("workflowName")
+    @classmethod
+    def validate_workflow_name(cls, value: str) -> str:
+        return _validate_graph_text(value, "Workflow name", 120)
+
+
+class CreateWorkflowIntent(DirectActionIntentBase):
+    type: Literal["create_workflow"] = "create_workflow"
+    graph: AgentWorkflowGraphV1
+
+
+DirectActionIntent = Annotated[
+    ModelsUnloadedIntent | MeshOperationIntent | RunWorkflowIntent | CreateWorkflowIntent,
+    Field(discriminator="type"),
+]
+
+
+def _new_direct_action_id() -> str:
+    return f"direct-{secrets.token_hex(16)}"
+
+
+def _resolve_context_workflow(context: dict, workflow_id: str) -> tuple[str, str] | None:
+    raw_workflows = context.get("workflows")
+    if not isinstance(raw_workflows, list) or len(raw_workflows) > 256:
+        return None
+    normalized: dict[str, str] = {}
+    for value in raw_workflows:
+        if not isinstance(value, dict) or set(value) != {"id", "name"}:
+            return None
+        candidate_id = value.get("id")
+        candidate_name = value.get("name")
+        if (
+            not isinstance(candidate_id, str)
+            or not WORKFLOW_ID_PATTERN.fullmatch(candidate_id)
+            or candidate_id in UNSAFE_JSON_KEYS
+            or not isinstance(candidate_name, str)
+        ):
+            return None
+        try:
+            _validate_graph_text(candidate_name, "Workflow name", 120)
+        except ValueError:
+            return None
+        if candidate_id in normalized:
+            return None
+        normalized[candidate_id] = candidate_name
+    name = normalized.get(workflow_id)
+    return (workflow_id, name) if name is not None else None
+
+
+def _build_direct_action_intent(name: str, arguments: dict, context: dict) -> tuple[str, dict | None]:
+    try:
+        action_id = _new_direct_action_id()
+        if name == "unload_models":
+            UnloadModelsArguments.model_validate(arguments)
+            intent: DirectActionIntent = ModelsUnloadedIntent(actionId=action_id)
+        elif name == "smooth_mesh":
+            parsed = SmoothMeshArguments.model_validate(arguments)
+            current_asset = _canonical_workspace_asset_ref(context.get("currentMeshRef"))
+            if current_asset is None or current_asset != parsed.asset_ref:
+                raise ValueError("Mesh asset reference is stale")
+            intent = MeshOperationIntent(
+                actionId=action_id,
+                operation="smooth",
+                assetRef=parsed.asset_ref,
+                iterations=parsed.iterations,
+            )
+        elif name == "decimate_mesh":
+            parsed = DecimateMeshArguments.model_validate(arguments)
+            current_asset = _canonical_workspace_asset_ref(context.get("currentMeshRef"))
+            if current_asset is None or current_asset != parsed.asset_ref:
+                raise ValueError("Mesh asset reference is stale")
+            intent = MeshOperationIntent(
+                actionId=action_id,
+                operation="decimate",
+                assetRef=parsed.asset_ref,
+                targetFaces=parsed.target_faces,
+            )
+        elif name == "run_workflow":
+            parsed = RunWorkflowArguments.model_validate(arguments)
+            workflow = _resolve_context_workflow(context, parsed.workflow_id)
+            if workflow is None:
+                raise ValueError("Workflow selection is stale")
+            intent = RunWorkflowIntent(
+                actionId=action_id,
+                workflowId=workflow[0],
+                workflowName=workflow[1],
+            )
+        elif name == "create_workflow":
+            parsed = CreateWorkflowArguments.model_validate(arguments)
+            intent = CreateWorkflowIntent(actionId=action_id, graph=parsed.graph)
+        else:
+            return _compact_json(GOVERNED_ACTION_REQUIRED_RESULT), None
+        return _compact_json(DIRECT_ACTION_RECORDED_RESULT), intent.model_dump(by_alias=True, exclude_none=True)
+    except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
+        return _compact_json(INVALID_DIRECT_ACTION_RESULT), None
 
 
 class AgentCapabilityInputHint(StrictModel):
@@ -724,10 +1271,43 @@ class AgentChatRequest(StrictModel):
         return ordered
 
 
-class ActionDone(BaseModel):
+class ActionDone(StrictModel):
     tool: str
     result: str
-    payload: dict | None = None
+    payload: DirectActionIntent | None = None
+
+    @field_validator("tool")
+    @classmethod
+    def validate_tool(cls, value: str) -> str:
+        if value not in READ_ONLY_TOOL_NAMES and value not in DIRECT_ACTION_TOOL_NAMES:
+            raise ValueError("Completed action tool is invalid")
+        return value
+
+    @field_validator("result")
+    @classmethod
+    def validate_result(cls, value: str) -> str:
+        if not isinstance(value, str) or len(value) > 64 * 1024 or "\0" in value:
+            raise ValueError("Completed action result is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_payload_correlation(self):
+        if self.tool in READ_ONLY_TOOL_NAMES:
+            if self.payload is not None:
+                raise ValueError("Read-only action cannot contain a direct intent")
+            return self
+        expected = {
+            "unload_models": ("models_unloaded", None),
+            "smooth_mesh": ("mesh_operation", "smooth"),
+            "decimate_mesh": ("mesh_operation", "decimate"),
+            "run_workflow": ("run_workflow", None),
+            "create_workflow": ("create_workflow", None),
+        }[self.tool]
+        if self.payload is None or self.payload.type != expected[0]:
+            raise ValueError("Direct action tool and payload do not correlate")
+        if isinstance(self.payload, MeshOperationIntent) and self.payload.operation != expected[1]:
+            raise ValueError("Mesh action tool and operation do not correlate")
+        return self
 
 
 class ActionProposal(StrictModel):
@@ -744,9 +1324,14 @@ class AgentChatResponse(BaseModel):
     proposals: list[ActionProposal] = Field(default_factory=list)
     thinking: str | None = None
 
+    @model_validator(mode="after")
+    def enforce_atomic_action_batch(self):
+        self.actions = _finalize_actions(self.actions)
+        return self
+
 
 def _build_tools(capabilities: list[AgentCapabilityPromptView]) -> list[dict]:
-    tools = json.loads(json.dumps(READ_ONLY_TOOLS))
+    tools = json.loads(json.dumps([*READ_ONLY_TOOLS, *DIRECT_ACTION_TOOLS]))
     if not capabilities:
         return tools
     tools.append({
@@ -848,7 +1433,14 @@ def _normalize_stream_tool_calls(value: object) -> list[dict]:
         if name != name.strip() or len(name) > 128 or any(ord(character) < 32 for character in name):
             raise _invalid_stream()
         try:
-            normalized_arguments = _normalize_bounded_json_object(arguments, MAX_TOOL_ARGUMENT_BYTES)
+            is_create_workflow = name == "create_workflow"
+            argument_limit = MAX_DIRECT_TOOL_ARGUMENT_BYTES if is_create_workflow else MAX_TOOL_ARGUMENT_BYTES
+            argument_depth = MAX_DIRECT_TOOL_JSON_DEPTH if is_create_workflow else MAX_JSON_DEPTH
+            normalized_arguments = _normalize_bounded_json_object(
+                arguments,
+                argument_limit,
+                max_depth=argument_depth,
+            )
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise _invalid_stream("Ollama returned invalid tool arguments.") from error
         tool_call = dict(value_item)
@@ -1085,10 +1677,35 @@ async def _stream_ollama_round(
     return assistant_message
 
 
+def _action_batch_is_valid(actions: list[ActionDone]) -> bool:
+    if len(actions) > MAX_AGENT_ACTIONS_PER_RESPONSE:
+        return False
+    if sum(action.tool in DIRECT_ACTION_TOOL_NAMES for action in actions) > 1:
+        return False
+    serialized = [
+        action.model_dump(by_alias=True, exclude_none=True) if hasattr(action, "model_dump") else action.dict(exclude_none=True)
+        for action in actions
+    ]
+    try:
+        encoded = json.dumps(
+            serialized,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    return len(encoded) <= MAX_AGENT_ACTION_BATCH_BYTES
+
+
+def _finalize_actions(actions: list[ActionDone]) -> list[ActionDone]:
+    return list(actions) if _action_batch_is_valid(actions) else []
+
+
 def _serialize_actions(actions: list[ActionDone]) -> list[dict]:
     return [
-        action.model_dump() if hasattr(action, "model_dump") else action.dict()
-        for action in actions
+        action.model_dump(by_alias=True, exclude_none=True) if hasattr(action, "model_dump") else action.dict(exclude_none=True)
+        for action in _finalize_actions(actions)
     ]
 
 
@@ -1150,17 +1767,32 @@ async def list_ollama_models(ollama_url: str = "http://localhost:11434"):
             return {"models": []}
 
 
-@router.post("/chat", response_model=AgentChatResponse)
+@router.post("/chat", response_model=AgentChatResponse, response_model_exclude_none=True)
 async def agent_chat(request: AgentChatRequest):
+    if not _is_valid_ollama_base_url(request.ollama_url):
+        _raise_ollama_boundary_error(
+            OllamaBoundaryError(
+                503,
+                "ollama_unavailable",
+                "The configured Ollama URL is invalid. Check the agent settings and try again.",
+                False,
+            ),
+            1,
+            [],
+            [],
+        )
+
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # Inject scene context so the LLM knows current state
     if request.context:
         ctx_lines = []
-        if request.context.get("currentMeshPath"):
-            ctx_lines.append(f"Current mesh path: {request.context['currentMeshPath']}")
-        if request.context.get("meshTriangles"):
-            ctx_lines.append(f"Current mesh triangles: {request.context['meshTriangles']:,}")
+        current_mesh_ref = _canonical_workspace_asset_ref(request.context.get("currentMeshRef"))
+        if current_mesh_ref:
+            ctx_lines.append(f"Current mesh reference: {current_mesh_ref}")
+        mesh_triangles = request.context.get("meshTriangles")
+        if isinstance(mesh_triangles, int) and not isinstance(mesh_triangles, bool) and mesh_triangles > 0:
+            ctx_lines.append(f"Current mesh triangles: {mesh_triangles:,}")
         if ctx_lines:
             messages.append({
                 "role": "system",
@@ -1187,6 +1819,8 @@ async def agent_chat(request: AgentChatRequest):
 
     actions_done: list[ActionDone] = []
     proposals: list[ActionProposal] = []
+    direct_action_call_count = 0
+    direct_action_batch_rejected = False
     all_thinking:  list[str]       = []
     capabilities_by_id = {capability.id: capability for capability in request.capabilities}
     tools = _build_tools(request.capabilities)
@@ -1226,7 +1860,7 @@ async def agent_chat(request: AgentChatRequest):
                 combined_thinking = "\n\n---\n\n".join(all_thinking) if all_thinking else None
                 return AgentChatResponse(
                     message=clean_content,
-                    actions=actions_done,
+                    actions=[] if direct_action_batch_rejected else _finalize_actions(actions_done),
                     proposals=proposals,
                     thinking=combined_thinking,
                 )
@@ -1270,9 +1904,20 @@ async def agent_chat(request: AgentChatRequest):
                                 "code": "action_proposal_recorded",
                                 "message": "The proposal was recorded. Explicit user approval is required before execution.",
                             })
+                elif name in DIRECT_ACTION_TOOL_NAMES:
+                    direct_action_call_count += 1
+                    if direct_action_call_count > 1:
+                        direct_action_batch_rejected = True
+                        actions_done.clear()
+                        result_text = _compact_json(DIRECT_ACTION_BATCH_REJECTED_RESULT)
+                    else:
+                        result_text, payload = await execute_tool(name, arguments, request.context)
+                        if payload is not None:
+                            actions_done.append(ActionDone(tool=name, result=result_text, payload=payload))
                 elif name in READ_ONLY_TOOL_NAMES:
                     result_text, payload = await execute_tool(name, arguments, request.context)
-                    actions_done.append(ActionDone(tool=name, result=result_text, payload=payload))
+                    if not direct_action_batch_rejected:
+                        actions_done.append(ActionDone(tool=name, result=result_text, payload=payload))
                 else:
                     result_text, _payload = await execute_tool(name, arguments, request.context)
                 messages.append({"role": "tool", "content": result_text, "tool_name": fn["name"]})
@@ -1280,7 +1925,7 @@ async def agent_chat(request: AgentChatRequest):
     combined_thinking = "\n\n---\n\n".join(all_thinking) if all_thinking else None
     return AgentChatResponse(
         message="Reached maximum tool iterations.",
-        actions=actions_done,
+        actions=[] if direct_action_batch_rejected else _finalize_actions(actions_done),
         proposals=proposals,
         thinking=combined_thinking,
     )

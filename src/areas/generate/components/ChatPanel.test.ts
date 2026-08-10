@@ -84,7 +84,13 @@ test('structured agent failures expose safe copy and completed actions', async (
     const partialAction = {
       tool: 'smooth_mesh',
       result: 'Smoothed mesh.',
-      payload: { type: 'mesh_update', url: '/workspace/smoothed.glb' },
+      payload: {
+        type: 'mesh_operation',
+        actionId: 'direct-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        operation: 'smooth',
+        assetRef: '/workspace/smoothed.glb',
+        iterations: 1,
+      },
     }
     const response = {
       ok: false,
@@ -135,14 +141,14 @@ test('action application attempts every returned action exactly once after a han
     assert.equal(failures[0].action.tool, 'smooth_mesh')
     assert.equal(
       module.withActionFailureSummary('Original server error.', failures.length),
-      'Original server error. 1 completed action could not be reflected locally.',
+      'Original server error. 1 action could not be applied locally.',
     )
   } finally {
     await cleanup()
   }
 })
 
-test('Agent mutation payloads fail closed before any legacy mutation can run', async () => {
+test('legacy Agent mutation payloads fail closed at the response boundary', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
     const actions = [
@@ -157,39 +163,34 @@ test('Agent mutation payloads fail closed before any legacy mutation can run', a
         },
       },
     ]
-    const legacyMutations: string[] = []
 
-    const failures = await module.applyAgentActions(actions, async (action: { payload: { type: string } }) => {
-      await module.rejectUngovernedAgentAction(action)
-      legacyMutations.push(action.payload.type)
-    })
-
-    assert.deepEqual(legacyMutations, [])
-    assert.equal(failures.length, 3)
-    for (const failure of failures) {
-      assert.equal(failure.error?.code, 'governed_action_required')
-      assert.equal(failure.error?.message, 'This action requires approval before Modly can apply it.')
+    for (const action of actions) {
+      await assert.rejects(module.parseAgentChatResponse({
+        ok: true,
+        status: 200,
+        json: async () => ({ message: 'Unsafe legacy action.', actions: [action] }),
+      }), /invalid agent response/i)
     }
   } finally {
     await cleanup()
   }
 })
 
-test('ChatPanel has no transitive legacy workflow or mesh mutation path for Agent actions', async () => {
+test('ChatPanel captures immutable request origin and routes success/error actions through one runtime once-registry', async () => {
   const source = await readFile(chatPanelEntry, 'utf8')
-  for (const forbidden of [
-    '@areas/workflows/workflowRunStore',
-    'useWorkflowRunStore',
-    'runWorkflow',
-    'saveWorkflow',
-    'setActiveWorkflow',
-    'updateCurrentJob',
-    'pushMeshUrl',
-    'pendingWorkflow',
-    'setPendingWorkflow',
-  ]) {
-    assert.equal(source.includes(forbidden), false, `ChatPanel must not contain ${forbidden}`)
-  }
+  assert.match(source, /const uiToken = originUiGateRef\.current\.begin\(originatingSessionId\)/)
+  assert.match(source, /applyCompletedActions\(data\.actions, originatingSessionId, uiToken, msgs\)/)
+  assert.match(source, /applyCompletedActions\(e\.actions, originatingSessionId, uiToken, msgs\)/)
+  assert.match(source, /appliedIds: appliedDirectActionIdsRef\.current/)
+  assert.equal(source.match(/applyAgentResponseActions\(/g)?.length, 1)
+  assert.equal(source.match(/appliedIds: appliedDirectActionIdsRef\.current/g)?.length, 1)
+  assert.match(source, /createWorkflow: \(request\) => window\.electron\.agentWorkflows\.create\(request\)/)
+
+  const actionAdapter = source.slice(
+    source.indexOf('async function applyCompletedActions'),
+    source.indexOf('async function callAgent'),
+  )
+  assert.doesNotMatch(actionAdapter, /callAgent\(/)
 })
 
 test('ChatPanel wires capability discovery and governed proposals without automatic execution', async () => {
@@ -709,7 +710,7 @@ test('Ollama model discovery accepts only bounded model names from authoritative
   }
 })
 
-test('response guards reject malformed success actions and drop malformed error actions safely', async () => {
+test('response guards reject malformed or duplicate success batches and discard invalid error batches atomically', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
     await assert.rejects(
@@ -719,6 +720,21 @@ test('response guards reject malformed success actions and drop malformed error 
         json: async () => ({
           message: 'Unsafe payload',
           actions: [{ tool: 'smooth_mesh', result: 'bad', payload: { type: 'mesh_update', url: 42 } }],
+        }),
+      }),
+      /invalid agent response/i,
+    )
+
+    await assert.rejects(
+      module.parseAgentChatResponse({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          message: 'Duplicate direct actions',
+          actions: [
+            { tool: 'unload_models', result: 'first', payload: { type: 'models_unloaded', actionId: 'direct-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } },
+            { tool: 'unload_models', result: 'second', payload: { type: 'models_unloaded', actionId: 'direct-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } },
+          ],
         }),
       }),
       /invalid agent response/i,
@@ -742,10 +758,33 @@ test('response guards reject malformed success actions and drop malformed error 
         assert.ok(error instanceof module.AgentApiError)
         const agentError = error as Error & { actions: Array<{ tool: string }> }
         assert.equal(agentError.message, 'Original structured error.')
-        assert.deepEqual(agentError.actions.map((action) => action.tool), ['list_models'])
+        assert.deepEqual(agentError.actions, [])
         return true
       },
     )
+
+    for (const actions of [
+      [
+        { tool: 'unload_models', result: 'first', payload: { type: 'models_unloaded', actionId: 'direct-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } },
+        { tool: 'smooth_mesh', result: 'second', payload: { type: 'mesh_operation', actionId: 'direct-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', operation: 'smooth', assetRef: '/workspace/a.glb', iterations: 1 } },
+      ],
+      [{ tool: 'list_models', result: 'x'.repeat(512 * 1024), payload: null }],
+    ]) {
+      await assert.rejects(
+        module.parseAgentChatResponse({
+          ok: false,
+          status: 504,
+          json: async () => ({ detail: { message: 'Sanitized terminal error.', actions } }),
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof module.AgentApiError)
+          const agentError = error as Error & { actions: unknown[] }
+          assert.equal(agentError.message, 'Sanitized terminal error.')
+          assert.deepEqual(agentError.actions, [])
+          return true
+        },
+      )
+    }
   } finally {
     await cleanup()
   }

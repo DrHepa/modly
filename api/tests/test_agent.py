@@ -1,13 +1,13 @@
 import asyncio
 import json
 import unittest
+from pathlib import Path
 
 import httpx
 import pytest
 
 try:
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient
 except ModuleNotFoundError as error:
     if error.name == "fastapi":
         raise unittest.SkipTest("fastapi is not installed") from error
@@ -314,16 +314,20 @@ def test_chat_router_serializes_malformed_ollama_url_as_structured_503():
     app = FastAPI()
     app.include_router(agent.router)
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/agent/chat",
-            json={
-                "messages": [],
-                "ollama_url": "http://[::1",
-                "model": "test-model",
-                "modelLeaseId": MODEL_LEASE_ID,
-            },
-        )
+    async def invoke():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.post(
+                "/agent/chat",
+                json={
+                    "messages": [],
+                    "ollama_url": "http://[::1",
+                    "model": "test-model",
+                    "modelLeaseId": MODEL_LEASE_ID,
+                },
+            )
+
+    response = run(invoke())
 
     assert response.status_code == 503
     assert response.json() == {
@@ -336,6 +340,34 @@ def test_chat_router_serializes_malformed_ollama_url_as_structured_503():
             "proposals": [],
         }
     }
+
+
+def test_chat_rejects_malformed_ollama_url_before_client_or_stream(monkeypatch):
+    monkeypatch.setattr(
+        agent.httpx,
+        "AsyncClient",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("invalid URL must not reach the HTTP client")),
+    )
+
+    with pytest.raises(agent.HTTPException) as raised:
+        run(agent.agent_chat(agent.AgentChatRequest(
+            messages=[],
+            ollama_url="http://[::1",
+            model="test-model",
+            modelLeaseId=MODEL_LEASE_ID,
+        )))
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail["code"] == "ollama_unavailable"
+    assert raised.value.detail["actions"] == []
+    assert raised.value.detail["proposals"] == []
+
+
+def test_project_python_runner_selects_direct_action_contract_tests():
+    runner = Path(__file__).resolve().parents[2] / "scripts" / "run-pytests.mjs"
+    source = runner.read_text(encoding="utf-8")
+
+    assert "'tests/test_agent_direct_actions.py'," in source
 
 
 def test_agent_executes_streamed_tools_with_tool_names_then_returns_final_round(monkeypatch):
@@ -577,10 +609,10 @@ def test_agent_rejects_model_supplied_capability_hash_or_model_lease(monkeypatch
     assert json.loads(rounds[1]["messages"][-1]["content"])["code"] == "invalid_action_proposal"
 
 
-def test_mutating_and_unknown_legacy_tools_are_not_exposed_and_never_call_downstream(monkeypatch):
+def test_private_direct_tools_are_exposed_while_unknown_mutations_stay_governed(monkeypatch):
     exposed = {tool["function"]["name"] for tool in agent._build_tools([])}
     mutating = {"unload_models", "decimate_mesh", "smooth_mesh", "run_workflow", "create_workflow"}
-    assert exposed.isdisjoint(mutating)
+    assert mutating <= exposed
 
     class NoMutationClient(FakeToolClient):
         async def post(self, *_args, **_kwargs):
@@ -588,13 +620,19 @@ def test_mutating_and_unknown_legacy_tools_are_not_exposed_and_never_call_downst
 
     client = NoMutationClient()
     monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: client)
-    for name in [*sorted(mutating), "invented_mutation"]:
+    for name in sorted(mutating):
         result_text, payload = run(agent.execute_tool(name, {}, {}))
-        assert json.loads(result_text) == {
-            "code": "governed_action_required",
-            "message": "This tool cannot change Modly directly. A governed capability proposal is required.",
-        }
-        assert payload is None
+        assert json.loads(result_text)["code"] == (
+            "direct_action_recorded" if name == "unload_models" else "invalid_direct_action"
+        )
+        assert (payload is not None) is (name == "unload_models")
+
+    result_text, payload = run(agent.execute_tool("invented_mutation", {}, {}))
+    assert json.loads(result_text) == {
+        "code": "governed_action_required",
+        "message": "This tool cannot change Modly directly. A governed capability proposal is required.",
+    }
+    assert payload is None
 
 
 class FakeResponse:

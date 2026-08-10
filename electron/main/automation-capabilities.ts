@@ -5,6 +5,7 @@ import { join, resolve as resolvePath } from 'path'
 import { readFile, readdir } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
+import { ARTIFACT_KINDS } from '../../src/shared/types/artifacts.ts'
 import {
   normalizeModelSources, normalizeWeightGroupReferences, normalizeWeightGroups,
   normalizeWeightVariants, safeModelSourceId, validateModelNodeIds,
@@ -356,7 +357,11 @@ type PartialCapabilityAutomationMetadata = {
   substitution?: PartialCapabilitySubstitutionMetadata
 }
 
-const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const LEGACY_PROCESS_ARTIFACT_KINDS = [
+  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+] as const satisfies readonly ArtifactKind[]
+const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(LEGACY_PROCESS_ARTIFACT_KINDS)
+const GOVERNED_AGENT_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
 const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process', 'skills'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
@@ -486,8 +491,9 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
   }
 }
 
-function isProcessPortType(value: unknown): value is ProcessPortType {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+function isProcessPortType(value: unknown, governedAgentKinds = false): value is ProcessPortType {
+  const kinds = governedAgentKinds ? GOVERNED_AGENT_ARTIFACT_KINDS : CAPABILITY_ARTIFACT_KINDS
+  return typeof value === 'string' && kinds.has(value as ArtifactKind)
 }
 
 function normalizeLegacyArtifactKind(value: string): string
@@ -635,6 +641,7 @@ export function parseExtensionManifest(
   fallbackId: string,
   trustedRepos: Set<string>,
   builtin = false,
+  options: { governedAgentKinds?: boolean } = {},
 ) {
   const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
   const extensionType = parsed.type === 'process' ? 'process' : 'model'
@@ -712,8 +719,8 @@ export function parseExtensionManifest(
     }
     const hasModelAssets = Boolean(httpsDownloads || hfDownloads || n.hf_repo || n.download_check || n.weight_owner_id)
     const agentResult = extensionType === 'process'
-      && isProcessPortType(n.input)
-      && isProcessPortType(n.output)
+      && isProcessPortType(n.input, options.governedAgentKinds === true)
+      && isProcessPortType(n.output, options.governedAgentKinds === true)
       ? normalizeAgentCapabilityDeclarationResult(n.agent, capabilityId, parsed.entry ?? 'processor.js')
       : {}
 
@@ -890,7 +897,9 @@ export async function readResolvedExtensionsFromDirDetailed(
             }
           }
           if (localSourcePath) manifest.source = `local://${localSourcePath}`
-          const extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+          const extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin, {
+            governedAgentKinds: validateAgentJson,
+          })
           return {
             resolved: { extension: markExtensionInstallationInterrupted(extension, installInterrupted), extDir: resolvePath(entryPath), manifest },
             errors,
@@ -1177,6 +1186,18 @@ async function buildAgentCapabilitySnapshot(
     const execution = await bindAgentProcessExecution(
       extensionDir, extension.entry, node.agent.process, processPythonExecutable,
     )
+    if (!execution.artifacts.allowed.some((artifact) => artifact.kind === node.output)) {
+      throw new AgentProcessManifestError(
+        'invalid_metadata',
+        'Agent process primary node output must be declared in its allowed artifact kinds',
+      )
+    }
+    const outputKinds = [
+      node.output,
+      ...execution.artifacts.allowed.flatMap((artifact) => (
+        artifact.kind === node.output ? [] : [artifact.kind]
+      )),
+    ]
     const skillBinding = node.agent.skills
       ? await bindAgentSkillSet(extensionDir, node.agent.skills)
       : undefined
@@ -1196,6 +1217,7 @@ async function buildAgentCapabilitySnapshot(
         id: node.id,
         input: node.input,
         output: node.output,
+        outputs: outputKinds,
         ...(inputs ? { inputs } : {}),
         paramsSchema,
       },

@@ -267,6 +267,20 @@ export interface ArtifactRefV1 {
   sizeBytes: number
 }
 
+export interface AgentArtifactSelectionV1 {
+  id: string
+  kind: ArtifactKind
+  mediaType: string
+  sha256: string
+  sizeBytes: number
+}
+
+export interface AgentCompletedArtifactContextV1 extends AgentArtifactSelectionV1 {
+  actionId: string
+  capabilityId: string
+  capabilityName: string
+}
+
 export interface AgentOllamaModelSnapshotV1 {
   provider: 'ollama'
   endpoint: string

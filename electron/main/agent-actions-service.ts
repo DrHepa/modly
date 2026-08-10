@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 
 import type {
+  AgentArtifactSelectionV1,
   AgentActionDecisionRequest,
   AgentActionResolvedProposeRequest,
   AgentActionSessionGetRequest,
@@ -14,6 +15,7 @@ import type {
   ArtifactRefV1,
   JsonValue,
 } from '../../src/shared/types/agentActions.ts'
+import { ARTIFACT_KINDS } from '../../src/shared/types/artifacts.ts'
 import {
   assertMcpApprovalArgumentsPreviewable,
   assertAgentActionV1,
@@ -34,6 +36,8 @@ import { AgentMcpBrokerError, validateMcpProposalArguments } from './agent-mcp-b
 const ACTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
+const MIME_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/
+const ARTIFACT_KIND_SET = new Set<string>(ARTIFACT_KINDS)
 const TERMINAL_STATUSES = new Set(['rejected', 'expired', 'completed', 'failed', 'cancelled'])
 const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1_000
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1_000
@@ -71,11 +75,6 @@ export interface AgentActionsServiceLike {
 export interface AgentActionsServiceOptions {
   resolveCapabilities: () => Promise<AgentCapabilityInventoryResult>
   resolveCurrentModel: (expected: AgentOllamaModelSnapshotV1) => Promise<unknown>
-  resolveArtifact?: (
-    originSessionId: string,
-    artifactId: string,
-    expectedKind: ArtifactRefV1['kind'],
-  ) => Promise<unknown | null>
   artifactVerifier?: AgentArtifactVerifier
   executor?: AgentActionExecutor
   isExecutorAvailable?: () => boolean
@@ -162,6 +161,39 @@ function assertCapabilityHash(value: unknown): string {
     throw new AgentActionsServiceError('invalid_request')
   }
   return value
+}
+
+function assertArtifactSelection(value: unknown): AgentArtifactSelectionV1 {
+  const selection = assertExactRecord(
+    value,
+    ['id', 'kind', 'mediaType', 'sha256', 'sizeBytes'],
+    'invalid_arguments',
+  )
+  if (typeof selection.id !== 'string' || !ACTION_ID_PATTERN.test(selection.id)) {
+    throw new AgentActionsServiceError('invalid_arguments')
+  }
+  if (typeof selection.kind !== 'string' || !ARTIFACT_KIND_SET.has(selection.kind)) {
+    throw new AgentActionsServiceError('invalid_arguments')
+  }
+  if (typeof selection.mediaType !== 'string' || selection.mediaType.length > 128
+    || selection.mediaType !== selection.mediaType.toLowerCase()
+    || !MIME_TYPE_PATTERN.test(selection.mediaType)) {
+    throw new AgentActionsServiceError('invalid_arguments')
+  }
+  if (typeof selection.sha256 !== 'string' || !SHA256_PATTERN.test(selection.sha256)) {
+    throw new AgentActionsServiceError('invalid_arguments')
+  }
+  if (typeof selection.sizeBytes !== 'number' || !Number.isSafeInteger(selection.sizeBytes)
+    || selection.sizeBytes < 0) {
+    throw new AgentActionsServiceError('invalid_arguments')
+  }
+  return {
+    id: selection.id,
+    kind: selection.kind as ArtifactRefV1['kind'],
+    mediaType: selection.mediaType,
+    sha256: selection.sha256,
+    sizeBytes: selection.sizeBytes,
+  }
 }
 
 function cloneCanonical<T>(value: T): T {
@@ -259,6 +291,7 @@ export class AgentActionsService implements AgentActionsServiceLike {
   private readonly executionSettlements = new Map<string, ExecutionSettlement>()
   private readonly actionLocks = new Map<string, Promise<void>>()
   private shuttingDown = false
+  private nextMcpArtifactIdentity = 0
   private readonly now: () => Date
   private readonly createActionId: () => string
   private readonly createLease: () => string
@@ -621,13 +654,20 @@ export class AgentActionsService implements AgentActionsServiceLike {
         transaction = this.normalizeExecutorResult(result, prepared.action.capability, prepared.action.id)
         settlement.rollback = transaction.rollback
         if (!settlement.cancellationRequested && !prepared.controller.signal.aborted) {
-          artifacts = await this.verifyArtifacts(
+          const verifiedArtifacts = await this.verifyArtifacts(
             transaction.artifacts,
             prepared.action.capability.execution === undefined
               ? prepared.action.capability.node.output
               : undefined,
             prepared.controller.signal,
           )
+          if (prepared.action.capability.execution?.kind === 'process'
+            && !verifiedArtifacts.some((artifact) => artifact.kind === prepared.action.capability.node.output)) {
+            throw new AgentActionsServiceError('invalid_artifact')
+          }
+          artifacts = prepared.action.capability.execution?.kind === 'mcp_tool'
+            ? this.assignMcpArtifactIdentities(verifiedArtifacts, prepared.action.id)
+            : verifiedArtifacts
         }
       } catch (error) {
         failure = error instanceof AgentActionsServiceError
@@ -815,31 +855,12 @@ export class AgentActionsService implements AgentActionsServiceLike {
           if (inputArtifacts.some((artifact) => artifact.id === artifactId)) {
             throw new AgentActionsServiceError('invalid_arguments')
           }
-          let rawArtifact: unknown | null
-          try {
-            const sessionCandidates = [...this.actions.values()].flatMap((record) => (
-              record.originSessionId === originSessionId && record.action.status === 'completed'
-                ? record.action.outputArtifacts.filter((artifact) => artifact.id === artifactId && artifact.kind === binding.kind)
-                : []
-            ))
-            if (sessionCandidates.length > 1) throw new AgentActionsServiceError('artifact_not_found')
-            rawArtifact = sessionCandidates[0]
-              ?? (this.options.resolveArtifact
-                ? await this.options.resolveArtifact(originSessionId, artifactId, binding.kind)
-                : null)
-          } catch (error) {
-            if (error instanceof AgentActionsServiceError) throw error
-            throw new AgentActionsServiceError('artifact_not_found', error)
-          }
-          if (rawArtifact === null) throw new AgentActionsServiceError('artifact_not_found')
-          let artifact: ArtifactRefV1
-          try { artifact = assertArtifactRefV1(rawArtifact) } catch (error) {
-            throw new AgentActionsServiceError('artifact_not_found', error)
-          }
-          if (artifact.id !== artifactId || artifact.kind !== binding.kind
-            || !binding.mediaTypes.includes(artifact.mediaType)) {
-            throw new AgentActionsServiceError('artifact_not_found')
-          }
+          const artifact = this.resolveCompletedArtifact(
+            originSessionId,
+            { id: artifactId },
+            binding.kind,
+            binding.mediaTypes,
+          )
           inputArtifacts.push(artifact)
         }
         return { arguments: argumentsValue, inputArtifacts }
@@ -934,25 +955,45 @@ export class AgentActionsService implements AgentActionsServiceLike {
     originSessionId: string,
   ): Promise<JsonValue> {
     if (kind === 'text') return normalizeText(value)
-    const reference = assertExactRecord(value, ['artifactId'], 'invalid_arguments')
-    const artifactId = assertSafeActionId(reference.artifactId)
-    if (!this.options.resolveArtifact) throw new AgentActionsServiceError('artifact_not_found')
-    let rawArtifact: unknown | null
-    try {
-      rawArtifact = await this.options.resolveArtifact(originSessionId, artifactId, kind)
-    } catch (error) {
-      throw new AgentActionsServiceError('artifact_not_found', error)
-    }
-    if (rawArtifact === null) throw new AgentActionsServiceError('artifact_not_found')
-    let artifact: ArtifactRefV1
-    try {
-      artifact = assertArtifactRefV1(rawArtifact)
-    } catch (error) {
-      throw new AgentActionsServiceError('artifact_not_found', error)
-    }
-    if (artifact.id !== artifactId || artifact.kind !== kind) throw new AgentActionsServiceError('artifact_not_found')
+    const selection = assertArtifactSelection(value)
+    const artifact = this.resolveCompletedArtifact(originSessionId, selection, kind)
     inputArtifacts.push(artifact)
     return normalizeJsonValue(artifact)
+  }
+
+  private resolveCompletedArtifact(
+    originSessionId: string,
+    requested: Pick<AgentArtifactSelectionV1, 'id'> | AgentArtifactSelectionV1,
+    expectedKind: ArtifactRefV1['kind'],
+    allowedMediaTypes?: readonly string[],
+  ): ArtifactRefV1 {
+    this.prune()
+    const candidates = [...this.actions.values()].flatMap((record) => (
+      record.originSessionId === originSessionId && record.action.status === 'completed'
+        ? record.action.outputArtifacts.filter((artifact) => artifact.id === requested.id)
+        : []
+    ))
+    if (candidates.length !== 1) throw new AgentActionsServiceError('artifact_not_found')
+    let artifact: ArtifactRefV1
+    try {
+      artifact = assertArtifactRefV1(candidates[0])
+    } catch (error) {
+      throw new AgentActionsServiceError('artifact_not_found', error)
+    }
+    if (artifact.kind !== expectedKind
+      || (allowedMediaTypes && !allowedMediaTypes.includes(artifact.mediaType))) {
+      throw new AgentActionsServiceError('artifact_not_found')
+    }
+    if ('kind' in requested && (
+      artifact.id !== requested.id
+      || artifact.kind !== requested.kind
+      || artifact.mediaType !== requested.mediaType
+      || artifact.sha256 !== requested.sha256
+      || artifact.sizeBytes !== requested.sizeBytes
+    )) {
+      throw new AgentActionsServiceError('artifact_not_found')
+    }
+    return cloneCanonical(artifact)
   }
 
   private async resolveCapability(
@@ -1116,6 +1157,26 @@ export class AgentActionsService implements AgentActionsServiceLike {
         return rollbackPromise
       },
     }
+  }
+
+  private assignMcpArtifactIdentities(
+    artifacts: ArtifactRefV1[],
+    actionId: string,
+  ): ArtifactRefV1[] {
+    return artifacts.map((artifact) => {
+      if (this.nextMcpArtifactIdentity >= Number.MAX_SAFE_INTEGER) {
+        throw new AgentActionsServiceError('invalid_artifact')
+      }
+      this.nextMcpArtifactIdentity += 1
+      return {
+        ...artifact,
+        id: `mcp-${sha256Canonical({
+          schema: 'modly.mcp-artifact-identity.v1',
+          actionId,
+          sequence: this.nextMcpArtifactIdentity,
+        })}`,
+      }
+    })
   }
 
   private async verifyArtifacts(

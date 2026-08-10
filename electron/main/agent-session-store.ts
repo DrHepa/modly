@@ -626,6 +626,33 @@ export class AgentSessionStore {
     return { ...session, ...patch, revision: session.revision + 1, updatedAt: timestamp, expiresAt: new Date(now + AGENT_SESSION_TTL_MS).toISOString() }
   }
 
+  /**
+   * Linearizes an external main-process commit with session activation and
+   * deletion. The operation runs only while sessionId is the live active
+   * session, under the same exclusive queue used by every session mutation.
+   */
+  async commitIfActive(
+    sessionId: string,
+    operation: () => Promise<void>,
+  ): Promise<'committed' | 'inactive' | 'commit_failed'> {
+    return this.exclusive(async () => {
+      if (!safeId(sessionId) || typeof operation !== 'function') return 'inactive'
+      const loaded = await this.load()
+      if (loaded.readOnly || loaded.document.activeSessionId !== sessionId) return 'inactive'
+      try {
+        this.find(loaded.document, sessionId)
+      } catch {
+        return 'inactive'
+      }
+      try {
+        await operation()
+        return 'committed'
+      } catch {
+        return 'commit_failed'
+      }
+    })
+  }
+
   async list(): Promise<AgentSessionListResult> {
     return this.exclusive(async () => {
       const loaded = await this.load()

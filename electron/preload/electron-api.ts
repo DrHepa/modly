@@ -10,6 +10,7 @@ import type {
 } from '../../src/shared/types/assetLibrary'
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
 import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult } from '../../src/shared/types/agentActions.ts'
+import type { AgentWorkflowCreateRequest, AgentWorkflowCreateResult } from '../../src/shared/types/agentWorkflows.ts'
 
 export interface IpcRendererLike {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
@@ -63,6 +64,9 @@ export function createElectronApi(
     },
     agentCapabilities: {
       list: (): Promise<AgentCapabilityInventoryResult> => ipcRenderer.invoke('agentCapabilities:list') as Promise<AgentCapabilityInventoryResult>,
+    },
+    agentWorkflows: {
+      create: (request: AgentWorkflowCreateRequest): Promise<AgentWorkflowCreateResult> => ipcRenderer.invoke('agentWorkflows:create', request) as Promise<AgentWorkflowCreateResult>,
     },
     agentSessions: {
       list: (): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:list') as Promise<AgentSessionListResult>,

@@ -46,7 +46,7 @@ import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensure
 import { logger } from './logger'
 import { getProcessRunner, getPythonProcessRunner, getExtPythonExe, terminateProcessRunner, terminateAllProcessRunners } from './process-runner'
 import { getBuiltinExtensionsDir } from './builtin-sync'
-import { activeExtensionInstalls, listAgentCapabilities, listVisibleExtensions, resolveGovernedAgentProcessTarget, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
+import { activeExtensionInstalls, listAgentCapabilities, listVisibleExtensions, listVisibleExtensionsDetailed, resolveGovernedAgentProcessTarget, parseExtensionManifest, type ParsedManifest } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { fetchTrustedRepos } from './trusted-repos'
@@ -108,6 +108,8 @@ import { RendererFilesystemAccess } from './renderer-filesystem-access'
 import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime'
 import { createAgentModelAccessRuntime } from './agent-model-access-runtime'
 import { createSharedAgentCapabilityResolver } from './agent-capability-resolver'
+import { AgentWorkflowAuthority, validateAgentWorkspaceSource } from './agent-workflow-authority'
+import { registerAgentWorkflowsIpcHandlers } from './agent-workflows-ipc'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -404,6 +406,24 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
   }
   const LOCKED_MODEL_FILES_ERROR = 'Model files are still locked after several attempts. Close any programs using the model and try again.'
+
+  const agentWorkflowAuthority = new AgentWorkflowAuthority({
+    commitIfOriginSessionActive: (originSessionId, operation) => agentSessionStore.commitIfActive(originSessionId, operation),
+    discoverExtensions: async () => {
+      const userData = app.getPath('userData')
+      return listVisibleExtensionsDetailed({
+        builtinDir: getBuiltinExtensionsDir(),
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        trustedRepos: await fetchTrustedRepos(),
+      })
+    },
+    getWorkflowsDir: () => getSettings(app.getPath('userData')).workflowsDir,
+    validateWorkspaceSource: (source) => validateAgentWorkspaceSource(
+      getSettings(app.getPath('userData')).workspaceDir,
+      source,
+    ),
+  })
+  registerAgentWorkflowsIpcHandlers(ipcMain, agentWorkflowAuthority)
 
   const mcpSandboxReadiness = createAgentMcpSandboxReadiness({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,

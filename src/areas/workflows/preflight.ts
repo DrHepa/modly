@@ -2,6 +2,7 @@ import { getPositionalInputTypes, hasNamedProcessInputs } from './processPorts'
 import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import { validateWorkflowProcessRun } from './processConnectionRules'
 import type { Workflow, WFNode } from '@shared/types/electron.d'
+import { WORKFLOW_BUILTIN_NODE_CONTRACTS, workflowBuiltinParamIsRequired } from '../../shared/workflowBuiltinContracts.ts'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
@@ -111,6 +112,21 @@ export function validateWorkflowPreflight(
         }
       }
     }
+
+    if (node.type === 'videoNode') {
+      const params = node.data.params ?? {}
+      const videoPathContract = WORKFLOW_BUILTIN_NODE_CONTRACTS.videoNode.params.videoPath
+      const videoPath = params.videoPath
+      if (workflowBuiltinParamIsRequired(videoPathContract, params)
+        && (typeof videoPath !== 'string' || videoPath.trim().length === 0)) {
+        pushIssue(issues, {
+          key: `${node.id}:missing:videoPath`,
+          nodeId: node.id,
+          message: `${nodeLabel(node, allExtensions)} needs a selected video.`,
+        })
+      }
+    }
+
     if (node.type === 'meshNode' && node.data.params?.source === 'current' && !options?.currentMeshUrl) {
       pushIssue(issues, {
         key: `${node.id}:current-mesh`,

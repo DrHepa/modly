@@ -34,6 +34,39 @@ test('create, list, read, and activate do not slide the seven-day TTL', async ()
   })
 })
 
+test('active-session commits share the session mutation lock and reject inactive origins without running', async () => {
+  await withStore(async (store) => {
+    const first = await store.create({ title: 'First' })
+    const second = await store.create({ title: 'Second' })
+    await store.activate({ sessionId: first.id })
+
+    let release!: () => void
+    let commitStarted!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const started = new Promise<void>((resolve) => { commitStarted = resolve })
+    const committed = store.commitIfActive(first.id, async () => {
+      commitStarted()
+      await gate
+    })
+    await started
+
+    let activationFinished = false
+    const activation = store.activate({ sessionId: second.id }).then((result) => {
+      activationFinished = true
+      return result
+    })
+    await Promise.resolve()
+    assert.equal(activationFinished, false)
+    release()
+    assert.equal(await committed, 'committed')
+    assert.equal((await activation).activeSessionId, second.id)
+
+    let ran = false
+    assert.equal(await store.commitIfActive(first.id, async () => { ran = true }), 'inactive')
+    assert.equal(ran, false)
+  })
+})
+
 test('new sessions and mutations sample the clock exactly once', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'modly-agent-clock-'))
   const base = Date.parse('2026-08-05T10:00:00.000Z')

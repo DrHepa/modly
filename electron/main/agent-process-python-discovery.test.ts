@@ -114,11 +114,15 @@ test('renderer inventory and Agent actions share one fresh capability discovery 
   assert.equal(shared.forAgentActions, shared.forRendererIpc)
   await shared.forAgentActions()
   await shared.forRendererIpc()
+  assert.deepEqual(await shared.withPrivateSkillBindings(), {
+    inventory: { capabilities: [], errors: [] },
+    skillBindings: [],
+  })
 
-  assert.equal(calls.length, 2)
+  assert.equal(calls.length, 3)
   assert.notEqual(calls[0], calls[1])
-  assert.deepEqual(calls.map((options) => options.userExtensionsDir), ['/extensions/1', '/extensions/2'])
-  assert.deepEqual(calls.map((options) => [...options.trustedRepos]), [['trusted-1'], ['trusted-2']])
+  assert.deepEqual(calls.map((options) => options.userExtensionsDir), ['/extensions/1', '/extensions/2', '/extensions/3'])
+  assert.deepEqual(calls.map((options) => [...options.trustedRepos]), [['trusted-1'], ['trusted-2'], ['trusted-3']])
   for (const options of calls) {
     assert.equal(options.hostRuntimes, hostRuntimes)
     assert.equal(options.mcpSandboxReadiness, mcpSandboxReadiness)
@@ -126,6 +130,9 @@ test('renderer inventory and Agent actions share one fresh capability discovery 
     assert.equal(options.processModelAccessReadiness, processModelAccessReadiness)
     assert.equal(options.processPythonExecutable, processPythonExecutable)
   }
+  assert.equal(calls[0].skillBindingSink, undefined)
+  assert.equal(calls[1].skillBindingSink, undefined)
+  assert.equal(typeof calls[2].skillBindingSink, 'function')
 })
 
 test('shared renderer inventory exposes model-backed PROCESS capabilities only while private model readiness is true', async () => {

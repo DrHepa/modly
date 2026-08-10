@@ -25,6 +25,7 @@ import { discoverGovernedMcpTools } from './agent-mcp-manifest.ts'
 import {
   AgentSkillsManifestError,
   bindAgentSkillSet,
+  type BoundAgentSkillSetV1,
   normalizeAgentSkillsDeclaration,
   parseAgentSkillDocument,
 } from './agent-skills-manifest.ts'
@@ -161,7 +162,7 @@ async function rejectsCode(promise: Promise<unknown>, code: string): Promise<voi
   })
 }
 
-test('Agent Skills v1 declaration and document grammar are exact, deterministic, and host-normalized', () => {
+test('Agent Skills v1 grammar is exact, deterministic, and printable-ASCII bounded', () => {
   assert.deepEqual(normalizeAgentSkillsDeclaration(skillsDeclaration()), {
     schema: 'modly.agent-skills.v1',
     file: SKILL_PATH,
@@ -222,6 +223,66 @@ test('Agent Skills v1 declaration and document grammar are exact, deterministic,
     skillDocument({ examples: ['Use h\u200bt\u200bt\u200bp://example.invalid as a reference.'] }),
     skillDocument({ examples: ['Use h\u{E0100}ttps://example.invalid as a reference.'] }),
     skillDocument({ constraint: 'Never execute data\u{E0100}:text/plain,private.' }),
+    ...[
+      '/home/alice/private/skill',
+      '~/private/skill',
+      '../private/skill',
+      './private/skill',
+      'C:\\Users\\Alice\\private.txt',
+      '\\\\server\\share\\private.txt',
+      'skills/private/instructions',
+      'skills\\private\\instructions',
+      'skills＼private＼instructions',
+      'skills⧸private⧸instructions',
+      'skills⧹private⧹instructions',
+      'skills⧵private⧵instructions',
+      'skills∖private∖instructions',
+      'skills⁄private∕instructions',
+      'skills⟋private⟍instructions',
+      'skills╱private╲instructions',
+      'skills﹨private﹨instructions',
+      'skills ／ private ． md',
+      'SKILL ． md',
+      'skills\u200b/\u200bprivate',
+      'C ： ／ Users ／ Alice',
+      'SKILL.md',
+      'runner.py',
+      'plugin.ts',
+      'plugin.js',
+      'config.json',
+      'settings.yaml',
+      'pyproject.toml',
+      'launch.sh',
+      '.env',
+    ].map((pathLike) => skillDocument({ instruction: `Never reveal ${pathLike} to the model.` })),
+    ...[
+      'Read README before continuing.',
+      'Review license before continuing.',
+      'Open COPYING before continuing.',
+      'Consult NOTICE before continuing.',
+      'Inspect AUTHORS before continuing.',
+      'Follow CONTRIBUTING before continuing.',
+      'Check CHANGELOG before continuing.',
+      'Read AGENTS before continuing.',
+      'Open SKILL before continuing.',
+      'Inspect ＭＡＮＩＦＥＳＴ before continuing.',
+      'Refer to ＲＥＡＤＭＥ before continuing.',
+      'Review Makefile before continuing.',
+      'Open dOcKeRfIlE before continuing.',
+      'Contact example.ai before continuing.',
+      'Contact EXAMPLE．INVALID before continuing.',
+      'Never use .invalid as a reference.',
+      'Contact 例子．测试 before continuing.',
+      'Return scene.obj as a public artifact.',
+      'Return scene.gltf as a public artifact.',
+      'Return image.png as a public artifact.',
+    ].map((instruction) => skillDocument({ instruction })),
+    ...[
+      0x0080, 0x00a0, 0x00e9, 0x0301, 0x03a9, 0x4e2d, 0x1f642,
+      0x2f03, 0x244a, 0x233f, 0x2340, 0x3033, 0x31d3, 0x10ffff,
+    ].map((codePoint) => skillDocument({
+      instruction: `Reject non-ASCII sample ${String.fromCodePoint(codePoint)} in Skill content.`,
+    })),
     skillDocument({ name: 'cad-planner-v1' }),
     skillDocument().replace('- Interpret dimensions in millimetres.', 'Interpret dimensions in millimetres.'),
   ]
@@ -235,6 +296,23 @@ test('Agent Skills v1 declaration and document grammar are exact, deterministic,
     summary: 'Note: support deterministic format version 1.2.3 without external references.',
   }), 'utf8'))
   assert.equal(versionText.summary, 'Note: support deterministic format version 1.2.3 without external references.')
+
+  const licenseProse = parseAgentSkillDocument(Buffer.from(skillDocument({
+    instruction: 'Review license requirements before distribution.',
+  }), 'utf8'))
+  assert.equal(licenseProse.instructions[0], 'Review license requirements before distribution.')
+
+  const asciiProse = parseAgentSkillDocument(Buffer.from(skillDocument({
+    instruction: 'Use plain ASCII guidance: 50% scale, millimetres, plus +, and equals =.',
+  }), 'utf8'))
+  assert.equal(asciiProse.instructions[0], 'Use plain ASCII guidance: 50% scale, millimetres, plus +, and equals =.')
+
+  const publicArtifacts = parseAgentSkillDocument(Buffer.from(skillDocument({
+    examples: ['Return scene.glb, scene.blend, bracket.step, and bracket.stp as declared public artifacts.'],
+  }), 'utf8'))
+  assert.deepEqual(publicArtifacts.examples, [
+    'Return scene.glb, scene.blend, bracket.step, and bracket.stp as declared public artifacts.',
+  ])
 })
 
 test('Agent skill raw-file byte limit accepts exactly 8192 bytes and rejects 8193', () => {
@@ -424,6 +502,20 @@ test('PROCESS and MCP capabilities bind declared skills while invalid skills rem
     assert.equal(inventory.capabilities.find((capability) => capability.id === 'process-skills/legacy')?.skills, undefined)
     assert.equal(inventory.capabilities.find((capability) => capability.id === 'mcp-skills/legacy')?.skills, undefined)
     assert.ok(inventory.errors.filter((error) => error.code === 'AGENT_SKILL_INVALID').length >= 2)
+
+    const privateBindings: Array<{ capability: { id: string }, extensionDir: string, bound: BoundAgentSkillSetV1 }> = []
+    const reboundInventory = await listAgentCapabilities({
+      builtinDir,
+      userExtensionsDir: userDir,
+      trustedRepos: new Set(),
+      skillBindingSink: (binding) => { privateBindings.push(binding) },
+    })
+    assert.deepEqual(privateBindings.map((binding) => binding.capability.id), [
+      'mcp-skills/valid',
+      'process-skills/valid',
+    ])
+    assert.deepEqual(privateBindings.map((binding) => binding.extensionDir), [mcpDir, processDir])
+    assert.deepEqual(reboundInventory, inventory)
 
     const publicJson = JSON.stringify(inventory.capabilities)
     for (const secret of [processDir, mcpDir, 'skills/valid.md', 'millimetres', 'declared artifacts']) {

@@ -4,6 +4,7 @@ import { lstat, open, realpath, type FileHandle } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
 import type {
+  AgentSkillNormalizedBodyV1,
   AgentSkillsDeclarationV1,
   AgentSkillsPublicSnapshotV1,
 } from '../../src/shared/types/agentActions.ts'
@@ -24,25 +25,28 @@ const SAFE_SKILL_NAME = /^modly-[a-z0-9]+(?:-[a-z0-9]+)*-v1$/
 const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const RAW_DIRECTIVE = /(?:\{\{|\{%|:::|@(?:include|import)\b|!INCLUDE\b)/i
-const URL_SLASH_CODE_POINTS = new Set([0x2f, 0x5c, 0x2044, 0x2215, 0xff0f, 0xff3c])
-const URL_COLON_CODE_POINTS = new Set([0x3a, 0x2d0, 0x2236, 0xa789, 0xfe13, 0xfe55, 0xff1a])
-const URL_DOT_CODE_POINTS = new Set([0x2e, 0x3002, 0xfe52, 0xff0e, 0xff61])
-const URL_DEFAULT_IGNORABLE = /\p{Default_Ignorable_Code_Point}/u
-const URL_WHITESPACE = /\p{White_Space}/u
+const PRINTABLE_ASCII = /^[\x20-\x7e]+$/
 const URL_SCHEME_WITH_AUTHORITY = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*\s*:\s*\/\s*\//
 const URL_DANGEROUS_SCHEME = /(?:^|[^a-z0-9+.-])(?:h\s*t\s*t\s*p\s*s?|f\s*i\s*l\s*e|f\s*t\s*p\s*s?|w\s*s\s*s?|d\s*a\s*t\s*a|j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t|v\s*b\s*s\s*c\s*r\s*i\s*p\s*t|m\s*a\s*i\s*l\s*t\s*o|b\s*l\s*o\s*b)\s*:/
 const URL_WWW = /(?:^|[^a-z0-9.-])w\s*w\s*w\s*\./
+const SENSITIVE_FILENAME_MARKER = /\.(?:md|markdown|rst|txt|py|pyw|pyi|js|jsx|mjs|cjs|ts|tsx|mts|cts|json|jsonc|json5|ya?ml|toml|ini|cfg|conf|env|sh|bash|zsh|fish|ps1|bat|cmd|html?|css|scss|xml|go|rs|c|cc|cpp|h|hpp|java|kt|kts|swift|rb|php|pl|lua)/
+const PUBLIC_ARTIFACT_SUFFIXES = new Set(['glb', 'blend', 'step', 'stp'])
+const SOURCE_DOCUMENT_NAMES = new Set([
+  'readme', 'license', 'copying', 'notice', 'authors', 'contributing', 'changelog',
+  'agents', 'skill', 'manifest', 'makefile', 'dockerfile',
+])
+const SOURCE_REFERENCE_VERBS = new Set([
+  'check', 'consult', 'follow', 'inspect', 'load', 'open', 'read', 'refer', 'review', 'see', 'use',
+  'abrir', 'consultar', 'inspeccionar', 'leer', 'revisar', 'seguir', 'usar',
+])
+const SOURCE_REFERENCE_BRIDGES = new Set(['a', 'al', 'el', 'la', 'las', 'los', 'the', 'to', 'un', 'una'])
+const LICENSE_PROSE_FOLLOWERS = new Set([
+  'agreement', 'agreements', 'compliance', 'conditions', 'obligations', 'policies', 'policy',
+  'requirements', 'restrictions', 'terms',
+])
 const FRONTMATTER_KEYS = ['name', 'version', 'summary'] as const
 
-export type AgentSkillNormalizedV1 = Readonly<{
-  schema: typeof DOCUMENT_SCHEMA
-  version: 1
-  name: string
-  summary: string
-  instructions: readonly string[]
-  constraints: readonly string[]
-  examples?: readonly string[]
-}>
+export type AgentSkillNormalizedV1 = Readonly<AgentSkillNormalizedBodyV1>
 
 export type AgentSkillFileIdentityV1 = Readonly<{
   path: string
@@ -97,43 +101,90 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[], l
   }
 }
 
-function hasControlCharacter(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code <= 0x1f || code === 0x7f) return true
+function asciiSafetyProbe(value: string): string {
+  return value.toLowerCase()
+}
+
+function isDomainLetter(character: string): boolean {
+  return /^[a-z]$/.test(character)
+}
+
+function isDomainAlphaNumeric(character: string): boolean {
+  return /^[a-z0-9]$/.test(character)
+}
+
+function isValidDomainLabel(label: string): boolean {
+  const characters = [...label]
+  return characters.length >= 1 && characters.length <= 63
+    && characters[0] !== '-' && characters.at(-1) !== '-'
+    && characters.every((character) => character === '-' || isDomainAlphaNumeric(character))
+}
+
+function isDomainLikeToken(rawToken: string): boolean {
+  const token = rawToken.replace(/\.+$/, '')
+  if (!token.includes('.')) return false
+  const characters = [...token]
+  if (characters.length > 253) return true
+  const artifactSuffix = token.slice(token.lastIndexOf('.') + 1)
+  if (PUBLIC_ARTIFACT_SUFFIXES.has(artifactSuffix)) return false
+  if (token.startsWith('.')) {
+    const suffix = token.slice(1)
+    const suffixCharacters = [...suffix]
+    return suffixCharacters.length >= 2 && suffixCharacters.length <= 63
+      && isDomainLetter(suffixCharacters[0])
+      && isValidDomainLabel(suffix)
+  }
+  const labels = token.split('.')
+  if (labels.length < 2 || labels.some((label) => !isValidDomainLabel(label))) return false
+  const suffixCharacters = [...labels.at(-1)!]
+  return suffixCharacters.length >= 2 && isDomainLetter(suffixCharacters[0])
+}
+
+function containsBareDottedReference(probe: string): boolean {
+  let token = ''
+  const flush = (): boolean => {
+    const matched = token.length > 0 && isDomainLikeToken(token)
+    token = ''
+    return matched
+  }
+  for (const character of probe) {
+    if (character === '.' || character === '-' || isDomainAlphaNumeric(character)) token += character
+    else if (flush()) return true
+  }
+  return flush()
+}
+
+function containsSourceDocumentReference(probe: string): boolean {
+  const tokens = probe.match(/[a-z0-9]+/g) ?? []
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!SOURCE_REFERENCE_VERBS.has(tokens[index])) continue
+    let referenceIndex = index + 1
+    let skipped = 0
+    while (referenceIndex < tokens.length && skipped < 2 && SOURCE_REFERENCE_BRIDGES.has(tokens[referenceIndex])) {
+      referenceIndex += 1
+      skipped += 1
+    }
+    const reference = tokens[referenceIndex]
+    if (!reference || !SOURCE_DOCUMENT_NAMES.has(reference)) continue
+    if (reference === 'license' && LICENSE_PROSE_FOLLOWERS.has(tokens[referenceIndex + 1] ?? '')) continue
+    return true
   }
   return false
 }
 
-function hasLoneSurrogate(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1)
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
-      index += 1
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true
-    }
-  }
-  return false
-}
-
-function normalizedUrlProbe(value: string): string {
-  let probe = ''
-  for (const character of value.normalize('NFKC').toLowerCase()) {
-    const codePoint = character.codePointAt(0) as number
-    if (URL_DEFAULT_IGNORABLE.test(character)) continue
-    if (URL_WHITESPACE.test(character)) {
-      probe += ' '
-      continue
-    }
-    if (URL_SLASH_CODE_POINTS.has(codePoint)) probe += '/'
-    else if (URL_COLON_CODE_POINTS.has(codePoint)) probe += ':'
-    else if (URL_DOT_CODE_POINTS.has(codePoint)) probe += '.'
-    else probe += character
-  }
-  return probe
+function containsPathLikeText(probe: string): boolean {
+  const structural = probe.replace(/\s*([/:.])\s*/g, '$1')
+  const compact = structural.replace(/\s+/g, '')
+  return compact.includes('//')
+    || compact.includes('~/')
+    || compact.includes('../')
+    || compact.includes('./')
+    || /[a-z]:\//.test(compact)
+    || /\/[a-z0-9._~-]/.test(compact)
+    || /[a-z0-9._~-]\/[a-z0-9._~-]/.test(compact)
+    || SENSITIVE_FILENAME_MARKER.test(compact)
+    || containsBareDottedReference(structural)
+    || containsSourceDocumentReference(probe)
 }
 
 function normalizeSkillRelativePath(value: unknown): string {
@@ -167,15 +218,17 @@ export function normalizeAgentSkillsDeclaration(value: unknown): AgentSkillsDecl
 }
 
 function plainText(value: string, label: string, maximum: number): string {
-  const urlProbe = normalizedUrlProbe(value)
+  const urlProbe = asciiSafetyProbe(value)
   if (value.length < 1 || value.length > maximum || value.trim() !== value
-    || hasControlCharacter(value) || hasLoneSurrogate(value)
+    || !PRINTABLE_ASCII.test(value)
+    || value.includes('\\')
     || value.includes('`') || value.includes('<') || value.includes('>')
     || value.includes('[') || value.includes(']') || value.includes('~~~')
     || RAW_DIRECTIVE.test(value)
     || URL_SCHEME_WITH_AUTHORITY.test(urlProbe)
     || URL_DANGEROUS_SCHEME.test(urlProbe)
-    || URL_WWW.test(urlProbe)) {
+    || URL_WWW.test(urlProbe)
+    || containsPathLikeText(urlProbe)) {
     throw new AgentSkillsManifestError('invalid_document', `${label} is not safe bounded plain text`)
   }
   return value

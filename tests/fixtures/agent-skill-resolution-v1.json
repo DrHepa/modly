@@ -1,0 +1,19 @@
+{
+  "schema": "modly.agent-skill-resolution-fixture.v1",
+  "originSessionId": "session-a",
+  "userText": "Créate café cube with a hole.",
+  "capabilities": [
+    {
+      "id": "zeta/mesh",
+      "hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "skillsHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "id": "cad/plan",
+      "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "skillsHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "canonical": "{\"capabilities\":[{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"cad/plan\",\"skillsHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"hash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"id\":\"zeta/mesh\",\"skillsHash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}],\"originSessionId\":\"session-a\",\"schema\":\"modly.agent-skill-resolution.v1\",\"userText\":\"Créate café cube with a hole.\",\"version\":1}",
+  "resolutionHash": "87b1d83b867146bea69283b012d64f87e35e88b32d6e2ee372ea6a7a1e4b9aca"
+}

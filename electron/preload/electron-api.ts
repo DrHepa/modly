@@ -9,7 +9,7 @@ import type {
   AssetLibraryReadResult,
 } from '../../src/shared/types/assetLibrary'
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
-import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult } from '../../src/shared/types/agentActions.ts'
+import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult, AgentSkillContextResolveRequestV1, AgentSkillContextResolveResultV1 } from '../../src/shared/types/agentActions.ts'
 import type { AgentWorkflowCreateRequest, AgentWorkflowCreateResult } from '../../src/shared/types/agentWorkflows.ts'
 
 export interface IpcRendererLike {
@@ -64,6 +64,7 @@ export function createElectronApi(
     },
     agentCapabilities: {
       list: (): Promise<AgentCapabilityInventoryResult> => ipcRenderer.invoke('agentCapabilities:list') as Promise<AgentCapabilityInventoryResult>,
+      resolveSkillContexts: (request: AgentSkillContextResolveRequestV1): Promise<AgentSkillContextResolveResultV1> => ipcRenderer.invoke('agentCapabilities:resolveSkillContexts', request) as Promise<AgentSkillContextResolveResultV1>,
     },
     agentWorkflows: {
       create: (request: AgentWorkflowCreateRequest): Promise<AgentWorkflowCreateResult> => ipcRenderer.invoke('agentWorkflows:create', request) as Promise<AgentWorkflowCreateResult>,

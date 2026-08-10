@@ -40,6 +40,10 @@ import type {
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
   AgentOllamaModelSelectionV1,
+  AgentSkillContextCapabilityRefV1,
+  AgentSkillContextResolveRequestV1,
+  AgentSkillContextResolveResultV1,
+  AgentSkillsPublicSnapshotV1,
   JsonValue,
 } from '@shared/types/agentActions'
 import type {
@@ -100,6 +104,7 @@ export interface AgentCapabilityPromptView {
   name: string
   description: string
   inputHints: AgentCapabilityPromptInputHint[]
+  skills?: AgentSkillsPublicSnapshotV1
 }
 
 const MAX_AGENT_PROPOSALS = 4
@@ -110,6 +115,7 @@ const UNSAFE_JSON_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const HASH_PATTERN = /^[a-f0-9]{64}$/
+const AGENT_SKILL_NAME_PATTERN = /^modly-[a-z0-9]+(?:-[a-z0-9]+)*-v1$/
 const GOVERNED_TERMINAL_STATUSES = new Set<AgentActionStatus>([
   'rejected', 'expired', 'completed', 'failed', 'cancelled',
 ])
@@ -349,6 +355,26 @@ function mcpInputHints(capability: AgentCapabilitySnapshotV1): AgentCapabilityPr
   }).slice(0, 32)
 }
 
+function publicSkillsSnapshot(value: AgentCapabilitySnapshotV1['skills']): AgentSkillsPublicSnapshotV1 | undefined {
+  if (!value) return undefined
+  if (!isRecord(value) || !hasExactKeys(value, ['schema', 'version', 'hash', 'count', 'items'])
+    || value.schema !== 'modly.agent-skills.v1' || value.version !== 1
+    || value.count !== 1 || !HASH_PATTERN.test(value.hash)
+    || !Array.isArray(value.items) || value.items.length !== 1) {
+    throw new Error('Agent capability inventory contains invalid public skill metadata.')
+  }
+  const item = value.items[0]
+  if (!isRecord(item) || !hasExactKeys(item, ['name', 'version', 'hash'])
+    || typeof item.name !== 'string' || !AGENT_SKILL_NAME_PATTERN.test(item.name)
+    || item.version !== 1 || typeof item.hash !== 'string' || !HASH_PATTERN.test(item.hash)) {
+    throw new Error('Agent capability inventory contains invalid public skill metadata.')
+  }
+  return {
+    schema: 'modly.agent-skills.v1', version: 1, hash: value.hash, count: 1,
+    items: [{ name: item.name, version: 1, hash: item.hash }],
+  }
+}
+
 export function buildAgentCapabilityPromptInventory(inventory: AgentCapabilityInventoryResult): AgentCapabilityPromptView[] {
   if (!inventory || !Array.isArray(inventory.capabilities) || inventory.capabilities.length > MAX_AGENT_CAPABILITIES) {
     throw new Error('Agent capability inventory exceeds its safe bounds.')
@@ -380,7 +406,8 @@ export function buildAgentCapabilityPromptInventory(inventory: AgentCapabilityIn
             return hint ? [hint] : []
           }),
         ].slice(0, 32)
-    return { id, hash: capability.hash, name, description, inputHints }
+    const skills = publicSkillsSnapshot(capability.skills)
+    return { id, hash: capability.hash, name, description, inputHints, ...(skills ? { skills } : {}) }
   }).sort((left, right) => left.id.localeCompare(right.id))
   if (new Set(views.map((view) => view.id)).size !== views.length || new Set(views.map((view) => view.hash)).size !== views.length) {
     throw new Error('Agent capability inventory contains a collision.')
@@ -389,6 +416,48 @@ export function buildAgentCapabilityPromptInventory(inventory: AgentCapabilityIn
     throw new Error('Agent capability inventory exceeds its safe bounds.')
   }
   return views
+}
+
+export function buildAgentSkillContextRefs(inventory: AgentCapabilityInventoryResult): AgentSkillContextCapabilityRefV1[] {
+  if (!inventory || !Array.isArray(inventory.capabilities) || inventory.capabilities.length > MAX_AGENT_CAPABILITIES) {
+    throw new Error('Agent capability inventory exceeds its safe bounds.')
+  }
+  const refs = inventory.capabilities.flatMap((capability) => {
+    const skills = publicSkillsSnapshot(capability.skills)
+    if (!skills) return []
+    if (!CAPABILITY_ID_PATTERN.test(capability.id) || !HASH_PATTERN.test(capability.hash)) {
+      throw new Error('Agent capability inventory contains an invalid skill reference.')
+    }
+    return [{ id: capability.id, hash: capability.hash, skillsHash: skills.hash }]
+  }).sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  if (new Set(refs.map((ref) => ref.id)).size !== refs.length) {
+    throw new Error('Agent capability inventory contains a skill reference collision.')
+  }
+  return refs
+}
+
+export async function resolveAgentSkillContextsForTurn(input: {
+  originSessionId: string
+  userText: string
+  capabilityRefs: AgentSkillContextCapabilityRefV1[]
+  isCurrent: () => boolean
+  resolve: (request: AgentSkillContextResolveRequestV1) => Promise<AgentSkillContextResolveResultV1>
+}): Promise<AgentSkillContextResolveResultV1 | null> {
+  if (!input.isCurrent()) return null
+  if (input.userText.length < 1 || input.userText.length > 4_096
+    || new TextEncoder().encode(input.userText).byteLength > 8_192) return null
+  const result = await input.resolve({
+    originSessionId: input.originSessionId,
+    userText: input.userText,
+    capabilities: input.capabilityRefs,
+  })
+  if (!input.isCurrent()) return null
+  if (!isRecord(result) || !hasExactKeys(result, ['resolutionHash', 'contexts'])
+    || typeof result.resolutionHash !== 'string' || !HASH_PATTERN.test(result.resolutionHash)
+    || !Array.isArray(result.contexts) || result.contexts.length > 2) {
+    throw new Error('Modly returned invalid Agent skill contexts.')
+  }
+  return { resolutionHash: result.resolutionHash, contexts: result.contexts }
 }
 
 export function normalizeLocalOllamaEndpoint(value: unknown): string | null {
@@ -1704,6 +1773,7 @@ export default function ChatPanel(): JSX.Element {
     })
     try {
       let capabilities: ReturnType<typeof buildAgentCapabilityPromptInventory> = []
+      let capabilityRefs: AgentSkillContextCapabilityRefV1[] = []
       if (selectedModel) {
         try {
           const [capabilityInventory, modelLeaseResult] = await Promise.all([
@@ -1722,6 +1792,7 @@ export default function ChatPanel(): JSX.Element {
             ) {
               modelLeaseId = modelLeaseResult.lease.id
               capabilities = buildAgentCapabilityPromptInventory(capabilityInventory)
+              capabilityRefs = buildAgentSkillContextRefs(capabilityInventory)
             }
           }
         } catch {
@@ -1741,8 +1812,24 @@ export default function ChatPanel(): JSX.Element {
         }
         return entry
       })
+      const latestUserText = [...apiMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
+      let skillResolution: AgentSkillContextResolveResultV1 | null = null
+      if (modelLeaseId) {
+        try {
+          skillResolution = await resolveAgentSkillContextsForTurn({
+            originSessionId: originatingSessionId,
+            userText: latestUserText,
+            capabilityRefs,
+            isCurrent: uiToken.isCurrent,
+            resolve: (request) => window.electron.agentCapabilities.resolveSkillContexts(request),
+          })
+        } catch {
+          // Optional skill guidance failures never block ordinary chat.
+        }
+      }
+      if (!uiToken.isCurrent()) return
       if (extraContext.workflowCompletion) {
-        apiMessages.push({ role: 'user', content: `[System] ${extraContext.workflowCompletion}` })
+        apiMessages.push({ role: 'system', content: extraContext.workflowCompletion as string })
         delete context.workflowCompletion
       }
 
@@ -1754,9 +1841,14 @@ export default function ChatPanel(): JSX.Element {
           model,
           provider: selectedProvider,
           ...(modelLeaseId ? { modelLeaseId } : {}),
+          ...(skillResolution ? {
+            originSessionId: originatingSessionId,
+            resolutionHash: skillResolution.resolutionHash,
+          } : {}),
           context,
           thinking: selectedThinkingMode,
           capabilities,
+          ...(skillResolution ? { skillContexts: skillResolution.contexts } : {}),
         }),
       })
       const data = await parseAgentChatResponse(res)

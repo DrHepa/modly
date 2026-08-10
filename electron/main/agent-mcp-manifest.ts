@@ -10,6 +10,7 @@ import type {
   AgentApprovalPolicyV1,
   AgentMcpArtifactOutputContractV1,
   AgentMcpInputArtifactBindingV1,
+  AgentSkillsDeclarationV1,
   JsonValue,
 } from '../../src/shared/types/agentActions.ts'
 import { canonicalJson, sha256Canonical } from './agent-trust-contracts.ts'
@@ -22,6 +23,8 @@ import {
   type AgentHostRuntimeRegistry,
   type BoundAgentHostRuntime,
 } from './agent-host-runtime.ts'
+import { normalizeAgentSkillsDeclaration } from './agent-skills-manifest.ts'
+import { parseStrictJson } from './strict-json.ts'
 
 const MCP_SCHEMA = 'modly.mcp-stdio.v1' as const
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
@@ -69,6 +72,8 @@ export type NormalizedMcpTool = Readonly<{
   mutating: boolean
   approval: AgentApprovalPolicyV1
   artifact: McpArtifactDeclaration
+  skills?: AgentSkillsDeclarationV1
+  skillsInvalid?: true
 }>
 
 export type NormalizedMcpServer = Readonly<{
@@ -516,7 +521,7 @@ function normalizeTool(
   const tool = record(value, label)
   exactKeys(tool, [
     'name', 'capability_id', 'display_name', 'description', 'input_schema', 'output_schema',
-    'input_artifacts', 'mutating', 'approval', 'artifact',
+    'input_artifacts', 'mutating', 'approval', 'artifact', 'skills',
   ], label)
   const name = safeId(tool.name, `${label}.name`)
   const capabilityId = literal(tool.capability_id, `${label}.capability_id`, 257)
@@ -530,6 +535,15 @@ function normalizeTool(
   const input = jsonSchema(tool.input_schema, `${label}.input_schema`)
   const output = tool.output_schema === undefined ? undefined : jsonSchema(tool.output_schema, `${label}.output_schema`)
   const inputArtifacts = normalizeInputArtifacts(tool.input_artifacts, input.schema, `${label}.input_artifacts`)
+  let skills: AgentSkillsDeclarationV1 | undefined
+  let skillsInvalid = false
+  if (Object.prototype.hasOwnProperty.call(tool, 'skills') && tool.skills !== undefined) {
+    try {
+      skills = normalizeAgentSkillsDeclaration(tool.skills)
+    } catch {
+      skillsInvalid = true
+    }
+  }
   if (typeof tool.mutating !== 'boolean') throw new AgentMcpManifestError('invalid_manifest', `${label}.mutating must be boolean`)
   return {
     name,
@@ -543,6 +557,8 @@ function normalizeTool(
     mutating: tool.mutating,
     approval: normalizeApproval(tool.approval, `${label}.approval`),
     artifact: normalizeArtifact(tool.artifact, artifactOutput, `${label}.artifact`),
+    ...(skills ? { skills } : {}),
+    ...(skillsInvalid ? { skillsInvalid: true as const } : {}),
   }
 }
 
@@ -705,7 +721,12 @@ async function readBoundedManifest(path: string): Promise<unknown> {
       throw new AgentMcpManifestError('invalid_manifest', 'Extension manifest changed while it was read')
     }
     const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, offset))
-    const value = JSON.parse(text) as unknown
+    const value = parseStrictJson(text, {
+      maxBytes: MAX_MANIFEST_BYTES,
+      maxDepth: MAX_MANIFEST_DEPTH,
+      maxProperties: MAX_MANIFEST_PROPERTIES,
+      maxArrayLength: MAX_MANIFEST_ARRAY,
+    })
     inspectManifestJson(value, 0, { properties: 0 })
     return value
   } catch (error) {

@@ -17,6 +17,7 @@ import type {
   AgentCapabilitySnapshotV1,
   AgentMcpArtifactOutputContractV1,
   AgentProcessModelAccessDeclarationV1,
+  AgentSkillsDeclarationV1,
 } from '../../src/shared/types/agentActions.ts'
 import { discoverGovernedMcpTools, type DiscoveredMcpTool } from './agent-mcp-manifest.ts'
 import {
@@ -25,6 +26,17 @@ import {
   normalizeAgentProcessDeclaration,
 } from './agent-process-manifest.ts'
 import type { AgentHostRuntimeRegistry } from './agent-host-runtime.ts'
+import {
+  AgentSkillsManifestError,
+  bindAgentSkillSet,
+  normalizeAgentSkillsDeclaration,
+} from './agent-skills-manifest.ts'
+import { parseStrictJson } from './strict-json.ts'
+
+const MAX_EXTENSION_MANIFEST_BYTES = 512 * 1_024
+const MAX_EXTENSION_MANIFEST_DEPTH = 64
+const MAX_EXTENSION_MANIFEST_PROPERTIES = 10_000
+const MAX_EXTENSION_MANIFEST_ARRAY = 5_000
 
 export type ModelInputKind = ArtifactKind | string | 'none'
 export type ExtensionPortKind = ArtifactKind | string
@@ -257,6 +269,12 @@ export type ParsedManifest = {
   }[]
 }
 
+type ParsedManifestNode = NonNullable<ParsedManifest['nodes']>[number]
+
+type AgentCapabilityDeclarationError = Readonly<{
+  code: 'AGENT_SKILL_INVALID'
+}>
+
 export type ListedExtensionNode<
   TInput extends ModelInputKind = ModelInputKind,
 > = {
@@ -279,6 +297,7 @@ export type ListedExtensionNode<
   legacyPaths?: string[]
   automation?: CapabilityAutomationMetadata
   agent?: AgentCapabilityDeclarationV1
+  agentError?: AgentCapabilityDeclarationError
 }
 
 export type ListedWorkflowNode = {
@@ -310,7 +329,7 @@ type PartialCapabilityAutomationMetadata = {
 
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
-const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process'])
+const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process', 'skills'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
 
 function isPlainOwnRecord(value: unknown): value is Record<string, unknown> {
@@ -354,35 +373,64 @@ function hasLoneSurrogate(value: string): boolean {
   return false
 }
 
-export function normalizeAgentCapabilityDeclaration(
+function normalizeAgentCapabilityDeclarationResult(
   input: unknown,
   expectedCapabilityId: string,
   entry = 'processor.js',
-): AgentCapabilityDeclarationV1 | undefined {
+): Readonly<{
+  declaration?: AgentCapabilityDeclarationV1
+  error?: AgentCapabilityDeclarationError
+}> {
+  if (!isPlainOwnRecord(input) || !hasOnlyKeys(input, AGENT_DECLARATION_KEYS)) return {}
+  if (input.schema !== 'modly.agent-capability-declaration.v1') return {}
+  if (input.capability_id !== expectedCapabilityId) return {}
+  const [extensionId, nodeId, ...extraSegments] = expectedCapabilityId.split('/')
+  if (!extensionId || !nodeId || extraSegments.length > 0) return {}
   try {
-    if (!isPlainOwnRecord(input) || !hasOnlyKeys(input, AGENT_DECLARATION_KEYS)) return undefined
-    if (input.schema !== 'modly.agent-capability-declaration.v1') return undefined
-    if (input.capability_id !== expectedCapabilityId) return undefined
-    const [extensionId, nodeId, ...extraSegments] = expectedCapabilityId.split('/')
-    if (!extensionId || !nodeId || extraSegments.length > 0) return undefined
     assertSafeExtensionId(extensionId)
     assertSafeOwnershipSegment(nodeId, 'Agent capability node id')
-    if (!isSafeDisplayText(input.display_name, 80) || !isSafeDisplayText(input.description, 500)) return undefined
-    if (!isPlainOwnRecord(input.approval) || !hasOnlyKeys(input.approval, AGENT_APPROVAL_KEYS)) return undefined
-    if (input.approval.required !== true || input.approval.scope !== 'single_action') return undefined
-    const process = normalizeAgentProcessDeclaration(input.process, entry)
+  } catch {
+    return {}
+  }
+  if (!isSafeDisplayText(input.display_name, 80) || !isSafeDisplayText(input.description, 500)) return {}
+  if (!isPlainOwnRecord(input.approval) || !hasOnlyKeys(input.approval, AGENT_APPROVAL_KEYS)) return {}
+  if (input.approval.required !== true || input.approval.scope !== 'single_action') return {}
+
+  let skills: AgentSkillsDeclarationV1 | undefined
+  if (Object.prototype.hasOwnProperty.call(input, 'skills') && input.skills !== undefined) {
+    try {
+      skills = normalizeAgentSkillsDeclaration(input.skills)
+    } catch {
+      return { error: { code: 'AGENT_SKILL_INVALID' } }
+    }
+  }
+
+  let process: AgentCapabilityDeclarationV1['process']
+  try {
+    process = normalizeAgentProcessDeclaration(input.process, entry)
     canonicalJson(input)
-    return {
+  } catch {
+    return {}
+  }
+  return {
+    declaration: {
       schema: 'modly.agent-capability-declaration.v1',
       capability_id: expectedCapabilityId,
       display_name: input.display_name,
       description: input.description,
       approval: { required: true, scope: 'single_action' },
       process,
-    }
-  } catch {
-    return undefined
+      ...(skills ? { skills } : {}),
+    },
   }
+}
+
+export function normalizeAgentCapabilityDeclaration(
+  input: unknown,
+  expectedCapabilityId: string,
+  entry = 'processor.js',
+): AgentCapabilityDeclarationV1 | undefined {
+  return normalizeAgentCapabilityDeclarationResult(input, expectedCapabilityId, entry).declaration
 }
 
 function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomationMetadata | undefined): CapabilityAutomationMetadata {
@@ -555,6 +603,24 @@ function buildManifestInvalidError(
     source: 'electron-manifest',
     code: 'PROCESS_DISCOVERY_MANIFEST_INVALID',
     message: `Failed to parse ${manifestFile} for extension '${extensionDirName}'.`,
+    retryable: false,
+    context: {
+      extension_id: extensionDirName,
+      manifest_file: manifestFile,
+      error: error instanceof Error ? error.message : String(error),
+    },
+  }
+}
+
+function buildAgentManifestInvalidError(
+  extensionDirName: string,
+  manifestFile: string,
+  error: unknown,
+): AutomationCapabilityError {
+  return {
+    source: 'electron-manifest',
+    code: 'AGENT_MANIFEST_INVALID',
+    message: `Agent declarations in ${manifestFile} for extension '${extensionDirName}' failed strict validation.`,
     retryable: false,
     context: {
       extension_id: extensionDirName,
@@ -744,11 +810,11 @@ export function parseExtensionManifest(
     const automationMetadata = parsed.type === 'process' || node.automation
       ? { automation: normalizeCapabilityAutomationMetadata(node.automation) }
       : {}
-    const agentDeclaration = extensionType === 'process'
+    const agentResult = extensionType === 'process'
       && isProcessPortType(node.input)
       && isProcessPortType(node.output)
-      ? normalizeAgentCapabilityDeclaration(node.agent, capabilityId, parsed.entry ?? 'processor.js')
-      : undefined
+      ? normalizeAgentCapabilityDeclarationResult(node.agent, capabilityId, parsed.entry ?? 'processor.js')
+      : {}
 
     return {
       id: node.id,
@@ -768,7 +834,8 @@ export function parseExtensionManifest(
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
       ...automationMetadata,
-      ...(agentDeclaration ? { agent: agentDeclaration } : {}),
+      ...(agentResult.declaration ? { agent: agentResult.declaration } : {}),
+      ...(agentResult.error ? { agentError: agentResult.error } : {}),
       ...modelOwnership,
     }
   })
@@ -805,9 +872,35 @@ async function readExtensionManifest(dir: string, extensionDirName: string): Pro
   return null
 }
 
+function validateStrictAgentManifest(bytes: Buffer): void {
+  if (bytes.byteLength < 1 || bytes.byteLength > MAX_EXTENSION_MANIFEST_BYTES) {
+    throw new Error('Agent manifest validation requires a non-empty bounded manifest')
+  }
+  const raw = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  parseStrictJson(raw, {
+    maxBytes: MAX_EXTENSION_MANIFEST_BYTES,
+    maxDepth: MAX_EXTENSION_MANIFEST_DEPTH,
+    maxProperties: MAX_EXTENSION_MANIFEST_PROPERTIES,
+    maxArrayLength: MAX_EXTENSION_MANIFEST_ARRAY,
+  })
+}
+
+function stripAgentDeclarations(manifest: ParsedManifest): ParsedManifest {
+  if (!Array.isArray(manifest.nodes)) return manifest
+  return {
+    ...manifest,
+    nodes: manifest.nodes.map((node) => {
+      if (!isPlainOwnRecord(node) || !Object.hasOwn(node, 'agent')) return node
+      const { agent: _agent, ...ordinaryNode } = node
+      return ordinaryNode as ParsedManifestNode
+    }),
+  }
+}
+
 async function readExtensionManifestDetailed(
   dir: string,
   extensionDirName: string,
+  validateAgentJson = false,
 ): Promise<{ manifest: ParsedManifest | null; manifestFile: string | null; errors: AutomationCapabilityError[] }> {
   const errors: AutomationCapabilityError[] = []
 
@@ -816,8 +909,19 @@ async function readExtensionManifestDetailed(
     if (!existsSync(manifestPath)) continue
 
     try {
-      const raw = await readFile(manifestPath, 'utf-8')
-      return { manifest: JSON.parse(raw) as ParsedManifest, manifestFile, errors }
+      const bytes = await readFile(manifestPath)
+      const manifest = JSON.parse(bytes.toString('utf-8')) as ParsedManifest
+      if (!validateAgentJson) return { manifest, manifestFile, errors }
+      try {
+        validateStrictAgentManifest(bytes)
+        return { manifest, manifestFile, errors }
+      } catch (error) {
+        return {
+          manifest: stripAgentDeclarations(manifest),
+          manifestFile,
+          errors: [...errors, buildAgentManifestInvalidError(extensionDirName, manifestFile, error)],
+        }
+      }
     } catch (error) {
       errors.push(buildManifestInvalidError(extensionDirName, manifestFile, error))
     }
@@ -946,6 +1050,7 @@ export async function readResolvedExtensionsFromDirDetailed(
   dir: string,
   isBuiltin: boolean,
   trustedRepos: Set<string>,
+  validateAgentJson = false,
 ): Promise<{ extensions: ResolvedListedExtension[]; errors: AutomationCapabilityError[] }> {
   if (!existsSync(dir)) return { extensions: [], errors: [] }
 
@@ -956,7 +1061,11 @@ export async function readResolvedExtensionsFromDirDetailed(
       directories.map(async (entry) => {
         const fallback = normalizeListedExtensionFallback(entry.name, isBuiltin)
 
-        const { manifest, manifestFile, errors } = await readExtensionManifestDetailed(dir, entry.name)
+        const { manifest, manifestFile, errors } = await readExtensionManifestDetailed(
+          dir,
+          entry.name,
+          validateAgentJson,
+        )
         let extension: ListedExtension = fallback
         let resolvedManifest: ParsedManifest | null = manifest
 
@@ -1014,10 +1123,10 @@ async function listVisibleResolvedExtensionsDetailed(options: {
   builtinDir: string
   userExtensionsDir: string
   trustedRepos: Set<string>
-}): Promise<{ extensions: ResolvedListedExtension[]; errors: AutomationCapabilityError[] }> {
+}, validateAgentJson = false): Promise<{ extensions: ResolvedListedExtension[]; errors: AutomationCapabilityError[] }> {
   const [builtinResult, userResult] = await Promise.all([
-    readResolvedExtensionsFromDirDetailed(options.builtinDir, true, options.trustedRepos),
-    readResolvedExtensionsFromDirDetailed(options.userExtensionsDir, false, options.trustedRepos),
+    readResolvedExtensionsFromDirDetailed(options.builtinDir, true, options.trustedRepos, validateAgentJson),
+    readResolvedExtensionsFromDirDetailed(options.userExtensionsDir, false, options.trustedRepos, validateAgentJson),
   ])
 
   return {
@@ -1225,17 +1334,39 @@ async function buildAgentCapabilitySnapshot(
   node: ListedExtensionNode<ArtifactKind>,
   extensionDir: string,
   processPythonExecutable?: string,
+  skillFileLimitExceeded = false,
 ): Promise<{
   capability?: AgentCapabilitySnapshotV1
   error?: { code: string, message: string, capabilityId: string }
 }> {
+  if (node.agentError) {
+    return {
+      error: {
+        code: node.agentError.code,
+        message: 'A PROCESS Agent skill declaration is invalid.',
+        capabilityId: `${extension.id}/${node.id}`,
+      },
+    }
+  }
   if (!node.agent) return {}
+  if (node.agent.skills && skillFileLimitExceeded) {
+    return {
+      error: {
+        code: 'AGENT_SKILLS_FILE_LIMIT_EXCEEDED',
+        message: 'An extension declared more than four unique Agent skill files.',
+        capabilityId: node.agent.capability_id,
+      },
+    }
+  }
   try {
     const paramsSchema = normalizeAgentParamsSchema(node.paramsSchema)
     const inputs = node.inputs?.map((input) => ({ ...input }))
     const execution = await bindAgentProcessExecution(
       extensionDir, extension.entry, node.agent.process, processPythonExecutable,
     )
+    const skills = node.agent.skills
+      ? (await bindAgentSkillSet(extensionDir, node.agent.skills)).publicSnapshot
+      : undefined
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1255,10 +1386,20 @@ async function buildAgentCapabilitySnapshot(
         paramsSchema,
       },
       execution,
+      ...(skills ? { skills } : {}),
       approval: { ...node.agent.approval },
     }
     return { capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }) }
   } catch (error) {
+    if (error instanceof AgentSkillsManifestError) {
+      return {
+        error: {
+          code: 'AGENT_SKILL_INVALID',
+          message: 'A declared Agent skill file is invalid or changed during discovery.',
+          capabilityId: node.agent.capability_id,
+        },
+      }
+    }
     const runtimeRequired = node.agent.process.runtime?.kind === 'extension-python-venv-v1'
     const stale = error instanceof AgentProcessManifestError && error.code === 'runtime_stale'
     const unavailable = error instanceof AgentProcessManifestError && error.code === 'unsafe_runtime'
@@ -1285,14 +1426,41 @@ async function buildAgentCapabilitySnapshot(
   }
 }
 
-function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCapabilitySnapshotV1 | undefined {
+async function buildMcpAgentCapabilitySnapshot(
+  candidate: DiscoveredMcpTool,
+  skillFileLimitExceeded = false,
+): Promise<{
+  capability?: AgentCapabilitySnapshotV1
+  error?: { code: string, message: string, capabilityId: string }
+}> {
+  if (candidate.tool.skillsInvalid) {
+    return {
+      error: {
+        code: 'AGENT_SKILL_INVALID',
+        message: 'An MCP tool Agent skill declaration is invalid.',
+        capabilityId: candidate.tool.capabilityId,
+      },
+    }
+  }
+  if (candidate.tool.skills && skillFileLimitExceeded) {
+    return {
+      error: {
+        code: 'AGENT_SKILLS_FILE_LIMIT_EXCEEDED',
+        message: 'An extension declared more than four unique Agent skill files.',
+        capabilityId: candidate.tool.capabilityId,
+      },
+    }
+  }
   try {
     const nodeId = candidate.tool.capabilityId.split('/')[1]
     const primaryArtifact = candidate.tool.artifact.allowed[0]
-    if (!primaryArtifact) return undefined
+    if (!primaryArtifact) return {}
     const outputKinds = candidate.tool.artifact.allowed.reduce<ArtifactKind[]>((kinds, artifact) => (
       kinds.includes(artifact.kind) ? kinds : [...kinds, artifact.kind]
     ), [])
+    const skills = candidate.tool.skills
+      ? (await bindAgentSkillSet(candidate.extensionDir, candidate.tool.skills)).publicSnapshot
+      : undefined
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1336,11 +1504,20 @@ function buildMcpAgentCapabilitySnapshot(candidate: DiscoveredMcpTool): AgentCap
         mutating: candidate.tool.mutating,
         bindingHash: candidate.tool.capabilityBindingHash,
       },
+      ...(skills ? { skills } : {}),
       approval: candidate.tool.approval,
     }
-    return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
-  } catch {
-    return undefined
+    return { capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }) }
+  } catch (error) {
+    return {
+      error: {
+        code: error instanceof AgentSkillsManifestError ? 'AGENT_SKILL_INVALID' : 'MCP_AGENT_METADATA_INVALID',
+        message: error instanceof AgentSkillsManifestError
+          ? 'A declared MCP Agent skill file is invalid or changed during discovery.'
+          : 'An MCP Agent capability snapshot is invalid and was excluded.',
+        capabilityId: candidate.tool.capabilityId,
+      },
+    }
   }
 }
 
@@ -1356,17 +1533,33 @@ export async function listAgentCapabilities(options: {
   processPythonExecutable?: () => string | null | Promise<string | null>
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
-    listVisibleResolvedExtensionsDetailed(options),
+    listVisibleResolvedExtensionsDetailed(options, true),
     discoverGovernedMcpTools(options),
   ])
   const processPythonExecutable = options.processPythonExecutable
     ? await Promise.resolve(options.processPythonExecutable()).catch(() => null) ?? undefined
     : undefined
+  const skillPathsByExtensionDir = new Map<string, Set<string>>()
+  const recordSkillPath = (extensionDir: string, declaration: AgentSkillsDeclarationV1 | undefined): void => {
+    if (!declaration) return
+    const paths = skillPathsByExtensionDir.get(extensionDir) ?? new Set<string>()
+    paths.add(declaration.file)
+    skillPathsByExtensionDir.set(extensionDir, paths)
+  }
+  for (const resolved of result.extensions) {
+    if (resolved.extension.type !== 'process') continue
+    for (const node of resolved.extension.nodes) recordSkillPath(resolved.extDir, node.agent?.skills)
+  }
+  for (const candidate of mcpResult.tools) recordSkillPath(candidate.extensionDir, candidate.tool.skills)
+  const overflowSkillExtensionDirs = new Set([...skillPathsByExtensionDir.entries()]
+    .filter(([, paths]) => [...paths].sort((left, right) => left < right ? -1 : left > right ? 1 : 0).length > 4)
+    .map(([extensionDir]) => extensionDir))
   const processResults = await Promise.all(result.extensions.flatMap((resolved) => {
     const extension = resolved.extension
     if (extension.type !== 'process') return []
     return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(
       extension, node, resolved.extDir, processPythonExecutable,
+      overflowSkillExtensionDirs.has(resolved.extDir),
     ))
   }))
   const processFailures = processResults.flatMap((result) => result.error ? [result.error] : [])
@@ -1416,10 +1609,14 @@ export async function listAgentCapabilities(options: {
     return options.mcpSandboxReady !== false
   }
   const readyMcpTools = mcpResult.tools.filter(isMcpReady)
-  const mcpCandidates = readyMcpTools.flatMap((candidate) => {
-    const snapshot = buildMcpAgentCapabilitySnapshot(candidate)
-    return snapshot ? [snapshot] : []
-  })
+  const mcpResults = await Promise.all(readyMcpTools.map(async (candidate) => (
+    buildMcpAgentCapabilitySnapshot(
+      candidate,
+      overflowSkillExtensionDirs.has(candidate.extensionDir),
+    )
+  )))
+  const mcpFailures = mcpResults.flatMap((result) => result.error ? [result.error] : [])
+  const mcpCandidates = mcpResults.flatMap((result) => result.capability ? [result.capability] : [])
   const candidates = [...processCandidates, ...mcpCandidates]
   const candidateIds = new Set(candidates.map((candidate) => candidate.id))
   const counts = new Map<string, number>()
@@ -1447,11 +1644,14 @@ export async function listAgentCapabilities(options: {
     errors: [
       ...result.errors.map(({ code }) => ({
         code,
-        message: code === 'PROCESS_DISCOVERY_MANIFEST_INVALID'
+        message: code === 'AGENT_MANIFEST_INVALID'
+          ? 'An extension manifest failed strict Agent validation; only its Agent declarations were excluded.'
+          : code === 'PROCESS_DISCOVERY_MANIFEST_INVALID'
           ? 'An extension manifest is invalid and was excluded from Agent discovery.'
           : 'Agent capability discovery could not inspect one or more extensions.',
       })),
       ...processFailures,
+      ...mcpFailures,
       ...unavailablePythonCapabilities.map((capabilityId) => ({
         code: 'PROCESS_PYTHON_SANDBOX_UNAVAILABLE',
         message: 'An extension Python Agent capability is unavailable because its production sandbox readiness probe failed.',
@@ -1495,7 +1695,7 @@ export async function resolveGovernedAgentProcessTarget(
   },
   capabilityId: string,
 ): Promise<GovernedAgentProcessTarget> {
-  const result = await listVisibleResolvedExtensionsDetailed(options)
+  const result = await listVisibleResolvedExtensionsDetailed(options, true)
   const matches: GovernedAgentProcessTarget[] = []
   const processPythonExecutable = options.processPythonExecutable
     ? await Promise.resolve(options.processPythonExecutable()).catch(() => null) ?? undefined

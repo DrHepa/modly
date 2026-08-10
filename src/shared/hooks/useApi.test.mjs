@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildSync } from 'esbuild'
+import { build } from 'esbuild'
 import { createRequire } from 'node:module'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 //   - axios            → records requests and returns canned responses
 //   - appStore         → useAppStore returns a fixed apiUrl (no React runtime)
 // The stub modules communicate with the test through globalThis.
-function loadUseApi() {
+async function loadUseApi() {
   const dir = mkdtempSync(join(tmpdir(), 'modly-useapi-test-'))
 
   const axiosStub = join(dir, 'axios-stub.mjs')
@@ -37,7 +37,7 @@ function loadUseApi() {
 
   const outfile = join(dir, 'useApi.cjs')
   const require = createRequire(import.meta.url)
-  const result = buildSync({
+  const result = await build({
     entryPoints: [resolve('src/shared/hooks/useApi.ts')],
     bundle: true,
     platform: 'node',
@@ -45,8 +45,13 @@ function loadUseApi() {
     write: false,
     alias: {
       axios: axiosStub,
-      '@shared/stores/appStore': storeStub,
     },
+    plugins: [{
+      name: 'stub-app-store',
+      setup(build) {
+        build.onResolve({ filter: /^\.\.\/stores\/appStore\.ts$/ }, () => ({ path: storeStub }))
+      },
+    }],
   })
   writeFileSync(outfile, result.outputFiles[0].text, 'utf8')
   return require(outfile).useApi
@@ -59,9 +64,9 @@ function reset() {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-test('exposes every method consumed by the app (regression: getAllModelsStatus)', () => {
+test('exposes every method consumed by the app (regression: getAllModelsStatus)', async () => {
   reset()
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
   for (const name of [
     'generateFromImage', 'pollJobStatus', 'cancelJob', 'getModelStatus',
     'getAllModelsStatus', 'downloadModel', 'optimizeMesh', 'smoothMesh', 'importMesh',
@@ -73,7 +78,7 @@ test('exposes every method consumed by the app (regression: getAllModelsStatus)'
 test('getAllModelsStatus hits /model/all and returns the payload', async () => {
   reset()
   globalThis.__responses['http://test.local/model/all'] = [{ id: 'm1', name: 'M1', downloaded: true }]
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
 
   const result = await api.getAllModelsStatus()
 
@@ -86,7 +91,7 @@ test('pollJobStatus maps output_url → outputUrl', async () => {
   globalThis.__responses['http://test.local/generate/status/job1'] = {
     status: 'done', progress: 100, output_url: '/workspace/out.glb',
   }
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
 
   const result = await api.pollJobStatus('job1')
 
@@ -97,7 +102,7 @@ test('pollJobStatus maps output_url → outputUrl', async () => {
 test('optimizeMesh maps face_count → faceCount and posts target_faces', async () => {
   reset()
   globalThis.__responses['http://test.local/optimize/mesh'] = { url: '/o.glb', face_count: 5000 }
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
 
   const result = await api.optimizeMesh('/in.glb', 5000)
 
@@ -109,7 +114,7 @@ test('optimizeMesh maps face_count → faceCount and posts target_faces', async 
 
 test('cancelJob posts to the cancel endpoint and swallows errors', async () => {
   reset()
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
   await api.cancelJob('job9')
   assert.equal(globalThis.__calls[0].url, 'http://test.local/generate/cancel/job9')
 })
@@ -118,7 +123,7 @@ test('generateFromImage posts multipart and maps job_id → jobId', async () => 
   reset()
   globalThis.__responses['http://test.local/generate/from-image'] = { job_id: 'job42' }
   // generateFromImage builds a Blob/FormData from base64 image data.
-  const api = loadUseApi()()
+  const api = (await loadUseApi())()
 
   const options = {
     modelId: 'model-x', remesh: 'none', enableTexture: false,

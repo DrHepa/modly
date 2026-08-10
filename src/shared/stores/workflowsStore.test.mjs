@@ -10,6 +10,13 @@ import { join, resolve } from 'node:path'
 // type-only one (electron.d) which esbuild erases. The store reads the global
 // `window.electron.workflows.*` bridge, which we stub per test.
 function loadStore() {
+  const storage = new Map()
+  globalThis.localStorage = {
+    getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => { storage.set(key, String(value)) },
+    removeItem: (key) => { storage.delete(key) },
+    clear: () => { storage.clear() },
+  }
   const outfile = join(mkdtempSync(join(tmpdir(), 'modly-wfstore-test-')), 'workflowsStore.cjs')
   const require = createRequire(import.meta.url)
   const result = buildSync({
@@ -141,7 +148,7 @@ test('importFile migrates, moves the workflow to the front, and makes it active'
 test('setActive updates only activeId', () => {
   const useStore = loadStore()
   stubBridge()
-  useStore.setState({ workflows: [migrated('a')], activeId: null })
+  useStore.setState({ workflows: [migrated('a')], openIds: ['a'], activeId: null })
 
   useStore.getState().setActive('a')
   assert.equal(useStore.getState().activeId, 'a')

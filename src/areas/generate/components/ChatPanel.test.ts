@@ -196,10 +196,69 @@ test('ChatPanel captures immutable request origin and routes success/error actio
 test('ChatPanel wires capability discovery and governed proposals without automatic execution', async () => {
   const source = await readFile(chatPanelEntry, 'utf8')
   assert.match(source, /window\.electron\.agentCapabilities\.list\(\)/)
+  assert.match(source, /window\.electron\.agentCapabilities\.resolveSkillContexts\(/)
+  assert.match(source, /apiMessages\.push\(\{ role: 'system', content: extraContext\.workflowCompletion/)
   assert.match(source, /proposeGovernedAgentActions\(\{[\s\S]*\n\s*proposals,/)
-  assert.match(source, /JSON\.stringify\(\{[\s\S]*capabilities[\s\S]*\}\)/)
+  assert.match(source, /JSON\.stringify\(\{[\s\S]*originSessionId[\s\S]*resolutionHash[\s\S]*skillContexts[\s\S]*\}\)/)
   assert.match(source, /<GovernedActionCard/)
   assert.equal(source.includes('approveAndExecute'), false)
+})
+
+test('skill context request uses only public refs and discards a late origin result', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const skilled = {
+      schema: 'modly.agent-capability.v1', version: 1,
+      id: 'cad/plan', displayName: 'CAD Planner', description: 'Plan CAD geometry.',
+      extension: { id: 'cad', name: 'CAD' },
+      node: { id: 'plan', input: 'text', output: 'mesh', paramsSchema: [] },
+      skills: {
+        schema: 'modly.agent-skills.v1', version: 1, hash: 'b'.repeat(64), count: 1,
+        items: [{ name: 'modly-cad-plan-v1', version: 1, hash: 'c'.repeat(64) }],
+      },
+      approval: { required: true, scope: 'single_action' }, hash: 'a'.repeat(64),
+    }
+    assert.deepEqual(module.buildAgentSkillContextRefs({ capabilities: [skilled], errors: [] }), [{
+      id: 'cad/plan', hash: 'a'.repeat(64), skillsHash: 'b'.repeat(64),
+    }])
+    const promptView = module.buildAgentCapabilityPromptInventory({ capabilities: [skilled], errors: [] })[0]
+    assert.deepEqual(promptView.skills, skilled.skills)
+    assert.equal(JSON.stringify(promptView).includes('instructions'), false)
+    assert.equal(JSON.stringify(promptView).includes('.md'), false)
+
+    let current = true
+    let release!: (value: unknown) => void
+    const requests: unknown[] = []
+    const pending = module.resolveAgentSkillContextsForTurn({
+      originSessionId: 'session-a',
+      userText: 'Create CAD geometry',
+      capabilityRefs: module.buildAgentSkillContextRefs({ capabilities: [skilled], errors: [] }),
+      isCurrent: () => current,
+      resolve: (request: unknown) => new Promise((resolve) => {
+        requests.push(request)
+        release = resolve
+      }),
+    })
+    assert.deepEqual(requests, [{
+      originSessionId: 'session-a', userText: 'Create CAD geometry',
+      capabilities: [{ id: 'cad/plan', hash: 'a'.repeat(64), skillsHash: 'b'.repeat(64) }],
+    }])
+    assert.equal(JSON.stringify(requests).includes('instructions'), false)
+    current = false
+    release({ resolutionHash: 'd'.repeat(64), contexts: [{ private: 'must be discarded' }] })
+    assert.equal(await pending, null)
+
+    current = true
+    assert.deepEqual(await module.resolveAgentSkillContextsForTurn({
+      originSessionId: 'session-a',
+      userText: 'Create CAD geometry',
+      capabilityRefs: module.buildAgentSkillContextRefs({ capabilities: [skilled], errors: [] }),
+      isCurrent: () => current,
+      resolve: async () => ({ resolutionHash: 'd'.repeat(64), contexts: [] }),
+    }), { resolutionHash: 'd'.repeat(64), contexts: [] })
+  } finally {
+    await cleanup()
+  }
 })
 
 test('chat response parses bounded governed proposals separately from completed read actions', async () => {

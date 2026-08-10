@@ -14,7 +14,29 @@ def run(coro):
 
 
 def chat_request(**values):
-    return agent.AgentChatRequest(modelLeaseId=MODEL_LEASE_ID, **values)
+    messages = values.pop("messages", [])
+    capabilities = values.pop("capabilities", [])
+    origin_session_id = values.pop("originSessionId", "session-a")
+    latest_user_text = next(
+        ((message.get("content") if isinstance(message, dict) else message.content)
+         for message in reversed(messages)
+         if (message.get("role") if isinstance(message, dict) else message.role) == "user"),
+        "",
+    )
+    refs = [
+        {"id": item["id"], "hash": item["hash"], "skillsHash": item["skills"]["hash"]}
+        for item in capabilities if isinstance(item, dict) and item.get("skills") is not None
+    ]
+    return agent.AgentChatRequest(
+        modelLeaseId=MODEL_LEASE_ID,
+        originSessionId=origin_session_id,
+        resolutionHash=agent._canonical_hash(agent._skill_resolution_binding(
+            origin_session_id, latest_user_text, refs,
+        )),
+        messages=messages,
+        capabilities=capabilities,
+        **values,
+    )
 
 
 def branch_graph(pair_count: int = 12) -> dict:

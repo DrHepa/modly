@@ -29,6 +29,7 @@ import type { AgentHostRuntimeRegistry } from './agent-host-runtime.ts'
 import {
   AgentSkillsManifestError,
   bindAgentSkillSet,
+  type BoundAgentSkillSetV1,
   normalizeAgentSkillsDeclaration,
 } from './agent-skills-manifest.ts'
 import { parseStrictJson } from './strict-json.ts'
@@ -1337,6 +1338,7 @@ async function buildAgentCapabilitySnapshot(
   skillFileLimitExceeded = false,
 ): Promise<{
   capability?: AgentCapabilitySnapshotV1
+  skillBinding?: BoundAgentSkillSetV1
   error?: { code: string, message: string, capabilityId: string }
 }> {
   if (node.agentError) {
@@ -1364,9 +1366,10 @@ async function buildAgentCapabilitySnapshot(
     const execution = await bindAgentProcessExecution(
       extensionDir, extension.entry, node.agent.process, processPythonExecutable,
     )
-    const skills = node.agent.skills
-      ? (await bindAgentSkillSet(extensionDir, node.agent.skills)).publicSnapshot
+    const skillBinding = node.agent.skills
+      ? await bindAgentSkillSet(extensionDir, node.agent.skills)
       : undefined
+    const skills = skillBinding?.publicSnapshot
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1389,7 +1392,10 @@ async function buildAgentCapabilitySnapshot(
       ...(skills ? { skills } : {}),
       approval: { ...node.agent.approval },
     }
-    return { capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }) }
+    return {
+      capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }),
+      ...(skillBinding ? { skillBinding } : {}),
+    }
   } catch (error) {
     if (error instanceof AgentSkillsManifestError) {
       return {
@@ -1431,6 +1437,7 @@ async function buildMcpAgentCapabilitySnapshot(
   skillFileLimitExceeded = false,
 ): Promise<{
   capability?: AgentCapabilitySnapshotV1
+  skillBinding?: BoundAgentSkillSetV1
   error?: { code: string, message: string, capabilityId: string }
 }> {
   if (candidate.tool.skillsInvalid) {
@@ -1458,9 +1465,10 @@ async function buildMcpAgentCapabilitySnapshot(
     const outputKinds = candidate.tool.artifact.allowed.reduce<ArtifactKind[]>((kinds, artifact) => (
       kinds.includes(artifact.kind) ? kinds : [...kinds, artifact.kind]
     ), [])
-    const skills = candidate.tool.skills
-      ? (await bindAgentSkillSet(candidate.extensionDir, candidate.tool.skills)).publicSnapshot
+    const skillBinding = candidate.tool.skills
+      ? await bindAgentSkillSet(candidate.extensionDir, candidate.tool.skills)
       : undefined
+    const skills = skillBinding?.publicSnapshot
     const unsigned = {
       schema: 'modly.agent-capability.v1' as const,
       version: 1 as const,
@@ -1507,7 +1515,10 @@ async function buildMcpAgentCapabilitySnapshot(
       ...(skills ? { skills } : {}),
       approval: candidate.tool.approval,
     }
-    return { capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }) }
+    return {
+      capability: assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) }),
+      ...(skillBinding ? { skillBinding } : {}),
+    }
   } catch (error) {
     return {
       error: {
@@ -1531,6 +1542,11 @@ export async function listAgentCapabilities(options: {
   processPythonSandboxReadiness?: () => Promise<boolean>
   processModelAccessReadiness?: (declaration: AgentProcessModelAccessDeclarationV1) => Promise<boolean>
   processPythonExecutable?: () => string | null | Promise<string | null>
+  skillBindingSink?: (binding: Readonly<{
+    capability: AgentCapabilitySnapshotV1
+    extensionDir: string
+    bound: BoundAgentSkillSetV1
+  }>) => void
 }): Promise<AgentCapabilityInventoryResult> {
   const [result, mcpResult] = await Promise.all([
     listVisibleResolvedExtensionsDetailed(options, true),
@@ -1557,10 +1573,13 @@ export async function listAgentCapabilities(options: {
   const processResults = await Promise.all(result.extensions.flatMap((resolved) => {
     const extension = resolved.extension
     if (extension.type !== 'process') return []
-    return extension.nodes.map(async (node) => buildAgentCapabilitySnapshot(
-      extension, node, resolved.extDir, processPythonExecutable,
-      overflowSkillExtensionDirs.has(resolved.extDir),
-    ))
+    return extension.nodes.map(async (node) => ({
+      ...await buildAgentCapabilitySnapshot(
+        extension, node, resolved.extDir, processPythonExecutable,
+        overflowSkillExtensionDirs.has(resolved.extDir),
+      ),
+      extensionDir: resolved.extDir,
+    }))
   }))
   const processFailures = processResults.flatMap((result) => result.error ? [result.error] : [])
   const discoveredProcessCandidates = processResults.flatMap((result) => result.capability ? [result.capability] : [])
@@ -1609,12 +1628,13 @@ export async function listAgentCapabilities(options: {
     return options.mcpSandboxReady !== false
   }
   const readyMcpTools = mcpResult.tools.filter(isMcpReady)
-  const mcpResults = await Promise.all(readyMcpTools.map(async (candidate) => (
-    buildMcpAgentCapabilitySnapshot(
+  const mcpResults = await Promise.all(readyMcpTools.map(async (candidate) => ({
+    ...await buildMcpAgentCapabilitySnapshot(
       candidate,
       overflowSkillExtensionDirs.has(candidate.extensionDir),
-    )
-  )))
+    ),
+    extensionDir: candidate.extensionDir,
+  })))
   const mcpFailures = mcpResults.flatMap((result) => result.error ? [result.error] : [])
   const mcpCandidates = mcpResults.flatMap((result) => result.capability ? [result.capability] : [])
   const candidates = [...processCandidates, ...mcpCandidates]
@@ -1639,6 +1659,19 @@ export async function listAgentCapabilities(options: {
   const capabilities = candidates
     .filter((candidate) => !collisionIdSet.has(candidate.id))
     .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  if (options.skillBindingSink) {
+    const finalHashes = new Map(capabilities.map((capability) => [capability.id, capability.hash]))
+    for (const result of [...processResults, ...mcpResults]
+      .filter((candidate) => candidate.capability && candidate.skillBinding)
+      .sort((left, right) => (left.capability!.id < right.capability!.id ? -1 : left.capability!.id > right.capability!.id ? 1 : 0))) {
+      if (finalHashes.get(result.capability!.id) !== result.capability!.hash) continue
+      options.skillBindingSink({
+        capability: result.capability!,
+        extensionDir: result.extensionDir,
+        bound: result.skillBinding!,
+      })
+    }
+  }
   return {
     capabilities,
     errors: [

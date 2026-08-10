@@ -70,6 +70,9 @@ import { RendererFilesystemAccess } from './renderer-filesystem-access'
 import { createDefaultAgentHostRuntimeRegistry } from './agent-host-runtime'
 import { createAgentModelAccessRuntime } from './agent-model-access-runtime'
 import { createSharedAgentCapabilityResolver } from './agent-capability-resolver'
+import { AgentSkillContextAuthority } from './agent-skill-context-authority'
+import { registerAgentSkillContextsIpcHandlers } from './agent-skill-contexts-ipc'
+import { bindAgentSkillSet } from './agent-skills-manifest'
 import { AgentWorkflowAuthority, validateAgentWorkspaceSource } from './agent-workflow-authority'
 import { registerAgentWorkflowsIpcHandlers } from './agent-workflows-ipc'
 
@@ -474,6 +477,21 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     processPythonSandboxReadiness: () => mcpSandboxReadiness('artifact-v1'),
     processModelAccessReadiness: (declaration) => agentModelAccess.readiness(declaration),
     processPythonExecutable: () => getVenvPythonExe(app.getPath('userData')),
+  })
+  const agentSkillContextAuthority = new AgentSkillContextAuthority({
+    resolveCapabilitiesWithSkillBindings: sharedAgentCapabilityResolver.withPrivateSkillBindings,
+    rebindSkillSet: (binding) => bindAgentSkillSet(binding.extensionDir, binding.bound.declaration),
+    commitIfOriginSessionActive: (originSessionId, operation) => agentSessionStore.commitIfActive(originSessionId, operation),
+  })
+  registerAgentSkillContextsIpcHandlers(ipcMain, agentSkillContextAuthority, {
+    isTrustedSender: (value) => {
+      if (!value || typeof value !== 'object') return false
+      const event = value as IpcMainInvokeEvent
+      const window = getWindow()
+      return Boolean(window && !window.isDestroyed()
+        && event.sender === window.webContents
+        && event.senderFrame === window.webContents.mainFrame)
+    },
   })
   const processExecutor = createAgentProcessExecutor({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,

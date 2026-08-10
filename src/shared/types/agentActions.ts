@@ -51,6 +51,47 @@ export interface AgentSkillsPublicSnapshotV1 {
   items: AgentSkillPublicItemV1[]
 }
 
+// D1 validates every textual value as trimmed printable ASCII before hashing.
+// This restriction is Skill-only; Agent user/chat text remains Unicode-capable.
+export interface AgentSkillNormalizedBodyV1 {
+  schema: 'modly.agent-skill.v1'
+  version: 1
+  name: string
+  summary: string
+  instructions: string[]
+  constraints: string[]
+  examples?: string[]
+}
+
+export interface AgentSkillContextCapabilityRefV1 {
+  id: string
+  hash: string
+  skillsHash: string
+}
+
+export interface AgentSkillContextResolveRequestV1 {
+  originSessionId: string
+  userText: string
+  capabilities: AgentSkillContextCapabilityRefV1[]
+}
+
+export interface AgentSkillContextV1 {
+  schema: 'modly.agent-skill-context.v1'
+  version: 1
+  capabilityId: string
+  capabilityHash: string
+  skillsHash: string
+  resolutionHash: string
+  skill: AgentSkillPublicItemV1
+  body: AgentSkillNormalizedBodyV1
+  contextHash: string
+}
+
+export interface AgentSkillContextResolveResultV1 {
+  resolutionHash: string
+  contexts: AgentSkillContextV1[]
+}
+
 export interface AgentProcessArtifactPolicyV1 {
   kind: ArtifactKind
   mediaTypes: string[]
@@ -305,6 +346,7 @@ export interface AgentCapabilityInventoryResult {
 
 export interface AgentCapabilitiesApi {
   list(): Promise<AgentCapabilityInventoryResult>
+  resolveSkillContexts(request: AgentSkillContextResolveRequestV1): Promise<AgentSkillContextResolveResultV1>
 }
 
 export type AgentActionDecision = 'approve' | 'reject'

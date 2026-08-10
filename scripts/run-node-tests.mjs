@@ -36,6 +36,8 @@ const TYPESCRIPT_TEST_FILES = [
   'electron/main/agent-process-python-executor.test.ts',
   'electron/main/agent-process-python-runtime.test.ts',
   'electron/main/agent-skills-manifest.test.ts',
+  'electron/main/agent-skill-context-authority.test.ts',
+  'electron/main/agent-skill-contexts-ipc.test.ts',
   'electron/main/agent-workflow-authority.test.ts',
   'electron/main/agent-workflows-ipc.test.ts',
   'electron/main/renderer-filesystem-access.test.ts',

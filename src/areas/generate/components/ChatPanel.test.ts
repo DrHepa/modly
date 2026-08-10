@@ -5,6 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build, type Plugin } from 'esbuild'
+import ts from 'typescript'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const chatPanelEntry = path.join(projectRoot, 'src/areas/generate/components/ChatPanel.tsx')
@@ -199,7 +200,8 @@ test('ChatPanel wires capability discovery and governed proposals without automa
   assert.match(source, /window\.electron\.agentCapabilities\.resolveSkillContexts\(/)
   assert.match(source, /apiMessages\.push\(\{ role: 'system', content: extraContext\.workflowCompletion/)
   assert.match(source, /proposeGovernedAgentActions\(\{[\s\S]*\n\s*proposals,/)
-  assert.match(source, /JSON\.stringify\(\{[\s\S]*originSessionId[\s\S]*resolutionHash[\s\S]*skillContexts[\s\S]*\}\)/)
+  assert.match(source, /const request: AgentChatRequest = \{[\s\S]*originSessionId[\s\S]*resolutionHash[\s\S]*completedArtifacts[\s\S]*skillContexts[\s\S]*\}/)
+  assert.match(source, /body: JSON\.stringify\(request\)/)
   assert.match(source, /<GovernedActionCard/)
   assert.equal(source.includes('approveAndExecute'), false)
 })
@@ -256,6 +258,181 @@ test('skill context request uses only public refs and discards a late origin res
       isCurrent: () => current,
       resolve: async () => ({ resolutionHash: 'd'.repeat(64), contexts: [] }),
     }), { resolutionHash: 'd'.repeat(64), contexts: [] })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('MCP artifact prompt hints expose bounded kind and media guidance without private bindings', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const inputSchema = {
+      type: 'object', additionalProperties: false,
+      properties: {
+        sceneArtifact: { type: 'string', description: 'Approved Blender scene artifact.' },
+      },
+      required: ['sceneArtifact'],
+    }
+    const capability = {
+      schema: 'modly.agent-capability.v1', version: 1,
+      id: 'blender/inspect', displayName: 'Inspect scene', description: 'Inspect a governed Blender scene.',
+      extension: { id: 'blender', name: 'Blender' },
+      node: { id: 'inspect', input: 'blend', output: 'text', paramsSchema: [] },
+      execution: {
+        kind: 'mcp_tool', inputSchema, inputSchemaHash: 'b'.repeat(64),
+        inputArtifacts: [{
+          argument: 'sceneArtifact', kind: 'blend', mediaTypes: ['application/x-blender'], sandboxPath: '/input/0',
+        }],
+        mutating: false, bindingHash: 'c'.repeat(64),
+      },
+      approval: { required: true, scope: 'single_action' }, hash: 'a'.repeat(64),
+    }
+    const view = module.buildAgentCapabilityPromptInventory({ capabilities: [capability], errors: [] })[0]
+    assert.deepEqual(view.inputHints, [{
+      path: 'arguments.sceneArtifact',
+      type: 'string',
+      required: true,
+      description: 'Approved Blender scene artifact.',
+      artifact: { kind: 'blend', mediaTypes: ['application/x-blender'] },
+    }])
+    const serialized = JSON.stringify(view)
+    assert.equal(serialized.includes('/input/0'), false)
+    assert.equal(serialized.includes('sandboxPath'), false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('completed artifact context is path-free, deterministic, newest-bounded, and excludes unsuccessful actions', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const actions = Array.from({ length: 40 }, (_, index) => ({
+      schema: 'modly.agent-action-summary.v1', version: 1,
+      id: `action-${String(index).padStart(2, '0')}`,
+      status: 'completed',
+      createdAt: new Date(Date.UTC(2026, 7, 10, 12, 0, index)).toISOString(),
+      updatedAt: new Date(Date.UTC(2026, 7, 10, 12, 1, index)).toISOString(),
+      capability: {
+        id: 'text-to-cad-agent/plan-cad', displayName: 'Plan CAD',
+        description: `private-description-${index}`, hash: 'a'.repeat(64), risk: 'mutating',
+      },
+      model: { provider: 'ollama', model: 'private-model', digest: `sha256:${'b'.repeat(64)}` },
+      approval: { scope: 'single_action', expiresAt: '2026-08-10T13:00:00.000Z' },
+      preview: [], inputs: [],
+      outputs: [{
+        id: `artifact-${String(index).padStart(2, '0')}`, kind: 'plan',
+        mediaType: 'application/vnd.modly.cad-plan+json', sha256: index.toString(16).padStart(64, '0'),
+        sizeBytes: index + 1, workspacePath: `/private/artifact-${index}.json`,
+      }],
+    }))
+    actions.push({
+      ...actions[0], id: 'failed-action', status: 'failed',
+      outputs: [{ ...actions[0].outputs[0], id: 'failed-artifact' }],
+    })
+    const context = module.buildCompletedArtifactContext(actions)
+    assert.equal(context.length, 32)
+    assert.deepEqual(context.map((item: { actionId: string }) => item.actionId),
+      Array.from({ length: 32 }, (_, index) => `action-${String(index + 8).padStart(2, '0')}`))
+    assert.ok(new TextEncoder().encode(JSON.stringify(context)).byteLength <= 32 * 1024)
+    const encoded = JSON.stringify(context)
+    for (const forbidden of ['workspacePath', '/private/', 'private-description', 'private-model', 'failed-artifact']) {
+      assert.equal(encoded.includes(forbidden), false, forbidden)
+    }
+    assert.deepEqual(Object.keys(context[0]), [
+      'id', 'kind', 'mediaType', 'sha256', 'sizeBytes', 'actionId', 'capabilityId', 'capabilityName',
+    ])
+
+    const byteHeavyActions = Array.from({ length: 40 }, (_, index) => ({
+      ...actions[index],
+      id: `y${String(index).padStart(3, '0')}${'x'.repeat(124)}`,
+      capability: {
+        ...actions[index].capability,
+        id: `${'c'.repeat(128)}/${'d'.repeat(128)}`,
+        displayName: '界'.repeat(80),
+      },
+      outputs: [{
+        ...actions[index].outputs[0],
+        id: `z${String(index).padStart(3, '0')}${'x'.repeat(124)}`,
+        mediaType: `a/${'b'.repeat(126)}`,
+      }],
+    }))
+    const byteBounded = module.buildCompletedArtifactContext(byteHeavyActions)
+    assert.ok(byteBounded.length > 0 && byteBounded.length < 32)
+    assert.ok(new TextEncoder().encode(JSON.stringify(byteBounded)).byteLength <= 32 * 1024)
+
+    const unicodeBoundary = [{
+      ...actions[0],
+      capability: { ...actions[0].capability, displayName: '🙂'.repeat(40) },
+    }]
+    assert.equal(module.buildCompletedArtifactContext(unicodeBoundary)[0].capabilityName, '🙂'.repeat(40))
+    assert.throws(() => module.buildCompletedArtifactContext([{
+      ...actions[0], capability: { ...actions[0].capability, displayName: '🙂'.repeat(41) },
+    }]), /invalid completed Agent artifacts/i)
+    assert.throws(() => module.buildCompletedArtifactContext([{
+      ...actions[0], capability: { ...actions[0].capability, displayName: 'Unsafe\u007fName' },
+    }]), /invalid completed Agent artifacts/i)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('completed artifact lookup is origin-bound, abortable, excludes ambiguous ids, and is never persisted', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    let activeSessionId: string | null = 'session-a'
+    const gate = module.createOriginBoundUiGate(() => activeSessionId)
+    const token = gate.begin('session-a')
+    assert.equal(token.signal.aborted, false)
+    let release!: (value: unknown) => void
+    const requests: unknown[] = []
+    const pending = module.resolveCompletedArtifactsForTurn({
+      originSessionId: 'session-a',
+      isCurrent: token.isCurrent,
+      signal: token.signal,
+      list: (request: unknown) => new Promise((resolve) => {
+        requests.push(request)
+        release = resolve
+      }),
+    })
+    activeSessionId = 'session-b'
+    gate.invalidate()
+    assert.equal(token.signal.aborted, true)
+    release({ ok: true, actions: [] })
+    assert.equal(await pending, null)
+    assert.deepEqual(requests, [{ originSessionId: 'session-a' }])
+
+    const duplicate = {
+      schema: 'modly.agent-action-summary.v1', version: 1, status: 'completed',
+      createdAt: '2026-08-10T12:00:00.000Z', updatedAt: '2026-08-10T12:01:00.000Z',
+      capability: {
+        id: 'cad/plan', displayName: 'Plan', description: 'Plan.', hash: 'a'.repeat(64), risk: 'mutating',
+      },
+      model: { provider: 'ollama', model: 'model', digest: `sha256:${'b'.repeat(64)}` },
+      approval: { scope: 'single_action', expiresAt: '2026-08-10T13:00:00.000Z' },
+      preview: [], inputs: [],
+      outputs: [{
+        id: 'ambiguous-artifact', kind: 'plan', mediaType: 'application/json', sha256: 'c'.repeat(64), sizeBytes: 1,
+      }],
+    }
+    assert.deepEqual(module.buildCompletedArtifactContext([
+      { ...duplicate, id: 'action-a' }, { ...duplicate, id: 'action-b' },
+    ]), [])
+
+    const source = await readFile(chatPanelEntry, 'utf8')
+    assert.match(source, /resolveCompletedArtifactsForTurn\(\{[\s\S]*originSessionId: originatingSessionId/)
+    assert.match(source, /completedArtifacts,/)
+    const sourceFile = ts.createSourceFile(chatPanelEntry, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+    const persistenceCalls: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+        && node.expression.text === 'appendPersistedMessage') {
+        persistenceCalls.push(node.getText(sourceFile))
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sourceFile)
+    assert.ok(persistenceCalls.length >= 3, 'expected real appendPersistedMessage call sites')
+    for (const call of persistenceCalls) assert.doesNotMatch(call, /completedArtifacts/)
   } finally {
     await cleanup()
   }
@@ -690,7 +867,8 @@ test('cancellation reconciliation waits without busy-looping until authoritative
 test('chat mints a main-process model lease before FastAPI and sends only the opaque lease into proposal handoff', async () => {
   const source = await readFile(chatPanelEntry, 'utf8')
   assert.match(source, /window\.electron\.agentActions\.leaseModel\(\{[\s\S]*originSessionId:[\s\S]*model: selectedModel/)
-  assert.match(source, /body: JSON\.stringify\(\{[\s\S]*modelLeaseId/)
+  assert.match(source, /const request: AgentChatRequest = \{[\s\S]*modelLeaseId:/)
+  assert.match(source, /body: JSON\.stringify\(request\)/)
   assert.match(source, /handoffGovernedProposals\([\s\S]*modelLeaseId/)
 })
 

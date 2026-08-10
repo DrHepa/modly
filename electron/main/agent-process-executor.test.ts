@@ -121,7 +121,7 @@ async function fixture() {
   await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
     id: 'cad-tools', name: 'CAD Tools', version: '1.0.0', type: 'process', entry: 'processor.mjs',
     nodes: [{
-      id: 'generate', name: 'Generate', input: 'text', output: 'mesh',
+      id: 'generate', name: 'Generate', input: 'text', output: 'glb',
       params_schema: [{
         id: 'mode', type: 'select', default: 'honest', options: [
           'honest', 'forged', 'path', 'symlink', 'oversize', 'digest', 'partial', 'hang', 'tree', 'log-flood', 'terminal-after',
@@ -149,6 +149,8 @@ async function fixture() {
   }))
   const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
   assert.equal(inventory.capabilities.length, 1)
+  assert.equal(inventory.capabilities[0].node.output, 'glb')
+  assert.deepEqual(inventory.capabilities[0].node.outputs, ['glb', 'plan'])
   const inputPath = join(workspaceDir, 'input.txt')
   const inputBytes = Buffer.from('approved input\n')
   await writeFile(inputPath, inputBytes)

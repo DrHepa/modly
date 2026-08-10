@@ -78,7 +78,19 @@ function modelFreeProcessCapabilityFixture(runtimeSha256 = 'c'.repeat(64)): Agen
       schema: 'modly.agent-process-execution.v1', entry: 'processor.mjs', runtimeHash, artifacts,
     }),
   }
-  return capabilityFixture({ execution })
+  return capabilityFixture({
+    node: {
+      id: 'generate', input: 'text', output: 'glb', outputs: ['glb', 'plan'],
+      paramsSchema: [
+        {
+          id: 'quality', type: 'select', default: 'balanced',
+          options: [{ value: 'draft', label: 'Draft' }, { value: 'balanced', label: 'Balanced' }],
+        },
+        { id: 'iterations', type: 'int', default: 2, min: 1, max: 4 },
+      ],
+    },
+    execution,
+  })
 }
 
 function modelAccessProcessCapabilityFixture(): AgentCapabilitySnapshotV1 {
@@ -114,6 +126,16 @@ function modelAccessProcessCapabilityFixture(): AgentCapabilitySnapshotV1 {
     allowed: [{ kind: 'text' as const, mediaTypes: ['text/plain'], maxBytes: 1024 }],
   }
   return capabilityFixture({
+    node: {
+      id: 'generate', input: 'text', output: 'text', outputs: ['text'],
+      paramsSchema: [
+        {
+          id: 'quality', type: 'select', default: 'balanced',
+          options: [{ value: 'draft', label: 'Draft' }, { value: 'balanced', label: 'Balanced' }],
+        },
+        { id: 'iterations', type: 'int', default: 2, min: 1, max: 4 },
+      ],
+    },
     execution: {
       kind: 'process', schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
       runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
@@ -144,6 +166,73 @@ const validOutput: ArtifactRefV1 = {
 
 const passThroughArtifactVerifier: AgentArtifactVerifier = {
   async verify(candidate) { return candidate },
+}
+
+function publicArtifactSelection(artifact: ArtifactRefV1) {
+  return {
+    id: artifact.id,
+    kind: artifact.kind,
+    mediaType: artifact.mediaType,
+    sha256: artifact.sha256,
+    sizeBytes: artifact.sizeBytes,
+  }
+}
+
+function cadProcessCapability(input: {
+  id: string
+  input: AgentCapabilitySnapshotV1['node']['input']
+  output: AgentCapabilitySnapshotV1['node']['output']
+  outputs?: AgentCapabilitySnapshotV1['node']['outputs']
+  inputs?: AgentCapabilitySnapshotV1['node']['inputs']
+  allowed: Array<{ kind: ArtifactRefV1['kind'], mediaTypes: string[], maxBytes: number }>
+  modelAccess?: boolean
+}): AgentCapabilitySnapshotV1 {
+  const template = input.modelAccess
+    ? modelAccessProcessCapabilityFixture().execution
+    : modelFreeProcessCapabilityFixture().execution
+  if (template?.kind !== 'process') throw new Error('PROCESS fixture is unavailable')
+  const { runtimeFiles, resourceFiles, runtime, modelAccess } = template
+  const artifacts = {
+    maxCount: input.allowed.length,
+    maxTotalBytes: input.allowed.reduce((total, policy) => total + policy.maxBytes, 0),
+    allowed: input.allowed,
+  }
+  const runtimeHash = sha256Canonical({
+    runtimeFiles,
+    resourceFiles,
+    ...(runtime ? { runtime } : {}),
+    ...(modelAccess ? { modelAccess } : {}),
+  })
+  const execution = {
+    kind: 'process' as const,
+    schema: 'modly.agent-process-execution.v1' as const,
+    entry: template.entry,
+    runtimeFiles,
+    resourceFiles,
+    ...(runtime ? { runtime } : {}),
+    ...(modelAccess ? { modelAccess } : {}),
+    runtimeHash,
+    artifacts,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: template.entry, runtimeHash, artifacts,
+    }),
+  }
+  const [extensionId, nodeId] = input.id.split('/')
+  return capabilityFixture({
+    id: input.id,
+    displayName: nodeId,
+    description: `${nodeId} fixture.`,
+    extension: { id: extensionId, name: extensionId, version: '1.0.0' },
+    node: {
+      id: nodeId,
+      input: input.input,
+      output: input.output,
+      ...(input.outputs ? { outputs: input.outputs } : {}),
+      ...(input.inputs ? { inputs: input.inputs } : {}),
+      paramsSchema: [],
+    },
+    execution,
+  })
 }
 
 function clock(start = '2026-08-06T12:00:00.000Z') {
@@ -285,6 +374,40 @@ test('process execution accepts only its declared multi-artifact policy and keep
   assert.equal(captured?.originSessionId, 'session-process')
   assert.deepEqual(captured?.model, { ...selectedModel, endpoint: 'http://127.0.0.1:11434' })
   assert.deepEqual(completed.outputs.map((output) => output.kind), ['plan', 'glb'])
+})
+
+test('process execution requires a verified artifact matching the declared primary output', async () => {
+  const capability = cadProcessCapability({
+    id: 'cad-tools/build', input: 'text', output: 'glb', outputs: ['glb', 'plan'],
+    allowed: [
+      { kind: 'glb', mediaTypes: ['model/gltf-binary'], maxBytes: 1536 },
+      { kind: 'plan', mediaTypes: ['text/markdown'], maxBytes: 512 },
+    ],
+  })
+  const secondary: ArtifactRefV1 = {
+    ...validOutput,
+    id: 'secondary-plan',
+    kind: 'plan',
+    mediaType: 'text/markdown',
+    workspacePath: 'Workflows/agent-actions/action-secondary-only/plan.md',
+    sizeBytes: 64,
+  }
+  const service = new AgentActionsService({
+    createActionId: () => 'action-secondary-only',
+    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async () => ({ artifacts: [secondary] }),
+  })
+  const proposed = await service.propose({
+    originSessionId: 'session-secondary-only', capabilityId: capability.id,
+    capabilityHash: capability.hash, arguments: { input: 'chair', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposed.id, originSessionId: 'session-secondary-only', decision: 'approve' })
+  await rejectsCode(
+    service.execute({ actionId: proposed.id, originSessionId: 'session-secondary-only' }),
+    'invalid_artifact',
+  )
 })
 
 test('model-free process still rejects a changed runtime binding without consulting the model provider', async () => {
@@ -510,24 +633,30 @@ test('MCP artifact arguments resolve opaque inventory ids in main and bind autho
     mediaType: 'application/x-blender', workspacePath: 'Workflows/scenes/approved.blend',
     sha256: 'c'.repeat(64), sizeBytes: 4096,
   }
+  const producer = capabilityFixture({
+    id: 'scene-tools/create-scene',
+    extension: { id: 'scene-tools', name: 'Scene Tools', version: '1.0.0' },
+    node: { id: 'create-scene', input: 'text', output: 'blend', paramsSchema: [] },
+  })
   let captured: AgentActionExecutorRequest | undefined
-  let resolvedSession = ''
+  let nextId = 0
   const service = new AgentActionsService({
-    createActionId: () => 'action-mcp-input',
-    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    createActionId: () => `action-mcp-input-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, capability], errors: [] }),
     resolveCurrentModel: async () => selectedModel,
-    resolveArtifact: async (originSessionId, artifactId, kind) => {
-      resolvedSession = originSessionId
-      return originSessionId === 'test-session' && artifactId === sourceArtifact.id && kind === sourceArtifact.kind
-        ? sourceArtifact
-        : null
-    },
     artifactVerifier: passThroughArtifactVerifier,
     executor: async (request) => {
+      if (request.capability.id === producer.id) return { artifacts: [sourceArtifact] }
       captured = request
       return { artifacts: [{ ...validOutput, kind: 'text', mediaType: 'text/plain' }] }
     },
   })
+  const source = await service.propose({
+    originSessionId: 'test-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'cube', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: source.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: source.id, originSessionId: 'test-session' })
   const proposed = await service.propose({
     originSessionId: 'test-session', capabilityId: capability.id, capabilityHash: capability.hash,
     arguments: { sceneArtifact: sourceArtifact.id, operation: 'inspect' }, model: selectedModel,
@@ -538,7 +667,6 @@ test('MCP artifact arguments resolve opaque inventory ids in main and bind autho
   await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.deepEqual(captured?.arguments, { sceneArtifact: sourceArtifact.id, operation: 'inspect' })
   assert.deepEqual(captured?.inputArtifacts, [sourceArtifact])
-  assert.equal(resolvedSession, 'test-session')
 
   for (const [invalid, expected] of [
     [{ sceneArtifact: sourceArtifact.workspacePath, operation: 'inspect' }, 'invalid_arguments'],
@@ -550,6 +678,135 @@ test('MCP artifact arguments resolve opaque inventory ids in main and bind autho
       arguments: invalid as never, model: selectedModel,
     }), expected)
   }
+})
+
+test('MCP artifact bindings resolve only an unambiguous successful output from the same session', async () => {
+  const producer = capabilityFixture({
+    id: 'scene-tools/create-scene',
+    extension: { id: 'scene-tools', name: 'Scene Tools', version: '1.0.0' },
+    node: { id: 'create-scene', input: 'text', output: 'blend', paramsSchema: [] },
+  })
+  const inputSchema = {
+    type: 'object', additionalProperties: false,
+    properties: { sceneArtifact: { type: 'string', maxLength: 128 } },
+    required: ['sceneArtifact'],
+  }
+  const consumer = capabilityFixture({
+    id: 'mcp-tools/inspect-scene',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'inspect-scene', input: 'blend', output: 'text', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema, inputSchemaHash: sha256Canonical(inputSchema),
+      inputArtifacts: [{
+        argument: 'sceneArtifact', kind: 'blend', mediaTypes: ['application/x-blender'], sandboxPath: '/input/0',
+      }],
+      mutating: false, bindingHash: 'd'.repeat(64),
+    } as never,
+  })
+  const blend: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'scene-output', kind: 'blend',
+    mediaType: 'application/x-blender', workspacePath: 'Workflows/scene.blend',
+    sha256: '7'.repeat(64), sizeBytes: 2048,
+  }
+  let nextId = 0
+  let captured: AgentActionExecutorRequest | undefined
+  const service = new AgentActionsService({
+    createActionId: () => `mcp-chain-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, consumer], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      if (request.capability.id === producer.id) return { artifacts: [blend] }
+      captured = request
+      return { artifacts: [{ ...validOutput, id: 'scene-report', kind: 'text', mediaType: 'text/plain' }] }
+    },
+  })
+  const produced = await service.propose({
+    originSessionId: 'scene-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'cube', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: produced.id, originSessionId: 'scene-session', decision: 'approve' })
+  await service.execute({ actionId: produced.id, originSessionId: 'scene-session' })
+
+  await rejectsCode(service.propose({
+    originSessionId: 'other-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { sceneArtifact: blend.id }, model: selectedModel,
+  }), 'artifact_not_found')
+  const proposal = await service.propose({
+    originSessionId: 'scene-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { sceneArtifact: blend.id }, model: selectedModel,
+  })
+  await service.decide({ actionId: proposal.id, originSessionId: 'scene-session', decision: 'approve' })
+  await service.execute({ actionId: proposal.id, originSessionId: 'scene-session' })
+  assert.deepEqual(captured?.inputArtifacts, [blend])
+  assert.equal(JSON.stringify(proposal).includes(blend.workspacePath), false)
+})
+
+test('MCP output identities remain non-reusable after pruning while the current same-session reference stays valid', async () => {
+  const producerSchema = { type: 'object', additionalProperties: false, properties: {} }
+  const producer = capabilityFixture({
+    id: 'mcp-tools/create-scene',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'create-scene', input: 'text', output: 'blend', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema: producerSchema, inputSchemaHash: sha256Canonical(producerSchema),
+      mutating: true, bindingHash: 'd'.repeat(64),
+    } as never,
+  })
+  const consumerSchema = {
+    type: 'object', additionalProperties: false,
+    properties: { sceneArtifact: { type: 'string', maxLength: 128 } },
+    required: ['sceneArtifact'],
+  }
+  const consumer = capabilityFixture({
+    id: 'mcp-tools/inspect-scene',
+    extension: { id: 'mcp-tools', name: 'MCP Tools', version: '1.0.0' },
+    node: { id: 'inspect-scene', input: 'blend', output: 'text', paramsSchema: [] },
+    execution: {
+      kind: 'mcp_tool', inputSchema: consumerSchema, inputSchemaHash: sha256Canonical(consumerSchema),
+      inputArtifacts: [{
+        argument: 'sceneArtifact', kind: 'blend', mediaTypes: ['application/x-blender'], sandboxPath: '/input/0',
+      }],
+      mutating: false, bindingHash: 'e'.repeat(64),
+    } as never,
+  })
+  const providerArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'provider-scene', kind: 'blend',
+    mediaType: 'application/x-blender', workspacePath: 'Workflows/provider-scene.blend',
+    sha256: '7'.repeat(64), sizeBytes: 2048,
+  }
+  const actionIds = ['mcp-producer-one', 'mcp-producer-two', 'mcp-consumer']
+  const service = new AgentActionsService({
+    maxTerminalActions: 1,
+    createActionId: () => actionIds.shift() ?? 'unexpected-action',
+    resolveCapabilities: async () => ({ capabilities: [producer, consumer], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => request.capability.id === producer.id
+      ? { artifacts: [providerArtifact] }
+      : { artifacts: [{ ...validOutput, id: 'provider-report', kind: 'text', mediaType: 'text/plain' }] },
+  })
+  const produce = async () => {
+    const action = await service.propose({
+      originSessionId: 'mcp-reuse-session', capabilityId: producer.id,
+      capabilityHash: producer.hash, arguments: {}, model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, originSessionId: 'mcp-reuse-session', decision: 'approve' })
+    return service.execute({ actionId: action.id, originSessionId: 'mcp-reuse-session' })
+  }
+
+  const first = await produce()
+  const second = await produce()
+  assert.notEqual(first.outputs[0].id, second.outputs[0].id)
+  await rejectsCode(service.propose({
+    originSessionId: 'mcp-reuse-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { sceneArtifact: first.outputs[0].id }, model: selectedModel,
+  }), 'artifact_not_found')
+  const valid = await service.propose({
+    originSessionId: 'mcp-reuse-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { sceneArtifact: second.outputs[0].id }, model: selectedModel,
+  })
+  assert.deepEqual(valid.inputs, [{ ...second.outputs[0] }])
 })
 
 test('MCP file outputs are validated against their own declared path policy instead of the first output kind', async () => {
@@ -630,17 +887,31 @@ test('artifact inputs are resolved from opaque ids and paths or hashes are never
     workspacePath: 'Workflows/private/source.glb',
     sha256: 'c'.repeat(64),
   }
+  const producer = capabilityFixture({
+    id: 'mesh-tools/create-mesh',
+    extension: { id: 'mesh-tools', name: 'Mesh Tools', version: '1.0.0' },
+    node: { id: 'create-mesh', input: 'text', output: 'mesh', paramsSchema: [] },
+  })
   let captured: AgentActionExecutorRequest | undefined
+  let nextId = 0
   const service = new AgentActionsService({
-    createActionId: () => 'action-artifact',
-    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    createActionId: () => `action-artifact-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, capability], errors: [] }),
     resolveCurrentModel: async () => selectedModel,
     artifactVerifier: passThroughArtifactVerifier,
-    resolveArtifact: async (originSessionId, artifactId) => (
-      originSessionId === 'test-session' && artifactId === sourceArtifact.id ? sourceArtifact : null
-    ),
-    executor: async (request) => { captured = request; return { artifacts: [validOutput] } },
+    executor: async (request) => {
+      if (request.capability.id === producer.id) return { artifacts: [sourceArtifact] }
+      captured = request
+      return { artifacts: [validOutput] }
+    },
   })
+
+  const source = await service.propose({
+    originSessionId: 'test-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'mesh', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: source.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: source.id, originSessionId: 'test-session' })
 
   await rejectsCode(service.propose({
     originSessionId: 'test-session',
@@ -654,7 +925,7 @@ test('artifact inputs are resolved from opaque ids and paths or hashes are never
     originSessionId: 'test-session',
     capabilityId: capability.id,
     capabilityHash: capability.hash,
-    arguments: { input: { artifactId: sourceArtifact.id }, params: {} },
+    arguments: { input: publicArtifactSelection(sourceArtifact), params: {} },
     model: selectedModel,
   })
   assert.equal(JSON.stringify(proposed).includes(sourceArtifact.workspacePath), false)
@@ -662,6 +933,326 @@ test('artifact inputs are resolved from opaque ids and paths or hashes are never
   await service.decide({ actionId: proposed.id, originSessionId: 'test-session', decision: 'approve' })
   await service.execute({ actionId: proposed.id, originSessionId: 'test-session' })
   assert.deepEqual(captured?.arguments, { input: sourceArtifact, params: {} })
+})
+
+test('same-session completed PROCESS outputs chain plan to source to model-free build with exact public refs', async () => {
+  const planCapability = cadProcessCapability({
+    id: 'text-to-cad-agent/plan-cad', input: 'text', output: 'plan', outputs: ['plan'], modelAccess: true,
+    allowed: [{ kind: 'plan', mediaTypes: ['application/vnd.modly.cad-plan+json'], maxBytes: 4096 }],
+  })
+  const compileCapability = cadProcessCapability({
+    id: 'text-to-cad-agent/compile-cad', input: 'plan', output: 'source', outputs: ['source'], modelAccess: true,
+    allowed: [{ kind: 'source', mediaTypes: ['application/vnd.modly.cad-source+json'], maxBytes: 4096 }],
+  })
+  const buildCapability = cadProcessCapability({
+    id: 'text-to-cad-agent/build-cad', input: 'source', output: 'glb', outputs: ['glb', 'step'],
+    inputs: [
+      { name: 'plan', label: 'Approved CAD plan', type: 'plan', required: true },
+      { name: 'source', label: 'Approved CAD source', type: 'source', required: true },
+    ],
+    allowed: [
+      { kind: 'glb', mediaTypes: ['model/gltf-binary'], maxBytes: 8192 },
+      { kind: 'step', mediaTypes: ['model/step'], maxBytes: 8192 },
+    ],
+  })
+  const planArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'cad-plan-1', kind: 'plan',
+    mediaType: 'application/vnd.modly.cad-plan+json', workspacePath: 'Workflows/agent-actions/action-plan/plan.json',
+    sha256: '1'.repeat(64), sizeBytes: 321,
+  }
+  const sourceArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'cad-source-1', kind: 'source',
+    mediaType: 'application/vnd.modly.cad-source+json', workspacePath: 'Workflows/agent-actions/action-compile/source.json',
+    sha256: '2'.repeat(64), sizeBytes: 654,
+  }
+  const glbArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'cad-glb-1', kind: 'glb',
+    mediaType: 'model/gltf-binary', workspacePath: 'Workflows/agent-actions/action-build/model.glb',
+    sha256: '3'.repeat(64), sizeBytes: 1024,
+  }
+  const stepArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'cad-step-1', kind: 'step',
+    mediaType: 'model/step', workspacePath: 'Workflows/agent-actions/action-build/model.step',
+    sha256: '4'.repeat(64), sizeBytes: 2048,
+  }
+  const ids = ['action-plan', 'action-compile', 'action-build']
+  const captured = new Map<string, AgentActionExecutorRequest>()
+  let modelResolverCalls = 0
+  const service = new AgentActionsService({
+    createActionId: () => ids.shift() ?? 'unexpected-action',
+    resolveCapabilities: async () => ({ capabilities: [planCapability, compileCapability, buildCapability], errors: [] }),
+    resolveCurrentModel: async () => { modelResolverCalls += 1; return selectedModel },
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      captured.set(request.capability.id, request)
+      if (request.capability.id === planCapability.id) return { artifacts: [planArtifact] }
+      if (request.capability.id === compileCapability.id) return { artifacts: [sourceArtifact] }
+      return { artifacts: [glbArtifact, stepArtifact] }
+    },
+  })
+
+  const plan = await service.propose({
+    originSessionId: 'cad-session', capabilityId: planCapability.id, capabilityHash: planCapability.hash,
+    arguments: { input: 'Create a 40 mm cube.', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: plan.id, originSessionId: 'cad-session', decision: 'approve' })
+  const completedPlan = await service.execute({ actionId: plan.id, originSessionId: 'cad-session' })
+  assert.deepEqual(completedPlan.outputs, [publicArtifactSelection(planArtifact)])
+  assert.equal(JSON.stringify(completedPlan).includes(planArtifact.workspacePath), false)
+  assert.deepEqual(
+    (await service.list({ originSessionId: 'cad-session' })).flatMap((action) => action.outputs.map((output) => output.id)),
+    ['cad-plan-1'],
+  )
+  assert.deepEqual(await service.list({ originSessionId: 'other-session' }), [])
+
+  await rejectsCode(service.propose({
+    originSessionId: 'other-session', capabilityId: compileCapability.id, capabilityHash: compileCapability.hash,
+    arguments: { input: publicArtifactSelection(planArtifact), params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+  const compile = await service.propose({
+    originSessionId: 'cad-session', capabilityId: compileCapability.id, capabilityHash: compileCapability.hash,
+    arguments: { input: publicArtifactSelection(planArtifact), params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: compile.id, originSessionId: 'cad-session', decision: 'approve' })
+  await service.execute({ actionId: compile.id, originSessionId: 'cad-session' })
+  assert.deepEqual(captured.get(compileCapability.id)?.inputArtifacts, [planArtifact])
+  assert.deepEqual(
+    (await service.list({ originSessionId: 'cad-session' }))
+      .flatMap((action) => action.outputs.map((output) => output.id)).sort(),
+    ['cad-plan-1', 'cad-source-1'],
+  )
+
+  const modelCallsBeforeBuild = modelResolverCalls
+  const build = await service.propose({
+    originSessionId: 'cad-session', capabilityId: buildCapability.id, capabilityHash: buildCapability.hash,
+    arguments: { input: {
+      plan: publicArtifactSelection(planArtifact),
+      source: publicArtifactSelection(sourceArtifact),
+    }, params: {} },
+    model: selectedModel,
+  })
+  await service.decide({ actionId: build.id, originSessionId: 'cad-session', decision: 'approve' })
+  const completedBuild = await service.execute({ actionId: build.id, originSessionId: 'cad-session' })
+  assert.deepEqual(captured.get(buildCapability.id)?.inputArtifacts, [planArtifact, sourceArtifact])
+  assert.deepEqual(completedBuild.outputs, [publicArtifactSelection(glbArtifact), publicArtifactSelection(stepArtifact)])
+  assert.equal(modelResolverCalls, modelCallsBeforeBuild)
+
+  const restarted = new AgentActionsService({
+    resolveCapabilities: async () => ({ capabilities: [compileCapability], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+  })
+  await rejectsCode(restarted.propose({
+    originSessionId: 'cad-session', capabilityId: compileCapability.id, capabilityHash: compileCapability.hash,
+    arguments: { input: publicArtifactSelection(planArtifact), params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+})
+
+test('completed artifact resolution rejects non-success, ambiguity, and every requested identity mismatch', async () => {
+  const producer = cadProcessCapability({
+    id: 'cad-chain/produce-plan', input: 'text', output: 'plan', outputs: ['plan'],
+    allowed: [{ kind: 'plan', mediaTypes: ['application/vnd.modly.cad-plan+json'], maxBytes: 4096 }],
+  })
+  const consumer = cadProcessCapability({
+    id: 'cad-chain/consume-plan', input: 'plan', output: 'source', outputs: ['source'],
+    allowed: [{ kind: 'source', mediaTypes: ['application/vnd.modly.cad-source+json'], maxBytes: 4096 }],
+  })
+  const planArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'shared-plan', kind: 'plan',
+    mediaType: 'application/vnd.modly.cad-plan+json', workspacePath: 'Workflows/shared-plan.json',
+    sha256: '5'.repeat(64), sizeBytes: 99,
+  }
+  let nextId = 0
+  const service = new AgentActionsService({
+    createActionId: () => `artifact-status-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, consumer], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => request.capability.id === producer.id
+      ? { artifacts: [planArtifact] }
+      : { artifacts: [{ ...planArtifact, id: 'compiled-source', kind: 'source', mediaType: 'application/vnd.modly.cad-source+json' }] },
+  })
+  const selection = publicArtifactSelection(planArtifact)
+
+  const running = await service.propose({
+    originSessionId: 'session-a', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'pending', params: {} }, model: selectedModel,
+  })
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: selection, params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+  await service.decide({ actionId: running.id, originSessionId: 'session-a', decision: 'reject' })
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: selection, params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+
+  for (let index = 0; index < 2; index += 1) {
+    const action = await service.propose({
+      originSessionId: 'session-a', capabilityId: producer.id, capabilityHash: producer.hash,
+      arguments: { input: `complete-${index}`, params: {} }, model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, originSessionId: 'session-a', decision: 'approve' })
+    await service.execute({ actionId: action.id, originSessionId: 'session-a' })
+    if (index === 0) {
+      for (const mismatched of [
+        { ...selection, id: 'missing-plan' },
+        { ...selection, kind: 'source' },
+        { ...selection, mediaType: 'application/json' },
+        { ...selection, sha256: '6'.repeat(64) },
+        { ...selection, sizeBytes: selection.sizeBytes + 1 },
+      ]) {
+        await rejectsCode(service.propose({
+          originSessionId: 'session-a', capabilityId: consumer.id, capabilityHash: consumer.hash,
+          arguments: { input: mismatched, params: {} } as never, model: selectedModel,
+        }), 'artifact_not_found')
+      }
+    }
+  }
+  await rejectsCode(service.propose({
+    originSessionId: 'session-a', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: selection, params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+})
+
+test('failed, cancelled, and executing producer attempts never become artifact authority', async () => {
+  const producer = cadProcessCapability({
+    id: 'artifact-status/produce-plan', input: 'text', output: 'plan', outputs: ['plan'],
+    allowed: [{ kind: 'plan', mediaTypes: ['application/vnd.modly.cad-plan+json'], maxBytes: 4096 }],
+  })
+  const consumer = cadProcessCapability({
+    id: 'artifact-status/consume-plan', input: 'plan', output: 'source', outputs: ['source'],
+    allowed: [{ kind: 'source', mediaTypes: ['application/vnd.modly.cad-source+json'], maxBytes: 4096 }],
+  })
+  const failedArtifact: ArtifactRefV1 = {
+    schema: 'modly.artifact-ref.v1', version: 1, id: 'failed-plan', kind: 'plan',
+    mediaType: 'application/vnd.modly.cad-plan+json', workspacePath: 'Workflows/failed-plan.json',
+    sha256: '7'.repeat(64), sizeBytes: 7,
+  }
+  const cancelledArtifact: ArtifactRefV1 = {
+    ...failedArtifact, id: 'cancelled-plan', workspacePath: 'Workflows/cancelled-plan.json',
+    sha256: '8'.repeat(64), sizeBytes: 8,
+  }
+  let nextId = 0
+  let executorStarted!: () => void
+  const didStartExecutor = new Promise<void>((resolve) => { executorStarted = resolve })
+  let releaseExecutor!: () => void
+  const executorBarrier = new Promise<void>((resolve) => { releaseExecutor = resolve })
+  let executorAborted!: () => void
+  const didAbortExecutor = new Promise<void>((resolve) => { executorAborted = resolve })
+  const service = new AgentActionsService({
+    createActionId: () => `producer-status-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, consumer], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      if (request.capability.id !== producer.id) throw new Error('consumer must not execute')
+      if (JSON.stringify(request.arguments).includes('failed')) throw new Error('producer failed')
+      request.signal.addEventListener('abort', executorAborted, { once: true })
+      executorStarted()
+      await executorBarrier
+      return { artifacts: [cancelledArtifact] }
+    },
+  })
+  const proposeConsumer = (artifact: ArtifactRefV1) => service.propose({
+    originSessionId: 'artifact-status-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: publicArtifactSelection(artifact), params: {} }, model: selectedModel,
+  })
+
+  const failed = await service.propose({
+    originSessionId: 'artifact-status-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'failed', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: failed.id, originSessionId: 'artifact-status-session', decision: 'approve' })
+  await rejectsCode(service.execute({ actionId: failed.id, originSessionId: 'artifact-status-session' }), 'execution_failed')
+  assert.equal((await service.get({ actionId: failed.id, originSessionId: 'artifact-status-session' })).status, 'failed')
+  await rejectsCode(proposeConsumer(failedArtifact), 'artifact_not_found')
+
+  const cancellable = await service.propose({
+    originSessionId: 'artifact-status-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'cancelled', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: cancellable.id, originSessionId: 'artifact-status-session', decision: 'approve' })
+  const running = service.execute({ actionId: cancellable.id, originSessionId: 'artifact-status-session' })
+  await didStartExecutor
+  assert.equal((await service.get({ actionId: cancellable.id, originSessionId: 'artifact-status-session' })).status, 'executing')
+  await rejectsCode(proposeConsumer(cancelledArtifact), 'artifact_not_found')
+  const cancelling = service.cancel({ actionId: cancellable.id, originSessionId: 'artifact-status-session' })
+  await didAbortExecutor
+  releaseExecutor()
+  assert.equal((await cancelling).status, 'cancelled')
+  assert.equal((await running).status, 'cancelled')
+  await rejectsCode(proposeConsumer(cancelledArtifact), 'artifact_not_found')
+})
+
+test('artifact authority follows bounded terminal retention without invalidating an already-bound action', async () => {
+  const producer = cadProcessCapability({
+    id: 'retention/produce-plan', input: 'text', output: 'plan', outputs: ['plan'],
+    allowed: [{ kind: 'plan', mediaTypes: ['application/vnd.modly.cad-plan+json'], maxBytes: 4096 }],
+  })
+  const consumer = cadProcessCapability({
+    id: 'retention/consume-plan', input: 'plan', output: 'source', outputs: ['source'],
+    allowed: [{ kind: 'source', mediaTypes: ['application/vnd.modly.cad-source+json'], maxBytes: 4096 }],
+  })
+  const time = clock()
+  let nextAction = 0
+  let producedCount = 0
+  const producedArtifacts: ArtifactRefV1[] = []
+  const service = new AgentActionsService({
+    now: time.now,
+    terminalRetentionMs: 1_000,
+    maxTerminalActions: 1,
+    createActionId: () => `retained-action-${++nextAction}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, consumer], errors: [] }),
+    resolveCurrentModel: async () => selectedModel,
+    artifactVerifier: passThroughArtifactVerifier,
+    executor: async (request) => {
+      if (request.capability.id === producer.id) {
+        producedCount += 1
+        const artifact: ArtifactRefV1 = {
+          schema: 'modly.artifact-ref.v1', version: 1, id: `retained-plan-${producedCount}`, kind: 'plan',
+          mediaType: 'application/vnd.modly.cad-plan+json', workspacePath: `Workflows/plan-${producedCount}.json`,
+          sha256: String(producedCount).repeat(64), sizeBytes: producedCount,
+        }
+        producedArtifacts.push(artifact)
+        return { artifacts: [artifact] }
+      }
+      return { artifacts: [{
+        schema: 'modly.artifact-ref.v1', version: 1, id: 'retained-source', kind: 'source',
+        mediaType: 'application/vnd.modly.cad-source+json', workspacePath: 'Workflows/source.json',
+        sha256: '9'.repeat(64), sizeBytes: 9,
+      }] }
+    },
+  })
+  const completePlan = async (label: string) => {
+    const action = await service.propose({
+      originSessionId: 'retention-session', capabilityId: producer.id, capabilityHash: producer.hash,
+      arguments: { input: label, params: {} }, model: selectedModel,
+    })
+    await service.decide({ actionId: action.id, originSessionId: 'retention-session', decision: 'approve' })
+    await service.execute({ actionId: action.id, originSessionId: 'retention-session' })
+    time.advance(1)
+  }
+  await completePlan('first')
+  const boundConsumer = await service.propose({
+    originSessionId: 'retention-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: publicArtifactSelection(producedArtifacts[0]), params: {} }, model: selectedModel,
+  })
+  await completePlan('second')
+  await rejectsCode(service.propose({
+    originSessionId: 'retention-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: publicArtifactSelection(producedArtifacts[0]), params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
+
+  await service.decide({ actionId: boundConsumer.id, originSessionId: 'retention-session', decision: 'approve' })
+  assert.equal((await service.execute({ actionId: boundConsumer.id, originSessionId: 'retention-session' })).status, 'completed')
+  // State transitions use strictly monotonic millisecond timestamps even when
+  // this test clock has not advanced between approval/execution boundaries.
+  time.advance(1_010)
+  await rejectsCode(service.propose({
+    originSessionId: 'retention-session', capabilityId: consumer.id, capabilityHash: consumer.hash,
+    arguments: { input: publicArtifactSelection(producedArtifacts[1]), params: {} }, model: selectedModel,
+  }), 'artifact_not_found')
 })
 
 test('approval fails closed when capability, model, or expiry changes after proposal', async () => {
@@ -1053,32 +1644,49 @@ test('cancellation during input revalidation prevents executor invocation', asyn
     node: { id: 'optimize', input: 'mesh', output: 'mesh', paramsSchema: [] },
   })
   const source = { ...validOutput, id: 'source-mesh', sha256: 'c'.repeat(64) }
+  const producer = capabilityFixture({
+    id: 'mesh-tools/create-mesh',
+    extension: { id: 'mesh-tools', name: 'Mesh Tools', version: '1.0.0' },
+    node: { id: 'create-mesh', input: 'text', output: 'mesh', paramsSchema: [] },
+  })
   let verificationStarted!: () => void
   const didStartVerification = new Promise<void>((resolve) => { verificationStarted = resolve })
   let releaseVerification!: () => void
   const verificationBarrier = new Promise<void>((resolve) => { releaseVerification = resolve })
   let executions = 0
+  let sourceCompleted = false
+  let nextId = 0
   const service = new AgentActionsService({
-    createActionId: () => 'action-cancel-before-executor',
-    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    createActionId: () => `action-cancel-before-executor-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, capability], errors: [] }),
     resolveCurrentModel: async () => selectedModel,
-    resolveArtifact: async () => source,
     artifactVerifier: {
       async verify(candidate) {
-        if (candidate.id === source.id) {
+        if (candidate.id === source.id && sourceCompleted) {
           verificationStarted()
           await verificationBarrier
         }
         return candidate
       },
     },
-    executor: async () => { executions += 1; return { artifacts: [validOutput] } },
+    executor: async (request) => {
+      if (request.capability.id === producer.id) return { artifacts: [source] }
+      executions += 1
+      return { artifacts: [validOutput] }
+    },
   })
+  const produced = await service.propose({
+    originSessionId: 'test-session', capabilityId: producer.id, capabilityHash: producer.hash,
+    arguments: { input: 'mesh', params: {} }, model: selectedModel,
+  })
+  await service.decide({ actionId: produced.id, originSessionId: 'test-session', decision: 'approve' })
+  await service.execute({ actionId: produced.id, originSessionId: 'test-session' })
+  sourceCompleted = true
   const action = await service.propose({
     originSessionId: 'test-session',
     capabilityId: capability.id,
     capabilityHash: capability.hash,
-    arguments: { input: { artifactId: source.id }, params: {} },
+    arguments: { input: publicArtifactSelection(source), params: {} },
     model: selectedModel,
   })
   await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })
@@ -1308,12 +1916,13 @@ test('input artifact mutation is detected immediately before start and never rea
   const original = Buffer.from('original mesh')
   await mkdir(workflows, { recursive: true })
   await writeFile(join(workflows, 'source.glb'), original)
-  const processExecution = modelFreeProcessCapabilityFixture().execution
-  const capability = capabilityFixture({
-    id: 'mesh-tools/optimize',
-    extension: { id: 'mesh-tools', name: 'Mesh Tools', version: '1.0.0' },
-    node: { id: 'optimize', input: 'mesh', output: 'mesh', paramsSchema: [] },
-    execution: processExecution,
+  const producer = cadProcessCapability({
+    id: 'mesh-tools/create-mesh', input: 'text', output: 'mesh', outputs: ['mesh'],
+    allowed: [{ kind: 'mesh', mediaTypes: ['model/gltf-binary'], maxBytes: 4096 }],
+  })
+  const capability = cadProcessCapability({
+    id: 'mesh-tools/optimize', input: 'mesh', output: 'mesh', outputs: ['mesh'],
+    allowed: [{ kind: 'mesh', mediaTypes: ['model/gltf-binary'], maxBytes: 4096 }],
   })
   const source: ArtifactRefV1 = {
     ...validOutput,
@@ -1324,23 +1933,33 @@ test('input artifact mutation is detected immediately before start and never rea
   }
   let executions = 0
   let modelResolverCalls = 0
+  let nextId = 0
   const service = new AgentActionsService({
-    createActionId: () => 'action-mutated-input',
-    resolveCapabilities: async () => ({ capabilities: [capability], errors: [] }),
+    createActionId: () => `action-mutated-input-${++nextId}`,
+    resolveCapabilities: async () => ({ capabilities: [producer, capability], errors: [] }),
     resolveCurrentModel: async () => {
       modelResolverCalls += 1
       throw new Error('model-free execution must not resolve a provider model')
     },
-    resolveArtifact: async () => source,
     artifactVerifier: new WorkspaceAgentArtifactVerifier({ getWorkspaceRoot: () => root }),
-    executor: async () => { executions += 1; return { artifacts: [validOutput] } },
+    executor: async (request) => {
+      if (request.capability.id === producer.id) return { artifacts: [source] }
+      executions += 1
+      return { artifacts: [validOutput] }
+    },
   })
   try {
+    const produced = await service.propose({
+      originSessionId: 'test-session', capabilityId: producer.id, capabilityHash: producer.hash,
+      arguments: { input: 'mesh', params: {} }, model: selectedModel,
+    })
+    await service.decide({ actionId: produced.id, originSessionId: 'test-session', decision: 'approve' })
+    await service.execute({ actionId: produced.id, originSessionId: 'test-session' })
     const action = await service.propose({
     originSessionId: 'test-session',
       capabilityId: capability.id,
     capabilityHash: capability.hash,
-      arguments: { input: { artifactId: source.id }, params: {} },
+      arguments: { input: publicArtifactSelection(source), params: {} },
       model: selectedModel,
     })
     await service.decide({ actionId: action.id, originSessionId: 'test-session', decision: 'approve' })

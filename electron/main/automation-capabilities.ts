@@ -3,7 +3,7 @@ import { join, resolve as resolvePath } from 'path'
 import { readFile, readdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
-import type { ArtifactKind } from '../../src/shared/types/artifacts.ts'
+import { ARTIFACT_KINDS, type ArtifactKind } from '../../src/shared/types/artifacts.ts'
 import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest.ts'
 import {
   normalizeHttpsDownloads,
@@ -328,7 +328,11 @@ type PartialCapabilityAutomationMetadata = {
   substitution?: PartialCapabilitySubstitutionMetadata
 }
 
-const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const LEGACY_PROCESS_ARTIFACT_KINDS = [
+  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+] as const satisfies readonly ArtifactKind[]
+const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(LEGACY_PROCESS_ARTIFACT_KINDS)
+const GOVERNED_AGENT_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
 const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process', 'skills'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
@@ -458,16 +462,13 @@ function normalizeCapabilityAutomationMetadata(input: PartialCapabilityAutomatio
   }
 }
 
-function isProcessPortType(value: unknown): value is ProcessPortType {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio' || value === 'video'
+function isProcessPortType(value: unknown, governedAgentKinds = false): value is ProcessPortType {
+  const kinds = governedAgentKinds ? GOVERNED_AGENT_ARTIFACT_KINDS : CAPABILITY_ARTIFACT_KINDS
+  return typeof value === 'string' && kinds.has(value as ArtifactKind)
 }
 
 function normalizeLegacyArtifactKind(value: unknown): unknown {
   return value
-}
-
-function isModelInputKind(value: unknown): value is ModelInputKind {
-  return value === 'none' || isProcessPortType(value)
 }
 
 function isWorkflowNodeComponent(value: unknown): value is WorkflowNodeComponent {
@@ -702,12 +703,18 @@ function normalizeExtensionNodeInput(
   value: ModelInputKind | undefined,
   extensionType: 'model' | 'process',
   context: string,
+  governedAgentKinds = false,
 ): ModelInputKind {
   const normalizedValue = normalizeLegacyArtifactKind(value)
 
-  if (normalizedValue !== undefined && !isModelInputKind(normalizedValue)) {
+  if (normalizedValue !== undefined
+    && normalizedValue !== 'none'
+    && !isProcessPortType(normalizedValue, governedAgentKinds)) {
     throw new Error(
-      context + " must be one of: image, text, mesh, scene, audio, video, none",
+      `${context} must be one of: ${[
+        ...(governedAgentKinds ? ARTIFACT_KINDS : LEGACY_PROCESS_ARTIFACT_KINDS),
+        'none',
+      ].join(', ')}`,
     )
   }
 
@@ -728,6 +735,7 @@ export function parseExtensionManifest(
   fallbackId: string,
   trustedRepos: Set<string>,
   builtin = false,
+  options: { governedAgentKinds?: boolean } = {},
 ): ListedExtension {
   const extensionId = assertSafeExtensionId(parsed.id ?? fallbackId)
   const extensionType = parsed.type === 'process' ? 'process' : 'model'
@@ -770,7 +778,8 @@ export function parseExtensionManifest(
     const ownerId = node.weight_owner_id ?? node.id
     const weightOwnerId = `${extensionId}/${ownerId}`
     const processOwnerId = node.process_owner_id ? `${extensionId}/${node.process_owner_id}` : undefined
-    const declaredOutput = isProcessPortType(normalizeLegacyArtifactKind(node.output))
+    const governedAgentKinds = options.governedAgentKinds === true
+    const declaredOutput = isProcessPortType(normalizeLegacyArtifactKind(node.output), governedAgentKinds)
       ? normalizeLegacyArtifactKind(node.output) as ArtifactKind
       : 'mesh' as const
     const normalizedInputs = normalizeProcessPorts(
@@ -812,8 +821,8 @@ export function parseExtensionManifest(
       ? { automation: normalizeCapabilityAutomationMetadata(node.automation) }
       : {}
     const agentResult = extensionType === 'process'
-      && isProcessPortType(node.input)
-      && isProcessPortType(node.output)
+      && isProcessPortType(node.input, true)
+      && isProcessPortType(node.output, true)
       ? normalizeAgentCapabilityDeclarationResult(node.agent, capabilityId, parsed.entry ?? 'processor.js')
       : {}
 
@@ -824,6 +833,7 @@ export function parseExtensionManifest(
         node.input,
         extensionType,
         capabilityId + '.input',
+        governedAgentKinds,
       ),
       output: declaredOutput,
       ...(normalizedInputs ? { inputs: normalizedInputs } : {}),
@@ -1072,7 +1082,9 @@ export async function readResolvedExtensionsFromDirDetailed(
 
         if (manifest) {
           try {
-            extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+            extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin, {
+              governedAgentKinds: validateAgentJson,
+            })
           } catch (error) {
             resolvedManifest = null
             return {
@@ -1366,6 +1378,18 @@ async function buildAgentCapabilitySnapshot(
     const execution = await bindAgentProcessExecution(
       extensionDir, extension.entry, node.agent.process, processPythonExecutable,
     )
+    if (!execution.artifacts.allowed.some((artifact) => artifact.kind === node.output)) {
+      throw new AgentProcessManifestError(
+        'invalid_metadata',
+        'Agent process primary node output must be declared in its allowed artifact kinds',
+      )
+    }
+    const outputKinds = [
+      node.output,
+      ...execution.artifacts.allowed.flatMap((artifact) => (
+        artifact.kind === node.output ? [] : [artifact.kind]
+      )),
+    ]
     const skillBinding = node.agent.skills
       ? await bindAgentSkillSet(extensionDir, node.agent.skills)
       : undefined
@@ -1385,6 +1409,7 @@ async function buildAgentCapabilitySnapshot(
         id: node.id,
         input: node.input,
         output: node.output,
+        outputs: outputKinds,
         ...(inputs ? { inputs } : {}),
         paramsSchema,
       },

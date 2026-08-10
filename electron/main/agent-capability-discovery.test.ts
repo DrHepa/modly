@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -45,7 +45,7 @@ function processManifest(agent: unknown = declaration()) {
     type: 'process' as const,
     entry: 'processor.js',
     nodes: [{
-      id: 'generate', name: 'Generate', input: 'text' as const, output: 'mesh' as const,
+      id: 'generate', name: 'Generate', input: 'text' as const, output: 'glb' as const,
       params_schema: [{ id: 'quality', type: 'select', default: 'balanced' }],
       ...(agent === OMIT_AGENT ? {} : { agent }),
     }],
@@ -185,6 +185,116 @@ test('only validated opt-in process nodes appear in renderer-safe Agent inventor
   }
 })
 
+test('PROCESS Agent discovery preserves governed CAD artifact ports and derives ordered public outputs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-cad-kinds-'))
+  const builtinDir = join(root, 'builtin')
+  const userDir = join(root, 'user')
+  const extensionDir = join(userDir, 'cad-chain')
+  await mkdir(builtinDir, { recursive: true })
+  await mkdir(join(extensionDir, 'assets'), { recursive: true })
+  await writeFile(join(extensionDir, 'processor.js'), 'export {}\n')
+  await writeFile(join(extensionDir, 'assets', 'runtime-data.json'), '{}\n')
+  const agentDeclaration = (
+    nodeId: string,
+    allowed: Array<{ kind: string, mediaTypes: string[], maxBytes: number }>,
+  ) => declaration({
+    capability_id: `cad-chain/${nodeId}`,
+    display_name: nodeId,
+    process: {
+      schema: 'modly.agent-process.v1',
+      runtimeFiles: ['processor.js'],
+      resourceFiles: ['assets/runtime-data.json'],
+      artifacts: {
+        maxCount: allowed.length,
+        maxTotalBytes: allowed.reduce((total, artifact) => total + artifact.maxBytes, 0),
+        allowed,
+      },
+    },
+  })
+  await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
+    id: 'cad-chain', name: 'CAD Chain', version: '1.0.0', type: 'process', entry: 'processor.js',
+    nodes: [
+      {
+        id: 'plan', input: 'text', output: 'plan', params_schema: [],
+        agent: agentDeclaration('plan', [{
+          kind: 'plan', mediaTypes: ['application/vnd.modly.cad-plan+json'], maxBytes: 1024,
+        }]),
+      },
+      {
+        id: 'compile', input: 'plan', output: 'source', params_schema: [],
+        agent: agentDeclaration('compile', [{
+          kind: 'source', mediaTypes: ['application/vnd.modly.cad-source+json'], maxBytes: 1024,
+        }]),
+      },
+      {
+        id: 'build', input: 'source', output: 'step',
+        inputs: [
+          { name: 'plan', type: 'plan', required: true },
+          { name: 'source', type: 'source', required: true },
+        ],
+        params_schema: [],
+        agent: agentDeclaration('build', [
+          { kind: 'glb', mediaTypes: ['model/gltf-binary'], maxBytes: 2048 },
+          { kind: 'step', mediaTypes: ['model/step'], maxBytes: 2048 },
+        ]),
+      },
+    ],
+  }))
+
+  try {
+    const rawManifest = JSON.parse(await readFile(join(extensionDir, 'manifest.json'), 'utf8'))
+    assert.throws(
+      () => parseExtensionManifest(rawManifest, 'cad-chain', new Set()),
+      /must be one of: image, text, mesh, scene, audio, video, none/i,
+    )
+    const parsed = parseExtensionManifest(rawManifest, 'cad-chain', new Set(), false, {
+      governedAgentKinds: true,
+    })
+    assert.deepEqual(parsed.nodes.map((node) => ({
+      id: node.id, input: node.input, output: node.output, inputs: node.inputs,
+    })), [
+      { id: 'plan', input: 'text', output: 'plan', inputs: undefined },
+      { id: 'compile', input: 'plan', output: 'source', inputs: undefined },
+      { id: 'build', input: 'source', output: 'step', inputs: [
+        { name: 'plan', type: 'plan', required: true },
+        { name: 'source', type: 'source', required: true },
+      ] },
+    ])
+    const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
+    assert.deepEqual(inventory.errors, [])
+    assert.deepEqual(inventory.capabilities.map((capability) => ({
+      id: capability.id,
+      input: capability.node.input,
+      output: capability.node.output,
+      outputs: capability.node.outputs,
+    })), [
+      { id: 'cad-chain/build', input: 'source', output: 'step', outputs: ['step', 'glb'] },
+      { id: 'cad-chain/compile', input: 'plan', output: 'source', outputs: ['source'] },
+      { id: 'cad-chain/plan', input: 'text', output: 'plan', outputs: ['plan'] },
+    ])
+
+    const mismatchedManifest = JSON.parse(await readFile(join(extensionDir, 'manifest.json'), 'utf8'))
+    mismatchedManifest.nodes[2].output = 'mesh'
+    await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify(mismatchedManifest))
+    const mismatched = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
+    assert.deepEqual(mismatched.capabilities.map((capability) => capability.id), [
+      'cad-chain/compile', 'cad-chain/plan',
+    ])
+    assert.deepEqual(mismatched.errors, [{
+      code: 'PROCESS_AGENT_METADATA_INVALID',
+      message: 'An Agent process declaration is invalid and was excluded.',
+      capabilityId: 'cad-chain/build',
+    }])
+    assert.deepEqual(
+      (await listVisibleExtensions({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() }))
+        .map((extension) => extension.id),
+      ['cad-chain'],
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('runtime files are identity-bound and missing, symlinked, directory, or changed files deny only Agent inventory', async (t) => {
   if (process.platform === 'win32') t.skip('O_NOFOLLOW identity coverage is POSIX-specific')
   const root = await mkdtemp(join(tmpdir(), 'modly-agent-process-runtime-'))
@@ -246,8 +356,8 @@ test('Agent inventory denies duplicate capability IDs across roots and duplicate
     ...processManifest(),
     id: 'duplicate-nodes',
     nodes: [
-      { id: 'generate', input: 'text', output: 'mesh', params_schema: [], agent: duplicateDeclaration },
-      { id: 'generate', input: 'text', output: 'mesh', params_schema: [], agent: duplicateDeclaration },
+      { id: 'generate', input: 'text', output: 'glb', params_schema: [], agent: duplicateDeclaration },
+      { id: 'generate', input: 'text', output: 'glb', params_schema: [], agent: duplicateDeclaration },
     ],
   }))
 

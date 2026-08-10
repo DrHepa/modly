@@ -18,6 +18,7 @@ const EXPECTED_TYPESCRIPT_TESTS = [
   'electron/main/agent-actions-service.test.ts',
   'electron/main/agent-artifact-verifier.test.ts',
   'electron/main/agent-capability-discovery.test.ts',
+  'electron/main/automation-capabilities.test.ts',
   'electron/main/agent-mcp-broker.test.ts',
   'electron/main/agent-mcp-manifest.test.ts',
   'electron/main/agent-model-access-gateway.test.ts',

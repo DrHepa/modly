@@ -426,6 +426,35 @@ test('parseExtensionManifest rejects unknown input metadata values', () => {
   )
 })
 
+test('ordinary PROCESS discovery keeps governed-only artifact kinds out of legacy workflow ports', () => {
+  for (const kind of ['plan', 'source', 'step', 'glb', 'blend'] as const) {
+    assert.throws(
+      () => parseExtensionManifest(
+        {
+          id: `governed-${kind}`,
+          type: 'process',
+          entry: 'processor.js',
+          nodes: [{ id: 'run', input: kind, output: kind }],
+        },
+        `governed-${kind}`,
+        new Set(),
+        false,
+      ),
+      /must be one of: image, text, mesh, scene, audio, video, none/i,
+    )
+  }
+
+  const legacy = parseExtensionManifest({
+    id: 'governed-output', type: 'process', entry: 'processor.js',
+    nodes: [{
+      id: 'run', input: 'text', output: 'glb',
+      automation: { substitution: { supported: true, artifactKinds: ['glb', 'mesh'] } },
+    }],
+  }, 'governed-output', new Set(), false)
+  assert.equal(legacy.nodes[0].output, 'mesh')
+  assert.deepEqual(legacy.nodes[0].automation?.substitution.artifactKinds, ['mesh'])
+})
+
 test('parseExtensionManifest rejects input none on process extensions', () => {
   assert.throws(
     () => parseExtensionManifest(

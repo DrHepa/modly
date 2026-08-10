@@ -38,6 +38,7 @@ import type {
   AgentActionsApi,
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
+  AgentCompletedArtifactContextV1,
   AgentOllamaModelSelectionV1,
   AgentSkillContextCapabilityRefV1,
   AgentSkillContextResolveRequestV1,
@@ -45,6 +46,7 @@ import type {
   AgentSkillsPublicSnapshotV1,
   JsonValue,
 } from '@shared/types/agentActions'
+import { ARTIFACT_KINDS, type ArtifactKind } from '@shared/types/artifacts'
 import type {
   AgentReflectedAction,
   AgentResponseAction,
@@ -81,6 +83,20 @@ interface AgentChatData {
   thinking?: string
 }
 
+interface AgentChatRequest {
+  messages: Array<{ role: string, content: string, images?: string[] }>
+  ollama_url: string
+  model: string
+  modelLeaseId: string
+  originSessionId: string
+  resolutionHash: string
+  context: Record<string, unknown>
+  thinking: ThinkingMode
+  capabilities: AgentCapabilityPromptView[]
+  completedArtifacts: AgentCompletedArtifactContextV1[]
+  skillContexts: AgentSkillContextResolveResultV1['contexts']
+}
+
 export interface AgentActionProposal {
   type: 'action_proposal'
   capabilityId: string
@@ -95,6 +111,10 @@ export interface AgentCapabilityPromptInputHint {
   required: boolean
   description: string
   options?: Array<string | number>
+  artifact?: {
+    kind: ArtifactKind
+    mediaTypes: string[]
+  }
 }
 
 export interface AgentCapabilityPromptView {
@@ -109,11 +129,15 @@ export interface AgentCapabilityPromptView {
 const MAX_AGENT_PROPOSALS = 4
 const MAX_AGENT_CAPABILITIES = 32
 const MAX_AGENT_CAPABILITY_BYTES = 32 * 1024
+const MAX_AGENT_COMPLETED_ARTIFACTS = 32
+const MAX_AGENT_COMPLETED_ARTIFACT_BYTES = 32 * 1024
 const MAX_AGENT_JSON_BYTES = 16 * 1024
 const UNSAFE_JSON_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const HASH_PATTERN = /^[a-f0-9]{64}$/
+const MIME_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/
+const AGENT_ARTIFACT_KINDS = new Set<string>(ARTIFACT_KINDS)
 const AGENT_SKILL_NAME_PATTERN = /^modly-[a-z0-9]+(?:-[a-z0-9]+)*-v1$/
 const GOVERNED_TERMINAL_STATUSES = new Set<AgentActionStatus>([
   'rejected', 'expired', 'completed', 'failed', 'cancelled',
@@ -344,12 +368,30 @@ function mcpInputHints(capability: AgentCapabilitySnapshotV1): AgentCapabilityPr
     const options = Array.isArray(property.enum)
       ? property.enum.filter((value): value is string | number => typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))).slice(0, 32)
       : undefined
+    const bindings = capability.execution?.kind === 'mcp_tool'
+      ? capability.execution.inputArtifacts?.filter((binding) => binding.argument === id) ?? []
+      : []
+    if (bindings.length > 1) throw new Error('Agent capability inventory contains duplicate MCP artifact bindings.')
+    const binding = bindings[0]
+    let artifact: AgentCapabilityPromptInputHint['artifact']
+    if (binding) {
+      if (!AGENT_ARTIFACT_KINDS.has(binding.kind)
+        || !Array.isArray(binding.mediaTypes) || binding.mediaTypes.length < 1 || binding.mediaTypes.length > 16
+        || new Set(binding.mediaTypes).size !== binding.mediaTypes.length
+        || binding.mediaTypes.some((mediaType) => typeof mediaType !== 'string'
+          || mediaType.length > 128 || mediaType !== mediaType.trim() || mediaType !== mediaType.toLowerCase()
+          || !MIME_TYPE_PATTERN.test(mediaType))) {
+        throw new Error('Agent capability inventory contains an invalid MCP artifact binding.')
+      }
+      artifact = { kind: binding.kind, mediaTypes: [...binding.mediaTypes] }
+    }
     return [{
       path: `arguments.${id}`,
       type,
       required: required.has(id),
       description,
       ...(options?.length ? { options } : {}),
+      ...(artifact ? { artifact } : {}),
     }]
   }).slice(0, 32)
 }
@@ -457,6 +499,106 @@ export async function resolveAgentSkillContextsForTurn(input: {
     throw new Error('Modly returned invalid Agent skill contexts.')
   }
   return { resolutionHash: result.resolutionHash, contexts: result.contexts }
+}
+
+function codeUnitCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function canonicalCompletedArtifactSort(
+  left: AgentCompletedArtifactContextV1,
+  right: AgentCompletedArtifactContextV1,
+): number {
+  return codeUnitCompare(left.id, right.id)
+    || codeUnitCompare(left.actionId, right.actionId)
+    || codeUnitCompare(left.kind, right.kind)
+    || codeUnitCompare(left.mediaType, right.mediaType)
+    || codeUnitCompare(left.sha256, right.sha256)
+    || left.sizeBytes - right.sizeBytes
+    || codeUnitCompare(left.capabilityId, right.capabilityId)
+    || codeUnitCompare(left.capabilityName, right.capabilityName)
+}
+
+interface CompletedArtifactCandidate {
+  artifact: AgentCompletedArtifactContextV1
+  updatedAtMs: number
+}
+
+export function buildCompletedArtifactContext(
+  actions: AgentActionPublicSummaryV1[],
+): AgentCompletedArtifactContextV1[] {
+  const candidates: CompletedArtifactCandidate[] = []
+  const artifactIdCounts = new Map<string, number>()
+
+  for (const action of actions) {
+    if (action.status !== 'completed') continue
+    const actionId = action.id
+    const capabilityId = action.capability?.id
+    const capabilityName = displayText(action.capability?.displayName, 80)
+    const updatedAtMs = Date.parse(action.updatedAt)
+    if (
+      typeof actionId !== 'string' || !OPAQUE_ID_PATTERN.test(actionId)
+      || typeof capabilityId !== 'string' || !CAPABILITY_ID_PATTERN.test(capabilityId)
+      || capabilityId.split('/').some((segment) => UNSAFE_JSON_KEYS.has(segment))
+      || !capabilityName
+      || !Number.isFinite(updatedAtMs) || new Date(updatedAtMs).toISOString() !== action.updatedAt
+      || !Array.isArray(action.outputs)
+    ) throw new Error('Modly returned invalid completed Agent artifacts.')
+
+    for (const output of action.outputs) {
+      if (
+        typeof output.id !== 'string' || !OPAQUE_ID_PATTERN.test(output.id)
+        || typeof output.kind !== 'string' || !AGENT_ARTIFACT_KINDS.has(output.kind)
+        || typeof output.mediaType !== 'string' || output.mediaType.length > 128
+        || output.mediaType !== output.mediaType.trim() || output.mediaType !== output.mediaType.toLowerCase()
+        || !MIME_TYPE_PATTERN.test(output.mediaType)
+        || typeof output.sha256 !== 'string' || !HASH_PATTERN.test(output.sha256)
+        || !Number.isSafeInteger(output.sizeBytes) || output.sizeBytes < 0
+      ) throw new Error('Modly returned invalid completed Agent artifacts.')
+      const artifact: AgentCompletedArtifactContextV1 = {
+        id: output.id,
+        kind: output.kind,
+        mediaType: output.mediaType,
+        sha256: output.sha256,
+        sizeBytes: output.sizeBytes,
+        actionId,
+        capabilityId,
+        capabilityName,
+      }
+      candidates.push({ artifact, updatedAtMs })
+      artifactIdCounts.set(output.id, (artifactIdCounts.get(output.id) ?? 0) + 1)
+    }
+  }
+
+  candidates.sort((left, right) => (
+    right.updatedAtMs - left.updatedAtMs
+    || codeUnitCompare(left.artifact.actionId, right.artifact.actionId)
+    || codeUnitCompare(left.artifact.id, right.artifact.id)
+  ))
+  const selected: AgentCompletedArtifactContextV1[] = []
+  for (const candidate of candidates) {
+    if (selected.length >= MAX_AGENT_COMPLETED_ARTIFACTS) break
+    if (artifactIdCounts.get(candidate.artifact.id) !== 1) continue
+    const next = [...selected, candidate.artifact].sort(canonicalCompletedArtifactSort)
+    if (new TextEncoder().encode(JSON.stringify(next)).byteLength <= MAX_AGENT_COMPLETED_ARTIFACT_BYTES) {
+      selected.push(candidate.artifact)
+    }
+  }
+  return selected.sort(canonicalCompletedArtifactSort)
+}
+
+export async function resolveCompletedArtifactsForTurn(input: {
+  originSessionId: string
+  isCurrent: () => boolean
+  signal: AbortSignal
+  list: AgentActionsApi['list']
+}): Promise<AgentCompletedArtifactContextV1[] | null> {
+  if (input.signal.aborted || !input.isCurrent()) return null
+  const result = await input.list({ originSessionId: input.originSessionId })
+  if (input.signal.aborted || !input.isCurrent()) return null
+  if (!result.ok) throw new Error('Completed Agent artifacts are unavailable.')
+  const artifacts = buildCompletedArtifactContext(result.actions)
+  return input.signal.aborted || !input.isCurrent() ? null : artifacts
 }
 
 export function normalizeLocalOllamaEndpoint(value: unknown): string | null {
@@ -842,17 +984,23 @@ export function createSubmissionGate() {
 }
 
 export interface OriginBoundUiToken {
+  readonly signal: AbortSignal
   isCurrent(): boolean
   run(update: () => void): void
 }
 
 export function createOriginBoundUiGate(getActiveSessionId: () => string | null) {
   let generation = 0
+  let controller = new AbortController()
   return {
     begin(sessionId: string): OriginBoundUiToken {
       const originGeneration = generation
-      const isCurrent = () => generation === originGeneration && getActiveSessionId() === sessionId
+      const signal = controller.signal
+      const isCurrent = () => !signal.aborted
+        && generation === originGeneration
+        && getActiveSessionId() === sessionId
       return {
+        signal,
         isCurrent,
         run(update: () => void): void {
           if (isCurrent()) update()
@@ -860,6 +1008,8 @@ export function createOriginBoundUiGate(getActiveSessionId: () => string | null)
       }
     },
     invalidate(): void {
+      controller.abort()
+      controller = new AbortController()
       generation += 1
     },
   }
@@ -1766,13 +1916,20 @@ export default function ChatPanel(): JSX.Element {
       setError(null)
     })
     try {
-      const [capabilityInventory, modelLeaseResult] = await Promise.all([
+      const [capabilityInventory, modelLeaseResult, completedArtifacts] = await Promise.all([
         window.electron.agentCapabilities.list(),
         window.electron.agentActions.leaseModel({
           originSessionId: originatingSessionId,
           model: selectedModel,
         }),
+        resolveCompletedArtifactsForTurn({
+          originSessionId: originatingSessionId,
+          isCurrent: uiToken.isCurrent,
+          signal: uiToken.signal,
+          list: (request) => window.electron.agentActions.list(request),
+        }),
       ])
+      if (!completedArtifacts || !uiToken.isCurrent()) return
       if (!modelLeaseResult.ok) throw new Error(governedActionErrorMessage(modelLeaseResult.error.code))
       const leaseExpiresAt = Date.parse(modelLeaseResult.lease.expiresAt)
       if (
@@ -1810,21 +1967,24 @@ export default function ChatPanel(): JSX.Element {
         delete context.workflowCompletion
       }
 
+      const request: AgentChatRequest = {
+        messages: apiMessages,
+        ollama_url: selectedModel.endpoint,
+        model: selectedModel.model,
+        modelLeaseId: modelLeaseResult.lease.id,
+        originSessionId: originatingSessionId,
+        resolutionHash: skillResolution.resolutionHash,
+        context,
+        thinking: selectedThinkingMode,
+        capabilities,
+        completedArtifacts,
+        skillContexts: skillResolution.contexts,
+      }
       const res = await fetch(`${apiUrl}/agent/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: apiMessages,
-          ollama_url: selectedModel.endpoint,
-          model: selectedModel.model,
-          modelLeaseId,
-          originSessionId: originatingSessionId,
-          resolutionHash: skillResolution.resolutionHash,
-          context,
-          thinking: selectedThinkingMode,
-          capabilities,
-          skillContexts: skillResolution.contexts,
-        }),
+        signal: uiToken.signal,
+        body: JSON.stringify(request),
       })
       const data = await parseAgentChatResponse(res)
       const proposalErrors = await handoffGovernedProposals(

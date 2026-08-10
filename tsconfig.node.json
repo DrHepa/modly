@@ -28,6 +28,8 @@
     "src/areas/generate/rigSkeleton.ts",
     "src/shared/types/agentSessions.ts",
     "src/shared/types/agentActions.ts",
+    "src/shared/types/agentWorkflows.ts",
+    "src/shared/workflowBuiltinContracts.ts",
     "src/shared/types/artifacts.ts"
   ]
 }

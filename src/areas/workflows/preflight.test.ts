@@ -129,3 +129,22 @@ test('preflight accepts a Video source connected to a video-to-mesh model', () =
 
   assert.deepEqual(issues, [])
 })
+
+test('preflight consumes the builtin videoPath contract and rejects a source without it', () => {
+  const workflow = createWorkflow([
+    createNode('video-source', 'videoNode', { enabled: true, params: {} }),
+    createNode('video-model', 'extensionNode', {
+      extensionId: 'lingbot-map/reconstruct',
+      enabled: true,
+      params: {},
+    }),
+  ])
+
+  const issues = validateWorkflowPreflight(workflow, [createModelExtension({
+    id: 'lingbot-map/reconstruct',
+    input: 'video',
+    output: 'mesh',
+  })])
+
+  assert.equal(issues.some((issue: { key: string }) => issue.key === 'video-source:missing:videoPath'), true)
+})

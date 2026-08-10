@@ -1,6 +1,7 @@
 import type { AnyExtension, ArtifactRegistryReadRequest, ArtifactRegistryReadResult, ArtifactRegistryWriteRequest, ArtifactRegistryWriteResult, AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult, EditedSceneArtifactWriteRequest, EditedSceneArtifactWriteResult, ExtensionInstallProgress, ExtensionInstallResult, HumanoidDraftSidecarReadRequest, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadRequest, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarWriteRequest, HumanoidPromotionSidecarWriteResult, LandmarkSidecarWriteRequest, LandmarkSidecarWriteResult, MotionRetargetSidecarReadRequest, MotionRetargetSidecarReadResult, MotionRetargetSidecarWriteRequest, MotionRetargetSidecarWriteResult, PoseClipSidecarReadRequest, PoseClipSidecarReadResult, PoseClipSidecarWriteRequest, PoseClipSidecarWriteResult, ProcessInput, RigMetaSidecarReadRequest, RigMetaSidecarReadResult, RigRenameSidecarReadRequest, RigRenameSidecarReadResult, RigRenameSidecarWriteRequest, RigRenameSidecarWriteResult, RuntimeReadinessAction, RuntimeReadinessActionResult, RuntimeReadinessResponse, VideoInputSelection, WorkspaceArtifactDownloadRequest, WorkspaceArtifactDownloadResult, WorkspaceArtifactPreviewRequest, WorkspaceArtifactPreviewResult, WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
 import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult } from '../../src/shared/types/agentActions.ts'
+import type { AgentWorkflowCreateRequest, AgentWorkflowCreateResult } from '../../src/shared/types/agentWorkflows.ts'
 import { invokeExtensionsRunProcess } from './run-process-ipc.ts'
 
 export type IpcRendererLike = {
@@ -40,6 +41,9 @@ export function createElectronApi({ ipcRenderer, webFrame }: ElectronApiDependen
     },
     agentCapabilities: {
       list: (): Promise<AgentCapabilityInventoryResult> => ipcRenderer.invoke('agentCapabilities:list') as Promise<AgentCapabilityInventoryResult>,
+    },
+    agentWorkflows: {
+      create: (request: AgentWorkflowCreateRequest): Promise<AgentWorkflowCreateResult> => ipcRenderer.invoke('agentWorkflows:create', request) as Promise<AgentWorkflowCreateResult>,
     },
     agentSessions: {
       list: (): Promise<AgentSessionListResult> => ipcRenderer.invoke('agentSessions:list') as Promise<AgentSessionListResult>,

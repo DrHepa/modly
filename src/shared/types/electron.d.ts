@@ -7,6 +7,7 @@ import type { MotionRetargetCorrectionIdentityV1, MotionRetargetCorrectionsV1, M
 import type { PlyKind } from '../ply/plyHeaderClassification.ts'
 import type { AgentSessionsApi } from './agentSessions.ts'
 import type { AgentActionsApi, AgentCapabilitiesApi, AgentCapabilityDeclarationV1 } from './agentActions.ts'
+import type { AgentWorkflowsApi } from './agentWorkflows.ts'
 
 export type {
   AgentActionApprovalV1,
@@ -31,6 +32,19 @@ export type {
   ArtifactRefV1,
   JsonValue,
 } from './agentActions.ts'
+
+export type {
+  AgentCreatedWorkflow,
+  AgentCreatedWorkflowEdge,
+  AgentCreatedWorkflowNode,
+  AgentWorkflowCreateErrorCode,
+  AgentWorkflowCreateRequest,
+  AgentWorkflowCreateResult,
+  AgentWorkflowGraphEdgeV1,
+  AgentWorkflowGraphNodeV1,
+  AgentWorkflowGraphV1,
+  AgentWorkflowsApi,
+} from './agentWorkflows.ts'
 
 export type {
   ArtifactKind,
@@ -1094,6 +1108,7 @@ declare global {
       agentActions: AgentActionsApi
       agentSessions: AgentSessionsApi
       agentCapabilities: AgentCapabilitiesApi
+      agentWorkflows: AgentWorkflowsApi
       shell: {
         openExternal: (url: string) => Promise<void>
       }

@@ -12,6 +12,7 @@ import {
   type AgentProcessArtifactContractV1,
   type AgentProcessModelAccessDeclarationV1,
   type AgentProcessPythonRuntimeBindingV1,
+  type AgentSkillsPublicSnapshotV1,
   type ArtifactRefV1,
   type JsonPrimitive,
   type JsonValue,
@@ -32,6 +33,7 @@ const OLLAMA_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z
 const WINDOWS_FORBIDDEN_SEGMENT_CHARACTER_PATTERN = /[<>:"|?*]/
 const WINDOWS_RESERVED_SEGMENT_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const EXECUTABLE_RESOURCE_EXTENSION = /\.(?:[cm]?js|[cm]?ts|py|pyc|pyz|zip|sh|bash|zsh|fish|exe|dll|so|dylib|wasm)$/i
+const AGENT_SKILL_NAME_PATTERN = /^modly-[a-z0-9]+(?:-[a-z0-9]+)*-v1$/
 
 function fail(message: string): never {
   throw new TypeError(`Invalid canonical JSON: ${message}`)
@@ -236,6 +238,32 @@ export function assertArtifactRefV1(value: unknown): ArtifactRefV1 {
 function capabilityUnsigned(capability: AgentCapabilitySnapshotV1): Omit<AgentCapabilitySnapshotV1, 'hash'> {
   const { hash: _hash, ...unsigned } = capability
   return unsigned
+}
+
+function normalizeAgentSkillsPublicSnapshot(value: unknown): AgentSkillsPublicSnapshotV1 {
+  assertPlainRecord(value, 'Agent capability skills')
+  assertExactKeys(value, ['schema', 'version', 'hash', 'count', 'items'], 'Agent capability skills')
+  if (value.schema !== 'modly.agent-skills.v1' || value.version !== 1 || value.count !== 1) {
+    throw new TypeError('Agent capability skills schema, version, or count is invalid')
+  }
+  const hash = normalizeSha256(value.hash, 'Agent capability skills hash')
+  if (!Array.isArray(value.items) || value.items.length !== 1) {
+    throw new TypeError('Agent capability skills items must contain exactly one public item')
+  }
+  const item = value.items[0]
+  assertPlainRecord(item, 'Agent capability skill item')
+  assertExactKeys(item, ['name', 'version', 'hash'], 'Agent capability skill item')
+  const name = assertString(item.name, 'Agent capability skill item name', 96)
+  if (!AGENT_SKILL_NAME_PATTERN.test(name) || item.version !== 1) {
+    throw new TypeError('Agent capability skill item name or version is invalid')
+  }
+  return {
+    schema: 'modly.agent-skills.v1',
+    version: 1,
+    hash,
+    count: 1,
+    items: [{ name, version: 1, hash: normalizeSha256(item.hash, 'Agent capability skill item hash') }],
+  }
 }
 
 function normalizeProcessArtifactContract(value: unknown): AgentProcessArtifactContractV1 {
@@ -805,7 +833,7 @@ function normalizeAgentInputs(value: unknown): AgentSnapshotInputs | undefined {
 
 export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapabilitySnapshotV1 {
   assertPlainRecord(value, 'Agent capability snapshot')
-  assertExactKeys(value, ['schema', 'version', 'id', 'displayName', 'description', 'extension', 'node', 'execution', 'approval', 'hash'], 'Agent capability snapshot')
+  assertExactKeys(value, ['schema', 'version', 'id', 'displayName', 'description', 'extension', 'node', 'execution', 'skills', 'approval', 'hash'], 'Agent capability snapshot')
   if (value.schema !== 'modly.agent-capability.v1' || value.version !== 1) throw new TypeError('Agent capability snapshot schema/version is invalid')
   const id = assertString(value.id, 'Agent capability id', 257)
   const idSegments = id.split('/')
@@ -841,6 +869,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
   const paramsSchema = normalizeAgentParamsSchema(value.node.paramsSchema)
   const inputs = normalizeAgentInputs(value.node.inputs)
   const execution = normalizeExecution(value.execution)
+  const skills = value.skills === undefined ? undefined : normalizeAgentSkillsPublicSnapshot(value.skills)
 
   assertPlainRecord(value.approval, 'Agent capability approval')
   assertExactKeys(value.approval, ['required', 'scope'], 'Agent capability approval')
@@ -855,6 +884,7 @@ export function assertAgentCapabilitySnapshotV1(value: unknown): AgentCapability
       ...(inputs ? { inputs } : {}), paramsSchema,
     },
     ...(execution ? { execution } : {}),
+    ...(skills ? { skills } : {}),
     approval: { required: true, scope: 'single_action' }, hash,
   }
   if (id !== `${extension.id}/${nodeId}`) throw new TypeError('Agent capability id must match its extension and node identity')

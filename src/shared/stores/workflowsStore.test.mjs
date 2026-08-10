@@ -15,8 +15,9 @@ function loadStore() {
     configurable: true,
     value: {
       getItem: (key) => storage.get(key) ?? null,
-      setItem: (key, value) => { storage.set(key, value) },
+      setItem: (key, value) => { storage.set(key, String(value)) },
       removeItem: (key) => { storage.delete(key) },
+      clear: () => { storage.clear() },
     },
   })
   const outfile = join(mkdtempSync(join(tmpdir(), 'modly-wfstore-test-')), 'workflowsStore.cjs')

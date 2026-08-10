@@ -29,6 +29,26 @@ export interface AgentCapabilityDeclarationV1 {
   description: string
   approval: AgentApprovalPolicyV1
   process: AgentProcessDeclarationV1
+  skills?: AgentSkillsDeclarationV1
+}
+
+export interface AgentSkillsDeclarationV1 {
+  schema: 'modly.agent-skills.v1'
+  file: string
+}
+
+export interface AgentSkillPublicItemV1 {
+  name: string
+  version: 1
+  hash: string
+}
+
+export interface AgentSkillsPublicSnapshotV1 {
+  schema: 'modly.agent-skills.v1'
+  version: 1
+  hash: string
+  count: number
+  items: AgentSkillPublicItemV1[]
 }
 
 export interface AgentProcessArtifactPolicyV1 {
@@ -190,6 +210,7 @@ export interface AgentCapabilitySnapshotV1 {
     paramsSchema: JsonValue[]
   }
   execution?: AgentMcpToolExecutionV1 | AgentProcessExecutionV1
+  skills?: AgentSkillsPublicSnapshotV1
   approval: AgentApprovalPolicyV1
   hash: string
 }

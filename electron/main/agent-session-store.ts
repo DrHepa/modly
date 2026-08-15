@@ -47,6 +47,8 @@ export interface StoreOptions {
 const DOCUMENT_FILE = 'agent-sessions.json'
 const ATTACHMENTS_DIR = 'agent-session-attachments'
 const DEFAULT_TITLE = 'New chat'
+const LEGACY_REDACTION_MARKER = ['[redacted', ' private content]'].join('')
+const UNAVAILABLE_CONTENT = 'Content unavailable.'
 const MIME_EXTENSIONS = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp' } as const
 const PRIVATE_URI_PATTERN = /\b(?:data|file)\s*:/i
 const WEB_URL_PATTERN = /\bhttps?\s*:\s*\/\//i
@@ -104,10 +106,10 @@ function safePersistedText(value: unknown, max: number): value is string {
     && !containsCredentialMaterial(text)
 }
 
-function redactPersistedText(value: unknown, max: number): string | null {
-  if (!nonEmptyString(value, max)) return null
-  if (containsPrivateLocation(value) || containsCredentialMaterial(value)) return '[redacted private content]'
-  return value
+function migrateLegacyRedactionMarker(text: string): string {
+  return text.includes(LEGACY_REDACTION_MARKER)
+    ? text.replaceAll(LEGACY_REDACTION_MARKER, UNAVAILABLE_CONTENT)
+    : text
 }
 
 function safeAttachmentDisplayName(value: string, mimeType: keyof typeof MIME_EXTENSIONS): string {
@@ -229,6 +231,31 @@ function parseStrictDocument(value: unknown): AgentSessionDocumentV1 | null {
   if (!parsed.some((session) => session.id === value.activeSessionId)) return null
   if (new Set(parsed.map((session) => session.id)).size !== parsed.length) return null
   return { schema: AGENT_SESSION_SCHEMA, version: AGENT_SESSION_SCHEMA_VERSION, activeSessionId: value.activeSessionId, sessions: parsed }
+}
+
+function migrateLegacyDocument(document: AgentSessionDocumentV1): { document: AgentSessionDocumentV1, changed: boolean } {
+  let changed = false
+  const sessions = document.sessions.map((session) => {
+    const title = migrateLegacyRedactionMarker(session.title)
+    let sessionChanged = title !== session.title
+    const messages = session.messages.map((message) => {
+      const content = migrateLegacyRedactionMarker(message.content)
+      let messageChanged = content !== message.content
+      const summaries = message.summaries.map((summary) => {
+        const label = migrateLegacyRedactionMarker(summary.label)
+        if (label === summary.label) return summary
+        messageChanged = true
+        return { ...summary, label } as AgentSessionSummary
+      })
+      if (!messageChanged) return message
+      sessionChanged = true
+      return { ...message, content, summaries }
+    })
+    if (!sessionChanged) return session
+    changed = true
+    return { ...session, title, messages }
+  })
+  return changed ? { document: { ...document, sessions }, changed } : { document, changed }
 }
 
 function listItem(session: AgentSession): AgentSessionListItem {
@@ -456,8 +483,9 @@ export class AgentSessionStore {
   private newSession(title = DEFAULT_TITLE): AgentSession {
     const now = this.now()
     const timestamp = new Date(now).toISOString()
+    const migratedTitle = migrateLegacyRedactionMarker(title)
     return {
-      id: this.randomId(), title: title.trim() || DEFAULT_TITLE, revision: 1,
+      id: this.randomId(), title: migratedTitle.trim() || DEFAULT_TITLE, revision: 1,
       createdAt: timestamp, updatedAt: timestamp, expiresAt: new Date(now + AGENT_SESSION_TTL_MS).toISOString(),
       messages: [], attachments: [],
     }
@@ -527,6 +555,7 @@ export class AgentSessionStore {
     await this.pruneTempFiles()
     await this.pruneCorruptBackups()
     let document = parseStrictDocument(raw)
+    let rewriteDocument = false
     if (!document) {
       await this.backupCorrupt()
       const parsedCandidates = isRecord(raw) && Array.isArray(raw.sessions) ? raw.sessions.map(parseSession).filter((item): item is AgentSession => item !== null) : []
@@ -540,8 +569,11 @@ export class AgentSessionStore {
       document = candidates.length > 0 && active
         ? { schema: AGENT_SESSION_SCHEMA, version: AGENT_SESSION_SCHEMA_VERSION, activeSessionId: active, sessions: candidates }
         : this.freshDocument()
-      await this.writeDocument(document)
+      rewriteDocument = true
     }
+    const migrated = migrateLegacyDocument(document)
+    document = migrated.document
+    if (rewriteDocument || migrated.changed) await this.writeDocument(document)
     document = await this.pruneExpired(document)
     await this.pruneOrphans(document)
     return { document, readOnly: false }
@@ -694,7 +726,7 @@ export class AgentSessionStore {
       if (!isRecord(request) || !hasOnlyKeys(request, ['sessionId', 'expectedRevision', 'title']) || !safePersistedText(request.title, 200)) throw new Error('Invalid agent session rename request.')
       const loaded = await this.load(); const document = this.requireWritable(loaded); const session = this.find(document, request.sessionId)
       this.checkRevision(session, request.expectedRevision)
-      const title = request.title.trim()
+      const title = migrateLegacyRedactionMarker(request.title).trim()
       if (title === session.title) return session
       const updated = this.mutate(session, { title })
       await this.writeDocument({ ...document, sessions: document.sessions.map((item) => item.id === updated.id ? updated : item) })
@@ -707,11 +739,14 @@ export class AgentSessionStore {
       if (!isRecord(request) || !hasOnlyKeys(request, ['sessionId', 'expectedRevision', 'message']) || !isRecord(request.message)) throw new Error('Invalid agent session message request.')
       if (!hasOnlyKeys(request.message, ['id', 'role', 'content', 'attachmentIds', 'summaries'])) throw new Error('Agent messages may contain only allowed fields.')
       const summaries = Array.isArray(request.message.summaries)
-        ? request.message.summaries.map((summary) => isRecord(summary) && typeof summary.label === 'string'
-          ? { ...summary, label: redactPersistedText(summary.label, 300) }
+        ? request.message.summaries.map((summary) => isRecord(summary) && nonEmptyString(summary.label, 300)
+          ? { ...summary, label: migrateLegacyRedactionMarker(summary.label) }
           : summary)
         : []
-      const message = parseMessage({ ...request.message, attachmentIds: request.message.attachmentIds ?? [], summaries })
+      const content = nonEmptyString(request.message.content, 100_000)
+        ? migrateLegacyRedactionMarker(request.message.content)
+        : request.message.content
+      const message = parseMessage({ ...request.message, content, attachmentIds: request.message.attachmentIds ?? [], summaries })
       if (!message) throw new Error('Invalid agent session message.')
       const loaded = await this.load(); const document = this.requireWritable(loaded); const session = this.find(document, request.sessionId)
       this.checkRevision(session, request.expectedRevision)

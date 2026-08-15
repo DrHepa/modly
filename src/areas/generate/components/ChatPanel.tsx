@@ -40,6 +40,7 @@ import type {
   AgentCapabilityInventoryResult,
   AgentCapabilitySnapshotV1,
   AgentCompletedArtifactContextV1,
+  AgentModelLeaseResult,
   AgentOllamaModelSelectionV1,
   AgentSkillContextCapabilityRefV1,
   AgentSkillContextResolveRequestV1,
@@ -88,9 +89,9 @@ interface AgentChatRequest {
   messages: Array<{ role: string, content: string, images?: string[] }>
   model: string
   provider: { type: string, base_url?: string, api_key?: string }
-  modelLeaseId?: string
-  originSessionId?: string
-  resolutionHash?: string
+  modelLeaseId: string | null
+  originSessionId: string
+  resolutionHash: string | null
   context: Record<string, unknown>
   thinking: ThinkingMode
   capabilities: AgentCapabilityPromptView[]
@@ -294,6 +295,42 @@ export async function parseAgentChatResponse(
   }
 }
 
+export async function runAgentChatWithOptionalProposalAuthority<T>(input: {
+  leaseModel: () => Promise<AgentModelLeaseResult>
+  send: (modelLeaseId: string | null) => Promise<T>
+  accept: (response: T, modelLeaseId: string | null) => Promise<void>
+  recover?: (error: unknown, modelLeaseId: string | null) => Promise<void>
+  proposalAuthorityAvailable?: boolean
+  onAuthorityResolved?: (modelLeaseId: string | null) => void
+  now?: () => number
+}): Promise<{ response: T, modelLeaseId: string | null }> {
+  let modelLeaseId: string | null = null
+  if (input.proposalAuthorityAvailable !== false) {
+    try {
+      const result = await input.leaseModel()
+      if (result.ok) {
+        const expiresAt = Date.parse(result.lease.expiresAt)
+        if (
+          OPAQUE_ID_PATTERN.test(result.lease.id)
+          && Number.isFinite(expiresAt)
+          && expiresAt > (input.now ?? Date.now)()
+        ) modelLeaseId = result.lease.id
+      }
+    } catch {
+      // Proposal authority is optional for normal chat. Protected actions remain unavailable.
+    }
+  }
+  input.onAuthorityResolved?.(modelLeaseId)
+  try {
+    const response = await input.send(modelLeaseId)
+    await input.accept(response, modelLeaseId)
+    return { response, modelLeaseId }
+  } catch (error) {
+    await input.recover?.(error, modelLeaseId)
+    throw error
+  }
+}
+
 export interface AgentActionFailure<T> {
   action: T
   error: unknown
@@ -317,6 +354,21 @@ export async function applyAgentActions<T>(
 export function withActionFailureSummary(message: string, failureCount: number): string {
   if (failureCount <= 0) return message
   return `${message} ${failureCount} action${failureCount === 1 ? '' : 's'} could not be applied locally.`
+}
+
+export function agentTurnFailureMessage(input: {
+  error: unknown
+  actionFailureCount: number
+  partialSummaryError: string | null
+  proposalErrors: GovernedActionHandoffError[]
+}): string {
+  const message = input.error instanceof Error ? input.error.message : String(input.error)
+  const safeMessage = message.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : message
+  return [
+    withActionFailureSummary(safeMessage, input.actionFailureCount),
+    input.partialSummaryError,
+    ...input.proposalErrors.map((failure) => failure.message),
+  ].filter((value): value is string => Boolean(value)).join(' ')
 }
 
 function displayText(value: unknown, maxLength: number): string | null {
@@ -486,8 +538,11 @@ export async function resolveAgentSkillContextsForTurn(input: {
   resolve: (request: AgentSkillContextResolveRequestV1) => Promise<AgentSkillContextResolveResultV1>
 }): Promise<AgentSkillContextResolveResultV1 | null> {
   if (!input.isCurrent()) return null
-  if (input.userText.length < 1 || input.userText.length > 4_096
-    || new TextEncoder().encode(input.userText).byteLength > 8_192) return null
+  if (input.userText.length < 1) return null
+  if (input.userText.length > 4_096
+    || new TextEncoder().encode(input.userText).byteLength > 8_192) {
+    throw new Error('The Agent message is too long to process safely.')
+  }
   const result = await input.resolve({
     originSessionId: input.originSessionId,
     userText: input.userText,
@@ -500,6 +555,65 @@ export async function resolveAgentSkillContextsForTurn(input: {
     throw new Error('Modly returned invalid Agent skill contexts.')
   }
   return { resolutionHash: result.resolutionHash, contexts: result.contexts }
+}
+
+export async function resolveOptionalAgentProtectedContext(input: {
+  originSessionId: string
+  userText: string
+  isCurrent: () => boolean
+  signal: AbortSignal
+  listCapabilities: () => Promise<AgentCapabilityInventoryResult>
+  listCompletedArtifacts: () => Promise<AgentCompletedArtifactContextV1[] | null>
+  resolveSkillContexts: (
+    capabilityRefs: AgentSkillContextCapabilityRefV1[],
+  ) => Promise<AgentSkillContextResolveResultV1 | null>
+}): Promise<{
+  capabilities: AgentCapabilityPromptView[]
+  completedArtifacts: AgentCompletedArtifactContextV1[]
+  skillContexts: AgentSkillContextResolveResultV1['contexts']
+  resolutionHash: string | null
+  proposalAuthorityAvailable: boolean
+} | null> {
+  if (input.signal.aborted || !input.isCurrent()) return null
+  if (input.userText.length < 1 || input.userText.length > 4_096
+    || new TextEncoder().encode(input.userText).byteLength > 8_192) {
+    return {
+      capabilities: [],
+      completedArtifacts: [],
+      skillContexts: [],
+      resolutionHash: null,
+      proposalAuthorityAvailable: false,
+    }
+  }
+  try {
+    const [inventory, completedArtifacts] = await Promise.all([
+      input.listCapabilities(),
+      input.listCompletedArtifacts(),
+    ])
+    if (input.signal.aborted || !input.isCurrent()) return null
+    if (!completedArtifacts) throw new Error('Completed Agent artifacts are unavailable.')
+    const capabilities = buildAgentCapabilityPromptInventory(inventory)
+    const capabilityRefs = buildAgentSkillContextRefs(inventory)
+    const skillResolution = await input.resolveSkillContexts(capabilityRefs)
+    if (input.signal.aborted || !input.isCurrent()) return null
+    if (!skillResolution) throw new Error('Agent skill guidance is unavailable.')
+    return {
+      capabilities,
+      completedArtifacts,
+      skillContexts: skillResolution.contexts,
+      resolutionHash: skillResolution.resolutionHash,
+      proposalAuthorityAvailable: true,
+    }
+  } catch {
+    if (input.signal.aborted || !input.isCurrent()) return null
+    return {
+      capabilities: [],
+      completedArtifacts: [],
+      skillContexts: [],
+      resolutionHash: null,
+      proposalAuthorityAvailable: false,
+    }
+  }
 }
 
 function codeUnitCompare(left: string, right: string): number {
@@ -1736,10 +1850,14 @@ export default function ChatPanel(): JSX.Element {
   async function handoffGovernedProposals(
     proposals: AgentActionProposal[],
     originSessionId: string,
-    modelLeaseId: string,
+    modelLeaseId: string | null,
     uiToken: OriginBoundUiToken,
   ): Promise<GovernedActionHandoffError[]> {
     if (proposals.length === 0) return []
+    if (!modelLeaseId) return [{
+      code: 'model_stale',
+      message: 'This protected action could not be proposed because proposal authority is unavailable.',
+    }]
     const handoff = await proposeGovernedAgentActions({
       proposals,
       originSessionId,
@@ -1916,55 +2034,14 @@ export default function ChatPanel(): JSX.Element {
       model,
     } : null
     const selectedThinkingMode = thinkingMode
-    let modelLeaseId: string | null = null
+    let actionFailureCount = 0
+    let proposalErrors: GovernedActionHandoffError[] = []
+    let partialSummaryError: string | null = null
     uiToken.run(() => {
       setIsLoading(true)
       setError(null)
     })
     try {
-      let capabilities: ReturnType<typeof buildAgentCapabilityPromptInventory> = []
-      let capabilityRefs: AgentSkillContextCapabilityRefV1[] = []
-      if (selectedModel) {
-        try {
-          const [capabilityInventory, modelLeaseResult] = await Promise.all([
-            window.electron.agentCapabilities.list(),
-            window.electron.agentActions.leaseModel({
-              originSessionId: originatingSessionId,
-              model: selectedModel,
-            }),
-          ])
-          if (modelLeaseResult.ok) {
-            const leaseExpiresAt = Date.parse(modelLeaseResult.lease.expiresAt)
-            if (
-              OPAQUE_ID_PATTERN.test(modelLeaseResult.lease.id)
-              && Number.isFinite(leaseExpiresAt)
-              && leaseExpiresAt > Date.now()
-            ) {
-              modelLeaseId = modelLeaseResult.lease.id
-              capabilities = buildAgentCapabilityPromptInventory(capabilityInventory)
-              capabilityRefs = buildAgentSkillContextRefs(capabilityInventory)
-            }
-          }
-        } catch {
-          // Governed lease/discovery failures never block ordinary read-only chat.
-        }
-      }
-      let completedArtifacts: AgentCompletedArtifactContextV1[] = []
-      try {
-        const resolvedArtifacts = await resolveCompletedArtifactsForTurn({
-          originSessionId: originatingSessionId,
-          isCurrent: uiToken.isCurrent,
-          signal: uiToken.signal,
-          list: (request) => window.electron.agentActions.list(request),
-        })
-        if (resolvedArtifacts) completedArtifacts = resolvedArtifacts
-      } catch {
-        // Optional completed-artifact context failures never block ordinary chat.
-      }
-      if (!uiToken.isCurrent()) return
-      const context = { ...buildContext(), ...extraContext }
-
-      // Inject workflow completion as a system hint if present
       const apiMessages = msgs.map((m) => {
         const entry: { role: string; content: string; images?: string[] } = {
           role: m.role,
@@ -1976,131 +2053,154 @@ export default function ChatPanel(): JSX.Element {
         return entry
       })
       const latestUserText = [...apiMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
-      let skillResolution: AgentSkillContextResolveResultV1 | null = null
-      if (modelLeaseId) {
-        try {
-          skillResolution = await resolveAgentSkillContextsForTurn({
-            originSessionId: originatingSessionId,
-            userText: latestUserText,
-            capabilityRefs,
-            isCurrent: uiToken.isCurrent,
-            resolve: (request) => window.electron.agentCapabilities.resolveSkillContexts(request),
-          })
-        } catch {
-          // Optional skill guidance failures never block ordinary chat.
-        }
-      }
-      if (!uiToken.isCurrent()) return
+      const protectedContext = await resolveOptionalAgentProtectedContext({
+        originSessionId: originatingSessionId,
+        userText: latestUserText,
+        isCurrent: uiToken.isCurrent,
+        signal: uiToken.signal,
+        listCapabilities: () => window.electron.agentCapabilities.list(),
+        listCompletedArtifacts: () => resolveCompletedArtifactsForTurn({
+          originSessionId: originatingSessionId,
+          isCurrent: uiToken.isCurrent,
+          signal: uiToken.signal,
+          list: (request) => window.electron.agentActions.list(request),
+        }),
+        resolveSkillContexts: (capabilityRefs) => resolveAgentSkillContextsForTurn({
+          originSessionId: originatingSessionId,
+          userText: latestUserText,
+          capabilityRefs,
+          isCurrent: uiToken.isCurrent,
+          resolve: (request) => window.electron.agentCapabilities.resolveSkillContexts(request),
+        }),
+      })
+      if (!protectedContext || !uiToken.isCurrent()) return
+      const {
+        capabilities,
+        completedArtifacts,
+        skillContexts,
+        resolutionHash,
+        proposalAuthorityAvailable,
+      } = protectedContext
+      const context = { ...buildContext(), ...extraContext }
+
+      // Inject workflow completion as a system hint if present
       if (extraContext.workflowCompletion) {
         apiMessages.push({ role: 'system', content: extraContext.workflowCompletion as string })
         delete context.workflowCompletion
       }
 
-      const request: AgentChatRequest = {
-        messages: apiMessages,
-        model,
-        provider: selectedProvider,
-        modelLeaseId: modelLeaseId ?? undefined,
-        ...(skillResolution ? {
-          originSessionId: originatingSessionId,
-          resolutionHash: skillResolution.resolutionHash,
-        } : {}),
-        context,
-        thinking: selectedThinkingMode,
-        capabilities,
-        completedArtifacts,
-        ...(skillResolution ? { skillContexts: skillResolution.contexts } : {}),
-      }
-      const res = await fetch(`${apiUrl}/agent/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: uiToken.signal,
-        body: JSON.stringify(request),
-      })
-      const data = await parseAgentChatResponse(res)
-      const proposalErrors = modelLeaseId ? await handoffGovernedProposals(
-        data.proposals,
-        originatingSessionId,
-        modelLeaseId,
-        uiToken,
-      ) : []
+      await runAgentChatWithOptionalProposalAuthority({
+        proposalAuthorityAvailable: proposalAuthorityAvailable && selectedModel !== null,
+        leaseModel: async () => {
+          if (!selectedModel) throw new Error('Proposal authority is unavailable for this provider.')
+          return window.electron.agentActions.leaseModel({
+            originSessionId: originatingSessionId,
+            model: selectedModel,
+          })
+        },
+        send: async (resolvedModelLeaseId) => {
+          const request: AgentChatRequest = {
+            messages: apiMessages,
+            model,
+            provider: selectedProvider,
+            modelLeaseId: resolvedModelLeaseId,
+            originSessionId: originatingSessionId,
+            resolutionHash,
+            context,
+            thinking: selectedThinkingMode,
+            capabilities,
+            completedArtifacts,
+            skillContexts,
+          }
+          const res = await fetch(`${apiUrl}/agent/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: uiToken.signal,
+            body: JSON.stringify(request),
+          })
+          return parseAgentChatResponse(res)
+        },
+        accept: async (data, resolvedModelLeaseId) => {
+          const actionApplication = await applyCompletedActions(data.actions, originatingSessionId, uiToken, msgs)
+          const actionFailures = actionApplication.failures
+          const reflectedActions = actionApplication.reflectedActions
+          const assistantMessage: Message = {
+            id: `a-${Date.now()}`,
+            role: 'assistant',
+            content: data.message,
+            thinking: data.thinking ?? undefined,
+            actions: reflectedActions.length ? reflectedActions : undefined,
+          }
+          await appendPersistedMessage(originatingSessionId, {
+            id: assistantMessage.id,
+            role: assistantMessage.role,
+            content: assistantMessage.content,
+            summaries: reflectedActions
+              .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
+          })
+          proposalErrors = await handoffGovernedProposals(
+            data.proposals,
+            originatingSessionId,
+            resolvedModelLeaseId,
+            uiToken,
+          )
+          uiToken.run(() => {
+            const nextMessages = appendOrReplaceMessage(messagesRef.current, assistantMessage)
+            messagesRef.current = nextMessages
+            setMessages(nextMessages)
+            if (proposalErrors.length > 0) setError(proposalErrors.map((failure) => failure.message).join(' '))
+          })
 
-      const actionApplication = await applyCompletedActions(data.actions, originatingSessionId, uiToken, msgs)
-      const actionFailures = actionApplication.failures
-      const reflectedActions = actionApplication.reflectedActions
-      const assistantMessage: Message = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: data.message,
-        thinking: data.thinking ?? undefined,
-        actions: reflectedActions.length ? reflectedActions : undefined,
-      }
-      await appendPersistedMessage(originatingSessionId, {
-        id: assistantMessage.id,
-        role: assistantMessage.role,
-        content: assistantMessage.content,
-        summaries: reflectedActions
-          .map((action, index) => completedActionSummary(action, assistantMessage.id, index)),
-      })
-      uiToken.run(() => {
-        const nextMessages = appendOrReplaceMessage(messagesRef.current, assistantMessage)
-        messagesRef.current = nextMessages
-        setMessages(nextMessages)
-        if (proposalErrors.length > 0) setError(proposalErrors.map((failure) => failure.message).join(' '))
-      })
-
-      if (actionFailures.length > 0) {
-        throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
-      }
-    } catch (e: unknown) {
-      let actionFailureCount = 0
-      let proposalErrors: GovernedActionHandoffError[] = []
-      let partialSummaryError: string | null = null
-      if (e instanceof AgentApiError) {
-        if (modelLeaseId) proposalErrors = await handoffGovernedProposals(
-          e.proposals,
-          originatingSessionId,
-          modelLeaseId,
-          uiToken,
-        )
-        if (e.actions.length > 0) {
-          const application = await applyCompletedActions(e.actions, originatingSessionId, uiToken, msgs)
-          actionFailureCount = application.failures.length
-          if (application.reflectedActions.length > 0) {
-            const partialMessage: Message = {
-              id: `a-partial-${Date.now()}`,
-              role: 'assistant',
-              content: 'Completed local actions before the Agent request stopped.',
-              actions: application.reflectedActions,
-            }
-            try {
-              await appendPersistedMessage(originatingSessionId, {
-                id: partialMessage.id,
-                role: partialMessage.role,
-                content: partialMessage.content,
-                summaries: application.reflectedActions.map((action, index) => (
-                  completedActionSummary(action, partialMessage.id, index)
-                )),
-              })
-              uiToken.run(() => {
-                const nextMessages = appendOrReplaceMessage(messagesRef.current, partialMessage)
-                messagesRef.current = nextMessages
-                setMessages(nextMessages)
-              })
-            } catch {
-              partialSummaryError = 'Completed actions could not be saved to this chat session.'
+          if (actionFailures.length > 0) {
+            throw new Error(withActionFailureSummary('The agent response was received.', actionFailures.length))
+          }
+        },
+        recover: async (error, resolvedModelLeaseId) => {
+          if (!(error instanceof AgentApiError)) return
+          if (error.actions.length > 0) {
+            const application = await applyCompletedActions(error.actions, originatingSessionId, uiToken, msgs)
+            actionFailureCount = application.failures.length
+            if (application.reflectedActions.length > 0) {
+              const partialMessage: Message = {
+                id: `a-partial-${Date.now()}`,
+                role: 'assistant',
+                content: 'Completed local actions before the Agent request stopped.',
+                actions: application.reflectedActions,
+              }
+              try {
+                await appendPersistedMessage(originatingSessionId, {
+                  id: partialMessage.id,
+                  role: partialMessage.role,
+                  content: partialMessage.content,
+                  summaries: application.reflectedActions.map((action, index) => (
+                    completedActionSummary(action, partialMessage.id, index)
+                  )),
+                })
+                uiToken.run(() => {
+                  const nextMessages = appendOrReplaceMessage(messagesRef.current, partialMessage)
+                  messagesRef.current = nextMessages
+                  setMessages(nextMessages)
+                })
+              } catch {
+                partialSummaryError = 'Completed actions could not be saved to this chat session.'
+              }
             }
           }
-        }
-      }
-      const msg = e instanceof Error ? e.message : String(e)
-      const safeMessage = msg.includes('fetch') ? 'Cannot reach Modly API. Is the backend running?' : msg
-      const primaryMessage = withActionFailureSummary(safeMessage, actionFailureCount)
-      uiToken.run(() => setError(
-        [primaryMessage, partialSummaryError, ...proposalErrors.map((failure) => failure.message)]
-          .filter((message): message is string => Boolean(message))
-          .join(' '),
-      ))
+          proposalErrors = await handoffGovernedProposals(
+            error.proposals,
+            originatingSessionId,
+            resolvedModelLeaseId,
+            uiToken,
+          )
+        },
+      })
+    } catch (e: unknown) {
+      uiToken.run(() => setError(agentTurnFailureMessage({
+        error: e,
+        actionFailureCount,
+        partialSummaryError,
+        proposalErrors,
+      })))
     } finally {
       uiToken.run(() => setIsLoading(false))
     }

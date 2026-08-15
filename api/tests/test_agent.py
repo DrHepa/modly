@@ -72,13 +72,14 @@ def capability(capability_id="text-to-cad/generate", *, digest=None, name="Text 
 def chat_request(**values):
     messages = values.pop("messages", [])
     capabilities = values.pop("capabilities", [])
+    model_lease_id = values.pop("modelLeaseId", MODEL_LEASE_ID)
     origin_session_id = values.pop("originSessionId", "session-a")
     resolution_hash = values.pop(
         "resolutionHash",
         canonical_hash(skill_resolution_binding(origin_session_id, messages, capabilities)),
     )
     return agent.AgentChatRequest(
-        modelLeaseId=MODEL_LEASE_ID,
+        modelLeaseId=model_lease_id,
         originSessionId=origin_session_id,
         resolutionHash=resolution_hash,
         messages=messages,
@@ -1054,6 +1055,87 @@ def test_agent_emits_bounded_proposal_events_without_executing_or_reporting_perf
         "arguments",
     }
     assert rounds[1]["messages"][-1]["tool_name"] == "propose_capability_action"
+
+
+def test_agent_without_proposal_authority_keeps_normal_tools_and_rejects_hallucinated_proposal(monkeypatch):
+    rounds = []
+    executed = []
+
+    async def fake_stream(_client, _url, payload, round_number):
+        rounds.append(json.loads(json.dumps(payload)))
+        if round_number == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "list_models", "arguments": {}}},
+                    {"function": {"name": "unload_models", "arguments": {}}},
+                    {"function": {
+                        "name": "propose_capability_action",
+                        "arguments": {
+                            "capability_id": "text-to-cad/generate",
+                            "arguments": {"input": "chair"},
+                        },
+                    }},
+                ],
+            }
+        return {"role": "assistant", "content": "I can explain capabilities, but no protected proposal was recorded."}
+
+    async def fake_execute(name, _arguments, _context):
+        executed.append(name)
+        if name == "list_models":
+            return json.dumps({"models": []}), None
+        if name == "unload_models":
+            return json.dumps({"code": "direct_action_recorded"}), {
+                "type": "models_unloaded",
+                "actionId": f"direct-{'a' * 32}",
+            }
+        raise AssertionError("a hallucinated protected proposal must fail closed before tool execution")
+
+    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "execute_tool", fake_execute)
+
+    request = chat_request(messages=[], capabilities=[capability()], modelLeaseId=None)
+    response = run(agent.agent_chat(request))
+
+    exposed = {tool["function"]["name"] for tool in rounds[0]["tools"]}
+    assert {"list_models", "list_processes", "unload_models", "run_workflow"} <= exposed
+    assert "propose_capability_action" not in exposed
+    assert "propose_capability_action" not in rounds[0]["messages"][0]["content"]
+    assert executed == ["list_models", "unload_models"]
+    assert len(rounds) == 1
+    assert "authority is unavailable" in response.message.lower()
+    assert [action.tool for action in response.actions] == ["list_models", "unload_models"]
+    assert response.proposals == []
+
+
+def test_agent_with_proposal_authority_preserves_the_existing_system_guidance(monkeypatch):
+    rounds = []
+
+    async def fake_stream(_client, _url, payload, _round_number):
+        rounds.append(payload)
+        return {"role": "assistant", "content": "Ready."}
+
+    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    response = run(agent.agent_chat(chat_request(capabilities=[capability()])))
+
+    assert response.message == "Ready."
+    assert rounds[0]["messages"][0]["content"] == agent.SYSTEM_PROMPT
+    assert "propose_capability_action" in {tool["function"]["name"] for tool in rounds[0]["tools"]}
+
+
+def test_agent_accepts_absent_protected_context_binding_without_proposal_authority(monkeypatch):
+    rounds = []
+
+    async def fake_stream(_client, _url, payload, _round_number):
+        rounds.append(payload)
+        return {"role": "assistant", "content": "Ordinary chat still works."}
+
+    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    response = run(agent.agent_chat(chat_request(modelLeaseId=None, resolutionHash=None)))
+
+    assert response.message == "Ordinary chat still works."
+    assert rounds[0]["messages"][0]["content"] == agent.SYSTEM_PROMPT_WITHOUT_PROPOSAL_AUTHORITY
 
 
 def test_agent_rejects_model_supplied_capability_hash_or_model_lease(monkeypatch):

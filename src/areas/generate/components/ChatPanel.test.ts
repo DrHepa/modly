@@ -149,6 +149,24 @@ test('action application attempts every returned action exactly once after a han
   }
 })
 
+test('turn error recovery surfaces proposal handoff and direct-action reflection failures together', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    assert.equal(module.agentTurnFailureMessage({
+      error: new Error('The agent response was received.'),
+      actionFailureCount: 1,
+      partialSummaryError: null,
+      proposalErrors: [{
+        code: 'model_stale',
+        message: 'This protected action could not be proposed because proposal authority is unavailable.',
+      }],
+    }), 'The agent response was received. 1 action could not be applied locally. '
+      + 'This protected action could not be proposed because proposal authority is unavailable.')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('legacy Agent mutation payloads fail closed at the response boundary', async () => {
   const { module, cleanup } = await loadChatPanelModule()
   try {
@@ -181,7 +199,6 @@ test('ChatPanel captures immutable request origin and routes success/error actio
   const source = await readFile(chatPanelEntry, 'utf8')
   assert.match(source, /const uiToken = originUiGateRef\.current\.begin\(originatingSessionId\)/)
   assert.match(source, /applyCompletedActions\(data\.actions, originatingSessionId, uiToken, msgs\)/)
-  assert.match(source, /applyCompletedActions\(e\.actions, originatingSessionId, uiToken, msgs\)/)
   assert.match(source, /appliedIds: appliedDirectActionIdsRef\.current/)
   assert.equal(source.match(/applyAgentResponseActions\(/g)?.length, 1)
   assert.equal(source.match(/appliedIds: appliedDirectActionIdsRef\.current/g)?.length, 1)
@@ -864,12 +881,135 @@ test('cancellation reconciliation waits without busy-looping until authoritative
   }
 })
 
-test('chat mints a main-process model lease before FastAPI and sends only the opaque lease into proposal handoff', async () => {
-  const source = await readFile(chatPanelEntry, 'utf8')
-  assert.match(source, /window\.electron\.agentActions\.leaseModel\(\{[\s\S]*originSessionId:[\s\S]*model: selectedModel/)
-  assert.match(source, /const request: AgentChatRequest = \{[\s\S]*modelLeaseId:/)
-  assert.match(source, /body: JSON\.stringify\(request\)/)
-  assert.match(source, /handoffGovernedProposals\([\s\S]*modelLeaseId/)
+test('normal chat still sends and accepts assistant text when proposal authority cannot be leased', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    for (const code of ['invalid_request', 'internal_error']) {
+      const sentLeaseIds: Array<string | null> = []
+      const persisted: string[] = []
+      const rendered: string[] = []
+      const response = await module.runAgentChatWithOptionalProposalAuthority({
+        leaseModel: async () => ({ ok: false, error: { code } }),
+        send: async (modelLeaseId: string | null) => {
+          sentLeaseIds.push(modelLeaseId)
+          return { message: `Assistant reply after ${code}.`, actions: [], proposals: [] }
+        },
+        accept: async (data: { message: string }) => {
+          persisted.push(data.message)
+          rendered.push(data.message)
+        },
+      })
+
+      assert.deepEqual(sentLeaseIds, [null])
+      assert.deepEqual(persisted, [`Assistant reply after ${code}.`])
+      assert.deepEqual(rendered, persisted)
+      assert.equal(response.modelLeaseId, null)
+      assert.doesNotMatch(rendered.join(' '), /could not create this governed action proposal/i)
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+test('normal chat preserves an available proposal lease through send and acceptance', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const observed: Array<string | null> = []
+    const result = await module.runAgentChatWithOptionalProposalAuthority({
+      now: () => Date.parse('2026-08-15T10:00:00.000Z'),
+      leaseModel: async () => ({
+        ok: true,
+        lease: { id: 'model-lease-1', expiresAt: '2026-08-15T10:05:00.000Z' },
+      }),
+      send: async (modelLeaseId: string | null) => {
+        observed.push(modelLeaseId)
+        return { message: 'Bound reply.', actions: [], proposals: [] }
+      },
+      accept: async (_data: unknown, modelLeaseId: string | null) => { observed.push(modelLeaseId) },
+    })
+
+    assert.deepEqual(observed, ['model-lease-1', 'model-lease-1'])
+    assert.equal(result.modelLeaseId, 'model-lease-1')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('turn seam degrades malformed and thrown leases while recovering partial actions without authority', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    for (const leaseModel of [
+      async () => { throw new Error('lease IPC failed') },
+      async () => ({ ok: true, lease: { id: '', expiresAt: 'not-a-date' } }),
+    ]) {
+      const accepted: string[] = []
+      const recovered: Array<{ actions: unknown[], lease: string | null }> = []
+      const partialAction = { tool: 'list_models', result: 'listed', payload: null }
+      await assert.rejects(module.runAgentChatWithOptionalProposalAuthority({
+        leaseModel,
+        send: async (modelLeaseId: string | null) => {
+          assert.equal(modelLeaseId, null)
+          throw new module.AgentApiError('Ollama timed out.', [partialAction])
+        },
+        accept: async () => { accepted.push('accepted') },
+        recover: async (error: unknown, modelLeaseId: string | null) => {
+          assert.ok(error instanceof module.AgentApiError)
+          recovered.push({ actions: (error as { actions: unknown[] }).actions, lease: modelLeaseId })
+        },
+      }), /Ollama timed out/)
+      assert.deepEqual(accepted, [])
+      assert.deepEqual(recovered, [{ actions: [partialAction], lease: null }])
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+test('protected turn context failures degrade to empty context and no proposal authority without swallowing size validation', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const base = {
+      originSessionId: 'session-a',
+      userText: 'Explain my local models',
+      isCurrent: () => true,
+      signal: new AbortController().signal,
+      listCapabilities: async () => ({ capabilities: [], errors: [] }),
+      listCompletedArtifacts: async () => [],
+      resolveSkillContexts: async () => ({ resolutionHash: 'a'.repeat(64), contexts: [] }),
+    }
+    for (const failed of ['capabilities', 'artifacts', 'skills'] as const) {
+      const result = await module.resolveOptionalAgentProtectedContext({
+        ...base,
+        ...(failed === 'capabilities' ? { listCapabilities: async () => { throw new Error('inventory failed') } } : {}),
+        ...(failed === 'artifacts' ? { listCompletedArtifacts: async () => { throw new Error('artifact lookup failed') } } : {}),
+        ...(failed === 'skills' ? { resolveSkillContexts: async () => { throw new Error('skill lookup failed') } } : {}),
+      })
+      assert.deepEqual(result, {
+        capabilities: [], completedArtifacts: [], skillContexts: [],
+        resolutionHash: null, proposalAuthorityAvailable: false,
+      })
+    }
+    let leaseCalls = 0
+    await module.runAgentChatWithOptionalProposalAuthority({
+      proposalAuthorityAvailable: false,
+      leaseModel: async () => {
+        leaseCalls += 1
+        throw new Error('must not lease without protected context')
+      },
+      send: async (modelLeaseId: string | null) => {
+        assert.equal(modelLeaseId, null)
+        return { message: 'Ordinary chat.' }
+      },
+      accept: async () => {},
+    })
+    assert.equal(leaseCalls, 0)
+    await assert.rejects(module.resolveOptionalAgentProtectedContext({
+      ...base,
+      userText: 'x'.repeat(4_097),
+    }), /too long/i)
+  } finally {
+    await cleanup()
+  }
 })
 
 test('only terminal governed actions produce minimal durable summaries', async () => {

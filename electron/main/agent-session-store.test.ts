@@ -117,12 +117,15 @@ test('message persistence is allowlisted while visible content remains exact byt
       String.raw`preview=data:image/png;base64,AAAA path=/home/alice/private.txt win=C:\Users\Alice\secret.txt unc=\\server\share\secret.txt`,
       'Authorization: Bearer bearer-value',
       'api_key->arrow-value',
+      'Processes: ollama serve (PID 4242); model=qwen3.6:27b; endpoint=http://127.0.0.1:11434/api/chat',
+      String.raw`Command: python /home/alice/Modly/tools/run.py --input C:\Users\Alice\scene.glb`,
+      'Action description: run local_model_generate with arguments={"prompt":"secret inventory","token_budget":2048}; result={"status":"completed","output":"/home/alice/Modly/output.glb"}',
       'Unicode survives too: cañón 🧰',
     ].join('\n')
     const exact = await store.appendMessage({
       sessionId: session.id,
       expectedRevision: appended.revision,
-      message: { id: 'm2', role: 'user', content: exactPrivateLookingContent },
+      message: { id: 'm2', role: 'assistant', content: exactPrivateLookingContent },
     })
     assert.equal(exact.messages[1].content, exactPrivateLookingContent)
     assert.equal((await store.read({ sessionId: session.id })).messages[1].content, exactPrivateLookingContent)
@@ -130,6 +133,131 @@ test('message persistence is allowlisted while visible content remains exact byt
       store.create({ title: 'preview=data:image/png;base64,AAAA' }),
       /invalid agent session create/i,
     )
+  })
+})
+
+test('legacy redaction markers migrate in titles, messages, and summary labels', async () => {
+  await withStore(async (store, root) => {
+    const legacyMarker = ['[redacted', ' private content]'].join('')
+    const replacement = 'Content unavailable.'
+    const documentPath = path.join(root, 'agent-sessions.json')
+    await writeFile(documentPath, JSON.stringify({
+      schema: 'modly.agent-sessions',
+      version: 1,
+      activeSessionId: 'legacy-session',
+      sessions: [{
+        id: 'legacy-session',
+        title: `Before ${legacyMarker} ${legacyMarker} after`,
+        revision: 1,
+        createdAt: '2026-08-05T10:00:00.000Z',
+        updatedAt: '2026-08-05T10:00:00.000Z',
+        expiresAt: '2026-08-12T10:00:00.000Z',
+        messages: [{
+          id: 'legacy-message',
+          role: 'assistant',
+          content: `Before ${legacyMarker}; ${legacyMarker} after`,
+          attachmentIds: [],
+          summaries: [
+            { kind: 'action', label: `Action ${legacyMarker}` },
+            {
+              kind: 'governed-action',
+              label: `${legacyMarker} result`,
+              governedAction: {
+                status: 'completed',
+                capability: 'Text to CAD',
+                model: 'qwen3.6:latest',
+                outputs: [{ kind: 'mesh', sha256: 'a'.repeat(64), sizeBytes: 42 }],
+              },
+            },
+          ],
+        }],
+        attachments: [],
+      }],
+    }))
+
+    const listed = await store.list()
+    const loaded = await store.read({ sessionId: 'legacy-session' })
+    const visible = JSON.stringify({ listed, loaded })
+    assert.equal(visible.includes(legacyMarker), false)
+    assert.equal(loaded.title, `Before ${replacement} ${replacement} after`)
+    assert.equal(loaded.messages[0].content, `Before ${replacement}; ${replacement} after`)
+    assert.deepEqual(loaded.messages[0].summaries.map((summary) => summary.label), [
+      `Action ${replacement}`,
+      `${replacement} result`,
+    ])
+
+    const migratedBytes = await readFile(documentPath, 'utf8')
+    assert.equal(migratedBytes.includes(legacyMarker), false)
+    await store.read({ sessionId: 'legacy-session' })
+    assert.equal(await readFile(documentPath, 'utf8'), migratedBytes)
+  })
+})
+
+test('create, rename, and append migrate legacy markers without extra session mutations', async () => {
+  await withStore(async (store, root, clock) => {
+    const legacyMarker = ['[redacted', ' private content]'].join('')
+    const replacement = 'Content unavailable.'
+    const documentPath = path.join(root, 'agent-sessions.json')
+    const sessionState = (session: {
+      revision: number
+      createdAt: string
+      updatedAt: string
+      expiresAt: string
+    }) => ({
+      revision: session.revision,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      expiresAt: session.expiresAt,
+    })
+    const assertFixedPoint = async (expected: Awaited<ReturnType<typeof store.read>>) => {
+      const persisted = await readFile(documentPath, 'utf8')
+      assert.equal(persisted.includes(legacyMarker), false)
+      const loaded = await store.read({ sessionId: expected.id })
+      const listed = (await store.list()).sessions.find((session) => session.id === expected.id)
+      assert.ok(listed)
+      assert.deepEqual(sessionState(loaded), sessionState(expected))
+      assert.deepEqual(sessionState(listed), sessionState(expected))
+      assert.equal(await readFile(documentPath, 'utf8'), persisted)
+    }
+
+    const created = await store.create({ title: `Created ${legacyMarker}` })
+    assert.equal(created.title, `Created ${replacement}`)
+    assert.equal(created.revision, 1)
+    assert.equal(created.updatedAt, created.createdAt)
+    assert.equal(Date.parse(created.expiresAt) - Date.parse(created.updatedAt), AGENT_SESSION_TTL_MS)
+    await assertFixedPoint(created)
+
+    clock.now += 60_000
+    const renamed = await store.rename({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      title: `${legacyMarker} renamed ${legacyMarker}`,
+    })
+    assert.equal(renamed.title, `${replacement} renamed ${replacement}`)
+    assert.equal(renamed.revision, created.revision + 1)
+    assert.equal(renamed.createdAt, created.createdAt)
+    assert.equal(renamed.updatedAt, new Date(clock.now).toISOString())
+    assert.equal(Date.parse(renamed.expiresAt) - Date.parse(renamed.updatedAt), AGENT_SESSION_TTL_MS)
+    await assertFixedPoint(renamed)
+
+    clock.now += 60_000
+    const appended = await store.appendMessage({
+      sessionId: renamed.id,
+      expectedRevision: renamed.revision,
+      message: {
+        id: 'legacy-api-message',
+        role: 'assistant',
+        content: `Before ${legacyMarker}; ${legacyMarker} after`,
+        summaries: [{ kind: 'action', label: `Action ${legacyMarker}` }],
+      },
+    })
+    assert.equal(appended.messages[0].content, `Before ${replacement}; ${replacement} after`)
+    assert.equal(appended.messages[0].summaries[0].label, `Action ${replacement}`)
+    assert.equal(appended.revision, renamed.revision + 1)
+    assert.equal(appended.createdAt, created.createdAt)
+    assert.equal(appended.updatedAt, new Date(clock.now).toISOString())
+    assert.equal(Date.parse(appended.expiresAt) - Date.parse(appended.updatedAt), AGENT_SESSION_TTL_MS)
+    await assertFixedPoint(appended)
   })
 })
 
@@ -193,6 +321,8 @@ test('terminal governed action summaries persist only minimal safe public eviden
     for (const invalidSummary of [
       { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, status: 'approved' } },
       { ...terminalSummary, actionId: 'private-action-id' },
+      { ...terminalSummary, label: 'Run /home/user/private.glb' },
+      { ...terminalSummary, label: 'token=private-value' },
       { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, digest: `sha256:${'b'.repeat(64)}` } },
       { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, arguments: { input: '/home/user/private.glb' } } },
       { ...terminalSummary, governedAction: { ...terminalSummary.governedAction, outputs: [{ ...terminalSummary.governedAction.outputs[0], path: '/home/user/private.glb' }] } },

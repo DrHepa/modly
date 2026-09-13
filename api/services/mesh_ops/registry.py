@@ -35,6 +35,30 @@ def _apply_numeric_bounds(
     return value
 
 
+def _validate_param(
+    parameter_id: str,
+    value: Any,
+    schema: Mapping[str, Any],
+) -> Any:
+    """Validate (and where applicable, clamp) a supplied param against its schema."""
+    param_type = schema.get("type")
+
+    if param_type == "boolean":
+        if not isinstance(value, bool):
+            raise TypeError(f"Parameter {parameter_id!r} must be a boolean")
+        return value
+
+    if param_type == "select":
+        allowed = {option["value"] for option in schema.get("options", [])}
+        if allowed and value not in allowed:
+            raise ValueError(
+                f"Parameter {parameter_id!r} must be one of {sorted(allowed)}"
+            )
+        return value
+
+    return _apply_numeric_bounds(parameter_id, value, schema)
+
+
 class MeshOpsRegistry:
     """Stores mesh operations and provides one invocation path for every caller."""
 
@@ -83,7 +107,7 @@ class MeshOpsRegistry:
             parameter_id = schema.get("id")
             if parameter_id not in resolved_params:
                 continue
-            resolved_params[parameter_id] = _apply_numeric_bounds(
+            resolved_params[parameter_id] = _validate_param(
                 parameter_id,
                 resolved_params[parameter_id],
                 schema,

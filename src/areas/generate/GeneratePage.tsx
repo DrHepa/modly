@@ -193,13 +193,15 @@ function LightPopover({
   onClose,
   pointLights,
   onPointLightsChange,
-  onSelectPointLight: _onSelectPointLight,
+  selectedPointLightId,
+  onSelectPointLight,
 }: {
   settings: LightSettings
   onChange: (s: LightSettings) => void
   onClose: () => void
   pointLights: PointLight[]
   onPointLightsChange: (lights: PointLight[]) => void
+  selectedPointLightId: string | null
   onSelectPointLight: (id: string | null) => void
 }) {
   function lightRow(
@@ -292,7 +294,15 @@ function LightPopover({
         )}
 
         {pointLights.map((pl) => (
-          <div key={pl.id} className="flex flex-col gap-1.5 p-2 rounded-lg bg-zinc-800/40 border border-zinc-700/40">
+          <div
+            key={pl.id}
+            onClick={() => onSelectPointLight(pl.id)}
+            className={`flex flex-col gap-1.5 p-2 rounded-lg bg-zinc-800/40 border cursor-pointer transition-colors ${
+              pl.id === selectedPointLightId
+                ? 'border-violet-500'
+                : 'border-zinc-700/40 hover:border-zinc-600'
+            }`}
+          >
             <div className="flex items-center gap-2">
               <ColorPicker
                 value={pl.color}
@@ -301,7 +311,10 @@ function LightPopover({
               <span className="text-[10px] text-zinc-400 flex-1">Point</span>
               <span className="text-[10px] text-zinc-500 font-mono">{pl.intensity.toFixed(1)}</span>
               <button
-                onClick={() => onPointLightsChange(pointLights.filter((p) => p.id !== pl.id))}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onPointLightsChange(pointLights.filter((p) => p.id !== pl.id))
+                }}
                 className="p-0.5 rounded text-zinc-600 hover:text-red-400 transition-colors"
               >
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -679,6 +692,18 @@ export default function GeneratePage(): JSX.Element {
   }, [undoMesh, redoMesh])
 
   const hasModel = currentJob?.status === 'done' && !!currentJob.outputUrl
+
+  // Selecting a point light (from the 3D marker or the light panel list) —
+  // also drops the active gizmo tool so it doesn't silently carry over from
+  // whatever was selected before. Switching selection directly (mesh →
+  // point light, or point light → point light) never passes through a
+  // fully-deselected state, so an effect keyed on the selection alone can't
+  // catch this; clearing it here, at the one place all of those paths go
+  // through, does.
+  const handleSelectPointLight = useCallback((id: string | null) => {
+    setSelectedPointLightId(id)
+    setGizmoMode(null)
+  }, [])
 
   // Drop the active transform tool when nothing is selected, so it doesn't
   // silently re-activate on the next selection.
@@ -1143,7 +1168,8 @@ export default function GeneratePage(): JSX.Element {
                 onClose={() => setOpenPanel(null)}
                 pointLights={pointLights}
                 onPointLightsChange={setPointLights}
-                onSelectPointLight={setSelectedPointLightId}
+                selectedPointLightId={selectedPointLightId}
+                onSelectPointLight={handleSelectPointLight}
               />
             )}
           </div>
@@ -1201,7 +1227,7 @@ export default function GeneratePage(): JSX.Element {
             gizmoUndoRef={gizmoUndoRef}
             pointLights={pointLights}
             selectedPointLightId={selectedPointLightId}
-            onSelectPointLight={setSelectedPointLightId}
+            onSelectPointLight={handleSelectPointLight}
             onPointLightsChange={setPointLights}
           />
           <GenerationHUD />

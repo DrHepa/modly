@@ -315,7 +315,6 @@ export const useAppStore = create<AppState>()(
         useAtkinsonFont: state.useAtkinsonFont,
         uiScale: state.uiScale,
         lightSettings: state.lightSettings,
-        pointLights: state.pointLights,
       }),
     }
   )

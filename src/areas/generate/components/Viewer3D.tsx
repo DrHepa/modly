@@ -64,7 +64,9 @@ function createCheckerTexture(): THREE.CanvasTexture {
   return tex
 }
 
-function makeLightBulbTexture(color: string): THREE.CanvasTexture {
+const SELECTION_OUTLINE_COLOR = '#8b5cf6'
+
+function makeLightBulbTexture(color: string, isSelected: boolean): THREE.CanvasTexture {
   const size = 64
   const canvas = document.createElement('canvas')
   canvas.width = canvas.height = size
@@ -73,35 +75,45 @@ function makeLightBulbTexture(color: string): THREE.CanvasTexture {
   const cx = size / 2
   const cy = size / 2
 
-  // Rays
-  ctx.strokeStyle = color
-  ctx.lineWidth = 2
-  ctx.lineCap = 'round'
-  for (let i = 0; i < 6; i++) {
-    const a = (i / 6) * Math.PI * 2 - Math.PI / 2
-    const r1 = 20
-    const r2 = 27
+  // Draws the bulb glyph (rays + circle + base). `pad` grows every part by a
+  // few pixels — used to lay down an oversized violet silhouette behind the
+  // normal-sized icon, so the outline hugs the actual glyph shape instead of
+  // being a plain circle around it.
+  const drawGlyph = (fillColor: string, pad: number) => {
+    ctx.strokeStyle = fillColor
+    ctx.lineWidth = 2 + pad * 2
+    ctx.lineCap = 'round'
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 - Math.PI / 2
+      const r1 = 20 - pad
+      const r2 = 27 + pad
+      ctx.beginPath()
+      ctx.moveTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1)
+      ctx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2)
+      ctx.stroke()
+    }
+
     ctx.beginPath()
-    ctx.moveTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1)
-    ctx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2)
-    ctx.stroke()
+    ctx.arc(cx, cy - 1, 12 + pad, 0, Math.PI * 2)
+    ctx.fillStyle = fillColor
+    ctx.fill()
+    if (pad === 0) {
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+
+    ctx.fillStyle = fillColor
+    ctx.fillRect(cx - 4 - pad, cy + 11 - pad, 8 + pad * 2, 8 + pad * 2)
+    if (pad === 0) {
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1
+      ctx.strokeRect(cx - 4, cy + 11, 8, 8)
+    }
   }
 
-  // Bulb circle
-  ctx.beginPath()
-  ctx.arc(cx, cy - 1, 12, 0, Math.PI * 2)
-  ctx.fillStyle = color
-  ctx.fill()
-  ctx.strokeStyle = '#ffffff'
-  ctx.lineWidth = 1.5
-  ctx.stroke()
-
-  // Base (small rectangle below bulb)
-  ctx.fillStyle = color
-  ctx.fillRect(cx - 4, cy + 11, 8, 8)
-  ctx.strokeStyle = '#ffffff'
-  ctx.lineWidth = 1
-  ctx.strokeRect(cx - 4, cy + 11, 8, 8)
+  if (isSelected) drawGlyph(SELECTION_OUTLINE_COLOR, 2.5)
+  drawGlyph(color, 0)
 
   return new THREE.CanvasTexture(canvas)
 }
@@ -844,7 +856,7 @@ function PointLightMarker({
   onPositionChange: (pos: [number, number, number]) => void
 }) {
   const [group, setGroup] = useState<THREE.Group | null>(null)
-  const iconTexture = useMemo(() => makeLightBulbTexture(light.color), [light.color])
+  const iconTexture = useMemo(() => makeLightBulbTexture(light.color, isSelected), [light.color, isSelected])
 
   return (
     <>

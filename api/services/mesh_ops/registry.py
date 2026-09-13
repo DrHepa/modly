@@ -2,6 +2,7 @@
 
 import re
 from copy import deepcopy
+from math import isfinite
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -9,6 +10,29 @@ from .types import MeshOp, MeshOpContext, MeshOpNotFoundError, MeshOpResult
 
 
 _OP_ID = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def _apply_numeric_bounds(
+    parameter_id: str,
+    value: Any,
+    schema: Mapping[str, Any],
+) -> Any:
+    """Clamp a supplied numeric value to the bounds declared by its schema."""
+    minimum = schema.get("min")
+    maximum = schema.get("max")
+    if minimum is None and maximum is None:
+        return value
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"Parameter {parameter_id!r} must be numeric")
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError(f"Parameter {parameter_id!r} must be finite")
+
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
 class MeshOpsRegistry:
@@ -54,5 +78,15 @@ class MeshOpsRegistry:
         }
         if params:
             resolved_params.update(params)
+
+        for schema in operation.params_schema:
+            parameter_id = schema.get("id")
+            if parameter_id not in resolved_params:
+                continue
+            resolved_params[parameter_id] = _apply_numeric_bounds(
+                parameter_id,
+                resolved_params[parameter_id],
+                schema,
+            )
 
         return operation.fn(path, resolved_params, context)

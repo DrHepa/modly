@@ -6,7 +6,13 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from routers import optimize
-from services.mesh_ops import MeshOpNotFoundError, MeshOpResult
+from services.mesh_ops import (
+    MeshOp,
+    MeshOpExecutionError,
+    MeshOpNotFoundError,
+    MeshOpResult,
+    MeshOpsRegistry,
+)
 
 
 class _FakeRegistry:
@@ -119,6 +125,82 @@ class OptimizeMeshOpsRouteTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 404)
+
+    def test_generic_run_route_enforces_registry_bounds(self) -> None:
+        calls = []
+
+        def operation(input_path, params, context):
+            calls.append(params)
+            return MeshOpResult(input_path)
+
+        registry = MeshOpsRegistry(
+            [
+                MeshOp(
+                    id="bounded",
+                    label="Bounded",
+                    params_schema=(
+                        {
+                            "id": "amount",
+                            "type": "int",
+                            "default": 3,
+                            "min": 1,
+                            "max": 5,
+                        },
+                    ),
+                    fn=operation,
+                    category="test",
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            input_path = workspace / "input.glb"
+            input_path.touch()
+            with (
+                patch.object(optimize, "WORKSPACE_DIR", workspace),
+                patch.object(optimize, "mesh_ops_registry", registry),
+            ):
+                optimize.run_mesh_operation(
+                    "bounded",
+                    optimize.MeshOpRequest(
+                        path="input.glb",
+                        params={"amount": 99},
+                    ),
+                )
+
+        self.assertEqual(calls, [{"amount": 5}])
+
+    def test_missing_input_during_execution_is_a_404(self) -> None:
+        class MissingInputRegistry:
+            def run(self, operation_id, input_path, params, context):
+                raise FileNotFoundError(f"Input mesh not found: {input_path}")
+
+        self._assert_operation_error(MissingInputRegistry(), 404)
+
+    def test_backend_execution_failure_is_a_503(self) -> None:
+        class FailedBackendRegistry:
+            def run(self, operation_id, input_path, params, context):
+                raise MeshOpExecutionError("mesh-optimizer exited with code 1")
+
+        self._assert_operation_error(FailedBackendRegistry(), 503)
+
+    def _assert_operation_error(self, registry, expected_status: int) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            input_path = workspace / "input.glb"
+            input_path.touch()
+            with (
+                patch.object(optimize, "WORKSPACE_DIR", workspace),
+                patch.object(optimize, "mesh_ops_registry", registry),
+                self.assertRaises(HTTPException) as raised,
+            ):
+                optimize.run_mesh_operation(
+                    "decimate",
+                    optimize.MeshOpRequest(path="input.glb"),
+                )
+
+        self.assertEqual(raised.exception.status_code, expected_status)
 
 
 if __name__ == "__main__":

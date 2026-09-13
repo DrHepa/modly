@@ -62,6 +62,77 @@ class MeshOpsRegistryTests(unittest.TestCase):
             3,
         )
 
+    def test_run_clamps_supplied_values_to_schema_bounds(self) -> None:
+        calls = []
+
+        def operation(input_path, params, context):
+            calls.append(params)
+            return MeshOpResult(input_path)
+
+        registry = MeshOpsRegistry(
+            [
+                MeshOp(
+                    id="bounded",
+                    label="Bounded",
+                    params_schema=(
+                        {
+                            "id": "count",
+                            "type": "int",
+                            "default": 3,
+                            "min": 1,
+                            "max": 5,
+                        },
+                        {
+                            "id": "strength",
+                            "type": "float",
+                            "default": 0.5,
+                            "min": 0.1,
+                            "max": 1.0,
+                        },
+                    ),
+                    fn=operation,
+                    category="test",
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "mesh.glb"
+            input_path.touch()
+            context = MeshOpContext(Path(directory), Path(directory))
+            registry.run(
+                "bounded",
+                input_path,
+                {"count": 99, "strength": -2.0},
+                context,
+            )
+
+        self.assertEqual(calls[0], {"count": 5, "strength": 0.1})
+
+    def test_run_rejects_non_numeric_values_for_bounded_params(self) -> None:
+        operation = MeshOp(
+            id="bounded",
+            label="Bounded",
+            params_schema=(
+                {"id": "amount", "type": "int", "min": 1, "max": 5},
+            ),
+            fn=lambda path, params, context: MeshOpResult(path),
+            category="test",
+        )
+        registry = MeshOpsRegistry([operation])
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "mesh.glb"
+            input_path.touch()
+            context = MeshOpContext(Path(directory), Path(directory))
+            with self.assertRaisesRegex(TypeError, "'amount' must be numeric"):
+                registry.run(
+                    "bounded",
+                    input_path,
+                    {"amount": "a lot"},
+                    context,
+                )
+
     def test_invalid_duplicate_and_unknown_ids_are_rejected(self) -> None:
         operation = MeshOp(
             id="valid",

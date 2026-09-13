@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from services.generator_registry import WORKSPACE_DIR
 from services.mesh_ops import (
     MeshOpContext,
+    MeshOpExecutionError,
     MeshOpNotFoundError,
     MeshOpResult,
     MeshOpUnavailableError,
@@ -88,7 +89,9 @@ def _run_operation(
         return mesh_ops_registry.run(operation_id, input_path, params, context)
     except MeshOpNotFoundError as exc:
         raise HTTPException(404, f"Unknown mesh operation: {operation_id}") from exc
-    except MeshOpUnavailableError as exc:
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (MeshOpUnavailableError, MeshOpExecutionError) as exc:
         raise HTTPException(503, str(exc)) from exc
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc

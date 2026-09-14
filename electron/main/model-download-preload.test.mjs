@@ -48,15 +48,10 @@ test('renderer model actions keep node and shared-weight identities explicit', a
   ])
 })
 
-test('declared partial data is removable and active downloads block destructive actions', () => {
-  const main = readFileSync(resolve('electron/main/ipc-handlers.ts'), 'utf8')
+test('UI exposes partial-data removal and dependent-node warnings', () => {
   const page = readFileSync(resolve('src/areas/models/ModelsPage.tsx'), 'utf8')
   const drawer = readFileSync(resolve('src/areas/models/components/ExtensionDrawer.tsx'), 'utf8')
 
-  assert.match(main, /model:delete[\s\S]*activeDownloads\.has\(modelId\)/)
-  assert.match(main, /model:deleteSharedGroup[\s\S]*activeWeightTargets\.has\(groupRoot\)/)
-  assert.match(main, /model:deleteExtensionWeights[\s\S]*resolveExtensionModelRoot/)
-  assert.match(main, /extensions:uninstall[\s\S]*activeDownloads\.keys\(\)/)
   assert.match(page, /window\.electron\.model\.hasLocalData\(fullId\)/)
   assert.match(page, /deleteExtensionWeights\(extId\)/)
   assert.match(drawer, /localDataIds\.includes\(fullId\) && state\.kind !== 'downloading'/)

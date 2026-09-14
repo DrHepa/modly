@@ -149,6 +149,19 @@ export function normalizeModelSources(
   })
 }
 
+export function validateModelNodeIds(nodes: Array<{ id?: unknown }>): void {
+  const seen = new Set<string>()
+  for (const node of nodes) {
+    if (typeof node?.id === 'string' && node.id.toLowerCase() === '_shared') {
+      throw new Error('model node id "_shared" is reserved')
+    }
+    const id = safeModelSourceId(node?.id, 'model node id')
+    const alias = id.toLowerCase()
+    if (seen.has(alias)) throw new Error(`model node id "${id}" is not portable-unique`)
+    seen.add(alias)
+  }
+}
+
 export function normalizeWeightGroups(manifest: ModelWeightManifest): ModelWeightGroup[] | undefined {
   if (!Object.prototype.hasOwnProperty.call(manifest, 'weight_groups')) return undefined
   if (!Array.isArray(manifest.weight_groups) || manifest.weight_groups.length === 0) {

@@ -2,6 +2,7 @@ import {
   normalizeModelSources,
   normalizeWeightGroupReferences,
   normalizeWeightGroups,
+  validateModelNodeIds,
   safeModelSourceId,
   type ModelWeightNode,
 } from './model-sources'
@@ -61,6 +62,9 @@ export function validateInstallManifest(
     throw new Error('manifest.json: weight_groups is supported only for model extensions')
   }
   const weightGroups = normalizeWeightGroups(manifest)
+  if (weightGroups || nodes.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
+    validateModelNodeIds(manifest.nodes ?? [])
+  }
   for (const node of Array.isArray(manifest.nodes) ? manifest.nodes : []) {
     const usesSharedWeights = weightGroups !== undefined || node.weight_groups !== undefined
     if (usesSharedWeights && typeof node.id === 'string' && node.id.toLowerCase() === '_shared') {

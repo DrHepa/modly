@@ -240,6 +240,8 @@ declare global {
           cancelled?: boolean
         }) => void) => void
         offProgress:    () => void
+        onWeightsChanged: (cb: () => void) => void
+        offWeightsChanged: () => void
       }
       app: {
         info: () => Promise<{

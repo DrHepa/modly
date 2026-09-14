@@ -78,6 +78,7 @@ class BaseGenerator(ABC):
     # Metadata — override in each subclass
     # ------------------------------------------------------------------ #
     MODEL_ID:     str = ""
+    MODEL_NODE_ID: str = ""
     DISPLAY_NAME: str = ""
     VRAM_GB:      int = 0   # Minimum recommended VRAM (in GB)
 

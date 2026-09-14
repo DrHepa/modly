@@ -12,6 +12,7 @@ from services.model_sources import (
     resolve_weight_group_root,
     resolve_weight_storage_root,
     validate_source_file_plan,
+    validate_model_node_ids,
     weight_group_sources_are_downloaded,
 )
 
@@ -40,6 +41,11 @@ def valid_node() -> dict:
 
 
 class ModelSourcesTests(unittest.TestCase):
+    def test_managed_node_ids_reject_case_aliases(self):
+        for ids in (("Fast", "fast"), ("fast", "fast")):
+            with self.subTest(ids=ids), self.assertRaisesRegex(ValueError, "portable-unique"):
+                validate_model_node_ids([{"id": node_id} for node_id in ids])
+
     def test_validates_new_sources_without_reinterpreting_legacy_fields(self) -> None:
         sources = normalize_model_sources(valid_node())
         self.assertEqual([source["id"] for source in sources or []], ["primary", "encoder"])

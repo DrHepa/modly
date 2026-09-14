@@ -195,6 +195,8 @@ def main() -> None:
     # Falls back to MODELS_DIR/manifest_id for legacy / standalone use.
     model_dir = Path(_MODEL_DIR_OVERRIDE) if _MODEL_DIR_OVERRIDE else MODELS_DIR / model_id
     gen = GenClass(model_dir, WORKSPACE_DIR)
+    gen.MODEL_ID = model_id
+    gen.MODEL_NODE_ID = node.get("id", "")
     gen.shared_model_dirs = dict(_SHARED_MODEL_DIRS)
     _apply_manifest_metadata(gen, manifest, node)
 

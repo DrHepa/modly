@@ -12,6 +12,7 @@ import {
   normalizeModelSources,
   normalizeWeightGroupReferences,
   normalizeWeightGroups,
+  validateModelNodeIds,
   safeModelSourceId,
   weightGroupTargetId,
   type ModelSource,
@@ -76,6 +77,9 @@ function installedSharedGroups(
   nodes: InstalledNode[],
 ): InstalledSharedWeightGroup[] {
   const groups = normalizeWeightGroups(manifest)
+  if (groups || nodes.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
+    validateModelNodeIds(manifest.nodes as InstalledNode[])
+  }
   if (groups === undefined) return []
   const groupDependents = new Map<string, string[]>()
   for (const candidate of nodes) {

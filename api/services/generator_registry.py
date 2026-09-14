@@ -30,6 +30,7 @@ from services.model_sources import (
     normalize_model_sources,
     normalize_weight_group_references,
     normalize_weight_groups,
+    validate_model_node_ids,
     resolve_weight_group_root,
     safe_source_id,
     weight_group_sources_are_downloaded,
@@ -466,6 +467,8 @@ def _discover_extensions(
             uses_shared_weights = weight_groups is not None or any(
                 "weight_groups" in node for node in nodes
             )
+            if uses_shared_weights or any("model_sources" in node for node in nodes):
+                validate_model_node_ids(raw_nodes)
             if uses_shared_weights:
                 for node in nodes:
                     raw_node_id = node.get("id")
@@ -670,6 +673,8 @@ class GeneratorRegistry:
                     gen.download_check   = manifest.get("download_check", "")
                     gen._params_schema   = manifest.get("params_schema", [])
 
+                gen.MODEL_ID = model_id
+                gen.MODEL_NODE_ID = manifest.get("node_id", "")
                 gen.shared_model_dirs = {
                     group["id"]: resolve_weight_group_root(
                         MODELS_DIR, manifest.get("ext_id", model_id.split("/", 1)[0]), group["id"]
@@ -895,6 +900,8 @@ class GeneratorRegistry:
                 gen.stop()
             else:
                 gen.unload()
+                if gen.is_loaded():
+                    raise RuntimeError("Model is still loaded; weights were preserved")
 
 
 # Singleton

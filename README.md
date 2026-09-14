@@ -199,8 +199,12 @@ reference them from any sibling node. Shared files are downloaded once under
 
 At runtime, `MODEL_DIR` remains the selected node's private directory.
 Subprocess extensions also receive `MODEL_ID`, `MODEL_NODE_ID`, and a JSON
-`SHARED_MODEL_DIRS` map. Direct generators receive the same resolved mapping in
-`shared_model_dirs`. Removing private node data never removes a shared group;
+`SHARED_MODEL_DIRS` map in their environment. Both direct and subprocess generator
+instances receive `MODEL_ID`, `MODEL_NODE_ID`, and the resolved mapping in
+`shared_model_dirs` before `load()`. Direct generators use these instance attributes,
+not process-global environment variables, to distinguish sibling nodes.
+Shared groups are installed through their dependent nodes; the drawer exposes
+shared-group status and explicit removal. Removing private node data never removes a shared group;
 shared-group removal is a separate action that identifies every affected node.
 
 ---

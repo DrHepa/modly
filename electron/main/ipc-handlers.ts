@@ -28,6 +28,7 @@ import {
   normalizeModelSources,
   normalizeWeightGroupReferences,
   normalizeWeightGroups,
+  validateModelNodeIds,
   removePartialDownloadArtifacts,
   resolveExtensionModelRoot,
   resolveModelRoot,
@@ -80,6 +81,7 @@ import {
 } from './extension-install-recovery'
 import { registerWorkspaceAssetLibraryIpcHandlers } from './artifact-registry-service'
 import { updatesSupported } from './updater'
+import { ModelWeightOperations } from './model-weight-operations'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -167,9 +169,24 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     finish: () => void
     targetRoots: string[]
     currentTargetId?: string
+    stopRequested?: 'pause' | 'cancel'
   }
   const activeDownloads = new Map<string, ActiveDownload>()
-  const activeWeightTargets = new Map<string, string>()
+  const weightOperations = new ModelWeightOperations()
+  // Paused/error sessions retain their original paths even after settings change.
+  const interruptedTargets = new Map<string, string[]>()
+  const notifyWeightChange = () => {
+    getWindow()?.webContents.send('model:weightsChanged')
+  }
+  async function unloadForRemoval(modelIds?: string[]) {
+    const urls = modelIds
+      ? modelIds.map((id) => `${API_BASE_URL}/model/unload/${encodeURIComponent(id)}`)
+      : [`${API_BASE_URL}/model/unload-all`]
+    for (const url of urls) {
+      const response = await axios.post(url, {}, { timeout: 40_000 })
+      if (response.data?.unloaded !== true) throw new Error('Model unload was not confirmed; weights were preserved')
+    }
+  }
   // Logging from renderer
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
   ipcMain.handle('log:getPath', () => join(app.getPath('userData'), 'logs', 'modly.log'))
@@ -366,23 +383,16 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return { success: false, error: String(err) }
     }
 
-    // Unload the model and wait for confirmation so file handles are released
     try {
-      await axios.post(`${API_BASE_URL}/model/unload/${encodeURIComponent(modelId)}`, {}, { timeout: 10_000 })
-      // Give the OS a moment to release file locks (Windows holds handles briefly after close)
-      await new Promise(resolve => setTimeout(resolve, 1_500))
-    } catch {
-      // Unload failed (model may not be loaded) — still attempt deletion
-    }
-
-    // Retry removal — Windows may return EBUSY/EPERM if handles linger
-    const removed = await rmWithRetry(modelDir, 'model-delete')
-    if (removed.ok) return { success: true }
-    return {
-      success: false,
-      error: removed.locked
-        ? 'Model files are still locked after several attempts. Close any programs using the model and try again.'
-        : String(removed.error),
+      const removed = await weightOperations.remove(
+        [modelDir], () => unloadForRemoval([modelId]), () => rmWithRetry(modelDir, 'model-delete'),
+      )
+      notifyWeightChange()
+      return removed.ok ? { success: true } : {
+        success: false, error: removed.locked ? 'Model files are still locked. Try again after closing the model.' : String(removed.error),
+      }
+    } catch (err) {
+      return { success: false, error: String(err) }
     }
   })
 
@@ -492,20 +502,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         extensionId,
         group.id,
       )
-      if (activeWeightTargets.has(groupRoot)) {
-        return { success: false, error: 'Cannot remove shared weights while their download is active' }
-      }
-      await Promise.all(group.dependentModelIds.map(async (dependentModelId) => {
-        try {
-          await axios.post(
-            `${API_BASE_URL}/model/unload/${encodeURIComponent(dependentModelId)}`,
-            {},
-            { timeout: 10_000 },
-          )
-        } catch { /* an unloaded or unavailable model does not block file removal */ }
-      }))
-      await new Promise(resolve => setTimeout(resolve, 1_500))
-      const removed = await rmWithRetry(groupRoot, 'shared-model-delete')
+      const removed = await weightOperations.remove(
+        [groupRoot],
+        () => unloadForRemoval(group.dependentModelIds),
+        () => rmWithRetry(groupRoot, 'shared-model-delete'),
+      )
+      notifyWeightChange()
       if (removed.ok) return { success: true }
       return {
         success: false,
@@ -531,11 +533,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         getSettings(app.getPath('userData')).modelsDir,
         safeExtensionId,
       )
-      try {
-        await axios.post(`${API_BASE_URL}/model/unload-all`, {}, { timeout: 10_000 })
-        await new Promise(resolve => setTimeout(resolve, 1_500))
-      } catch { /* still attempt deletion when the API is unavailable */ }
-      const removed = await rmWithRetry(extensionRoot, 'extension-model-delete')
+      const removed = await weightOperations.remove(
+        [extensionRoot], () => unloadForRemoval(), () => rmWithRetry(extensionRoot, 'extension-model-delete'),
+      )
+      notifyWeightChange()
       if (removed.ok) return { success: true }
       return {
         success: false,
@@ -575,7 +576,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
 
     const modelsDir = getSettings(app.getPath('userData')).modelsDir
-    const managedTargets = plan.kind === 'multi-source'
+    const allTargets = plan.kind === 'multi-source'
       ? [
           ...plan.sharedGroups.map((group) => ({
             targetId: group.targetId,
@@ -587,27 +588,26 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             label: 'Node-specific',
             sources: plan.sources,
           }] : []),
-        ].filter((target) => !areModelSourcesDownloadedAtRoot(
-          resolveWeightStorageRoot(modelsDir, target.targetId),
-          target.sources,
-        ))
+        ]
       : []
     const targetRoots = plan.kind === 'multi-source'
-      ? managedTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
+      ? allTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
       : [resolveModelRoot(modelsDir, modelId)]
-    const conflict = targetRoots.find((root) => activeWeightTargets.has(root))
-    if (conflict) {
-      return {
-        success: false,
-        error: `Weights are already being downloaded by ${activeWeightTargets.get(conflict)}`,
-      }
+    let release: () => void
+    try {
+      release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
+    } catch (err) {
+      return { success: false, error: String(err) }
     }
+    const managedTargets = allTargets.filter((target) => !areModelSourcesDownloadedAtRoot(
+      resolveWeightStorageRoot(modelsDir, target.targetId), target.sources,
+    ))
 
     let finish!: () => void
     const done = new Promise<void>((resolveDone) => { finish = resolveDone })
     const active: ActiveDownload = { progress: { percent: 0 }, done, finish, targetRoots }
     activeDownloads.set(modelId, active)
-    for (const root of targetRoots) activeWeightTargets.set(root, modelId)
+    interruptedTargets.set(modelId, targetRoots)
     try {
       const onProgress = (progress: typeof active.progress) => {
         active.progress = progress
@@ -618,6 +618,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           onProgress({ percent: 100 })
         }
         for (const [index, target] of managedTargets.entries()) {
+          if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
           active.currentTargetId = target.targetId
           await downloadModelSourcesFromHF(target.targetId, target.sources, (progress) => {
             const aggregatePercent = Math.min(
@@ -630,7 +631,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
               status: progress.status ? `${target.label} · ${progress.status}` : target.label,
             })
           })
+          notifyWeightChange()
         }
+        if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
         if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
       } else {
         active.currentTargetId = modelId
@@ -642,6 +645,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           plan.includePrefixes,
         )
       }
+      interruptedTargets.delete(modelId)
       return { success: true }
     } catch (err: any) {
       const message = err?.message ?? String(err)
@@ -656,17 +660,18 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return { success: false, error: String(err) }
     } finally {
       if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
-      for (const root of targetRoots) {
-        if (activeWeightTargets.get(root) === modelId) activeWeightTargets.delete(root)
-      }
+      release()
       active.finish()
+      notifyWeightChange()
     }
   })
 
   ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
     try {
-      const targetId = activeDownloads.get(modelId)?.currentTargetId
-      if (!targetId) return { success: false, error: 'No active download target' }
+      const active = activeDownloads.get(modelId)
+      const targetId = active?.currentTargetId
+      if (!active || !targetId) return { success: false, error: 'No active download target' }
+      active.stopRequested = 'pause'
       await axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
         params: { model_id: targetId },
         timeout: 5000,
@@ -680,6 +685,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('model:cancelDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const active = activeDownloads.get(modelId)
+      if (active) active.stopRequested = 'cancel'
       if (active?.currentTargetId) {
         await axios.post(`${API_BASE_URL}/model/hf-download/cancel`, null, {
           params: { model_id: active.currentTargetId },
@@ -687,20 +693,30 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         })
       }
       if (active) {
-        await Promise.race([
-          active.done,
-          new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error('Timed out waiting for the download to stop')), 30_000)
-          }),
-        ])
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            active.done,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error('Timed out waiting for the download to stop')), 30_000)
+            }),
+          ])
+        } finally {
+          clearTimeout(timer)
+        }
       }
-      // Only remove in-progress `.part` files — a model can now have multiple sources
-      // sharing this directory, and any source that already finished downloading
-      // must survive cancelling the ones still in flight.
-      await Promise.all((active?.targetRoots ?? [resolveModelRoot(
-        getSettings(app.getPath('userData')).modelsDir,
-        modelId,
-      )]).map((root) => removePartialDownloadArtifacts(root)))
+      const roots = active?.targetRoots ?? interruptedTargets.get(modelId) ?? [resolveModelRoot(
+        getSettings(app.getPath('userData')).modelsDir, modelId,
+      )]
+      // Another sibling may have resumed these targets after our session stopped.
+      const release = weightOperations.acquire(`cancelling ${modelId}`, roots)
+      try {
+        await Promise.all(roots.map((root) => removePartialDownloadArtifacts(root)))
+        interruptedTargets.delete(modelId)
+      } finally {
+        release()
+        notifyWeightChange()
+      }
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -794,6 +810,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('settings:set', async (_event, patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string; hfToken?: string }) => {
+    if (patch.modelsDir !== undefined && weightOperations.busy) {
+      throw new Error('Cannot change model storage while model weights are busy')
+    }
     const updated = setSettings(app.getPath('userData'), patch)
     // Keep main-process env in sync so child processes spawned after token change inherit it
     if (patch.hfToken !== undefined) {
@@ -1042,6 +1061,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       throw new Error('manifest.json: weight_groups is supported only for model extensions')
     }
     const weightGroups = normalizeWeightGroups(parsed)
+    if (weightGroups || parsed.nodes?.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
+      validateModelNodeIds(parsed.nodes ?? [])
+    }
     const nodes = (parsed.nodes ?? []).map(n => {
       const usesManagedWeights = weightGroups !== undefined
         || n.model_sources !== undefined
@@ -2000,6 +2022,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // Update FastAPI paths at runtime (without restarting)
   ipcMain.handle('api:updatePaths', async (_event, patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string }) => {
     try {
+      if (patch.modelsDir !== undefined && weightOperations.busy) {
+        throw new Error('Cannot change model storage while model weights are busy')
+      }
       await axios.post(`${API_BASE_URL}/settings/paths`, {
         models_dir:     patch.modelsDir,
         workspace_dir:  patch.workspaceDir,

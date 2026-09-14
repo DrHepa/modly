@@ -158,6 +158,21 @@ def normalize_model_sources(
     return sources
 
 
+def validate_model_node_ids(nodes: list[dict[str, Any]]) -> None:
+    """Managed node roots must be unique on case-insensitive filesystems too."""
+    seen: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("model node must be an object")
+        if isinstance(node.get("id"), str) and node["id"].casefold() == "_shared":
+            raise ValueError('model node id "_shared" is reserved')
+        node_id = safe_source_id(node.get("id"), "model node id")
+        alias = node_id.casefold()
+        if alias in seen:
+            raise ValueError(f'model node id "{node_id}" is not portable-unique')
+        seen.add(alias)
+
+
 def normalize_weight_groups(manifest: dict[str, Any]) -> list[dict[str, Any]] | None:
     if "weight_groups" not in manifest:
         return None

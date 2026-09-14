@@ -158,6 +158,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         }))
       },
       offProgress:    () => ipcRenderer.removeAllListeners('model:downloadProgress'),
+      onWeightsChanged: (cb: () => void) => ipcRenderer.on('model:weightsChanged', cb),
+      offWeightsChanged: () => ipcRenderer.removeAllListeners('model:weightsChanged'),
     },
 
     // App metadata

@@ -423,3 +423,16 @@ test('incompleteInstallRecoveryAction chooses restore, removal, or no-op', () =>
     backupExists: true,
   }), 'none')
 })
+
+test('managed model node ids reject portable aliases before installation', () => {
+  const { validateInstallManifest } = loadModule()
+  const opts = { hasGeneratorFile: () => true, hasEntryFile: () => true }
+  for (const ids of [['Fast', 'fast'], ['fast', 'fast']]) {
+    const manifest = {
+      id: 'demo', type: 'model', generator_class: 'Generator',
+      weight_groups: [{ id: 'base', model_sources: [{ id: 'main', provider: 'huggingface', repo_id: 'org/base', destination: '.', checks: ['weights.bin'] }] }],
+      nodes: ids.map((id) => ({ id, weight_groups: ['base'] })),
+    }
+    assert.throws(() => validateInstallManifest(manifest, opts, 'test'), /portable-unique/)
+  }
+})

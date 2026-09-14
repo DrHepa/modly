@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import type { AnyExtension, ModelExtension, SharedWeightGroupState } from '@shared/types/electron.d'
-import { deleteModelsThenUninstallExtension, formatModelName } from './utils'
+import { deleteModelsThenUninstallExtension, formatModelName, installModelAndRefresh, installModelQueue } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import type { ExtensionNode } from './components/ExtensionCard'
 import { ExtensionDrawer } from './components/ExtensionDrawer'
@@ -81,10 +81,14 @@ export default function ModelsPage(): JSX.Element {
   const [ghUrl,      setGhUrl]      = useState('')
   const [ghErr,      setGhErr]      = useState<string | null>(null)
 
+  const installedRefreshRevision = useRef(0)
+  const installQueues = useRef(new Set<string>())
+
   // ── Init ──────────────────────────────────────────────────────────────────
 
   // Check each model node individually via filesystem IPC — reliable regardless of API state
   async function refreshInstalledIds(exts: ModelExtension[]) {
+    const revision = ++installedRefreshRevision.current
     const ids: string[] = []
     const localIds: string[] = []
     const sharedStates: Record<string, SharedWeightGroupState[]> = {}
@@ -101,6 +105,7 @@ export default function ModelsPage(): JSX.Element {
         if (hasLocalData) localIds.push(fullId)
       }
     }
+    if (revision !== installedRefreshRevision.current) return
     setInstalledVariantIds(ids)
     setLocalDataIds(localIds)
     setSharedGroupStates(sharedStates)
@@ -118,6 +123,9 @@ export default function ModelsPage(): JSX.Element {
         })
       }
       refreshInstalledIds(exts)
+    })
+    window.electron.model.onWeightsChanged(() => {
+      void refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
     })
     window.electron.model.onProgress(({ modelId: id, percent, file, fileIndex, totalFiles, status, bytesDownloaded, totalBytes, stalledSeconds, paused, cancelled }) => {
       if (cancelled) {
@@ -148,7 +156,10 @@ export default function ModelsPage(): JSX.Element {
         })
       }
     })
-    return () => window.electron.model.offProgress()
+    return () => {
+      window.electron.model.offProgress()
+      window.electron.model.offWeightsChanged()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- register the progress listener once on mount
   }, [])
 
@@ -172,22 +183,38 @@ export default function ModelsPage(): JSX.Element {
   // ── Node install / download controls ──────────────────────────────────────
 
   async function handleInstallNode(node: ExtensionNode, fullId: string) {
-    if (!nodeHasManagedWeights(node)) return
+    if (!nodeHasManagedWeights(node)) return { success: true }
     setDownloading((prev) => ({ ...prev, [fullId]: { ...(prev[fullId] ?? { percent: 0 }), paused: false, status: 'Starting…' } }))
-    const result = await window.electron.model.download(fullId)
-    if (!result.success && !result.paused && !result.cancelled) {
-      setGhErr(result.error ?? 'Download failed')
-      setDownloading((prev) => { const n = { ...prev }; delete n[fullId]; return n })
+    try {
+      const result = await installModelAndRefresh(
+        () => window.electron.model.download(fullId),
+        () => refreshInstalledIds(useExtensionsStore.getState().modelExtensions),
+      )
+      if (!result.success && !result.paused && !result.cancelled) {
+        setGhErr(result.error ?? 'Download failed')
+      }
+      if (!result.paused) setDownloading((prev) => { const next = { ...prev }; delete next[fullId]; return next })
+      return result
+    } catch (err) {
+      const error = String(err)
+      setGhErr(error)
+      setDownloading((prev) => { const next = { ...prev }; delete next[fullId]; return next })
+      return { success: false, error }
     }
   }
 
   async function handleInstallAll(ext: AnyExtension) {
-    if (ext.type !== 'model') return
-    for (const node of ext.nodes) {
-      if (!nodeHasManagedWeights(node)) continue
-      const fullId = `${ext.id}/${node.id}`
-      if (installedVariantIds.includes(fullId) || downloading[fullId]) continue
-      await handleInstallNode(node, fullId)
+    if (ext.type !== 'model' || installQueues.current.has(ext.id)) return
+    installQueues.current.add(ext.id)
+    try {
+      const nodes = new Map(ext.nodes.filter(nodeHasManagedWeights).map((node) => [`${ext.id}/${node.id}`, node]))
+      await installModelQueue(
+        nodes.keys(),
+        (id) => window.electron.model.isDownloaded(id),
+        (id) => handleInstallNode(nodes.get(id)!, id),
+      )
+    } finally {
+      installQueues.current.delete(ext.id)
     }
   }
 

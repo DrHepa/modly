@@ -261,6 +261,10 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
         adapter = self.registry.get_generator("shared-model/adapter")
         self.assertEqual(generate.shared_model_dirs, {"base": base_root})
         self.assertEqual(adapter.shared_model_dirs, {"base": base_root})
+        self.assertEqual(generate.MODEL_ID, "shared-model/generate")
+        self.assertEqual(generate.MODEL_NODE_ID, "generate")
+        self.assertEqual(adapter.MODEL_ID, "shared-model/adapter")
+        self.assertEqual(adapter.MODEL_NODE_ID, "adapter")
         self.assertFalse(self.registry._is_downloaded("shared-model/generate", generate))
         self.assertFalse(self.registry._is_downloaded("shared-model/adapter", adapter))
 
@@ -273,6 +277,12 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
         private_root.mkdir(parents=True)
         (private_root / "adapter.bin").write_bytes(b"adapter")
         self.assertTrue(self.registry._is_downloaded("shared-model/adapter", adapter))
+        relocated = self.root / "relocated-models"
+        self.registry.update_paths(relocated, None)
+        self.assertEqual(adapter.model_dir, relocated / "shared-model/adapter")
+        self.assertEqual(adapter.shared_model_dirs, {"base": relocated / "shared-model/_shared/base"})
+        self.assertEqual(adapter.MODEL_NODE_ID, "adapter")
+        self.assertFalse(self.registry._is_downloaded("shared-model/adapter", adapter))
 
     def test_reload_preserves_legacy_path_owned_by_the_host(self) -> None:
         extension = self._make_extension("host-owned-path")

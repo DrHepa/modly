@@ -32,6 +32,17 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(node["id"], "quality")
 
+    def test_select_node_prefers_explicit_node_id_over_storage_path(self) -> None:
+        manifest = {"nodes": [{"id": "fast"}, {"id": "quality"}]}
+
+        node = _select_node(
+            manifest,
+            str(Path("/tmp/ext/_shared/base")),
+            "quality",
+        )
+
+        self.assertEqual(node["id"], "quality")
+
     def test_ready_schema_falls_back_to_selected_node_schema(self) -> None:
         class GenClass:
             @classmethod

@@ -25,7 +25,15 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from services.generators.base import BaseGenerator
 from services.extension_process import ExtensionProcess, _venv_python
-from services.model_sources import model_sources_are_downloaded, normalize_model_sources
+from services.model_sources import (
+    model_sources_are_downloaded,
+    normalize_model_sources,
+    normalize_weight_group_references,
+    normalize_weight_groups,
+    resolve_weight_group_root,
+    safe_source_id,
+    weight_group_sources_are_downloaded,
+)
 
 # ------------------------------------------------------------------ #
 # Global paths
@@ -432,6 +440,8 @@ def _discover_extensions(
             if "model_sources" in manifest:
                 raise ValueError("model_sources must be declared on a model node")
 
+            weight_groups = normalize_weight_groups(manifest)
+
             if ext_id != ext_dir.name:
                 message = (
                     f"Extension folder '{ext_dir.name}' declares mismatched "
@@ -452,6 +462,30 @@ def _discover_extensions(
                 node for node in raw_nodes
                 if isinstance(node, dict) and node.get("id")
             ]
+            group_by_id = {group["id"]: group for group in weight_groups or []}
+            uses_shared_weights = weight_groups is not None or any(
+                "weight_groups" in node for node in nodes
+            )
+            if uses_shared_weights:
+                for node in nodes:
+                    raw_node_id = node.get("id")
+                    if (
+                        weight_groups is not None
+                        and isinstance(raw_node_id, str)
+                        and raw_node_id.casefold() == "_shared"
+                    ):
+                        raise ValueError('model node id "_shared" is reserved')
+                    node_id = safe_source_id(raw_node_id, "model node id")
+                    normalize_weight_group_references(
+                        node,
+                        weight_groups,
+                        field_name=f"nodes[{node_id}].weight_groups",
+                    )
+                    if "weight_groups" in node and "hf_repo" in node:
+                        raise ValueError(
+                            f'model node "{node_id}" must use model_sources for private '
+                            "weights when weight_groups are declared"
+                        )
 
             # Markers left while setup or runtime registration is unfinished:
             # the folder is not ready to be loaded. The readable manifest lets
@@ -528,6 +562,11 @@ def _discover_extensions(
             if nodes:
                 for node in nodes:
                     model_sources = normalize_model_sources(node)
+                    group_ids = normalize_weight_group_references(
+                        node,
+                        weight_groups,
+                        field_name=f"nodes[{node['id']}].weight_groups",
+                    ) or []
                     node_manifest = {
                         **manifest,
                         "id":               f"{ext_id}/{node['id']}",
@@ -541,6 +580,7 @@ def _discover_extensions(
                         "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
                         "input":            node.get("input", "image"),
                         "output":           node.get("output", "mesh"),
+                        "weight_groups":    [group_by_id[group_id] for group_id in group_ids],
                     }
                     if model_sources is not None:
                         node_manifest["model_sources"] = model_sources
@@ -630,6 +670,13 @@ class GeneratorRegistry:
                     gen.download_check   = manifest.get("download_check", "")
                     gen._params_schema   = manifest.get("params_schema", [])
 
+                gen.shared_model_dirs = {
+                    group["id"]: resolve_weight_group_root(
+                        MODELS_DIR, manifest.get("ext_id", model_id.split("/", 1)[0]), group["id"]
+                    )
+                    for group in manifest.get("weight_groups", [])
+                }
+
                 self._generators[model_id] = gen
                 self._manifests[model_id]  = manifest
                 self._errors.pop(model_id, None)
@@ -707,9 +754,12 @@ class GeneratorRegistry:
         self._assert_not_quarantined(self._active_id)
         gen = self._generators[self._active_id]
         downloaded = self._is_downloaded(self._active_id, gen)
-        if "model_sources" in self._manifests[self._active_id] and not downloaded:
+        if (
+            "model_sources" in self._manifests[self._active_id]
+            or self._manifests[self._active_id].get("weight_groups")
+        ) and not downloaded:
             raise RuntimeError(
-                "Model sources are incomplete. Download this node's weights "
+                "Model sources are incomplete. Download this node's shared and private weights "
                 "from the Modly Models page before generation."
             )
         if not gen.is_loaded():
@@ -758,10 +808,21 @@ class GeneratorRegistry:
 
     def _is_downloaded(self, model_id: str, gen: BaseGenerator) -> bool:
         manifest = self._manifests[model_id]
+        private_ready = True
         if "model_sources" in manifest:
-            return model_sources_are_downloaded(
+            private_ready = model_sources_are_downloaded(
                 MODELS_DIR, model_id, manifest["model_sources"]
             )
+        shared_ready = all(
+            weight_group_sources_are_downloaded(
+                MODELS_DIR,
+                manifest.get("ext_id", model_id.split("/", 1)[0]),
+                group,
+            )
+            for group in manifest.get("weight_groups", [])
+        )
+        if "model_sources" in manifest or manifest.get("weight_groups"):
+            return private_ready and shared_ready
         return gen.is_downloaded()
 
     def active_status(self) -> dict:
@@ -812,6 +873,15 @@ class GeneratorRegistry:
             _self_module.MODELS_DIR = models_dir
             for model_id, gen in self._generators.items():
                 gen.model_dir = models_dir / model_id
+                manifest = self._manifests[model_id]
+                gen.shared_model_dirs = {
+                    group["id"]: resolve_weight_group_root(
+                        models_dir,
+                        manifest.get("ext_id", model_id.split("/", 1)[0]),
+                        group["id"],
+                    )
+                    for group in manifest.get("weight_groups", [])
+                }
 
         if workspace_dir is not None:
             workspace_dir.mkdir(parents=True, exist_ok=True)

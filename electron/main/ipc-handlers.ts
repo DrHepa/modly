@@ -14,14 +14,27 @@ import {
   listDownloadedModels,
   downloadModelFromHF,
   downloadModelSourcesFromHF,
+  type DownloadProgress,
 } from './model-downloader'
-import { resolveInstalledModelDownloadPlan } from './model-download-plan'
+import {
+  resolveInstalledExtensionSharedWeightGroups,
+  resolveInstalledModelDownloadPlan,
+} from './model-download-plan'
 import {
   areModelSourcesDownloaded,
+  areModelSourcesDownloadedAtRoot,
+  areWeightGroupSourcesDownloaded,
   modelHasLocalData,
   normalizeModelSources,
+  normalizeWeightGroupReferences,
+  normalizeWeightGroups,
   removePartialDownloadArtifacts,
+  resolveExtensionModelRoot,
   resolveModelRoot,
+  resolveWeightGroupRoot,
+  resolveWeightStorageRoot,
+  safeModelSourceId,
+  weightStorageHasLocalData,
 } from './model-sources'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
@@ -149,11 +162,14 @@ const renameWithRetry = (from: string, to: string, label: string) =>
 
 export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): void {
   type ActiveDownload = {
-    progress: { percent: number; file?: string; fileIndex?: number; totalFiles?: number }
+    progress: DownloadProgress
     done: Promise<void>
     finish: () => void
+    targetRoots: string[]
+    currentTargetId?: string
   }
   const activeDownloads = new Map<string, ActiveDownload>()
+  const activeWeightTargets = new Map<string, string>()
   // Logging from renderer
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
   ipcMain.handle('log:getPath', () => join(app.getPath('userData'), 'logs', 'modly.log'))
@@ -409,9 +425,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         builtinExtensionsDir: getBuiltinExtensionsDir(),
         blockedExtensionIds: activeExtensionInstalls,
       })
-      return plan.kind === 'multi-source'
-        ? areModelSourcesDownloaded(modelsDir, modelId, plan.sources)
-        : isModelDownloaded(modelsDir, modelId, plan.downloadCheck)
+      if (plan.kind === 'multi-source') {
+        const privateReady = plan.sources.length === 0
+          || areModelSourcesDownloaded(modelsDir, modelId, plan.sources)
+        return privateReady && plan.sharedGroups.every((group) => (
+          areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group)
+        ))
+      }
+      return isModelDownloaded(modelsDir, modelId, plan.downloadCheck)
     } catch {
       return false
     }
@@ -431,6 +452,102 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
+  ipcMain.handle('model:sharedGroups', async (_, extensionId: string) => {
+    try {
+      const groups = await resolveInstalledExtensionSharedWeightGroups({
+        extensionId,
+        userExtensionsDir: getSettings(app.getPath('userData')).extensionsDir,
+        builtinExtensionsDir: getBuiltinExtensionsDir(),
+        blockedExtensionIds: activeExtensionInstalls,
+      })
+      const modelsDir = getSettings(app.getPath('userData')).modelsDir
+      return groups.map((group) => ({
+        id: group.id,
+        targetId: group.targetId,
+        dependentModelIds: group.dependentModelIds,
+        downloaded: areWeightGroupSourcesDownloaded(modelsDir, extensionId, group),
+        hasLocalData: weightStorageHasLocalData(modelsDir, group.targetId),
+      }))
+    } catch {
+      return []
+    }
+  })
+
+  ipcMain.handle('model:deleteSharedGroup', async (
+    _,
+    extensionId: string,
+    groupId: string,
+  ): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const groups = await resolveInstalledExtensionSharedWeightGroups({
+        extensionId,
+        userExtensionsDir: getSettings(app.getPath('userData')).extensionsDir,
+        builtinExtensionsDir: getBuiltinExtensionsDir(),
+        blockedExtensionIds: activeExtensionInstalls,
+      })
+      const group = groups.find((candidate) => candidate.id === groupId)
+      if (!group) return { success: false, error: `Unknown shared weight group: ${groupId}` }
+      const groupRoot = resolveWeightGroupRoot(
+        getSettings(app.getPath('userData')).modelsDir,
+        extensionId,
+        group.id,
+      )
+      if (activeWeightTargets.has(groupRoot)) {
+        return { success: false, error: 'Cannot remove shared weights while their download is active' }
+      }
+      await Promise.all(group.dependentModelIds.map(async (dependentModelId) => {
+        try {
+          await axios.post(
+            `${API_BASE_URL}/model/unload/${encodeURIComponent(dependentModelId)}`,
+            {},
+            { timeout: 10_000 },
+          )
+        } catch { /* an unloaded or unavailable model does not block file removal */ }
+      }))
+      await new Promise(resolve => setTimeout(resolve, 1_500))
+      const removed = await rmWithRetry(groupRoot, 'shared-model-delete')
+      if (removed.ok) return { success: true }
+      return {
+        success: false,
+        error: removed.locked
+          ? 'Shared model files are still locked. Close any programs using them and try again.'
+          : String(removed.error),
+      }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  ipcMain.handle('model:deleteExtensionWeights', async (
+    _,
+    extensionId: string,
+  ): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const safeExtensionId = assertSafeExtensionId(extensionId)
+      if ([...activeDownloads.keys()].some((modelId) => modelId.split('/', 1)[0] === safeExtensionId)) {
+        return { success: false, error: 'Cannot remove extension weights while a download is active' }
+      }
+      const extensionRoot = resolveExtensionModelRoot(
+        getSettings(app.getPath('userData')).modelsDir,
+        safeExtensionId,
+      )
+      try {
+        await axios.post(`${API_BASE_URL}/model/unload-all`, {}, { timeout: 10_000 })
+        await new Promise(resolve => setTimeout(resolve, 1_500))
+      } catch { /* still attempt deletion when the API is unavailable */ }
+      const removed = await rmWithRetry(extensionRoot, 'extension-model-delete')
+      if (removed.ok) return { success: true }
+      return {
+        success: false,
+        error: removed.locked
+          ? 'Extension model files are still locked. Close any programs using them and try again.'
+          : String(removed.error),
+      }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
   ipcMain.handle('model:activeDownloads', () =>
     [...activeDownloads.entries()].map(([modelId, active]) => ({ modelId, ...active.progress }))
   )
@@ -442,24 +559,81 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Download already in progress' }
     }
-    let finish!: () => void
-    const done = new Promise<void>((resolveDone) => { finish = resolveDone })
-    const active: ActiveDownload = { progress: { percent: 0 }, done, finish }
-    activeDownloads.set(modelId, active)
+    let plan: Awaited<ReturnType<typeof resolveInstalledModelDownloadPlan>>
     try {
-      const plan = await resolveInstalledModelDownloadPlan({
+      plan = await resolveInstalledModelDownloadPlan({
         modelId,
         userExtensionsDir: getSettings(app.getPath('userData')).extensionsDir,
         builtinExtensionsDir: getBuiltinExtensionsDir(),
         blockedExtensionIds: activeExtensionInstalls,
       })
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+    if (activeDownloads.has(modelId)) {
+      return { success: false, error: 'Download already in progress' }
+    }
+
+    const modelsDir = getSettings(app.getPath('userData')).modelsDir
+    const managedTargets = plan.kind === 'multi-source'
+      ? [
+          ...plan.sharedGroups.map((group) => ({
+            targetId: group.targetId,
+            label: `Shared · ${group.id}`,
+            sources: group.sources,
+          })),
+          ...(plan.sources.length > 0 ? [{
+            targetId: modelId,
+            label: 'Node-specific',
+            sources: plan.sources,
+          }] : []),
+        ].filter((target) => !areModelSourcesDownloadedAtRoot(
+          resolveWeightStorageRoot(modelsDir, target.targetId),
+          target.sources,
+        ))
+      : []
+    const targetRoots = plan.kind === 'multi-source'
+      ? managedTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
+      : [resolveModelRoot(modelsDir, modelId)]
+    const conflict = targetRoots.find((root) => activeWeightTargets.has(root))
+    if (conflict) {
+      return {
+        success: false,
+        error: `Weights are already being downloaded by ${activeWeightTargets.get(conflict)}`,
+      }
+    }
+
+    let finish!: () => void
+    const done = new Promise<void>((resolveDone) => { finish = resolveDone })
+    const active: ActiveDownload = { progress: { percent: 0 }, done, finish, targetRoots }
+    activeDownloads.set(modelId, active)
+    for (const root of targetRoots) activeWeightTargets.set(root, modelId)
+    try {
       const onProgress = (progress: typeof active.progress) => {
         active.progress = progress
         event.sender.send('model:downloadProgress', { modelId, ...progress })
       }
       if (plan.kind === 'multi-source') {
-        await downloadModelSourcesFromHF(modelId, plan.sources, onProgress)
+        if (managedTargets.length === 0) {
+          onProgress({ percent: 100 })
+        }
+        for (const [index, target] of managedTargets.entries()) {
+          active.currentTargetId = target.targetId
+          await downloadModelSourcesFromHF(target.targetId, target.sources, (progress) => {
+            const aggregatePercent = Math.min(
+              99,
+              Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
+            )
+            onProgress({
+              ...progress,
+              percent: aggregatePercent,
+              status: progress.status ? `${target.label} · ${progress.status}` : target.label,
+            })
+          })
+        }
+        if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
       } else {
+        active.currentTargetId = modelId
         await downloadModelFromHF(
           plan.repoId,
           modelId,
@@ -482,14 +656,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return { success: false, error: String(err) }
     } finally {
       if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
+      for (const root of targetRoots) {
+        if (activeWeightTargets.get(root) === modelId) activeWeightTargets.delete(root)
+      }
       active.finish()
     }
   })
 
   ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
     try {
+      const targetId = activeDownloads.get(modelId)?.currentTargetId
+      if (!targetId) return { success: false, error: 'No active download target' }
       await axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
-        params: { model_id: modelId },
+        params: { model_id: targetId },
         timeout: 5000,
       })
       return { success: true }
@@ -501,10 +680,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('model:cancelDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const active = activeDownloads.get(modelId)
-      await axios.post(`${API_BASE_URL}/model/hf-download/cancel`, null, {
-        params: { model_id: modelId },
-        timeout: 5000,
-      })
+      if (active?.currentTargetId) {
+        await axios.post(`${API_BASE_URL}/model/hf-download/cancel`, null, {
+          params: { model_id: active.currentTargetId },
+          timeout: 5000,
+        })
+      }
       if (active) {
         await Promise.race([
           active.done,
@@ -513,11 +694,13 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           }),
         ])
       }
-      const modelDir = resolveModelRoot(getSettings(app.getPath('userData')).modelsDir, modelId)
       // Only remove in-progress `.part` files — a model can now have multiple sources
       // sharing this directory, and any source that already finished downloading
       // must survive cancelling the ones still in flight.
-      await removePartialDownloadArtifacts(modelDir)
+      await Promise.all((active?.targetRoots ?? [resolveModelRoot(
+        getSettings(app.getPath('userData')).modelsDir,
+        modelId,
+      )]).map((root) => removePartialDownloadArtifacts(root)))
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -818,6 +1001,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     type?:  'model' | 'process'
     entry?: string
     model_sources?: unknown
+    weight_groups?: unknown
     // Optional top-level fallbacks — applied to each node if not set on the node
     params_schema?:  unknown[]
     param_defaults?: Record<string, unknown>
@@ -835,6 +1019,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       hf_skip_prefixes?: string[]
       hf_include_prefixes?: string[]
       model_sources?: unknown
+      weight_groups?: unknown
     }[]
   }
 
@@ -853,13 +1038,34 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     if (parsed.model_sources !== undefined) {
       throw new Error('manifest.json: model_sources must be declared on a model node')
     }
+    if (parsed.type === 'process' && parsed.weight_groups !== undefined) {
+      throw new Error('manifest.json: weight_groups is supported only for model extensions')
+    }
+    const weightGroups = normalizeWeightGroups(parsed)
     const nodes = (parsed.nodes ?? []).map(n => {
-      if (parsed.type === 'process' && n.model_sources !== undefined) {
-        throw new Error('manifest.json: model_sources is supported only for model nodes')
+      const usesManagedWeights = weightGroups !== undefined
+        || n.model_sources !== undefined
+        || n.weight_groups !== undefined
+      if (weightGroups !== undefined && typeof n.id === 'string' && n.id.toLowerCase() === '_shared') {
+        throw new Error('manifest.json: model node id "_shared" is reserved')
+      }
+      const nodeId = usesManagedWeights ? safeModelSourceId(n.id, 'model node id') : n.id
+      if (parsed.type === 'process' && (n.model_sources !== undefined || n.weight_groups !== undefined)) {
+        throw new Error('manifest.json: model_sources and weight_groups are supported only for model nodes')
       }
       const modelSources = normalizeModelSources(n)
+      const groupRefs = normalizeWeightGroupReferences(
+        n,
+        weightGroups,
+        `nodes[${n.id}].weight_groups`,
+      )
+      if (groupRefs && n.hf_repo !== undefined) {
+        throw new Error(
+          `manifest.json: model node "${nodeId}" must use model_sources for private weights when weight_groups are declared`,
+        )
+      }
       return {
-        id:             n.id,
+        id:             nodeId,
         name:           n.name ?? n.id,
         input:          n.input  ?? 'image' as const,
         inputs:         n.inputs,
@@ -872,6 +1078,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         hfSkipPrefixes: n.hf_skip_prefixes,
         hfIncludePrefixes: n.hf_include_prefixes,
         hasModelSources: modelSources !== undefined,
+        weightGroups: groupRefs,
       }
     })
 
@@ -879,7 +1086,17 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
     }
 
-    return { ...common, type: 'model' as const, nodes }
+    return {
+      ...common,
+      type: 'model' as const,
+      nodes,
+      weightGroups: (weightGroups ?? []).map((group) => ({
+        id: group.id,
+        dependentNodeIds: nodes
+          .filter((node) => node.weightGroups?.includes(group.id))
+          .map((node) => node.id),
+      })),
+    }
   }
 
   async function reloadAndValidateModelExtension(

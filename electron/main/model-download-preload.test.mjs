@@ -20,7 +20,7 @@ function loadModule() {
   return require(outfile)
 }
 
-test('renderer model actions send only the model node id', async () => {
+test('renderer model actions keep node and shared-weight identities explicit', async () => {
   const { createElectronApi } = loadModule()
   const calls = []
   const ipc = {
@@ -33,12 +33,18 @@ test('renderer model actions send only the model node id', async () => {
 
   await api.model.isDownloaded('pixal3d/generate')
   await api.model.hasLocalData('pixal3d/generate')
+  await api.model.sharedGroups('pixal3d')
   await api.model.download('pixal3d/generate')
+  await api.model.deleteSharedGroup('pixal3d', 'base')
+  await api.model.deleteExtensionWeights('pixal3d')
 
   assert.deepEqual(calls, [
     ['model:isDownloaded', 'pixal3d/generate'],
     ['model:hasLocalData', 'pixal3d/generate'],
+    ['model:sharedGroups', 'pixal3d'],
     ['model:download', 'pixal3d/generate'],
+    ['model:deleteSharedGroup', 'pixal3d', 'base'],
+    ['model:deleteExtensionWeights', 'pixal3d'],
   ])
 })
 
@@ -48,8 +54,12 @@ test('declared partial data is removable and active downloads block destructive 
   const drawer = readFileSync(resolve('src/areas/models/components/ExtensionDrawer.tsx'), 'utf8')
 
   assert.match(main, /model:delete[\s\S]*activeDownloads\.has\(modelId\)/)
+  assert.match(main, /model:deleteSharedGroup[\s\S]*activeWeightTargets\.has\(groupRoot\)/)
+  assert.match(main, /model:deleteExtensionWeights[\s\S]*resolveExtensionModelRoot/)
   assert.match(main, /extensions:uninstall[\s\S]*activeDownloads\.keys\(\)/)
   assert.match(page, /window\.electron\.model\.hasLocalData\(fullId\)/)
+  assert.match(page, /deleteExtensionWeights\(extId\)/)
   assert.match(drawer, /localDataIds\.includes\(fullId\) && state\.kind !== 'downloading'/)
   assert.match(drawer, /Remove partial model data/)
+  assert.match(drawer, /following nodes will become unavailable/)
 })

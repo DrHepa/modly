@@ -177,6 +177,29 @@ class MultiSourceRouterTests(unittest.TestCase):
         self.assertEqual(resumed[-1], {"percent": 100, "status": "done"})
         self.assertTrue((self.models_dir / "pixal3d/generate/main.bin").is_file())
 
+    def test_shared_target_downloads_under_extension_reserved_root(self) -> None:
+        calls: list[str] = []
+        self.install_hf_stub({"org/main": ["main.bin"]}, calls)
+
+        def fake_download(**kwargs):
+            target = Path(kwargs["dest_dir"]) / kwargs["filename"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"shared")
+            return target.stat().st_size
+
+        async def run():
+            with patch.object(model_router, "_download_file_streamed", fake_download):
+                response = await model_router.hf_download_sources(
+                    request_for([SOURCES[0]]), "pixal3d/_shared/base"
+                )
+                return await collect_events(response)
+
+        events = asyncio.run(run())
+        self.assertEqual(events[-1], {"percent": 100, "status": "done"})
+        self.assertTrue(
+            (self.models_dir / "pixal3d/_shared/base/main.bin").is_file()
+        )
+
     def test_rejects_a_check_filtered_out_of_the_source_plan(self) -> None:
         calls: list[str] = []
         self.install_hf_stub({"org/main": ["other.bin"]}, calls)

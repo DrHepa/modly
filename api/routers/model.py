@@ -14,8 +14,8 @@ from services.generator_registry import generator_registry, MODELS_DIR
 from services.model_sources import (
     normalize_model_sources,
     resolve_download_path,
-    resolve_model_root,
-    resolve_source_destination,
+    resolve_source_destination_at_root,
+    resolve_weight_storage_root,
     validate_source_file_plan,
 )
 
@@ -131,7 +131,7 @@ async def cancel_hf_download(model_id: str):
 
 @router.post("/hf-download-sources")
 async def hf_download_sources(request: FastAPIRequest, model_id: str):
-    """Download all Hugging Face sources declared for one model node."""
+    """Download sources into one validated node or extension-shared target."""
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -140,10 +140,10 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
         if raw_sources is None:
             raise ValueError("sources are required")
         sources = normalize_model_sources({"model_sources": raw_sources})
-        model_root = resolve_model_root(MODELS_DIR, model_id)
+        model_root = resolve_weight_storage_root(MODELS_DIR, model_id)
         destinations = {
-            source["id"]: resolve_source_destination(
-                MODELS_DIR, model_id, source["destination"]
+            source["id"]: resolve_source_destination_at_root(
+                model_root, source["destination"]
             )
             for source in sources
         }

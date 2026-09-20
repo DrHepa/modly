@@ -8,6 +8,8 @@ import { initAutoUpdater } from './updater'
 import { syncBuiltinExtensions } from './builtin-sync'
 import { reconcileInterruptedExtensionInstalls } from './extension-install-recovery'
 import { getSettings } from './settings-store'
+import { mkdirSync } from 'fs'
+import { resolveApiEndpoint, resolveIsolatedUserDataDir } from './api-endpoint'
 
 let mainWindow: BrowserWindow | null = null
 let pythonBridge: PythonBridge | null = null
@@ -75,6 +77,19 @@ function createWindow(): void {
 }
 
 app.setName('Modly')
+
+// Establish the private profile before any settings, cache, or extension sync.
+// Fail closed if isolated mode lacks either a private port or profile.
+resolveApiEndpoint()
+const isolatedUserDataDir = resolveIsolatedUserDataDir(
+  process.env,
+  app.getPath('userData'),
+  [join(app.getPath('documents'), 'Modly')],
+)
+if (isolatedUserDataDir) {
+  mkdirSync(isolatedUserDataDir, { recursive: true })
+  app.setPath('userData', isolatedUserDataDir)
+}
 
 process.on('uncaughtException', (err) => {
   if ((err as NodeJS.ErrnoException).code === 'EPIPE') return

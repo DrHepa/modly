@@ -2,7 +2,7 @@ import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
 
-type DataType = 'image' | 'text' | 'mesh' | 'audio'
+type DataType = 'image' | 'text' | 'mesh' | 'audio' | 'scene' | 'capture'
 
 export interface WorkflowPreflightIssue {
   key: string
@@ -14,6 +14,8 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
   if (node.type === 'imageNode') return 'Image'
   if (node.type === 'textNode') return 'Text'
   if (node.type === 'meshNode') return 'Load 3D Mesh'
+  if (node.type === 'sceneNode') return 'Load Scene'
+  if (node.type === 'captureNode') return 'Load Capture'
   if (node.type === 'outputNode') return 'Add to Scene'
   if (node.type === 'previewNode') return 'Preview Views'
   if (node.type === 'imagePreviewNode') return 'Preview Image'
@@ -31,6 +33,8 @@ function formatType(type: DataType): string {
   if (type === 'mesh') return 'mesh'
   if (type === 'image') return 'image'
   if (type === 'audio') return 'audio'
+  if (type === 'scene') return 'scene'
+  if (type === 'capture') return 'capture'
   return 'text'
 }
 
@@ -44,6 +48,8 @@ function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): Da
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
+  if (node.type === 'sceneNode') return 'scene'
+  if (node.type === 'captureNode') return 'capture'
   if (node.type === 'previewNode') return 'image'
   if (node.type === 'imagePreviewNode') return 'image'
   if (node.type === 'forEachNode') {
@@ -119,6 +125,35 @@ export function validateWorkflowPreflight(
         message: `${nodeLabel(node, allExtensions)} is unavailable. Reload extensions or remove the node.`,
       })
       continue
+    }
+
+    if (ext.type === 'process' && (ext.input === 'scene' || ext.input === 'capture' || ext.inputs?.some((kind) => kind === 'scene' || kind === 'capture'))) {
+      const consumesScene = ext.input === 'scene' || ext.inputs?.includes('scene')
+      pushIssue(issues, {
+        key: `${node.id}:unsupported:scene-process`,
+        nodeId: node.id,
+        message: consumesScene
+          ? `${ext.name} declares scene input, but process nodes cannot receive scenes. Use a model node.`
+          : `${ext.name} declares capture input, but process nodes cannot receive capture manifests. Use a model node.`,
+      })
+      continue
+    }
+
+    if (ext.type === 'model' && (ext.input === 'scene' || ext.input === 'capture' || ext.inputs?.some((kind) => kind === 'scene' || kind === 'capture'))) {
+      const inputs = ext.inputs ?? [ext.input]
+      const primary = ext.input
+      if ((primary !== 'scene' && primary !== 'capture')
+        || inputs.filter((kind) => kind === primary).length !== 1
+        || inputs.filter((kind) => kind === 'scene' || kind === 'capture').length !== 1
+        || inputs.filter((kind) => kind === 'text').length > 1
+        || inputs.some((kind) => kind !== primary && kind !== 'text')) {
+        pushIssue(issues, {
+          key: `${node.id}:unsupported:${primary === 'scene' ? 'scene-model-inputs' : 'capture-model-inputs'}`,
+          nodeId: node.id,
+          message: `${ext.name} declares unsupported typed inputs. Typed models accept one scene or capture and an optional text prompt, not image or mesh artifacts or mixed typed artifacts.`,
+        })
+        continue
+      }
     }
 
     const incomingEdges = workflow.edges.filter((edge) => edge.target === node.id)

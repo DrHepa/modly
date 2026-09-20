@@ -25,6 +25,8 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from services.generators.base import BaseGenerator
 from services.extension_process import ExtensionProcess, _venv_python
+from services.generation_lifecycle import generation_lifecycle
+from services.capture_input import validate_typed_model_node_inputs
 from services.model_sources import (
     model_sources_are_downloaded,
     normalize_model_sources,
@@ -463,6 +465,8 @@ def _discover_extensions(
                 node for node in raw_nodes
                 if isinstance(node, dict) and node.get("id")
             ]
+            for node in nodes:
+                validate_typed_model_node_inputs(node)
             group_by_id = {group["id"]: group for group in weight_groups or []}
             uses_shared_weights = weight_groups is not None or any(
                 "weight_groups" in node for node in nodes
@@ -710,6 +714,7 @@ class GeneratorRegistry:
         Re-scans extensions and updates the registry without restarting FastAPI.
         Unloads all current generators before reloading.
         """
+        self._assert_all_generators_idle()
         registration_authorization = _consume_registration_validation_capability(
             validation_capability,
         )
@@ -756,12 +761,20 @@ class GeneratorRegistry:
 
     def get_active(self) -> BaseGenerator:
         """Returns the active generator. Downloads and loads if necessary."""
-        self._assert_not_quarantined(self._active_id)
-        gen = self._generators[self._active_id]
-        downloaded = self._is_downloaded(self._active_id, gen)
+        return self.get_requested(self._active_id, self._generators[self._active_id])
+
+    def get_requested(self, model_id: str, expected_generator: object) -> BaseGenerator:
+        """Load the exact generator identity frozen when a job was accepted."""
+        self._assert_not_quarantined(model_id)
+        gen = self._generators.get(model_id)
+        if gen is not expected_generator:
+            raise RuntimeError(
+                f"Requested model '{model_id}' changed before execution; refusing to run another generator"
+            )
+        downloaded = self._is_downloaded(model_id, gen)
         if (
-            "model_sources" in self._manifests[self._active_id]
-            or self._manifests[self._active_id].get("weight_groups")
+            "model_sources" in self._manifests[model_id]
+            or self._manifests[model_id].get("weight_groups")
         ) and not downloaded:
             raise RuntimeError(
                 "Model sources are incomplete. Download this node's shared and private weights "
@@ -779,6 +792,22 @@ class GeneratorRegistry:
             gen.load()
         return gen
 
+    def requested_status(self, model_id: str, expected_generator: object) -> dict:
+        """Status for an immutable requested target, independent of active_id."""
+        self._assert_not_quarantined(model_id)
+        gen = self._generators.get(model_id)
+        if gen is not expected_generator:
+            raise RuntimeError(
+                f"Requested model '{model_id}' changed before execution; refusing to run another generator"
+            )
+        manifest = self._manifests[model_id]
+        return {
+            "id": model_id,
+            "name": manifest.get("name", gen.DISPLAY_NAME),
+            "downloaded": self._is_downloaded(model_id, gen),
+            "loaded": gen.is_loaded(),
+        }
+
     def get_generator(self, model_id: str) -> BaseGenerator:
         self._assert_not_quarantined(model_id)
         if model_id not in self._generators:
@@ -794,6 +823,18 @@ class GeneratorRegistry:
             raise KeyError(f"No manifest for model ID: '{model_id}'")
         return self._manifests[model_id]
 
+    def assert_generator_idle(self, model_id: str) -> BaseGenerator:
+        """Return a generator only when no accepted job owns its lifecycle."""
+        gen = self.get_generator(model_id)
+        if generation_lifecycle.is_generator_reserved(gen):
+            raise RuntimeError(f"Cannot unload '{model_id}' while it is executing")
+        return gen
+
+    def _assert_all_generators_idle(self) -> None:
+        for model_id, gen in self._generators.items():
+            if generation_lifecycle.is_generator_reserved(gen):
+                raise RuntimeError(f"Cannot unload '{model_id}' while it is executing")
+
     def switch_model(self, model_id: str) -> None:
         """Switches the active model. Unloads the previous one if different."""
         self._assert_not_quarantined(model_id)
@@ -804,7 +845,12 @@ class GeneratorRegistry:
             )
         if model_id != self._active_id:
             if self._active_id in self._generators:
-                self._generators[self._active_id].unload()
+                previous = self._generators[self._active_id]
+                if generation_lifecycle.is_generator_reserved(previous):
+                    raise RuntimeError(
+                        f"Cannot switch models while '{self._active_id}' is executing"
+                    )
+                previous.unload()
             self._active_id = model_id
 
     # ------------------------------------------------------------------ #
@@ -895,6 +941,7 @@ class GeneratorRegistry:
                 gen.outputs_dir = workspace_dir
 
     def unload_all(self) -> None:
+        self._assert_all_generators_idle()
         for gen in self._generators.values():
             if isinstance(gen, ExtensionProcess):
                 gen.stop()

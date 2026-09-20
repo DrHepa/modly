@@ -6,10 +6,11 @@ import axios from 'axios'
 import { getSettings } from './settings-store'
 import { logger } from './logger'
 import { cleanPythonEnv, getVenvPythonExe } from './python-setup'
+import { assertApiPortAvailable, resolveApiEndpoint } from './api-endpoint'
 
-const API_PORT = 8765
+const API_PORT = resolveApiEndpoint().port
 const API_HOST = '127.0.0.1'
-export const API_BASE_URL = `http://${API_HOST}:${API_PORT}`
+export const API_BASE_URL = resolveApiEndpoint().baseUrl
 
 export class PythonBridge {
   private process: ChildProcess | null = null
@@ -45,7 +46,7 @@ export class PythonBridge {
     console.log('[PythonBridge] Starting FastAPI at', apiDir)
     console.log('[PythonBridge] Python executable:', pythonExecutable)
 
-    await this.killProcessOnPort()
+    await assertApiPortAvailable(API_PORT)
 
     this.process = spawn(pythonExecutable, ['-m', 'uvicorn', 'main:app', '--host', API_HOST, '--port', String(API_PORT)], {
       cwd: apiDir,
@@ -60,6 +61,7 @@ export class PythonBridge {
         WORKSPACE_DIR:          this.resolveWorkspaceDir(),
         EXTENSIONS_DIR:         this.resolveExtensionsDir(),
         SELECTED_MODEL_ID:      process.env['SELECTED_MODEL_ID'] ?? '',
+        MODLY_API_PORT:         String(API_PORT),
         HUGGING_FACE_HUB_TOKEN: this.resolveHfToken(),
         HF_TOKEN:               this.resolveHfToken(),
       },
@@ -149,34 +151,6 @@ export class PythonBridge {
 
   isReady(): boolean { return this.ready }
   getPort(): number { return API_PORT }
-
-  private async killProcessOnPort(): Promise<void> {
-    const { execSync } = require('child_process')
-
-    if (process.platform !== 'win32') {
-      try { execSync(`lsof -ti tcp:${API_PORT} | xargs kill -9 2>/dev/null || true`, { shell: true }) } catch {}
-      return
-    }
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      let output = ''
-      try {
-        output = execSync(`netstat -ano | findstr ":${API_PORT} "`, { encoding: 'utf8', shell: true }) as string
-      } catch { break }
-
-      const pids = new Set<string>()
-      for (const line of output.split('\n')) {
-        const match = line.trim().match(/\s+(\d+)$/)
-        if (match && match[1] !== '0') pids.add(match[1])
-      }
-      if (pids.size === 0) break
-
-      for (const pid of pids) {
-        try { execSync(`taskkill /PID ${pid} /T /F`, { shell: true }) } catch {}
-      }
-      await new Promise((r) => setTimeout(r, 300))
-    }
-  }
 
   private async waitUntilReady(maxRetries = 180, delayMs = 500): Promise<void> {
     for (let i = 0; i < maxRetries; i++) {

@@ -13,14 +13,17 @@ import os
 import platform
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
 _RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
+_CANCEL_GRACE_SECONDS = 3.0
 _MISSING_MODULE_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
 _AUTO_REPAIR_PACKAGE_MAP = {
     "PIL": "Pillow",
@@ -32,6 +35,121 @@ def _venv_python(ext_dir: Path) -> Path:
     if platform.system() == "Windows":
         return ext_dir / "venv" / "Scripts" / "python.exe"
     return ext_dir / "venv" / "bin" / "python"
+
+
+def _popen_process_group_kwargs() -> dict:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _close_process_pipes(proc: subprocess.Popen) -> None:
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _posix_descendants(root_pid: int) -> set[int]:
+    """Return the live descendant closure without assuming shared sessions.
+
+    Extensions are allowed to create their own sessions/process groups.  A
+    killpg() aimed only at runner.py therefore cannot be the host's complete
+    cancellation authority.  Linux exposes parentage in /proc; other POSIX
+    hosts use the standard ps table.
+    """
+    pairs: list[tuple[int, int]] = []
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "stat").read_text(encoding="utf-8")
+                tail = raw[raw.rfind(")") + 2:].split()
+                pairs.append((int(entry.name), int(tail[1])))
+            except (IndexError, OSError, ValueError):
+                continue
+    else:
+        completed = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in completed.stdout.splitlines():
+            try:
+                pid, ppid = (int(value) for value in line.split())
+            except ValueError:
+                continue
+            pairs.append((pid, ppid))
+    children: dict[int, list[int]] = {}
+    for pid, ppid in pairs:
+        children.setdefault(ppid, []).append(pid)
+    descendants: set[int] = set()
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children.get(pid, ()))
+    return descendants
+
+
+def _kill_posix_tree(root_pid: int) -> None:
+    """Freeze then kill all descendant groups, including nested sessions."""
+    descendants = _posix_descendants(root_pid)
+    # Stop every observed process before the second snapshot so no observed
+    # parent can race cancellation by forking another detached worker.
+    for pid in {root_pid, *descendants}:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except (ProcessLookupError, PermissionError):
+            pass
+    descendants.update(_posix_descendants(root_pid))
+    pids = {root_pid, *descendants}
+    groups: set[int] = set()
+    for pid in pids:
+        try:
+            groups.add(os.getpgid(pid))
+        except (ProcessLookupError, PermissionError):
+            pass
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _terminate_process_tree(proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Hard-stop the runner and every process inheriting its owned group."""
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int):
+        proc.kill()
+        proc.wait(timeout=timeout)
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    else:
+        _kill_posix_tree(pid)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    _close_process_pipes(proc)
 
 
 class ExtensionProcess:
@@ -130,6 +248,7 @@ class ExtensionProcess:
                 errors="replace",
                 bufsize=1,
                 env=self._build_env(),
+                **_popen_process_group_kwargs(),
             )
 
             # Background thread: read stdout → queue
@@ -150,8 +269,7 @@ class ExtensionProcess:
                 print(f"[ExtensionProcess] {self.MODEL_ID} subprocess started (pid {self._proc.pid})")
                 return
 
-            self._proc.kill()
-            self._proc.wait()
+            _terminate_process_tree(self._proc)
             missing_module = self._extract_missing_module(msg)
             package_name = self._resolve_auto_repair_package(missing_module) if missing_module else None
             if package_name and attempt < 2:
@@ -293,18 +411,37 @@ class ExtensionProcess:
 
     def generate(
         self,
-        image_bytes: bytes,
+        image_bytes,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
         from services.generators.base import GenerationCancelled
 
+        # Pin this call to one subprocess lifetime. A cancelled executor future
+        # can outlive its asyncio task; the retiring call must never consume a
+        # later job's queue or send cancellation to its replacement process.
+        run_proc = self._proc
+        run_queue = self._queue
         req_id = str(uuid.uuid4())
+        from services.capture_input import TypedModelInput, revalidate_typed_model_input
+        if isinstance(image_bytes, TypedModelInput):
+            from services.generator_registry import WORKSPACE_DIR
+            typed = revalidate_typed_model_input(WORKSPACE_DIR, image_bytes)
+            input_payload = {"input": {"kind": typed.kind, "path": str(typed.path)}}
+        elif isinstance(image_bytes, Path):
+            from services.generator_registry import WORKSPACE_DIR
+            from services.scene_input import revalidate_scene_manifest
+            scene_path = revalidate_scene_manifest(WORKSPACE_DIR, image_bytes)
+            input_payload = {"input": {"kind": "scene", "path": str(scene_path)}}
+        elif isinstance(image_bytes, bytes):
+            input_payload = {"image_b64": base64.b64encode(image_bytes).decode()}
+        else:
+            raise TypeError("Model input must be image bytes, a scene Path, or a typed model input")
         self._send({
             "action":      "generate",
             "id":          req_id,
-            "image_b64":   base64.b64encode(image_bytes).decode(),
+            **input_payload,
             "params":      params,
             "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
         })
@@ -314,8 +451,6 @@ class ExtensionProcess:
         # between steps shut down cleanly, short enough that the user isn't
         # left staring at a stuck UI when the subprocess is blocked inside a
         # native call (octree decode, marching cubes, etc.) that ignores stdin.
-        CANCEL_GRACE_SECONDS = 3.0
-
         cancel_sent_at: Optional[float] = None
         while True:
             # Check for cancellation
@@ -323,36 +458,35 @@ class ExtensionProcess:
                 if cancel_sent_at is None:
                     # First observation of the cancel — ask the subprocess to stop.
                     try:
-                        self._send({"action": "cancel", "id": req_id})
+                        if self._proc is run_proc:
+                            self._send({"action": "cancel", "id": req_id})
                     except Exception:
                         pass
-                    import time
                     cancel_sent_at = time.monotonic()
                 else:
-                    import time
-                    if time.monotonic() - cancel_sent_at >= CANCEL_GRACE_SECONDS:
+                    if time.monotonic() - cancel_sent_at >= _CANCEL_GRACE_SECONDS:
                         # Grace period expired — the subprocess is not
                         # responding (almost certainly stuck in native code).
                         # Hard-kill it and drop our state so the next
                         # generation forces a fresh load.
                         try:
-                            if self._proc and self._proc.poll() is None:
-                                self._proc.kill()
-                                self._proc.wait(timeout=5.0)
+                            if self._proc is run_proc and run_proc and run_proc.poll() is None:
+                                _terminate_process_tree(run_proc)
                         except Exception:
                             pass
-                        self._loaded = False
-                        self._proc   = None
+                        if self._proc is run_proc:
+                            self._loaded = False
+                            self._proc = None
                         print(
                             f"[ExtensionProcess] {self.MODEL_ID} subprocess killed "
-                            f"after {CANCEL_GRACE_SECONDS}s grace; model will reload on next run",
+                            f"after {_CANCEL_GRACE_SECONDS}s grace; model will reload on next run",
                             file=sys.stderr,
                         )
                         raise GenerationCancelled()
 
             # Poll queue with short timeout so we can re-check cancel_event
             try:
-                msg = self._queue.get(timeout=0.5)
+                msg = run_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -400,8 +534,7 @@ class ExtensionProcess:
         self._loaded = False
         if proc and proc.poll() is None:
             try:
-                proc.kill()
-                proc.wait(timeout=5)
+                _terminate_process_tree(proc)
             except Exception as exc:
                 # Keep the process reference so callers can verify that the
                 # worker may still be alive and refuse to mutate its venv.
@@ -416,6 +549,12 @@ class ExtensionProcess:
                 )
         self._proc = None
         self._drain_queue()
+        # stop() may run from the API event-loop thread while load()/generate()
+        # is blocked in _recv() on an executor thread.  The reader's sentinel
+        # can race with the drain above; always publish one final sentinel to
+        # the retiring queue so the reserved execution wakes and releases its
+        # generator lock before another job can acquire it.
+        self._queue.put(None)
 
     def _drain_queue(self) -> None:
         while not self._queue.empty():

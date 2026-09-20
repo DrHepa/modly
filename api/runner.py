@@ -81,6 +81,22 @@ def recv():
                       "message": f"Runner: invalid JSON on stdin: {exc}"})
 
 
+def decode_model_input(msg: dict):
+    """Decode legacy images or revalidate a typed scene/capture inside the worker."""
+    typed_input = msg.get("input")
+    if typed_input is not None:
+        if (not isinstance(typed_input, dict) or typed_input.get("kind") not in ("scene", "capture")
+                or not isinstance(typed_input.get("path"), str)):
+            raise ValueError("Invalid typed model input")
+        from services.capture_input import TypedModelInput, revalidate_typed_model_input
+        validated = revalidate_typed_model_input(
+            WORKSPACE_DIR,
+            TypedModelInput(typed_input["kind"], Path(typed_input["path"])),
+        )
+        return validated.path if validated.kind == "scene" else validated
+    return base64.b64decode(msg["image_b64"], validate=True)
+
+
 # ------------------------------------------------------------------ #
 # Generator loader
 # ------------------------------------------------------------------ #
@@ -217,8 +233,22 @@ def main() -> None:
             elif action == "generate":
                 cancel_evt = threading.Event()
                 _cancel[rid] = cancel_evt
-                image_bytes  = base64.b64decode(msg["image_b64"])
-                params       = msg.get("params", {})
+                image_bytes = decode_model_input(msg)
+                raw_params = msg.get("params", {})
+                if not isinstance(raw_params, dict):
+                    raise ValueError("Model params must be an object")
+                params = dict(raw_params)
+                from services.capture_input import TypedModelInput
+                if isinstance(image_bytes, TypedModelInput):
+                    params.pop("scene_path", None)
+                    params.pop("input_scene_path", None)
+                    params.pop("capture_path", None)
+                    params.pop("input_capture_path", None)
+                    params[f"{image_bytes.kind}_manifest_path"] = str(image_bytes.path)
+                elif isinstance(image_bytes, Path):
+                    params.pop("scene_path", None)
+                    params.pop("input_scene_path", None)
+                    params["scene_manifest_path"] = str(image_bytes)
                 if msg.get("outputs_dir"):
                     gen.outputs_dir = Path(msg["outputs_dir"])
                     gen.outputs_dir.mkdir(parents=True, exist_ok=True)

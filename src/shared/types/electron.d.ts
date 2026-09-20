@@ -14,10 +14,10 @@ import type {
 export interface ExtensionNode {
   id:               string
   name:             string
-  input:            'image' | 'text' | 'mesh' | 'audio'
-  inputs?:          ('image' | 'text' | 'mesh' | 'audio')[]   // multi-input nodes; overrides input when set
+  input:            'image' | 'text' | 'mesh' | 'audio' | 'scene' | 'capture'
+  inputs?:          ('image' | 'text' | 'mesh' | 'audio' | 'scene' | 'capture')[]   // multi-input nodes; overrides input when set
   inputLabels?:     string[]   // display labels per input slot (e.g. positive/negative)
-  output:           'image' | 'text' | 'mesh' | 'audio'
+  output:           'image' | 'text' | 'mesh' | 'audio' | 'scene' | 'capture'
   paramsSchema:     ParamSchema[]
   paramDefaults?:   Record<string, number | string>
   hfRepo?:          string

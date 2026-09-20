@@ -110,8 +110,8 @@ async def unload_all_models():
 async def unload_model(model_id: str):
     """Unloads a model from memory so its files can be safely deleted."""
     try:
-        gen = generator_registry.get_generator(model_id)
-    except ValueError as exc:
+        gen = generator_registry.assert_generator_idle(model_id)
+    except (ValueError, RuntimeError) as exc:
         if model_id in generator_registry._generators:
             raise HTTPException(409, str(exc)) from exc
         return {"unloaded": True}  # No runtime registered for these files.

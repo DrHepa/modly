@@ -1,5 +1,6 @@
 import { join } from 'path'
 import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { assertPrivateDataPath } from './api-endpoint'
 
 export interface AppSettings {
   modelsDir:        string
@@ -8,6 +9,15 @@ export interface AppSettings {
   extensionsDir:    string
   dependenciesDir:  string
   hfToken?:         string
+}
+
+function validateIsolatedSettings(settings: AppSettings, userData: string): AppSettings {
+  if (process.env['MODLY_ISOLATED_DEV'] === '1') {
+    for (const key of ['modelsDir', 'workspaceDir', 'workflowsDir', 'extensionsDir', 'dependenciesDir'] as const) {
+      assertPrivateDataPath(settings[key], userData)
+    }
+  }
+  return settings
 }
 
 function settingsPath(userData: string): string {
@@ -24,7 +34,7 @@ export function getSettings(userData: string): AppSettings {
   }
 
   const file = settingsPath(userData)
-  if (!existsSync(file)) return defaults
+  if (!existsSync(file)) return validateIsolatedSettings(defaults, userData)
 
   try {
     const saved = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, string>
@@ -33,14 +43,14 @@ export function getSettings(userData: string): AppSettings {
       saved['workspaceDir'] = saved['outputsDir']
       delete saved['outputsDir']
     }
-    return { ...defaults, ...saved }
+    return validateIsolatedSettings({ ...defaults, ...saved }, userData)
   } catch {
-    return defaults
+    return validateIsolatedSettings(defaults, userData)
   }
 }
 
 export function setSettings(userData: string, patch: Partial<AppSettings>): AppSettings {
-  const updated = { ...getSettings(userData), ...patch }
+  const updated = validateIsolatedSettings({ ...getSettings(userData), ...patch }, userData)
   writeFileSync(settingsPath(userData), JSON.stringify(updated, null, 2), 'utf-8')
   return updated
 }

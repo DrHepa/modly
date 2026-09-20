@@ -2,6 +2,7 @@
 Agent chat endpoint — runs an Ollama-powered tool-use loop against Modly's API.
 """
 import re
+import os
 import uuid
 import httpx
 from fastapi import APIRouter
@@ -9,7 +10,7 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
-MODLY_API = "http://localhost:8765"
+MODLY_API = f"http://127.0.0.1:{os.environ.get('MODLY_API_PORT', '8765')}"
 
 SYSTEM_PROMPT = """\
 You are Modly's built-in AI assistant, specialized in 3D modeling and workflow automation.

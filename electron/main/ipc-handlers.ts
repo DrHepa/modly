@@ -9,6 +9,7 @@ import * as tar from 'tar'
 import * as os from 'os'
 import { promisify } from 'util'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
+import { assertPrivateDataPath } from './api-endpoint'
 import {
   isModelDownloaded,
   listDownloadedModels,
@@ -254,7 +255,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // Setup handlers — skipped in dev (uses .venv instead of python-embed)
   ipcMain.handle('setup:check', async () => {
     const userData = app.getPath('userData')
-    const defaultDataDir = join(app.getPath('documents'), 'Modly')
+    const defaultDataDir = process.env['MODLY_ISOLATED_DEV'] === '1'
+      ? join(userData, 'data')
+      : join(app.getPath('documents'), 'Modly')
     return {
       needed: checkSetupNeeded(userData),
       defaultDataDir,
@@ -265,6 +268,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('setup:saveDataDir', async (_event, { baseDir }: { baseDir: string }) => {
     const userData = app.getPath('userData')
+    if (process.env['MODLY_ISOLATED_DEV'] === '1') assertPrivateDataPath(baseDir, userData)
     setSettings(userData, {
       modelsDir:        join(baseDir, 'models'),
       workspaceDir:     join(baseDir, 'workspace'),
@@ -1027,10 +1031,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     nodes?: {
       id:                string
       name?:             string
-      input?:            'mesh' | 'image' | 'text' | 'audio'
-      inputs?:           ('mesh' | 'image' | 'text' | 'audio')[]
+      input?:            'mesh' | 'image' | 'text' | 'audio' | 'scene' | 'capture'
+      inputs?:           ('mesh' | 'image' | 'text' | 'audio' | 'scene' | 'capture')[]
       input_labels?:     string[]
-      output?:           'mesh' | 'image' | 'text' | 'audio'
+      output?:           'mesh' | 'image' | 'text' | 'audio' | 'scene' | 'capture'
       params_schema?:    unknown[]
       param_defaults?:   Record<string, unknown>
       hf_repo?:          string
@@ -1065,6 +1069,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       validateModelNodeIds(parsed.nodes ?? [])
     }
     const nodes = (parsed.nodes ?? []).map(n => {
+      if (parsed.type === 'process' && (n.input === 'scene' || n.input === 'capture' || n.inputs?.some(kind => kind === 'scene' || kind === 'capture'))) {
+        throw new Error(`manifest.json: process node "${n.id}" cannot consume scene or capture input; use a model node`)
+      }
+      if (parsed.type !== 'process' && (n.input === 'scene' || n.input === 'capture' || n.inputs?.some(kind => kind === 'scene' || kind === 'capture'))) {
+        const inputs = n.inputs ?? [n.input ?? 'image']
+        const primary = n.input
+        if ((primary !== 'scene' && primary !== 'capture')
+          || inputs.filter(kind => kind === primary).length !== 1
+          || inputs.filter(kind => kind === 'scene' || kind === 'capture').length !== 1
+          || inputs.filter(kind => kind === 'text').length > 1
+          || inputs.some(kind => kind !== primary && kind !== 'text')) {
+          throw new Error(`manifest.json: model node "${n.id}" typed input supports one scene or capture and an optional text prompt; mixed artifacts are not supported`)
+        }
+      }
       const usesManagedWeights = weightGroups !== undefined
         || n.model_sources !== undefined
         || n.weight_groups !== undefined

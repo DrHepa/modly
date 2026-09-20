@@ -40,6 +40,9 @@ def _clear_job_stores() -> None:
         generation._cancel_events,
         generation._cancelled,
         generation._completed_at,
+        generation._job_execution_tokens,
+        generation._job_execution_targets,
+        generation._job_reservations,
     ):
         store.clear()
 
@@ -90,6 +93,33 @@ class WorkflowRunJobLifecycleTests(unittest.TestCase):
         self.assertEqual(generation._jobs[run_id].status, "cancelled")
         # Without a _completed_at stamp the purge sweep can never evict a cancelled run.
         self.assertIn(run_id, generation._completed_at)
+
+    def test_stale_workflow_cancel_does_not_stop_new_execution_owner(self) -> None:
+        stopped = []
+        process = type("Process", (), {"poll": lambda self: None})()
+        generator = type("Generator", (), {
+            "_proc": process,
+            "_loaded": True,
+            "stop": lambda self: stopped.append(True),
+        })()
+        generation._jobs["old"] = JobStatus(job_id="old", status="done", progress=100)
+        generation._jobs["new"] = JobStatus(job_id="new", status="running", progress=10)
+        generation._cancel_events["old"] = threading.Event()
+        generation._cancel_events["new"] = threading.Event()
+        generation._register_job_execution("old", "model", generator)
+        generation._register_job_execution("new", "model", generator)
+
+        async def scenario() -> None:
+            reservation = await generation._reserve_execution("new")
+            try:
+                await workflow_runs.cancel_run("old")
+                self.assertIs(generation._owned_generator("new"), generator)
+            finally:
+                generation._release_execution(reservation)
+
+        asyncio.run(scenario())
+        self.assertEqual(stopped, [])
+        self.assertFalse(generation._cancel_events["new"].is_set())
 
 
 if __name__ == "__main__":

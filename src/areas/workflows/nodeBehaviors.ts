@@ -58,6 +58,25 @@ export function resolveDataSource(
 }
 
 /**
+ * Resolves the runtime output feeding `nodeId`. Runtime outputs are keyed by
+ * the executable/source node that produced them, while terminal and
+ * passthrough nodes only describe graph connectivity.
+ */
+export function resolveUpstreamOutput<T>(
+  nodeId:  string,
+  edges:   WFEdge[],
+  nodeMap: Map<string, WFNode>,
+  outputs: Record<string, T>,
+): T | undefined {
+  for (const edge of edges) {
+    if (edge.target !== nodeId) continue
+    const sourceId = resolveDataSource(edge.source, edges, nodeMap)
+    if (sourceId && outputs[sourceId] !== undefined) return outputs[sourceId]
+  }
+  return undefined
+}
+
+/**
  * Walks backwards from `nodeId` and returns the set of nearest upstream
  * branch-starter (Wait) nodes — the first Wait found on each incoming path,
  * without traversing past it. Empty = no upstream Wait. Size > 1 = the node
@@ -104,6 +123,32 @@ export function reachesSceneOutput(
       const tType = nodeMap.get(e.target)?.type
       if (isSceneOutput(tType))                          return true
       if (isPassthrough(tType) && !isBranchStarter(tType)) stack.push(e.target)
+    }
+  }
+  return false
+}
+
+/**
+ * True when `sourceId` has any forward path to a scene output. Unlike
+ * `reachesSceneOutput`, this deliberately crosses Wait boundaries: it is used
+ * to decide whether a source mesh is relevant to eventual workflow execution,
+ * not whether it should be pushed to the viewer immediately.
+ */
+export function connectsToSceneOutput(
+  sourceId: string,
+  edges:    WFEdge[],
+  nodeMap:  Map<string, WFNode>,
+): boolean {
+  const stack = [sourceId]
+  const seen  = new Set<string>()
+  while (stack.length > 0) {
+    const id = stack.pop()!
+    if (seen.has(id)) continue
+    seen.add(id)
+    for (const edge of edges) {
+      if (edge.source !== id) continue
+      if (isSceneOutput(nodeMap.get(edge.target)?.type)) return true
+      stack.push(edge.target)
     }
   }
   return false

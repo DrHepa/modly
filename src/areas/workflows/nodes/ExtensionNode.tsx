@@ -15,6 +15,8 @@ const HANDLE_COLOR: Record<string, string> = {
   audio: '#34d399',
   image: '#38bdf8',
   mesh:  '#a78bfa',
+  scene: '#34d399',
+  capture: '#22d3ee',
   text:  '#fbbf24',
 }
 
@@ -22,6 +24,8 @@ const TAG_CLS: Record<string, string> = {
   audio: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
   image: 'border-sky-500/30 bg-sky-500/10 text-sky-400',
   mesh:  'border-violet-500/30 bg-violet-500/10 text-violet-400',
+  scene: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
+  capture: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-400',
   text:  'border-amber-500/30 bg-amber-500/10 text-amber-400',
 }
 

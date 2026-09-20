@@ -1,6 +1,5 @@
 import json
 import threading
-import time
 import uuid
 from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
@@ -9,23 +8,30 @@ from pydantic import BaseModel
 from routers.generation import (
     VALID_REMESH_MODES,
     _cancel_events,
-    _cancelled,
-    _completed_at,
     _jobs,
     _purge_old_jobs,
+    _register_job_execution,
     _run_generation,
+    cancel_generation_job,
+    generate_from_scene,
     sanitize_collection,
 )
-from schemas.generation import JobStatus
+from schemas.generation import GenerateFromSceneRequest, JobStatus, ProgressPercent
 from services.generator_registry import generator_registry
 
 router = APIRouter(tags=["workflow-runs"])
 
 
+@router.post("/from-scene", status_code=202)
+async def create_run_from_scene(payload: GenerateFromSceneRequest, background_tasks: BackgroundTasks):
+    result = await generate_from_scene(payload, background_tasks)
+    return {"run_id": result["job_id"], "status": "pending"}
+
+
 class WorkflowRunStatus(BaseModel):
     run_id: str
     status: str
-    progress: int = 0
+    progress: ProgressPercent = 0.0
     step: Optional[str] = None
     output_url: Optional[str] = None
     error: Optional[str] = None
@@ -69,11 +75,14 @@ async def create_run_from_image(
     collection = sanitize_collection(collection)
 
     try:
-        generator_registry.get_generator(model_id)
+        requested_generator = generator_registry.get_generator(model_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    generator_registry.switch_model(model_id)
+    try:
+        generator_registry.switch_model(model_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409 if isinstance(exc, RuntimeError) else 400, str(exc)) from exc
 
     job_id = str(uuid.uuid4())
     image_bytes = await image.read()
@@ -82,6 +91,7 @@ async def create_run_from_image(
 
     _jobs[job_id] = JobStatus(job_id=job_id, status="pending", progress=0)
     _cancel_events[job_id] = threading.Event()
+    _register_job_execution(job_id, model_id, requested_generator)
 
     background_tasks.add_task(_run_generation, job_id, image_bytes, full_params, collection)
 
@@ -111,24 +121,9 @@ async def get_run(run_id: str):
 
 @router.post("/{run_id}/cancel")
 async def cancel_run(run_id: str):
-    job = _jobs.get(run_id)
-    if not job:
-        raise HTTPException(404, f"Run {run_id} not found")
-
-    _cancelled.add(run_id)
-    if run_id in _cancel_events:
-        _cancel_events[run_id].set()
-    if job.status in ("pending", "running"):
-        job.status = "cancelled"
-        _completed_at[run_id] = time.monotonic()
-
     try:
-        gen = generator_registry._generators.get(generator_registry._active_id)
-        if gen is not None and hasattr(gen, "_proc") and gen._proc and gen._proc.poll() is None:
-            gen._proc.kill()
-            gen._loaded = False
-            gen._proc = None
-    except Exception:
-        pass
-
-    return {"cancelled": True}
+        return await cancel_generation_job(run_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(404, f"Run {run_id} not found") from exc
+        raise

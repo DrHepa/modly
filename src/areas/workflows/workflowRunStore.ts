@@ -5,7 +5,9 @@ import { getWorkflowExtension } from './mockExtensions'
 import { showCompletionNotification } from '@shared/utils/notification'
 import type { WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge } from '@shared/types/electron.d'
-import { isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
+import { connectsToSceneOutput, isBranchStarter, isSceneOutput, resolveDataSource, reachesSceneOutput, nearestUpstreamWaits } from './nodeBehaviors'
+import { resolveSceneSourceManifest } from './workflowSceneSource'
+import { resolveCaptureSourceManifest } from './workflowCaptureSource'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -30,6 +32,9 @@ const IDLE: WorkflowRunState = {
 
 const _cancel      = { current: false }
 const _activeJobId = { current: null as string | null }
+// Monotonic run ownership token. Cancelling/resetting or starting another run
+// invalidates every async continuation captured by the previous owner.
+const _runToken    = { current: 0 }
 // While container (manual mode) pause/resume — set by continueWhile()/retryWhile().
 const _resume      = { current: null as (() => void) | null }
 const _retry       = { current: false }
@@ -112,10 +117,45 @@ function reachableExecutable(startId: string, edges: WFEdge[], nodeMap: Map<stri
   return body
 }
 
-function toWorkspaceUrl(filePath: string, workspaceDir: string): string | undefined {
-  const norm = filePath.replace(/\\/g, '/')
-  if (!norm.startsWith(workspaceDir)) return undefined
-  return `/workspace/${norm.slice(workspaceDir.length).replace(/^\//, '')}`
+interface CanonicalPath { value: string; windows: boolean }
+
+/** Lexically canonicalize an absolute POSIX or drive-qualified Windows path. */
+function canonicalPath(input: string): CanonicalPath | undefined {
+  if (!input || input.includes('\0')) return undefined
+  const slash = input.replace(/\\/g, '/')
+  const drive = /^([A-Za-z]):(?:\/|$)/.exec(slash)
+  const windows = drive !== null
+  if (!windows && !slash.startsWith('/')) return undefined
+
+  const prefix = windows ? `${drive![1].toUpperCase()}:/` : '/'
+  const body = windows ? slash.slice(drive![0].length) : slash.replace(/^\/+/, '')
+  const parts: string[] = []
+  for (const part of body.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      // Absolute paths cannot traverse above their filesystem root.
+      if (parts.length > 0) parts.pop()
+      continue
+    }
+    parts.push(part)
+  }
+  return { value: parts.length > 0 ? `${prefix}${parts.join('/')}` : prefix, windows }
+}
+
+function workspaceRelativePath(filePath: string, workspaceDir: string): string | undefined {
+  const candidate = canonicalPath(filePath)
+  const workspace = canonicalPath(workspaceDir)
+  if (!candidate || !workspace || candidate.windows !== workspace.windows) return undefined
+
+  const norm = candidate.windows ? candidate.value.toLowerCase() : candidate.value
+  const root = workspace.windows ? workspace.value.toLowerCase() : workspace.value
+  if (norm !== root && !norm.startsWith(`${root.replace(/\/$/, '')}/`)) return undefined
+  return candidate.value.slice(workspace.value.replace(/\/$/, '').length).replace(/^\//, '')
+}
+
+export function toWorkspaceUrl(filePath: string, workspaceDir: string): string | undefined {
+  const relative = workspaceRelativePath(filePath, workspaceDir)
+  return relative === undefined ? undefined : `/workspace/${relative}`
 }
 
 // Inverse of toWorkspaceUrl — used by node components that read a `/workspace/...`
@@ -146,6 +186,14 @@ interface RunContext {
   iteratorFiles:      Map<string, string[]>
   /** workspace URL of the most recently pushed scene mesh (last branch the user ran wins) */
   lastSceneMesh?:     string
+  /** Producer owning lastSceneMesh, used to invalidate only the retried branch. */
+  lastSceneMeshSourceId?: string
+  /** Viewer-safe URLs keyed by the source/executable node that produced them. */
+  meshOutputUrls:     Map<string, string>
+  /** False after cancellation, reset, or ownership passing to a newer run. */
+  isActive:           () => boolean
+  /** Publish a mesh as soon as its producer completes. */
+  publishMeshOutput:  (nodeId: string, filePath: string) => Promise<string | undefined>
 }
 const _ctx = { current: null as RunContext | null }
 
@@ -296,6 +344,7 @@ async function executeExtensionNode(
   ctx:         RunContext,
   setRunState: (updater: (s: WorkflowRunState) => WorkflowRunState) => void,
 ): Promise<void> {
+  if (!ctx.isActive()) return
   if (isIterator(node.type)) {
     await executeIteratorNode(node, ctx, setRunState)
     return
@@ -317,6 +366,8 @@ async function executeExtensionNode(
   let nodeInputPath:     string | undefined
   let nodeInputText:     string | undefined
   let nodeInputMeshPath: string | undefined
+  let nodeInputScenePath: string | undefined
+  let nodeInputCapturePath: string | undefined
   // Per-slot texts for multi-text-input nodes (e.g. positive/negative prompts).
   // Indexed by target handle: input-0 → texts[0], input-1 → texts[1].
   const nodeInputTexts: (string | undefined)[] = []
@@ -349,6 +400,10 @@ async function executeExtensionNode(
       if (!fp) continue
       if (inputTypes[i] === 'mesh') {
         nodeInputMeshPath = fp
+      } else if (inputTypes[i] === 'scene') {
+        nodeInputScenePath = fp
+      } else if (inputTypes[i] === 'capture') {
+        nodeInputCapturePath = fp
       } else if (inputTypes[i] === 'image') {
         if (!nodeInputPath) nodeInputPath = fp
         else extraImagePaths.push(fp)
@@ -365,6 +420,35 @@ async function executeExtensionNode(
   const isModelNode = ext?.type === 'model'
 
   if (isModelNode) {
+    const typedInputKind = ext?.input === 'scene' || ext?.inputs?.includes('scene')
+      ? 'scene'
+      : ext?.input === 'capture' || ext?.inputs?.includes('capture') ? 'capture' : undefined
+    if (typedInputKind) {
+      const typedPath = typedInputKind === 'scene'
+        ? (nodeInputScenePath ?? nodeInputPath)
+        : (nodeInputCapturePath ?? nodeInputPath)
+      if (!typedPath) throw new Error(`No ${typedInputKind} selected for model node`)
+      const source = typedInputKind === 'scene'
+        ? await resolveSceneSourceManifest({ scenePath: typedPath, workspaceDir, readFileBase64: window.electron.fs.readFileBase64 })
+        : await resolveCaptureSourceManifest({ capturePath: typedPath, workspaceDir, readFileBase64: window.electron.fs.readFileBase64 })
+      if (!ctx.isActive()) return
+      if (!source.ok) throw new Error(`Load ${typedInputKind === 'scene' ? 'Scene' : 'Capture'}: ${source.error}`)
+      const defaults = Object.fromEntries((ext.params ?? []).map((p) => [p.id, p.default]))
+      setRunState((s) => ({ ...s, blockProgress: 5, blockStep: `Submitting ${typedInputKind} to model…` }))
+      const { data } = await client.post<{ job_id: string }>('/generate/from-artifact', {
+        input_kind: typedInputKind,
+        input_path: source.manifestWorkspacePath,
+        model_id: node.data.extensionId ?? '',
+        collection: 'Workflows',
+        remesh: 'none',
+        params: { ...defaults, ...liveParams, ...(nodeInputText ? { prompt: nodeInputText, text: nodeInputText } : {}) },
+      })
+      if (!ctx.isActive()) {
+        await client.post(`/generate/cancel/${data.job_id}`).catch(() => {})
+        return
+      }
+      _activeJobId.current = data.job_id
+    } else {
     const isTextInput = ext?.inputs ? ext.inputs.every((i) => i === 'text') : ext?.input === 'text'
     const activeImagePath = isTextInput ? undefined : (nodeInputPath ?? selectedImagePath)
     if (!isTextInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
@@ -381,6 +465,7 @@ async function executeExtensionNode(
       blob = new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type: 'image/png' })
     } else {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
+      if (!ctx.isActive()) return
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
       blob = new Blob([bytes], { type: 'image/png' })
       fname = activeImagePath?.split(/[\\/]/).pop() ?? 'image.png'
@@ -389,9 +474,7 @@ async function executeExtensionNode(
     const extraParams: Record<string, unknown> = {}
     if (nodeInputMeshPath) {
       const norm = nodeInputMeshPath.replace(/\\/g, '/')
-      extraParams.mesh_path = norm.startsWith(workspaceDir)
-        ? norm.slice(workspaceDir.length).replace(/^\//, '')
-        : norm
+      extraParams.mesh_path = workspaceRelativePath(norm, workspaceDir) ?? norm
     }
     if (nodeInputText !== undefined && nodeInputText.trim().length > 0) {
       extraParams.prompt = nodeInputText
@@ -421,19 +504,26 @@ async function executeExtensionNode(
       '/generate/from-image', fd,
       { headers: { 'Content-Type': 'multipart/form-data' } },
     )
+    if (!ctx.isActive()) {
+      await client.post(`/generate/cancel/${data.job_id}`).catch(() => {})
+      return
+    }
     _activeJobId.current = data.job_id
+    }
 
     while (true) {
-      if (_cancel.current) {
+      if (!ctx.isActive()) {
         await client.post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
         _activeJobId.current = null
-        throw new Error('Cancelled')
+        return
       }
       await new Promise((r) => setTimeout(r, 1200))
+      if (!ctx.isActive()) return
 
       const { data: st } = await client.get<{
         status: string; progress?: number; step?: string; output_url?: string; error?: string
       }>(`/generate/status/${_activeJobId.current}`)
+      if (!ctx.isActive()) return
 
       if (st.status === 'done' && st.output_url) {
         const rel = st.output_url.replace(/^\/workspace\//, '')
@@ -448,6 +538,9 @@ async function executeExtensionNode(
       useAppStore.getState().updateCurrentJob({ status: 'generating', progress: st.progress, step: st.step })
     }
   } else {
+    if (ext?.input === 'scene' || ext?.input === 'capture' || ext?.inputs?.some((kind) => kind === 'scene' || kind === 'capture')) {
+      throw new Error(`${ext.name} declares typed artifact input, but process nodes cannot receive scene or capture manifests. Use a model node.`)
+    }
     if (ext?.input === 'mesh'  && !nodeInputPath) throw new Error(`${ext.name} needs an incoming mesh connection`)
     if (ext?.input === 'image' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming image connection`)
     if (ext?.input === 'audio' && !nodeInputPath) throw new Error(`${ext.name} needs an incoming audio connection`)
@@ -478,6 +571,7 @@ async function executeExtensionNode(
       },
       processParams,
     )
+    if (!ctx.isActive()) return
     if (!result.success) throw new Error(result.error ?? 'Process extension failed')
     nodeInputPath = result.result?.filePath ?? nodeInputPath
     nodeInputText = result.result?.text     ?? nodeInputText
@@ -488,9 +582,13 @@ async function executeExtensionNode(
   nodeOutputs.set(node.id, { filePath: nodeInputPath, text: nodeInputText, outputType })
 
   const output = nodeOutputs.get(node.id)
-  const url = isSceneMeshOutput(output) ? toWorkspaceUrl(output.filePath, workspaceDir) : undefined
+  const url = isSceneMeshOutput(output)
+    ? await ctx.publishMeshOutput(node.id, output.filePath)
+    : undefined
+  if (!ctx.isActive()) return
   if (url && reachesSceneOutput(node.id, workflow.edges, nodeMap)) {
     ctx.lastSceneMesh = url   // remember it so finalize() keeps the last-run branch in view
+    ctx.lastSceneMeshSourceId = node.id
     useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
   }
 }
@@ -526,10 +624,10 @@ function pushBranchSceneMesh(ctx: RunContext, waitId: string): void {
     const inEdge = ctx.workflow.edges.find((e) => e.target === node.id)
     if (!inEdge) continue
     const srcId = resolveDataSource(inEdge.source, ctx.workflow.edges, ctx.nodeMap)
-    const sourceOutput = srcId ? ctx.nodeOutputs.get(srcId) : undefined
-    const url = isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
+    const url = srcId ? ctx.meshOutputUrls.get(srcId) : undefined
     if (url) {
       ctx.lastSceneMesh = url
+      ctx.lastSceneMeshSourceId = srcId
       useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
     }
   }
@@ -542,6 +640,7 @@ interface WorkflowRunStore {
   activeNodeId:     string | null
   activeWorkflowId: string | null
   nodeImageOutputs: Record<string, string>
+  nodeMeshOutputs:  Record<string, string>
   waitStates:       Record<string, WaitState>
   runningBranchId:  string | null
   /** whileId → current iteration / total (total null = manual/unbounded) */
@@ -572,16 +671,15 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     const out: Record<string, string> = {}
     for (const [nodeId, o] of ctx.nodeOutputs) {
       if (o.outputType === 'image' && o.filePath) {
-        const norm = o.filePath.replace(/\\/g, '/')
-        if (norm.startsWith(ctx.workspaceDir)) {
-          out[nodeId] = `/workspace/${norm.slice(ctx.workspaceDir.length).replace(/^\//, '')}`
-        }
+        const url = toWorkspaceUrl(o.filePath, ctx.workspaceDir)
+        if (url) out[nodeId] = url
       }
     }
     return out
   }
 
   const finalize = (ctx: RunContext, finalWaitStates?: Record<string, WaitState>): void => {
+    if (!ctx.isActive()) return
     // Prefer the mesh of the last branch the user actually ran — it's already in the
     // viewer, and topo order must not override the user's last action.
     let outputUrl:  string | undefined = ctx.lastSceneMesh
@@ -592,7 +690,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       for (const edge of ctx.workflow.edges.filter((e) => e.target === lastOutputNode.id)) {
         const src = ctx.nodeOutputs.get(edge.source)
         if (isSceneMeshOutput(src)) {
-          outputUrl = toWorkspaceUrl(src.filePath, ctx.workspaceDir)
+          outputUrl = ctx.meshOutputUrls.get(edge.source)
         }
       }
     }
@@ -636,12 +734,14 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     activeNodeId:     null,
     activeWorkflowId: null,
     nodeImageOutputs: {},
+    nodeMeshOutputs:  {},
     waitStates:       {},
     runningBranchId:  null,
     whileProgress:    {},
     pausedGroup:      [],
 
     async run(workflow, allExtensions, overrideImageData?) {
+      const runToken = ++_runToken.current
       _cancel.current = false
       _pauseRequested.current = false
       // Seed live params from the snapshot; UI edits during the run override these.
@@ -751,6 +851,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       set({
         activeWorkflowId: workflow.id,
         nodeImageOutputs: {},
+        nodeMeshOutputs:  {},
         // Top-level Waits are pending; nested Waits start blocked until their parent finishes.
         waitStates:       Object.fromEntries(waitIds.map((id) => [id, parentWait.get(id) ? 'blocked' as WaitState : 'pending' as WaitState])),
         runningBranchId:  null,
@@ -773,6 +874,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       try {
         const client       = axios.create({ baseURL: apiUrl })
         const settings     = await window.electron.settings.get()
+        if (runToken !== _runToken.current || _cancel.current) return
         const workspaceDir = settings.workspaceDir.replace(/\\/g, '/')
 
         const tmpAbsPath = settings.workspaceDir.replace(/[\\/]+$/, '') + '/tmp'
@@ -807,13 +909,63 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
               if (fp) nodeOutputs.set(node.id, { filePath: fp, outputType: 'mesh' })
             }
           }
+          if (node.type === 'sceneNode') {
+            const path = node.data.params?.path
+            if (typeof path === 'string' && path.trim()) {
+              const source = await resolveSceneSourceManifest({ scenePath: path, workspaceDir, readFileBase64: window.electron.fs.readFileBase64 })
+              if (runToken !== _runToken.current || _cancel.current) return
+              if (!source.ok) throw new Error(`Load Scene: ${source.error}`)
+              nodeOutputs.set(node.id, { filePath: source.manifestAbsolutePath, outputType: 'scene' })
+            }
+          }
+          if (node.type === 'captureNode') {
+            const path = node.data.params?.path
+            if (typeof path === 'string' && path.trim()) {
+              const source = await resolveCaptureSourceManifest({ capturePath: path, workspaceDir, readFileBase64: window.electron.fs.readFileBase64 })
+              if (runToken !== _runToken.current || _cancel.current) return
+              if (!source.ok) throw new Error(`Load Capture: ${source.error}`)
+              nodeOutputs.set(node.id, { filePath: source.manifestAbsolutePath, outputType: 'capture' })
+            }
+          }
+        }
+
+        const meshOutputUrls = new Map<string, string>()
+        const isActive = (): boolean => runToken === _runToken.current && !_cancel.current
+        const publishMeshOutput = async (nodeId: string, filePath: string): Promise<string | undefined> => {
+          let url = toWorkspaceUrl(filePath, workspaceDir)
+          if (!url) {
+            const response = await client.post<{ url: string }>('/optimize/import-by-path', { path: filePath })
+            if (!isActive()) return undefined
+            url = response.data.url
+          }
+          if (!isActive()) return undefined
+          meshOutputUrls.set(nodeId, url)
+          set((state) => ({ nodeMeshOutputs: { ...state.nodeMeshOutputs, [nodeId]: url! } }))
+          return url
         }
 
         const ctx: RunContext = {
           workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
           overrideImageData, nodeOutputs, nodeMap, ordered, branches, waitIds, parentWait, iteratorFiles,
+          meshOutputUrls, isActive, publishMeshOutput,
         }
+        if (!isActive()) return
         _ctx.current = ctx
+
+        // Source meshes are producers too. Publish them before executing the graph
+        // so a direct Load 3D Mesh → Add to Scene workflow is immediately usable,
+        // including files intentionally selected outside the workspace.
+        for (const [nodeId, output] of nodeOutputs) {
+          if (!isSceneMeshOutput(output)) continue
+          if (!connectsToSceneOutput(nodeId, workflow.edges, nodeMap)) continue
+          const url = await publishMeshOutput(nodeId, output.filePath)
+          if (!isActive()) return
+          if (url && reachesSceneOutput(nodeId, workflow.edges, nodeMap)) {
+            ctx.lastSceneMesh = url
+            ctx.lastSceneMeshSourceId = nodeId
+            useAppStore.getState().updateCurrentJob({ status: 'done', progress: 100, outputUrl: url })
+          }
+        }
 
         // While the runner is replaying a loop body, this holds the body nodes of the
         // active loop (or the union of several For Each loops sharing a boundary);
@@ -856,7 +1008,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
               set({ activeNodeId: groupIds[0], runningBranchId: groupIds[0], pausedGroup: groupIds })
               setRunState((s) => ({ ...s, status: 'paused', blockStep: 'Paused — Continue or Retry' }))
               await new Promise<void>((resolve) => { _resume.current = resolve })
-              if (_cancel.current) return 'cancel'
+              if (!ctx.isActive()) return 'cancel'
               set({ runningBranchId: null, pausedGroup: [] })
               setRunState((s) => ({ ...s, status: 'running' }))
               if (_retry.current) {   // re-run the current file(s), no advance
@@ -904,7 +1056,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           set({ activeNodeId: whileLoop.whileId, runningBranchId: whileLoop.whileId })
           setRunState((s) => ({ ...s, status: 'paused', blockStep: 'Loop finished — Continue or Retry' }))
           await new Promise<void>((resolve) => { _resume.current = resolve })
-          if (_cancel.current) return 'cancel'
+          if (!ctx.isActive()) return 'cancel'
           set({ runningBranchId: null })
           setRunState((s) => ({ ...s, status: 'running' }))
           if (_retry.current) {
@@ -920,7 +1072,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         // Pre-phase: nodes that don't belong to any single branch (sources + merges).
         let stepsDone = 0
         for (let i = 0; i < preExecExtNodes.length; i++) {
-          if (_cancel.current) { _ctx.current = null; set({ runState: IDLE, activeNodeId: null }); return }
+          if (!ctx.isActive()) return
           const node = preExecExtNodes[i]
           // During a loop replay, only re-run the active loop's body members.
           if (activeLoopBody && !activeLoopBody.has(node.id)) continue
@@ -929,6 +1081,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
             runState: { ...s.runState, blockIndex: stepsDone, blockProgress: 0, blockStep: 'Starting…' },
           }))
           await executeExtensionNode(node, ctx, setRunState)
+          if (!ctx.isActive()) return
           stepsDone++
 
           const jump = await handleLoopEnd(i)
@@ -947,7 +1100,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
         finalize(ctx)
       } catch (err) {
-        if (!_cancel.current) {
+        if (runToken === _runToken.current && !_cancel.current) {
           set((s) => ({ runState: { ...s.runState, status: 'error', error: String(err) }, activeNodeId: null }))
           useAppStore.getState().updateCurrentJob({ status: 'error', error: String(err) })
         }
@@ -964,7 +1117,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       // pre-phase, it never handed off — don't start a branch with missing inputs.
       if (ws === 'pending' && state.runState.status === 'error') return
       const ctx = _ctx.current
-      if (!ctx) {
+      if (!ctx || !ctx.isActive()) {
         console.warn('continueRun: no active run context — was the module hot-reloaded mid-run?')
         return
       }
@@ -975,11 +1128,22 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       // them to blocked until this branch produces a fresh result.
       const descendants = descendantWaits(waitId, ctx)
 
-      _cancel.current = false
-
       // Reset outputs for this branch's nodes so Retry re-executes cleanly.
-      for (const node of branch) ctx.nodeOutputs.delete(node.id)
-      for (const d of descendants) for (const node of ctx.branches.get(d) ?? []) ctx.nodeOutputs.delete(node.id)
+      const staleNodeIds = new Set<string>()
+      for (const node of branch) { ctx.nodeOutputs.delete(node.id); ctx.meshOutputUrls.delete(node.id); staleNodeIds.add(node.id) }
+      for (const d of descendants) for (const node of ctx.branches.get(d) ?? []) {
+        ctx.nodeOutputs.delete(node.id); ctx.meshOutputUrls.delete(node.id); staleNodeIds.add(node.id)
+      }
+      if (ctx.lastSceneMeshSourceId && staleNodeIds.has(ctx.lastSceneMeshSourceId)) {
+        const staleUrl = ctx.lastSceneMesh
+        ctx.lastSceneMesh = undefined
+        ctx.lastSceneMeshSourceId = undefined
+        const appState = useAppStore.getState()
+        if (staleUrl && appState.currentJob?.outputUrl === staleUrl) appState.setCurrentJob(null)
+      }
+      set((state) => ({
+        nodeMeshOutputs: Object.fromEntries(Object.entries(state.nodeMeshOutputs).filter(([nodeId]) => !staleNodeIds.has(nodeId))),
+      }))
 
       set((s) => {
         const waitStates = { ...s.waitStates, [waitId]: 'running' as WaitState }
@@ -992,7 +1156,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       })
 
       const finishBranch = (next: WaitState, err?: string): void => {
-        if (_cancel.current) return
+        if (!ctx.isActive()) return
         const newWaitStates = { ...get().waitStates, [waitId]: next }
         // Unblock nested Waits whose parent branch just finished, and push this
         // branch's scene output to the viewer.
@@ -1031,13 +1195,14 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
 
       try {
         for (let i = 0; i < branch.length; i++) {
-          if (_cancel.current) return
+          if (!ctx.isActive()) return
           const node = branch[i]
           set((s) => ({
             activeNodeId: node.id,
             runState: { ...s.runState, blockIndex: i, blockProgress: 0, blockStep: 'Starting…' },
           }))
           await executeExtensionNode(node, ctx, setRunState)
+          if (!ctx.isActive()) return
         }
         finishBranch('done')
       } catch (err) {
@@ -1046,6 +1211,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     },
 
     cancel() {
+      _runToken.current++
       _cancel.current = true
       _pauseRequested.current = false
       flushResume()   // unblock a manual While pause so the run can tear down
@@ -1055,13 +1221,15 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         _activeJobId.current = null
       }
       _ctx.current = null
-      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, nodeMeshOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
       useAppStore.getState().setCurrentJob(null)
     },
 
     reset() {
+      _runToken.current++
+      _cancel.current = true
       _ctx.current = null
-      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
+      set({ runState: IDLE, activeNodeId: null, activeWorkflowId: null, nodeImageOutputs: {}, nodeMeshOutputs: {}, waitStates: {}, runningBranchId: null, whileProgress: {}, pausedGroup: [] })
     },
 
     continueWhile() {

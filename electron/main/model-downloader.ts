@@ -7,6 +7,7 @@ import { join } from 'path'
 import { getSettings } from './settings-store'
 import { app } from 'electron'
 import type { ModelSource } from './model-sources'
+import { resolveApiEndpoint } from './api-endpoint'
 
 export interface DownloadProgress {
   percent: number
@@ -20,7 +21,7 @@ export interface DownloadProgress {
 }
 export type ProgressCallback = (progress: DownloadProgress) => void
 
-const PYTHON_API_URL = process.env['PYTHON_API_URL'] ?? 'http://127.0.0.1:8765'
+const PYTHON_API_URL = resolveApiEndpoint().baseUrl
 
 // ------------------------------------------------------------------
 // Public API

@@ -1,16 +1,22 @@
 import { useCallback } from 'react'
-import { Handle, Position } from '@xyflow/react'
+import { Handle, Position, useEdges, useNodes } from '@xyflow/react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useNavStore } from '@shared/stores/navStore'
-import type { WFNodeData } from '@shared/types/electron.d'
+import type { WFNode, WFNodeData } from '@shared/types/electron.d'
+import { useWorkflowRunStore } from '../workflowRunStore'
+import { resolveUpstreamOutput } from '../nodeBehaviors'
 import BaseNode from './BaseNode'
 
 const INPUT_COLOR = '#a78bfa'
 
-export default function AddToSceneNode({ id, data, selected }: { id: string; data: WFNodeData; selected?: boolean }) {
+export default function AddToSceneNode({ id, selected }: { id: string; data: WFNodeData; selected?: boolean }) {
   const { navigate }  = useNavStore()
   const setCurrentJob = useAppStore((s) => s.setCurrentJob)
-  const outputUrl     = data.params.outputUrl as string | undefined
+  const meshOutputs   = useWorkflowRunStore((s) => s.nodeMeshOutputs)
+  const edges         = useEdges()
+  const nodes         = useNodes()
+  const nodeMap       = new Map(nodes.map((node) => [node.id, node as unknown as WFNode]))
+  const outputUrl     = resolveUpstreamOutput(id, edges, nodeMap, meshOutputs)
 
   const viewIn3D = useCallback(() => {
     if (!outputUrl) return

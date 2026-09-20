@@ -23,7 +23,7 @@ function loadModule() {
 
 const {
   isPassthrough, isBranchStarter, isSceneOutput, isBranchConsumer,
-  resolveDataSource, nearestUpstreamWaits, reachesSceneOutput,
+  resolveDataSource, resolveUpstreamOutput, nearestUpstreamWaits, reachesSceneOutput,
 } = loadModule()
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -66,6 +66,21 @@ test('resolveDataSource terminates on a passthrough cycle (no infinite loop)', (
   const nodes = mapOf(node('w1', 'waitNode'), node('w2', 'waitNode'))
   const edges = [edge('w2', 'w1'), edge('w1', 'w2')]
   assert.equal(resolveDataSource('w1', edges, nodes), 'w1')
+})
+
+test('resolveUpstreamOutput returns the executed mesh URL feeding an output node', () => {
+  const nodes = mapOf(node('proc', 'extensionNode'), node('out', 'outputNode'))
+  const edges = [edge('proc', 'out')]
+  const outputs = { proc: '/workspace/Workflows/result.glb' }
+
+  assert.equal(resolveUpstreamOutput('out', edges, nodes, outputs), outputs.proc)
+})
+
+test('resolveUpstreamOutput follows passthrough nodes to the executed source', () => {
+  const nodes = mapOf(node('proc', 'extensionNode'), node('wait', 'waitNode'), node('out', 'outputNode'))
+  const edges = [edge('proc', 'wait'), edge('wait', 'out')]
+
+  assert.equal(resolveUpstreamOutput('out', edges, nodes, { proc: '/workspace/branch.glb' }), '/workspace/branch.glb')
 })
 
 // ─── nearestUpstreamWaits ──────────────────────────────────────────────────────

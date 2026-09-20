@@ -308,6 +308,104 @@ def test_registry_propagates_hf_downloads_and_requires_every_asset(monkeypatch, 
     assert generator.is_downloaded() is True
 
 
+def test_registry_prefers_structured_hf_downloads_over_legacy_metadata(monkeypatch, tmp_path: Path):
+    import services.generator_registry as registry_module
+    from services.generators.base import BaseGenerator
+
+    class DummyGenerator(BaseGenerator):
+        def load(self):
+            self._model = object()
+
+        def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):
+            return self.outputs_dir / "dummy.glb"
+
+    manifest = {
+        "id": "demo/generate",
+        "name": "Demo",
+        "hf_repo": "owner/legacy",
+        "hf_downloads": _plan({"path": "weights/model.bin"}),
+        "weight_owner_id": "generate",
+    }
+    ext_dir = tmp_path / "extension"
+    ext_dir.mkdir()
+    monkeypatch.setattr(
+        registry_module,
+        "_discover_extensions",
+        lambda: {"demo/generate": (DummyGenerator, manifest, ext_dir)},
+    )
+
+    registry = registry_module.GeneratorRegistry()
+    registry.initialize()
+
+    generator = registry.get_generator("demo/generate")
+    assert generator.hf_downloads == manifest["hf_downloads"]
+
+
+def test_registry_still_rejects_genuinely_conflicting_download_plan_kinds(monkeypatch, tmp_path: Path):
+    import services.generator_registry as registry_module
+    from services.generators.base import BaseGenerator
+
+    class DummyGenerator(BaseGenerator):
+        def load(self):
+            self._model = object()
+
+        def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):
+            return self.outputs_dir / "dummy.glb"
+
+    manifest = {
+        "id": "demo/generate",
+        "name": "Demo",
+        "https_downloads": [{"url": "https://example.invalid/model.bin", "path": "model.bin"}],
+        "hf_downloads": _plan({"path": "weights/model.bin"}),
+        "weight_owner_id": "generate",
+    }
+    ext_dir = tmp_path / "extension"
+    ext_dir.mkdir()
+    monkeypatch.setattr(
+        registry_module,
+        "_discover_extensions",
+        lambda: {"demo/generate": (DummyGenerator, manifest, ext_dir)},
+    )
+
+    registry = registry_module.GeneratorRegistry()
+    registry.initialize()
+
+    assert "demo/generate" not in registry._generators
+    assert "conflicting download plan kinds" in registry.load_errors()["demo/generate"]
+
+
+def test_discovery_skips_process_extension_before_requiring_generator(monkeypatch, tmp_path: Path, capsys):
+    import services.generator_registry as registry_module
+
+    extension = tmp_path / "process-extension"
+    extension.mkdir()
+    (extension / "manifest.json").write_text(
+        json.dumps({"id": "process-extension", "type": "process"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", tmp_path)
+
+    assert registry_module._discover_extensions() == {}
+    output = capsys.readouterr().out
+    assert "type 'process' is not handled" in output
+    assert "missing generator.py" not in output
+
+
+def test_discovery_rejects_model_extension_without_generator(monkeypatch, tmp_path: Path, capsys):
+    import services.generator_registry as registry_module
+
+    extension = tmp_path / "model-extension"
+    extension.mkdir()
+    (extension / "manifest.json").write_text(
+        json.dumps({"id": "model-extension", "type": "model"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", tmp_path)
+
+    assert registry_module._discover_extensions() == {}
+    assert "missing generator.py" in capsys.readouterr().out
+
+
 def test_hf_download_assets_endpoint_resolves_plan_from_canonical_model_id(monkeypatch, tmp_path: Path):
     fastapi = pytest.importorskip("fastapi")
     from fastapi import FastAPI

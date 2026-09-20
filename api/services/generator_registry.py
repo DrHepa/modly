@@ -108,10 +108,6 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
         if not manifest_path.exists():
             print(f"[Registry] Skipping '{ext_dir.name}': missing manifest.json")
             continue
-        if not generator_path.exists():
-            print(f"[Registry] Skipping '{ext_dir.name}': missing generator.py")
-            continue
-
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -120,6 +116,10 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
             if manifest.get("type", "model") != "model":
                 print(f"[Registry] Skipping '{ext_dir.name}': type "
                       f"'{manifest.get('type')}' is not handled by this registry")
+                continue
+
+            if not generator_path.exists():
+                print(f"[Registry] Skipping '{ext_dir.name}': missing generator.py")
                 continue
 
             ext_id     = manifest["id"]
@@ -229,6 +229,26 @@ def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
     return canonical_dir
 
 
+def validate_download_plan_exclusivity(manifest: dict, model_id: str) -> None:
+    """Reject manifests whose effective source declarations are ambiguous."""
+    kinds = []
+    if "model_sources" in manifest:
+        kinds.append("model_sources")
+    if manifest.get("https_downloads"):
+        kinds.append("https_downloads")
+    if manifest.get("hf_downloads"):
+        kinds.append("hf_downloads")
+    # Structured multi-repository plans supersede the legacy single-repository
+    # metadata. Transitional manifests may keep hf_repo/download_check so older
+    # Modly releases can still install them without making the plan ambiguous.
+    if manifest.get("hf_repo") and not manifest.get("hf_downloads"):
+        kinds.append("hf_repo")
+    if len(kinds) > 1:
+        raise ValueError(
+            f"{model_id} declares conflicting download plan kinds: {', '.join(kinds)}"
+        )
+
+
 # ------------------------------------------------------------------ #
 # GeneratorRegistry
 # ------------------------------------------------------------------ #
@@ -267,6 +287,7 @@ class GeneratorRegistry:
         for model_id, entry in extensions.items():
             cls, manifest, ext_dir = entry
             try:
+                validate_download_plan_exclusivity(manifest, model_id)
                 manifest["input"] = validate_model_input(
                     manifest.get("input", "image"),
                     context=f"{model_id}.input",

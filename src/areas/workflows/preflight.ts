@@ -2,7 +2,7 @@ import type { Workflow, WFNode } from '@shared/types/electron.d'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
 
-type DataType = 'image' | 'text' | 'mesh' | 'audio'
+type DataType = 'image' | 'text' | 'mesh' | 'audio' | 'scene'
 
 export interface WorkflowPreflightIssue {
   key: string
@@ -14,6 +14,7 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
   if (node.type === 'imageNode') return 'Image'
   if (node.type === 'textNode') return 'Text'
   if (node.type === 'meshNode') return 'Load 3D Mesh'
+  if (node.type === 'sceneNode') return 'Load Scene'
   if (node.type === 'outputNode') return 'Add to Scene'
   if (node.type === 'previewNode') return 'Preview Views'
   if (node.type === 'imagePreviewNode') return 'Preview Image'
@@ -28,6 +29,7 @@ function nodeLabel(node: WFNode, allExtensions: WorkflowExtension[]): string {
 }
 
 function formatType(type: DataType): string {
+  if (type === 'scene') return 'scene'
   if (type === 'mesh') return 'mesh'
   if (type === 'image') return 'image'
   if (type === 'audio') return 'audio'
@@ -44,6 +46,7 @@ function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): Da
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'meshNode' || node.type === 'outputNode') return 'mesh'
+  if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'previewNode') return 'image'
   if (node.type === 'imagePreviewNode') return 'image'
   if (node.type === 'forEachNode') {
@@ -96,6 +99,13 @@ export function validateWorkflowPreflight(
       })
     }
 
+    if (node.type === 'sceneNode' && !((node.data.params?.manifestPath as string | undefined)?.trim())) {
+      pushIssue(issues, {
+        key: `${node.id}:scene-invalid`, nodeId: node.id,
+        message: 'Load Scene needs a validated scene directory.',
+      })
+    }
+
     // A node fed by two different Wait branches can't be scheduled into a single
     // branch — it would run before either branch produces its mesh.
     if (
@@ -117,6 +127,20 @@ export function validateWorkflowPreflight(
         key: `${node.id}:missing-extension`,
         nodeId: node.id,
         message: `${nodeLabel(node, allExtensions)} is unavailable. Reload extensions or remove the node.`,
+      })
+      continue
+    }
+
+    const usesSceneInput = ext.input === 'scene' || ext.inputs?.includes('scene') === true
+    const unsupportedSceneShape =
+      (ext.type === 'process' && (usesSceneInput || ext.output === 'scene'))
+      || (ext.type === 'model' && usesSceneInput
+        && (ext.inputs !== undefined || ext.input !== 'scene'))
+    if (unsupportedSceneShape) {
+      pushIssue(issues, {
+        key: `${node.id}:unsupported-scene-shape`,
+        nodeId: node.id,
+        message: `${ext.name} uses an unsupported scene input or output declaration.`,
       })
       continue
     }

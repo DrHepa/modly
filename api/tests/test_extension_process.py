@@ -2,6 +2,9 @@ import io
 import platform
 import queue
 import unittest
+import json
+import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 from services.extension_process import ExtensionProcess, _venv_python
@@ -12,6 +15,31 @@ def _make_proc() -> ExtensionProcess:
 
 
 class ExtensionProcessTests(unittest.TestCase):
+    def test_generation_envelope_pins_worker_model_id(self) -> None:
+        proc = _make_proc()
+        sent = []
+        proc._send = sent.append
+        proc._receive_generation = lambda *args: Path("result.glb")
+        proc._generate_request({"image_b64": ""}, {}, None, None)
+        self.assertEqual(sent[0]["model_id"], "demo")
+
+    def test_generate_artifact_sends_typed_scene_without_image_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            scene = workspace / "Workflows" / "room"
+            scene.mkdir(parents=True)
+            manifest = scene / "scene-manifest.json"
+            manifest.write_text(json.dumps({
+                "schema": "modly.scene-manifest.v1", "sceneRoot": ".", "assets": [],
+            }))
+            proc = _make_proc()
+            calls = []
+            proc._generate_request = lambda payload, params, progress, cancel: calls.append((payload, params)) or manifest
+            with patch("services.generator_registry.WORKSPACE_DIR", workspace):
+                result = proc.generate_artifact("scene", manifest, {"quality": "high"})
+            self.assertEqual(result, manifest)
+            self.assertEqual(calls, [({"input": {"kind": "scene", "path": str(manifest.resolve())}}, {"quality": "high"})])
+
     def test_read_loop_writes_sentinel_to_own_queue_only(self) -> None:
         proc = _make_proc()
 

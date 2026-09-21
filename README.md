@@ -153,6 +153,18 @@ original behavior.
 ## Workflows
 Start with a basic workflow first. For example, on the "Workflows" tab, try: Image -> Generate Mesh -> Add to Scene. Make sure there is a connection between each of the steps. Go to the "Generate" tab, make sure the workflow is selected, then click on "Generate 3D Model". Click on "Settings/Logs/Errors" to see any issues.
 
+Model extensions may also declare `scene` as a node input or output. A scene is
+a workspace directory containing `scene-manifest.json` with schema
+`modly.scene-manifest.v1`; it is not an arbitrary JSON file. Use the **Load
+Scene** workflow node to select and validate an existing scene directory.
+Scene-capable generators implement `generate_artifact(input_kind,
+artifact_path, ...)`; legacy image generators and `POST /generate/from-image`
+remain unchanged. The generic `POST /generate/from-artifact` boundary currently
+accepts only `scene`, leaving future artifact kinds to separate reviewed changes.
+For this first contract, `scene` is model-only and must be declared as the single
+`input` value (not inside `inputs`); process and mixed-input scene nodes are rejected.
+Model nodes may still accept multiple images and produce a scene.
+
 
 ## Modly CLI
 

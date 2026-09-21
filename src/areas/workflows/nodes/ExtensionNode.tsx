@@ -17,6 +17,7 @@ const HANDLE_COLOR: Record<string, string> = {
   mesh:  '#a78bfa',
   text:  '#fbbf24',
   scene: '#34d399',
+  video: '#f472b6',
 }
 
 const TAG_CLS: Record<string, string> = {
@@ -25,6 +26,7 @@ const TAG_CLS: Record<string, string> = {
   mesh:  'border-violet-500/30 bg-violet-500/10 text-violet-400',
   text:  'border-amber-500/30 bg-amber-500/10 text-amber-400',
   scene: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
+  video: 'border-pink-500/30 bg-pink-500/10 text-pink-400',
 }
 
 // ─── Param control ────────────────────────────────────────────────────────────

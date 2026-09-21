@@ -156,10 +156,20 @@ def decode_model_input(msg: dict):
     if "input" not in msg:
         return base64.b64decode(msg["image_b64"])
     value = msg["input"]
-    if not isinstance(value, dict) or set(value) != {"kind", "path"}:
+    if not isinstance(value, dict):
+        raise ValueError("Typed artifact input must contain exactly kind and path")
+    kind = value.get("kind")
+    expected_fields = {"kind", "path", "snapshot"} if kind == "video" else {"kind", "path"}
+    if set(value) != expected_fields:
+        if kind == "video":
+            raise ValueError("Video artifact input requires a well-formed snapshot")
         raise ValueError("Typed artifact input must contain exactly kind and path")
     from services.artifact_input import TypedArtifactInput, revalidate_artifact_input
-    typed = TypedArtifactInput(kind=value.get("kind"), path=Path(value.get("path", "")))
+    snapshot = None
+    if kind == "video":
+        from services.video_input import video_snapshot_from_dict
+        snapshot = video_snapshot_from_dict(value["snapshot"])
+    typed = TypedArtifactInput(kind=kind, path=Path(value.get("path", "")), snapshot=snapshot)
     return revalidate_artifact_input(WORKSPACE_DIR, typed)
 
 
@@ -235,9 +245,10 @@ def main() -> None:
                 if hasattr(model_input, "kind"):
                     if not isinstance(params, dict):
                         raise ValueError("Model params must be an object")
-                    reserved = {"artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path"}
+                    reserved = {"artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path", "video_path"}
                     params = {key: value for key, value in params.items() if key not in reserved}
-                    params["scene_manifest_path"] = str(model_input.path)
+                    if model_input.kind == "scene":
+                        params["scene_manifest_path"] = str(model_input.path)
                 if msg.get("outputs_dir"):
                     gen.outputs_dir = Path(msg["outputs_dir"])
                     gen.outputs_dir.mkdir(parents=True, exist_ok=True)

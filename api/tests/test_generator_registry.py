@@ -155,13 +155,13 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
         self.registry.reload()
         self.assertNotIn(str(extension.resolve()), sys.path)
 
-    def test_scene_io_is_registered_but_capture_and_video_are_rejected(self) -> None:
-        for extension_id, input_kind in (("scene-io", "scene"), ("capture-io", "capture"), ("video-io", "video")):
+    def test_scene_and_video_inputs_are_registered_but_capture_is_rejected(self) -> None:
+        for extension_id, input_kind, output_kind in (("scene-io", "scene", "scene"), ("capture-io", "capture", "mesh"), ("video-io", "video", "mesh")):
             extension = self._make_extension(extension_id)
             manifest = {
                 "id": extension_id, "name": extension_id, "type": "model",
                 "generator_class": "TestGenerator",
-                "nodes": [{"id": "generate", "input": input_kind, "output": "scene"}],
+                "nodes": [{"id": "generate", "input": input_kind, "output": output_kind}],
             }
             (extension / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             (extension / "generator.py").write_text(
@@ -174,8 +174,28 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
 
         self.registry.initialize()
         self.assertEqual(self.registry.get_manifest("scene-io/generate")["input"], "scene")
+        self.assertEqual(self.registry.get_manifest("video-io/generate")["input"], "video")
         self.assertIn("capture-io/generate", self.registry.load_errors())
-        self.assertIn("video-io/generate", self.registry.load_errors())
+
+    def test_video_input_rejects_arrays_and_video_output(self) -> None:
+        cases = {
+            "video-array": {"input": "video", "inputs": ["video"], "output": "mesh"},
+            "video-mixed": {"input": "video", "inputs": ["video", "text"], "output": "mesh"},
+            "video-output": {"input": "image", "output": "video"},
+        }
+        for extension_id, node in cases.items():
+            extension = self._make_extension(extension_id)
+            (extension / "manifest.json").write_text(json.dumps({
+                "id": extension_id, "name": extension_id, "type": "model",
+                "generator_class": "TestGenerator", "nodes": [{"id": "generate", **node}],
+            }), encoding="utf-8")
+            (extension / "generator.py").write_text(
+                "from services.generators.base import BaseGenerator\nclass TestGenerator(BaseGenerator):\n pass\n",
+                encoding="utf-8",
+            )
+        self.registry.initialize()
+        for extension_id in cases:
+            self.assertIn(f"{extension_id}/generate", self.registry.load_errors())
 
     def test_scene_input_rejects_multi_input_shapes_but_image_multi_can_output_scene(self) -> None:
         cases = {

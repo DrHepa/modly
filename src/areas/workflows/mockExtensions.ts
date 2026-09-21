@@ -10,8 +10,8 @@ export interface WorkflowExtension {
   nodeId:          string   // "node_id"
   name:            string
   description:     string
-  input:           'image' | 'text' | 'mesh' | 'audio' | 'scene'
-  inputs?:         ('image' | 'text' | 'mesh' | 'audio' | 'scene')[]   // multi-input; overrides input when set
+  input:           'image' | 'text' | 'mesh' | 'audio' | 'scene' | 'video'
+  inputs?:         ('image' | 'text' | 'mesh' | 'audio' | 'scene' | 'video')[]   // multi-input; overrides input when set
   inputLabels?:    string[]                                  // display labels per input slot
   output:          'image' | 'text' | 'mesh' | 'audio' | 'scene'
   params:          ParamSchema[]

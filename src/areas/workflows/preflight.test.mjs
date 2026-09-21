@@ -166,3 +166,23 @@ test('renderer fails closed for unsupported process and mixed scene node shapes'
     assert.ok(issues.some((issue) => issue.key === 'target:unsupported-scene-shape'))
   }
 })
+
+test('video input accepts only a validated Load Video source and fails closed on unsupported shapes', () => {
+  const { validateWorkflowPreflight } = loadModule()
+  const video = { id: 'video', type: 'videoNode', position: { x: 0, y: 0 }, data: { params: { workspacePath: 'Workflows/Videos/clip.mp4' } } }
+  const target = { id: 'target', type: 'extensionNode', position: { x: 0, y: 0 }, data: { extensionId: 'pack/process-node' } }
+  const valid = ext({ input: 'video', output: 'mesh', type: 'model' })
+  assert.deepEqual(validateWorkflowPreflight(wf([video, target], [{ id: 'e', source: 'video', target: 'target' }]), [valid]), [])
+  for (const extension of [
+    ext({ input: 'video', output: 'mesh', type: 'process' }),
+    ext({ input: 'video', inputs: ['video'], output: 'mesh', type: 'model' }),
+    ext({ input: 'image', output: 'video', type: 'model' }),
+  ]) {
+    const issues = validateWorkflowPreflight(wf([video, target], [{ id: 'e', source: 'video', target: 'target' }]), [extension])
+    assert.ok(issues.some((issue) => issue.key === 'target:unsupported-video-shape'))
+  }
+  for (const params of [{ path: '/tmp/clip.mp4' }, { workspacePath: '../clip.mp4' }, { workspacePath: 'Workflows/clip.exe' }]) {
+    const invalid = { ...video, data: { params } }
+    assert.ok(validateWorkflowPreflight(wf([invalid], []), []).some((issue) => issue.key === 'video:video-invalid'))
+  }
+})

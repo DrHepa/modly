@@ -452,15 +452,16 @@ def _discover_extensions(
                 node for node in raw_nodes
                 if isinstance(node, dict) and node.get("id")
             ]
-            allowed_io = {"image", "text", "mesh", "audio", "scene"}
+            allowed_inputs = {"image", "text", "mesh", "audio", "scene", "video"}
+            allowed_outputs = {"image", "text", "mesh", "audio", "scene"}
             for node in nodes:
                 declared_inputs = node.get("inputs") or [node.get("input", "image")]
                 if (not isinstance(declared_inputs, list)
-                        or any(value not in allowed_io for value in declared_inputs)):
+                        or any(value not in allowed_inputs for value in declared_inputs)):
                     raise ValueError(
                         f'model node "{node.get("id", "unknown")}" has an unsupported input type'
                     )
-                if node.get("output", "mesh") not in allowed_io:
+                if node.get("output", "mesh") not in allowed_outputs:
                     raise ValueError(
                         f'model node "{node.get("id", "unknown")}" has an unsupported output type'
                     )
@@ -469,6 +470,13 @@ def _discover_extensions(
                 ):
                     raise ValueError(
                         f'model node "{node.get("id", "unknown")}" must declare scene '
+                        'as its single input field'
+                    )
+                if "video" in declared_inputs and (
+                    "inputs" in node or node.get("input", "image") != "video"
+                ):
+                    raise ValueError(
+                        f'model node "{node.get("id", "unknown")}" must declare video '
                         'as its single input field'
                     )
 

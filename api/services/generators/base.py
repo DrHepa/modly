@@ -174,6 +174,10 @@ class BaseGenerator(ABC):
         ``generate`` with the canonical path so scene-capable extensions built
         against the pre-release contract remain compatible.
         """
+        if input_kind != "scene":
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement typed artifact input '{input_kind}'"
+            )
         return self.generate(artifact_path, params, progress_cb, cancel_event)  # type: ignore[arg-type]
 
     def _check_cancelled(self, cancel_event: Optional[threading.Event]) -> None:

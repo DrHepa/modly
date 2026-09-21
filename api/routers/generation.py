@@ -142,7 +142,7 @@ async def generate_from_image(
 
 
 _RESERVED_ARTIFACT_PARAMS = {
-    "artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path",
+    "artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path", "video_path",
 }
 
 
@@ -165,7 +165,8 @@ async def generate_from_artifact(
         raise HTTPException(400, str(exc)) from exc
 
     params = {k: v for k, v in request.params.items() if k not in _RESERVED_ARTIFACT_PARAMS}
-    params["scene_manifest_path"] = str(artifact.path)
+    if artifact.kind == "scene":
+        params["scene_manifest_path"] = str(artifact.path)
     collection = sanitize_collection(request.collection)
     job_id = str(uuid.uuid4())
     _purge_old_jobs()
@@ -277,11 +278,22 @@ async def _run_generation(
             from services.artifact_input import revalidate_artifact_input
             model_input = revalidate_artifact_input(registry.WORKSPACE_DIR, model_input)
             import inspect
-            supports_cancel = "cancel_event" in inspect.signature(gen.generate_artifact).parameters
+            artifact_parameters = inspect.signature(gen.generate_artifact).parameters
+            supports_cancel = "cancel_event" in artifact_parameters
+            supports_snapshot = "artifact_snapshot" in artifact_parameters
+
+            def invoke_artifact():
+                kwargs = {}
+                if supports_cancel:
+                    kwargs["cancel_event"] = cancel_event
+                if supports_snapshot:
+                    kwargs["artifact_snapshot"] = model_input.snapshot
+                return gen.generate_artifact(
+                    model_input.kind, model_input.path, params, progress_cb, **kwargs
+                )
             output_path = await loop.run_in_executor(
                 None,
-                lambda: gen.generate_artifact(model_input.kind, model_input.path, params, progress_cb, cancel_event)
-                        if supports_cancel else gen.generate_artifact(model_input.kind, model_input.path, params, progress_cb),
+                invoke_artifact,
             )
         else:
             import inspect

@@ -6,7 +6,8 @@ import test, { after } from 'node:test'
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { assertCapturedTranslation, assertNativeNumericCommit, assertUiAuthoredScene, assertBothScenesReopened, CAPTURED_TRANSFORM_TOLERANCE, waitForOwnedWindowFocus, assertNativeClickPointStable, isNativeNumericCommitSettled, assertInspector, isNativeHandleHover, assertReopenedAuthoringVisual } from './driver.ts'
+import { DOMParser } from '@xmldom/xmldom'
+import { assertCapturedTranslation, assertNativeNumericCommit, assertUiAuthoredScene, assertBothScenesReopened, CAPTURED_TRANSFORM_TOLERANCE, waitForOwnedWindowFocus, waitFor, key, assertNativeClickPointStable, isNativeNumericCommitSettled, assertInspector, isNativeHandleHover, assertReopenedAuthoringVisual } from './driver.ts'
 import { captureOwnedDisplayResources, waitForDisplayResourcesAbsent } from './display-resources.mjs'
 import { parseRunArguments, inheritedDisplayEnvironment, validateRunnerLocalAiConfig, validateRunnerRepositoryAdmission } from './run.mjs'
 import { BufferGeometry, BoxGeometry, Group, Mesh, MeshBasicMaterial, PerspectiveCamera, Vector3 } from 'three'
@@ -15,7 +16,9 @@ import { createSourceCustody } from '../worlds-authoring-electron-fixture.mjs'
 import { materializeLocalAiConfig, parseBuildArguments } from '../worlds-authoring-electron-fixture.mjs'
 import * as aiPolicies from './shared.ts'
 import { createServer, request as ownedHttpRequest } from 'node:http'
-import { parseWorldAiQueryRequest, WorldAiContractError, WORLD_AI_QUERY_BYTES, WORLD_AI_PAGE_BYTES } from '../../src/areas/worlds/core/worldAiContract.ts'
+import { parseWorldAiQueryRequest, sameWorldAiContext, WorldAiContractError, WORLD_AI_QUERY_BYTES, WORLD_AI_PAGE_BYTES } from '../../src/areas/worlds/core/worldAiContract.ts'
+import { compileWorldAiProposal } from '../../src/areas/worlds/core/worldAiCreationCompiler.ts'
+import { createValidWorldSnapshot } from '../../src/areas/worlds/core/_testFixtures.ts'
 
 const canonicalRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
 const canonicalLocalAiConfig = materializeLocalAiConfig(canonicalRoot)
@@ -671,6 +674,88 @@ function assertFocusAdmissionClean({ window, controller }) {
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
 }
 
+async function passiveInputFixture(deadline = Date.now() + 1000) {
+  const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const body = oneSeam(source, /(function guard\([\s\S]*?)(?=const mainDeadline)/g, 'passive and native input guards')
+  const fixture = focusAdmissionFixture(true), events = []
+  let observations = 0, beforeObservation = () => {}
+  const contents = { destroyed: false, isDestroyed() { return this.destroyed },
+    async executeJavaScript(expression) {
+      beforeObservation(expression)
+      if (expression.startsWith('typeof')) return true
+      observations++; fixture.window.focused = false
+      return { environment: { sandboxed: true, contextIsolated: true }, nodeGlobals: { require: 'undefined', process: 'undefined' }, diagnostics: [], untrustedInputs: 0, alerts: [], editor: { error: null }, observations }
+    },
+    sendInputEvent(event) { events.push(structuredClone(event)) },
+  }
+  fixture.window.webContents = contents
+  fixture.window.focus = () => { throw new Error('Passive admission must never request desktop focus') }
+  const make = await inertFunction(`let currentWindow = window, firstFailure = null, stopping = false; ${body}; return {
+    guard, inputGuard: typeof inputGuard === 'function' ? inputGuard : undefined,
+    admitNativeFocus: typeof admitNativeFocus === 'function' ? admitNativeFocus : undefined,
+    replaceWindow(value) { currentWindow = value }, fail(value) { firstFailure = value }, stop() { stopping = true }
+  }`, ['window', 'assert', 'BrowserWindow', 'waitForOwnedWindowFocus', 'mainDeadline', 'localAi', 'focusAdmissionAbort', 'evidence', 'now'])
+  const policy = make(fixture.window, assert, { getAllWindows: () => fixture.state.windows }, waitForOwnedWindowFocus, deadline, { cleanupSeconds: 0 }, fixture.controller, {}, () => new Date().toISOString())
+  const ports = { guard: policy.guard, inputGuard: policy.inputGuard, record() {} }
+  return { ...fixture, contents, events, policy, ports, beforeObservation(value) { beforeObservation = value } }
+}
+
+async function assertPassiveWaitAndNativeInputSeparation() {
+  const fixture = await passiveInputFixture()
+  const view = await waitFor(fixture.contents, fixture.ports, (value) => value.observations === 2, 'blurred passive model wait', 250)
+  assert.equal(view.observations, 2); assert.equal(fixture.window.focused, false); assert.deepEqual(fixture.events, [])
+  assert.throws(() => key(fixture.contents, fixture.ports, 'Return'), /owned focused window/)
+  assert.deepEqual(fixture.events, [], 'Blurred native key must not reach the transport')
+  const { sendNativeInput } = await import('./driver.ts')
+  for (const type of ['mouseMove', 'mouseDown', 'mouseUp', 'keyDown', 'keyUp', 'char']) {
+    assert.throws(() => sendNativeInput(fixture.contents, fixture.ports, { type, x: 1, y: 1, keyCode: 'a' }), /owned focused window/)
+  }
+  const admission = fixture.policy.admitNativeFocus(fixture.contents)
+  assert.equal(fixture.window.listenerCount('focus'), 1)
+  assert.deepEqual(fixture.events, [], 'Waiting for focus must not inject any input')
+  fixture.window.focused = true; fixture.window.emit('focus'); await admission
+  key(fixture.contents, fixture.ports, 'Return')
+  assert.deepEqual(fixture.events.map((event) => event.type), ['keyDown', 'keyUp'], 'Restored owned focus permits exactly one native key pair')
+  assertFocusAdmissionClean(fixture)
+  fixture.events.length = 0
+  fixture.contents.sendInputEvent = (event) => { fixture.events.push(event); fixture.window.focused = false }
+  assert.throws(() => key(fixture.contents, fixture.ports, 'Return'), /owned focused window/)
+  assert.deepEqual(fixture.events.map((event) => event.type), ['keyDown'], 'Every event, including release, must recheck focus')
+
+  for (const [label, mutate] of [
+    ['destroyed window', (f) => { f.window.destroyed = true }],
+    ['destroyed renderer', (f) => { f.contents.destroyed = true }],
+    ['missing window', (f) => f.policy.replaceWindow(null)],
+    ['wrong singleton owner', (f) => { f.state.windows = [new EventEmitter()] }],
+    ['additional window', (f) => f.state.windows.push(new EventEmitter())],
+    ['replaced window', (f) => { const replacement = { isDestroyed: () => false, isFocused: () => true, webContents: { isDestroyed: () => false } }; f.state.windows = [replacement]; f.policy.replaceWindow(replacement) }],
+    ['replaced renderer', (f) => { f.window.webContents = { isDestroyed: () => false } }],
+    ['stopping fixture', (f) => f.policy.stop()],
+    ['fatal failure', (f) => f.policy.fail(new Error('Controlled fatal failure'))],
+  ]) {
+    const invalid = await passiveInputFixture(); mutate(invalid)
+    await assert.rejects(waitFor(invalid.contents, invalid.ports, () => true, label, 100), undefined, label)
+    assert.throws(() => key(invalid.contents, invalid.ports, 'Return'), undefined, label)
+    assert.deepEqual(invalid.events, [])
+  }
+  const wrongContents = await passiveInputFixture(), unrelated = { isDestroyed: () => false, sendInputEvent() { throw new Error('Unrelated renderer must not receive input') } }
+  assert.throws(() => wrongContents.policy.guard(unrelated), /renderer replaced/)
+  assert.throws(() => key(unrelated, wrongContents.ports, 'Return'), /renderer replaced/)
+  assert.deepEqual(wrongContents.events, [])
+  for (const phase of ['typeof', 'window.worldsAuthoringObserve()']) {
+    const replaced = await passiveInputFixture()
+    replaced.beforeObservation((expression) => { if (expression.startsWith(phase)) replaced.window.webContents = { isDestroyed: () => false } })
+    await assert.rejects(waitFor(replaced.contents, replaced.ports, () => true, 'replacement during observation', 100), /renderer|contents|reference-equal/)
+  }
+  const expired = await passiveInputFixture(Date.now() + 30); expired.window.focused = false
+  await assert.rejects(expired.policy.admitNativeFocus(expired.contents), /deadline exceeded/)
+  assert.deepEqual(expired.events, []); assertFocusAdmissionClean(expired)
+  const driver = await readFile(new URL('./driver.ts', import.meta.url), 'utf8')
+  assert.equal([...driver.matchAll(/\.sendInputEvent\(/g)].length, 1, 'Shared checked transport is the sole native injection boundary')
+  assert.match(driver, /ports\.inputGuard\(contents\)\s+contents\.sendInputEvent\(event\)/)
+  for (const filename of ['ai-driver.ts', 'navigation-driver.ts']) assert.doesNotMatch(await readFile(new URL(filename, import.meta.url), 'utf8'), /\.sendInputEvent\(/, `${filename} must use the guarded transport`)
+}
+
 test('NF1 waits for an asynchronous focus event and authoritative owned focus predicate', async () => {
   const fixture = focusAdmissionFixture(), admission = waitForOwnedWindowFocus(fixture.window, fixture.options)
   assert.equal(fixture.window.listenerCount('focus'), 1); assert.equal(fixture.window.isFocused(), false)
@@ -678,6 +763,7 @@ test('NF1 waits for an asynchronous focus event and authoritative owned focus pr
   const result = await admission
   assert.equal(result.observedBy, 'native-focus-event'); assert.ok(Number.isFinite(Date.parse(result.focusedAt)))
   assertFocusAdmissionClean(fixture)
+  await assertPassiveWaitAndNativeInputSeparation()
 })
 
 test('NF2 admits an already focused owned window without installing waiting listeners', async () => {
@@ -1043,6 +1129,10 @@ test('RF4 final reopened-scene visual seam rejects missing nonfinite corners or 
 
 // Local-AI admission is pure policy/source-body evidence, NEVER an ASGI or provider test.
 test('AI1 build admission explicitly opts into manifest-bound canonical AI without selecting a model', () => {
+  assert.equal(aiPolicies.normalizeWorldsModelControlLabel('Ollama · qwen3.6:27b'), 'qwen3.6:27b')
+  assert.equal(aiPolicies.normalizeWorldsModelControlLabel('Ollama · qwen3.6:27b · Not installed'), 'qwen3.6:27b')
+  assert.equal(aiPolicies.normalizeWorldsModelControlLabel('OpenAI · gpt-5.4 · Remote'), 'gpt-5.4')
+  for (const value of [null, '', 'qwen3.6:27b', 'Ollama qwen3.6:27b', 'Ollama ·  · Not installed']) assert.equal(aiPolicies.normalizeWorldsModelControlLabel(value), null)
   assert.deepEqual(parseBuildArguments([]), { buildOnly: true, nativeMode: 'owned-xvfb' })
   let parsed
   assert.doesNotThrow(() => { parsed = parseBuildArguments(['--build-only', '--inherited-display', '--local-ai']) })
@@ -1073,6 +1163,30 @@ test('AI1 build admission explicitly opts into manifest-bound canonical AI witho
   assert.deepEqual(args.slice(0, 6), ['-I', '-B', '-m', 'uvicorn', 'main:app', '--app-dir'])
   assert.equal(args[6], config.apiRoot)
   assert.equal(args[args.indexOf('--port') + 1], '0')
+})
+
+test('AI1I Inspector number observation excludes nested units and uses the nearest production group heading', () => {
+  const document = new DOMParser().parseFromString(`<div aria-label="Entity inspector">
+    <section class="worlds-inspector-section"><div class="worlds-inspector-section__heading"><h3>Transform</h3></div>
+      <fieldset><legend>Position <span>m</span></legend><label><span>X</span><input id="position-x" type="number" value="0" /></label></fieldset>
+      <fieldset><legend>Rotation <span>°</span></legend><label><span>Y</span><input id="rotation-y" type="number" value="0" /></label></fieldset>
+      <fieldset><legend>Scale <span>×</span></legend><label><span>Z</span><input id="scale-z" type="number" value="1" /></label></fieldset>
+    </section>
+    <section class="worlds-inspector-section"><div class="worlds-inspector-section__heading"><h3>Camera</h3></div>
+      <label><span>Near<small>m</small></span><input id="camera-near" type="number" value="0.1" /></label>
+      <label><span>Far<small>m</small></span><input id="camera-far" type="number" value="1000" /></label>
+      <label><span>Field of view<small>°</small></span><input id="camera-fov" type="number" value="60" /></label>
+    </section>
+  </div>`, 'application/xml')
+  const expected = new Map([
+    ['position-x', 'Position:X'], ['rotation-y', 'Rotation:Y'], ['scale-z', 'Scale:Z'],
+    ['camera-near', 'Camera:Near'], ['camera-far', 'Camera:Far'], ['camera-fov', 'Camera:Field of view'],
+  ])
+  for (const [id, label] of expected) {
+    const input = document.getElementById(id)
+    assert.ok(input, `Production-shaped Inspector input missing: ${id}`)
+    assert.equal(aiPolicies.worldInspectorNumberFieldLabel(input), label)
+  }
 })
 
 test('AI1P local-AI paths materialize only from a canonical relocated repository root', () => {
@@ -1107,7 +1221,7 @@ test('AI2 runner admission forwards exactly the reviewed runtime mode and reserv
 })
 
 test('P1 repository admissions bind relocated main and runner consumers before source reads or spawning', async () => {
-  const head = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61', branch = 'codex/worlds-engine'
+  const head = '416fcfa079aa3e569e8dd460c64c7462fac7850b', branch = 'codex/worlds-engine'
   const admission = { schema: 'modly.worlds-authoring-repository-admission.v1', root: canonicalRoot, head, branch }
   assert.equal(aiPolicies.validateRepositoryAdmission(admission, canonicalRoot, head, branch), admission)
   for (const mutate of [
@@ -1753,50 +1867,61 @@ test('AI8 bounded received response custody precedes JSON/DTO decoding failures'
 
 function completeActualAiPolicyControl() {
   // Synthetic policy control ONLY. This is not HTTP, repository, model or native evidence.
-  const context = { schema: 'modly.world-ai-context.v1', projectKey: `world-${'a'.repeat(32)}`, projectId: 'project:observed', activeSceneId: 'scene:first', baseRevision: 8, editorEpoch: 2, originSessionId: 'session:observed', requestId: 'request:first' }
-  const model = { name: 'reviewed-existing:tag', digest: `sha256:${'b'.repeat(64)}`, toolsReviewed: true }
+  const prompt = 'Add one perspective camera named AI Probe Camera to the current scene at position [0, 2, 5], with field of view 60, no rotation and scale [1, 1, 1]. Put it at the scene root and change nothing else.'
+  const context = { schema: 'modly.world-ai-context.v1', projectKey: `world-${'a'.repeat(32)}`, projectId: 'project:observed', activeSceneId: 'scene:first', baseRevision: 8, editorEpoch: 2, originSessionId: 'session:observed', requestId: 'request:camera' }
+  const model = { name: 'qwen3.6:27b', digest: 'sha256:a50eda8ed977ab48a12431878896b27ffd5cef552c17af3317d9623b939a7f1e', toolsReviewed: true }
   const receipt = (body) => { const bytes = Buffer.from(JSON.stringify(body)); return { status: 200, responseBytes: bytes.length, responseSha256: createHash('sha256').update(bytes).digest('hex'), rawResponseBase64: bytes.toString('base64'), validation: 'accepted', response: body } }
-  const before = authoredSnapshot(), candidate = structuredClone(before); candidate.project.revision++
-  candidate.project.scenes.push({ id: 'scene:new' }); candidate.scenes.push({ sceneId: 'scene:new', entities: [] })
-  before.project.resources = []; candidate.project.resources = [{ id: 'resource:observed', type: 'model', format: 'glb', workspacePath: 'Exports/AuthoringFixtures/red-cube.glb' }]
-  before.project.startSceneId = 'scene:first'; candidate.project.startSceneId = 'scene:first'
-  for (const scene of [candidate.scenes[0], candidate.scenes[2]]) scene.entities.push({ id: `${scene.sceneId}:new-model`, enabled: true, parentId: null, transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, components: [{ id: `${scene.sceneId}:render`, type: 'renderable', enabled: true, resourceId: 'resource:observed' }, { id: `${scene.sceneId}:collider`, type: 'collider', shape: 'box', enabled: true }, { id: `${scene.sceneId}:body`, type: 'rigid-body', bodyType: 'dynamic', enabled: true }] })
-  candidate.scenes[2].entities.push({ id: 'camera:new', components: [{ type: 'camera', enabled: true }] }, { id: 'light:new', components: [{ type: 'light', enabled: true }] })
-  const state = { snapshot: before, history: { undo: 3, redo: 0 }, documents: [{ path: 'project.json', sha256: 'c'.repeat(64), bytes: 80 }] }
+  const before = authoredSnapshot(); before.project.resources = []; before.project.startSceneId = 'scene:first'
+  for (const scene of before.scenes) for (const entity of scene.entities) entity.components.forEach((component, index) => { component.id = `${entity.id}:component:${index}` })
+  const camera = { id: 'entity:ai-probe-camera', name: 'AI Probe Camera', parentId: null, enabled: true, locked: false, tags: [], transform: { position: [0, 2, 5], rotation: [0, 0, 0], scale: [1, 1, 1] }, components: [{ id: 'component:ai-probe-camera', type: 'camera', enabled: true, projection: 'perspective', primary: false, near: 0.1, far: 1000, fieldOfView: 60 }] }
+  const candidate = structuredClone(before); candidate.project.revision++; candidate.scenes[0].entities.push(structuredClone(camera))
+  const state = { snapshot: before, history: { undo: 3, redo: 0 }, documents: [{ path: 'Worlds/world-a/project.world-project.json', sha256: 'c'.repeat(64), bytes: 80 }] }
+  const after = { snapshot: candidate, history: { undo: 4, redo: 0 }, documents: [{ path: 'Worlds/world-a/project.world-project.json', sha256: 'd'.repeat(64), bytes: 96 }] }
   const point = { x: 20, y: 30 }, hover = { point, matchCount: 1, enabled: true, visible: true, hitMatches: true }
-  const target = { trusted: true, sequence: 1, target: 'BUTTON:Reject Worlds proposal', hitMatches: true, point, hover }
-  const proposal = (ctx, commands) => ({ type: 'world_command_proposal', context: ctx, commands })
-  const firstProposal = proposal(context, [{ type: 'create-entity', kind: 'group', localRef: 'group-control', sceneRef: { kind: 'existing', id: 'scene:first' }, name: 'AI review group' }, { type: 'reparent-entity', sceneId: 'scene:first', entityId: 'scene:first:model-a', parentRef: { kind: 'local', localRef: 'group-control' } }])
-  const secondContext = { ...context, requestId: 'request:second' }, handle = `asset_${'d'.repeat(32)}`
-  const secondProposal = proposal(secondContext, [{ type: 'create-scene', localRef: 'new', name: 'Observed scene' }, ...['scene:first', 'new'].map((ref) => ({ type: 'create-entity', kind: 'observed-model', localRef: `model:${ref}`, sceneRef: ref === 'new' ? { kind: 'local', localRef: ref } : { kind: 'existing', id: ref }, name: 'Observed model', resourceHandle: handle }))])
-  const query = (ctx, kind, items) => ({ request: { context: ctx, query: { kind } }, result: { ok: true, value: { context: ctx, kind, items: items.map((item) => kind === 'components' ? { ...item, current: { type: 'renderable', enabled: true } } : kind === 'project' ? { ...item, capabilities: ['create-scene', 'create-entity'] } : kind === 'resources' ? { ...item, fingerprint: proof.fingerprint } : item) } } })
-  const details = [{ entityName: 'Observed', property: 'Position', before: 'old', after: 'new' }]
-  const batch = { schema: 'modly.world-command-batch.v1', transactionId: 'tx:ai-observed', projectId: context.projectId, baseRevision: 8, origin: 'ai', commands: [{ type: 'add-scene', scene: candidate.scenes[2] }] }, authority = `apply_${'e'.repeat(48)}`
-  const secondPreview = { request: { proposal: secondProposal }, result: { ok: true, value: { batch, result: { snapshot: candidate, inverse: { kind: 'world-snapshot', snapshot: before }, warnings: [] }, details, authority } } }
-  const firstPreview = structuredClone(secondPreview); firstPreview.request.proposal = firstProposal
-  const firstCandidate = structuredClone(before); firstCandidate.project.revision++; firstCandidate.scenes[0].entities[0].transform.position[0] += 0.25
-  firstCandidate.scenes[0].entities[0].parentId = 'group:control'; firstCandidate.scenes[0].entities.push({ id: 'group:control', name: 'AI review group', parentId: null, transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, components: [] })
-  firstPreview.result.value.result.snapshot = firstCandidate
-  const turn = (ctx, prop, preview, queries, decision) => { const request = { worldContext: ctx, model: model.name }; return { context: ctx, request, responseReceipt: { ...receipt({ message: 'Observed', actions: [], proposals: [], worldProposals: [prop] }), request: structuredClone(request), admittedSelection: { name: model.name, digest: model.digest } }, queries, preview, before: structuredClone(state), beforeDecision: structuredClone(state), review: { details, warnings: [], applyEnabled: true, rejectEnabled: true, busy: false, focused: true }, decision } }
+  const proposal = { type: 'world_command_proposal', context, commands: [{ type: 'create-entity', kind: 'camera', localRef: 'ai_probe_camera', sceneRef: { kind: 'existing', id: context.activeSceneId }, parentRef: null, name: 'AI Probe Camera', transform: structuredClone(camera.transform), camera: { projection: 'perspective', fieldOfView: 60 } }] }
+  const query = (kind, items) => ({ request: { context, query: { kind } }, result: { ok: true, value: { context, kind, items, total: items.length, nextCursor: null } } })
+  const queries = [
+    query('project', [{ kind: 'project', id: context.projectId, name: 'Observed', revision: 8, startSceneId: 'scene:first', sceneCount: 2, resourceCount: 0, capabilities: ['create-camera'] }]),
+    query('scenes', [{ kind: 'scene', id: 'scene:first', name: 'First', isActive: true, isStart: true, entityCount: before.scenes[0].entities.length }, { kind: 'scene', id: 'scene:second', name: 'Second', isActive: false, isStart: false, entityCount: before.scenes[1].entities.length }]),
+  ]
+  const details = [{ entityName: camera.name, property: 'entity', before: 'Missing', after: 'Created' }]
+  const batch = { schema: 'modly.world-command-batch.v1', transactionId: 'tx:ai-camera-observed', projectId: context.projectId, baseRevision: 8, origin: 'ai', commands: [{ type: 'add-entity', sceneId: context.activeSceneId, entity: structuredClone(camera) }] }, authority = `apply_${'e'.repeat(48)}`
+  const preview = { request: { proposal }, result: { ok: true, value: { batch, result: { snapshot: candidate, inverse: { kind: 'world-snapshot', snapshot: before }, warnings: [] }, details, authority } } }
+  const request = { messages: [{ role: 'user', content: prompt }], model: model.name, ollama_url: 'http://127.0.0.1:11434', thinking: 'off', originSessionId: context.originSessionId, worldContext: context, context: {} }
   const applied = { snapshot: candidate, inverse: { kind: 'world-snapshot', snapshot: before }, idempotent: false, newRevision: 9, receipt: { transactionId: batch.transactionId, payloadSha256: createHash('sha256').update(canonicalWorldCommandBatchPayload(batch)).digest('hex') } }
   const stored = { verified: true, transactionId: batch.transactionId, snapshot: candidate, inverse: applied.inverse }
   const undo = structuredClone(before); undo.project.revision = 10
   const redo = structuredClone(candidate); redo.project.revision = 11
   const history = (kind, snap) => {
     const transactionId = `tx:synthetic-policy-history-${kind}`, inverse = { kind: 'world-snapshot', snapshot: structuredClone(kind === 'Undo' ? candidate : undo) }
-    return { kind, input: { ...target, target: `BUTTON:${kind}` }, result: { ok: true, value: { snapshot: snap, inverse, receipt: { transactionId }, newRevision: snap.project.revision, idempotent: false } }, stored: { verified: true, transactionId, snapshot: structuredClone(snap), inverse: structuredClone(inverse) } }
+    return { kind, input: { trusted: true, sequence: kind === 'Undo' ? 2 : 3, target: `BUTTON:${kind}`, hitMatches: true, point, hover }, result: { ok: true, value: { snapshot: snap, inverse, receipt: { transactionId }, newRevision: snap.project.revision, idempotent: false } }, stored: { verified: true, transactionId, snapshot: structuredClone(snap), inverse: structuredClone(inverse) } }
   }
-  const sourceBytes = Buffer.alloc(24); sourceBytes.writeUInt32LE(0x46546c67, 0); sourceBytes.writeUInt32LE(2, 4); sourceBytes.writeUInt32LE(24, 8); sourceBytes.writeUInt32LE(4, 12); sourceBytes.writeUInt32LE(0x4e4f534a, 16); sourceBytes.write('{}  ', 20)
-  const input = { bytes: sourceBytes.length, sha256: createHash('sha256').update(sourceBytes).digest('hex'), rawBase64: sourceBytes.toString('base64') }
-  const proof = { workspacePath: candidate.project.resources[0].workspacePath, format: 'glb', files: [{ path: candidate.project.resources[0].workspacePath, sha256: input.sha256, byteLength: input.bytes, identity: 'synthetic-policy-control-only' }] }
-  proof.fingerprint = createHash('sha256').update(JSON.stringify(['glb', proof.files])).digest('hex')
-  return { status: 'PASS', checks: ['actual-model-discovery', 'actual-ai-reject', 'actual-ai-apply-and-history', 'actual-ai-both-scenes-reopen'].map((name) => ({ name, status: 'PASS' })), evidence: { actualAi: {
+  const responseReceipt = { ...receipt({ message: 'Created the requested camera.', actions: [], proposals: [], worldProposals: [proposal] }), request: structuredClone(request), admittedSelection: { name: model.name, digest: model.digest } }
+  const invocation = { request: { projectKey: context.projectKey, batch, aiAuthority: { token: authority, context } }, forwardedAt: 'observed', settledAt: 'observed', result: { ok: true, value: applied } }
+  const settledUi = { expanded: true, prompt: '', promptDisabled: false, sendEnabled: false, selectedModel: model.name, modelOptions: [], busy: false, focused: false, status: 'Saved', details: [], warnings: [], applyEnabled: false, rejectEnabled: false, manualControls: { apply: 0, reject: 0 } }
+  const selectionInput = { trusted: true, sequence: 8, target: `SPAN:${camera.name}`, hitMatches: true, point, hover }
+  return { status: 'PASS', checks: ['actual-model-discovery', 'actual-ai-camera-auto-apply-and-history', 'actual-ai-camera-reopen'].map((name) => ({ name, status: 'PASS' })), evidence: { actualAi: {
     schema: 'modly.worlds-actual-ai-acceptance.v1', phase: 'complete', admittedModel: model, discovery: receipt({ models: [{ name: model.name, digest: model.digest }] }),
-    counters: { discoveryRequests: 1, discoveryResponses: 1, chatRequests: 2, receivedChats: 2, validDecodedChats: 2, validReturnedWorldProposals: 2, hostPreviews: 2, hostDiscards: 1, aiApplies: 1, aiSettledApplies: 1, undo: 1, redo: 1 },
-    turns: [turn(context, firstProposal, firstPreview, [query(context, 'entities', [{ kind: 'entity', id: 'scene:first:model-a' }]), query(context, 'components', [{ kind: 'component', entityId: 'scene:first:model-a', type: 'renderable' }])], { kind: 'reject', input: target, discarded: { request: { context, authority }, result: { ok: true, value: { discarded: true } } }, after: structuredClone(state) }), turn(secondContext, secondProposal, secondPreview, [query(secondContext, 'project', [{ kind: 'project', id: context.projectId }]), query(secondContext, 'resources', [{ kind: 'resource', id: handle, format: 'glb', capability: 'mesh', fingerprint: input.sha256 }])], { kind: 'apply', input: { ...target, sequence: 2, target: 'BUTTON:Apply Worlds proposal' }, invocation: { request: { projectKey: context.projectKey, batch, aiAuthority: { token: authority, context: secondContext } }, forwardedAt: 'observed', settledAt: 'observed', result: { ok: true, value: applied } }, stored })],
-    sourceWitnesses: [{ handle, resourceId: 'resource:observed', fingerprint: proof.fingerprint, proof, input }], undo: history('Undo', undo), redo: history('Redo', redo),
-    reopened: ['scene:first', 'scene:new'].map((sceneId) => ({ sceneId, oldBootId: 'old', bootId: 'new', snapshot: redo, canonicalDiskMatches: true, model: { entityId: `${sceneId}:new-model`, meshes: 1, triangles: 12, visible: true, matrixWorld: Array(16).fill(1), worldCorners: Array(8).fill({ world: [0, 0, 0], ndc: [0, 0, 0], depth: 2 }) }, screenshot: { bytes: 100, sha256: 'f'.repeat(64), filename: 'observed.png' } })),
+    prompt, counters: { discoveryRequests: 1, discoveryResponses: 1, chatRequests: 1, receivedChats: 1, validDecodedChats: 1, validReturnedWorldProposals: 1, hostPreviews: 1, hostDiscards: 0, aiApplies: 1, aiSettledApplies: 1, undo: 1, redo: 1 },
+    turn: { context, request, responseReceipt, queries, preview, before: structuredClone(state), after: structuredClone(after), settledUi, manualDecisionInputs: [], invocation, stored },
+    undo: history('Undo', undo), redo: history('Redo', redo),
+    reopened: { sceneId: context.activeSceneId, entityId: camera.id, oldBootId: 'old', bootId: 'new', snapshot: redo, canonicalDiskMatches: true, selectionActive: camera.id, inspectorName: camera.name, inspectorValues: [
+      ['Position:X', '0'], ['Position:Y', '2'], ['Position:Z', '5'], ['Rotation:X', '0'], ['Rotation:Y', '0'], ['Rotation:Z', '0'], ['Scale:X', '1'], ['Scale:Y', '1'], ['Scale:Z', '1'], ['Camera:Near', '0.1'], ['Camera:Far', '1000'], ['Camera:Field of view', '60'],
+    ].map(([label, value]) => ({ label, value, disabled: false })), selectionInput, screenshot: { bytes: 100, sha256: 'f'.repeat(64), filename: 'ai-camera-fresh-reopen.png' } },
   } } }
+}
+function replaceActualAiPolicyProposal(control, proposal) {
+  const actual = control.evidence.actualAi
+  const response = structuredClone(actual.turn.responseReceipt.response)
+  response.worldProposals = [structuredClone(proposal)]
+  const bytes = Buffer.from(JSON.stringify(response))
+  Object.assign(actual.turn.responseReceipt, {
+    response,
+    responseBytes: bytes.length,
+    responseSha256: createHash('sha256').update(bytes).digest('hex'),
+    rawResponseBase64: bytes.toString('base64'),
+  })
+  actual.turn.preview.request.proposal = structuredClone(proposal)
 }
 test('AI9 actual native terminal rejects startup-only empty AI evidence', async () => {
   const source = await readFile(new URL('./run.mjs', import.meta.url), 'utf8')
@@ -1805,11 +1930,119 @@ test('AI9 actual native terminal rejects startup-only empty AI evidence', async 
   const accepted = completeActualAiPolicyControl()
   const invoke = (result, localAi = true) => finish(result, assert, localAi, null, runnerPolicy.assertActualAiTerminal, runnerPolicy.assertActualWorldSculptNavigationTerminal)
   assert.doesNotThrow(() => invoke(accepted), 'Complete synthetic policy control must be accepted')
+  const driverSource = await readFile(new URL('./ai-driver.ts', import.meta.url), 'utf8')
+  const queryBody = oneSeam(driverSource, /(  const queries = receipts\.queries\.slice\(counts\.queries\);[\s\S]*?)(?=  const creation = assertCameraCreation)/g, 'actual camera query validation')
+  const nativeQueries = await inertFunction(queryBody, ['receipts', 'counts', 'context', 'assert', 'sameWorldAiContext'])
+  const queryValidators = [
+    ['native driver', (control) => nativeQueries({ queries: control.evidence.actualAi.turn.queries }, { queries: 0 }, control.evidence.actualAi.turn.context, assert, sameWorldAiContext)],
+    ['terminal', invoke],
+  ]
+  // Sanitized shape of the retained real scene-only query/camera response. This is
+  // a synthetic policy control, NOT a promotion of the consumed native FAIL.
+  const sceneOnly = structuredClone(accepted), observedTurn = sceneOnly.evidence.actualAi.turn
+  const observedQuery = structuredClone(observedTurn.queries.find((query) => query.request.query.kind === 'scenes'))
+  observedQuery.request.query = { kind: 'scenes', pageSize: 50 }
+  observedQuery.result.value.items.reverse() // Inactive scene first, captured active scene second.
+  observedTurn.queries = [observedQuery]
+  const observedProposal = structuredClone(observedTurn.preview.request.proposal)
+  observedProposal.commands[0].localRef = 'AI_Probe_Camera'
+  delete observedProposal.commands[0].parentRef
+  replaceActualAiPolicyProposal(sceneOnly, observedProposal)
+  const queryOutcomes = queryValidators.map(([label, validate]) => {
+    try { validate(sceneOnly); return `${label}: accepted` }
+    catch (error) { return `${label}: ${error.message}` }
+  })
+  assert.deepEqual(queryOutcomes, ['native driver: accepted', 'terminal: accepted'], 'A real successful active-scene query and camera recipe do not require a redundant project query')
+  const projectQuery = structuredClone(accepted.evidence.actualAi.turn.queries.find((query) => query.request.query.kind === 'project'))
+  for (const [label, validate] of queryValidators) {
+    assert.doesNotThrow(() => validate(accepted), `${label} must also accept the valid optional project query`)
+    for (const [negative, mutate] of [
+      ['missing scene query', (turn) => { turn.queries = [] }],
+      ['only project query', (turn) => { turn.queries = [structuredClone(projectQuery)] }],
+      ['failed scene query', (turn) => { turn.queries[0].result = { ok: false, error: { code: 'failed' } } }],
+      ['stale scene request context', (turn) => { turn.queries[0].request.context = { ...turn.context, requestId: 'request:stale' } }],
+      ['stale scene result context', (turn) => { turn.queries[0].result.value.context = { ...turn.context, baseRevision: turn.context.baseRevision - 1 } }],
+      ['mismatched query kind', (turn) => { turn.queries[0].request.query.kind = 'project' }],
+      ['missing active scene row', (turn) => { turn.queries[0].result.value.items.pop() }],
+      ['wrong active scene ID', (turn) => { turn.queries[0].result.value.items[1].id = 'scene:unrelated' }],
+      ['inactive captured scene', (turn) => { turn.queries[0].result.value.items[1].isActive = false }],
+      ['empty optional project page', (turn) => { turn.queries.push(structuredClone(projectQuery)); turn.queries[1].result.value.items = [] }],
+      ['unsupported optional capability', (turn) => { turn.queries.push(structuredClone(projectQuery)); turn.queries[1].result.value.items[0].capabilities = [] }],
+      ['wrong optional project ID', (turn) => { turn.queries.push(structuredClone(projectQuery)); turn.queries[1].result.value.items[0].id = 'project:unrelated' }],
+      ['stale optional project context', (turn) => { turn.queries.push(structuredClone(projectQuery)); turn.queries[1].result.value.context = { ...turn.context, requestId: 'request:stale' } }],
+      ['failed optional project query', (turn) => { turn.queries.push(structuredClone(projectQuery)); turn.queries[1].result = { ok: false, error: { code: 'failed' } } }],
+      ['invalid optional page after valid project page', (turn) => { turn.queries.push(structuredClone(projectQuery), structuredClone(projectQuery)); turn.queries[2].result.value.items = [] }],
+    ]) {
+      const invalid = structuredClone(sceneOnly); mutate(invalid.evidence.actualAi.turn)
+      assert.throws(() => validate(invalid), undefined, `${label} must reject ${negative}`)
+    }
+  }
+  const actual = accepted.evidence.actualAi
+  const baselineProposal = structuredClone(actual.turn.preview.request.proposal)
+  const compilerSnapshot = createValidWorldSnapshot()
+  const forCompiler = (proposal) => {
+    const value = structuredClone(proposal)
+    value.context.projectId = compilerSnapshot.project.projectId
+    value.context.baseRevision = compilerSnapshot.project.revision
+    value.context.activeSceneId = compilerSnapshot.scenes[0].sceneId
+    value.context.requestId = 'tx:camera-equivalence'
+    value.commands[0].sceneRef = { kind: 'existing', id: compilerSnapshot.scenes[0].sceneId }
+    return value
+  }
+  const observations = { resources: new Map(), assertObserved() { throw new Error('Equivalent one-camera recipe unexpectedly required an observed owner') } }
+  const baselineCompilation = compileWorldAiProposal(compilerSnapshot, forCompiler(baselineProposal), observations)
+  const equivalents = [
+    ['arbitrary valid localRef', (proposal) => { proposal.commands[0].localRef = 'camera' }],
+    ['omitted root parentRef', (proposal) => { delete proposal.commands[0].parentRef }],
+    ['explicit canonical camera defaults', (proposal) => { proposal.commands[0].camera = { projection: 'perspective', near: 0.1, far: 1000, fieldOfView: 60 } }],
+  ]
+  for (const [label, mutate] of equivalents) {
+    const proposal = structuredClone(baselineProposal); mutate(proposal)
+    const compilation = compileWorldAiProposal(compilerSnapshot, forCompiler(proposal), observations)
+    assert.deepEqual(compilation.candidate, baselineCompilation.candidate, `${label} changed the production-compiled camera candidate`)
+    assert.deepEqual(compilation.batch, baselineCompilation.batch, `${label} changed the production-compiled canonical batch`)
+    const equivalent = structuredClone(accepted); replaceActualAiPolicyProposal(equivalent, proposal)
+    assert.doesNotThrow(() => invoke(equivalent), `${label} must remain a valid natural-language acceptance representation`)
+  }
+  for (const [label, mutate] of [
+    ['changed requested position', (proposal) => { proposal.commands[0].transform.position[1] = 3 }],
+    ['changed requested field of view', (proposal) => { proposal.commands[0].camera = { projection: 'perspective', fieldOfView: 61 } }],
+  ]) {
+    const proposal = structuredClone(baselineProposal); mutate(proposal)
+    const compilation = compileWorldAiProposal(compilerSnapshot, forCompiler(proposal), observations)
+    assert.notDeepEqual(compilation.candidate, baselineCompilation.candidate, `${label} control must change the production-compiled candidate`)
+    const changed = structuredClone(accepted); replaceActualAiPolicyProposal(changed, proposal)
+    assert.throws(() => invoke(changed), undefined, `${label} must not satisfy the requested camera acceptance`)
+  }
   assert.doesNotThrow(() => invoke({ status: 'PASS', checks: [{ status: 'PASS' }] }, null), 'Non-AI authoring remains unchanged')
   for (const bad of [{ status: 'PASS', checks: [{ status: 'PASS' }] }, { ...accepted, evidence: { actualApi: { queries: [], chats: [], discoveries: [] } } }]) assert.throws(() => invoke(bad), /AI|actual|query|proposal/i, 'Startup-only cannot satisfy actual AI acceptance')
-  const paths = ['schema', 'phase', 'admittedModel', 'discovery', 'counters', 'turns', 'sourceWitnesses', 'undo', 'redo', 'reopened']
+  const paths = ['schema', 'phase', 'admittedModel', 'discovery', 'prompt', 'counters', 'turn', 'undo', 'redo', 'reopened']
   for (const path of paths) { const bad = structuredClone(accepted); delete bad.evidence.actualAi[path]; assert.throws(() => invoke(bad), undefined, `Missing ${path} must be refused`) }
-  const corruptions = [(a) => a.turns.pop(), (a) => a.discovery.response.models[0].digest = `sha256:${'c'.repeat(64)}`, (a) => a.turns[0].responseReceipt.validation = 'pending', (a) => a.turns[0].queries.pop(), (a) => a.turns[1].queries[1].result.value.context.requestId = 'stale', (a) => a.turns[0].beforeDecision.history.undo++, (a) => a.turns[0].decision.after.documents = [], (a) => a.turns[0].decision.discarded.result.ok = false, (a) => a.turns[1].decision.input.trusted = false, (a) => a.turns[1].decision.invocation.request.batch.transactionId = 'different', (a) => a.turns[1].decision.invocation.request.aiAuthority.context.editorEpoch++, (a) => a.turns[1].decision.invocation.result.value.idempotent = true, (a) => a.turns[1].decision.stored.verified = false, (a) => a.sourceWitnesses[0].input.sha256 = '0'.repeat(64), (a) => a.undo.result.value.snapshot.project.revision--, (a) => a.redo.result.ok = false, (a) => a.reopened[0].bootId = 'old', (a) => a.reopened[1].canonicalDiskMatches = false, (a) => a.reopened[1].model.triangles = 0, (a) => a.reopened[1].model.worldCorners.pop(), (a) => delete a.reopened[1].screenshot]
+  const corruptions = [
+    (a) => a.discovery.response.models[0].digest = `sha256:${'c'.repeat(64)}`,
+    (a) => a.counters.chatRequests = 2,
+    (a) => a.turn.responseReceipt.validation = 'pending',
+    (a) => a.turn.responseReceipt.responseSha256 = '0'.repeat(64),
+    (a) => a.turn.request.model = 'substituted:model',
+    (a) => a.turn.queries.pop(),
+    (a) => a.turn.queries[0].result.value.context.requestId = 'stale',
+    (a) => a.turn.queries[0].result.value.items[0].capabilities = [],
+    (a) => a.turn.preview.request.proposal.commands[0].name = 'Wrong camera',
+    (a) => a.turn.preview.result.value.result.snapshot.scenes[0].entities.push({ id: 'entity:extra', name: 'Extra', parentId: null, enabled: true, locked: false, tags: [], transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, components: [] }),
+    (a) => a.turn.settledUi.manualControls.apply = 1,
+    (a) => a.turn.manualDecisionInputs.push({ target: 'BUTTON:Apply Worlds proposal' }),
+    (a) => a.turn.invocation.request.batch.transactionId = 'different',
+    (a) => a.turn.invocation.request.aiAuthority.context.editorEpoch++,
+    (a) => a.turn.invocation.result.value.idempotent = true,
+    (a) => a.turn.stored.verified = false,
+    (a) => a.undo.result.value.snapshot.project.revision--,
+    (a) => a.redo.result.ok = false,
+    (a) => a.redo.result.value.snapshot.scenes[0].entities.at(-1).id = 'entity:redo-drift',
+    (a) => a.reopened.bootId = 'old',
+    (a) => a.reopened.canonicalDiskMatches = false,
+    (a) => a.reopened.inspectorValues.find((field) => field.label === 'Camera:Field of view').value = '61',
+    (a) => delete a.reopened.screenshot,
+  ]
   for (const corrupt of corruptions) { const bad = structuredClone(accepted); corrupt(bad.evidence.actualAi); assert.throws(() => invoke(bad), undefined, 'Required actual witness corruption must be refused') }
   for (const event of ['undo', 'redo']) {
     for (const field of ['transactionId', 'snapshot', 'inverse']) {
@@ -2026,15 +2259,21 @@ async function thinkingNativeSurface(mode = 'auto', fault = null) {
   const events = [], records = [], titles = ['Thinking: auto', 'Thinking: on', 'Thinking: off']
   const button = { title: `Thinking: ${mode}`, textContent: '', tagName: 'BUTTON', isConnected: true, parentElement: null,
     getAttribute(name) { return name === 'title' ? this.title : null }, getBoundingClientRect: () => ({ x: 20, y: 20, width: 40, height: 20 }), matches: () => fault === 'disabled', contains: () => false }
-  const prompt = { parentElement: { querySelectorAll: (selector) => selector === 'button[title]' ? fault === 'absent' ? [] : fault === 'ambiguous' ? [button, button] : [button] : [] } }
+  const modelSpan = { textContent: 'Ollama · qwen3.6:27b' }
+  const modelOption = { tagName: 'BUTTON', isConnected: true, parentElement: null, querySelector: (selector) => selector === 'span' ? modelSpan : null,
+    getAttribute: () => null, getBoundingClientRect: () => ({ x: 80, y: 20, width: 80, height: 20 }), matches: () => false, contains: () => false }
+  const modelButton = { parentElement: { querySelectorAll: (selector) => selector === ':scope > div > button' ? [modelOption] : [] } }
+  const prompt = { parentElement: { querySelectorAll: (selector) => selector === 'button[title]' ? fault === 'absent' ? [] : fault === 'ambiguous' ? [button, button] : [button]
+    : selector === ':scope > div.flex > div.flex > div.relative > button' ? [modelButton] : [] } }
   const document = { querySelectorAll: (selector) => selector === '[aria-label="Worlds AI"] textarea[aria-label="Ask Worlds AI"]' ? [prompt] : [],
     elementFromPoint: () => fault === 'occluded' ? { tagName: 'DIV', getAttribute: () => null } : button, activeElement: { getAttribute: () => 'Ask Worlds AI' } }
   const contents = { isDestroyed: () => false, executeJavaScript: async (expression) => new Function('document', 'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame', `return ${expression}`)(document,
     () => ({ display: fault === 'hidden' ? 'none' : 'block', visibility: 'visible', opacity: '1' }), (callback) => { queueMicrotask(callback); return 1 }, () => {}),
     sendInputEvent(event) { events.push(structuredClone(event)); if (event.type === 'mouseMove' && fault === 'drift') button.title = 'Thinking: off'; if (event.type === 'mouseUp') button.title = titles[(titles.indexOf(button.title) + 1) % 3] } }
-  const ports = { guard() {}, record(name, value) { records.push({ name, value }) } }
-  const make = await inertFunction(`${body}; return {observeNativeClickPoint, click}`, ['assert', 'assertNativeClickPointStable'])
-  return { ...make(assert, assertNativeClickPointStable), contents, ports, events, records, button, titles }
+  const ports = { guard() {}, inputGuard() {}, record(name, value) { records.push({ name, value }) } }
+  const { sendNativeInput } = await import('./driver.ts')
+  const make = await inertFunction(`${body}; return {observeNativeClickPoint, click}`, ['assert', 'assertNativeClickPointStable', 'sendNativeInput'])
+  return { ...make(assert, assertNativeClickPointStable, sendNativeInput), contents, ports, events, records, button, titles }
 }
 test('TH1 genuine Thinking title uses the existing unique enabled fixed-point native path', async () => {
   for (const mode of ['auto', 'on', 'off']) {
@@ -2046,6 +2285,9 @@ test('TH1 genuine Thinking title uses the existing unique enabled fixed-point na
     assert.deepEqual(surface.events.map((event) => event.type), ['mouseMove', 'mouseDown', 'mouseUp'])
     assert.deepEqual(surface.events[0].x, surface.events[1].x); assert.deepEqual(surface.events[0].y, surface.events[1].y)
   }
+  const surface = await thinkingNativeSurface('off')
+  assert.equal((await surface.observeNativeClickPoint(surface.contents, 'ai-option', 'qwen3.6:27b')).matchCount, 1, 'Unified Ollama picker label must resolve from the exact model identity')
+  assert.equal((await surface.observeNativeClickPoint(surface.contents, 'ai-option', 'Ollama · qwen3.6:27b')).matchCount, 0, 'Native route must not accept a presentation label as model identity')
 })
 test('TH2 Thinking title drift after native hover denies mouseDown without retargeting', async () => {
   const surface = await thinkingNativeSurface('auto', 'drift')
@@ -2070,7 +2312,7 @@ test('TH3 missing ambiguous disabled hidden occluded or invalid Thinking targets
 })
 async function thinkingScenario(receiptThinking = 'off', requestChange = null) {
   const native = await thinkingNativeSurface(), source = await readFile(new URL('./ai-driver.ts', import.meta.url), 'utf8')
-  const body = oneSeam(source, /(async function typePrompt\([\s\S]*?)(?=async function decisionInput)/g, 'actual prompt and receipt review')
+  const body = oneSeam(source, /(async function typePrompt\([\s\S]*?)(?=async function autoApplyCameraTurn)/g, 'actual prompt and Thinking binding')
   const snapshotBody = oneSeam(source, /(const snapshot = [^\n]+)/g, 'actual driver snapshot observation')
   const context = { schema: 'modly.world-ai-context.v1', projectKey: `world-${'a'.repeat(32)}`, projectId: 'project:thinking', activeSceneId: 'scene:thinking', baseRevision: 7, editorEpoch: 2, originSessionId: 'session:thinking', requestId: 'request:thinking' }
   const state = { snapshot: { project: { projectId: context.projectId, revision: context.baseRevision }, scenes: [] }, history: { undo: 0, redo: 0 }, documents: [] }
@@ -2095,37 +2337,31 @@ async function thinkingScenario(receiptThinking = 'off', requestChange = null) {
     }
   }
   const click = async (contents, driverPorts, kind, name) => { if (kind === 'ai-thinking') await native.click(contents, driverPorts, kind, name) }
-  const make = await inertFunction(`${snapshotBody}\n${body}; return {typePrompt, reviewTurn}`, ['owner', 'assert', 'click', 'key', 'waitFor', 'budget', 'readView', 'parseWorldAiChatResponse', 'sameWorldAiContext', 'assertReview', 'observeNativeClickPoint', 'assertNativeClickPointStable', 'paint'])
+  const { sendNativeInput } = await import('./driver.ts')
+  const make = await inertFunction(`${snapshotBody}\n${body}; return {typePrompt}`, ['owner', 'assert', 'click', 'key', 'waitFor', 'readView', 'observeNativeClickPoint', 'assertNativeClickPointStable', 'paint', 'sendNativeInput'])
   const scenario = make((driverPorts, contents) => { driverPorts.guard(); assert.equal(contents, driverPorts.currentContents()); assert.equal(contents.isDestroyed(), false) }, assert, click, key,
-    async (_contents, _ports, predicate) => { assert.ok(predicate(view)); return view }, () => {}, async () => view, (response) => response,
-    (left, right) => JSON.stringify(left) === JSON.stringify(right), () => {}, native.observeNativeClickPoint, assertNativeClickPointStable, async () => view)
+    async (_contents, _ports, predicate) => { assert.ok(predicate(view)); return view }, async () => view,
+    native.observeNativeClickPoint, assertNativeClickPointStable, async () => view, sendNativeInput)
   return { ...scenario, native, ports, state, view, sent, receipts }
 }
-test('TH4 actual driver observes local Thinking off immediately before both scenario chats', async () => {
+test('TH4 actual driver observes local Thinking off immediately before its one camera chat', async () => {
   const scenario = await thinkingScenario()
-  await scenario.typePrompt(scenario.native.contents, scenario.ports, 'First source scenario')
-  assert.equal(scenario.sent[0].title, 'Thinking: off', 'First genuine native request must select local off')
+  const witness = await scenario.typePrompt(scenario.native.contents, scenario.ports, 'One camera source scenario')
+  assert.equal(scenario.sent[0].title, 'Thinking: off', 'The genuine native request must select local off')
   assert.equal(scenario.native.events.filter((event) => event.type === 'mouseDown').length, 2)
-  scenario.native.button.title = 'Thinking: on'; scenario.view.aiReview.applyEnabled = false
-  await scenario.typePrompt(scenario.native.contents, scenario.ports, 'Second source scenario')
-  assert.equal(scenario.sent[1].title, 'Thinking: off', 'Second genuine native request must recheck local off rather than trust earlier clicks')
-  assert.equal(scenario.native.events.filter((event) => event.type === 'mouseDown').length, 3)
-  assert.deepEqual(scenario.sent.map((entry) => entry.prompt), ['First source scenario', 'Second source scenario'])
+  assert.deepEqual(scenario.sent.map((entry) => entry.prompt), ['One camera source scenario'])
+  assert.deepEqual({ bootId: witness.bootId, projectKey: witness.projectKey, projectId: witness.projectId, activeSceneId: witness.activeSceneId, baseRevision: witness.baseRevision, model: witness.model },
+    { bootId: 'boot:thinking', projectKey: `world-${'a'.repeat(32)}`, projectId: 'project:thinking', activeSceneId: 'scene:thinking', baseRevision: 7, model: 'observed:thinking' })
 })
-test('TH5 actual captured request denies auto on or stale context despite native off and admits bound off', async () => {
-  for (const mode of ['auto', 'on', undefined]) {
-    const scenario = await thinkingScenario(mode)
-    // Undefined must be real missing data rather than the default parameter's positive value.
-    if (mode === undefined) { const original = scenario.ports.receipts; scenario.ports.receipts = () => { const value = original(); for (const chat of value.chats) delete chat.request.thinking; return value } }
-    await assert.rejects(() => scenario.reviewTurn(scenario.native.contents, scenario.ports, 'Bound source scenario', scenario.state, 0), /Thinking|request context/, 'A historical native off witness cannot admit a different actual request mode')
-  }
-  for (const change of [(request) => request.worldContext.baseRevision++, (request) => request.worldContext.projectKey = `world-${'b'.repeat(32)}`, (request) => request.worldContext.activeSceneId = 'scene:other', (request) => request.model = 'other:tag', (_request, view) => view.bootId = 'boot:other']) {
-    const scenario = await thinkingScenario('off', change)
-    await assert.rejects(() => scenario.reviewTurn(scenario.native.contents, scenario.ports, 'Bound source scenario', scenario.state, 0), /Thinking|request context|generation/)
-  }
-  const positive = await thinkingScenario('off')
-  await assert.doesNotReject(() => positive.reviewTurn(positive.native.contents, positive.ports, 'Bound source scenario', positive.state, 0))
-  assert.equal(positive.sent[0].title, 'Thinking: off')
+test('TH5 actual one-chat prompt rejects stale owned renderer before native send', async () => {
+  const scenario = await thinkingScenario('off')
+  const original = scenario.ports.currentContents
+  scenario.ports.currentContents = () => ({ id: 'replacement' })
+  await assert.rejects(() => scenario.typePrompt(scenario.native.contents, scenario.ports, 'Bound source scenario'), /strictly equal|reference-equal|stale|renderer|Expected values/)
+  assert.equal(scenario.sent.length, 0, 'A stale renderer must never submit the model request')
+  scenario.ports.currentContents = original
+  await assert.doesNotReject(() => scenario.typePrompt(scenario.native.contents, scenario.ports, 'Bound source scenario'))
+  assert.equal(scenario.sent.length, 1); assert.equal(scenario.sent[0].title, 'Thinking: off')
 })
 
 // Actual registered main callbacks and Promise.race teardown; all native/resource ports are inert.
@@ -2156,7 +2392,7 @@ async function ownedLifecycleMain(terminalPorts = {}) {
   class OwnedWindow extends EventEmitter {
     static getAllWindows() { return nativeWindows.filter((window) => !window.destroyed) }
     constructor() { super(); this.destroyed = false; this.focused = false; nativeWindows.push(this); this.webContents = new EventEmitter(); Object.assign(this.webContents,
-      { id: nativeWindows.length, setWindowOpenHandler() {}, focus() {}, getOSProcessId: () => 100 + nativeWindows.length, capturePage: async () => ({ toPNG: () => Buffer.from('synthetic screenshot') }) }) }
+      { id: nativeWindows.length, isDestroyed: () => this.destroyed, setWindowOpenHandler() {}, focus() {}, getOSProcessId: () => 100 + nativeWindows.length, capturePage: async () => ({ toPNG: () => Buffer.from('synthetic screenshot') }) }) }
     isDestroyed() { return this.destroyed } isFocused() { return this.focused }
     destroy() { this.destroyed = true; this.emit('closed') } async loadURL() {} show() {} focus() { this.focused = true }
   }
@@ -2304,7 +2540,7 @@ test('DB3 legacy twenty-second round1 HTTP504 never establishes actual AI accept
   const complete = completeActualAiPolicyControl()
   assert.doesNotThrow(() => runnerPolicy.assertActualAiTerminal(complete), 'Complete prior-stage synthetic control must pass before replacing its HTTP receipt')
   const failed = structuredClone(complete)
-  Object.assign(failed.evidence.actualAi.turns[0].responseReceipt, { status: 504, responseBytes: bytes.length, responseSha256: createHash('sha256').update(bytes).digest('hex'), rawResponseBase64: bytes.toString('base64'), validation: 'rejected', response: JSON.parse(bytes.toString('utf8')) })
-  assert.equal(failed.evidence.actualAi.turns[0].responseReceipt.response.detail.round, 1)
+  Object.assign(failed.evidence.actualAi.turn.responseReceipt, { status: 504, responseBytes: bytes.length, responseSha256: createHash('sha256').update(bytes).digest('hex'), rawResponseBase64: bytes.toString('base64'), validation: 'rejected', response: JSON.parse(bytes.toString('utf8')) })
+  assert.equal(failed.evidence.actualAi.turn.responseReceipt.response.detail.round, 1)
   assert.throws(() => runnerPolicy.assertActualAiTerminal(failed), { code: 'ERR_ASSERTION', actual: 504, expected: 200, message: /Actual AI HTTP success required/ }, 'A historical round timeout must fail specifically at real HTTP success validation, not at missing prior-stage evidence')
 })

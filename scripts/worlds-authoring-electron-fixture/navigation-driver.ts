@@ -9,6 +9,7 @@ import {
   paint,
   readView,
   selectValue,
+  sendNativeInput,
   waitFor,
   type CommonDriverPorts,
   type Invocation,
@@ -141,7 +142,7 @@ function interactionPoint(view: AuthoringView, entityId: string | null): { obser
 async function settleNativePoint(contents: WebContents, ports: CommonDriverPorts, entityId: string | null): Promise<{ point: Readonly<Point>; view: AuthoringView }> {
   const captured = await readView(contents), admitted = interactionPoint(captured, entityId)
   ports.guard()
-  contents.sendInputEvent({ type: 'mouseMove', ...admitted.point })
+  sendNativeInput(contents, ports, { type: 'mouseMove', ...admitted.point })
   await contents.executeJavaScript(`new Promise((resolve, reject) => {
     let first, second; const timer = setTimeout(() => reject(new Error('Canvas hover settlement exceeded 1000 ms')), 1000);
     first = requestAnimationFrame(() => { second = requestAnimationFrame(() => { clearTimeout(timer); resolve(); }); });
@@ -158,8 +159,8 @@ async function settleNativePoint(contents: WebContents, ports: CommonDriverPorts
 
 async function nativeCanvasClick(contents: WebContents, ports: CommonDriverPorts): Promise<Point> {
   const { point } = await settleNativePoint(contents, ports, null)
-  ports.guard(); contents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
-  contents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
+  ports.guard(); sendNativeInput(contents, ports, { type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
   return { ...point }
 }
 
@@ -170,10 +171,10 @@ async function nativeCanvasDoubleClick(contents: WebContents, ports: CommonDrive
   assert.ok(view.canvas)
   const result = { point: { ...point }, beforeCamera: [...view.canvas.camera], traceStart: view.trace.at(-1)?.sequence ?? 0, canvasUuid: view.canvas.canvasUuid }
   ports.guard()
-  contents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
-  contents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
-  contents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 2 })
-  contents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 2 })
+  sendNativeInput(contents, ports, { type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseDown', ...point, button: 'left', clickCount: 2 })
+  sendNativeInput(contents, ports, { type: 'mouseUp', ...point, button: 'left', clickCount: 2 })
   return result
 }
 
@@ -252,13 +253,13 @@ async function nativeOrbitDrag(contents: WebContents, ports: CommonDriverPorts):
   const end = { x: start.x - 90, y: start.y - 42 }
   let down = false
   try {
-    ports.guard(); contents.sendInputEvent({ type: 'mouseDown', ...start, button: 'left', clickCount: 1 }); down = true
+    ports.guard(); sendNativeInput(contents, ports, { type: 'mouseDown', ...start, button: 'left', clickCount: 1 }); down = true
     for (let step = 1; step <= 6; step += 1) {
       ports.guard()
-      contents.sendInputEvent({ type: 'mouseMove', x: Math.round(start.x + (end.x - start.x) * step / 6), y: Math.round(start.y + (end.y - start.y) * step / 6), button: 'left', modifiers: ['leftbuttondown'] })
+      sendNativeInput(contents, ports, { type: 'mouseMove', x: Math.round(start.x + (end.x - start.x) * step / 6), y: Math.round(start.y + (end.y - start.y) * step / 6), button: 'left', modifiers: ['leftbuttondown'] })
     }
   } finally {
-    if (down && !contents.isDestroyed()) contents.sendInputEvent({ type: 'mouseUp', ...end, button: 'left', clickCount: 1 })
+    if (down && !contents.isDestroyed()) sendNativeInput(contents, ports, { type: 'mouseUp', ...end, button: 'left', clickCount: 1 })
   }
 }
 
@@ -266,11 +267,11 @@ async function holdKeys(contents: WebContents, ports: CommonDriverPorts, keyCode
   assert.ok(milliseconds >= 250 && milliseconds <= 400)
   const held: string[] = []
   try {
-    for (const keyCode of keyCodes) { ports.guard(); contents.sendInputEvent({ type: 'keyDown', keyCode }); held.push(keyCode) }
+    for (const keyCode of keyCodes) { ports.guard(); sendNativeInput(contents, ports, { type: 'keyDown', keyCode }); held.push(keyCode) }
     const deadline = Date.now() + milliseconds
     while (Date.now() < deadline) { ports.guard(); await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now()))) }
   } finally {
-    if (!contents.isDestroyed()) for (const keyCode of [...held].reverse()) contents.sendInputEvent({ type: 'keyUp', keyCode })
+    if (!contents.isDestroyed()) for (const keyCode of [...held].reverse()) sendNativeInput(contents, ports, { type: 'keyUp', keyCode })
   }
 }
 
@@ -386,7 +387,7 @@ export async function runWorldSculptNavigationAcceptance(
   const canvasPoint = await nativeCanvasClick(contents, ports)
   view = await waitFor(contents, ports, (current) => current.navigation.pointerLock.canvasOwned && current.navigation.pointerLock.changes > lockChangesBefore && current.navigation.pointerLock.errors === 0 && current.navigation.status === FLY_LOCKED_STATUS, 'native-fly-pointer-lock')
   const flyBeforeLook = [...view.canvas!.cameraPose.quaternion]
-  contents.sendInputEvent({ type: 'mouseMove', x: canvasPoint.x + 37, y: canvasPoint.y - 19 })
+  sendNativeInput(contents, ports, { type: 'mouseMove', x: canvasPoint.x + 37, y: canvasPoint.y - 19 })
   view = await waitFor(contents, ports, (current) => !!current.canvas && changed(flyBeforeLook, current.canvas.cameraPose.quaternion), 'native-fly-look')
   const flyBeforeMove = [...view.canvas!.cameraPose.position]
   await holdKeys(contents, ports, ['W'], 300)

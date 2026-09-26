@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import type { WebContents } from 'electron'
 import { canonicalWorldCommandBatchPayload } from '../../src/areas/worlds/core/worldCommands.ts'
-import { sameWorldAiContext, type WorldAiContext, type WorldAiQueryRequest, type WorldAiQueryPage, type WorldAiResourceRow } from '../../src/areas/worlds/core/worldAiContract.ts'
-import type { WorldProjectSnapshotV1 } from '../../src/areas/worlds/core/worldModel.ts'
+import { sameWorldAiContext, worldAiCameraComponent, type WorldAiContext, type WorldAiQueryRequest, type WorldAiQueryPage, type WorldAiResourceRow } from '../../src/areas/worlds/core/worldAiContract.ts'
+import type { WorldEntity, WorldProjectSnapshotV1 } from '../../src/areas/worlds/core/worldModel.ts'
 import type { WorldProjectAiPreviewRequest, WorldProjectAiPreviewResult, WorldProjectAiDiscardRequest, WorldProjectResult } from '../../src/shared/types/worldProjects.ts'
 import { parseWorldAiChatResponse } from '../../src/areas/worlds/editor/worldAiChatAdapter.ts'
 import type { AuthoringView, LocalAiConfig, ReviewedAiModel } from './shared.ts'
-import { click, key, paint, readView, selectValue, waitFor, assertReopenedAuthoringVisual, type CommonDriverPorts, type Invocation, type Shot } from './driver.ts'
+import { click, key, paint, readView, selectValue, sendNativeInput, waitFor, type CommonDriverPorts, type Invocation, type Shot } from './driver.ts'
 import { observeNativeClickPoint, assertNativeClickPointStable } from './driver.ts'
 
 export interface AiHttpReceipt {
@@ -24,6 +24,7 @@ export interface AiStoredWitness { verified: true; transactionId: string; snapsh
 export interface AiDriverPorts extends CommonDriverPorts {
   config: LocalAiConfig; reviewedModel: Readonly<ReviewedAiModel>; deadline: number
   currentContents(): WebContents
+  admitNativeFocus(contents: WebContents): Promise<void>
   nativeClickWitness(label: string): unknown
   admitReopened(view: AuthoringView): void
   receipts(): { discoveries: readonly AiHttpReceipt[]; chats: readonly AiHttpReceipt[]; queries: readonly AiQueryCapture[]; previews: readonly AiPreviewCapture[]; discards: readonly AiDiscardCapture[]; discoveryRequests: number; chatRequests: number }
@@ -33,66 +34,58 @@ export interface AiDriverPorts extends CommonDriverPorts {
   capture(stage: string, view: AuthoringView, contents: WebContents): Promise<{ shot: Shot; screenshot: { filename: string; bytes: number; sha256: string } }>
 }
 const snapshot = (view: AuthoringView) => { assert.ok(view.editor.session); return view.editor.session.snapshot }
-const identity = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }
+export const AI_CAMERA_PROMPT = 'Add one perspective camera named AI Probe Camera to the current scene at position [0, 2, 5], with field of view 60, no rotation and scale [1, 1, 1]. Put it at the scene root and change nothing else.'
 function budget(ports: AiDriverPorts, seconds: number, stage: string): void {
   ports.guard(); assert.ok(Date.now() + seconds * 1000 < ports.deadline - ports.config.cleanupSeconds * 1000, `Insufficient remaining fixed budget for ${stage}`)
 }
 function owner(ports: AiDriverPorts, contents: WebContents): void {
-  ports.guard(); assert.equal(contents.isDestroyed(), false); assert.equal(contents, ports.currentContents(), 'Native AI cannot use a stale renderer generation')
+  ports.guard(contents); assert.equal(contents.isDestroyed(), false); assert.equal(contents, ports.currentContents(), 'Native AI cannot use a stale renderer generation')
 }
-function shortLabel(property: string): string {
-  const field = property.split('.').at(-1) ?? property
-  return ({ parentId: 'Parent', baseColor: 'Color', bodyType: 'Body', lightKind: 'Light', halfExtents: 'Size', halfHeight: 'Height', fieldOfView: 'FOV', orthographicSize: 'Size', castShadow: 'Shadow', receiveShadow: 'Receive', collisionLayer: 'Layer', collisionMask: 'Mask' } as Record<string, string>)[field]
-    ?? field.charAt(0).toUpperCase() + field.slice(1).replace(/([a-z])([A-Z])/g, '$1 $2')
+function assertCameraRecipe(preview: AiPreviewCapture): void {
+  const commands = preview.request.proposal.commands
+  assert.equal(commands.length, 1, 'Actual model must return exactly one recipe')
+  const recipe = commands[0]
+  assert.equal(recipe.type, 'create-entity')
+  if (recipe.type !== 'create-entity') throw new Error('Actual proposal is not a create-entity recipe')
+  assert.equal(recipe.kind, 'camera')
+  if (recipe.kind !== 'camera') throw new Error('Actual proposal is not a camera recipe')
+  assert.deepEqual(recipe.sceneRef, { kind: 'existing', id: preview.request.proposal.context.activeSceneId })
+  assert.ok(recipe.parentRef === undefined || recipe.parentRef === null, 'Requested camera must compile at the scene root')
+  assert.equal(recipe.name, 'AI Probe Camera')
+  assert.deepEqual(recipe.transform, { position: [0, 2, 5], rotation: [0, 0, 0], scale: [1, 1, 1] })
+  assert.deepEqual(worldAiCameraComponent('component:acceptance', recipe.camera ?? {}), {
+    id: 'component:acceptance', type: 'camera', enabled: true, primary: false,
+    projection: 'perspective', near: 0.1, far: 1000, fieldOfView: 60,
+  })
 }
-function assertReview(view: AuthoringView, preview: AiPreviewCapture): void {
-  assert.ok(preview.result.ok)
-  const ui = view.aiReview, value = preview.result.value
-  assert.ok(ui.expanded && !ui.busy && ui.focused && ui.applyEnabled && ui.rejectEnabled, 'Real visible review is not ready/focused')
-  assert.deepEqual(value.result.warnings, []); assert.deepEqual(ui.warnings, [])
-  assert.ok(value.details.length > 0)
-  assert.deepEqual(ui.details, value.details.map(({ entityName, property, before, after }) => ({ entityName, property: shortLabel(property), before, after })), 'Complete ordered visible NET differs from actual host preview')
-}
-function assertOrganization(before: WorldProjectSnapshotV1, preview: AiPreviewCapture, targetId: string, sceneId: string): void {
-  assert.ok(preview.result.ok); const candidate = preview.result.value.result.snapshot
-  const oldScene = before.scenes.find((s) => s.sceneId === sceneId)!, nextScene = candidate.scenes.find((s) => s.sceneId === sceneId)!
-  const added = nextScene.entities.filter((e) => !oldScene.entities.some((old) => old.id === e.id))
-  assert.equal(added.length, 1, 'Review request must create exactly one organizational group')
-  const group = added[0]; assert.equal(group.name, 'AI review group'); assert.equal(group.parentId, null); assert.deepEqual(group.transform, identity); assert.deepEqual(group.components, [])
+function assertCameraCreation(before: WorldProjectSnapshotV1, preview: AiPreviewCapture): { candidate: WorldProjectSnapshotV1; camera: WorldEntity } {
+  assert.ok(preview.result.ok); assertCameraRecipe(preview)
+  const value = preview.result.value, candidate = value.result.snapshot, activeSceneId = preview.request.proposal.context.activeSceneId
+  const beforeIds = new Set(before.scenes.flatMap((scene) => scene.entities.map((entity) => entity.id)))
+  const added = candidate.scenes.flatMap((scene) => scene.entities.filter((entity) => !beforeIds.has(entity.id)).map((entity) => ({ sceneId: scene.sceneId, entity })))
+  assert.equal(added.length, 1, 'Auto-apply candidate must add exactly one entity')
+  const camera = added[0].entity
+  assert.equal(added[0].sceneId, activeSceneId); assert.equal(camera.name, 'AI Probe Camera'); assert.equal(camera.parentId, null)
+  assert.equal(camera.enabled, true); assert.equal(camera.locked, false); assert.deepEqual(camera.tags, [])
+  assert.deepEqual(camera.transform, { position: [0, 2, 5], rotation: [0, 0, 0], scale: [1, 1, 1] })
+  assert.equal(camera.components.length, 1, 'AI camera entity must contain only its Camera component')
+  const component = camera.components[0]
+  assert.equal(component.type, 'camera')
+  if (component.type !== 'camera') throw new Error('AI camera component missing')
+  const activeBefore = before.scenes.find((scene) => scene.sceneId === activeSceneId)!
+  const expectedPrimary = !activeBefore.entities.some((entity) => entity.components.some((candidate) => candidate.type === 'camera' && candidate.primary))
+  assert.deepEqual(component, { id: component.id, type: 'camera', enabled: true, projection: 'perspective', primary: expectedPrimary, near: 0.1, far: 1000, fieldOfView: 60 })
+  const allIds = before.scenes.flatMap((scene) => scene.entities.flatMap((entity) => [entity.id, ...entity.components.map((item) => item.id)]))
+  assert.ok(typeof camera.id === 'string' && camera.id.length > 0 && !allIds.includes(camera.id)); assert.ok(typeof component.id === 'string' && component.id.length > 0 && !allIds.includes(component.id) && component.id !== camera.id)
   const expected = structuredClone(before); expected.project.revision++
-  const scene = expected.scenes.find((s) => s.sceneId === sceneId)!, target = scene.entities.find((e) => e.id === targetId)!
-  assert.equal(target.parentId, null); target.parentId = group.id; target.transform.position[0] += 0.25; scene.entities.push(structuredClone(group))
-  assert.deepEqual(candidate, expected, 'Organization proposal changed data beyond requested group/parent/localX')
-}
-function assertCreation(before: WorldProjectSnapshotV1, preview: AiPreviewCapture, witnesses: AiSourceWitness[]) {
-  assert.ok(preview.result.ok); const candidate = preview.result.value.result.snapshot, active = preview.request.proposal.context.activeSceneId
-  assert.equal(before.scenes.length, 2); assert.equal(candidate.scenes.length, 3)
-  const addedScenes = candidate.scenes.filter((s) => !before.scenes.some((old) => old.sceneId === s.sceneId)); assert.equal(addedScenes.length, 1)
-  const scene = addedScenes[0], old = before.scenes.find((s) => s.sceneId === active)!, next = candidate.scenes.find((s) => s.sceneId === active)!
-  const newModels = next.entities.filter((e) => !old.entities.some((entity) => entity.id === e.id)); assert.equal(newModels.length, 1)
-  const newSceneModels = scene.entities.filter((e) => e.components.some((c) => c.type === 'renderable')); assert.equal(newSceneModels.length, 1)
-  for (const [model, position] of [[newModels[0], [0, 0, 1.5]], [newSceneModels[0], [0, 0, 0]]] as const) {
-    assert.equal(model.parentId, null); assert.ok(model.enabled && !model.locked); assert.deepEqual(model.transform, { ...identity, position })
-    const render = model.components.find((c) => c.type === 'renderable'); assert.ok(render?.type === 'renderable' && render.enabled && render.visible)
-    assert.ok(witnesses.some((w) => w.resourceId === render.resourceId), 'New model is not linked to actual same-turn opaque GLB bytes')
-  }
-  for (const type of ['camera', 'light']) assert.equal(scene.entities.filter((e) => e.components.some((c) => c.type === type && c.enabled)).length, 1)
-  const cameraEntity = scene.entities.find((e) => e.components.some((c) => c.type === 'camera'))!, lightEntity = scene.entities.find((e) => e.components.some((c) => c.type === 'light'))!
-  assert.deepEqual(cameraEntity.transform, { position: [0, 1.5, 5], rotation: [-0.2, 0, 0], scale: [1, 1, 1] })
-  assert.ok(cameraEntity.components.some((c) => c.type === 'camera' && c.primary))
-  assert.ok(lightEntity.components.some((c) => c.type === 'light' && c.lightKind === 'ambient' && c.intensity === 0.8))
-  assert.equal(scene.entities.length, 3, 'Creation request admits one model/camera/light, not unrelated groups/entities')
-  assert.ok(newSceneModels[0].components.some((c) => c.type === 'collider' && c.enabled && c.shape === 'box'))
-  assert.ok(newSceneModels[0].components.some((c) => c.type === 'rigid-body' && c.enabled && c.bodyType === 'dynamic'))
-  // Preserve every original entity, scene and resource; only requested new canonical owners may be added.
-  const expected = structuredClone(before); expected.project.revision++
-  expected.project.resources = candidate.project.resources; expected.project.scenes.push(candidate.project.scenes.find((s) => s.id === scene.sceneId)!)
-  expected.scenes.find((s) => s.sceneId === active)!.entities.push(structuredClone(newModels[0])); expected.scenes.push(structuredClone(scene))
-  assert.deepEqual(candidate, expected, 'Creation modified existing document data')
-  for (const resource of before.project.resources) assert.deepEqual(candidate.project.resources.find((r) => r.id === resource.id), resource)
-  for (const resource of candidate.project.resources.filter((r) => !before.project.resources.some((old) => old.id === r.id))) assert.ok(witnesses.some((w) => w.resourceId === resource.id), 'Unrequested resource registered')
-  assert.deepEqual(preview.result.value.result.inverse, { kind: 'world-snapshot', snapshot: before })
-  return { candidate, sceneId: scene.sceneId, models: [{ sceneId: active, entityId: newModels[0].id }, { sceneId: scene.sceneId, entityId: newSceneModels[0].id }] }
+  expected.scenes.find((scene) => scene.sceneId === activeSceneId)!.entities.push(structuredClone(camera))
+  assert.deepEqual(candidate, expected, 'Camera proposal changed unrelated canonical owners')
+  assert.deepEqual(value.result.inverse, { kind: 'world-snapshot', snapshot: before })
+  assert.equal(value.batch.commands.length, 1); const command = value.batch.commands[0]
+  assert.equal(command.type, 'add-entity')
+  if (command.type !== 'add-entity') throw new Error('Camera preview did not compile to add-entity')
+  assert.equal(command.sceneId, activeSceneId); assert.deepEqual(command.entity, camera)
+  return { candidate, camera }
 }
 interface ThinkingRequestWitness {
   title: 'Thinking: off'; steps: Array<{ title: string; hover: unknown }>
@@ -103,7 +96,7 @@ async function typePrompt(contents: WebContents, ports: AiDriverPorts, prompt: s
   await click(contents, ports, 'ai-prompt', 'Ask Worlds AI')
   assert.equal(await contents.executeJavaScript('document.activeElement?.getAttribute("aria-label")', false), 'Ask Worlds AI')
   key(contents, ports, 'A', ['control'])
-  for (const char of prompt) { owner(ports, contents); contents.sendInputEvent({ type: 'char', keyCode: char }) }
+  for (const char of prompt) { owner(ports, contents); sendNativeInput(contents, ports, { type: 'char', keyCode: char }) }
   const ready = await waitFor(contents, ports, (v) => v.aiReview.prompt === prompt && v.aiReview.sendEnabled && !v.aiReview.busy, 'actual-prompt-hydrated-readiness', 5000)
   assert.equal(ready.aiReview.selectedModel, ports.reviewedModel.name)
   const steps = await selectThinkingOff(contents, ports)
@@ -151,16 +144,19 @@ async function selectThinkingOff(contents: WebContents, ports: AiDriverPorts): P
   assert.equal(title, 'Thinking: off', 'Thinking off requires at most two genuine native clicks')
   return steps
 }
-async function reviewTurn(contents: WebContents, ports: AiDriverPorts, prompt: string, before: AiDocumentState, index: number) {
-  budget(ports, ports.config.turnSeconds + (index === 0 ? ports.config.turnSeconds + 40 : 40), `chat-${index + 1}`)
+async function autoApplyCameraTurn(contents: WebContents, ports: AiDriverPorts, before: AiDocumentState) {
+  budget(ports, ports.config.turnSeconds + 40, 'camera-chat')
   const counts = { applies: ports.applies().length, chats: ports.receipts().chats.length, previews: ports.receipts().previews.length, queries: ports.receipts().queries.length }
-  assert.equal(counts.chats, index); assert.equal(counts.previews, index)
-  await ports.capture(`ai-${index + 1}-before-request`, await readView(contents), contents)
-  const thinking = await typePrompt(contents, ports, prompt)
-  const view = await waitFor(contents, ports, (v) => v.aiReview.applyEnabled && !v.aiReview.busy, `actual-chat-${index + 1}-review`, ports.config.turnSeconds * 1000)
-  owner(ports, contents); assert.equal(ports.applies().length, counts.applies, 'Provider/preview auto-applied a proposal')
-  const receipts = ports.receipts(); assert.equal(receipts.chats.length, index + 1); assert.equal(receipts.previews.length, index + 1)
-  const responseReceipt = receipts.chats[index], preview = receipts.previews[index]
+  assert.equal(counts.chats, 0); assert.equal(counts.previews, 0); assert.equal(ports.receipts().discards.length, 0)
+  const traceStart = (await readView(contents)).trace.at(-1)?.sequence ?? 0
+  await ports.capture('ai-camera-before-request', await readView(contents), contents)
+  const thinking = await typePrompt(contents, ports, AI_CAMERA_PROMPT)
+  const view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready'
+    && snapshot(v).project.revision === before.snapshot.project.revision + 1
+    && ports.applies().length === counts.applies + 1 && !v.aiReview.busy, 'actual-camera-auto-apply-settled', ports.config.turnSeconds * 1000)
+  owner(ports, contents)
+  const receipts = ports.receipts(); assert.equal(receipts.chats.length, 1); assert.equal(receipts.previews.length, 1); assert.equal(receipts.discards.length, 0)
+  const responseReceipt = receipts.chats[0], preview = receipts.previews[0]
   assert.equal(responseReceipt.status, 200); assert.equal(responseReceipt.validation, 'accepted'); assert.ok(responseReceipt.request)
   assert.equal(responseReceipt.request.thinking, 'off', 'Actual request Thinking differs from the native off witness')
   assert.equal(view.bootId, thinking.bootId, 'Thinking request renderer generation changed')
@@ -173,33 +169,44 @@ async function reviewTurn(contents: WebContents, ports: AiDriverPorts, prompt: s
   const context = preview.request.proposal.context; assert.ok(sameWorldAiContext(context, responseReceipt.request.worldContext))
   assert.equal(context.projectId, before.snapshot.project.projectId); assert.equal(context.baseRevision, before.snapshot.project.revision)
   const queries = receipts.queries.slice(counts.queries); assert.ok(queries.length > 0)
-  for (const q of queries) { assert.ok(q.result.ok && sameWorldAiContext(q.request.context, context) && sameWorldAiContext(q.result.value.context, context)) }
-  for (const kind of index === 0 ? ['entities', 'components'] : ['project', 'resources']) assert.ok(queries.some((q) => q.result.ok && q.result.value.kind === kind && q.result.value.items.length > 0), `Missing actual ${kind} tool query`)
-  assertReview(view, preview)
-  assert.deepEqual(await ports.documentState(view), before, 'Proposal preview changed canonical document/history/disk')
-  await ports.capture(`ai-${index + 1}-complete-net-before-decision`, view, contents)
-  return { view, context, thinking, request: responseReceipt.request, responseReceipt: structuredClone(responseReceipt), preview: structuredClone(preview), queries: structuredClone(queries), before: structuredClone(before), beforeDecision: await ports.documentState(view), review: structuredClone(view.aiReview) }
-}
-async function decisionInput(contents: WebContents, ports: AiDriverPorts, label: string) {
-  const before = await readView(contents), start = before.trace.at(-1)?.sequence ?? 0
-  await click(contents, ports, 'button', label)
-  const view = await readView(contents), clicks = view.trace.filter((t) => t.sequence > start && t.type === 'click' && t.target === `BUTTON:${label}`)
-  assert.equal(clicks.length, 1); assert.ok(clicks[0].trusted)
-  // click already enforces a stable, visible, enabled fixed-point hit before mouseDown.
-  const hover = ports.nativeClickWitness(label) as { point: { x: number; y: number }; matchCount: number; enabled: boolean; visible: boolean; hitMatches: boolean }
-  assert.ok(hover && hover.matchCount === 1 && hover.enabled && hover.visible && hover.hitMatches)
-  return { trusted: clicks[0].trusted, sequence: clicks[0].sequence, target: clicks[0].target, hitMatches: hover.hitMatches, point: hover.point, hover }
+  for (const q of queries) {
+    assert.ok(q.result.ok && sameWorldAiContext(q.request.context, context) && sameWorldAiContext(q.result.value.context, context))
+    assert.equal(q.result.value.kind, q.request.query.kind)
+    // The production recipe tool already advertises camera creation. A separate
+    // project query is optional, but any returned capability page must be valid.
+    if (q.result.value.kind === 'project') assert.ok(q.result.value.items.some((row) => row.kind === 'project' && row.id === context.projectId && row.capabilities?.includes('create-camera')), 'Invalid optional create-camera capability query')
+  }
+  const sceneRows = queries.filter((q) => q.result.ok && q.result.value.kind === 'scenes').flatMap((q) => q.result.ok ? q.result.value.items : [])
+  assert.ok(sceneRows.some((row) => row.kind === 'scene' && row.id === context.activeSceneId && row.isActive === true), 'Missing actual captured active scene query')
+  const creation = assertCameraCreation(before.snapshot, preview)
+  const manualDecisionInputs = view.trace.filter((event) => event.sequence > traceStart && event.type === 'click'
+    && (event.target === 'BUTTON:Apply Worlds proposal' || event.target === 'BUTTON:Reject Worlds proposal'))
+  assert.deepEqual(manualDecisionInputs, [], 'Direct auto-apply must not use a manual decision input')
+  assert.deepEqual(view.aiReview.manualControls, { apply: 0, reject: 0 }, 'Settled production UI exposed manual proposal decisions')
+  assert.equal(view.aiReview.applyEnabled, false); assert.equal(view.aiReview.rejectEnabled, false); assert.equal(view.aiReview.busy, false)
+  assert.deepEqual(view.aiReview.details, []); assert.deepEqual(view.aiReview.warnings, []); assert.equal(view.aiReview.status, 'Saved')
+  assert.equal(ports.applies().length, counts.applies + 1); const invocation = ports.applies()[counts.applies]
+  assert.ok(preview.result.ok && invocation.result?.ok && invocation.result.value.idempotent === false)
+  assert.equal(invocation.request.batch.origin, 'ai'); assert.deepEqual(invocation.request.batch, preview.result.value.batch)
+  assert.equal(canonicalWorldCommandBatchPayload(invocation.request.batch), canonicalWorldCommandBatchPayload(preview.result.value.batch))
+  assert.deepEqual(invocation.request.aiAuthority, { token: preview.result.value.authority, context })
+  assert.deepEqual(snapshot(view), creation.candidate); assert.deepEqual(invocation.result.value.snapshot, creation.candidate)
+  assert.deepEqual(invocation.result.value.inverse, preview.result.value.result.inverse)
+  const after = await ports.documentState(view)
+  assert.deepEqual(after.snapshot, creation.candidate); assert.equal(after.history.undo, before.history.undo + 1); assert.equal(after.history.redo, 0)
+  await ports.capture('ai-camera-auto-applied-canonical-candidate', view, contents)
+  return { view, creation, evidence: { context, thinking, request: structuredClone(responseReceipt.request), responseReceipt: structuredClone(responseReceipt),
+    queries: structuredClone(queries), preview: structuredClone(preview), before: structuredClone(before), after: structuredClone(after),
+    settledUi: structuredClone(view.aiReview), manualDecisionInputs: structuredClone(manualDecisionInputs), invocation: structuredClone(invocation), stored: await ports.stored(invocation) } }
 }
 function revised(snapshot: WorldProjectSnapshotV1, revision: number) { const result = structuredClone(snapshot); result.project.revision = revision; return result }
 
-/** TWO real future turns, no provider response/proposal substitution or mutation API escapes. */
+/** One real model turn, direct production auto-apply, and native history/reopen proof. */
 export async function runActualOllamaDriver(contents: WebContents, ports: AiDriverPorts): Promise<void> {
   budget(ports, 250, 'finite actual AI scenario'); owner(ports, contents)
   const initial = await readView(contents), before = await ports.documentState(initial), activeSceneId = initial.editor.activeSceneId, projectKey = initial.editor.projectKey
   assert.ok(activeSceneId && projectKey); assert.equal(before.snapshot.scenes.length, 2)
-  const eligible = before.snapshot.scenes.find((s) => s.sceneId === activeSceneId)!.entities.filter((e) => e.parentId === null && e.enabled && !e.locked && e.components.some((c) => c.type === 'renderable' && c.enabled && c.visible))
-  assert.ok(eligible.length > 0, 'Actual baseline has no editable root model')
-  const target = eligible[0], offset = ports.applies().length
+  const offset = ports.applies().length
   assert.equal(ports.receipts().chats.length, 0); assert.equal(ports.receipts().discoveries.length, 0)
   ports.stage('actual-model-discovery')
   await click(contents, ports, 'ai-toggle', 'Worlds AI')
@@ -213,38 +220,17 @@ export async function runActualOllamaDriver(contents: WebContents, ports: AiDriv
   await waitFor(contents, ports, (v) => v.aiReview.selectedModel === ports.reviewedModel.name && v.aiReview.modelOptions.length === 0, 'actual-selected-reviewed-model')
   await ports.pass('actual-model-discovery')
 
-  ports.stage('actual-ai-reject')
-  const first = await reviewTurn(contents, ports, `Query this active scene's entities and current components for entity ${target.id}. Propose only: create root group named AI review group with identity transform, reparent that root model under it, increase its LOCAL X by exactly 0.25 while preserving its other transform values. No other changes. Use create-entity group, reparent and complete transform patch recipes. I will review and Reject; never apply yourself.`, before, 0)
-  assertOrganization(before.snapshot, first.preview, target.id, activeSceneId)
-  const firstRows = first.queries.flatMap((q) => q.result.ok ? q.result.value.items : [])
-  assert.ok(firstRows.some((row) => row.kind === 'entity' && row.id === target.id))
-  assert.ok(firstRows.some((row) => row.kind === 'component' && row.entityId === target.id && row.type === 'renderable' && row.current))
-  const rejectedInput = await decisionInput(contents, ports, 'Reject Worlds proposal')
-  let view = await waitFor(contents, ports, (v) => !v.aiReview.applyEnabled && !v.aiReview.busy && ports.receipts().discards.length === 1, 'actual-human-Reject-discard', 5000)
-  assert.equal(ports.applies().length, offset); assert.deepEqual(await ports.documentState(view), before)
-  const rejected = { ...first, decision: { kind: 'reject', input: rejectedInput, discarded: structuredClone(ports.receipts().discards[0]), after: await ports.documentState(view) } }
-  await ports.capture('ai-1-rejected-document-unchanged', view, contents); await ports.pass('actual-ai-reject')
-
-  ports.stage('actual-ai-apply-and-history')
-  const second = await reviewTurn(contents, ports, 'Query project capabilities and resources (GLB mesh pages); use one SAME actually returned opaque GLB resource handle for both new models. Create ONE new scene named AI staging: one observed-model root at [0,0,0], box collider and dynamic body on that model, ONE camera at [0,1.5,5] rotation [-0.2,0,0], ONE ambient light intensity 0.8. Also add one observed-model root in the current active scene at [0,0,1.5]. Both models have rotation [0,0,0], scale [1,1,1]. Keep all existing scenes/entities/resources/start scene unchanged. Stay within 16 expanded commands. Propose only; I will explicitly Apply.', before, 1)
-  const rows = second.queries.flatMap((q) => q.result.ok ? q.result.value.items.filter((i): i is WorldAiResourceRow => i.kind === 'resource') : [])
-  assert.ok(second.queries.some((q) => q.result.ok && q.result.value.items.some((row) => row.kind === 'project' && row.capabilities && row.capabilities.length > 0)))
-  const sourceWitnesses = await ports.sourceWitnesses(second.preview, rows), creation = assertCreation(before.snapshot, second.preview, sourceWitnesses)
-  assert.equal(ports.applies().length, offset); assert.deepEqual(await ports.documentState(await readView(contents)), before)
-  const appliedInput = await decisionInput(contents, ports, 'Apply Worlds proposal')
-  view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready' && snapshot(v).project.revision === before.snapshot.project.revision + 1 && !v.aiReview.busy, 'actual-human-Apply-settled', 12000)
-  assert.equal(ports.applies().length, offset + 1); const invocation = ports.applies()[offset]
-  assert.ok(second.preview.result.ok && invocation.result?.ok && invocation.result.value.idempotent === false)
-  assert.equal(invocation.request.batch.origin, 'ai'); assert.deepEqual(invocation.request.batch, second.preview.result.value.batch)
-  assert.equal(canonicalWorldCommandBatchPayload(invocation.request.batch), canonicalWorldCommandBatchPayload(second.preview.result.value.batch))
-  assert.deepEqual(invocation.request.aiAuthority, { token: second.preview.result.value.authority, context: second.context })
-  assert.deepEqual(snapshot(view), creation.candidate); assert.deepEqual(invocation.result.value.inverse, second.preview.result.value.result.inverse)
-  const applied = { ...second, decision: { kind: 'apply', input: appliedInput, invocation: structuredClone(invocation), stored: await ports.stored(invocation) } }
-  await ports.capture('ai-2-applied-canonical-candidate', view, contents)
+  ports.stage('actual-ai-camera-auto-apply-and-history')
+  const turn = await autoApplyCameraTurn(contents, ports, before)
+  let view = turn.view
+  assert.equal(ports.applies().length, offset + 1)
+  await ports.admitNativeFocus(contents)
   await click(contents, ports, 'ai-toggle', 'Worlds AI')
+  await waitFor(contents, ports, (current) => !current.aiReview.expanded, 'actual-ai-drawer-closed-before-history')
   const historyEvents = []
-  for (const [index, kind, original] of [[0, 'Undo', before.snapshot], [1, 'Redo', creation.candidate]] as const) {
+  for (const [index, kind, original] of [[0, 'Undo', before.snapshot], [1, 'Redo', turn.creation.candidate]] as const) {
     const start = (await readView(contents)).trace.at(-1)?.sequence ?? 0
+    await ports.admitNativeFocus(contents)
     await click(contents, ports, 'button', kind)
     view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready' && snapshot(v).project.revision === before.snapshot.project.revision + 2 + index, `actual-ai-${kind}`, 12000)
     assert.equal(ports.applies().length, offset + 2 + index); const entry = ports.applies()[offset + 1 + index]
@@ -254,36 +240,48 @@ export async function runActualOllamaDriver(contents: WebContents, ports: AiDriv
     const hover = ports.nativeClickWitness(kind) as { point: { x: number; y: number }; matchCount: number; enabled: boolean; visible: boolean; hitMatches: boolean }
     assert.ok(hover && hover.matchCount === 1 && hover.enabled && hover.visible && hover.hitMatches)
     historyEvents.push({ kind, input: { trusted: events[0].trusted, sequence: events[0].sequence, target: events[0].target, hitMatches: hover.hitMatches, point: hover.point, hover }, result: structuredClone(entry.result), stored: await ports.stored(entry) })
-    await ports.capture(`ai-2-${kind.toLowerCase()}-exact-document`, await paint(contents, ports), contents)
+    await ports.capture(`ai-camera-${kind.toLowerCase()}-exact-document`, await paint(contents, ports), contents)
   }
-  await ports.pass('actual-ai-apply-and-history')
+  assert.deepEqual(snapshot(view), revised(turn.creation.candidate, before.snapshot.project.revision + 3), 'Redo changed the generated camera identity or values')
+  await ports.pass('actual-ai-camera-auto-apply-and-history')
 
-  ports.stage('actual-ai-both-scenes-reopen'); budget(ports, 25, 'fresh AI-target scenes')
+  ports.stage('actual-ai-camera-reopen'); budget(ports, 25, 'fresh AI camera')
   const durable = snapshot(view), oldBootId = view.bootId, auxiliaryKey = view.editor.projects.find((p) => p.projectKey !== projectKey)?.projectKey
   assert.ok(auxiliaryKey, 'Inherited authoring lane must provide the actual auxiliary project for explicit Open')
   contents = await ports.reopen(); owner(ports, contents)
   const fresh = await waitFor(contents, ports, (v) => v.bootId !== oldBootId && v.editor.lifecycle === 'ready' && !!v.canvas && !v.canvas.contextLost && v.canvas.frame > 1, 'actual-ai-fresh-renderer', 8000)
   ports.admitReopened(fresh)
+  await ports.admitNativeFocus(contents)
   if (fresh.editor.projectKey !== auxiliaryKey) {
     await selectValue(contents, ports, 'World project', auxiliaryKey); await click(contents, ports, 'button', 'Open selected World project')
     await waitFor(contents, ports, (v) => v.editor.projectKey === auxiliaryKey && v.editor.lifecycle === 'ready', 'actual-ai-open-auxiliary')
   }
+  await ports.admitNativeFocus(contents)
   await selectValue(contents, ports, 'World project', projectKey); await click(contents, ports, 'button', 'Open selected World project')
   await waitFor(contents, ports, (v) => v.editor.projectKey === projectKey && v.editor.lifecycle === 'ready', 'actual-ai-explicit-project-reopen')
-  const reopened = []
-  for (const [index, targetModel] of creation.models.entries()) {
-    await selectValue(contents, ports, 'Active scene', targetModel.sceneId)
-    view = await waitFor(contents, ports, (v) => v.editor.activeSceneId === targetModel.sceneId && !!v.canvas?.models.some((m) => m.entityId === targetModel.entityId && m.meshes > 0 && m.triangles > 0), `actual-ai-target-scene-${index + 1}`, 8000)
-    view = await paint(contents, ports); assert.deepEqual(snapshot(view), durable); assert.equal(ports.applies().length, offset + 3)
-    const captured = await ports.capture(`ai-3-fresh-target-scene-${index + 1}`, view, contents)
-    assertReopenedAuthoringVisual(captured.shot, view, targetModel.entityId)
-    const model = view.canvas!.models.find((m) => m.entityId === targetModel.entityId)!; const canonical = durable.scenes.find((s) => s.sceneId === targetModel.sceneId)!.entities.find((e) => e.id === targetModel.entityId)!
-    for (const field of ['position', 'rotation', 'scale'] as const) for (let axis = 0; axis < 3; axis++) assert.ok(Math.abs(model.transform[field][axis] - canonical.transform[field][axis]) <= 1e-7)
-    assert.deepEqual((await ports.documentState(view)).snapshot, durable)
-    reopened.push({ sceneId: targetModel.sceneId, oldBootId, bootId: view.bootId, snapshot: durable, canonicalDiskMatches: true, model, screenshot: captured.screenshot })
+  await ports.admitNativeFocus(contents)
+  await selectValue(contents, ports, 'Active scene', activeSceneId)
+  view = await waitFor(contents, ports, (current) => current.editor.activeSceneId === activeSceneId && current.editor.lifecycle === 'ready', 'actual-ai-camera-scene-reopen')
+  const selectionStart = view.trace.at(-1)?.sequence ?? 0
+  await ports.admitNativeFocus(contents)
+  await click(contents, ports, 'tree', turn.creation.camera.name)
+  view = await waitFor(contents, ports, (current) => current.selection.active === turn.creation.camera.id && current.inspectorName === turn.creation.camera.name, 'actual-ai-camera-inspector-reopen')
+  view = await paint(contents, ports); assert.deepEqual(snapshot(view), durable); assert.equal(ports.applies().length, offset + 3)
+  const selectionEvents = view.trace.filter((event) => event.sequence > selectionStart && event.type === 'click' && event.target === `SPAN:${turn.creation.camera.name}`)
+  assert.equal(selectionEvents.length, 1); assert.equal(selectionEvents[0].trusted, true)
+  const selectionHover = ports.nativeClickWitness(turn.creation.camera.name) as { point: { x: number; y: number }; matchCount: number; enabled: boolean; visible: boolean; hitMatches: boolean }
+  assert.ok(selectionHover && selectionHover.matchCount === 1 && selectionHover.enabled && selectionHover.visible && selectionHover.hitMatches)
+  const inspector = new Map(view.inspectorValues.map((field) => [field.label, field]))
+  for (const [label, expected] of [['Position:X', 0], ['Position:Y', 2], ['Position:Z', 5], ['Rotation:X', 0], ['Rotation:Y', 0], ['Rotation:Z', 0], ['Scale:X', 1], ['Scale:Y', 1], ['Scale:Z', 1], ['Camera:Near', 0.1], ['Camera:Far', 1000], ['Camera:Field of view', 60]] as const) {
+    const field = inspector.get(label); assert.ok(field, `Fresh camera Inspector missing ${label}`); assert.equal(field.disabled, false); assert.equal(Number(field.value), expected)
   }
-  await ports.pass('actual-ai-both-scenes-reopen')
+  const captured = await ports.capture('ai-camera-fresh-reopen-inspector', view, contents)
+  assert.deepEqual((await ports.documentState(view)).snapshot, durable)
+  const reopened = { sceneId: activeSceneId, entityId: turn.creation.camera.id, oldBootId, bootId: view.bootId, snapshot: durable, canonicalDiskMatches: true,
+    selectionActive: view.selection.active, inspectorName: view.inspectorName, inspectorValues: structuredClone(view.inspectorValues),
+    selectionInput: { trusted: selectionEvents[0].trusted, sequence: selectionEvents[0].sequence, target: selectionEvents[0].target, hitMatches: selectionHover.hitMatches, point: selectionHover.point, hover: selectionHover }, screenshot: captured.screenshot }
+  await ports.pass('actual-ai-camera-reopen')
   const receipts = ports.receipts(), aiCalls = ports.applies().filter((call) => call.request.batch.origin === 'ai')
-  ports.record('actualAi', { schema: 'modly.worlds-actual-ai-acceptance.v1', phase: 'complete', admittedModel: ports.reviewedModel, discovery: structuredClone(discovery), turns: [rejected, applied], sourceWitnesses, undo: historyEvents[0], redo: historyEvents[1], reopened,
+  ports.record('actualAi', { schema: 'modly.worlds-actual-ai-acceptance.v1', phase: 'complete', admittedModel: ports.reviewedModel, discovery: structuredClone(discovery), prompt: AI_CAMERA_PROMPT, turn: turn.evidence, undo: historyEvents[0], redo: historyEvents[1], reopened,
     counters: { discoveryRequests: receipts.discoveryRequests, discoveryResponses: receipts.discoveries.length, chatRequests: receipts.chatRequests, receivedChats: receipts.chats.length, validDecodedChats: receipts.chats.filter((c) => c.validation === 'accepted').length, validReturnedWorldProposals: receipts.chats.reduce((n, c) => n + parseWorldAiChatResponse(c.response).worldProposals.length, 0), hostPreviews: receipts.previews.length, hostDiscards: receipts.discards.length, aiApplies: aiCalls.length, aiSettledApplies: aiCalls.filter((c) => c.result?.ok && c.forwardedAt && c.settledAt).length, undo: historyEvents.filter((e) => e.kind === 'Undo').length, redo: historyEvents.filter((e) => e.kind === 'Redo').length } })
 }

@@ -34,9 +34,10 @@ export const REQUIRED_AUTHORING_GUARD_TEST_NAMES = Object.freeze([
   'NS3 rejects loading and wrong-revision numeric observations even without a pending marker',
   'NS4 keeps settled Inspector count disability and value errors outside the wait boundary',
   'AI1P local-AI paths materialize only from a canonical relocated repository root',
+  'AI1I Inspector number observation excludes nested units and uses the nearest production group heading',
   'P1 repository admissions bind relocated main and runner consumers before source reads or spawning',
 ])
-export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 303
+export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 304
 
 export function parseAuthoringGuardTapNames(stdout) {
   return [...stdout.matchAll(/^ok \d+ - (.+)$/gm)].map((match) => match[1])

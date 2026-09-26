@@ -6,7 +6,7 @@ import { worldEditorController } from '../../src/areas/worlds/editor/worldEditor
 import { useWorldsUiStore } from '../../src/areas/worlds/editor/worldsUiStore.ts'
 import { useAppStore } from '../../src/shared/stores/appStore.ts'
 import { useAgentStore } from '../../src/shared/stores/agentStore.ts'
-import { parseObservedOrbitEnabled, type AiReviewObservation, type AuthoringView, type CanvasInteractionHitKind, type CanvasInteractionPointObservation, type CanvasInteractionTargetsObservation, type CanvasObservation, type HandleCandidate, type ModelObservation, type NativePointerHit, type NativeTrace, type Point, type Rect, type WorldCornerObservation } from './shared.ts'
+import { normalizeWorldsModelControlLabel, parseObservedOrbitEnabled, worldInspectorNumberFieldLabel, type AiReviewObservation, type AuthoringView, type CanvasInteractionHitKind, type CanvasInteractionPointObservation, type CanvasInteractionTargetsObservation, type CanvasObservation, type HandleCandidate, type ModelObservation, type NativePointerHit, type NativeTrace, type Point, type Rect, type WorldCornerObservation } from './shared.ts'
 import { withPickerScratch } from './picker-scratch.ts'
 import './styles.css'
 
@@ -266,6 +266,8 @@ function observeAiReview(): AiReviewObservation {
   const picker = prompt?.parentElement?.querySelectorAll<HTMLButtonElement>(':scope > div.flex > div.flex > div.relative > button')
   const modelButton = picker?.length === 1 ? picker[0] : null
   const review = drawer?.querySelector('[aria-label="Worlds proposal review"]')
+  const applyControls = drawer?.querySelectorAll<HTMLButtonElement>('button[aria-label="Apply Worlds proposal"]') ?? []
+  const rejectControls = drawer?.querySelectorAll<HTMLButtonElement>('button[aria-label="Reject Worlds proposal"]') ?? []
   const enabled = (label: string) => {
     const matches = review?.querySelectorAll<HTMLButtonElement>(`button[aria-label="${label}"]`)
     return matches?.length === 1 && !matches[0].disabled
@@ -274,13 +276,15 @@ function observeAiReview(): AiReviewObservation {
     expanded: drawer?.querySelector('[aria-controls="worlds-ai-content"]')?.getAttribute('aria-expanded') === 'true',
     prompt: prompt?.value ?? null, promptDisabled: !prompt || prompt.disabled,
     sendEnabled: !!prompt?.value.trim() && !!prompt.parentElement?.querySelector<HTMLButtonElement>(':scope > div.flex > button') && !prompt.parentElement.querySelector<HTMLButtonElement>(':scope > div.flex > button')!.disabled,
-    selectedModel: modelButton?.textContent?.trim() ?? null,
-    modelOptions: [...(modelButton?.parentElement?.querySelectorAll(':scope > div > button > span') ?? [])].map((option) => option.textContent ?? ''),
-    busy: review?.getAttribute('aria-busy') === 'true', focused: review?.querySelector('h3') === document.activeElement,
-    status: review?.querySelector('[role="status"], [role="alert"]')?.textContent?.trim() ?? '',
+    selectedModel: normalizeWorldsModelControlLabel(modelButton?.textContent),
+    modelOptions: [...(modelButton?.parentElement?.querySelectorAll(':scope > div > button > span') ?? [])]
+      .map((option) => normalizeWorldsModelControlLabel(option.textContent)).filter((model): model is string => model !== null),
+    busy: drawer?.querySelector('#worlds-ai-content')?.getAttribute('aria-busy') === 'true', focused: review?.querySelector('h3') === document.activeElement,
+    status: drawer?.querySelector('[role="status"], [role="alert"]')?.textContent?.trim() ?? '',
     details: [...(review?.querySelectorAll('[aria-label="Proposed property changes"] > li') ?? [])].map((row) => ({ entityName: row.querySelector('strong')?.textContent ?? '', property: row.querySelector(':scope > span')?.textContent ?? '', before: row.querySelector('del')?.textContent ?? '', after: row.querySelector('ins')?.textContent ?? '' })),
     warnings: [...(review?.querySelectorAll('[aria-label="Proposal warnings"] > li') ?? [])].map((row) => row.textContent ?? ''),
     applyEnabled: enabled('Apply Worlds proposal'), rejectEnabled: enabled('Reject Worlds proposal'),
+    manualControls: { apply: applyControls.length, reject: rejectControls.length },
   }
 }
 function observe(): AuthoringView {
@@ -296,7 +300,7 @@ function observe(): AuthoringView {
     alerts: [...document.querySelectorAll('[role="alert"]')].map((element) => element.textContent?.trim() ?? ''),
     statuses: [...document.querySelectorAll('[role="status"]')].map((element) => element.textContent?.trim() ?? ''),
     inspectorName: inspector?.querySelector('.worlds-dock-header small')?.textContent ?? null,
-    inspectorValues: [...(inspector?.querySelectorAll<HTMLInputElement>('input[type="number"]') ?? [])].map((input) => ({ label: `${input.closest('fieldset')?.querySelector('legend')?.textContent?.trim() ?? ''}:${input.closest('label')?.querySelector('span')?.textContent ?? ''}`, value: input.value, disabled: input.matches(':disabled') })),
+    inspectorValues: [...(inspector?.querySelectorAll<HTMLInputElement>('input[type="number"]') ?? [])].map((input) => ({ label: worldInspectorNumberFieldLabel(input), value: input.value, disabled: input.matches(':disabled') })),
     assetButtons: [...document.querySelectorAll('[aria-label="Assets library"] button.worlds-asset-add')].map((button) => button.getAttribute('aria-label') ?? ''),
     selectValues: [...document.querySelectorAll<HTMLSelectElement>('select[aria-label]')].map((select) => ({ label: select.getAttribute('aria-label') ?? '', value: select.value })),
     viewport: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight },

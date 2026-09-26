@@ -42,7 +42,7 @@ interface BuildManifest {
 }
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 const now = () => new Date().toISOString()
-const reviewedRepositoryHead = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61'
+const reviewedRepositoryHead = '416fcfa079aa3e569e8dd460c64c7462fac7850b'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 const sourceRepositoryRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
 const bundle = realpathSync(__dirname)
@@ -159,7 +159,7 @@ const report: Record<string, unknown> = {
   checks, applies, storedWitnesses, ipcTrace, network, errors, cleanup, seedRecords, evidence, build,
   requestedWebPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
 }
-if (localAi) report.localAi = { status: 'NOT_RUN', scope: 'finite-two-chat-real-Ollama-native-authoring', config: localAi, reviewedAiModel,
+if (localAi) report.localAi = { status: 'NOT_RUN', scope: 'single-chat-real-Ollama-camera-auto-apply-native-authoring', config: localAi, reviewedAiModel,
   networkScope: 'owned session and narrow host proxy ONLY; not a global Python/Ollama network sandbox', modelSelection: 'component-local native picker; NEVER fixture/global default setter' }
 const reportPath = path.join(runDirectory, 'fixture-report.json')
 const persist = () => writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 })
@@ -209,17 +209,37 @@ function disposeOwnedLifecycleListeners(): void {
   app.removeListener('window-all-closed', onOwnedWindowsClosed)
   recordLifecycle('owned-lifecycle-listeners-disposed')
 }
-function guard(): void {
+// Passive observations need a live exact owner, not continuous desktop focus.
+function guard(contents?: Electron.WebContents): void {
   if (firstFailure) throw firstFailure
   if (stopping) throw new Error('Fixture is stopping')
+  if (contents) assert.ok(currentWindow, 'Owned fixture window missing')
   if (currentWindow) {
     assert.equal(currentWindow.isDestroyed(), false, 'Owned fixture window lost')
-    assert.equal(BrowserWindow.getAllWindows().length, 1, 'Unexpected window ownership')
-    assert.equal(currentWindow.isFocused(), true, 'Native input is permitted only in the owned focused window')
+    const windows = BrowserWindow.getAllWindows()
+    assert.equal(windows.length, 1, 'Unexpected window ownership')
+    assert.equal(windows[0], currentWindow, 'Unexpected owned window identity')
+    assert.equal(currentWindow.webContents.isDestroyed(), false, 'Owned fixture renderer lost')
+    if (contents) assert.equal(contents, currentWindow.webContents, 'Owned fixture renderer replaced')
   }
 }
+function inputGuard(contents: Electron.WebContents): void {
+  guard(contents); assert.ok(currentWindow)
+  assert.equal(currentWindow.isFocused(), true, 'Native input is permitted only in the owned focused window')
+}
 function assertCurrentAiContents(contents: Electron.WebContents): void {
-  guard(); assert.ok(currentWindow); assert.equal(contents, currentWindow.webContents); assert.equal(contents.isDestroyed(), false)
+  guard(contents); assert.ok(currentWindow); assert.equal(contents, currentWindow.webContents); assert.equal(contents.isDestroyed(), false)
+}
+async function admitNativeFocus(contents: Electron.WebContents): Promise<void> {
+  // Observe genuine focus only; never steal the desktop after asynchronous work.
+  guard(contents); const window = currentWindow!
+  const admission = await waitForOwnedWindowFocus(window, {
+    deadline: Math.min(Date.now() + 8000, mainDeadline - (localAi?.cleanupSeconds ?? 0) * 1000), signal: focusAdmissionAbort.signal,
+    assertOwned() { guard(contents); assert.equal(currentWindow, window, 'Owned fixture window replaced during native focus admission') },
+  })
+  inputGuard(contents)
+  const admissions = (evidence.nativeInputFocusAdmissions ??= []) as unknown[]
+  admissions.push({ ...admission, webContentsId: contents.id })
 }
 const mainDeadline = Date.now() + (localAi?.mainWatchdogSeconds ?? 120) * 1000
 const watchdog = setTimeout(() => fail(new Error(`Native authoring main exceeded its ${localAi?.mainWatchdogSeconds ?? 120} second internal deadline`)), (localAi?.mainWatchdogSeconds ?? 120) * 1000)
@@ -342,16 +362,13 @@ const aiPreviews: AiPreviewCapture[] = [], aiDiscards: AiDiscardCapture[] = []
 function captureAiProjectRead(channel: string, args: unknown[], result: unknown): void {
   assert.equal(args.length, 1)
   if (channel === WORLD_PROJECT_CHANNELS.previewAi) {
-    assert.ok(aiPreviews.length < 2, 'Exactly two actual host previews admitted')
+    assert.equal(aiPreviews.length, 0, 'Exactly one actual host preview admitted')
     const captured = { at: now(), request: structuredClone(args[0]), result: structuredClone(result) } as AiPreviewCapture
     const chat = aiChats.find((item) => item.validation === 'accepted' && item.request && sameWorldAiContext(item.request.worldContext, captured.request.proposal.context))
     assert.ok(chat && parseWorldAiChatResponse(chat.response).worldProposals.some((proposal) => JSON.stringify(proposal) === JSON.stringify(captured.request.proposal)), 'Preview must originate in an actual returned same-turn proposal')
     aiPreviews.push(captured)
   } else {
-    assert.equal(aiDiscards.length, 0, 'Exactly one human Reject discard admitted')
-    const captured = { at: now(), request: structuredClone(args[0]), result: structuredClone(result) } as AiDiscardCapture
-    assert.ok(aiPreviews.some((item) => item.result.ok && item.result.value.authority === captured.request.authority && sameWorldAiContext(item.request.proposal.context, captured.request.context)))
-    aiDiscards.push(captured)
+    throw new Error('Manual AI discard is forbidden in the direct auto-apply acceptance lane')
   }
 }
 let discoveredModels = new Map<string, string>(), queryBytes = 0, queryRequests = 0, modelRequests = 0, chatRequests = 0
@@ -673,7 +690,7 @@ async function captureStoredWitness(entry: Invocation): Promise<void> {
   storedWitnesses.push({ projectKey, transaction: structuredClone(transaction), filename, capturedAt: now(), bytes: bytes.length, sha256: hash(bytes) })
 }
 async function checkpoint(stage: string, view: AuthoringView, contents: Electron.WebContents) {
-  guard(); assert.match(stage, /^[a-z0-9-]+$/)
+  guard(contents); assert.match(stage, /^[a-z0-9-]+$/)
   const fresh = new WorldProjectRepository({ getWorkspaceRoot: () => workspace })
   const projectKey = view.editor.projectKey
   assert.ok(projectKey, 'Checkpoint requires an actual UI/controller project key')
@@ -709,7 +726,7 @@ async function checkpoint(stage: string, view: AuthoringView, contents: Electron
   }
   assert.deepEqual(ledger.transactions, [...initialLedger.transactions, ...witnessedTransactions].slice(-WORLD_PROJECT_TRANSACTION_LEDGER_LIMIT), 'Durable ledger must equal the exact ordered retained suffix')
   evidence.canonicalApplyCounts = { totalIpcApplies: applies.length, projectKey, successfulProjectApplies: successful.length, retainedProjectTransactions: ledger.transactions.length }
-  const image = await contents.capturePage()
+  guard(contents); const image = await contents.capturePage()
   const size = image.getSize(), pixels = image.toBitmap(), png = image.toPNG()
   assert.equal(pixels.length, size.width * size.height * 4)
   assert.equal(size.width, view.viewport.width, 'Native screenshot pixel coordinates must equal actual CSS coordinates')
@@ -839,7 +856,7 @@ async function run(): Promise<void> {
   currentStage = 'positive-canvas-admission'
   const contents = await openWindow()
   const ports: Omit<DriverPorts, 'seed'> = {
-    guard, applies: () => applies, arm, held: () => gate?.state === 'held', abort: abortGate,
+    guard, inputGuard, applies: () => applies, arm, held: () => gate?.state === 'held', abort: abortGate,
     release: () => { assert.equal(gate?.state, 'held'); gate!.state = 'released'; evidence.gateReleasedAt = now(); gate!.continue(true) },
     checkpoint, reopen: openWindow,
     stage: (name) => { currentStage = name },
@@ -850,7 +867,7 @@ async function run(): Promise<void> {
     },
   }
   const aiPorts: AiDriverPorts = {
-    ...ports, config: localAi!, reviewedModel: reviewedAiModel!, deadline: mainDeadline,
+    ...ports, config: localAi!, reviewedModel: reviewedAiModel!, deadline: mainDeadline, admitNativeFocus,
     currentContents: () => { assert.ok(currentWindow); return currentWindow.webContents },
     receipts: () => ({ discoveries: aiDiscoveries, chats: aiChats, queries: aiQueries, previews: aiPreviews, discards: aiDiscards, discoveryRequests: modelRequests, chatRequests }),
     nativeClickWitness: (label) => structuredClone(evidence[`native-click-hover-${label}`]),
@@ -935,7 +952,7 @@ async function run(): Promise<void> {
     assertCurrentAiContents(currentWindow.webContents)
     await runActualOllamaDriver(currentWindow.webContents, aiPorts)
     Object.assign(report.localAi as Record<string, unknown>, { status: 'PASS' })
-    Object.assign(evidence.actualApi as Record<string, unknown>, { aiInteraction: 'ACTUAL_TWO_CHAT_SOURCE_SCENARIO_COMPLETE' })
+    Object.assign(evidence.actualApi as Record<string, unknown>, { aiInteraction: 'ACTUAL_SINGLE_CHAT_CAMERA_AUTO_APPLY_COMPLETE' })
   }
   guard(); verifySources()
   if (!inheritedDisplay) assert.equal(applies.length, 4)

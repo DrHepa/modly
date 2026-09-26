@@ -8,7 +8,7 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { captureOwnedDisplayResources, waitForDisplayResourcesAbsent } from './display-resources.mjs'
 
-const reviewedRepositoryHead = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61'
+const reviewedRepositoryHead = '416fcfa079aa3e569e8dd460c64c7462fac7850b'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 
 export function validateRunnerRepositoryAdmission(build) {
@@ -88,9 +88,11 @@ export function inheritedDisplayEnvironment(environment, runDirectory, buildSha2
 /** Evidence policy only. Synthetic guard controls never establish that a native run occurred. */
 export function assertActualAiTerminal(result) {
   const a = result.evidence?.actualAi
+  const expectedPrompt = 'Add one perspective camera named AI Probe Camera to the current scene at position [0, 2, 5], with field of view 60, no rotation and scale [1, 1, 1]. Put it at the scene root and change nothing else.'
+  const expectedModel = { name: 'qwen3.6:27b', digest: 'sha256:a50eda8ed977ab48a12431878896b27ffd5cef552c17af3317d9623b939a7f1e', toolsReviewed: true }
   assert.equal(a?.schema, 'modly.worlds-actual-ai-acceptance.v1', 'Actual AI acceptance schema missing')
   assert.equal(a.phase, 'complete', 'Actual AI acceptance phase incomplete')
-  for (const name of ['actual-model-discovery', 'actual-ai-reject', 'actual-ai-apply-and-history', 'actual-ai-both-scenes-reopen']) assert.equal(result.checks.filter((check) => check.name === name && check.status === 'PASS').length, 1, `Actual AI check missing: ${name}`)
+  for (const name of ['actual-model-discovery', 'actual-ai-camera-auto-apply-and-history', 'actual-ai-camera-reopen']) assert.equal(result.checks.filter((check) => check.name === name && check.status === 'PASS').length, 1, `Actual AI check missing: ${name}`)
   const stable = (value) => JSON.stringify((function sort(v) { return Array.isArray(v) ? v.map(sort) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().filter((key) => v[key] !== undefined).map((key) => [key, sort(v[key])])) : v })(value))
   const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
   const same = (value, other, label) => assert.deepEqual(value, other, `Actual AI ${label}`)
@@ -100,139 +102,137 @@ export function assertActualAiTerminal(result) {
     for (const field of ['projectId', 'activeSceneId', 'originSessionId', 'requestId']) assert.ok(typeof c[field] === 'string' && c[field].length > 0)
     for (const field of ['baseRevision', 'editorEpoch']) assert.ok(Number.isSafeInteger(c[field]) && c[field] >= 0)
   }
-  const raw = (r) => {
-    assert.equal(r?.status, 200, 'Actual AI HTTP success required'); assert.equal(r.validation, 'accepted', 'Actual AI decode not accepted')
-    assert.ok(typeof r.rawResponseBase64 === 'string'); const bytes = Buffer.from(r.rawResponseBase64, 'base64')
-    assert.equal(bytes.toString('base64'), r.rawResponseBase64); assert.ok(bytes.length > 0 && bytes.length <= 65536)
-    assert.equal(r.responseBytes, bytes.length); assert.equal(r.responseSha256, digest(bytes))
-    same(JSON.parse(bytes.toString('utf8')), r.response, 'received bytes/decoded response mismatch')
-    return r.response
+  const raw = (receipt) => {
+    assert.equal(receipt?.status, 200, 'Actual AI HTTP success required'); assert.equal(receipt.validation, 'accepted', 'Actual AI decode not accepted')
+    assert.ok(typeof receipt.rawResponseBase64 === 'string'); const bytes = Buffer.from(receipt.rawResponseBase64, 'base64')
+    assert.equal(bytes.toString('base64'), receipt.rawResponseBase64); assert.ok(bytes.length > 0 && bytes.length <= 65536)
+    assert.equal(receipt.responseBytes, bytes.length); assert.equal(receipt.responseSha256, digest(bytes))
+    same(JSON.parse(bytes.toString('utf8')), receipt.response, 'received bytes/decoded response mismatch')
+    return receipt.response
   }
-  const input = (i, label) => {
-    assert.equal(i?.trusted, true, 'Actual AI decision was not trusted native input')
-    assert.ok(Number.isSafeInteger(i.sequence) && i.sequence > 0); assert.equal(i.hitMatches, true)
-    assert.equal(i.target, `BUTTON:${label}`)
-    assert.ok(i.hover?.matchCount === 1 && i.hover.enabled === true && i.hover.visible === true && i.hover.hitMatches === true, 'Actual native fixed-point hover witness missing')
-    same(i.point, i.hover.point, 'Native input point changed after hover')
-    assert.ok(Number.isFinite(i.point.x) && Number.isFinite(i.point.y))
+  const nativeButtonInput = (input, label) => {
+    assert.equal(input?.trusted, true, 'Actual AI history input was not trusted native input')
+    assert.ok(Number.isSafeInteger(input.sequence) && input.sequence > 0); assert.equal(input.hitMatches, true)
+    assert.equal(input.target, `BUTTON:${label}`)
+    assert.ok(input.hover?.matchCount === 1 && input.hover.enabled === true && input.hover.visible === true && input.hover.hitMatches === true, 'Actual native fixed-point hover witness missing')
+    same(input.point, input.hover.point, 'Native input point changed after hover')
+    assert.ok(Number.isFinite(input.point.x) && Number.isFinite(input.point.y))
   }
-  const propertyLabel = (property) => {
-    const field = property.split('.').at(-1) ?? property
-    return ({ parentId: 'Parent', baseColor: 'Color', bodyType: 'Body', lightKind: 'Light', halfExtents: 'Size', halfHeight: 'Height', fieldOfView: 'FOV', orthographicSize: 'Size', castShadow: 'Shadow', receiveShadow: 'Receive', collisionLayer: 'Layer', collisionMask: 'Mask' })[field] ?? field.charAt(0).toUpperCase() + field.slice(1).replace(/([a-z])([A-Z])/g, '$1 $2')
+  const state = (value) => {
+    assert.ok(value?.snapshot?.project && Array.isArray(value.snapshot.scenes))
+    assert.ok(Number.isSafeInteger(value.history?.undo) && Number.isSafeInteger(value.history?.redo))
+    assert.ok(Array.isArray(value.documents) && value.documents.length > 0)
+    for (const document of value.documents) { assert.ok(typeof document.path === 'string' && !document.path.startsWith('/') && !document.path.split('/').includes('..')); assert.match(document.sha256, /^[a-f0-9]{64}$/); assert.ok(Number.isSafeInteger(document.bytes) && document.bytes > 0) }
   }
-  const state = (s) => {
-    assert.ok(s?.snapshot?.project && Array.isArray(s.snapshot.scenes))
-    assert.ok(Number.isSafeInteger(s.history?.undo) && Number.isSafeInteger(s.history?.redo))
-    assert.ok(Array.isArray(s.documents) && s.documents.length > 0)
-    for (const d of s.documents) { assert.ok(typeof d.path === 'string' && !d.path.startsWith('/') && !d.path.split('/').includes('..')); assert.match(d.sha256, /^[a-f0-9]{64}$/); assert.ok(Number.isSafeInteger(d.bytes) && d.bytes > 0) }
-  }
-  assert.equal(a.admittedModel?.toolsReviewed, true, 'Explicit reviewed tool-capable identity required')
-  assert.ok(typeof a.admittedModel.name === 'string' && a.admittedModel.name.length > 0)
-  assert.match(a.admittedModel.digest, /^sha256:[a-f0-9]{64}$/)
+  same(a.admittedModel, expectedModel, 'reviewed model identity changed')
   const discovery = raw(a.discovery)
-  assert.equal(discovery.models.filter((model) => model.name === a.admittedModel.name && model.digest === a.admittedModel.digest).length, 1, 'Actual discovery does not contain the exact reviewed identity')
-  same(a.counters, { discoveryRequests: 1, discoveryResponses: 1, chatRequests: 2, receivedChats: 2, validDecodedChats: 2, validReturnedWorldProposals: 2, hostPreviews: 2, hostDiscards: 1, aiApplies: 1, aiSettledApplies: 1, undo: 1, redo: 1 }, 'finite counters mismatch')
-  assert.ok(Array.isArray(a.turns) && a.turns.length === 2, 'Actual AI requires exactly two turns')
-  for (const [index, t] of a.turns.entries()) {
-    context(t.context); same(t.request.worldContext, t.context, 'captured request context changed'); assert.equal(t.request.model, a.admittedModel.name)
-    same(t.responseReceipt.request, t.request, 'HTTP receipt request correlation changed')
-    same(t.responseReceipt.admittedSelection, { name: a.admittedModel.name, digest: a.admittedModel.digest }, 'HTTP receipt admitted identity changed')
-    const body = raw(t.responseReceipt); same(body.actions, [], 'generic actions forbidden'); same(body.proposals, [], 'generic proposals forbidden')
-    assert.equal(body.worldProposals.length, 1, 'Actual AI proposal missing')
-    const p = body.worldProposals[0]; same(p.context, t.context, 'returned proposal context changed')
-    assert.equal(p.type, 'world_command_proposal'); assert.ok(p.commands.length > 0 && p.commands.length <= 16)
-    assert.ok(Array.isArray(t.queries) && t.queries.length > 0)
-    for (const q of t.queries) { same(q.request.context, t.context, 'query request context changed'); assert.equal(q.result.ok, true, 'Actual query failed'); same(q.result.value.context, t.context, 'query result context changed'); assert.equal(q.result.value.kind, q.request.query.kind) }
-    for (const kind of index === 0 ? ['entities', 'components'] : ['project', 'resources']) assert.ok(t.queries.some((q) => q.result.value.kind === kind && q.result.value.items.length > 0), `Actual successful ${kind} query required`)
-    same(t.preview.request.proposal, p, 'preview is not the actual returned proposal'); assert.equal(t.preview.result.ok, true)
-    const preview = t.preview.result.value; assert.match(preview.authority, /^apply_[a-f0-9]{48}$/)
-    assert.equal(preview.batch.origin, 'ai'); assert.equal(preview.batch.projectId, t.context.projectId); assert.equal(preview.batch.baseRevision, t.context.baseRevision)
-    assert.ok(preview.batch.commands.length > 0 && preview.batch.commands.length <= 16 && Buffer.byteLength(stable(preview.batch)) <= 16384)
-    state(t.before); state(t.beforeDecision); same(t.beforeDecision, t.before, 'document/history/disk changed before human decision')
-    assert.equal(t.before.snapshot.project.revision, t.context.baseRevision)
-    same(preview.result.inverse, { kind: 'world-snapshot', snapshot: t.before.snapshot }, 'preview inverse changed')
-    assert.equal(preview.result.snapshot.project.revision, t.context.baseRevision + 1)
-    assert.ok(preview.details.length > 0); same(t.review.details, preview.details.map(({ entityName, property, before, after }) => ({ entityName, property: propertyLabel(property), before, after })), 'complete ordered visible NET changed')
-    same(preview.result.warnings, [], 'host warnings require explicit policy'); same(t.review.warnings, [], 'visible warnings require explicit policy')
-    assert.equal(t.review.busy, false); assert.equal(t.review.focused, true); assert.equal(t.review.applyEnabled, true); assert.equal(t.review.rejectEnabled, true)
+  assert.equal(discovery.models.filter((model) => model.name === expectedModel.name && model.digest === expectedModel.digest).length, 1, 'Actual discovery does not contain the exact reviewed identity')
+  assert.equal(a.prompt, expectedPrompt, 'Actual AI camera prompt changed')
+  same(a.counters, { discoveryRequests: 1, discoveryResponses: 1, chatRequests: 1, receivedChats: 1, validDecodedChats: 1, validReturnedWorldProposals: 1, hostPreviews: 1, hostDiscards: 0, aiApplies: 1, aiSettledApplies: 1, undo: 1, redo: 1 }, 'finite counters mismatch')
+  assert.equal(Object.hasOwn(a, 'turns'), false, 'Obsolete multi-turn evidence is forbidden')
+  assert.equal(Object.hasOwn(a, 'sourceWitnesses'), false, 'Camera acceptance must not fabricate model-source witnesses')
+  const turn = a.turn
+  context(turn?.context); same(turn.request?.worldContext, turn.context, 'captured request context changed')
+  assert.equal(turn.request.model, expectedModel.name); assert.equal(turn.request.ollama_url, 'http://127.0.0.1:11434'); assert.equal(turn.request.thinking, 'off')
+  assert.equal(turn.request.originSessionId, turn.context.originSessionId); same(turn.request.context, {}, 'legacy prompt context must remain empty')
+  same(turn.request.messages, [{ role: 'user', content: expectedPrompt }], 'exact user request changed')
+  assert.equal(Object.hasOwn(turn.request, 'provider'), false); assert.equal(Object.hasOwn(turn.request, 'openaiModel'), false)
+  same(turn.responseReceipt.request, turn.request, 'HTTP receipt request correlation changed')
+  same(turn.responseReceipt.admittedSelection, { name: expectedModel.name, digest: expectedModel.digest }, 'HTTP receipt admitted identity changed')
+  const body = raw(turn.responseReceipt); same(body.actions, [], 'generic actions forbidden'); same(body.proposals, [], 'generic proposals forbidden')
+  assert.equal(body.worldProposals.length, 1, 'Actual AI proposal missing')
+  const proposal = body.worldProposals[0]; same(proposal.context, turn.context, 'returned proposal context changed')
+  assert.equal(proposal.type, 'world_command_proposal')
+  assert.equal(proposal.commands.length, 1, 'Actual response must contain exactly one parsed recipe')
+  const recipe = proposal.commands[0]
+  assert.equal(recipe.type, 'create-entity'); assert.equal(recipe.kind, 'camera')
+  assert.ok(typeof recipe.localRef === 'string' && recipe.localRef.length > 0, 'Parsed camera local identity missing')
+  same(recipe.sceneRef, { kind: 'existing', id: turn.context.activeSceneId }, 'camera recipe does not target the captured active scene')
+  assert.ok(recipe.parentRef === undefined || recipe.parentRef === null, 'camera recipe is not rooted')
+  assert.equal(recipe.name, 'AI Probe Camera'); same(recipe.transform, { position: [0, 2, 5], rotation: [0, 0, 0], scale: [1, 1, 1] }, 'requested camera transform changed')
+  const cameraOptions = recipe.camera ?? {}
+  assert.ok(cameraOptions && typeof cameraOptions === 'object' && !Array.isArray(cameraOptions), 'Parsed camera options are invalid')
+  same({ projection: cameraOptions.projection ?? 'perspective', near: cameraOptions.near ?? 0.1, far: cameraOptions.far ?? 1000,
+    fieldOfView: cameraOptions.fieldOfView ?? 60 }, { projection: 'perspective', near: 0.1, far: 1000, fieldOfView: 60 }, 'requested camera options changed')
+  assert.equal(cameraOptions.orthographicSize, undefined, 'Perspective camera carried an orthographic option')
+  assert.ok(Array.isArray(turn.queries) && turn.queries.length >= 1)
+  for (const query of turn.queries) {
+    same(query.request.context, turn.context, 'query request context changed'); assert.equal(query.result.ok, true, 'Actual query failed')
+    same(query.result.value.context, turn.context, 'query result context changed'); assert.equal(query.result.value.kind, query.request.query.kind)
+    // Camera creation is advertised by the production recipe tool; validate a
+    // project capability query if present without prescribing an extra round.
+    if (query.result.value.kind === 'project') assert.ok(query.result.value.items.some((row) => row.kind === 'project' && row.id === turn.context.projectId && Array.isArray(row.capabilities) && row.capabilities.includes('create-camera')), 'Invalid optional create-camera capability query')
   }
-  const [rejected, applied] = a.turns
-  assert.notEqual(rejected.context.requestId, applied.context.requestId); const shared = { ...rejected.context, requestId: applied.context.requestId }; same(shared, applied.context, 'turns changed editor/project/revision/session')
-  assert.equal(rejected.decision.kind, 'reject'); input(rejected.decision.input, 'Reject Worlds proposal')
-  same(rejected.decision.after, rejected.before, 'Reject changed canonical document/history/disk')
-  same(rejected.decision.discarded.request, { context: rejected.context, authority: rejected.preview.result.value.authority }, 'Reject capability/context mismatch')
-  assert.equal(rejected.decision.discarded.result.ok, true); assert.equal(rejected.decision.discarded.result.value.discarded, true)
-  assert.notEqual(stable(rejected.preview.result.value.result.snapshot), stable(rejected.before.snapshot), 'Rejected proposal must be non-no-op')
-  const organized = rejected.preview.result.value.result.snapshot, originalScene = rejected.before.snapshot.scenes.find((s) => s.sceneId === rejected.context.activeSceneId), organizedScene = organized.scenes.find((s) => s.sceneId === rejected.context.activeSceneId)
-  const groups = organizedScene.entities.filter((e) => !originalScene.entities.some((old) => old.id === e.id)); assert.equal(groups.length, 1)
-  const group = groups[0]; assert.equal(group.name, 'AI review group'); assert.equal(group.parentId, null); same(group.components, [], 'Group must not contain Renderable/components')
-  same(group.transform, { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, 'Group identity transform changed')
-  const moved = organizedScene.entities.filter((e) => e.parentId === group.id); assert.equal(moved.length, 1)
-  const expectedOrganization = structuredClone(rejected.before.snapshot); expectedOrganization.project.revision++
-  const expectedScene = expectedOrganization.scenes.find((s) => s.sceneId === rejected.context.activeSceneId), target = expectedScene.entities.find((e) => e.id === moved[0].id)
-  assert.ok(target && target.parentId === null && target.components.some((c) => c.type === 'renderable' && c.enabled))
-  target.parentId = group.id; target.transform.position[0] += 0.25; expectedScene.entities.push(structuredClone(group)); same(organized, expectedOrganization, 'Organization modified unrelated canonical owners')
-  const firstRows = rejected.queries.flatMap((q) => q.result.value.items)
-  assert.ok(firstRows.some((r) => r.kind === 'entity' && r.id === target.id), 'Actual selected model entity query missing')
-  assert.ok(firstRows.some((r) => r.kind === 'component' && r.entityId === target.id && r.type === 'renderable' && r.current && typeof r.current === 'object'), 'Actual selected model current components missing')
-  assert.ok(applied.queries.flatMap((q) => q.result.value.items).some((r) => r.kind === 'project' && Array.isArray(r.capabilities) && r.capabilities.length > 0), 'Actual project capability query missing')
-  same(applied.before, rejected.before, 'Reject changed next-turn base state')
-  const pv = applied.preview.result.value, decision = applied.decision, call = decision.invocation
-  assert.equal(decision.kind, 'apply'); input(decision.input, 'Apply Worlds proposal'); assert.ok(decision.input.sequence > rejected.decision.input.sequence)
-  assert.equal(call.request.projectKey, applied.context.projectKey); same(call.request.batch, pv.batch, 'Apply payload differs from exact host preview')
-  same(call.request.aiAuthority, { token: pv.authority, context: applied.context }, 'Apply capability/context changed')
+  const sceneRows = turn.queries.filter((query) => query.result.value.kind === 'scenes').flatMap((query) => query.result.value.items)
+  assert.ok(sceneRows.some((row) => row.kind === 'scene' && row.id === turn.context.activeSceneId && row.isActive === true), 'Actual captured active scene query missing')
+  same(turn.preview.request.proposal, proposal, 'preview is not the actual returned proposal'); assert.equal(turn.preview.result.ok, true)
+  const preview = turn.preview.result.value
+  assert.match(preview.authority, /^apply_[a-f0-9]{48}$/); assert.equal(preview.batch.origin, 'ai')
+  assert.equal(preview.batch.projectId, turn.context.projectId); assert.equal(preview.batch.baseRevision, turn.context.baseRevision)
+  assert.equal(preview.batch.commands.length, 1); assert.ok(Buffer.byteLength(stable(preview.batch)) <= 16384)
+  state(turn.before); state(turn.after); assert.equal(turn.before.snapshot.project.revision, turn.context.baseRevision)
+  assert.equal(turn.after.history.undo, turn.before.history.undo + 1); assert.equal(turn.after.history.redo, 0)
+  same(preview.result.inverse, { kind: 'world-snapshot', snapshot: turn.before.snapshot }, 'preview inverse changed')
+  assert.equal(preview.result.snapshot.project.revision, turn.context.baseRevision + 1); assert.ok(preview.details.length > 0)
+  same(preview.result.warnings, [], 'host warnings require explicit policy')
+  assert.equal(turn.settledUi?.expanded, true); assert.equal(turn.settledUi.busy, false); assert.equal(turn.settledUi.status, 'Saved')
+  same(turn.settledUi.manualControls, { apply: 0, reject: 0 }, 'manual proposal controls became visible')
+  assert.equal(turn.settledUi.applyEnabled, false); assert.equal(turn.settledUi.rejectEnabled, false)
+  same(turn.settledUi.details, [], 'manual review details became visible'); same(turn.settledUi.warnings, [], 'manual review warnings became visible')
+  same(turn.manualDecisionInputs, [], 'manual Apply/Reject input is forbidden')
+  const before = turn.before.snapshot, candidate = preview.result.snapshot
+  const beforeEntityIds = new Set(before.scenes.flatMap((scene) => scene.entities.map((entity) => entity.id)))
+  const added = candidate.scenes.flatMap((scene) => scene.entities.filter((entity) => !beforeEntityIds.has(entity.id)).map((entity) => ({ sceneId: scene.sceneId, entity })))
+  assert.equal(added.length, 1, 'Canonical candidate must add exactly one entity')
+  assert.equal(added[0].sceneId, turn.context.activeSceneId)
+  const camera = added[0].entity
+  assert.ok(typeof camera.id === 'string' && camera.id.length > 0 && camera.id.length <= 256)
+  assert.equal(camera.name, 'AI Probe Camera'); assert.equal(camera.parentId, null); assert.equal(camera.enabled, true); assert.equal(camera.locked, false); same(camera.tags, [], 'camera tags changed')
+  same(camera.transform, { position: [0, 2, 5], rotation: [0, 0, 0], scale: [1, 1, 1] }, 'camera transform changed')
+  assert.equal(camera.components.length, 1, 'Camera entity contains unrelated components')
+  const component = camera.components[0], activeBefore = before.scenes.find((scene) => scene.sceneId === turn.context.activeSceneId)
+  const expectedPrimary = !activeBefore.entities.some((entity) => entity.components.some((value) => value.type === 'camera' && value.primary))
+  assert.ok(typeof component.id === 'string' && component.id.length > 0 && component.id.length <= 256 && component.id !== camera.id)
+  same(component, { id: component.id, type: 'camera', enabled: true, projection: 'perspective', primary: expectedPrimary, near: 0.1, far: 1000, fieldOfView: 60 }, 'camera component/defaults changed')
+  const allIds = candidate.scenes.flatMap((scene) => scene.entities.flatMap((entity) => [entity.id, ...entity.components.map((value) => value.id)]))
+  assert.equal(new Set(allIds).size, allIds.length, 'Canonical entity/component IDs are not unique')
+  const expected = structuredClone(before); expected.project.revision++
+  expected.scenes.find((scene) => scene.sceneId === turn.context.activeSceneId).entities.push(structuredClone(camera))
+  same(candidate, expected, 'camera proposal changed unrelated canonical owners')
+  const command = preview.batch.commands[0]; assert.equal(command.type, 'add-entity'); assert.equal(command.sceneId, turn.context.activeSceneId); same(command.entity, camera, 'compiled camera differs from candidate')
+  same(turn.after.snapshot, candidate, 'settled document differs from canonical candidate')
+  const call = turn.invocation
+  assert.equal(call.request.projectKey, turn.context.projectKey); same(call.request.batch, preview.batch, 'auto-apply payload differs from exact host preview')
+  same(call.request.aiAuthority, { token: preview.authority, context: turn.context }, 'auto-apply capability/context changed')
   assert.ok(call.forwardedAt && call.settledAt); assert.equal(call.result.ok, true); assert.equal(call.result.value.idempotent, false)
-  same(call.result.value.snapshot, pv.result.snapshot, 'Apply differs from exact canonical candidate'); same(call.result.value.inverse, pv.result.inverse, 'Apply inverse changed')
-  assert.equal(call.result.value.newRevision, applied.context.baseRevision + 1); assert.equal(call.result.value.receipt.transactionId, pv.batch.transactionId)
-  assert.equal(call.result.value.receipt.payloadSha256, digest(stable(pv.batch)), 'Canonical payload receipt changed')
-  assert.equal(decision.stored?.verified, true); assert.equal(decision.stored.transactionId, pv.batch.transactionId)
-  same(decision.stored.snapshot, pv.result.snapshot, 'Stored canonical snapshot changed'); same(decision.stored.inverse, pv.result.inverse, 'Stored inverse changed')
-  const candidate = pv.result.snapshot, before = applied.before.snapshot
-  assert.equal(before.scenes.length, 2); assert.equal(candidate.scenes.length, 3); assert.equal(candidate.project.scenes.length, 3)
-  assert.equal(candidate.project.startSceneId, before.project.startSceneId)
-  const newScenes = candidate.scenes.filter((scene) => !before.scenes.some((old) => old.sceneId === scene.sceneId)); assert.equal(newScenes.length, 1)
-  const targets = [applied.context.activeSceneId, newScenes[0].sceneId]
-  assert.ok(Array.isArray(a.sourceWitnesses) && a.sourceWitnesses.length > 0)
-  const used = bodyHandles(applied.responseReceipt.response.worldProposals[0])
-  function bodyHandles(p) { return [...new Set(p.commands.filter((command) => command.type === 'create-entity' && command.kind === 'observed-model').map((command) => command.resourceHandle))] }
-  assert.ok(used.length > 0)
-  for (const handle of used) {
-    const row = applied.queries.flatMap((q) => q.result.value.items).find((row) => row.kind === 'resource' && row.id === handle && row.format === 'glb' && row.capability === 'mesh')
-    assert.ok(row, 'Used opaque GLB handle was not returned to this actual turn')
-    const witness = a.sourceWitnesses.find((w) => w.handle === handle); assert.ok(witness, 'Actual source byte witness missing')
-    assert.equal(witness.fingerprint, row.fingerprint); const bytes = Buffer.from(witness.input.rawBase64, 'base64')
-    assert.equal(bytes.length, witness.input.bytes); assert.equal(digest(bytes), witness.input.sha256)
-    assert.ok(bytes.length >= 20 && bytes.readUInt32LE(0) === 0x46546c67 && bytes.readUInt32LE(4) === 2 && bytes.readUInt32LE(8) === bytes.length, 'Actual source is not GLB bytes')
-    const resource = candidate.project.resources.find((resource) => resource.id === witness.resourceId && resource.format === 'glb'); assert.ok(resource)
-    assert.equal(witness.proof?.workspacePath, resource.workspacePath); assert.equal(witness.proof.format, 'glb'); assert.equal(witness.proof.files.length, 1)
-    const sourceFile = witness.proof.files[0]; assert.equal(sourceFile.path, resource.workspacePath); assert.equal(sourceFile.sha256, witness.input.sha256); assert.equal(sourceFile.byteLength, bytes.length)
-    assert.ok(typeof sourceFile.identity === 'string' && sourceFile.identity.length > 0)
-    assert.equal(witness.proof.fingerprint, digest(Buffer.from(JSON.stringify(['glb', witness.proof.files])))); assert.equal(witness.fingerprint, witness.proof.fingerprint)
-    for (const sceneId of targets) assert.ok(candidate.scenes.find((scene) => scene.sceneId === sceneId).entities.some((entity) => !before.scenes.flatMap((s) => s.entities).some((old) => old.id === entity.id) && entity.components.some((component) => component.type === 'renderable' && component.resourceId === witness.resourceId)), 'Both targeted scenes require actual observed Renderable geometry')
-  }
-  for (const type of ['camera', 'light']) assert.ok(newScenes[0].entities.some((entity) => entity.components.some((component) => component.type === type)), `AI-created scene ${type} missing`)
-  assert.ok(newScenes[0].entities.some((entity) => entity.components.some((component) => component.type === 'renderable') && entity.components.some((component) => component.type === 'collider') && entity.components.some((component) => component.type === 'rigid-body')), 'AI model physical configuration missing')
-  for (const [event, base, revision, label] of [[a.undo, before, applied.context.baseRevision + 2, 'Undo'], [a.redo, candidate, applied.context.baseRevision + 3, 'Redo']]) {
-    assert.equal(event?.kind, label); input(event.input, label); assert.equal(event.result.ok, true); assert.equal(event.result.value.idempotent, false); assert.equal(event.stored?.verified, true)
+  same(call.result.value.snapshot, candidate, 'auto-apply differs from exact canonical candidate'); same(call.result.value.inverse, preview.result.inverse, 'auto-apply inverse changed')
+  assert.equal(call.result.value.newRevision, turn.context.baseRevision + 1); assert.equal(call.result.value.receipt.transactionId, preview.batch.transactionId)
+  assert.equal(call.result.value.receipt.payloadSha256, digest(stable(preview.batch)), 'Canonical payload receipt changed')
+  assert.equal(turn.stored?.verified, true); assert.equal(turn.stored.transactionId, preview.batch.transactionId)
+  same(turn.stored.snapshot, candidate, 'stored canonical snapshot changed'); same(turn.stored.inverse, preview.result.inverse, 'stored inverse changed')
+  for (const [event, base, revision, label] of [[a.undo, before, turn.context.baseRevision + 2, 'Undo'], [a.redo, candidate, turn.context.baseRevision + 3, 'Redo']]) {
+    assert.equal(event?.kind, label); nativeButtonInput(event.input, label); assert.equal(event.result.ok, true); assert.equal(event.result.value.idempotent, false); assert.equal(event.stored?.verified, true)
     assert.ok(typeof event.result.value.receipt?.transactionId === 'string' && event.result.value.receipt.transactionId.length > 0, `${label} result transaction receipt missing`)
     assert.ok(event.result.value.inverse && typeof event.result.value.inverse === 'object', `${label} result inverse missing`)
-    assert.ok(typeof event.stored.transactionId === 'string' && event.stored.transactionId.length > 0 && event.stored.snapshot && typeof event.stored.snapshot === 'object' && event.stored.inverse && typeof event.stored.inverse === 'object', `${label} stored result copies missing`)
     assert.equal(event.stored.transactionId, event.result.value.receipt.transactionId, `${label} stored transaction differs`)
     same(event.stored.snapshot, event.result.value.snapshot, `${label} stored snapshot differs`); same(event.stored.inverse, event.result.value.inverse, `${label} stored inverse differs`)
-    const expected = structuredClone(base); expected.project.revision = revision; same(event.result.value.snapshot, expected, `${label} document differs`); assert.equal(event.result.value.newRevision, revision)
+    const expectedHistory = structuredClone(base); expectedHistory.project.revision = revision
+    same(event.result.value.snapshot, expectedHistory, `${label} document differs`); assert.equal(event.result.value.newRevision, revision)
   }
-  assert.ok(Array.isArray(a.reopened) && a.reopened.length === 2)
-  same(a.reopened.map((r) => r.sceneId).sort(), targets.sort(), 'Fresh AI-targeted scene IDs mismatch')
-  for (const r of a.reopened) {
-    assert.ok(r.oldBootId && r.bootId && r.oldBootId !== r.bootId, 'Actual fresh renderer generation missing'); assert.equal(r.canonicalDiskMatches, true)
-    same(r.snapshot, a.redo.result.value.snapshot, 'Fresh canonical disk/renderer differs')
-    const m = r.model; assert.ok(m?.visible && m.meshes > 0 && m.triangles > 0); assert.ok(Array.isArray(m.matrixWorld) && m.matrixWorld.length === 16 && m.matrixWorld.every(Number.isFinite))
-    const canonicalModel = r.snapshot.scenes.find((scene) => scene.sceneId === r.sceneId)?.entities.find((e) => e.id === m.entityId)
-    assert.ok(canonicalModel && !before.scenes.flatMap((s) => s.entities).some((old) => old.id === canonicalModel.id) && canonicalModel.components.some((c) => c.type === 'renderable' && a.sourceWitnesses.some((w) => w.resourceId === c.resourceId)), 'Fresh geometry is not the new observed model')
-    assert.ok(Array.isArray(m.worldCorners) && m.worldCorners.length === 8)
-    for (const corner of m.worldCorners) { assert.ok(corner.world.length === 3 && corner.world.every(Number.isFinite) && corner.ndc.length === 3 && corner.ndc.every(Number.isFinite) && corner.depth > 0); assert.ok(Math.abs(corner.ndc[0]) <= 0.92 && Math.abs(corner.ndc[1]) <= 0.92 && corner.ndc[2] > -1 && corner.ndc[2] < 1) }
-    assert.ok(r.screenshot?.bytes > 0 && r.screenshot.filename.endsWith('.png')); assert.match(r.screenshot.sha256, /^[a-f0-9]{64}$/)
+  assert.ok(a.undo.input.sequence < a.redo.input.sequence, 'Undo/Redo native order changed')
+  const reopened = a.reopened
+  assert.equal(reopened.sceneId, turn.context.activeSceneId); assert.equal(reopened.entityId, camera.id)
+  assert.ok(reopened.oldBootId && reopened.bootId && reopened.oldBootId !== reopened.bootId, 'Actual fresh renderer generation missing')
+  assert.equal(reopened.canonicalDiskMatches, true); same(reopened.snapshot, a.redo.result.value.snapshot, 'Fresh canonical disk/renderer differs')
+  assert.equal(reopened.selectionActive, camera.id); assert.equal(reopened.inspectorName, camera.name)
+  assert.equal(reopened.selectionInput?.trusted, true); assert.equal(reopened.selectionInput.target, `SPAN:${camera.name}`); assert.equal(reopened.selectionInput.hitMatches, true)
+  assert.ok(reopened.selectionInput.hover?.matchCount === 1 && reopened.selectionInput.hover.enabled === true && reopened.selectionInput.hover.visible === true && reopened.selectionInput.hover.hitMatches === true)
+  same(reopened.selectionInput.point, reopened.selectionInput.hover.point, 'Camera tree selection point changed after hover')
+  const fields = new Map(reopened.inspectorValues.map((field) => [field.label, field]))
+  for (const [label, value] of [['Position:X', 0], ['Position:Y', 2], ['Position:Z', 5], ['Rotation:X', 0], ['Rotation:Y', 0], ['Rotation:Z', 0], ['Scale:X', 1], ['Scale:Y', 1], ['Scale:Z', 1], ['Camera:Near', 0.1], ['Camera:Far', 1000], ['Camera:Field of view', 60]]) {
+    const field = fields.get(label); assert.ok(field, `Fresh camera Inspector missing ${label}`); assert.equal(field.disabled, false); assert.equal(Number(field.value), value)
   }
+  assert.ok(reopened.screenshot?.bytes > 0 && reopened.screenshot.filename.endsWith('.png')); assert.match(reopened.screenshot.sha256, /^[a-f0-9]{64}$/)
 }
 
 export function assertActualWorldSculptNavigationTerminal(result) {

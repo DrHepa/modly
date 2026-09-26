@@ -35,6 +35,104 @@ function aiExact(value: unknown, keys: readonly string[]): Record<string, unknow
   if (Object.keys(record).length !== keys.length || keys.some((key) => !Object.hasOwn(record, key))) throw new Error('Invalid local-AI fields')
   return record
 }
+export const WORLD_SCULPT_BUNDLED_RELATIVE_PATH = 'inputs/worldsculpt-scene.glb'
+export const WORLD_SCULPT_WORKSPACE_RELATIVE_PATH = 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb'
+export interface WorldSculptInputContract {
+  schema: 'modly.worlds-authoring-worldsculpt-input.v1'
+  sourceIdentity: { bytes: number; sha256: string; device: string; inode: string; uid: number; mode: number }
+  bundled: { relativePath: typeof WORLD_SCULPT_BUNDLED_RELATIVE_PATH; bytes: number; sha256: string }
+  workspaceRelativePath: typeof WORLD_SCULPT_WORKSPACE_RELATIVE_PATH
+}
+
+export interface WorldSculptPointerLockPermissionDetails {
+  requestingUrl?: string
+  isMainFrame: boolean
+}
+
+export interface WorldSculptPointerLockPermissionPolicy {
+  request(
+    webContents: object | null,
+    permission: string,
+    callback: (granted: boolean) => void,
+    details: Readonly<WorldSculptPointerLockPermissionDetails>,
+  ): void
+  check(
+    webContents: object | null,
+    permission: string,
+    requestingOrigin: string,
+    details: Readonly<WorldSculptPointerLockPermissionDetails>,
+  ): boolean
+}
+
+export function createWorldSculptPointerLockPermissionPolicy(options: Readonly<{
+  runtimeMode: unknown
+  expectedOrigin: string
+  expectedDocumentUrl: string
+  getOwnedWebContents: () => object | null
+  onDeniedRequest: (permission: string) => void
+}>): Readonly<WorldSculptPointerLockPermissionPolicy> {
+  const expectedDocument = new URL(options.expectedDocumentUrl)
+  if (expectedDocument.origin !== options.expectedOrigin || expectedDocument.href !== options.expectedDocumentUrl) {
+    throw new Error('Canonical WorldSculpt permission origin and document URL required')
+  }
+  const allows = (
+    webContents: object | null,
+    permission: string,
+    details: Readonly<WorldSculptPointerLockPermissionDetails>,
+  ): boolean => options.runtimeMode === 'worldsculpt-navigation'
+    && permission === 'pointerLock'
+    && webContents !== null
+    && webContents === options.getOwnedWebContents()
+    && details.isMainFrame === true
+    && details.requestingUrl === options.expectedDocumentUrl
+
+  const policy: WorldSculptPointerLockPermissionPolicy = {
+    request(
+      webContents: object | null,
+      permission: string,
+      callback: (granted: boolean) => void,
+      details: Readonly<WorldSculptPointerLockPermissionDetails>,
+    ) {
+      const granted = allows(webContents, permission, details)
+      callback(granted)
+      if (!granted) options.onDeniedRequest(permission)
+    },
+    check(
+      webContents: object | null,
+      permission: string,
+      requestingOrigin: string,
+      details: Readonly<WorldSculptPointerLockPermissionDetails>,
+    ) {
+      return requestingOrigin === options.expectedOrigin && allows(webContents, permission, details)
+    },
+  }
+  return Object.freeze(policy)
+}
+
+export function parseWorldSculptInputContract(value: unknown): Readonly<WorldSculptInputContract> {
+  const record = aiExact(value, ['schema', 'sourceIdentity', 'bundled', 'workspaceRelativePath'])
+  const source = aiExact(record.sourceIdentity, ['bytes', 'sha256', 'device', 'inode', 'uid', 'mode'])
+  const bundled = aiExact(record.bundled, ['relativePath', 'bytes', 'sha256'])
+  const validDigest = (candidate: unknown): candidate is string => typeof candidate === 'string' && /^[a-f0-9]{64}$/.test(candidate)
+  if (record.schema !== 'modly.worlds-authoring-worldsculpt-input.v1'
+    || record.workspaceRelativePath !== WORLD_SCULPT_WORKSPACE_RELATIVE_PATH
+    || bundled.relativePath !== WORLD_SCULPT_BUNDLED_RELATIVE_PATH
+    || !Number.isSafeInteger(source.bytes) || (source.bytes as number) < 12
+    || !Number.isSafeInteger(bundled.bytes) || bundled.bytes !== source.bytes
+    || !validDigest(source.sha256) || bundled.sha256 !== source.sha256
+    || typeof source.device !== 'string' || !/^[0-9]+$/.test(source.device)
+    || typeof source.inode !== 'string' || !/^[0-9]+$/.test(source.inode)
+    || !Number.isSafeInteger(source.uid) || (source.uid as number) < 0
+    || !Number.isSafeInteger(source.mode) || (source.mode as number) < 0 || (source.mode as number) > 0o777) {
+    throw new Error('Invalid WorldSculpt input contract')
+  }
+  return Object.freeze({
+    schema: 'modly.worlds-authoring-worldsculpt-input.v1',
+    sourceIdentity: Object.freeze({ bytes: source.bytes as number, sha256: source.sha256, device: source.device, inode: source.inode, uid: source.uid as number, mode: source.mode as number }),
+    bundled: Object.freeze({ relativePath: WORLD_SCULPT_BUNDLED_RELATIVE_PATH, bytes: bundled.bytes as number, sha256: bundled.sha256 as string }),
+    workspaceRelativePath: WORLD_SCULPT_WORKSPACE_RELATIVE_PATH,
+  })
+}
 const LOCAL_AI_CONFIG_KEYS = Object.freeze(['apiRoot', 'pythonPath', ...Object.keys(LOCAL_AI_PROFILE)])
 function validateLocalAiConfigShape(value: unknown): LocalAiConfig {
   const record = aiExact(value, LOCAL_AI_CONFIG_KEYS)
@@ -155,7 +253,8 @@ export const CHECK_NAMES = [
 ] as const
 export const UI_CHECK_NAMES = ['native-ui-project-and-both-scenes', 'native-numeric-authoring', 'native-both-scenes-reopen'] as const
 export const AI_CHECK_NAMES = ['actual-model-discovery', 'actual-ai-reject', 'actual-ai-apply-and-history', 'actual-ai-both-scenes-reopen'] as const
-export type CheckName = typeof CHECK_NAMES[number] | typeof UI_CHECK_NAMES[number] | typeof AI_CHECK_NAMES[number]
+export const NAVIGATION_CHECK_NAMES = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation'] as const
+export type CheckName = typeof CHECK_NAMES[number] | typeof UI_CHECK_NAMES[number] | typeof AI_CHECK_NAMES[number] | typeof NAVIGATION_CHECK_NAMES[number]
 export interface Check { name: CheckName; status: 'UNREACHED' | 'PASS' | 'FAIL'; reason?: string }
 export interface Rect { x: number; y: number; width: number; height: number }
 export interface Point { x: number; y: number }
@@ -174,16 +273,92 @@ export interface NativePointerHit {
   canvasUuid: string | null; targetCanvas: boolean; trusted: boolean; sequence: number; frame: number | null
   type: string; buttons: number; point: Point; firstHitAxis: string | null; pickerUuid: string | null
 }
+export function parseObservedOrbitEnabled(controls: unknown): boolean | null {
+  if (controls === undefined || controls === null) return null
+  if (typeof controls !== 'object') throw new Error('Observed OrbitControls public runtime contract changed')
+  const enabled = Reflect.get(controls, 'enabled')
+  if (typeof enabled !== 'boolean') throw new Error('Observed OrbitControls public runtime contract changed')
+  return enabled
+}
 export interface CanvasObservation {
   canvasUuid: string; rect: Rect; drawingBuffer: [number, number]; contextLost: boolean; frame: number
   gl: { version: string; vendor: string; renderer: string; unmaskedVendor: string | null; unmaskedRenderer: string | null }
   camera: number[]; models: ModelObservation[]
+  cameraPose: { position: [number, number, number]; quaternion: [number, number, number, number]; yawPitchRoll: [number, number, number] }
+  controls: { orbitEnabled: boolean | null }
   cameraFraming: { uuid: string; near: number; far: number; matrixWorldInverse: number[] }
   gizmo: null | { controlUuid: string; enabled: boolean; pointerHit: NativePointerHit | null; objectUuid: string; entityId: string | null; mode: string; axis: string | null; dragging: boolean; candidates: HandleCandidate[] }
+  interactionTargets: CanvasInteractionTargetsObservation
 }
 export interface NativeTrace {
   sequence: number; at: string; type: string; trusted: boolean; x: number | null; y: number | null
-  buttons: number | null; target: string; canvasUuid: string | null; frame: number | null
+  buttons: number | null; movementX: number | null; movementY: number | null; code: string | null
+  target: string; canvasUuid: string | null; frame: number | null
+}
+export type CanvasInteractionHitKind = 'model' | 'selection-hitbox'
+export interface CanvasInteractionPointObservation {
+  point: Point; canvasUuid: string; hitCanvas: boolean; interactionHitCount: number
+  firstEntityId: string | null; firstHitKind: CanvasInteractionHitKind | null
+}
+export interface CanvasInteractionTargetsObservation {
+  empty: CanvasInteractionPointObservation | null
+  entities: CanvasInteractionPointObservation[]
+}
+export function admitCanvasInteractionPoint(
+  observation: CanvasInteractionPointObservation | null,
+  expected: { canvasUuid: string; rect: Rect; entityId: string | null },
+): Readonly<Point> {
+  if (!observation) throw new Error('Canvas interaction admission is unavailable')
+  const { point, canvasUuid, hitCanvas, interactionHitCount, firstEntityId, firstHitKind } = observation
+  if (!point || !Number.isSafeInteger(point.x) || !Number.isSafeInteger(point.y)) throw new Error('Canvas interaction point must use finite integer pixels')
+  if (!expected.canvasUuid || canvasUuid !== expected.canvasUuid) throw new Error('Canvas interaction observation belongs to a stale Canvas')
+  const { rect } = expected
+  if (![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) || rect.width <= 0 || rect.height <= 0
+    || point.x <= rect.x || point.y <= rect.y || point.x >= rect.x + rect.width || point.y >= rect.y + rect.height) {
+    throw new Error('Canvas interaction point is outside the current Canvas')
+  }
+  if (!hitCanvas) throw new Error('Canvas interaction point is occluded by DOM content')
+  if (!Number.isSafeInteger(interactionHitCount) || interactionHitCount < 0 || interactionHitCount > 512) throw new Error('Canvas interaction hit count is invalid')
+  if (expected.entityId === null) {
+    if (interactionHitCount !== 0 || firstEntityId !== null || firstHitKind !== null) throw new Error('Empty Canvas point intersects an interactive scene object')
+  } else if (!expected.entityId || interactionHitCount < 1 || firstEntityId !== expected.entityId
+    || (firstHitKind !== 'model' && firstHitKind !== 'selection-hitbox')) {
+    throw new Error('Canvas focus point does not resolve to the expected entity')
+  }
+  return Object.freeze({ x: point.x, y: point.y })
+}
+export function admitNativeCanvasFocusEvidence(input: {
+  beforeCamera: readonly number[]; afterCamera: readonly number[]; trace: readonly NativeTrace[]
+  beforeBounds: Rect; afterBounds: Rect
+  afterWorldCorners: readonly WorldCornerObservation[]
+  traceStart: number; point: Point; canvasUuid: string
+}): Readonly<{ dblclickSequence: number }> {
+  const finiteCamera = (value: readonly number[]) => Array.isArray(value) && value.length === 32 && value.every(Number.isFinite)
+  if (!finiteCamera(input.beforeCamera) || !finiteCamera(input.afterCamera)) throw new Error('Native focus requires finite actual camera matrices')
+  const finiteBounds = (value: Rect) => value && [value.x, value.y, value.width, value.height].every(Number.isFinite) && value.width > 0 && value.height > 0
+  if (!finiteBounds(input.beforeBounds) || !finiteBounds(input.afterBounds)) throw new Error('Native focus requires finite positive projected bounds')
+  if (!Array.isArray(input.afterWorldCorners) || input.afterWorldCorners.length !== 8 || input.afterWorldCorners.some((corner) => (
+    !corner || !Array.isArray(corner.world) || corner.world.length !== 3 || !corner.world.every(Number.isFinite)
+    || !Array.isArray(corner.ndc) || corner.ndc.length !== 3 || !corner.ndc.every(Number.isFinite)
+    || Math.abs(corner.ndc[0]) > 0.92 || Math.abs(corner.ndc[1]) > 0.92
+    || corner.ndc[2] <= -1 || corner.ndc[2] >= 1 || !Number.isFinite(corner.depth) || corner.depth <= 0
+  ))) throw new Error('Native focus requires eight finite padded in-frame world corners')
+  if (!Number.isSafeInteger(input.traceStart) || input.traceStart < 0 || !Number.isSafeInteger(input.point.x) || !Number.isSafeInteger(input.point.y) || !input.canvasUuid) {
+    throw new Error('Native focus admission identity is invalid')
+  }
+  const matches = input.trace.filter((event) => event.sequence > input.traceStart && event.type === 'dblclick')
+  if (matches.length !== 1) throw new Error('Native focus requires exactly one post-admission double-click')
+  const event = matches[0]
+  if (!event.trusted || event.canvasUuid !== input.canvasUuid || event.x !== input.point.x || event.y !== input.point.y) {
+    throw new Error('Native focus double-click was untrusted or retargeted')
+  }
+  return Object.freeze({ dblclickSequence: event.sequence })
+}
+export interface NavigationObservation {
+  modes: Array<{ label: string; checked: boolean; tabIndex: number; focused: boolean; disabled: boolean }>
+  status: string | null; groundOnlyVisible: boolean
+  pointerLock: { canvasOwned: boolean; changes: number; errors: number; lastChangeAt: string | null; lastErrorAt: string | null }
+  observationCapability: { writable: boolean; configurable: boolean }
 }
 export interface AiReviewObservation {
   expanded: boolean; prompt: string | null; promptDisabled: boolean; sendEnabled: boolean
@@ -202,6 +377,7 @@ export interface AuthoringView {
   selectValues: { label: string; value: string }[]
   viewport: Rect
   trace: NativeTrace[]; untrustedInputs: number
+  navigation: NavigationObservation
   aiReview: AiReviewObservation
 }
 export interface SeedEvidence {

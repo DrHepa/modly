@@ -1,18 +1,49 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, copyFile, lstat, mkdtemp, readFile, readdir, readlink, realpath, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { inspect } from 'node:util'
 import { build as esbuild, transform as esTransform } from 'esbuild'
 import { build as viteBuild } from 'vite'
-import { LOCAL_AI_PATH_ADMISSION, createLocalAiConfig, parseReviewedAiModel, validateLocalAiConfig } from './worlds-authoring-electron-fixture/shared.ts'
+import { LOCAL_AI_PATH_ADMISSION, WORLD_SCULPT_BUNDLED_RELATIVE_PATH, WORLD_SCULPT_WORKSPACE_RELATIVE_PATH, createLocalAiConfig, parseReviewedAiModel, validateLocalAiConfig } from './worlds-authoring-electron-fixture/shared.ts'
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const fixtureSource = path.join(repositoryRoot, 'scripts/worlds-authoring-electron-fixture')
 const digest = (bytes) => ({ bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') })
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`
+export async function readWorldSculptBuildInput(sourcePath, expectedSha256) {
+  if (typeof sourcePath !== 'string' || !path.isAbsolute(sourcePath) || path.resolve(sourcePath) !== sourcePath || /[\0\r\n]/.test(sourcePath)) throw new Error('Canonical absolute WorldSculpt source required')
+  if (typeof expectedSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('Lowercase WorldSculpt source digest required')
+  const before = await lstat(sourcePath)
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error('WorldSculpt source must be a regular non-symlink file')
+  if (await realpath(sourcePath) !== sourcePath) throw new Error('WorldSculpt source alias is forbidden')
+  const handle = await open(sourcePath, 'r')
+  try {
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error('WorldSculpt source identity changed before read')
+    const bytes = await handle.readFile()
+    const after = await lstat(sourcePath)
+    if (!after.isFile() || after.isSymbolicLink() || after.dev !== opened.dev || after.ino !== opened.ino || await realpath(sourcePath) !== sourcePath) throw new Error('WorldSculpt source identity changed during read')
+    const actual = digest(bytes)
+    if (actual.sha256 !== expectedSha256) throw new Error('WorldSculpt source digest mismatch')
+    if (bytes.length < 12 || bytes.subarray(0, 4).toString('ascii') !== 'glTF' || bytes.readUInt32LE(4) !== 2 || bytes.readUInt32LE(8) !== bytes.length) throw new Error('WorldSculpt source is not a canonical GLB v2 payload')
+    return {
+      bytes,
+      sourceIdentity: Object.freeze({
+        bytes: actual.bytes,
+        sha256: actual.sha256,
+        device: String(opened.dev),
+        inode: String(opened.ino),
+        uid: opened.uid,
+        mode: opened.mode & 0o777,
+      }),
+    }
+  } finally {
+    await handle.close()
+  }
+}
 export function materializeLocalAiConfig(root, admission = LOCAL_AI_PATH_ADMISSION) {
   if (typeof root !== 'string' || !path.isAbsolute(root) || path.resolve(root) !== root || root.includes('\0')) throw new Error('Canonical repository root required for local-AI paths')
   if (!admission || typeof admission !== 'object' || Array.isArray(admission)
@@ -32,8 +63,23 @@ const repositoryLocalAiConfig = materializeLocalAiConfig(repositoryRoot)
 export function parseBuildArguments(args) {
   const keys = args.map((arg) => arg.split('=')[0])
   const identities = ['--ai-model', '--ai-model-digest', '--ai-tools-reviewed']
-  if (args.length > 6 || new Set(keys).size !== keys.length || args.some((arg) => !['--build-only', '--inherited-display', '--local-ai', '--ai-tools-reviewed'].includes(arg) && !/^--ai-model(?:-digest)?=.+$/.test(arg)) || (args.includes('--local-ai') && !args.includes('--inherited-display'))) throw new Error('Usage: build-only [--inherited-display --local-ai --ai-model=<name> --ai-model-digest=sha256:<digest> --ai-tools-reviewed]. This entry NEVER launches native processes.')
+  const worldSculpt = args.includes('--worldsculpt-navigation')
+  const allowedFlag = (arg) => ['--build-only', '--inherited-display', '--local-ai', '--ai-tools-reviewed', '--worldsculpt-navigation'].includes(arg)
+    || /^--ai-model(?:-digest)?=.+$/.test(arg)
+    || /^--worldsculpt-(?:source|sha256)=.+$/.test(arg)
+  if (args.length > 6 || new Set(keys).size !== keys.length || args.some((arg) => !allowedFlag(arg)) || (args.includes('--local-ai') && !args.includes('--inherited-display'))) throw new Error('Usage: build-only [--inherited-display --local-ai --ai-model=<name> --ai-model-digest=sha256:<digest> --ai-tools-reviewed] OR build-only --inherited-display --worldsculpt-navigation --worldsculpt-source=<absolute-glb> --worldsculpt-sha256=<digest>. This entry NEVER launches native processes.')
   const identityCount = identities.filter((key) => keys.includes(key)).length
+  if (worldSculpt) {
+    const sourceArg = args.find((arg) => arg.startsWith('--worldsculpt-source='))
+    const shaArg = args.find((arg) => arg.startsWith('--worldsculpt-sha256='))
+    if (args.length !== 5 || !args.includes('--build-only') || !args.includes('--inherited-display') || args.includes('--local-ai') || identityCount
+      || !sourceArg || !shaArg) throw new Error('WorldSculpt navigation requires one inherited-display build-only source and digest, without local AI')
+    const source = sourceArg.slice('--worldsculpt-source='.length)
+    const sha256 = shaArg.slice('--worldsculpt-sha256='.length)
+    if (!path.isAbsolute(source) || path.resolve(source) !== source || /[\0\r\n]/.test(source) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('WorldSculpt navigation requires a canonical absolute source and lowercase SHA-256')
+    return { buildOnly: true, nativeMode: 'inherited-display', runtimeMode: 'worldsculpt-navigation', worldSculptSource: { path: source, sha256 } }
+  }
+  if (keys.some((key) => key.startsWith('--worldsculpt-'))) throw new Error('WorldSculpt source identity is forbidden outside its navigation lane')
   if (identityCount && (!args.includes('--local-ai') || identityCount !== 3)) throw new Error('Reviewed identity requires all three explicit local-AI fields')
   const reviewedAiModel = identityCount ? parseReviewedAiModel({ name: args.find((arg) => arg.startsWith('--ai-model=')).slice('--ai-model='.length), digest: args.find((arg) => arg.startsWith('--ai-model-digest=')).slice('--ai-model-digest='.length), toolsReviewed: args.includes('--ai-tools-reviewed') }) : null
   if (args.includes('--local-ai')) return { buildOnly: true, nativeMode: 'inherited-display', runtimeMode: 'local-ai', localAi: repositoryLocalAiConfig, ...(reviewedAiModel ? { reviewedAiModel } : {}) }
@@ -130,9 +176,14 @@ export function mainModuleUrlPlugin(remember, warnings, load = readFile, transla
     })
   } }
 }
-export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', localAi = null, reviewedIdentity = null) {
+export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', localAi = null, reviewedIdentity = null, worldSculptSource = null) {
   if (!['owned-xvfb', 'inherited-display'].includes(nativeMode)) throw new Error('Unknown native mode')
   if (localAi) { validateLocalAiConfig(localAi, repositoryLocalAiConfig); if (nativeMode !== 'inherited-display') throw new Error('Local-AI requires separately owned inherited-display admission') }
+  if (worldSculptSource) {
+    if (nativeMode !== 'inherited-display' || localAi || reviewedIdentity !== null
+      || !worldSculptSource || typeof worldSculptSource !== 'object' || Array.isArray(worldSculptSource)
+      || Object.keys(worldSculptSource).length !== 2 || !Object.hasOwn(worldSculptSource, 'path') || !Object.hasOwn(worldSculptSource, 'sha256')) throw new Error('WorldSculpt navigation requires its exclusive inherited-display source admission')
+  }
   const reviewedAiModel = localAi ? parseReviewedAiModel(reviewedIdentity) : null
   if (!localAi && reviewedIdentity !== null) throw new Error('Reviewed AI identity is forbidden outside local-AI mode')
   if (await realpath(process.cwd()) !== repositoryRoot) throw new Error(`Canonical build cwd required: ${repositoryRoot}`)
@@ -149,7 +200,13 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
   }
   try {
     initialHead = git(['rev-parse', 'HEAD']).trim(); initialBranch = git(['branch', '--show-current']).trim()
-    if (initialHead !== '3807bb10ca60e071d183a30392e0c0ed1ae7534e' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
+    if (initialHead !== '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
+    const worldSculpt = worldSculptSource ? await readWorldSculptBuildInput(worldSculptSource.path, worldSculptSource.sha256) : null
+    if (worldSculpt) {
+      const bundledPath = path.join(outputDirectory, WORLD_SCULPT_BUNDLED_RELATIVE_PATH)
+      await mkdir(path.dirname(bundledPath), { mode: 0o700 })
+      await writeFile(bundledPath, worldSculpt.bytes, { flag: 'wx', mode: 0o600 })
+    }
     // Also hashes CSS scan inputs and config dependencies, not just a hand-written entrypoint list.
     const canonicalPaths = [...new Set(git(['ls-files', '-co', '--exclude-standard', '-z']).split('\0').filter(Boolean))].sort()
     for (const relative of canonicalPaths) await remember(path.join(repositoryRoot, relative), { canonicalEnumeration: true })
@@ -207,7 +264,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
       const filename = path.join(repositoryRoot, 'node_modules', name, 'package.json'); await remember(filename)
       versions[name] = JSON.parse(await readFile(filename, 'utf8')).version
     }
-    const requiredModules = ['components/WorldsWorkbench.tsx', 'components/WorldsSceneDock.tsx', 'components/WorldsInspector.tsx', 'components/WorldsViewer.tsx', 'editor/useWorldEditorController.ts', 'editor/worldEditorController.ts', 'editor/worldEditorTransformAdmission.ts', 'editor/useWorldEditorProjectionBridge.ts', 'core/worldSessions.ts', 'worldProjectService.ts']
+    const requiredModules = ['components/WorldsWorkbench.tsx', 'components/WorldsSceneDock.tsx', 'components/WorldsInspector.tsx', 'components/WorldsViewer.tsx', 'components/WorldsViewportModeControl.tsx', 'components/WorldsViewportNavigationControls.tsx', 'worldCameraNavigation.ts', 'editor/useWorldEditorController.ts', 'editor/worldEditorController.ts', 'editor/worldEditorTransformAdmission.ts', 'editor/useWorldEditorProjectionBridge.ts', 'core/worldSessions.ts', 'worldProjectService.ts']
     const rendererIds = new Set(moduleGraphs.filter((graph) => graph.label === 'renderer').flatMap((graph) => graph.nodes.map((node) => node.id.split('?')[0])))
     for (const relative of requiredModules) if (!rendererIds.has(path.join(repositoryRoot, 'src/areas/worlds', relative))) throw new Error(`Production module absent from actual Vite graph: ${relative}`)
     if (localAi) {
@@ -228,6 +285,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
     const manifest = {
       schema: 'modly.worlds-authoring-build.v1', scope: 'source-level-full-Workbench-native-authoring', execution: 'NOT_RUN', nativeMode,
       ...(localAi ? { runtimeMode: 'local-ai', localAi, pythonIdentity, reviewedAiModel, aiAcceptance: 'NOT_RUN; two actual tool-query/proposal chats, native Reject/Apply and fresh geometry/disk witnesses required; operator tool-review acknowledgement is not runtime capability proof' } : {}),
+      ...(worldSculpt ? { runtimeMode: 'worldsculpt-navigation', worldSculptInput: { schema: 'modly.worlds-authoring-worldsculpt-input.v1', sourceIdentity: worldSculpt.sourceIdentity, bundled: { relativePath: WORLD_SCULPT_BUNDLED_RELATIVE_PATH, ...digest(worldSculpt.bytes) }, workspaceRelativePath: WORLD_SCULPT_WORKSPACE_RELATIVE_PATH }, worldSculptAcceptance: 'NOT_RUN; production-library add plus trusted native Inspect/Fly/Run evidence and fresh durable reopen required' } : {}),
       builtAt: new Date().toISOString(), repositoryRoot, repositoryAdmission, outputDirectory, initialHead, initialBranch, nodePath, electronPath, versions,
       outputs, sourceInputs: [...sources.values()].sort((a, b) => a.path.localeCompare(b.path)),
       compilerDiagnostics: { schema: 'modly.worlds-authoring-compiler-diagnostics.v1', esbuild: builds.map((built, index) => ({ entry: index === 0 ? 'main' : 'preload', warnings: built.warnings })), mainTranslationWarnings },
@@ -243,7 +301,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`), buildSha256 = digest(manifestBytes).sha256
     await writeFile(path.join(outputDirectory, 'fixture-build.json'), manifestBytes, { flag: 'wx', mode: 0o600 })
     const launchEnvironment = nativeMode === 'owned-xvfb' ? '/usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 ' : ''
-    const nextCommand = `/usr/bin/timeout --signal=TERM --kill-after=5s ${localAi?.outerSeconds ?? 145}s ${launchEnvironment}${quote(nodePath)} ${quote(path.join(outputDirectory, 'run.mjs'))} --reviewed-build-sha256=${buildSha256}${nativeMode === 'inherited-display' ? ' --inherited-display' : ''}${localAi ? ' --local-ai' : ''}`
+    const nextCommand = `/usr/bin/timeout --signal=TERM --kill-after=5s ${localAi?.outerSeconds ?? 145}s ${launchEnvironment}${quote(nodePath)} ${quote(path.join(outputDirectory, 'run.mjs'))} --reviewed-build-sha256=${buildSha256}${nativeMode === 'inherited-display' ? ' --inherited-display' : ''}${localAi ? ' --local-ai' : ''}${worldSculpt ? ' --worldsculpt-navigation' : ''}`
     await writeFile(path.join(outputDirectory, 'next-command.txt'), `${nextCommand}\n`, { flag: 'wx', mode: 0o600 })
     return { status: 'BUILT_ONLY', execution: 'NOT_RUN', outputDirectory, buildSha256, nextCommand, graphDigests: manifest.graphDigests, sourceInputCount: sources.size }
   } catch (error) {
@@ -252,6 +310,6 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  try { const { nativeMode, localAi, reviewedAiModel } = parseBuildArguments(process.argv.slice(2)); console.log(JSON.stringify(await buildWorldsAuthoringFixture(nativeMode, localAi, reviewedAiModel), null, 2)) }
+  try { const { nativeMode, localAi, reviewedAiModel, worldSculptSource } = parseBuildArguments(process.argv.slice(2)); console.log(JSON.stringify(await buildWorldsAuthoringFixture(nativeMode, localAi, reviewedAiModel, worldSculptSource), null, 2)) }
   catch (error) { console.error(error); process.exitCode = 1 }
 }

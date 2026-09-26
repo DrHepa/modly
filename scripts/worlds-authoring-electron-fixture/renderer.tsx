@@ -1,12 +1,12 @@
 import { createRoot } from 'react-dom/client'
 import { _roots } from '@react-three/fiber'
-import { Box3, InstancedMesh, Matrix4, Mesh, Object3D, PerspectiveCamera, Vector3, type Camera } from 'three'
+import { Box3, Euler, InstancedMesh, Matrix4, Mesh, Object3D, PerspectiveCamera, Raycaster, Vector2, Vector3, type Camera } from 'three'
 import { WorldsWorkbench } from '../../src/areas/worlds/components/WorldsWorkbench.tsx'
 import { worldEditorController } from '../../src/areas/worlds/editor/worldEditorController.ts'
 import { useWorldsUiStore } from '../../src/areas/worlds/editor/worldsUiStore.ts'
 import { useAppStore } from '../../src/shared/stores/appStore.ts'
 import { useAgentStore } from '../../src/shared/stores/agentStore.ts'
-import type { AiReviewObservation, AuthoringView, CanvasObservation, HandleCandidate, ModelObservation, NativePointerHit, NativeTrace, Point, Rect, WorldCornerObservation } from './shared.ts'
+import { parseObservedOrbitEnabled, type AiReviewObservation, type AuthoringView, type CanvasInteractionHitKind, type CanvasInteractionPointObservation, type CanvasInteractionTargetsObservation, type CanvasObservation, type HandleCandidate, type ModelObservation, type NativePointerHit, type NativeTrace, type Point, type Rect, type WorldCornerObservation } from './shared.ts'
 import { withPickerScratch } from './picker-scratch.ts'
 import './styles.css'
 
@@ -21,18 +21,29 @@ function canvasId(canvas: HTMLCanvasElement): string {
 }
 let lastTrustedPointer: null | { target: HTMLCanvasElement | null; sequence: number; frame: number | null; type: string; buttons: number; point: Point } = null
 let untrustedInputs = 0
+let pointerLockChanges = 0, pointerLockErrors = 0
+let lastPointerLockChangeAt: string | null = null, lastPointerLockErrorAt: string | null = null
 let hostSetupComplete = false
 const reportError = (message: string) => { if (diagnostics.length < 64) diagnostics.push(message) }
 window.addEventListener('error', (event) => reportError(event.error instanceof Error ? event.error.stack ?? event.message : event.message))
 window.addEventListener('unhandledrejection', (event) => reportError(String(event.reason)))
 document.addEventListener('securitypolicyviolation', (event) => reportError(`CSP denied ${event.violatedDirective}: ${event.blockedURI}`))
 document.addEventListener('webglcontextlost', () => reportError('Actual Canvas context lost'), true)
-for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'change']) {
+document.addEventListener('pointerlockchange', (event) => {
+  if (!event.isTrusted) untrustedInputs += 1
+  pointerLockChanges += 1; lastPointerLockChangeAt = new Date().toISOString()
+}, true)
+document.addEventListener('pointerlockerror', (event) => {
+  if (!event.isTrusted) untrustedInputs += 1
+  pointerLockErrors += 1; lastPointerLockErrorAt = new Date().toISOString()
+}, true)
+for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click', 'dblclick', 'keydown', 'keyup', 'input', 'change']) {
   document.addEventListener(type, (event) => {
     if (!event.isTrusted) untrustedInputs += 1
     const target = event.target instanceof Element ? event.target : null
     const namedControl = target?.closest('button[aria-label]') ?? target
     const mouse = event instanceof MouseEvent ? event : null
+    const keyboard = event instanceof KeyboardEvent ? event : null
     const targetCanvas = target instanceof HTMLCanvasElement ? target : null
     const frame = targetCanvas ? _roots.get(targetCanvas)?.store.getState().gl.info.render.frame ?? null : null
     if (event.isTrusted && mouse && type.startsWith('pointer')) lastTrustedPointer = {
@@ -40,6 +51,7 @@ for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click', 'keydown
     }
     trace.push({ sequence: trace.length + 1, at: new Date().toISOString(), type, trusted: event.isTrusted,
       x: mouse?.clientX ?? null, y: mouse?.clientY ?? null, buttons: mouse?.buttons ?? null,
+      movementX: mouse?.movementX ?? null, movementY: mouse?.movementY ?? null, code: keyboard?.code ?? null,
       canvasUuid: targetCanvas ? canvasId(targetCanvas) : null, frame,
       target: namedControl ? `${namedControl.tagName}:${namedControl.getAttribute('aria-label') ?? namedControl.closest('[role="treeitem"]')?.querySelector('.worlds-tree-name')?.textContent ?? namedControl.className}` : '',
     })
@@ -140,6 +152,60 @@ function observeHandles(control: Object3D, object: Object3D, camera: Camera, vie
   })
 }
 
+function observedEntityHit(object: Object3D, entityIds: readonly string[]): { entityId: string; kind: CanvasInteractionHitKind } | null {
+  for (let current: Object3D | null = object; current; current = current.parent) {
+    if (current.userData.worldsSelectionSilhouette === true || current.userData.worldsCollisionSurface === true) return null
+    if (current.userData.worldsSelectionHitbox === true) {
+      const matches = entityIds.filter((entityId) => current.name === `${entityId} selection hitbox`)
+      if (matches.length !== 1) throw new Error('Selection hitbox identity is ambiguous')
+      return { entityId: matches[0], kind: 'selection-hitbox' }
+    }
+    const entityId: unknown = current.userData.worldsSceneItemId
+    if (typeof entityId === 'string' && entityIds.includes(entityId)) return { entityId, kind: 'model' }
+  }
+  return null
+}
+
+/** Bounded private raycasts over the production interaction registry; never mutates its raycaster, scene, camera or controls. */
+function observeCanvasInteractionTargets(
+  interaction: readonly Object3D[],
+  models: readonly ModelObservation[],
+  camera: Camera,
+  viewport: Rect,
+  canvas: HTMLCanvasElement,
+): CanvasInteractionTargetsObservation {
+  if (interaction.length > 512 || models.length > 256) throw new Error('Canvas interaction observation exceeds bounded fixture limits')
+  const raycaster = new Raycaster(), ndc = new Vector2(), entityIds = models.map((model) => model.entityId)
+  const observePoint = (point: Point): CanvasInteractionPointObservation => {
+    ndc.set(((point.x - viewport.x) / viewport.width) * 2 - 1, -((point.y - viewport.y) / viewport.height) * 2 + 1)
+    raycaster.setFromCamera(ndc, camera)
+    const hits = raycaster.intersectObjects([...interaction], true)
+    if (hits.length > 512) throw new Error('Canvas interaction raycast exceeds bounded fixture limits')
+    const first = hits.map((hit) => observedEntityHit(hit.object, entityIds)).find((hit) => hit !== null) ?? null
+    return {
+      point: { ...point }, canvasUuid: canvasId(canvas), hitCanvas: document.elementFromPoint(point.x, point.y) === canvas,
+      interactionHitCount: hits.length, firstEntityId: first?.entityId ?? null, firstHitKind: first?.kind ?? null,
+    }
+  }
+  const point = (x: number, y: number): Point => ({ x: Math.round(viewport.x + viewport.width * x), y: Math.round(viewport.y + viewport.height * y) })
+  const emptyCandidates = [
+    point(0.08, 0.12), point(0.92, 0.12), point(0.08, 0.88), point(0.92, 0.88),
+    point(0.15, 0.5), point(0.85, 0.5), point(0.5, 0.88), point(0.5, 0.2),
+  ]
+  const empty = emptyCandidates.map(observePoint).find((candidate) => candidate.hitCanvas && candidate.interactionHitCount === 0) ?? null
+  const entities = models.flatMap((model) => {
+    const bounds = model.bounds
+    if (!bounds || bounds.width <= 0 || bounds.height <= 0) return []
+    const candidates: Point[] = []
+    for (const y of [0.5, 0.35, 0.65]) for (const x of [0.5, 0.35, 0.65]) candidates.push({
+      x: Math.round(bounds.x + bounds.width * x), y: Math.round(bounds.y + bounds.height * y),
+    })
+    const admitted = candidates.map(observePoint).find((candidate) => candidate.hitCanvas && candidate.firstEntityId === model.entityId)
+    return admitted ? [admitted] : []
+  })
+  return { empty, entities }
+}
+
 function observeCanvas(): CanvasObservation | null {
   const canvases = [...document.querySelectorAll<HTMLCanvasElement>('[aria-label="Worlds 3D canvas"] canvas')]
   if (canvases.length !== 1) return null
@@ -155,6 +221,7 @@ function observeCanvas(): CanvasObservation | null {
     if (record(object).isTransformControls === true && object.visible) controls.push(object)
   })
   if (controls.length > 1) throw new Error('Ambiguous live TransformControls ownership')
+  const orbitEnabled = parseObservedOrbitEnabled(record(state).controls)
   let gizmo: CanvasObservation['gizmo'] = null
   if (controls.length) {
     const control = controls[0], values = record(control), object = values.object
@@ -164,11 +231,32 @@ function observeCanvas(): CanvasObservation | null {
     gizmo = { controlUuid: control.uuid, enabled: values.enabled, objectUuid: object.uuid, entityId, mode: values.mode, axis: values.axis, dragging: values.dragging,
       ...(values.dragging ? { candidates: [], pointerHit: null } : observeHandles(control, object, state.camera, viewport, canvas, model?.bounds ?? null)) }
   }
+  const navigationEuler = new Euler().setFromQuaternion(state.camera.quaternion, 'YXZ')
   return {
     canvasUuid: canvasId(canvas), rect: viewport, drawingBuffer: [gl.drawingBufferWidth, gl.drawingBufferHeight], contextLost: gl.isContextLost(), frame: state.gl.info.render.frame,
     gl: { version: String(gl.getParameter(gl.VERSION)), vendor: String(gl.getParameter(gl.VENDOR)), renderer: String(gl.getParameter(gl.RENDERER)), unmaskedVendor: debug ? String(gl.getParameter(debug.UNMASKED_VENDOR_WEBGL)) : null, unmaskedRenderer: debug ? String(gl.getParameter(debug.UNMASKED_RENDERER_WEBGL)) : null },
     camera: [...state.camera.matrixWorld.elements, ...state.camera.projectionMatrix.elements], models, gizmo,
+    cameraPose: { position: [state.camera.position.x, state.camera.position.y, state.camera.position.z], quaternion: [state.camera.quaternion.x, state.camera.quaternion.y, state.camera.quaternion.z, state.camera.quaternion.w], yawPitchRoll: [navigationEuler.y, navigationEuler.x, navigationEuler.z] },
+    controls: { orbitEnabled },
     cameraFraming: { uuid: state.camera.uuid, near: state.camera.near, far: state.camera.far, matrixWorldInverse: [...state.camera.matrixWorldInverse.elements] },
+    interactionTargets: observeCanvasInteractionTargets(state.internal.interaction, models, state.camera, viewport, canvas),
+  }
+}
+
+function observeNavigation() {
+  const canvas = document.querySelector<HTMLCanvasElement>('[aria-label="Worlds 3D canvas"] canvas')
+  const statusMatches = [...document.querySelectorAll<HTMLElement>('[role="status"][data-pointer-locked]')]
+  if (statusMatches.length > 1) throw new Error('Ambiguous navigation status observation')
+  const descriptor = Object.getOwnPropertyDescriptor(window, 'worldsAuthoringObserve')
+  return {
+    modes: [...document.querySelectorAll<HTMLButtonElement>('[role="radiogroup"][aria-label="Editor navigation mode"] button[role="radio"]')].map((button) => ({
+      label: button.getAttribute('aria-label') ?? '', checked: button.getAttribute('aria-checked') === 'true', tabIndex: button.tabIndex,
+      focused: document.activeElement === button, disabled: button.disabled,
+    })),
+    status: statusMatches[0]?.textContent?.trim() ?? null,
+    groundOnlyVisible: [...document.querySelectorAll('span')].some((element) => element.textContent?.trim() === 'Ground-only'),
+    pointerLock: { canvasOwned: !!canvas && document.pointerLockElement === canvas, changes: pointerLockChanges, errors: pointerLockErrors, lastChangeAt: lastPointerLockChangeAt, lastErrorAt: lastPointerLockErrorAt },
+    observationCapability: { writable: descriptor?.writable === true, configurable: descriptor?.configurable === true },
   }
 }
 
@@ -212,7 +300,7 @@ function observe(): AuthoringView {
     assetButtons: [...document.querySelectorAll('[aria-label="Assets library"] button.worlds-asset-add')].map((button) => button.getAttribute('aria-label') ?? ''),
     selectValues: [...document.querySelectorAll<HTMLSelectElement>('select[aria-label]')].map((select) => ({ label: select.getAttribute('aria-label') ?? '', value: select.value })),
     viewport: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight },
-    trace: [...trace], untrustedInputs, aiReview: observeAiReview(),
+    trace: [...trace], untrustedInputs, navigation: observeNavigation(), aiReview: observeAiReview(),
   })
 }
 

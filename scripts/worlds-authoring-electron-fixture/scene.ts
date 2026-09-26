@@ -1,19 +1,35 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import type { WorldProjectRepository } from '../../electron/main/world-project-repository.ts'
 import { WORLD_COMMAND_BATCH_SCHEMA, type WorldProjectSnapshotV1 } from '../../src/areas/worlds/core/worldModel.ts'
 import type { WorldCommand, WorldCommandBatchV1 } from '../../src/areas/worlds/core/worldCommands.ts'
 import { buildAddModelEntityCommands, buildAddSceneCommands, createDeterministicWorldEditorIdentityGenerator } from '../../src/areas/worlds/editor/worldEditorCommandBuilders.ts'
-import { NAMES, PROJECT_ID, PROJECT_KEY, SCENE_ID, type SeedEvidence } from './shared.ts'
+import { NAMES, PROJECT_ID, PROJECT_KEY, SCENE_ID, WORLD_SCULPT_WORKSPACE_RELATIVE_PATH, parseWorldSculptInputContract, type SeedEvidence, type WorldSculptInputContract } from './shared.ts'
 
 export const ASSET_PATHS = ['AuthoringFixtures/red-cube.glb', 'AuthoringFixtures/blue-pyramid.glb'] as const
 export const UI_ASSET_PATHS = ['Exports/AuthoringFixtures/red-cube.glb', 'Exports/AuthoringFixtures/blue-pyramid.glb'] as const
+export const WORLD_SCULPT_ASSET_PATHS = [WORLD_SCULPT_WORKSPACE_RELATIVE_PATH] as const
 
 /** Input provisioning only: no canonical project, scene, entity or command is created. */
-export async function provisionAuthoringInputs(workspace: string): Promise<void> {
+export async function provisionAuthoringInputs(
+  workspace: string,
+  worldSculpt?: Readonly<{ contract: WorldSculptInputContract; bytes: Buffer }>,
+): Promise<void> {
   await mkdir(path.join(workspace, 'Exports', 'AuthoringFixtures'), { recursive: true, mode: 0o700 })
   for (const [index, relative] of UI_ASSET_PATHS.entries()) await writeFile(path.join(workspace, relative), makeGlb(index === 1), { flag: 'wx', mode: 0o600 })
+  if (worldSculpt) {
+    const contract = parseWorldSculptInputContract(worldSculpt.contract)
+    const actualSha256 = createHash('sha256').update(worldSculpt.bytes).digest('hex')
+    assert.equal(worldSculpt.bytes.length, contract.bundled.bytes, 'Bundled WorldSculpt size changed before private workspace provisioning')
+    assert.equal(actualSha256, contract.bundled.sha256, 'Bundled WorldSculpt digest changed before private workspace provisioning')
+    assert.ok(worldSculpt.bytes.length >= 12 && worldSculpt.bytes.subarray(0, 4).toString('ascii') === 'glTF'
+      && worldSculpt.bytes.readUInt32LE(4) === 2 && worldSculpt.bytes.readUInt32LE(8) === worldSculpt.bytes.length, 'Bundled WorldSculpt payload is not GLB v2')
+    const destination = path.join(workspace, WORLD_SCULPT_WORKSPACE_RELATIVE_PATH)
+    await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+    await writeFile(destination, worldSculpt.bytes, { flag: 'wx', mode: 0o600 })
+  }
 }
 
 /** Self-contained, non-indexed glTF 2.0 geometry; no external buffers, images, or downloads. */

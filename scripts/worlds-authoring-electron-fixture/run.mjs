@@ -8,7 +8,7 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { captureOwnedDisplayResources, waitForDisplayResourcesAbsent } from './display-resources.mjs'
 
-const reviewedRepositoryHead = '3807bb10ca60e071d183a30392e0c0ed1ae7534e'
+const reviewedRepositoryHead = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 
 export function validateRunnerRepositoryAdmission(build) {
@@ -43,11 +43,38 @@ export function validateRunnerLocalAiConfig(localAi, repositoryAdmission) {
   return localAi
 }
 
+export function validateRunnerWorldSculptInput(build, runtimeMode) {
+  assert.ok(build && typeof build === 'object' && !Array.isArray(build), 'Build manifest record required')
+  if (runtimeMode !== 'worldsculpt-navigation') {
+    assert.equal(build.worldSculptInput, undefined, 'WorldSculpt input is forbidden outside its runtime lane')
+    return null
+  }
+  assert.equal(build.runtimeMode, runtimeMode, 'WorldSculpt runtime mode must match the reviewed manifest')
+  const input = build.worldSculptInput
+  assert.ok(input && typeof input === 'object' && !Array.isArray(input), 'WorldSculpt input contract required')
+  assert.deepEqual(Object.keys(input).sort(), ['schema', 'sourceIdentity', 'bundled', 'workspaceRelativePath'].sort())
+  assert.equal(input.schema, 'modly.worlds-authoring-worldsculpt-input.v1')
+  assert.equal(input.workspaceRelativePath, 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb')
+  const source = input.sourceIdentity, bundled = input.bundled
+  assert.ok(source && typeof source === 'object' && !Array.isArray(source)); assert.deepEqual(Object.keys(source).sort(), ['bytes', 'sha256', 'device', 'inode', 'uid', 'mode'].sort())
+  assert.ok(bundled && typeof bundled === 'object' && !Array.isArray(bundled)); assert.deepEqual(Object.keys(bundled).sort(), ['relativePath', 'bytes', 'sha256'].sort())
+  assert.equal(bundled.relativePath, 'inputs/worldsculpt-scene.glb')
+  assert.ok(Number.isSafeInteger(source.bytes) && source.bytes >= 12); assert.equal(bundled.bytes, source.bytes)
+  assert.match(source.sha256, /^[a-f0-9]{64}$/); assert.equal(bundled.sha256, source.sha256)
+  assert.match(source.device, /^[0-9]+$/); assert.match(source.inode, /^[0-9]+$/)
+  assert.ok(Number.isSafeInteger(source.uid) && source.uid >= 0); assert.ok(Number.isSafeInteger(source.mode) && source.mode >= 0 && source.mode <= 0o777)
+  assert.deepEqual(build.outputs?.[bundled.relativePath], { bytes: bundled.bytes, sha256: bundled.sha256 }, 'Bundled WorldSculpt output pin changed')
+  return input
+}
+
 export function parseRunArguments(args) {
   assert.ok(args.length >= 1 && args.length <= 3, 'One reviewed build and explicitly bounded modes are required')
   assert.match(args[0], /^--reviewed-build-sha256=[a-f0-9]{64}$/)
   if (args.length >= 2) assert.equal(args[1], '--inherited-display', 'No native flags or unreviewed modes are permitted')
-  if (args.length === 3) { assert.equal(args[2], '--local-ai'); return { buildSha256: args[0].split('=')[1], mode: 'inherited-display', runtimeMode: 'local-ai' } }
+  if (args.length === 3) {
+    assert.ok(['--local-ai', '--worldsculpt-navigation'].includes(args[2]), 'No unreviewed runtime modes are permitted')
+    return { buildSha256: args[0].split('=')[1], mode: 'inherited-display', runtimeMode: args[2] === '--local-ai' ? 'local-ai' : 'worldsculpt-navigation' }
+  }
   return { buildSha256: args[0].split('=')[1], mode: args.length === 2 ? 'inherited-display' : 'owned-xvfb' }
 }
 
@@ -208,6 +235,39 @@ export function assertActualAiTerminal(result) {
   }
 }
 
+export function assertActualWorldSculptNavigationTerminal(result) {
+  assert.equal(result?.status, 'PASS', 'WorldSculpt navigation requires an evidence PASS')
+  assert.deepEqual(result.errors, [], 'WorldSculpt navigation retained runtime or cleanup failures')
+  const requiredChecks = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation']
+  for (const name of requiredChecks) assert.equal(result.checks?.filter((check) => check?.name === name && check.status === 'PASS').length, 1, `WorldSculpt navigation check missing: ${name}`)
+  const evidence = result.evidence?.worldSculptNavigation
+  assert.equal(evidence?.schema, 'modly.worldsculpt-navigation-acceptance.v1')
+  assert.equal(evidence.phase, 'complete')
+  const source = evidence.source
+  assert.ok(Number.isSafeInteger(source?.bytes) && source.bytes >= 12)
+  for (const field of ['sourceSha256', 'bundledSha256', 'workspaceSha256', 'servedSha256']) assert.match(source?.[field], /^[a-f0-9]{64}$/)
+  assert.equal(source.sourceSha256, source.bundledSha256); assert.equal(source.sourceSha256, source.workspaceSha256); assert.equal(source.sourceSha256, source.servedSha256)
+  assert.ok(Array.isArray(evidence.inputTrace) && evidence.inputTrace.length > 0 && evidence.inputTrace.length <= 4096)
+  assert.ok(evidence.inputTrace.every((event) => event?.trusted === true), 'Only trusted native navigation input is accepted')
+  assert.ok(evidence.inputTrace.some((event) => event.type === 'pointermove' && (event.movementX !== 0 || event.movementY !== 0)), 'Native relative pointer motion missing')
+  for (const code of ['KeyW', 'Digit3']) assert.ok(evidence.inputTrace.some((event) => event.type === 'keydown' && event.code === code), `Native ${code} evidence missing`)
+  assert.ok(Number.isSafeInteger(evidence.pointerLock?.changes) && evidence.pointerLock.changes >= 2)
+  assert.equal(evidence.pointerLock.errors, 0); assert.equal(evidence.pointerLock.acquired, true)
+  assert.equal(evidence.pointerLock.retainedFlyToRun, true); assert.equal(evidence.pointerLock.released, true)
+  assert.equal(evidence.graphics?.contextLost, false)
+  assert.ok(Array.isArray(evidence.graphics.drawingBuffer) && evidence.graphics.drawingBuffer.length === 2 && evidence.graphics.drawingBuffer.every((value) => Number.isSafeInteger(value) && value > 0))
+  const renderer = typeof evidence.graphics.renderer === 'string' ? evidence.graphics.renderer.trim() : ''
+  const unmaskedRenderer = typeof evidence.graphics.unmaskedRenderer === 'string' ? evidence.graphics.unmaskedRenderer.trim() : ''
+  const rendererEvidence = `${renderer} ${unmaskedRenderer}`
+  assert.ok(renderer, 'Native WebGL renderer evidence required')
+  assert.ok(unmaskedRenderer, 'Positive unmasked hardware GPU identity required')
+  assert.ok(!/(?:swiftshader|llvmpipe|softpipe|lavapipe|software(?: rasterizer)?|microsoft basic render|mesa offscreen|osmesa|virtualbox|virgl)/i.test(rendererEvidence), 'Software renderer evidence is not hardware GPU proof')
+  assert.match(unmaskedRenderer, /\b(?:nvidia|geforce|quadro|tesla|amd|radeon|intel|apple|adreno|mali|powervr|tegra|vivante|videocore|qualcomm|imagination)\b/i, 'Recognized unmasked hardware GPU identity required')
+  assert.deepEqual(evidence.isolation, { canonicalUnchangedDuringNavigation: true, applyCountUnchanged: true, historyUnchanged: true, freshReopenMatched: true, observationCapabilityImmutable: true })
+  assert.deepEqual(evidence.run, { groundOnlyFallback: true, colliderBacked: false, yPinned: true, horizontalMoved: true, rollZero: true })
+  assert.deepEqual(evidence.screenshots, ['12-worldsculpt-inspect-framed.png', '13-worldsculpt-inspect-orbit.png', '14-worldsculpt-fly-locked.png', '15-worldsculpt-run-ground-only.png', '16-worldsculpt-restored-inspect.png'])
+}
+
 export function installOwnedFatalGate(entry, interrupt, limit) {
   let fatalQueued = false, interrupted = false, disposed = false, pending = Buffer.alloc(0)
   const cleanups = [], pipes = [], openPipes = new Set(['stdout', 'stderr'])
@@ -301,6 +361,7 @@ assert.ok(build.compilerDiagnostics.esbuild.every((entry) => Array.isArray(entry
 assert.equal(build.nativeMode ?? 'owned-xvfb', mode, 'Native mode must match the separately reviewed build')
 assert.equal(build.runtimeMode ?? 'authoring', runtimeMode, 'Runtime mode must match the reviewed manifest and CLI')
 const localAi = runtimeMode === 'local-ai' ? build.localAi : null
+const worldSculptInput = validateRunnerWorldSculptInput(build, runtimeMode)
 if (localAi) {
   validateRunnerLocalAiConfig(localAi, repositoryAdmission)
   assert.deepEqual(Object.keys(build.reviewedAiModel ?? {}).sort(), ['name', 'digest', 'toolsReviewed'].sort(), 'Local AI requires an explicitly reviewed immutable identity')
@@ -309,6 +370,9 @@ if (localAi) {
   assert.equal(mode, 'inherited-display'); assert.equal(localAi.mainWatchdogSeconds, 420); assert.equal(localAi.runnerWatchdogSeconds, 430)
   assert.equal(localAi.outerSeconds, 450); assert.equal(localAi.cleanupSeconds, 8); assert.equal(localAi.logBytes, 1048576)
   assert.equal(build.limits.mainWatchdogSeconds, 420); assert.equal(build.limits.runnerWatchdogSeconds, 430); assert.equal(build.limits.proposedOuterSeconds, 450)
+} else if (worldSculptInput) {
+  assert.equal(runtimeMode, 'worldsculpt-navigation'); assert.equal(mode, 'inherited-display')
+  assert.equal(build.localAi, undefined); assert.equal(build.reviewedAiModel, undefined)
 } else { assert.equal(runtimeMode, 'authoring'); assert.equal(build.localAi, undefined) }
 if (mode === 'inherited-display') inheritedDisplayEnvironment(process.env, '', expectedSha)
 for (const [relative, expected] of Object.entries(build.outputs)) {
@@ -339,7 +403,7 @@ const runDirectory = await mkdtemp(path.join(bundle, 'run-')); await chmod(runDi
 const displayNumber = mode === 'owned-xvfb' ? randomInt(200, 60000) : null
 const display = mode === 'inherited-display' ? process.env.DISPLAY : `:${displayNumber}`
 const displayPaths = { socket: `/tmp/.X11-unix/X${displayNumber}`, lock: `/tmp/.X${displayNumber}-lock` }
-const launcher = { schema: 'modly.worlds-authoring-launch.v1', launcherPid: process.pid, runDirectory, buildSha256: expectedSha, mode, ...(localAi ? { runtimeMode } : {}), display, inheritedXauthority: mode === 'inherited-display' ? process.env.XAUTHORITY ?? null : null, startedAt: new Date().toISOString() }
+const launcher = { schema: 'modly.worlds-authoring-launch.v1', launcherPid: process.pid, runDirectory, buildSha256: expectedSha, mode, ...(runtimeMode !== 'authoring' ? { runtimeMode } : {}), display, inheritedXauthority: mode === 'inherited-display' ? process.env.XAUTHORITY ?? null : null, startedAt: new Date().toISOString() }
 await marker.writeFile(`${JSON.stringify(launcher, null, 2)}\n`); await marker.sync(); await marker.close()
 const owned = [], events = [], removedInheritedNames = mode === 'owned-xvfb' ? Object.keys(process.env).sort() : []
 let failed = null, stopping = false, displayAttempted = false
@@ -397,7 +461,8 @@ async function execute() {
     launcher.displayResources = { scope: 'inherited-user-display-not-owned', cleanup: 'NOT_PERMITTED' }
     await log()
     const environment = inheritedDisplayEnvironment(process.env, runDirectory, expectedSha)
-    if (localAi) { environment.WORLD_AUTHORING_RUNTIME_MODE = runtimeMode; environment.WORLD_AUTHORING_LOCAL_AI_CONFIG = JSON.stringify(localAi) }
+    if (runtimeMode !== 'authoring') environment.WORLD_AUTHORING_RUNTIME_MODE = runtimeMode
+    if (localAi) environment.WORLD_AUTHORING_LOCAL_AI_CONFIG = JSON.stringify(localAi)
     const electron = await child('electron', build.electronPath, [path.join(bundle, 'main.cjs')], environment)
     const outcome = await electron.done
     assert.equal(outcome.code, 0, `Native fixture failed; preserve ${runDirectory}`)
@@ -405,6 +470,7 @@ async function execute() {
     assert.equal(result.status, 'PASS', 'Native process exit without an evidence PASS is not success')
     assert.ok(result.checks.every((entry) => entry.status === 'PASS'))
     if (localAi) assertActualAiTerminal(result)
+    if (worldSculptInput) assertActualWorldSculptNavigationTerminal(result)
     return
   }
   for (const name of ['home', 'tmp', 'cache', 'config', 'data', 'runtime']) await mkdir(path.join(runDirectory, name), { mode: 0o700 })

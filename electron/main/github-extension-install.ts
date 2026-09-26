@@ -1,13 +1,21 @@
 import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import axios from 'axios'
 import { buildSync } from 'esbuild'
 import * as tar from 'tar'
-import { parseExtensionManifest, type ListedExtension, type ParsedManifest } from './automation-capabilities.ts'
+import {
+  parseExtensionManifest,
+  projectAgentOnlyNodesForLegacy,
+  type ListedExtension,
+  type ParsedManifest,
+} from './automation-capabilities.ts'
+import { sha256Canonical } from './agent-trust-contracts.ts'
 import { assertSafeExtensionId, buildExtensionBackupPath, resolveExtensionPathWithinRoot } from './extension-path-guard.ts'
+import { assertSupportedVideoNodeShape } from './extension-install-utils.ts'
 
 export type InstallCandidateType = 'model' | 'process'
 
@@ -219,12 +227,7 @@ export async function validateInstallCandidates({ repoDir: _repoDir, sourceRepo,
       source: canonicalizeGitHubRepoUrl(sourceRepo),
     }
 
-    parseExtensionManifest(
-      manifest,
-      candidate.id,
-      new Set(),
-      false,
-    )
+    parseManifestForInstall(manifest, candidate.id, new Set())
 
     return {
       ...candidate,
@@ -443,6 +446,100 @@ async function readManifest(manifestPath: string): Promise<ParsedManifest> {
   return JSON.parse(raw) as ParsedManifest
 }
 
+export function parseManifestForInstall(
+  manifest: ParsedManifest,
+  fallbackId: string,
+  trustedRepos: Set<string>,
+): ListedExtension {
+  const rawAgentNodes = getRawAgentNodes(manifest)
+  if (rawAgentNodes.length === 0) return parseExtensionManifest(manifest, fallbackId, trustedRepos)
+  if (manifest.type !== 'process') {
+    throw new Error(`${fallbackId}: Agent declarations require a process manifest`)
+  }
+  assertUniqueManifestNodeIds(manifest, fallbackId)
+
+  const governed = parseExtensionManifest(
+    manifest, fallbackId, trustedRepos, false, { governedAgentKinds: true },
+  )
+  for (const { index, node: rawNode } of rawAgentNodes) {
+    const normalizedNode = governed.nodes[index]
+    if (!normalizedNode || normalizedNode.id !== rawNode.id || normalizedNode.agent === undefined) {
+      throw new Error(`${fallbackId}/${String(rawNode.id)}: Agent declaration is invalid`)
+    }
+  }
+  return parseExtensionManifest(projectAgentOnlyNodesForLegacy(manifest), fallbackId, trustedRepos)
+}
+
+function getRawAgentNodes(manifest: ParsedManifest): Array<{
+  index: number
+  node: NonNullable<ParsedManifest['nodes']>[number]
+}> {
+  if (!Array.isArray(manifest.nodes)) return []
+  return manifest.nodes.flatMap((node, index) => (
+    node && typeof node === 'object' && Object.hasOwn(node, 'agent') ? [{ index, node }] : []
+  ))
+}
+
+function assertUniqueManifestNodeIds(manifest: ParsedManifest, fallbackId: string): void {
+  const seen = new Set<string>()
+  for (const node of manifest.nodes ?? []) {
+    if (seen.has(node.id)) throw new Error(`${fallbackId}: duplicate node id "${node.id}"`)
+    seen.add(node.id)
+  }
+}
+
+function installManifestAuthorityHash(manifest: ParsedManifest): string {
+  return sha256Canonical({
+    schema: 'modly.github-governed-install-surface.v1',
+    id: manifest.id,
+    type: manifest.type,
+    source: manifest.source,
+    entry: manifest.entry ?? null,
+    nodes: manifest.nodes,
+  })
+}
+
+async function validateCommittedCandidateStructure(
+  destinationDir: string,
+  relativePath: string,
+  manifest: ParsedManifest,
+): Promise<InstallCandidate> {
+  const committedCandidate = createCandidate(destinationDir, relativePath, manifest)
+  validateCandidate(committedCandidate)
+  const entryFile = committedCandidate.type === 'process' ? committedCandidate.entryFile : 'generator.py'
+  const info = await lstat(join(destinationDir, entryFile))
+  if (!info.isFile()) {
+    throw new Error(`${committedCandidate.id}: entry file "${entryFile}" must be a regular file`)
+  }
+  return committedCandidate
+}
+
+async function governedEntryIdentityHash(destinationDir: string, manifest: ParsedManifest): Promise<string> {
+  if (manifest.type !== 'process') throw new Error('Governed Agent process entry is invalid')
+  const entry = manifest.entry ?? 'processor.js'
+  const entryPath = join(destinationDir, entry)
+  const info = await lstat(entryPath, { bigint: true })
+  if (!info.isFile()) throw new Error('Governed Agent process entry must be a regular file')
+  const mode = Number(info.mode & 0o7777n)
+  if (entry === 'processor.py' && (mode & 0o111) !== 0) {
+    throw new Error('Governed Agent processor.py must not be executable')
+  }
+  const content = await readFile(entryPath)
+  return sha256Canonical({
+    schema: 'modly.github-governed-entry-identity.v1',
+    entry,
+    device: info.dev.toString(),
+    inode: info.ino.toString(),
+    uid: info.uid.toString(),
+    gid: info.gid.toString(),
+    mode,
+    size: info.size.toString(),
+    mtimeNs: info.mtimeNs.toString(),
+    ctimeNs: info.ctimeNs.toString(),
+    sha256: createHash('sha256').update(content).digest('hex'),
+  })
+}
+
 function createCandidate(sourceDir: string, relativePath: string, manifest: ParsedManifest): InstallCandidate {
   const type = manifest.type === 'process' ? 'process' : 'model'
   const id = manifest.id ?? fallbackIdFromRelativePath(relativePath)
@@ -489,6 +586,10 @@ function validateCandidate(candidate: InstallCandidate): void {
 
   if (!candidate.manifest.nodes?.length) {
     throw new Error(`${candidate.id}: manifest.json missing required field "nodes" or nodes is empty`)
+  }
+
+  for (const node of candidate.manifest.nodes) {
+    assertSupportedVideoNodeShape(candidate.type, node)
   }
 
   if (candidate.type === 'process') {
@@ -543,9 +644,14 @@ async function settleCommittedCandidate({
     })
   }
 
-  let manifest = await readManifest(join(destinationDir, 'manifest.json'))
-
   try {
+    let manifest = await readManifest(join(destinationDir, 'manifest.json'))
+    if (installManifestAuthorityHash(manifest) !== installManifestAuthorityHash(candidate.manifest)) {
+      throw new Error('Install manifest authority changed before setup')
+    }
+    parseManifestForInstall(manifest, candidate.id, trustedRepos)
+    await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+
     if (candidate.type === 'process') {
       const currentEntry = manifest.entry ?? candidate.entryFile
 
@@ -558,6 +664,14 @@ async function settleCommittedCandidate({
         manifest = { ...manifest, entry: compiledEntry }
         await operations.writeTextFile(join(destinationDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
       }
+
+      parseManifestForInstall(manifest, candidate.id, trustedRepos)
+      await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+
+      const expectedAuthorityHash = installManifestAuthorityHash(manifest)
+      const expectedEntryIdentityHash = getRawAgentNodes(manifest).length > 0
+        ? await governedEntryIdentityHash(destinationDir, manifest)
+        : undefined
 
       const resolvedEntry = manifest.entry ?? candidate.entryFile
       if (resolvedEntry.endsWith('.py') && existsSync(join(destinationDir, 'setup.py'))) {
@@ -575,16 +689,38 @@ async function settleCommittedCandidate({
           onLog: emitSetupLog,
         })
       }
-    } else if (existsSync(join(destinationDir, 'setup.py'))) {
-      await operations.runExtensionSetup({
-        candidate,
-        candidateId: candidate.id,
-        destinationDir,
-        onLog: emitSetupLog,
-      })
-    }
 
-    const extension = parseExtensionManifest(manifest, candidate.id, trustedRepos)
+      manifest = await readManifest(join(destinationDir, 'manifest.json'))
+      await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+      if (installManifestAuthorityHash(manifest) !== expectedAuthorityHash) {
+        throw new Error('Install manifest authority changed during setup')
+      }
+      parseManifestForInstall(manifest, candidate.id, trustedRepos)
+      if (expectedEntryIdentityHash !== undefined) {
+        const currentEntryIdentityHash = await governedEntryIdentityHash(destinationDir, manifest)
+        if (currentEntryIdentityHash !== expectedEntryIdentityHash) {
+          throw new Error('Governed Agent process entry changed during setup')
+        }
+      }
+    } else {
+      const expectedAuthorityHash = installManifestAuthorityHash(manifest)
+      if (existsSync(join(destinationDir, 'setup.py'))) {
+        await operations.runExtensionSetup({
+          candidate,
+          candidateId: candidate.id,
+          destinationDir,
+          onLog: emitSetupLog,
+        })
+      }
+
+      manifest = await readManifest(join(destinationDir, 'manifest.json'))
+      await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+      if (installManifestAuthorityHash(manifest) !== expectedAuthorityHash) {
+        throw new Error('Install manifest authority changed during setup')
+      }
+      parseManifestForInstall(manifest, candidate.id, trustedRepos)
+    }
+    const extension = parseManifestForInstall(manifest, candidate.id, trustedRepos)
     return {
       installed: {
         extensionId: candidate.id,

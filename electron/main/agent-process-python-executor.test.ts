@@ -9,11 +9,13 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   utimes,
   writeFile,
 } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -48,9 +50,49 @@ const processTestLimits = {
   terminationGraceMs: 500,
 } as const
 
+let pathnameUnixListenerCapability: Promise<boolean> | undefined
+
+function hasPathnameUnixListenerCapability(): Promise<boolean> {
+  pathnameUnixListenerCapability ??= (async () => {
+    const root = await mkdtemp(join(tmpdir(), 'modly-agent-python-unix-listener-'))
+    const socketPath = join(root, 'probe.sock')
+    const server = createServer()
+    try {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error) => {
+            server.off('listening', onListening)
+            reject(error)
+          }
+          const onListening = () => {
+            server.off('error', onError)
+            resolve()
+          }
+          server.once('error', onError)
+          server.once('listening', onListening)
+          server.listen(socketPath)
+        })
+        return true
+      } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+        if (code === 'EPERM' || code === 'EACCES') return false
+        throw error
+      }
+    } finally {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error ? reject(error) : resolve())
+        })
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })()
+  return pathnameUnixListenerCapability
+}
+
 const fakeBubblewrap = String.raw`#!${process.execPath}
 const { createHash } = require('node:crypto')
-const { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync } = require('node:fs')
+const { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync, writeSync } = require('node:fs')
 const { join } = require('node:path')
 const args = process.argv.slice(2)
 const triple = (flag, destination) => {
@@ -60,8 +102,8 @@ const triple = (flag, destination) => {
   throw new Error('missing sandbox binding: ' + destination)
 }
 if (!args.includes('--unshare-all') || !args.includes('--disable-userns')) throw new Error('network namespace is not isolated')
-if (args.slice(-3).join(' ') !== '-- /runtime/bin/python /app/process.pyz') throw new Error('approved zipapp launch changed')
-const entryFd = triple('--ro-bind-fd', '/app/process.pyz')
+if (args.slice(-5).join(' ') !== '-- /runtime/bin/python -I -B /app/processor.py') throw new Error('approved Python launch changed')
+const entryFd = triple('--ro-bind-fd', '/app/processor.py')
 const resourceFd = triple('--ro-bind-fd', '/resources/0')
 const inputFd = triple('--ro-bind-fd', '/input/0')
 const snapshotSource = triple('--ro-bind', '/runtime')
@@ -69,47 +111,43 @@ const outputSource = triple('--bind', '/output')
 writeFileSync(readlinkSync(process.argv[1]) + '.invoked', 'yes')
 if (!readFileSync('/proc/self/fd/' + entryFd).length) throw new Error('entry fd is empty')
 if (!readFileSync(snapshotSource + '/bin/python').length) throw new Error('snapshot interpreter is missing')
-let serialized = ''
-process.stdin.setEncoding('utf8')
-process.stdin.on('data', (chunk) => { serialized += chunk })
-process.stdin.on('end', async () => {
-  try {
-    const request = JSON.parse(serialized)
-    if (request.trustedContext.dirs.output !== '/output') throw new Error('host output path leaked')
-    if (request.trustedContext.resources[0].fdPath !== '/resources/0') throw new Error('resource mount changed')
-    if (request.trustedContext.inputArtifacts[0].fdPath !== '/input/0') throw new Error('input mount changed')
-    if (request.trustedContext.modelAccess) {
-      const gatewaySource = triple('--ro-bind', '/run/modly/model')
-      if (!lstatSync(gatewaySource + '/gateway.sock').isSocket()) throw new Error('model gateway socket was not FD-mounted')
-      if (request.trustedContext.modelAccess.socketPath !== '/run/modly/model/gateway.sock') throw new Error('sandbox socket path changed')
-      if (request.trustedContext.modelAccess.model !== 'approved') throw new Error('model sentinel changed')
-      if (!request.trustedContext.modelAccess.bearerToken) throw new Error('model bearer missing')
-      if ('endpoint' in request.trustedContext || JSON.stringify(request.trustedContext).includes('127.0.0.1')) throw new Error('raw model endpoint leaked')
-      if (!request.trustedContext.proposalHash) throw new Error('proposal binding missing')
-    }
-    const resource = readFileSync('/proc/self/fd/' + resourceFd, 'utf8').trim()
-    const input = readFileSync('/proc/self/fd/' + inputFd, 'utf8').trim()
-    writeFileSync(join(outputSource, 'started'), 'ready')
-    if (request.arguments.params.mode === 'delay') {
-      const release = join(outputSource, 'release')
-      const deadline = Date.now() + 60000
-      while (!existsSync(release) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10))
-      }
-      if (!existsSync(release)) throw new Error('timed out waiting for source-drift test release')
-    }
-    const body = Buffer.from(resource + ':' + input)
-    writeFileSync(join(outputSource, 'result.txt'), body)
-    process.stdout.write(JSON.stringify({
-      schema: 'modly.agent-process-result.v1', type: 'result', artifacts: [{
-        path: 'result.txt', kind: 'text', mediaType: 'text/plain', sizeBytes: body.length,
-        sha256: createHash('sha256').update(body).digest('hex'),
-      }],
-    }) + '\n')
-  } catch (error) {
-    process.stderr.write(String(error && error.stack || error))
-    process.exitCode = 1
+const run = async () => {
+  const request = JSON.parse(readFileSync(0, 'utf8'))
+  if (request.trustedContext.dirs.output !== '/output') throw new Error('host output path leaked')
+  if (request.trustedContext.resources[0].fdPath !== '/resources/0') throw new Error('resource mount changed')
+  if (request.trustedContext.inputArtifacts[0].fdPath !== '/input/0') throw new Error('input mount changed')
+  if (request.trustedContext.modelAccess) {
+    const gatewaySource = triple('--ro-bind', '/run/modly/model')
+    if (!lstatSync(gatewaySource + '/gateway.sock').isSocket()) throw new Error('model gateway socket was not FD-mounted')
+    if (request.trustedContext.modelAccess.socketPath !== '/run/modly/model/gateway.sock') throw new Error('sandbox socket path changed')
+    if (request.trustedContext.modelAccess.model !== 'approved') throw new Error('model sentinel changed')
+    if (!request.trustedContext.modelAccess.bearerToken) throw new Error('model bearer missing')
+    if ('endpoint' in request.trustedContext || JSON.stringify(request.trustedContext).includes('127.0.0.1')) throw new Error('raw model endpoint leaked')
+    if (!request.trustedContext.proposalHash) throw new Error('proposal binding missing')
   }
+  const resource = readFileSync('/proc/self/fd/' + resourceFd, 'utf8').trim()
+  const input = readFileSync('/proc/self/fd/' + inputFd, 'utf8').trim()
+  writeFileSync(join(outputSource, 'started'), 'ready')
+  if (request.arguments.params.mode === 'delay') {
+    const release = join(outputSource, 'release')
+    const deadline = Date.now() + 60000
+    while (!existsSync(release) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    if (!existsSync(release)) throw new Error('timed out waiting for source-drift test release')
+  }
+  const body = Buffer.from(resource + ':' + input)
+  writeFileSync(join(outputSource, 'result.txt'), body)
+  writeSync(1, Buffer.from(JSON.stringify({
+    schema: 'modly.agent-process-result.v1', type: 'result', artifacts: [{
+      path: 'result.txt', kind: 'text', mediaType: 'text/plain', sizeBytes: body.length,
+      sha256: createHash('sha256').update(body).digest('hex'),
+    }],
+  }) + '\n'))
+}
+run().catch((error) => {
+  writeSync(2, Buffer.from(String(error && error.stack || error)))
+  process.exitCode = 1
 })
 `
 
@@ -140,7 +178,7 @@ async function fixture(withModelAccess = false) {
   await mkdir(join(extensionDir, 'assets'), { recursive: true })
   await mkdir(builtinDir, { recursive: true })
   await mkdir(workspaceDir, { recursive: true })
-  await writeFile(join(extensionDir, 'processor.pyz'), 'PK\u0003\u0004approved-zipapp')
+  await writeFile(join(extensionDir, 'processor.py'), 'print("approved source")\n')
   await writeFile(join(extensionDir, 'assets', 'runtime.txt'), 'resource')
   await writeFile(baseInterpreter, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   await symlink('python3', join(venvDir, 'bin', 'python'))
@@ -157,7 +195,7 @@ async function fixture(withModelAccess = false) {
   await writeFile(bwrapPath, fakeBubblewrap, { mode: 0o700 })
   await chmod(bwrapPath, 0o700)
   await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
-    id: 'python-tools', name: 'Python Tools', version: '1.0.0', type: 'process', entry: 'processor.pyz',
+    id: 'python-tools', name: 'Python Tools', version: '1.0.0', type: 'process', entry: 'processor.py',
     nodes: [{
       id: 'generate', name: 'Generate', input: 'text', output: 'text',
       params_schema: [{
@@ -166,10 +204,10 @@ async function fixture(withModelAccess = false) {
       }],
       agent: {
         schema: 'modly.agent-capability-declaration.v1', capability_id: 'python-tools/generate',
-        display_name: 'Run Python', description: 'Run an approved Python zipapp.',
+        display_name: 'Run Python', description: 'Run an approved Python process.',
         approval: { required: true, scope: 'single_action' },
         process: {
-          schema: 'modly.agent-process.v1', runtimeFiles: ['processor.pyz'], resourceFiles: ['assets/runtime.txt'],
+          schema: 'modly.agent-process.v1', runtimeFiles: ['processor.py'], resourceFiles: ['assets/runtime.txt'],
           runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
           ...(withModelAccess ? { modelAccess: {
             schema: 'modly.agent-model-access.v1', profile: 'ollama-responses-json-v1',
@@ -280,11 +318,9 @@ function request(
   })
 }
 
-test('declared model access is default-denied without a provider and an injected lease is FD-mounted then revoked', async (t) => {
-  if (process.platform !== 'linux') return t.skip('Linux proc-fd and pathname AF_UNIX semantics are required')
+test('declared model access is default-denied without a provider', async (t) => {
+  if (process.platform !== 'linux') return t.skip('Linux proc-fd semantics are required')
   const value = await fixture(true)
-  let hostSocketPath = ''
-  let modelResolverCalls = 0
   try {
     const common: AgentProcessExecutorOptions = {
       getWorkspaceRoot: () => value.workspaceDir,
@@ -293,7 +329,7 @@ test('declared model access is default-denied without a provider and an injected
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => value.baseInterpreter,
       limits: processTestLimits,
@@ -306,7 +342,30 @@ test('declared model access is default-denied without a provider and an injected
       createAgentProcessExecutor({ ...common, modelAccessReadiness: async () => true }).ensureReady(value.capability),
       (error: unknown) => error instanceof AgentProcessExecutorError && error.code === 'model_binding_unavailable',
     )
+  } finally {
+    await makeWritableAndRemove(value.root)
+  }
+})
 
+test('an injected model access lease is FD-mounted then revoked', async (t) => {
+  if (process.platform !== 'linux') return t.skip('Linux proc-fd and pathname AF_UNIX semantics are required')
+  if (!await hasPathnameUnixListenerCapability()) return t.skip('Pathname AF_UNIX listeners are unavailable')
+  const value = await fixture(true)
+  let hostSocketPath = ''
+  let modelResolverCalls = 0
+  try {
+    const common: AgentProcessExecutorOptions = {
+      getWorkspaceRoot: () => value.workspaceDir,
+      getPrivateTempRoot: () => value.privateTempRoot,
+      getRuntimeSnapshotRoot: () => value.snapshotRoot,
+      pythonSandboxReadiness: async () => true,
+      bwrapPath: value.bwrapPath,
+      systemPaths: ['/usr'],
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
+      resolveCurrentModel: async () => model,
+      resolvePythonExecutable: () => value.baseInterpreter,
+      limits: processTestLimits,
+    }
     const executor = createAgentProcessExecutor({
       ...common,
       modelAccessReadiness: async () => true,
@@ -355,7 +414,7 @@ test('declared model access revalidates the provider model before acquiring a ga
       modelAccessReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => {
         modelResolverCalls += 1
         throw new Error('selected model provider is unavailable')
@@ -378,7 +437,7 @@ test('declared model access revalidates the provider model before acquiring a ga
   }
 })
 
-test('declared Python runtime executes only through the snapshotted zipapp sandbox with FD authority', async (t) => {
+test('declared Python runtime executes only through the snapshotted Python source sandbox with FD authority', async (t) => {
   if (process.platform !== 'linux') return t.skip('Linux proc-fd semantics are required')
   const value = await fixture()
   let selectorCalls = 0
@@ -390,7 +449,7 @@ test('declared Python runtime executes only through the snapshotted zipapp sandb
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => { selectorCalls += 1; return value.baseInterpreter },
       limits: processTestLimits,
@@ -404,6 +463,50 @@ test('declared Python runtime executes only through the snapshotted zipapp sandb
     await result.rollback()
   } finally {
     await makeWritableAndRemove(value.root)
+  }
+})
+
+test('bound processor.py path replacement and symlink swaps fail before sandbox launch', async (t) => {
+  if (process.platform !== 'linux') return t.skip('Linux proc-fd semantics are required')
+  for (const scenario of ['replacement', 'symlink'] as const) {
+    await t.test(scenario, async () => {
+      const value = await fixture()
+      try {
+        const executor = createAgentProcessExecutor({
+          getWorkspaceRoot: () => value.workspaceDir,
+          getPrivateTempRoot: () => value.privateTempRoot,
+          getRuntimeSnapshotRoot: () => value.snapshotRoot,
+          pythonSandboxReadiness: async () => true,
+          bwrapPath: value.bwrapPath,
+          systemPaths: ['/usr'],
+          resolveTarget: async () => ({
+            capability: value.capability,
+            extensionDir: value.extensionDir,
+            entry: 'processor.py',
+          }),
+          resolveCurrentModel: async () => model,
+          resolvePythonExecutable: () => value.baseInterpreter,
+          limits: processTestLimits,
+        })
+        const entryPath = join(value.extensionDir, 'processor.py')
+        if (scenario === 'replacement') {
+          const replacementPath = join(value.extensionDir, 'processor.replacement')
+          await writeFile(replacementPath, 'print("replacement")\n')
+          await rename(replacementPath, entryPath)
+        } else {
+          const originalPath = join(value.extensionDir, 'processor.original.py')
+          await rename(entryPath, originalPath)
+          await symlink('processor.original.py', entryPath)
+        }
+        await assert.rejects(
+          executor.execute(request(value.capability, value.input, `action-python-${scenario}`, 'success')),
+          (error: unknown) => error instanceof AgentProcessExecutorError && error.code === 'capability_stale',
+        )
+        await assert.rejects(access(`${value.bwrapPath}.invoked`))
+      } finally {
+        await makeWritableAndRemove(value.root)
+      }
+    })
   }
 })
 
@@ -421,7 +524,7 @@ test('a changed Electron-selected base interpreter is rejected before the fixed 
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => selected,
       limits: processTestLimits,
@@ -456,7 +559,7 @@ test('pre-transfer Python sandbox failures release their prepared snapshot lease
           pythonSandboxReadiness: async () => true,
           bwrapPath: value.bwrapPath,
           systemPaths: ['/usr'],
-          resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+          resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
           resolveCurrentModel: async () => model,
           resolvePythonExecutable: () => value.baseInterpreter,
           limits: processTestLimits,
@@ -512,7 +615,7 @@ test('normal returned Python sandbox cleanup releases one lease without consumin
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => value.baseInterpreter,
       limits: processTestLimits,
@@ -547,7 +650,7 @@ test('running and queued Python snapshot leases survive concurrent cache sweepin
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => value.baseInterpreter,
       limits: processTestLimits,
@@ -597,7 +700,7 @@ test('post-execution source drift denies Python runtime publication', async (t) 
       pythonSandboxReadiness: async () => true,
       bwrapPath: value.bwrapPath,
       systemPaths: ['/usr'],
-      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.pyz' }),
+      resolveTarget: async () => ({ capability: value.capability, extensionDir: value.extensionDir, entry: 'processor.py' }),
       resolveCurrentModel: async () => model,
       resolvePythonExecutable: () => value.baseInterpreter,
       limits: processTestLimits,

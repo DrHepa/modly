@@ -82,10 +82,11 @@ test('preflight accepts scene outputs for scene workflow consumers', () => {
   assert.deepEqual(issues, [])
 })
 
-test('preflight accepts video outputs for video workflow consumers', () => {
+test('preflight allows model video outputs and fails closed for process video IO', () => {
   const workflow = createWorkflow([
     createNode('video-source', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} }),
     createNode('video-consumer', 'extensionNode', { extensionId: 'ext/video-consumer', enabled: true, params: {} }),
+    createNode('named-video-consumer', 'extensionNode', { extensionId: 'ext/named-video-consumer', enabled: true, params: {} }),
   ])
 
   const issues = validateWorkflowPreflight(workflow, [
@@ -101,11 +102,34 @@ test('preflight accepts video outputs for video workflow consumers', () => {
       nodeId: 'video-consumer',
       name: 'Video Consumer',
       input: 'video',
-      output: 'video',
+      output: 'mesh',
+    }),
+    createProcessExtension({
+      id: 'ext/named-video-consumer',
+      nodeId: 'named-video-consumer',
+      name: 'Named Video Consumer',
+      input: 'image',
+      output: 'mesh',
+      inputs: [{ name: 'clip', type: 'video' }],
     }),
   ])
 
-  assert.deepEqual(issues, [])
+  assert.equal(issues.some((issue: { key: string }) => issue.key === 'video-source:unsupported-video-shape'), false)
+  assert.equal(issues.some((issue: { key: string }) => issue.key === 'video-consumer:unsupported-video-shape'), true)
+  assert.equal(issues.some((issue: { key: string }) => issue.key === 'named-video-consumer:unsupported-video-shape'), true)
+
+  const modelWorkflow = createWorkflow([
+    createNode('image-source', 'imageNode', { enabled: true, params: { filePath: 'Workflows/Inputs/image.png' } }),
+    createNode('image-to-video', 'extensionNode', { extensionId: 'ext/image-to-video', enabled: true, params: {} }),
+  ])
+  const modelIssues = validateWorkflowPreflight(modelWorkflow, [createModelExtension({
+    id: 'ext/image-to-video',
+    nodeId: 'image-to-video',
+    name: 'Image To Video',
+    input: 'image',
+    output: 'video',
+  })])
+  assert.deepEqual(modelIssues, [])
 })
 
 test('preflight accepts a Video source connected to a video-to-mesh model', () => {

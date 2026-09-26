@@ -11,9 +11,10 @@ import type { ArtifactKind } from '../../shared/types/artifacts.ts'
 type NodeOutput = {
   filePath?: string
   text?: string
+  outputType?: string
 }
 
-const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'])
 
 function asArtifactKind(value: string | undefined): ArtifactKind | undefined {
   return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
@@ -64,6 +65,21 @@ function getProcessNodeId(node: WFNode, extension: WorkflowExtension | undefined
   return extensionId.split('/')[1] ?? ''
 }
 
+function processVideoError(): Error {
+  return new Error('Process extensions do not support video inputs or outputs')
+}
+
+function assertNoProcessVideoShape(extension: WorkflowExtension | undefined): void {
+  if (!extension || extension.type === 'model') return
+  if (
+    extension.input === 'video'
+    || extension.output === 'video'
+    || (extension.inputs ?? []).some((port) => port.type === 'video')
+  ) {
+    throw processVideoError()
+  }
+}
+
 export function buildProcessExecutionInput({
   node,
   nodes,
@@ -75,6 +91,7 @@ export function buildProcessExecutionInput({
   const extensionId = typeof node.data.extensionId === 'string' ? node.data.extensionId : ''
   const extension = getWorkflowExtension(extensionId, allExtensions)
   const nodeId = getProcessNodeId(node, extension)
+  assertNoProcessVideoShape(extension)
   const incomingEdges = edges.filter((edge) => edge.target === node.id)
   const targetPorts = extension ? getProcessTargetPorts(extension) : []
   const hasNamedInputs = targetPorts.some((port) => !port.isLegacy)
@@ -86,12 +103,16 @@ export function buildProcessExecutionInput({
     for (const edge of incomingEdges) {
       const sourceNode = nodes.find((candidate) => candidate.id === edge.source)
       const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
+      void sourceExtensionId
       const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs)
+      const sourceType = getNodeOutputType(sourceNode, allExtensions) ?? sourceOutput?.outputType
+      if (sourceType === 'video') throw processVideoError()
       if (sourceOutput?.filePath !== undefined) filePath = sourceOutput.filePath
       if (sourceOutput?.text !== undefined) text = sourceOutput.text
     }
 
     if (filePath === undefined && text === undefined) {
+      if (previousNodeOutput?.outputType === 'video') throw processVideoError()
       filePath = previousNodeOutput?.filePath
       text = previousNodeOutput?.text
     }
@@ -108,12 +129,15 @@ export function buildProcessExecutionInput({
 
     const sourceNode = nodes.find((candidate) => candidate.id === edge.source)
     const sourceExtensionId = typeof sourceNode?.data.extensionId === 'string' ? sourceNode.data.extensionId : ''
+    void sourceExtensionId
     const sourceOutput = resolveWorkflowEdgeOutput(edge, nodeOutputs)
     if (!sourceOutput || (sourceOutput.filePath === undefined && sourceOutput.text === undefined)) continue
 
     const type = getNodeOutputType(sourceNode, allExtensions)
+      ?? asArtifactKind(sourceOutput.outputType)
       ?? asArtifactKind(targetPort.type)
     if (!type) continue
+    if (type === 'video') throw processVideoError()
 
     const portName = targetPort.name
     if (!portName) continue

@@ -65,3 +65,14 @@ class GenerateFromSceneRequest(BaseModel):
     enable_texture: bool = False
     texture_resolution: int = 1024
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateFromArtifactRequest(BaseModel):
+    input_kind: Literal["capture", "scene", "video"]
+    input_path: str
+    model_id: str
+    collection: str = "Default"
+    remesh: str = "none"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
+    params: dict[str, Any] = Field(default_factory=dict)

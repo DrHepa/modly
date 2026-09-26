@@ -54,8 +54,10 @@ class BaseGenerator(ABC):
         self.hf_downloads:      list = []
         self.https_downloads:   list = []
         self.hf_skip_prefixes: list = []
+        self.hf_include_prefixes: list = []
         self.download_check:   str  = ""   # relative path to check in model_dir
         self._params_schema:   list = []   # params declared in the manifest
+        self.shared_model_dirs: dict[str, Path] = {}
 
     # ------------------------------------------------------------------ #
     # Model lifecycle
@@ -81,7 +83,9 @@ class BaseGenerator(ABC):
 
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
-            return (self.model_dir / self.download_check).exists()
+            from services.download_check import safe_download_check_exists
+
+            return safe_download_check_exists(self.model_dir, self.download_check)
         return self.model_dir.exists() and any(self.model_dir.iterdir())
 
     @abstractmethod
@@ -191,6 +195,7 @@ class BaseGenerator(ABC):
         snapshot_download(
             repo_id=self.hf_repo,
             local_dir=str(self.model_dir),
+            allow_patterns=list(self.hf_include_prefixes) or None,
             ignore_patterns=ignore,
         )
         print(f"[{self.__class__.__name__}] Download complete.")

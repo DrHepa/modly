@@ -10,6 +10,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from services.video_input import validate_video_input, video_snapshot_to_dict
+
 
 _tmp_ext_dir = tempfile.mkdtemp(prefix="modly-runner-test-")
 Path(_tmp_ext_dir, "manifest.json").write_text("{}", encoding="utf-8")
@@ -51,12 +53,14 @@ class RunnerTests(unittest.TestCase):
         manifest = {
             "hf_repo": "top/repo",
             "hf_skip_prefixes": ["top/"],
+            "hf_include_prefixes": ["top-include/"],
             "download_check": "top/file",
             "params_schema": [{"id": "top"}],
         }
         node = {
             "hf_repo": "node/repo",
             "hf_skip_prefixes": ["node/"],
+            "hf_include_prefixes": ["node-include/"],
             "download_check": "node/file",
             "params_schema": [{"id": "node"}],
         }
@@ -65,6 +69,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(gen.hf_repo, "node/repo")
         self.assertEqual(gen.hf_skip_prefixes, ["node/"])
+        self.assertEqual(gen.hf_include_prefixes, ["node-include/"])
         self.assertEqual(gen.download_check, "node/file")
         self.assertEqual(gen._params_schema, [{"id": "node"}])
 
@@ -73,6 +78,7 @@ class RunnerTests(unittest.TestCase):
         manifest = {
             "hf_repo": "top/repo",
             "hf_skip_prefixes": ["top/"],
+            "hf_include_prefixes": ["top-include/"],
             "download_check": "top/file",
             "params_schema": [{"id": "top"}],
         }
@@ -81,6 +87,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(gen.hf_repo, "top/repo")
         self.assertEqual(gen.hf_skip_prefixes, ["top/"])
+        self.assertEqual(gen.hf_include_prefixes, ["top-include/"])
         self.assertEqual(gen.download_check, "top/file")
         self.assertEqual(gen._params_schema, [{"id": "top"}])
 
@@ -293,15 +300,15 @@ class GenerationInputProtocolTests(unittest.TestCase):
     def test_typed_video_kind_must_match_declared_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "does not match"):
             runner._resolve_generation_input(
-                {"input": {"kind": "video", "path": "/tmp/clip.mp4"}},
+                {"input": {"kind": "video", "path": "/tmp/clip.mp4", "snapshot": {}}},
                 declared_input="image",
             )
 
-    def test_main_delivers_validated_video_path_to_generator(self) -> None:
+    def test_main_preserves_validated_video_envelope_to_generator(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="modly-runner-workspace-"))
-        video_path = workspace_dir / "Workflows" / "clip.capture"
+        video_path = workspace_dir / "Workflows" / "clip.mp4"
         video_path.parent.mkdir(parents=True)
-        video_path.write_bytes(b"video")
+        video_path.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2")
         manifest = {
             "id": "bundle/video-node",
             "generator_class": "FakeGenerator",
@@ -319,17 +326,26 @@ class GenerationInputProtocolTests(unittest.TestCase):
                 return []
 
             def generate(self, generation_input, params, progress_cb, cancel_event):
+                self_input_kind = getattr(generation_input, "kind", None)
+                self_input_path = getattr(generation_input, "path", None)
+                if self_input_kind != "video" or self_input_path != video_path.resolve():
+                    raise AssertionError("Scene video input must be a typed video envelope")
                 received.append((generation_input, params))
                 return workspace_dir / "output.glb"
 
             def unload(self):
                 pass
 
+        _, snapshot = validate_video_input(workspace_dir, "Workflows/clip.mp4")
         messages = iter([
             {
                 "action": "generate",
                 "id": "video-request",
-                "input": {"kind": "video", "path": str(video_path)},
+                "input": {
+                    "kind": "video",
+                    "path": str(video_path),
+                    "snapshot": video_snapshot_to_dict(snapshot),
+                },
                 "params": {"quality": "draft"},
             },
             {"action": "shutdown", "id": None},
@@ -346,7 +362,11 @@ class GenerationInputProtocolTests(unittest.TestCase):
              ):
             runner.main()
 
-        self.assertEqual(received, [(video_path.resolve(), {"quality": "draft"})])
+        self.assertEqual(len(received), 1)
+        self.assertEqual(getattr(received[0][0], "kind", None), "video")
+        self.assertEqual(getattr(received[0][0], "path", None), video_path.resolve())
+        self.assertIsNone(getattr(received[0][0], "snapshot", None))
+        self.assertEqual(received[0][1], {"quality": "draft"})
         self.assertTrue(any(
             message == {
                 "type": "done",

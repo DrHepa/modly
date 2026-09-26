@@ -14,6 +14,7 @@ const BASE_TYPESCRIPT_TESTS = [
   'src/shared/utils/agentModels.test.ts',
   'src/shared/stores/agentSessionsStore.test.ts',
   'src/shared/stores/navStore.test.ts',
+  'src/shared/components/ui/Tooltip.test.ts',
   'src/areas/generate/agentDirectActions.test.ts',
   'src/areas/generate/assetLibraryProjection.test.ts',
   'src/areas/generate/assetLibraryService.test.ts',
@@ -353,7 +354,7 @@ test('canonical main requires an ordinary-Node full proof before per-file dispat
     events.push('mock-proof-end')
   } })
   const plan = await createNodeTestPlan()
-  assert.equal(plan.length, 213)
+  assert.equal(plan.length, 220)
   assert.deepEqual(events, ['mock-proof-start', 'mock-proof-end', ...plan.map(({ file }) => file)])
   assert.equal(starts, plan.length)
   assert.equal(output.length, plan.length)
@@ -473,6 +474,7 @@ test('deterministic runner includes every canonical suite once and runs both pha
   assert.equal(mjsFiles.filter((file) => file === 'scripts/platform-contract.test.mjs').length, 1)
   assert.equal(mjsFiles.filter((file) => file === 'scripts/test-runner-contract.test.mjs').length, 1)
   assert.equal(mjsFiles.filter((file) => file === 'scripts/run-typechecks.test.mjs').length, 1)
+  assert.equal(mjsFiles.filter((file) => file === 'scripts/setup-hooks.test.mjs').length, 1)
   assert.equal(mjsFiles.filter((file) => file === 'scripts/world-ffmpeg-custody-convergence.test.mjs').length, 1)
   assert.equal(mjsFiles.filter((file) => file === 'scripts/world-ffmpeg-supply-chain.test.mjs').length, 1)
   assert.equal(mjsFiles.filter((file) => file === 'scripts/worlds-codex-cli-package.test.mjs').length, 1)
@@ -507,11 +509,11 @@ test('Worlds script registration preserves canonical membership and includes Nod
   const aiFiles = ['src/areas/worlds/core/worldAiContract.test.ts', 'src/areas/worlds/editor/worldAiChatAdapter.test.ts',
     'src/areas/worlds/components/WorldsAiDrawer.test.ts', 'electron/main/automation-http-bridge.test.ts', 'scripts/worlds-ai-electron-fixture.test.mjs']
   for (const file of aiFiles) assert.equal(plan.filter((entry) => entry.file === file).length, 1, file)
-  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 208)
-  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 212)
-  assert.equal(plan.length, 213)
-  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 181)
-  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 32)
+  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 215)
+  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 219)
+  assert.equal(plan.length, 220)
+  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 182)
+  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 38)
   assert.equal(new Set(plan.map(({ file }) => file)).size, plan.length)
   assert.equal((await collectWorldsTypeScriptTests()).length, 91)
 })

@@ -30,13 +30,14 @@ The node's `agent` declaration remains a
 
 Governed PROCESS v1 is Linux-only. `runtimeFiles` must contain exactly the
 manifest `entry`, which must be one self-contained ESM JavaScript bundle
-(`.js`/`.mjs`) or Python zipapp (`.pyz`). Multiple loose code files, package
-trees, relative imports, implicit dependencies, and ordinary `.py` scripts are
-default-denied. JavaScript is loaded by a fixed host launcher from the inherited
-entry FD, so it must not depend on its extension pathname.
+(`.js`/`.mjs`) or the exact root Python source `processor.py`. Multiple loose
+code files, sibling source packages, relative source imports, implicit
+dependencies, and other Python entry names are default-denied. JavaScript is
+loaded by a fixed host launcher from the inherited entry FD, so it must not
+depend on its extension pathname.
 
-An extension may opt a `.pyz` entry into its setup-managed virtual environment
-with this exact declaration:
+The `processor.py` entry requires its setup-managed virtual environment with
+this exact declaration:
 
 ```json
 {
@@ -47,7 +48,7 @@ with this exact declaration:
 }
 ```
 
-This declaration is valid only for `.pyz`. Its source root is fixed to
+This declaration is valid only for the exact `processor.py` entry. Its source root is fixed to
 `<extension>/venv`. Bounded relative links that resolve within that tree are
 allowed, including layouts such as `lib64 -> lib`; cycles, dangling links, and
 escapes are rejected. The `bin/python` chain may terminate outside the tree only
@@ -64,7 +65,7 @@ capability from the runnable inventory.
 
 ### Optional governed local-model access
 
-A Python zipapp may request this exact profile:
+The governed `processor.py` entry may request this exact profile:
 
 ```json
 {
@@ -239,11 +240,10 @@ persistence.
 The child is started with direct argv, `shell: false`, a detached owned process
 group, inherited read-only file descriptors, a minimal environment, and the
 private output directory as cwd/HOME/TMP. JavaScript uses the packaged runtime
-in Node mode with a fixed FD-consuming ESM launcher. Legacy Python zipapps may
-use Modly's configured host Python. A zipapp declaring
-`extension-python-venv-v1` is always launched as
-`/runtime/bin/python /app/process.pyz`; launcher selection never falls back to
-the API Python, another host Python, cloud execution, renderer
+in Node mode with a fixed FD-consuming ESM launcher. The exact `processor.py`
+entry always requires `extension-python-venv-v1` and is launched as
+`/runtime/bin/python -I -B /app/processor.py`; launcher selection never falls
+back to the API Python, another host Python, cloud execution, renderer
 `extensions.runProcess`, or the legacy runner.
 
 For the declared runtime, main materializes a content-addressed snapshot under
@@ -261,7 +261,9 @@ The approved entry, resources, inputs, snapshot root, and private output root
 remain FD-authorized. Bubblewrap mounts the snapshot read-only at `/runtime`,
 binds the private output at `/output`, mounts resources and inputs read-only,
 unshares the network and other namespaces, clears the environment, and executes
-`/runtime/bin/python /app/process.pyz`. Main revalidates the source venv,
+`/runtime/bin/python -I -B /app/processor.py`. The extension root is not
+mounted, so Python imports are limited to the standard library and the
+identity-bound extension venv. Main revalidates the source venv,
 completed snapshot, trusted bubblewrap executable, bundle/resources, inputs,
 and private output directory immediately before launch and again after a
 successful child exit, before publication.

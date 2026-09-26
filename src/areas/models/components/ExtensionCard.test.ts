@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -137,6 +137,12 @@ test('ExtensionCard maps runtime readiness to Codex iteration-one labels', async
     const html = await renderCard({ 'modly-codex-image-extension/text-to-image': readiness })
     assert.match(html, new RegExp(`>${expectedLabel}<`))
   }
+})
+
+test('ExtensionCard keeps delete diagnostics in the card component contract', async () => {
+  const source = await readFile(extensionCardEntry, 'utf8')
+  assert.match(source, /nodeDeleteErrors/)
+  assert.match(source, /Model weights were not removed\./)
 })
 
 test('ExtensionCard preserves no-HF and HF download behavior when readiness is absent', async () => {
@@ -311,6 +317,65 @@ test('ExtensionCard shows persisted structured asset failure with retry for hf_d
     assert.match(html, /verify: Downloaded file failed verification/)
     assert.match(html, /cube3d\/model\.pt/)
     assert.doesNotMatch(html, />Ready</)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('ExtensionCard surfaces pause cancel and resume controls for active downloads', async () => {
+  const { module, cleanup } = await loadExtensionCardModule()
+  try {
+    const baseProps = {
+      ext: {
+        type: 'model',
+        id: 'cube3d',
+        name: 'Cube3D',
+        trusted: false,
+        builtin: false,
+        nodes: [{
+          id: 'generate',
+          name: 'Generate',
+          input: 'text',
+          output: 'mesh',
+          paramsSchema: [],
+          hfRepo: 'owner/model',
+        }],
+      },
+      installedIds: [],
+      onInstall: () => undefined,
+      onUninstall: () => undefined,
+      onPauseDownload: () => undefined,
+      onCancelDownload: () => undefined,
+    }
+
+    const activeHtml = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ...baseProps,
+      downloading: {
+        'cube3d/generate': {
+          percent: 17,
+          file: 'weights/model.pt',
+          bytesDownloaded: 1024,
+          totalBytes: 4096,
+        },
+      },
+    }))
+    assert.match(activeHtml, />Pause</)
+    assert.match(activeHtml, />Cancel</)
+
+    const pausedHtml = renderToStaticMarkup(createElement(module.ExtensionCard, {
+      ...baseProps,
+      downloading: {
+        'cube3d/generate': {
+          percent: 17,
+          file: 'weights/model.pt',
+          bytesDownloaded: 1024,
+          totalBytes: 4096,
+          status: 'paused',
+        },
+      },
+    }))
+    assert.match(pausedHtml, />Resume</)
+    assert.match(pausedHtml, />Cancel</)
   } finally {
     await cleanup()
   }

@@ -1,13 +1,13 @@
 import type { Workflow, WFNode } from '@shared/types/electron.d'
 import type { ArtifactKind } from '@shared/types/artifacts.ts'
-import { WORKFLOW_BUILTIN_NODE_CONTRACTS, workflowBuiltinParamIsRequired } from '../../shared/workflowBuiltinContracts.ts'
+import { WORKFLOW_BUILTIN_NODE_CONTRACTS, isSafeWorkflowWorkspacePath, workflowBuiltinParamIsRequired } from '../../shared/workflowBuiltinContracts.ts'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
 import { previewNodeTargetArtifactKind } from './nodes/previewNodeShared.ts'
 
 type DataType = ArtifactKind
 
-const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'])
 
 function asDataType(value: string | undefined): DataType | undefined {
   return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
@@ -53,6 +53,7 @@ function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): Da
   if (node.type === 'textNode') return 'text'
   if (node.type === 'videoNode') return 'video'
   if (node.type === 'sceneNode') return 'scene'
+  if (node.type === 'captureNode') return 'capture'
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
   const previewType = previewNodeTargetArtifactKind(node.type)
   if (previewType) return previewType
@@ -101,6 +102,15 @@ export function validateWorkflowPreflight(
           nodeId: node.id,
           message: `${nodeLabel(node, allExtensions)} needs a selected video.`,
         })
+      } else if (typeof videoPath === 'string') {
+        const extension = videoPath.split('.').pop()?.toLowerCase()
+        if (!isSafeWorkflowWorkspacePath(videoPath) || !extension || !['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'].includes(extension)) {
+          pushIssue(issues, {
+            key: `${node.id}:invalid:videoPath`,
+            nodeId: node.id,
+            message: `${nodeLabel(node, allExtensions)} needs a safe workspace video file.`,
+          })
+        }
       }
     }
 
@@ -141,6 +151,18 @@ export function validateWorkflowPreflight(
         key: `${node.id}:missing-extension`,
         nodeId: node.id,
         message: `${nodeLabel(node, allExtensions)} is unavailable. Reload extensions or remove the node.`,
+      })
+      continue
+    }
+
+    const usesVideoInput = ext.input === 'video' || (ext.inputs ?? []).some((port) => port.type === 'video')
+    const unsupportedVideoShape = (ext.type !== 'model' && (ext.output === 'video' || usesVideoInput))
+      || (ext.type === 'model' && usesVideoInput && ((ext.inputs ?? []).length > 0 || ext.input !== 'video'))
+    if (unsupportedVideoShape) {
+      pushIssue(issues, {
+        key: `${node.id}:unsupported-video-shape`,
+        nodeId: node.id,
+        message: `${ext.name} uses an unsupported video input or output declaration.`,
       })
       continue
     }

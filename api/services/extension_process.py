@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
 from services.hf_download_assets import hf_download_assets_ready
 from services.https_download_assets import https_download_assets_ready
+from services.download_check import safe_download_check_exists
 
 _RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 _MISSING_MODULE_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
@@ -55,6 +56,7 @@ class ExtensionProcess:
         self.manifest      = manifest
         self.model_dir     = None   # set by registry after init
         self.outputs_dir   = None   # set by registry after init
+        self.shared_model_dirs: dict[str, Path] = {}
 
         self._proc:         Optional[subprocess.Popen] = None
         self._queue:        queue.Queue                = queue.Queue()
@@ -68,6 +70,7 @@ class ExtensionProcess:
         self.hf_downloads      = manifest.get("hf_downloads", [])
         self.https_downloads   = manifest.get("https_downloads", [])
         self.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
+        self.hf_include_prefixes = manifest.get("hf_include_prefixes", [])
         self.download_check   = manifest.get("download_check", "")
         self._params_schema   = manifest.get("params_schema", [])
 
@@ -95,6 +98,9 @@ class ExtensionProcess:
         # runner.py extracts the node id from MODEL_DIR's trailing path component.
         if self.model_dir is not None:
             env["MODEL_DIR"] = str(self.model_dir)
+        env["SHARED_MODEL_DIRS"] = json.dumps(
+            {group_id: str(path) for group_id, path in self.shared_model_dirs.items()}
+        )
         # Extension venvs are based on python-embed which ships without a CA bundle.
         # Only set SSL_CERT_FILE if not already provided (preserves corporate/custom certs).
         if "SSL_CERT_FILE" not in env:
@@ -303,7 +309,7 @@ class ExtensionProcess:
         if self.hf_downloads:
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
-            return (self.model_dir / self.download_check).exists()
+            return safe_download_check_exists(self.model_dir, self.download_check)
         return self.model_dir.exists() and any(self.model_dir.iterdir())
 
     def is_loaded(self) -> bool:
@@ -340,7 +346,7 @@ class ExtensionProcess:
 
     def generate(
         self,
-        image_bytes: bytes | Path,
+        image_bytes,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -350,7 +356,23 @@ class ExtensionProcess:
         with self._get_request_lock():
             self._ensure_started()
             req_id = str(uuid.uuid4())
-            if isinstance(image_bytes, bytes):
+            from services.capture_input import TypedModelInput, revalidate_typed_model_input
+            if isinstance(image_bytes, TypedModelInput):
+                from services.generator_registry import WORKSPACE_DIR
+                typed = revalidate_typed_model_input(WORKSPACE_DIR, image_bytes)
+                input_payload = {"kind": typed.kind, "path": str(typed.path)}
+                if typed.kind == "video":
+                    from services.video_input import video_snapshot_to_dict
+
+                    input_payload["snapshot"] = video_snapshot_to_dict(typed.snapshot)
+                request = {
+                    "action": "generate",
+                    "id": req_id,
+                    "input": input_payload,
+                    "params": params,
+                    "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+                }
+            elif isinstance(image_bytes, bytes):
                 request = {
                     "action":      "generate",
                     "id":          req_id,
@@ -359,19 +381,20 @@ class ExtensionProcess:
                     "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
                 }
             elif isinstance(image_bytes, Path):
-                if self.input != "video":
+                if self.input not in ("scene",):
                     raise TypeError(
-                        f"[{self.MODEL_ID}] Path input requires a model declaring input 'video'."
+                        f"[{self.MODEL_ID}] Path input requires a model declaring input 'scene'. Use a validated typed video input for video."
                     )
+                input_kind = self.input
                 request = {
                     "action":      "generate",
                     "id":          req_id,
-                    "input":       {"kind": "video", "path": str(image_bytes)},
+                    "input":       {"kind": input_kind, "path": str(image_bytes)},
                     "params":      params,
                     "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
                 }
             else:
-                raise TypeError("Generation input must be bytes or pathlib.Path.")
+                raise TypeError("Generation input must be bytes, pathlib.Path, or TypedModelInput.")
             self._send(request)
 
             while True:

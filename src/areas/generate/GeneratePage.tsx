@@ -518,7 +518,6 @@ export default function GeneratePage(): JSX.Element {
   useEffect(() => {
     if (openPanel !== 'library' || libraryLoaded || libraryLoading) return
     void loadLibraryEntries()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- lazy-load guarded by loaded/loading flags
   }, [openPanel, libraryLoaded, libraryLoading])
 
   async function handleUnloadAll() {

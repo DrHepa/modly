@@ -137,6 +137,71 @@ test('hf_downloads ownership readiness requires every declared asset', async () 
   })
 })
 
+test('model_sources ownership metadata is preserved and partial owner dirs are not complete', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const extension = parseExtensionManifest({
+      id: 'pixal3d',
+      type: 'model',
+      nodes: [{
+        id: 'generate',
+        name: 'Generate',
+        input: 'image',
+        output: 'mesh',
+        model_sources: [{
+          id: 'primary',
+          provider: 'huggingface',
+          repo_id: 'owner/model',
+          destination: '.',
+          checks: ['model.safetensors', 'config.json'],
+        }],
+      }],
+    }, 'pixal3d', new Set(), false)
+
+    const ownership = resolveModelOwnership([extension], 'pixal3d/generate')
+    assert.ok(ownership)
+    assert.equal(ownership.hasModelSources, true)
+    assert.deepEqual(ownership.modelSources?.[0].checks, ['model.safetensors', 'config.json'])
+
+    const target = join(modelsDir, 'pixal3d', 'generate')
+    await mkdir(target, { recursive: true })
+    await writeFile(join(target, 'model.safetensors'), 'weights')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+    assert.deepEqual(listDownloadedModelCapabilities(modelsDir, [extension]), [])
+  })
+})
+
+
+
+test('legacy download_check is required before falling back to non-empty owner directories', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const extension = parseExtensionManifest({
+      id: 'legacy3d',
+      type: 'model',
+      nodes: [{
+        id: 'generate',
+        name: 'Generate',
+        input: 'image',
+        output: 'mesh',
+        hf_repo: 'owner/model',
+        download_check: 'weights/model.safetensors',
+      }],
+    }, 'legacy3d', new Set(), false)
+
+    const ownership = resolveModelOwnership([extension], 'legacy3d/generate')
+    assert.ok(ownership)
+    const target = join(modelsDir, 'legacy3d', 'generate')
+    await mkdir(target, { recursive: true })
+    await writeFile(join(target, 'unrelated.txt'), 'not enough')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    await mkdir(join(target, 'weights'), { recursive: true })
+    await writeFile(join(target, 'weights', 'model.safetensors'), 'weights')
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+  })
+})
+
 test('hf_downloads ownership readiness verifies declared SHA-256 and keeps no-hash files compatible', async () => {
   await withTempModelsDir(async (modelsDir) => {
     const sha256 = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -245,7 +310,8 @@ test('isOwnedModelDownloaded and resolveShowInFolderPath fall back to the first 
 
     const legacyAlias = join(modelsDir, 'image-bundle', 'sd15')
     await mkdir(legacyAlias, { recursive: true })
-    await writeFile(join(legacyAlias, 'weights.safetensors'), 'ready')
+    await mkdir(join(legacyAlias, 'weights'), { recursive: true })
+    await writeFile(join(legacyAlias, 'weights', 'model.safetensors'), 'ready')
 
     assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
     assert.equal(resolveShowInFolderPath(modelsDir, ownership), legacyAlias)
@@ -261,7 +327,8 @@ test('createOwnerScopedDeletePlan blocks deleting shared owner payloads while si
 
     const canonicalPath = join(modelsDir, 'image-bundle', 'shared-base')
     await mkdir(canonicalPath, { recursive: true })
-    await writeFile(join(canonicalPath, 'weights.safetensors'), 'ready')
+    await mkdir(join(canonicalPath, 'weights'), { recursive: true })
+    await writeFile(join(canonicalPath, 'weights', 'model.safetensors'), 'ready')
 
     const plan = createOwnerScopedDeletePlan(modelsDir, ownership, ['image-bundle/sdxl-base'])
 
@@ -284,7 +351,8 @@ test('deleteOwnedModelPaths removes canonical and legacy owner paths for the fin
     const legacySdxlPath = join(modelsDir, 'image-bundle', 'sdxl-base')
 
     await mkdir(canonicalPath, { recursive: true })
-    await writeFile(join(canonicalPath, 'weights.safetensors'), 'ready')
+    await mkdir(join(canonicalPath, 'weights'), { recursive: true })
+    await writeFile(join(canonicalPath, 'weights', 'model.safetensors'), 'ready')
     await mkdir(legacySd15Path, { recursive: true })
     await writeFile(join(legacySd15Path, 'legacy.bin'), 'legacy')
     await mkdir(legacySdxlPath, { recursive: true })
@@ -304,7 +372,8 @@ test('listDownloadedModelCapabilities returns all capability ids that share one 
     const extension = createBundledModelExtension()
     const canonicalPath = join(modelsDir, 'image-bundle', 'shared-base')
     await mkdir(canonicalPath, { recursive: true })
-    await writeFile(join(canonicalPath, 'weights.safetensors'), 'ready')
+    await mkdir(join(canonicalPath, 'weights'), { recursive: true })
+    await writeFile(join(canonicalPath, 'weights', 'model.safetensors'), 'ready')
 
     const downloaded = listDownloadedModelCapabilities(modelsDir, [extension])
 
@@ -324,7 +393,8 @@ test('createExtensionUninstallCleanupPlan deletes a shared owner only once after
     const legacySdxlPath = join(modelsDir, 'image-bundle', 'sdxl-base')
 
     await mkdir(canonicalPath, { recursive: true })
-    await writeFile(join(canonicalPath, 'weights.safetensors'), 'ready')
+    await mkdir(join(canonicalPath, 'weights'), { recursive: true })
+    await writeFile(join(canonicalPath, 'weights', 'model.safetensors'), 'ready')
     await mkdir(legacySd15Path, { recursive: true })
     await writeFile(join(legacySd15Path, 'legacy.bin'), 'legacy')
     await mkdir(legacySdxlPath, { recursive: true })
@@ -346,6 +416,9 @@ test('mapDownloadProgressToCapability emits progress keyed by capability id', ()
       fileIndex: 1,
       totalFiles: 2,
       status: 'downloading',
+      bytesDownloaded: 1024,
+      totalBytes: 4096,
+      stalledSeconds: 0,
     }),
     {
       capabilityId: 'image-bundle/sd15',
@@ -355,6 +428,9 @@ test('mapDownloadProgressToCapability emits progress keyed by capability id', ()
       fileIndex: 1,
       totalFiles: 2,
       status: 'downloading',
+      bytesDownloaded: 1024,
+      totalBytes: 4096,
+      stalledSeconds: 0,
     },
   )
 })
@@ -365,9 +441,11 @@ test('bundled fixture keeps the remaining sibling ready and still reports standa
     const canonicalPath = join(modelsDir, 'image-bundle', 'shared-base')
     const standalonePath = join(modelsDir, 'image-bundle', 'flux-schnell')
     await mkdir(canonicalPath, { recursive: true })
-    await writeFile(join(canonicalPath, 'weights.safetensors'), 'ready')
+    await mkdir(join(canonicalPath, 'weights'), { recursive: true })
+    await writeFile(join(canonicalPath, 'weights', 'model.safetensors'), 'ready')
     await mkdir(standalonePath, { recursive: true })
-    await writeFile(join(standalonePath, 'flux.safetensors'), 'ready')
+    await mkdir(join(standalonePath, 'weights'), { recursive: true })
+    await writeFile(join(standalonePath, 'weights', 'model.safetensors'), 'ready')
 
     const sd15Ownership = resolveModelOwnership([extension], 'image-bundle/sd15')
 
@@ -389,7 +467,8 @@ test('bundled fixture keeps legacy-only shared payloads ready until the last sib
     const extension = createBundledModelExtension()
     const legacySharedPath = join(modelsDir, 'image-bundle', 'sdxl-base')
     await mkdir(legacySharedPath, { recursive: true })
-    await writeFile(join(legacySharedPath, 'weights.safetensors'), 'legacy-ready')
+    await mkdir(join(legacySharedPath, 'weights'), { recursive: true })
+    await writeFile(join(legacySharedPath, 'weights', 'model.safetensors'), 'legacy-ready')
 
     const sd15Ownership = resolveModelOwnership([extension], 'image-bundle/sd15')
 
@@ -757,5 +836,130 @@ test('HTTPS ownership readiness rejects symlinked assets and readiness markers',
     await symlink('marker-target.json', markerPath, 'file')
 
     assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+  })
+})
+
+
+test('legacy download_check cannot escape the canonical owner with traversal to a sibling owner', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const victimOwner = join(modelsDir, 'safe-extension', 'victim')
+    await mkdir(victimOwner, { recursive: true })
+    await writeFile(join(victimOwner, 'weights.bin'), 'victim')
+
+    const ownership = {
+      capabilityId: 'safe-extension/generate',
+      bundleId: 'safe-extension',
+      weightOwnerId: 'safe-extension/generate',
+      sharedOwner: false,
+      legacyPaths: ['safe-extension/generate'],
+      downloadCheck: '../victim/weights.bin',
+    }
+
+    const ownerPath = join(modelsDir, 'safe-extension', 'generate')
+    await mkdir(ownerPath, { recursive: true })
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+  })
+})
+
+test('legacy download_check rejects dot segments while allowing legitimate nested relative paths', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownerPath = join(modelsDir, 'safe-extension', 'generate')
+    await mkdir(join(ownerPath, 'nested'), { recursive: true })
+    await writeFile(join(ownerPath, 'weights.bin'), 'root weights')
+    await writeFile(join(ownerPath, 'nested', 'weights.bin'), 'nested weights')
+
+    const ownership = {
+      capabilityId: 'safe-extension/generate',
+      bundleId: 'safe-extension',
+      weightOwnerId: 'safe-extension/generate',
+      sharedOwner: false,
+      legacyPaths: ['safe-extension/generate'],
+      downloadCheck: 'nested/../weights.bin',
+    }
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    assert.equal(
+      isOwnedModelDownloaded(modelsDir, {
+        ...ownership,
+        downloadCheck: 'nested/weights.bin',
+      }),
+      true,
+    )
+  })
+})
+
+test('structured asset readiness takes precedence over legacy download_check', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownership = {
+      capabilityId: 'cube3d/generate',
+      bundleId: 'cube3d',
+      weightOwnerId: 'cube3d/generate',
+      sharedOwner: false,
+      legacyPaths: ['cube3d/generate'],
+      downloadCheck: 'legacy-ready.bin',
+      hfDownloads: [{
+        repoId: 'owner/model',
+        revision: 'ef15eda2e413f994e3b4657960b0309487587718',
+        targetSubdir: 'cube3d',
+        files: [{ path: 'model.pt' }],
+      }],
+    }
+    const ownerPath = join(modelsDir, 'cube3d', 'generate')
+    await mkdir(ownerPath, { recursive: true })
+    await writeFile(join(ownerPath, 'legacy-ready.bin'), 'legacy')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+
+    await mkdir(join(ownerPath, 'cube3d'), { recursive: true })
+    await writeFile(join(ownerPath, 'cube3d', 'model.pt'), 'weights')
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), true)
+  })
+})
+
+test('legacy readiness matches backend for empty files and non-empty directories', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownerPath = join(modelsDir, 'legacy', 'generate')
+    await mkdir(join(ownerPath, 'weights'), { recursive: true })
+    await writeFile(join(ownerPath, 'empty.bin'), '')
+    const ownership = {
+      capabilityId: 'legacy/generate', bundleId: 'legacy', weightOwnerId: 'legacy/generate',
+      sharedOwner: false, legacyPaths: ['legacy/generate'], downloadCheck: 'empty.bin',
+    }
+    assert.equal(isOwnedModelDownloaded(modelsDir, ownership), false)
+    await writeFile(join(ownerPath, 'weights', 'marker'), 'ok')
+    assert.equal(isOwnedModelDownloaded(modelsDir, { ...ownership, downloadCheck: 'weights' }), true)
+  })
+})
+
+test('owner-scoped readiness rejects malicious model ids without reading outside the models root', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'modly-model-outside-'))
+    try {
+      await writeFile(join(outsideRoot, 'weights.bin'), 'outside weights')
+      const maliciousOwnership = {
+        capabilityId: '../outside', bundleId: '..', weightOwnerId: '../outside',
+        sharedOwner: false, legacyPaths: ['../outside'], downloadCheck: 'weights.bin',
+      }
+
+      assert.equal(isOwnedModelDownloaded(modelsDir, maliciousOwnership), false)
+    } finally {
+      await rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+test('owner-scoped readiness accepts a valid existing model directory', async () => {
+  await withTempModelsDir(async (modelsDir) => {
+    const ownerPath = join(modelsDir, 'valid-model', 'generate')
+    await mkdir(ownerPath, { recursive: true })
+    await writeFile(join(ownerPath, 'weights.bin'), 'weights')
+
+    assert.equal(isOwnedModelDownloaded(modelsDir, {
+      capabilityId: 'valid-model/generate', bundleId: 'valid-model',
+      weightOwnerId: 'valid-model/generate', sharedOwner: false,
+      legacyPaths: ['valid-model/generate'], downloadCheck: 'weights.bin',
+    }), true)
   })
 })

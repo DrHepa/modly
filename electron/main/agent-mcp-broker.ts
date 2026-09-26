@@ -415,10 +415,15 @@ async function signalOwnedProcessGroup(
   pid: number,
   startTime: string | undefined,
   signal: NodeJS.Signals,
+  options: { leaderMayHaveExited?: boolean } = {},
 ): Promise<boolean> {
   if (startTime === undefined) return false
   const identity = await readLinuxProcessGroupIdentity(pid)
-  if (!identity || identity.pgrp !== pid || identity.startTime !== startTime) return false
+  if (identity) {
+    if (identity.pgrp !== pid || identity.startTime !== startTime) return false
+  } else if (!options.leaderMayHaveExited || !processGroupExists(pid)) {
+    return false
+  }
   try {
     process.kill(-pid, signal)
     return true
@@ -426,6 +431,24 @@ async function signalOwnedProcessGroup(
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
     throw error
   }
+}
+
+function processGroupExists(pid: number): boolean {
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return false
+    if (code === 'EPERM') return true
+    throw error
+  }
+}
+
+async function waitForProcessGroupExit(pid: number, maximumMs: number): Promise<boolean> {
+  const deadline = Date.now() + maximumMs
+  while (processGroupExists(pid) && Date.now() < deadline) await delay(10)
+  return !processGroupExists(pid)
 }
 
 /**
@@ -553,16 +576,17 @@ export class OwnedStdioTransport implements Transport {
       try {
         if (await signalOwnedProcessGroup(pid, startTime, 'SIGTERM')) this.options.onGroupSignal?.('SIGTERM')
       } catch (error) { this.onerror?.(error as Error) }
-      const exited = this.exitPromise
-        ? await Promise.race([
-          this.exitPromise.then(() => true),
-          delay(this.options.terminationGraceMs ?? PROCESS_TERMINATION_GRACE_MS).then(() => false),
-        ])
-        : true
+      const terminationGraceMs = this.options.terminationGraceMs ?? PROCESS_TERMINATION_GRACE_MS
+      const exited = await waitForProcessGroupExit(pid, terminationGraceMs)
       if (!exited) {
         try {
-          if (await signalOwnedProcessGroup(pid, startTime, 'SIGKILL')) this.options.onGroupSignal?.('SIGKILL')
+          if (await signalOwnedProcessGroup(pid, startTime, 'SIGKILL', { leaderMayHaveExited: true })) {
+            this.options.onGroupSignal?.('SIGKILL')
+          }
         } catch (error) { this.onerror?.(error as Error) }
+        if (!await waitForProcessGroupExit(pid, this.options.reapTimeoutMs ?? PROCESS_REAP_TIMEOUT_MS)) {
+          throw new AgentMcpBrokerError('protocol_error')
+        }
       }
     } else {
       this.child?.kill('SIGTERM')

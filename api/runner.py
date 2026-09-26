@@ -24,7 +24,7 @@ import threading
 import importlib.util
 from pathlib import Path
 
-from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV, validate_video_input_path
+from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
 
 # ------------------------------------------------------------------ #
 # Env
@@ -41,6 +41,13 @@ MODEL_ID      = os.environ.get("MODEL_ID", "")
 # MODEL_DIR is set by ExtensionProcess to match its own model_dir (composite node id path).
 # Falls back to MODELS_DIR/manifest_id for standalone/legacy use.
 _MODEL_DIR_OVERRIDE = os.environ.get("MODEL_DIR", "")
+try:
+    _SHARED_MODEL_DIRS = {
+        str(group_id): Path(path)
+        for group_id, path in json.loads(os.environ.get("SHARED_MODEL_DIRS", "{}" )).items()
+    }
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    _SHARED_MODEL_DIRS = {}
 
 # Inject Modly's api/ so generator.py can do:
 #   from services.generators.base import BaseGenerator, ...
@@ -77,7 +84,7 @@ def _resolve_generation_input(
     msg: dict,
     *,
     declared_input: str,
-) -> bytes | Path:
+) -> bytes | Path | object:
     """Decode one legacy or typed generation input from the NDJSON request."""
     if "input" not in msg:
         return base64.b64decode(msg["image_b64"])
@@ -93,17 +100,26 @@ def _resolve_generation_input(
         raise ValueError(
             f"Typed input kind '{kind}' does not match generator input '{declared_input}'."
         )
-    if kind != "video":
-        raise ValueError(f"Unsupported typed generation input kind: {kind!r}.")
+    if kind in ("scene", "capture", "video"):
+        raw_path = envelope.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("Typed artifact input path must be a non-empty string.")
+        from services.capture_input import TypedModelInput, revalidate_typed_model_input
+        snapshot = None
+        if kind == "video":
+            from services.video_input import video_snapshot_from_dict
 
-    raw_path = envelope.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ValueError("Typed video input path must be a non-empty string.")
-
-    return validate_video_input_path(
-        Path(raw_path),
-        workspace_dir=MODLY_WORKSPACE_DIR,
-    )
+            if set(envelope) != {"kind", "path", "snapshot"}:
+                raise ValueError("Video artifact input requires a well-formed snapshot")
+            snapshot = video_snapshot_from_dict(envelope["snapshot"])
+        elif set(envelope) != {"kind", "path"}:
+            raise ValueError("Typed artifact input must contain exactly kind and path")
+        validated = revalidate_typed_model_input(
+            MODLY_WORKSPACE_DIR,
+            TypedModelInput(kind, Path(raw_path), snapshot),
+        )
+        return validated.path if kind == "scene" else validated
+    raise ValueError(f"Unsupported typed generation input kind: {kind!r}.")
 
 
 # ------------------------------------------------------------------ #
@@ -158,6 +174,7 @@ def _apply_manifest_metadata(gen, manifest: dict, node: dict) -> None:
     gen.hf_downloads = node.get("hf_downloads") or manifest.get("hf_downloads", [])
     gen.https_downloads = node.get("https_downloads") or manifest.get("https_downloads", [])
     gen.hf_skip_prefixes = node.get("hf_skip_prefixes") or manifest.get("hf_skip_prefixes", [])
+    gen.hf_include_prefixes = node.get("hf_include_prefixes") or manifest.get("hf_include_prefixes", [])
     gen.download_check = node.get("download_check") or manifest.get("download_check", "")
     gen._params_schema = node.get("params_schema") or manifest.get("params_schema", [])
 
@@ -213,6 +230,7 @@ def main() -> None:
     gen.model_id         = model_id
     gen.node_id          = node.get("id", "")
     gen.input            = node.get("input") or manifest.get("input", "image")
+    gen.shared_model_dirs = dict(_SHARED_MODEL_DIRS)
     _apply_manifest_metadata(gen, manifest, node)
 
     send({"type": "ready", "params_schema": _resolve_ready_schema(gen, node, manifest)})
@@ -237,7 +255,27 @@ def main() -> None:
                 generation_input = _resolve_generation_input(
                     msg, declared_input=gen.input
                 )
-                params       = msg.get("params", {})
+                params       = dict(msg.get("params", {}))
+                from services.capture_input import TypedModelInput
+                if isinstance(generation_input, TypedModelInput):
+                    params.pop("scene_path", None)
+                    params.pop("input_scene_path", None)
+                    params.pop("capture_path", None)
+                    params.pop("input_capture_path", None)
+                    params.pop("video_path", None)
+                    params.pop("input_video_path", None)
+                    if generation_input.kind != "video":
+                        params[f"{generation_input.kind}_manifest_path"] = str(generation_input.path)
+                    else:
+                        generation_input = TypedModelInput("video", generation_input.path)
+                elif isinstance(generation_input, Path) and gen.input == "scene":
+                    params.pop("scene_manifest_path", None)
+                    params.pop("scene_path", None)
+                    params.pop("input_scene_path", None)
+                    scene_relative_path = generation_input.relative_to(MODLY_WORKSPACE_DIR.resolve()).as_posix()
+                    params["scene_manifest_path"] = str(generation_input)
+                    params["scene_path"] = scene_relative_path
+                    params["input_scene_path"] = scene_relative_path
                 if msg.get("outputs_dir"):
                     gen.outputs_dir = Path(msg["outputs_dir"])
                     gen.outputs_dir.mkdir(parents=True, exist_ok=True)

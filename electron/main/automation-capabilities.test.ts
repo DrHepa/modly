@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 import { tmpdir } from 'node:os'
@@ -100,6 +100,187 @@ test('parseExtensionManifest falls back to stable typed ports for legacy string 
   assert.deepEqual(extension.nodes[0].inputs, [
     { name: 'text', type: 'text', required: true },
     { name: 'mesh', type: 'mesh', required: true },
+  ])
+})
+
+test('parseExtensionManifest normalizes duplicate legacy fallback names without losing positional slots', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'legacy-positional-images',
+      type: 'model',
+      nodes: [{
+        id: 'compose',
+        input: 'image',
+        output: 'mesh',
+        inputs: ['image', 'image', 'mesh', 'image'],
+      }],
+    },
+    'legacy-positional-images',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'image', type: 'image', required: true },
+    { name: 'image_2', type: 'image', required: true },
+    { name: 'mesh', type: 'mesh', required: true },
+    { name: 'image_3', type: 'image', required: true },
+  ])
+})
+
+test('parseExtensionManifest keeps explicit names strict while avoiding explicit-name collisions for legacy fallbacks', () => {
+  const extension = parseExtensionManifest(
+    {
+      id: 'mixed-positional-images',
+      type: 'model',
+      nodes: [{
+        id: 'compose',
+        input: 'image',
+        output: 'mesh',
+        inputs: [
+          'image',
+          { name: 'image', type: 'image' } as never,
+          'image',
+        ],
+      }],
+    },
+    'mixed-positional-images',
+    new Set(),
+    false,
+  )
+
+  assert.deepEqual(extension.nodes[0].inputs, [
+    { name: 'image_2', type: 'image', required: true },
+    { name: 'image', type: 'image', required: true },
+    { name: 'image_3', type: 'image', required: true },
+  ])
+
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'duplicate-explicit-ports',
+        type: 'model',
+        nodes: [{
+          id: 'compose',
+          input: 'image',
+          output: 'mesh',
+          inputs: [
+            { name: 'front', type: 'image' },
+            { name: 'front', type: 'image' },
+          ],
+        }],
+      },
+      'duplicate-explicit-ports',
+      new Set(),
+      false,
+    ),
+    /duplicate port name "front"/i,
+  )
+
+  assert.deepEqual(
+    parseExtensionManifest(
+      {
+        id: 'trimmed-explicit-ports',
+        type: 'model',
+        nodes: [{
+          id: 'compose',
+          input: 'image',
+          output: 'mesh',
+          inputs: [{ name: ' front ', type: 'image' }],
+        }],
+      },
+      'trimmed-explicit-ports',
+      new Set(),
+      false,
+    ).nodes[0].inputs,
+    [{ name: 'front', type: 'image', required: true }],
+  )
+
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'trimmed-duplicate-explicit-ports',
+        type: 'model',
+        nodes: [{
+          id: 'compose',
+          input: 'image',
+          output: 'mesh',
+          inputs: [
+            { name: 'front', type: 'image' },
+            { name: ' front ', type: 'image' },
+          ],
+        }],
+      },
+      'trimmed-duplicate-explicit-ports',
+      new Set(),
+      false,
+    ),
+    /duplicate port name "front"/i,
+  )
+
+  assert.throws(
+    () => parseExtensionManifest(
+      {
+        id: 'missing-explicit-port-name',
+        type: 'model',
+        nodes: [{
+          id: 'compose',
+          input: 'image',
+          output: 'mesh',
+          inputs: [{ type: 'image' } as never],
+        }],
+      },
+      'missing-explicit-port-name',
+      new Set(),
+      false,
+    ),
+    /name must be a non-empty string/i,
+  )
+})
+
+test('parseExtensionManifest rejects duplicate or malformed input_contract names instead of silently rerouting them', () => {
+  const parse = (inputContract: unknown) => parseExtensionManifest(
+    {
+      id: 'invalid-input-contract',
+      type: 'model',
+      nodes: [{
+        id: 'compose',
+        input: 'image',
+        output: 'mesh',
+        inputs: ['image', 'image'],
+        input_contract: inputContract as never,
+      }],
+    },
+    'invalid-input-contract',
+    new Set(),
+    false,
+  )
+
+  assert.throws(() => parse([{ name: 'content' }, { name: 'content' }]), /duplicate port name "content"/i)
+  assert.throws(() => parse([{ name: ' ' }, {}]), /input_contract\[0\]\.name/i)
+})
+
+test('parseExtensionManifest rejects malformed explicit object port label and required metadata', () => {
+  const parse = (port: unknown) => parseExtensionManifest(
+    {
+      id: 'invalid-explicit-port-metadata',
+      type: 'model',
+      nodes: [{
+        id: 'compose',
+        input: 'image',
+        output: 'mesh',
+        inputs: [port as never],
+      }],
+    },
+    'invalid-explicit-port-metadata',
+    new Set(),
+    false,
+  )
+
+  assert.throws(() => parse({ name: 'front', type: 'image', label: 42 }), /inputs\[0\]\.label must be a string/i)
+  assert.throws(() => parse({ name: 'front', type: 'image', required: 'yes' }), /inputs\[0\]\.required must be a boolean/i)
+  assert.deepEqual(parse({ name: 'front', type: 'image', label: 'Front', required: false }).nodes[0].inputs, [
+    { name: 'front', label: 'Front', type: 'image', required: false },
   ])
 })
 
@@ -333,7 +514,7 @@ test('getUiOnlyNodes declares artifact editing as UI-only and unavailable headle
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio', 'video'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'], boundary: 'ui_only', headless: false },
     },
   })
 })
@@ -422,7 +603,7 @@ test('parseExtensionManifest rejects unknown input metadata values', () => {
       new Set(),
       false,
     ),
-    /must be one of: image, text, mesh, scene, audio, video, none/i,
+    /must be one of: image, text, mesh, scene, capture, audio, video, none/i,
   )
 })
 
@@ -440,7 +621,7 @@ test('ordinary PROCESS discovery keeps governed-only artifact kinds out of legac
         new Set(),
         false,
       ),
-      /must be one of: image, text, mesh, scene, audio, video, none/i,
+      /must be one of: image, text, mesh, scene, capture, audio, video, none/i,
     )
   }
 
@@ -453,6 +634,119 @@ test('ordinary PROCESS discovery keeps governed-only artifact kinds out of legac
   }, 'governed-output', new Set(), false)
   assert.equal(legacy.nodes[0].output, 'mesh')
   assert.deepEqual(legacy.nodes[0].automation?.substitution.artifactKinds, ['mesh'])
+})
+
+test('parseExtensionManifest accepts the installed-shaped Pixal3D five-node capture and scene contract', () => {
+  const source = (repo: string, file: string) => ({
+    id: file.replace(/[^a-z0-9]+/gi, '-').toLowerCase(),
+    provider: 'huggingface',
+    repo_id: repo,
+    destination: '.',
+    checks: [file],
+  })
+  const extension = parseExtensionManifest({
+    id: 'pixal3d',
+    version: '0.5.0',
+    type: 'model',
+    weight_groups: [
+      { id: 'pixal3d-base', model_sources: [source('vendor/base', 'base.bin')] },
+      { id: 'pixal3d-mv', model_sources: [source('vendor/mv', 'mv.bin')] },
+      { id: 'worldsculpt-adapters', model_sources: [source('vendor/ws', 'ws.bin')] },
+      { id: 'sam3', model_sources: [source('vendor/sam3', 'sam3.bin')] },
+      { id: 'da3-base', model_sources: [source('vendor/da3', 'da3.bin')] },
+    ],
+    nodes: [
+      { id: 'generate', input: 'image', output: 'mesh', weight_groups: ['pixal3d-base'] },
+      { id: 'generate-mv', input: 'capture', output: 'mesh', weight_groups: ['pixal3d-base', 'pixal3d-mv'] },
+      { id: 'worldsculpt', input: 'scene', output: 'mesh', weight_groups: ['pixal3d-base', 'worldsculpt-adapters'] },
+      { id: 'scene-from-estimates', input: 'capture', output: 'scene', weight_groups: ['sam3', 'da3-base'] },
+      { id: 'normalize-annotated-scene', input: 'scene', output: 'scene' },
+    ],
+  }, 'pixal3d', new Set(), false)
+
+  assert.deepEqual(extension.nodes.map((node: { id: string; input?: string; output?: string }) => [node.id, node.input, node.output]), [
+    ['generate', 'image', 'mesh'],
+    ['generate-mv', 'capture', 'mesh'],
+    ['worldsculpt', 'scene', 'mesh'],
+    ['scene-from-estimates', 'capture', 'scene'],
+    ['normalize-annotated-scene', 'scene', 'scene'],
+  ])
+  assert.deepEqual(extension.nodes.map((node: { hasModelSources?: boolean }) => node.hasModelSources), [true, true, true, true, undefined])
+})
+
+test('ordinary listing projects persisted Agent-only nodes while Agent discovery retains them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-agent-listing-projection-'))
+  const extensionDir = join(root, 'python-cad')
+  const agentNode = (id: string, input: string, output: string, mediaType: string) => ({
+    id,
+    input,
+    output,
+    params_schema: [],
+    agent: {
+      schema: 'modly.agent-capability-declaration.v1',
+      capability_id: `python-cad/${id}`,
+      display_name: `Create ${id}`,
+      description: `Create the ${id} artifact.`,
+      approval: { required: true, scope: 'single_action' },
+      process: {
+        schema: 'modly.agent-process.v1',
+        runtimeFiles: ['processor.py'],
+        resourceFiles: [],
+        runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
+        artifacts: {
+          maxCount: 1,
+          maxTotalBytes: 4096,
+          allowed: [{ kind: output, mediaTypes: [mediaType], maxBytes: 4096 }],
+        },
+      },
+    },
+  })
+  await mkdir(extensionDir, { recursive: true })
+  await writeFile(join(extensionDir, 'manifest.json'), JSON.stringify({
+    id: 'python-cad',
+    name: 'Python CAD',
+    type: 'process',
+    entry: 'processor.py',
+    nodes: [
+      agentNode('plan', 'text', 'plan', 'application/json'),
+      agentNode('source', 'plan', 'source', 'text/x-python'),
+      agentNode('glb', 'source', 'glb', 'model/gltf-binary'),
+      agentNode('step', 'source', 'step', 'model/step'),
+      { id: 'preview', input: 'text', output: 'mesh', params_schema: [] },
+    ],
+  }))
+
+  try {
+    const ordinary = await readExtensionsFromDir(root, false, new Set())
+    assert.equal(ordinary[0]?.type, 'process')
+    assert.deepEqual(ordinary[0]?.nodes.map((node: { id: string }) => node.id), ['preview'])
+
+    const detailed = await readExtensionsFromDirDetailed(root, false, new Set())
+    assert.deepEqual(detailed.errors, [])
+    assert.equal(detailed.extensions[0]?.type, 'process')
+    assert.deepEqual(detailed.extensions[0]?.nodes.map((node: { id: string }) => node.id), ['preview'])
+
+    const resolvedOrdinary = await readResolvedExtensionsFromDirDetailed(root, false, new Set())
+    assert.deepEqual(resolvedOrdinary.errors, [])
+    assert.equal(resolvedOrdinary.extensions[0]?.extension.type, 'process')
+    assert.deepEqual(
+      resolvedOrdinary.extensions[0]?.extension.nodes.map((node: { id: string }) => node.id),
+      ['preview'],
+    )
+    assert.equal(resolvedOrdinary.extensions[0]?.manifest?.nodes?.length, 5)
+
+    const resolvedAgent = await readResolvedExtensionsFromDirDetailed(root, false, new Set(), true)
+    assert.deepEqual(resolvedAgent.errors, [])
+    assert.equal(resolvedAgent.extensions[0]?.extension.type, 'process')
+    assert.deepEqual(
+      resolvedAgent.extensions[0]?.extension.nodes.map((node: { id: string }) => node.id),
+      ['plan', 'source', 'glb', 'step', 'preview'],
+    )
+    assert.equal(resolvedAgent.extensions[0]?.extension.nodes.slice(0, 4)
+      .every((node: { agent?: unknown }) => node.agent !== undefined), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('parseExtensionManifest rejects input none on process extensions', () => {

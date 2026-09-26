@@ -7,6 +7,7 @@ import { join } from 'path'
 import { getSettings } from './settings-store.ts'
 import { app } from 'electron'
 import { buildHttpsDownloadAssetsRequest, buildManifestAssetDownloadRequest, ModelAssetDownloadError, normalizeDownloadEvent } from './model-download-events.ts'
+import type { ModelSource } from './model-sources.ts'
 export { ModelAssetDownloadError }
 export type { ModelDownloadFailure } from './model-download-events.ts'
 export {
@@ -27,6 +28,8 @@ export interface DownloadProgress {
   repoIndex?: number
   totalRepos?: number
   status?: string
+  paused?: boolean
+  cancelled?: boolean
   bytesDownloaded?: number
   totalBytes?: number
   stalledSeconds?: number
@@ -125,21 +128,66 @@ export function listDownloadedModels(modelsDir: string): { id: string; name: str
 
 type StructuredAssetDownloadRequest = ReturnType<typeof buildManifestAssetDownloadRequest>
 
+async function throwDownloadHttpError(res: Response, fallback: string): Promise<never> {
+  let body: unknown
+  try {
+    body = JSON.parse(await res.text())
+  } catch {
+    body = undefined
+  }
+  const detail = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as { detail?: unknown }).detail
+    : undefined
+  if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+    const failure = detail as Record<string, unknown>
+    const transientStatus = res.status === 408 || res.status === 425 || res.status === 429 || res.status >= 500
+    throw new ModelAssetDownloadError({
+      code: typeof failure.code === 'string' ? failure.code : 'http_error',
+      stage: typeof failure.stage === 'string' ? failure.stage : 'request',
+      message: typeof failure.message === 'string' ? failure.message : fallback,
+      retryable: failure.retryable === true && transientStatus,
+    })
+  }
+  if (typeof detail === 'string' && /target owner/i.test(detail)) {
+    throw new ModelAssetDownloadError({
+      code: 'target_owner_mismatch',
+      stage: 'request',
+      message: detail,
+      retryable: false,
+    })
+  }
+  throw new ModelAssetDownloadError({
+    code: 'http_error',
+    stage: 'request',
+    message: `${fallback}: HTTP ${res.status}`,
+    retryable: res.status === 408 || res.status === 425 || res.status === 429 || res.status >= 500,
+  })
+}
+
+function asRetryableDownloadError(error: unknown, fallback: string): ModelAssetDownloadError {
+  if (error instanceof ModelAssetDownloadError) return error
+  return new ModelAssetDownloadError({
+    code: 'download_failed',
+    stage: 'request',
+    message: error instanceof Error && error.message ? error.message : fallback,
+    retryable: true,
+  })
+}
+
 async function consumeStructuredModelAssetDownload(
   request: StructuredAssetDownloadRequest,
   onProgress: ProgressCallback,
 ): Promise<void> {
   const { net } = require('electron')
-  const res = await net.fetch(request.url, { headers: request.headers })
-
-  if (!res.ok) {
-    throw new ModelAssetDownloadError({
-      code: 'http_error',
-      stage: 'request',
-      message: `Manifest asset download failed with HTTP ${res.status}`,
-      retryable: res.status >= 500 || res.status === 429,
-    })
+  const abortController = new AbortController()
+  let res: Response
+  try {
+    res = await net.fetch(request.url, { headers: request.headers, signal: abortController.signal })
+  } catch (error) {
+    throw asRetryableDownloadError(error, 'Manifest asset download request failed')
   }
+
+  if (!res.ok) await throwDownloadHttpError(res, 'Manifest asset download failed')
   if (!res.body) {
     throw new ModelAssetDownloadError({
       code: 'missing_stream',
@@ -150,9 +198,16 @@ async function consumeStructuredModelAssetDownload(
   }
 
   const decoder = new TextDecoder()
-  const reader = res.body.getReader()
+  let reader: ReadableStreamDefaultReader<Uint8Array>
+  try {
+    reader = res.body.getReader()
+  } catch (error) {
+    throw asRetryableDownloadError(error, 'Manifest asset download stream failed')
+  }
   let buffer = ''
   let completed = false
+  let stopped = false
+  const STALL_TIMEOUT_MS = 120_000
 
   const consumeLine = (line: string): void => {
     if (!line.startsWith('data: ')) return
@@ -167,27 +222,51 @@ async function consumeStructuredModelAssetDownload(
     if (event.failure) throw new ModelAssetDownloadError(event.failure)
     if (!event.progress) return
     onProgress(event.progress)
+    if (event.progress.paused || event.progress.cancelled) {
+      stopped = true
+      return
+    }
     if (event.progress.percent === 100 && event.progress.status === 'done') completed = true
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-    for (const line of lines) consumeLine(line)
+  async function readWithTimeout() {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Model download stalled for ${Math.round(STALL_TIMEOUT_MS / 1000)}s`)), STALL_TIMEOUT_MS)
+        }),
+      ])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
   }
 
-  buffer += decoder.decode()
-  if (buffer) consumeLine(buffer)
-  if (!completed) {
-    throw new ModelAssetDownloadError({
-      code: 'incomplete_stream',
-      stage: 'download',
-      message: 'Manifest asset download ended before completion',
-      retryable: true,
-    })
+  try {
+    while (true) {
+      const { done, value } = await readWithTimeout()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) consumeLine(line)
+    }
+
+    buffer += decoder.decode()
+    if (buffer) consumeLine(buffer)
+    if (!completed && !stopped) {
+      throw new ModelAssetDownloadError({
+        code: 'incomplete_stream',
+        stage: 'download',
+        message: 'Manifest asset download ended before completion',
+        retryable: true,
+      })
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined)
+    abortController.abort()
+    throw asRetryableDownloadError(error, 'Manifest asset download stream failed')
   }
 }
 
@@ -198,11 +277,12 @@ async function consumeStructuredModelAssetDownload(
  */
 export async function downloadModelAssetsFromHF(
   modelId: string,
+  targetOwnerId: string,
   onProgress: ProgressCallback,
 ): Promise<void> {
   const hfToken = getSettings(app.getPath('userData')).hfToken
   return consumeStructuredModelAssetDownload(
-    buildManifestAssetDownloadRequest(PYTHON_API_URL, modelId, hfToken),
+    buildManifestAssetDownloadRequest(PYTHON_API_URL, modelId, targetOwnerId, hfToken),
     onProgress,
   )
 }
@@ -213,10 +293,11 @@ export async function downloadModelAssetsFromHF(
  */
 export async function downloadModelAssetsFromHttps(
   modelId: string,
+  targetOwnerId: string,
   onProgress: ProgressCallback,
 ): Promise<void> {
   return consumeStructuredModelAssetDownload(
-    buildHttpsDownloadAssetsRequest(PYTHON_API_URL, modelId),
+    buildHttpsDownloadAssetsRequest(PYTHON_API_URL, modelId, targetOwnerId),
     onProgress,
   )
 }
@@ -233,7 +314,7 @@ export async function downloadModelFromHF(
   includePrefixes?: string[],
 ): Promise<void> {
   const { net } = require('electron')
-  const STALL_TIMEOUT_MS = 120_000
+  const abortController = new AbortController()
   let url = `${PYTHON_API_URL}/model/hf-download?repo_id=${encodeURIComponent(repoId)}&model_id=${encodeURIComponent(modelId)}`
   if (skipPrefixes && skipPrefixes.length > 0) {
     url += `&skip_prefixes=${encodeURIComponent(JSON.stringify(skipPrefixes))}`
@@ -246,58 +327,132 @@ export async function downloadModelFromHF(
     url += `&token=${encodeURIComponent(hfToken)}`
   }
 
-  const res = await net.fetch(url)
-  if (!res.ok) throw new Error(`HuggingFace download failed: HTTP ${res.status}`)
-  if (!res.body) throw new Error('No response body from HF download stream')
+  let res: Response
+  try {
+    res = await net.fetch(url, { signal: abortController.signal })
+  } catch (error) {
+    throw asRetryableDownloadError(error, 'HuggingFace download request failed')
+  }
+  if (!res.ok) await throwDownloadHttpError(res, 'HuggingFace download failed')
+  await consumeDownloadStream(res, onProgress, () => abortController.abort())
+}
 
-  const decoder = new TextDecoder()
-  const reader  = res.body.getReader()
-  let buffer = ''
+/** Download a validated node-level source plan through one aggregate SSE stream. */
+export async function downloadModelSourcesFromHF(
+  modelId: string,
+  targetOwnerId: string,
+  sources: ModelSource[],
+  onProgress: ProgressCallback,
+): Promise<void> {
+  const { net } = require('electron')
+  const abortController = new AbortController()
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const hfToken = getSettings(app.getPath('userData')).hfToken
+  if (hfToken) headers.Authorization = `Bearer ${hfToken}`
+  const url = `${PYTHON_API_URL}/model/hf-download-sources?model_id=${encodeURIComponent(modelId)}&target_owner_id=${encodeURIComponent(targetOwnerId)}`
+  let res: Response
+  try {
+    res = await net.fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({}),
+      signal: abortController.signal,
+    })
+  } catch (error) {
+    throw asRetryableDownloadError(error, 'HuggingFace multi-source download request failed')
+  }
+  if (!res.ok) await throwDownloadHttpError(res, 'HuggingFace multi-source download failed')
+  await consumeDownloadStream(res, onProgress, () => abortController.abort())
+}
 
-  async function readWithTimeout() {
-    return await Promise.race([
-      reader.read(),
-      new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error(`Model download stalled for ${Math.round(STALL_TIMEOUT_MS / 1000)}s`)), STALL_TIMEOUT_MS)
-      }),
-    ])
+async function consumeDownloadStream(
+  res: Response,
+  onProgress: ProgressCallback,
+  abortRequest: () => void = () => undefined,
+): Promise<void> {
+  if (!res.body) {
+    throw new ModelAssetDownloadError({
+      code: 'missing_stream',
+      stage: 'request',
+      message: 'HuggingFace download returned no response stream',
+      retryable: true,
+    })
   }
 
-  while (true) {
-    const { done, value } = await readWithTimeout()
-    if (done) break
+  const decoder = new TextDecoder()
+  let reader: ReadableStreamDefaultReader<Uint8Array>
+  try {
+    reader = res.body.getReader()
+  } catch (error) {
+    throw asRetryableDownloadError(error, 'HuggingFace download stream failed')
+  }
+  let buffer = ''
+  let completed = false
+  let stopped = false
+  const STALL_TIMEOUT_MS = 120_000
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue
-      try {
-        const data = JSON.parse(line.slice(6))
-        if (typeof data.percent === 'number') onProgress({
-          percent:    data.percent,
-          file:       data.file,
-          fileIndex:  data.fileIndex,
-          totalFiles: data.totalFiles,
-          status:     data.status,
-          bytesDownloaded: data.bytesDownloaded,
-          totalBytes: data.totalBytes,
-          stalledSeconds:  data.stalledSeconds,
-        })
-        if (data.paused) throw new Error('Model download paused')
-        if (data.cancelled) throw new Error('Model download cancelled')
-        if (data.error) throw new Error(`HF download error: ${data.error}`)
-      } catch (e) {
-        if (
-          e instanceof Error &&
-          (
-            e.message.startsWith('HF download error:') ||
-            e.message === 'Model download paused' ||
-            e.message === 'Model download cancelled'
-          )
-        ) throw e
-      }
+  const consumeLine = (line: string): void => {
+    if (!line.startsWith('data: ')) return
+    let data: unknown
+    try {
+      data = JSON.parse(line.slice(6))
+    } catch {
+      return
     }
+
+    const normalized = normalizeDownloadEvent(data)
+    if (normalized.failure) throw new ModelAssetDownloadError(normalized.failure)
+    if (!normalized.progress) return
+
+    onProgress(normalized.progress)
+    if (normalized.progress.paused || normalized.progress.cancelled) {
+      stopped = true
+      return
+    }
+    if (normalized.progress.percent === 100 && normalized.progress.status === 'done') {
+      completed = true
+    }
+  }
+
+  async function readWithTimeout() {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Model download stalled for ${Math.round(STALL_TIMEOUT_MS / 1000)}s`)), STALL_TIMEOUT_MS)
+        }),
+      ])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await readWithTimeout()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) consumeLine(line)
+    }
+
+    buffer += decoder.decode()
+    if (buffer) consumeLine(buffer)
+
+    if (!completed && !stopped) {
+      throw new ModelAssetDownloadError({
+        code: 'incomplete_stream',
+        stage: 'download',
+        message: 'HuggingFace download ended before completion',
+        retryable: true,
+      })
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined)
+    abortRequest()
+    throw asRetryableDownloadError(error, 'HuggingFace download stream failed')
   }
 }

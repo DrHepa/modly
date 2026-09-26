@@ -8,9 +8,9 @@ import { promisify } from 'util'
 import axios from 'axios'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
 import {
-  isModelDownloaded,
   listDownloadedModels,
   downloadModelFromHF,
+  downloadModelSourcesFromHF,
   downloadModelAssetsFromHF,
   downloadModelAssetsFromHttps,
   ModelAssetDownloadError,
@@ -26,6 +26,17 @@ import {
   resolveShowInFolderPath,
   type ModelOwnershipDescriptor,
 } from './model-ownership'
+import { resolveInstalledModelDownloadPlan } from './model-download-plan'
+import { parseLegacyModelDownloadPayload as parseLegacyModelDownloadPayloadContract } from './model-download-ipc-contract'
+import {
+  areModelSourcesDownloaded,
+  areWeightGroupSourcesDownloaded,
+  modelHasLocalData,
+  normalizeModelSources,
+  removePartialDownloadArtifacts,
+  resolveModelRoot,
+  resolveWeightGroupRoot,
+} from './model-sources'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
 import { logger } from './logger'
@@ -36,6 +47,7 @@ import {
   listVisibleExtensions,
   listVisibleExtensionsDetailed,
   resolveGovernedAgentProcessTarget,
+  type ParsedManifest,
 } from './automation-capabilities'
 import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
@@ -44,7 +56,7 @@ import { validateInstallManifest } from './extension-install-utils'
 import { fetchTrustedRepos } from './trusted-repos'
 import type { ProcessInput, WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
 import { runProcessExtensionWithDeps } from './run-process-handler'
-import { installGitHubExtensionRepo } from './github-extension-install'
+import { installGitHubExtensionRepo, parseManifestForInstall } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { assertSafeExtensionId, assertSafeOwnershipSegment, resolveExtensionPathWithinRoot } from './extension-path-guard'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
@@ -303,37 +315,6 @@ runpy.run_path(setup_py, run_name="__main__")
   })
 }
 
-function parseCanonicalModelDownloadPayload(payload: unknown): string {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('Model asset download payload must be an object containing only modelId')
-  }
-
-  const fields = Object.keys(payload)
-  if (fields.length !== 1 || fields[0] !== 'modelId') {
-    throw new Error('Model asset download payload must contain only modelId')
-  }
-
-  const modelId = (payload as Record<string, unknown>).modelId
-  if (typeof modelId !== 'string') {
-    throw new Error('Model asset download modelId must be a string')
-  }
-
-  const segments = modelId.split('/')
-  if (segments.length !== 2) {
-    throw new Error('Model asset download modelId must contain exactly two segments')
-  }
-
-  const extensionId = assertSafeOwnershipSegment(
-    segments[0],
-    'Model asset download extension segment',
-  )
-  const nodeId = assertSafeOwnershipSegment(
-    segments[1],
-    'Model asset download node segment',
-  )
-  return `${extensionId}/${nodeId}`
-}
-
 function modelAssetDownloadResult(error: unknown) {
   return {
     success: false,
@@ -425,7 +406,71 @@ export interface IpcHandlersLifecycle {
 }
 
 export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter, trustedRendererUrl: string): Promise<IpcHandlersLifecycle> {
-  const activeDownloads = new Map<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>()
+  type TrackedDownloadProgress = { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string; paused?: boolean; cancelled?: boolean; bytesDownloaded?: number; totalBytes?: number; stalledSeconds?: number }
+  type LocalDownloadControl = { pause: boolean; cancel: boolean }
+  const activeDownloads = new Map<string, TrackedDownloadProgress>()
+  const activeDownloadSettlements = new Map<string, Promise<void>>()
+  const localDownloadControls = new Map<string, LocalDownloadControl>()
+  // A multi-group install is intentionally serialized. Track only the target
+  // whose request is currently in flight so pause/cancel cannot create a
+  // backend control for a later group and poison that group's future download.
+  const activeWeightTargets = new Map<string, string>()
+  const localDownloadControl = (modelId: string): LocalDownloadControl => {
+    const existing = localDownloadControls.get(modelId)
+    if (existing) return existing
+    const created = { pause: false, cancel: false }
+    localDownloadControls.set(modelId, created)
+    return created
+  }
+  const aliasLocalDownloadControl = (alias: string, control: LocalDownloadControl): void => {
+    localDownloadControls.set(alias, control)
+  }
+  const findLocalDownloadControl = (keys: readonly string[]): LocalDownloadControl | undefined => {
+    for (const key of keys) {
+      const control = localDownloadControls.get(key)
+      if (control) return control
+    }
+    return undefined
+  }
+  const clearLocalDownloadControlAliases = (keys: readonly string[], control: LocalDownloadControl): void => {
+    for (const key of keys) {
+      if (localDownloadControls.get(key) === control) localDownloadControls.delete(key)
+    }
+  }
+  const beginPendingDownloadSettlement = (modelId: string): (() => void) => {
+    let release!: () => void
+    const settled = new Promise<void>((resolve) => { release = resolve })
+    activeDownloadSettlements.set(modelId, settled)
+    return () => {
+      if (activeDownloadSettlements.get(modelId) === settled) {
+        activeDownloadSettlements.delete(modelId)
+      }
+      release()
+    }
+  }
+  const runTrackedModelDownload = async (modelId: string, task: () => Promise<void>): Promise<void> => {
+    const release = beginPendingDownloadSettlement(modelId)
+    try {
+      await task()
+    } finally {
+      release()
+    }
+  }
+  const activeDownloadKeysForOwnership = (ownership: ModelOwnershipDescriptor, siblingCapabilityIds: string[] = []): string[] => (
+    [ownership.capabilityId, ownership.weightOwnerId, ...ownership.legacyPaths, ...siblingCapabilityIds]
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .filter((value) => activeDownloads.has(value) || activeDownloadSettlements.has(value))
+  )
+  const waitForActiveDownloadSettlement = async (modelId: string): Promise<void> => {
+    const settled = activeDownloadSettlements.get(modelId)
+    if (settled) await settled
+  }
+  const downloadInProgressError = (modelId: string, ownerId: string, activeKeys: string[]) => modelAssetDownloadResult(new ModelAssetDownloadError({
+    code: 'download_in_progress',
+    stage: 'request',
+    message: `Model asset download is already in progress for owner ${ownerId}; requested ${modelId}, active ${activeKeys.join(', ')}`,
+    retryable: true,
+  }))
   const getWorldsWorkspaceRoot = () => getSettings(app.getPath('userData')).workspaceDir
   const isTrustedMainFrameSender = (value: unknown): boolean => {
     if (!value || typeof value !== 'object') return false
@@ -728,11 +773,11 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
   const handleStructuredModelAssetDownload = async (
     event: IpcMainInvokeEvent,
     payload: unknown,
-    downloader: typeof downloadModelAssetsFromHF,
+    downloader: typeof downloadModelAssetsFromHF | typeof downloadModelAssetsFromHttps,
   ) => {
     let modelId: string
     try {
-      modelId = parseCanonicalModelDownloadPayload(payload)
+      modelId = parseLegacyModelDownloadPayloadContract(payload).modelId
     } catch (error) {
       return modelAssetDownloadResult(new ModelAssetDownloadError({
         code: 'invalid_model_id',
@@ -742,29 +787,60 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       }))
     }
 
-    if (activeDownloads.has(modelId)) {
-      return modelAssetDownloadResult(new ModelAssetDownloadError({
-        code: 'download_in_progress',
-        stage: 'request',
-        message: `Model asset download is already in progress for ${modelId}`,
-        retryable: false,
-      }))
-    }
-
+    const userData = app.getPath('userData')
+    const control = localDownloadControl(modelId)
     activeDownloads.set(modelId, { percent: 0, status: 'preparing' })
+    let ownership: ModelOwnershipDescriptor | undefined
+    let siblingCapabilityIds: string[]
     try {
-      await downloader(modelId, (progress) => {
-        activeDownloads.set(modelId, progress)
-        event.sender.send(
-          'model:downloadProgress',
-          mapDownloadProgressToCapability(modelId, progress),
-        )
+      await runTrackedModelDownload(modelId, async () => {
+        const context = await resolveOwnershipContext(userData, modelId)
+        ownership = context.ownership
+        siblingCapabilityIds = context.siblingCapabilityIds
+        const owner = ownership
+        aliasLocalDownloadControl(owner.weightOwnerId, control)
+        activeDownloads.delete(modelId)
+
+        const activeOwnerDownloads = activeDownloadKeysForOwnership(owner, siblingCapabilityIds)
+          .filter((activeId) => activeId !== modelId)
+        if (activeOwnerDownloads.length > 0) {
+          throw new ModelAssetDownloadError({
+            code: 'download_in_progress',
+            stage: 'request',
+            message: `Model asset download is already in progress for owner ${owner.weightOwnerId}; requested ${modelId}, active ${activeOwnerDownloads.join(', ')}`,
+            retryable: true,
+          })
+        }
+        if (control.cancel) {
+          activeDownloads.set(owner.weightOwnerId, { percent: 0, status: 'cancelled', cancelled: true })
+          event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, { percent: 0, status: 'cancelled', cancelled: true }))
+          return
+        }
+        if (control.pause) {
+          activeDownloads.set(owner.weightOwnerId, { percent: 0, status: 'paused', paused: true })
+          event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, { percent: 0, status: 'paused', paused: true }))
+          return
+        }
+
+        activeDownloads.set(owner.weightOwnerId, { percent: 0, status: 'preparing' })
+        await runTrackedModelDownload(owner.weightOwnerId, () => downloader(modelId, owner.weightOwnerId, (progress) => {
+          activeDownloads.set(owner.weightOwnerId, progress)
+          event.sender.send(
+            'model:downloadProgress',
+            mapDownloadProgressToCapability(modelId, progress),
+          )
+        }))
       })
       return { success: true }
     } catch (error) {
       return modelAssetDownloadResult(error)
     } finally {
       activeDownloads.delete(modelId)
+      if (typeof ownership !== 'undefined') activeDownloads.delete(ownership.weightOwnerId)
+      clearLocalDownloadControlAliases(
+        typeof ownership !== 'undefined' ? [modelId, ownership.weightOwnerId, ...ownership.legacyPaths] : [modelId],
+        control,
+      )
     }
   }
 
@@ -884,6 +960,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
 
     const result = await dialog.showOpenDialog(win, {
       title: 'Select a video',
+      filters: [{ name: 'Videos', extensions: ['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'] }],
       properties: ['openFile']
     })
 
@@ -973,6 +1050,10 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     const modelsDir = getSettings(userData).modelsDir
     const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(userData, modelId)
     const deletePlan = createOwnerScopedDeletePlan(modelsDir, ownership, siblingCapabilityIds)
+    const activeOwnerDownloads = activeDownloadKeysForOwnership(ownership, siblingCapabilityIds)
+    if (activeOwnerDownloads.length > 0) {
+      return { success: false, error: `Cannot delete model weights while download is active for: ${activeOwnerDownloads.join(', ')}` }
+    }
 
     if (deletePlan.mode === 'blocked') {
       return { success: true, warning: deletePlan.warning, skipped: true } as { success: boolean; error?: string }
@@ -1025,17 +1106,71 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     const modelsDir = getSettings(userData).modelsDir
     const extensions = await listModelExtensions(userData)
     const downloaded = listDownloadedModelCapabilities(modelsDir, extensions)
+    const downloadedIds = new Set(downloaded.map((model) => model.id))
+
+    for (const extension of extensions) {
+      if (extension.type !== 'model') continue
+      for (const node of extension.nodes) {
+        const capabilityId = node.capabilityId ?? `${extension.id}/${node.id}`
+        if (downloadedIds.has(capabilityId)) continue
+        try {
+          const plan = await resolveInstalledModelDownloadPlan({
+            modelId: capabilityId,
+            userExtensionsDir: getSettings(userData).extensionsDir,
+            builtinExtensionsDir: getBuiltinExtensionsDir(),
+          })
+          if (plan.kind !== 'multi-source') continue
+          const { ownership } = await resolveOwnershipContext(userData, capabilityId)
+          const privateReady = plan.sources.length === 0
+            || areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, plan.sources)
+          const sharedReady = plan.sharedGroups.every((group) => (
+            areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group)
+          ))
+          if (!privateReady || !sharedReady) continue
+          downloaded.push({ id: capabilityId, name: node.name, size_gb: 0 })
+          downloadedIds.add(capabilityId)
+        } catch {
+          // Ignore invalid or non-model entries; extension listing still succeeds.
+        }
+      }
+    }
+
     return downloaded.length > 0 ? downloaded : listDownloadedModels(modelsDir)
   })
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
     const userData = app.getPath('userData')
     const modelsDir = getSettings(userData).modelsDir
+    try {
+      const plan = await resolveInstalledModelDownloadPlan({
+        modelId,
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        builtinExtensionsDir: getBuiltinExtensionsDir(),
+      })
+      if (plan.kind === 'multi-source') {
+        const { ownership } = await resolveOwnershipContext(userData, modelId)
+        const privateReady = plan.sources.length === 0
+          || areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, plan.sources)
+        return privateReady && plan.sharedGroups.every((group) => (
+          areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group)
+        ))
+      }
+    } catch {
+      // Fall through to existing ownership/read-through semantics.
+    }
     const { ownership } = await resolveOwnershipContext(userData, modelId)
     const ownedDownloaded = isOwnedModelDownloaded(modelsDir, ownership)
-    return ownership.httpsDownloads?.length || ownership.hfDownloads?.length
-      ? ownedDownloaded
-      : ownedDownloaded || isModelDownloaded(modelsDir, modelId)
+    return ownedDownloaded
+  })
+
+  ipcMain.handle('model:hasLocalData', async (_, modelId: string): Promise<boolean> => {
+    try {
+      const userData = app.getPath('userData')
+      const { ownership } = await resolveOwnershipContext(userData, modelId)
+      return modelHasLocalData(getSettings(userData).modelsDir, ownership.weightOwnerId)
+    } catch {
+      return false
+    }
   })
 
   ipcMain.handle('model:activeDownloads', () =>
@@ -1058,28 +1193,211 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     )
   ))
 
-  ipcMain.handle('model:download', async (event, { repoId, modelId, skipPrefixes }: { repoId: string; modelId: string; skipPrefixes?: string[] }) => {
-    const userData = app.getPath('userData')
-    const { ownership } = await resolveOwnershipContext(userData, modelId)
-    if (activeDownloads.has(modelId)) {
+  ipcMain.handle('model:downloadSources', async (event, payload: unknown) => {
+    let modelId: string
+    try {
+      modelId = parseLegacyModelDownloadPayloadContract(payload).modelId
+    } catch (error) {
       return modelAssetDownloadResult(new ModelAssetDownloadError({
-        code: 'download_in_progress',
+        code: 'invalid_model_id',
         stage: 'request',
-        message: `Model asset download is already in progress for ${modelId}`,
+        message: error instanceof Error ? error.message : 'Invalid model asset download modelId',
         retryable: false,
       }))
     }
+
+    const userData = app.getPath('userData')
+    const control = localDownloadControl(modelId)
+    activeDownloads.set(modelId, { percent: 0, status: 'preparing' })
+    const releasePendingDownload = beginPendingDownloadSettlement(modelId)
+    let activeOwnerId: string | null = null
     try {
-      activeDownloads.set(modelId, { percent: 0 })
-      await downloadModelFromHF(repoId, ownership.weightOwnerId, (progress) => {
-        activeDownloads.set(modelId, progress)
+      const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(userData, modelId)
+      activeOwnerId = ownership.weightOwnerId
+      aliasLocalDownloadControl(activeOwnerId, control)
+      activeDownloads.delete(modelId)
+      if (control.cancel) return { success: true }
+      if (control.pause) return { success: true }
+      const activeOwnerDownloads = activeDownloadKeysForOwnership(ownership, siblingCapabilityIds)
+        .filter((activeId) => activeId !== modelId)
+      if (activeOwnerDownloads.length > 0) {
+        return downloadInProgressError(modelId, ownership.weightOwnerId, activeOwnerDownloads)
+      }
+
+      const plan = await resolveInstalledModelDownloadPlan({
+        modelId,
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        builtinExtensionsDir: getBuiltinExtensionsDir(),
+      })
+      if (plan.kind !== 'multi-source') {
+        return modelAssetDownloadResult(new ModelAssetDownloadError({
+          code: 'assets_not_declared',
+          stage: 'validate',
+          message: `Model node ${modelId} does not declare model_sources`,
+          retryable: false,
+        }))
+      }
+
+      const downloadPlans = [
+        ...plan.sharedGroups.map((group) => ({ targetId: group.targetId, sources: group.sources })),
+        ...(plan.sources.length > 0 ? [{ targetId: ownership.weightOwnerId, sources: plan.sources }] : []),
+      ]
+      const activePlanDownloads = downloadPlans
+        .map((item) => item.targetId)
+        .filter((targetId) => activeDownloads.has(targetId) || activeDownloadSettlements.has(targetId))
+      if (activePlanDownloads.length > 0) {
+        return downloadInProgressError(modelId, ownership.weightOwnerId, activePlanDownloads)
+      }
+      for (const [index, downloadPlan] of downloadPlans.entries()) {
+        if (control.cancel || control.pause) return { success: true }
+        if (downloadPlan.targetId.includes('/_shared/')) {
+          const group = plan.sharedGroups.find((candidate) => candidate.targetId === downloadPlan.targetId)!
+          if (areWeightGroupSourcesDownloaded(getSettings(userData).modelsDir, plan.extensionId, group)) continue
+        } else if (areModelSourcesDownloaded(getSettings(userData).modelsDir, ownership.weightOwnerId, plan.sources)) {
+          continue
+        }
+        activeWeightTargets.set(modelId, downloadPlan.targetId)
+        activeDownloads.set(downloadPlan.targetId, { percent: 0, status: 'preparing' })
+        aliasLocalDownloadControl(downloadPlan.targetId, control)
+        await runTrackedModelDownload(downloadPlan.targetId, () => downloadModelSourcesFromHF(modelId, downloadPlan.targetId, downloadPlan.sources, (progress) => {
+          const overall = {
+            ...progress,
+            percent: Math.round(((index + progress.percent / 100) / Math.max(1, downloadPlans.length)) * 100),
+          }
+          activeDownloads.set(downloadPlan.targetId, progress)
+          event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, overall))
+        }))
+        activeDownloads.delete(downloadPlan.targetId)
+        activeWeightTargets.delete(modelId)
+      }
+      return { success: true }
+    } catch (error) {
+      return modelAssetDownloadResult(error)
+    } finally {
+      const activeWeightTarget = activeWeightTargets.get(modelId)
+      if (activeWeightTarget) activeDownloads.delete(activeWeightTarget)
+      clearLocalDownloadControlAliases(activeWeightTarget ? [activeWeightTarget] : [], control)
+      activeWeightTargets.delete(modelId)
+      activeDownloads.delete(modelId)
+      if (activeOwnerId) activeDownloads.delete(activeOwnerId)
+      clearLocalDownloadControlAliases(activeOwnerId ? [modelId, activeOwnerId] : [modelId], control)
+      releasePendingDownload()
+    }
+  })
+
+  ipcMain.handle('model:download', async (event, payload: unknown) => {
+    let modelId: string
+    try {
+      modelId = parseLegacyModelDownloadPayloadContract(payload).modelId
+    } catch (error) {
+      return modelAssetDownloadResult(new ModelAssetDownloadError({
+        code: 'invalid_model_id',
+        stage: 'request',
+        message: error instanceof Error ? error.message : 'Invalid model asset download modelId',
+        retryable: false,
+      }))
+    }
+    const userData = app.getPath('userData')
+    const control = localDownloadControl(modelId)
+    activeDownloads.set(modelId, { percent: 0, status: 'preparing' })
+    const releasePendingDownload = beginPendingDownloadSettlement(modelId)
+    let activeOwnerId: string | null = null
+    try {
+      const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(userData, modelId)
+      activeOwnerId = ownership.weightOwnerId
+      aliasLocalDownloadControl(activeOwnerId, control)
+      activeDownloads.delete(modelId)
+      if (control.cancel) return { success: true }
+      if (control.pause) return { success: true }
+      const activeOwnerDownloads = activeDownloadKeysForOwnership(ownership, siblingCapabilityIds)
+        .filter((activeId) => activeId !== modelId)
+      if (activeOwnerDownloads.length > 0) {
+        return downloadInProgressError(modelId, ownership.weightOwnerId, activeOwnerDownloads)
+      }
+
+      const plan = await resolveInstalledModelDownloadPlan({
+        modelId,
+        userExtensionsDir: getSettings(userData).extensionsDir,
+        builtinExtensionsDir: getBuiltinExtensionsDir(),
+      })
+      if (plan.kind !== 'legacy') {
+        return modelAssetDownloadResult(new ModelAssetDownloadError({
+          code: 'legacy_download_not_applicable',
+          stage: 'validate',
+          message: `Model node ${modelId} does not declare a legacy hf_repo download`,
+          retryable: false,
+        }))
+      }
+      const request = parseLegacyModelDownloadPayloadContract(payload)
+      if ((request.repoId !== undefined && request.repoId !== plan.repoId)
+        || (request.skipPrefixes !== undefined && JSON.stringify(request.skipPrefixes) !== JSON.stringify(plan.skipPrefixes ?? []))
+        || (request.includePrefixes !== undefined && JSON.stringify(request.includePrefixes) !== JSON.stringify(plan.includePrefixes ?? []))) {
+        throw new ModelAssetDownloadError({ code: 'source_plan_invalid', stage: 'validate', message: `Model node ${modelId} download payload does not match its installed manifest`, retryable: false })
+      }
+      activeDownloads.set(ownership.weightOwnerId, { percent: 0 })
+      await runTrackedModelDownload(ownership.weightOwnerId, () => downloadModelFromHF(plan.repoId, modelId, (progress) => {
+        activeDownloads.set(ownership.weightOwnerId, progress)
         event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, progress))
-      }, skipPrefixes)
+      }, plan.skipPrefixes, plan.includePrefixes))
+      return { success: true }
+    } catch (err) {
+      return modelAssetDownloadResult(err)
+    } finally {
+      activeDownloads.delete(modelId)
+      if (activeOwnerId) activeDownloads.delete(activeOwnerId)
+      clearLocalDownloadControlAliases(
+        activeOwnerId ? [modelId, activeOwnerId] : [modelId],
+        control,
+      )
+      releasePendingDownload()
+    }
+  })
+
+  ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const userData = app.getPath('userData')
+      const { ownership } = await resolveOwnershipContext(userData, modelId)
+      const control = findLocalDownloadControl([modelId, ownership.weightOwnerId, ...ownership.legacyPaths])
+      if (control) control.pause = true
+      const targets = [activeWeightTargets.get(modelId) ?? ownership.weightOwnerId]
+      await Promise.all(targets.map((targetId) => axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
+        params: { model_id: targetId }, timeout: 5000,
+      })))
+      await waitForActiveDownloadSettlement(modelId)
+      await waitForActiveDownloadSettlement(ownership.weightOwnerId)
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
-    } finally {
-      activeDownloads.delete(modelId)
+    }
+  })
+
+  ipcMain.handle('model:cancelDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const userData = app.getPath('userData')
+      const { ownership } = await resolveOwnershipContext(userData, modelId)
+      const keys = [modelId, ownership.weightOwnerId, ...ownership.legacyPaths]
+      const hadOwnerSettlement = keys.some((key) => activeDownloadSettlements.has(key))
+      const control = findLocalDownloadControl(keys) ?? localDownloadControl(modelId)
+      control.cancel = true
+      const targets = [activeWeightTargets.get(modelId) ?? ownership.weightOwnerId]
+      await Promise.all(targets.map((targetId) => axios.post(`${API_BASE_URL}/model/hf-download/cancel`, null, {
+        params: { model_id: targetId }, timeout: 5000,
+      })))
+      await waitForActiveDownloadSettlement(modelId)
+      await waitForActiveDownloadSettlement(ownership.weightOwnerId)
+      if (hadOwnerSettlement) {
+        const modelDir = resolveModelRoot(getSettings(userData).modelsDir, ownership.weightOwnerId)
+        await removePartialDownloadArtifacts(modelDir)
+      }
+      for (const targetId of targets) {
+        const parts = targetId.split('/')
+        if (parts.length === 3 && parts[1] === '_shared') {
+          await removePartialDownloadArtifacts(resolveWeightGroupRoot(getSettings(userData).modelsDir, parts[0], parts[2]))
+        }
+      }
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
     }
   })
 
@@ -1352,69 +1670,6 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     }
   })
 
-  function isTrustedSource(source: string | undefined, trustedRepos: Set<string>): boolean {
-    if (!source) return false
-    return trustedRepos.has(source.toLowerCase().replace(/\/$/, ''))
-  }
-
-  type ParsedManifest = {
-    id?: string; name?: string; displayName?: string; version?: string
-    description?: string; author?: string | { name?: string }
-    source?: string; generator_class?: string
-    type?:  'model' | 'process'
-    entry?: string
-    params_schema?:  unknown[]
-    param_defaults?: Record<string, unknown>
-    nodes?: {
-      id:                string
-      name?:             string
-      input?:            'mesh' | 'image' | 'text' | 'audio' | 'video'
-      inputs?:           ('mesh' | 'image' | 'text' | 'audio' | 'video')[]
-      input_labels?:     string[]
-      output?:           'mesh' | 'image' | 'text' | 'audio' | 'video'
-      params_schema?:    unknown[]
-      param_defaults?:   Record<string, unknown>
-      hf_repo?:          string
-      download_check?:   string
-      hf_skip_prefixes?: string[]
-      hf_include_prefixes?: string[]
-    }[]
-  }
-
-  function parseExtensionManifest(parsed: ParsedManifest, fallbackId: string, trustedRepos: Set<string>, builtin = false) {
-    const common = {
-      id:          parsed.id          ?? fallbackId,
-      name:        parsed.displayName ?? parsed.name ?? fallbackId,
-      version:     parsed.version,
-      description: parsed.description,
-      author:      typeof parsed.author === 'string' ? parsed.author : parsed.author?.name,
-      trusted:     builtin || isTrustedSource(parsed.source, trustedRepos),
-      source:      parsed.source,
-      builtin,
-    }
-
-    const nodes = (parsed.nodes ?? []).map(n => ({
-      id:             n.id,
-      name:           n.name ?? n.id,
-      input:          n.input  ?? 'image' as const,
-      inputs:         n.inputs,
-      inputLabels:    n.input_labels,
-      output:         n.output ?? 'mesh'  as const,
-      paramsSchema:   n.params_schema ?? parsed.params_schema ?? [],
-      paramDefaults:  { ...(parsed.param_defaults ?? {}), ...(n.param_defaults ?? {}) },
-      hfRepo:         n.hf_repo,
-      downloadCheck:  n.download_check,
-      hfSkipPrefixes: n.hf_skip_prefixes,
-      hfIncludePrefixes: n.hf_include_prefixes,
-    }))
-
-    if (parsed.type === 'process') {
-      return { ...common, type: 'process' as const, entry: parsed.entry ?? 'processor.js', nodes }
-    }
-
-    return { ...common, type: 'model' as const, nodes }
-  }
-
   // Extensions — reads user extensions directory + built-in extensions directory
   ipcMain.handle('extensions:list', async () => {
     const userData      = app.getPath('userData')
@@ -1475,6 +1730,16 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     try {
       const { extensions } = await resolveOwnershipContext(userData, safeExtensionId)
       const cleanupPlans = createExtensionUninstallCleanupPlan(getSettings(userData).modelsDir, extensions, safeExtensionId)
+      const activeExtensionDownloads = extensions
+        .filter((extension) => extension.type === 'model' && extension.id === safeExtensionId)
+        .flatMap((extension) => extension.nodes.map((node) => {
+          const capabilityId = node.capabilityId ?? `${extension.id}/${node.id}`
+          const ownership = resolveModelOwnership(extensions, capabilityId) ?? createFallbackOwnership(capabilityId)
+          return activeDownloadKeysForOwnership(ownership)
+        }))
+      if (activeExtensionDownloads.length > 0) {
+        return { success: false, error: `Cannot uninstall extension while model download is active for: ${Array.from(new Set(activeExtensionDownloads)).join(', ')}` }
+      }
 
       // Terminate process runner if it's a process extension
       terminateProcessRunner(safeExtensionId)
@@ -1491,10 +1756,10 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         }
       }
 
-      await rmAsync(extPath, { recursive: true, force: true })
       for (const cleanupPlan of cleanupPlans) {
         await deleteOwnedModelPaths(getSettings(userData).modelsDir, cleanupPlan.targets)
       }
+      await rmAsync(extPath, { recursive: true, force: true })
       // Hot-reload Python so it stops using the deleted model extension
       try {
         await axios.post(`${API_BASE_URL}/extensions/reload`, {}, { timeout: 10_000 })
@@ -1559,6 +1824,8 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         'local folder',
       )
       const extensionId = assertSafeExtensionId(rawManifestId)
+      const annotatedManifest = { ...manifest, source: `local://${localPath}` }
+      const ext = parseManifestForInstall(annotatedManifest, extensionId, new Set())
 
       // 3. Create symlink / junction in extensionsDir
       const userData      = app.getPath('userData')
@@ -1605,10 +1872,6 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
 
       emit({ step: 'done', extensionId })
 
-      const trustedRepos = await fetchTrustedRepos()
-      // Build manifest with localPath marker so the UI can identify local extensions
-      const annotatedManifest = { ...manifest, source: `local://${localPath}` }
-      const ext = parseExtensionManifest(annotatedManifest, extensionId, trustedRepos)
       return { success: true, extensionId, extension: ext, localPath }
 
     } catch (err) {

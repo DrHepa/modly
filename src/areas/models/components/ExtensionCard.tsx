@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import type { AnyExtension, ModelDownloadFailure, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
+import type { AnyExtension, ModelDownloadFailure, ModelDownloadProgress, RuntimeReadiness, RuntimeReadinessAction, RuntimeReadinessDetails } from '@shared/types/electron.d'
 import type { ModelOwnershipCapabilityState } from '@areas/models/modelOwnershipState'
-import { ICONS, TypePill } from './extensionShared'
+import { ICONS, isRetryableModelDownloadFailure, TypePill, nodeHasManagedWeights } from './extensionShared'
 export type { AnyExtension as Extension }
 export type { ExtensionNode } from '@shared/types/electron.d'
 
@@ -18,7 +18,7 @@ type RuntimeReadinessModalState = {
 interface Props {
   ext:              AnyExtension
   installedIds:     string[]
-  downloading:      Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>
+  downloading:      Record<string, Omit<ModelDownloadProgress, 'capabilityId' | 'modelId'> & { paused?: boolean }>
   downloadFailures?: Record<string, ModelDownloadFailure>
   ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   runtimeReadinessById?: Record<string, RuntimeReadiness | undefined>
@@ -26,7 +26,7 @@ interface Props {
   disabled?:        boolean
   onInstall:        (node: import('@shared/types/electron.d').ExtensionNode, fullId: string) => void
   onUninstall?:     (extId: string) => void
-  onUninstallNode?: (fullId: string) => void
+  onUninstallNode?: (fullId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
   onRepaired?:      () => void
   onRuntimeReadinessAction?: (modelId: string, action: RuntimeReadinessAction) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string }
   onInstallAll?:    (ext: AnyExtension) => void
@@ -35,9 +35,10 @@ interface Props {
   onOpen?:          (ext: AnyExtension) => void
 }
 
-export function ExtensionCard({ ext, installedIds, downloading, downloadFailures, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction, onOpen }: Props): JSX.Element {
+export function ExtensionCard({ ext, installedIds, downloading, downloadFailures, ownershipStateById, runtimeReadinessById, loadError, disabled, onInstall, onUninstall, onUninstallNode, onRepaired, onRuntimeReadinessAction, onPauseDownload, onCancelDownload, onOpen }: Props): JSX.Element {
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
+  const [nodeDeleteErrors, setNodeDeleteErrors] = useState<Record<string, string>>({})
   const [runtimeModal, setRuntimeModal] = useState<RuntimeReadinessModalState | null>(null)
   const isModel = ext.type === 'model'
   const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
@@ -171,7 +172,7 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
               action.kind === 'open_external_url' || action.kind === 'refresh_readiness'
             ))
             const hasHttpsDownloads = Boolean(node.httpsDownloads?.length)
-            const hasWeights    = Boolean(hasHttpsDownloads || node.hfDownloads?.length || node.hfRepo)
+            const hasWeights    = nodeHasManagedWeights(node)
             const ownershipState = ownershipStateById?.[fullId]
             const installed     = !hasWeights || ownershipState?.downloaded || (!hasHttpsDownloads && installedIds.includes(fullId))
             const runtimeReadinessCheckFailed = runtimeReadiness?.machine_code === 'checking_failed' || runtimeReadiness?.machine_code === 'check_failed'
@@ -185,6 +186,7 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
             const dlTotalFiles  = dlInfo?.totalFiles
             const dlRepoIndex   = dlInfo?.repoIndex
             const dlTotalRepos  = dlInfo?.totalRepos
+            const isPaused      = dlInfo?.status === 'paused' || dlInfo?.paused
             const downloadFailure = downloadFailures?.[fullId]
             const installDisabled = Boolean(disabled || ownershipState?.installDisabled)
             const deleteDisabled = Boolean(disabled || ownershipState?.deleteDisabled)
@@ -225,7 +227,7 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] text-zinc-500 truncate max-w-[100px]" title={dlFile}>
-                          {dlFile ?? 'Downloading…'}
+                          {isPaused ? 'Paused' : dlFile ?? 'Downloading…'}
                         </span>
                         <span className="text-[10px] font-mono text-zinc-400 shrink-0 ml-1">
                           {`${dlRepoIndex && dlTotalRepos ? `R${dlRepoIndex}/${dlTotalRepos} · ` : ''}${dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ` : ''}${dlPercent}%`}
@@ -233,9 +235,31 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                       </div>
                       <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
                         <div
-                          className="h-full rounded-full bg-accent transition-all duration-300"
+                          className={`h-full rounded-full transition-all duration-300 ${isPaused ? 'bg-amber-400' : 'bg-accent'}`}
                           style={{ width: `${dlPercent}%` }}
                         />
+                      </div>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (isPaused) onInstall(node, fullId)
+                            else onPauseDownload?.(fullId)
+                          }}
+                          disabled={isPaused ? disabled : !onPauseDownload}
+                          className="flex-1 px-2 py-1 rounded-md bg-zinc-800/70 border border-zinc-700/50 text-[10px] font-semibold text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {isPaused ? 'Resume' : 'Pause'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); onCancelDownload?.(fullId) }}
+                          disabled={!onCancelDownload}
+                          className="flex-1 px-2 py-1 rounded-md bg-red-950/30 border border-red-800/30 text-[10px] font-semibold text-red-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Cancel
+                        </button>
                       </div>
                     </div>
                   ) : installed ? (
@@ -254,7 +278,24 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                       ))}
                       {onUninstallNode && (
                         <button
-                          onClick={(e) => { e.stopPropagation(); onUninstallNode(fullId) }}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void (async () => {
+                              const result = await onUninstallNode(fullId)
+                              if (!result.success || result.skipped) {
+                                setNodeDeleteErrors((current) => ({
+                                  ...current,
+                                  [fullId]: result.error ?? result.warning ?? 'Model weights were not removed.',
+                                }))
+                              } else {
+                                setNodeDeleteErrors((current) => {
+                                  const next = { ...current }
+                                  delete next[fullId]
+                                  return next
+                                })
+                              }
+                            })()
+                          }}
                           disabled={deleteDisabled}
                           title={deleteTitle}
                           className="shrink-0 text-emerald-700 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
@@ -270,7 +311,7 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] text-zinc-500 truncate max-w-[100px]" title={dlFile}>
-                          {dlFile ?? 'Downloading…'}
+                          {isPaused ? 'Paused' : dlFile ?? 'Downloading…'}
                         </span>
                         <span className="text-[10px] font-mono text-zinc-400 shrink-0 ml-1">
                           {`${dlRepoIndex && dlTotalRepos ? `R${dlRepoIndex}/${dlTotalRepos} · ` : ''}${dlFileIndex && dlTotalFiles ? `${dlFileIndex}/${dlTotalFiles} · ` : ''}${dlPercent}%`}
@@ -278,9 +319,31 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                       </div>
                       <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
                         <div
-                          className="h-full rounded-full bg-accent transition-all duration-300"
+                          className={`h-full rounded-full transition-all duration-300 ${isPaused ? 'bg-amber-400' : 'bg-accent'}`}
                           style={{ width: `${dlPercent}%` }}
                         />
+                      </div>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (isPaused) onInstall(node, fullId)
+                            else onPauseDownload?.(fullId)
+                          }}
+                          disabled={isPaused ? disabled : !onPauseDownload}
+                          className="flex-1 px-2 py-1 rounded-md bg-zinc-800/70 border border-zinc-700/50 text-[10px] font-semibold text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {isPaused ? 'Resume' : 'Pause'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); onCancelDownload?.(fullId) }}
+                          disabled={!onCancelDownload}
+                          className="flex-1 px-2 py-1 rounded-md bg-red-950/30 border border-red-800/30 text-[10px] font-semibold text-red-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Cancel
+                        </button>
                       </div>
                     </div>
                   ) : ownerDownloading ? (
@@ -288,7 +351,7 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                       <div className="w-2 h-2 rounded-full border border-sky-400/40 border-t-sky-200 animate-spin shrink-0" />
                       <span className="text-[10px] font-semibold text-sky-300 truncate">Shared download in progress</span>
                     </div>
-                  ) : downloadFailure?.retryable === false ? (
+                  ) : downloadFailure && !isRetryableModelDownloadFailure(downloadFailure) ? (
                     <div
                       aria-label="Download unavailable"
                       className="w-full flex items-center justify-center px-2 py-1 rounded-lg border bg-red-950/20 border-red-800/30 text-[10px] font-semibold text-red-300"
@@ -311,11 +374,17 @@ export function ExtensionCard({ ext, installedIds, downloading, downloadFailures
                         <polyline points="7 10 12 15 17 10"/>
                         <line x1="12" y1="15" x2="12" y2="3"/>
                       </svg>
-                      {downloadFailure ? 'Retry' : 'Download'}
+                      {isRetryableModelDownloadFailure(downloadFailure) ? 'Retry' : 'Download'}
                     </button>
                   )}
                 </div>
                 </div>
+
+                {nodeDeleteErrors[fullId] && (
+                  <div className="rounded-md border border-red-900/60 bg-red-950/30 px-2.5 py-2 text-[10px] text-red-300" role="alert">
+                    {nodeDeleteErrors[fullId]}
+                  </div>
+                )}
 
                 {downloadFailure && !isDownloading && !installed && (
                   <div role="alert" className="flex items-start gap-1.5 px-2.5 py-2 rounded-lg bg-red-950/30 border border-red-800/30">

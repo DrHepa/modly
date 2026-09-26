@@ -13,7 +13,9 @@ from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 from schemas.generation import JobStatus, SceneCandidate
 from services.generator_registry import WORKSPACE_DIR, generator_registry
+from services.extension_process import ExtensionProcess
 from services.generators.base import GenerationCancelled, smooth_progress
+from services.capture_input import TypedModelInput, revalidate_typed_model_input
 
 
 _jobs: Dict[str, JobStatus] = {}
@@ -83,8 +85,9 @@ def create_generation_job(
     params: dict,
     collection: str = "Default",
     image_bytes: Optional[bytes] = None,
-    generation_input: bytes | Path | None = None,
+    generation_input: bytes | Path | TypedModelInput | None = None,
     prompt: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> JobStatus:
     if image_bytes is not None and generation_input is not None:
         raise ValueError("Provide image_bytes or generation_input, not both.")
@@ -98,16 +101,18 @@ def create_generation_job(
         prompt=prompt,
         params=params,
         collection=collection,
+        model_id=model_id,
     )
     return job
 
 
-def create_from_image_job(background_tasks: BackgroundTasks, image_bytes: bytes, params: dict, collection: str = "Default") -> JobStatus:
+def create_from_image_job(background_tasks: BackgroundTasks, image_bytes: bytes, params: dict, collection: str = "Default", *, model_id: Optional[str] = None) -> JobStatus:
     return create_generation_job(
         background_tasks,
         image_bytes=image_bytes,
         params=params,
         collection=collection,
+        model_id=model_id,
     )
 
 
@@ -116,38 +121,63 @@ def create_from_video_job(
     video_path: Path,
     params: dict,
     collection: str = "Default",
+    *,
+    model_id: Optional[str] = None,
 ) -> JobStatus:
     return create_generation_job(
         background_tasks,
         generation_input=video_path,
         params=params,
         collection=collection,
+        model_id=model_id,
     )
 
 
-def create_from_text_job(background_tasks: BackgroundTasks, prompt: str, params: dict, collection: str = "Default") -> JobStatus:
+def create_from_text_job(background_tasks: BackgroundTasks, prompt: str, params: dict, collection: str = "Default", *, model_id: Optional[str] = None) -> JobStatus:
     return create_generation_job(
         background_tasks,
         prompt=prompt,
         params=params,
         collection=collection,
+        model_id=model_id,
     )
 
 
-def create_from_none_job(background_tasks: BackgroundTasks, params: dict, collection: str = "Default") -> JobStatus:
+def create_from_none_job(background_tasks: BackgroundTasks, params: dict, collection: str = "Default", *, model_id: Optional[str] = None) -> JobStatus:
     return create_generation_job(
         background_tasks,
         image_bytes=b"",
         params=params,
         collection=collection,
+        model_id=model_id,
     )
 
 
-def create_from_scene_job(background_tasks: BackgroundTasks, params: dict, collection: str = "Default") -> JobStatus:
+def create_from_scene_job(background_tasks: BackgroundTasks, params: dict, collection: str = "Default", *, model_id: Optional[str] = None) -> JobStatus:
     return create_generation_job(
         background_tasks,
         params=params,
         collection=collection,
+        model_id=model_id,
+    )
+
+
+def create_from_artifact_job(
+    background_tasks: BackgroundTasks,
+    input_kind: str,
+    artifact_path: Path,
+    params: dict,
+    collection: str = "Default",
+    *,
+    artifact_snapshot: object | None = None,
+    model_id: Optional[str] = None,
+) -> JobStatus:
+    return create_generation_job(
+        background_tasks,
+        generation_input=TypedModelInput(input_kind, artifact_path, artifact_snapshot),
+        params=params,
+        collection=collection,
+        model_id=model_id,
     )
 
 
@@ -383,10 +413,11 @@ async def _run_generation(
     job_id: str,
     *,
     image_bytes: Optional[bytes] = None,
-    generation_input: bytes | Path | None = None,
+    generation_input: bytes | Path | TypedModelInput | None = None,
     prompt: Optional[str] = None,
     params: dict,
     collection: str = "Default",
+    model_id: Optional[str] = None,
 ) -> None:
     collection = sanitize_collection_name(collection)
     job = _jobs[job_id]
@@ -402,8 +433,13 @@ async def _run_generation(
     try:
         loop = asyncio.get_running_loop()
 
-        if not generator_registry.active_status()["loaded"]:
-            active = generator_registry.active_status()
+        target_model_id = model_id
+        active = generator_registry.model_status(target_model_id) if target_model_id else generator_registry.active_status()
+        get_generator = (
+            lambda: generator_registry.get_loaded(target_model_id)
+        ) if target_model_id else generator_registry.get_active
+
+        if not active["loaded"]:
             model_name = active["name"]
             init_label = f"Downloading {model_name}…" if not active["downloaded"] else f"Loading {model_name}…"
             progress_cb(0, init_label)
@@ -415,11 +451,11 @@ async def _run_generation(
             )
             load_thread.start()
             try:
-                gen = await loop.run_in_executor(None, generator_registry.get_active)
+                gen = await loop.run_in_executor(None, get_generator)
             finally:
                 stop_load_evt.set()
         else:
-            gen = await loop.run_in_executor(None, generator_registry.get_active)
+            gen = await loop.run_in_executor(None, get_generator)
 
         if job_id in _cancelled:
             return
@@ -432,6 +468,12 @@ async def _run_generation(
         supports_cancel = "cancel_event" in inspect.signature(gen.generate).parameters
         if generation_input is None:
             generation_input = image_bytes if image_bytes is not None else b""
+        if isinstance(generation_input, TypedModelInput):
+            generation_input = revalidate_typed_model_input(
+                get_workspace_dir(), generation_input
+            )
+            if generation_input.kind == "video" and not isinstance(gen, ExtensionProcess):
+                generation_input = generation_input.path
         generation_params = dict(params)
         if prompt is not None:
             generation_params.setdefault("prompt", prompt)

@@ -25,7 +25,7 @@ export type WorkflowBuiltinParamContract = WorkflowBuiltinParamRules & (
 
 export type WorkflowBuiltinAgentSourceAuthority =
   | { kind: 'inline' }
-  | { kind: 'workspace', sourceKind: 'video' | 'scene', pathParam: string }
+  | { kind: 'workspace', sourceKind: 'video' | 'scene' | 'capture', pathParam: string }
   | { kind: 'current', discriminator: string, value: WorkflowBuiltinParamScalar }
   | { kind: 'unsupported' }
 
@@ -101,6 +101,16 @@ export const WORKFLOW_BUILTIN_NODE_CONTRACTS = {
       sourceKind: { type: 'select', required: false, options: ['manifest', 'directory'] },
     },
     agentSourceAuthority: { kind: 'workspace', sourceKind: 'scene', pathParam: 'path' },
+  },
+  captureNode: {
+    input: null,
+    output: 'capture',
+    params: {
+      path: { type: 'string', required: true, workspacePath: true },
+      manifestPath: { type: 'string', required: false, workspacePath: true },
+      kind: { type: 'select', required: false, options: ['frames', 'video'] },
+    },
+    agentSourceAuthority: { kind: 'workspace', sourceKind: 'capture', pathParam: 'path' },
   },
   outputNode: { input: 'mesh', output: null, params: {} },
   addToWorldsNode: { input: 'mesh', output: null, params: {} },

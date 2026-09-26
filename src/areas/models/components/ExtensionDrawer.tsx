@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { AnyExtension, ExtensionNode } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ModelDownloadFailure } from '@shared/types/electron.d'
+import type { ModelOwnershipCapabilityState } from '../modelOwnershipState'
 import { useNavStore } from '@shared/stores/navStore'
 import {
   DownloadMap,
@@ -10,19 +11,22 @@ import {
   extInstallSummary,
   formatBytes,
   getNodeState,
+  isRetryableModelDownloadFailure,
 } from './extensionShared'
 
 interface Props {
   ext:              AnyExtension
   installedIds:     string[]
   downloading:      DownloadMap
+  downloadFailures?: Record<string, ModelDownloadFailure>
+  ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   loadError?:       string
   disabled?:        boolean
   onInstall:        (node: ExtensionNode, fullId: string) => void
   onInstallAll:     (ext: AnyExtension) => void
   onPauseDownload:  (fullId: string) => void
   onCancelDownload: (fullId: string) => void
-  onUninstallNode:  (fullId: string) => void
+  onUninstallNode:  (fullId: string) => Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }>
   onUninstall:      (extId: string) => void
   onRepaired:       () => void
   onSynced:         () => void
@@ -30,7 +34,7 @@ interface Props {
 }
 
 export function ExtensionDrawer({
-  ext, installedIds, downloading, loadError, disabled,
+  ext, installedIds, downloading, downloadFailures, ownershipStateById, loadError, disabled,
   onInstall, onInstallAll, onPauseDownload, onCancelDownload,
   onUninstallNode, onUninstall, onRepaired, onSynced, onClose,
 }: Props): JSX.Element {
@@ -39,6 +43,7 @@ export function ExtensionDrawer({
   const [repairError, setRepairError] = useState<string | null>(null)
   const [syncing,     setSyncing]     = useState(false)
   const [syncError,   setSyncError]   = useState<string | null>(null)
+  const [nodeDeleteErrors, setNodeDeleteErrors] = useState<Record<string, string>>({})
 
   const isModel     = ext.type === 'model'
   // Built-ins are corrupted-flagged too (builtin-sync repairs them on restart),
@@ -53,6 +58,11 @@ export function ExtensionDrawer({
   const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
   const localPath = isLocal ? ext.source!.replace('local://', '') : null
   const { total, done, installing, hasAvailable } = extInstallSummary(ext, installedIds, downloading)
+  const hasRetryableAvailable = hasAvailable && ext.nodes.some((node) => {
+    const fullId = `${ext.id}/${node.id}`
+    return getNodeState(ext.id, node, installedIds, downloading).kind === 'available'
+      && (!downloadFailures?.[fullId] || isRetryableModelDownloadFailure(downloadFailures[fullId]))
+  })
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -175,6 +185,9 @@ export function ExtensionDrawer({
               {ext.nodes.map((node) => {
                 const fullId = `${ext.id}/${node.id}`
                 const state = getNodeState(ext.id, node, installedIds, downloading)
+                const ownershipState = ownershipStateById?.[node.capabilityId ?? fullId]
+                const permanentlyFailed = Boolean(downloadFailures?.[fullId] && !isRetryableModelDownloadFailure(downloadFailures[fullId]))
+                const failure = downloadFailures?.[fullId]
                 const dl = state.kind === 'downloading' ? state.dl : null
                 const sub =
                   state.kind === 'ready'       ? 'Available on the node graph'
@@ -196,7 +209,7 @@ export function ExtensionDrawer({
                           <div className="flex items-center gap-1.5">
                             <NodeInstallControl
                               state={state}
-                              disabled={disabled}
+                              disabled={disabled || permanentlyFailed}
                               onInstall={() => onInstall(node, fullId)}
                               onPause={() => onPauseDownload(fullId)}
                               onResume={() => onInstall(node, fullId)}
@@ -204,9 +217,23 @@ export function ExtensionDrawer({
                             />
                             {state.kind === 'installed' && (
                               <button
-                                onClick={() => onUninstallNode(fullId)}
-                                disabled={disabled}
-                                title="Remove model weights"
+                                onClick={async () => {
+                                  const result = await onUninstallNode(fullId)
+                                  if (!result.success || result.skipped) {
+                                    setNodeDeleteErrors((current) => ({
+                                      ...current,
+                                      [fullId]: result.error ?? result.warning ?? 'Model weights were not removed.',
+                                    }))
+                                  } else {
+                                    setNodeDeleteErrors((current) => {
+                                      const next = { ...current }
+                                      delete next[fullId]
+                                      return next
+                                    })
+                                  }
+                                }}
+                                disabled={disabled || ownershipState?.deleteDisabled}
+                                title={ownershipState?.warning ?? 'Remove model weights'}
                                 className="p-1 rounded-md text-zinc-600 hover:text-red-400 hover:bg-red-950/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -220,6 +247,18 @@ export function ExtensionDrawer({
                       </div>
                     </div>
 
+                    {nodeDeleteErrors[fullId] && (
+                      <div className="mt-3 rounded-md border border-red-900/60 bg-red-950/30 px-2.5 py-2 text-[10px] text-red-300" role="alert">
+                        {nodeDeleteErrors[fullId]}
+                      </div>
+                    )}
+
+                    {failure && permanentlyFailed && (
+                      <div className="mt-3 rounded-md border border-red-900/60 bg-red-950/30 px-2.5 py-2 text-[10px] text-red-300" role="alert">
+                        <div className="font-mono">{failure.code} · {failure.stage}</div>
+                        <div className="mt-1 break-words text-red-200/80">{failure.message}</div>
+                      </div>
+                    )}
                     {/* Download detail */}
                     {dl && (
                       <div className="mt-3 flex flex-col gap-1">
@@ -280,7 +319,7 @@ export function ExtensionDrawer({
               </svg>
               Delete broken folder
             </button>
-          ) : isModel && hasAvailable ? (
+          ) : isModel && hasRetryableAvailable ? (
             <button
               onClick={() => onInstallAll(ext)}
               disabled={disabled || installing}

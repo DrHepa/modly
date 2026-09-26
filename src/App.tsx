@@ -23,7 +23,6 @@ export default function App(): JSX.Element {
       window.electron.app.offError()
       window.electron.updater.offMajorMinorAvailable()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once on mount; store actions are stable
   }, [])
 
   // Apply before paint to avoid a flash of default font/size on launch.
@@ -39,7 +38,6 @@ export default function App(): JSX.Element {
 
   useEffect(() => {
     if (setupStatus === 'done') initApp()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- react to setup transition only; initApp is stable
   }, [setupStatus])
 
   useEffect(() => {

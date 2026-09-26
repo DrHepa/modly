@@ -17,15 +17,14 @@ import { listAgentCapabilities } from './automation-capabilities.ts'
 
 const processor = String.raw`
 import { createHash } from 'node:crypto'
+import { readFileSync, writeSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const request = JSON.parse(await new Promise((resolve) => {
-  let value = ''
-  process.stdin.setEncoding('utf8')
-  process.stdin.on('data', (chunk) => { value += chunk })
-  process.stdin.on('end', () => resolve(value))
-}))
+const writeProtocolMessage = (message) => {
+  writeSync(1, Buffer.from(JSON.stringify(message) + '\n'))
+}
+const request = JSON.parse(readFileSync(0, 'utf8'))
 const trusted = request.trustedContext
 for (const forbidden of ['modelAccess', 'bearerToken', 'socketPath', 'responsesPath']) {
   if (forbidden in trusted) throw new Error('model or network authority was exposed')
@@ -38,19 +37,19 @@ if (typeof trusted.proposalHash !== 'string' || trusted.proposalHash.length !== 
 }
 const body = Buffer.from('model-free:' + request.arguments.input)
 await writeFile(join(trusted.dirs.output, 'result.txt'), body)
-process.stdout.write(JSON.stringify({
+writeProtocolMessage({
   schema: 'modly.agent-process-result.v1',
   type: 'result',
   artifacts: [{
     path: 'result.txt', kind: 'text', mediaType: 'text/plain', sizeBytes: body.length,
     sha256: createHash('sha256').update(body).digest('hex'),
   }],
-}) + '\n')
+})
 `
 
 function modelAccessCapability(): AgentCapabilitySnapshotV1 {
   const runtimeFiles = [{
-    path: 'processor.pyz', device: '1', inode: '2', uid: 1000, gid: 1000,
+    path: 'processor.py', device: '1', inode: '2', uid: 1000, gid: 1000,
     mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
   }]
   const resourceFiles: never[] = []
@@ -78,9 +77,9 @@ function modelAccessCapability(): AgentCapabilitySnapshotV1 {
   }
   const execution = {
     kind: 'process' as const, schema: 'modly.agent-process-execution.v1' as const,
-    entry: 'processor.pyz', runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
+    entry: 'processor.py', runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
     bindingHash: sha256Canonical({
-      schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.py', runtimeHash, artifacts,
     }),
   }
   const unsigned = {

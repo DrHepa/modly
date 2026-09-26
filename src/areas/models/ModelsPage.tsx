@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
-import type { AnyExtension, ExtensionNode, ExtensionInstallResult, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ExtensionInstallResult, ModelDownloadFailure, ModelDownloadProgress, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { formatModelName } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import { ExtensionDrawer } from './components/ExtensionDrawer'
-import { ICONS } from './components/extensionShared'
+import { ICONS, isRetryableModelDownloadFailure, isValidModelDownloadFailure, nodeHasManagedWeights } from './components/extensionShared'
 import { collectModelOwnershipMetadata, deriveModelOwnershipState } from './modelOwnershipState'
+
+export { isRetryableModelDownloadFailure, isValidModelDownloadFailure }
 
 const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
 
@@ -36,6 +38,11 @@ type ModelApiWithDownloadControls = {
   cancelDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
 }
 
+type DownloadingState = Omit<ModelDownloadProgress, 'capabilityId' | 'modelId'> & {
+  paused?: boolean
+  cancelled?: boolean
+}
+
 function hasLocalInstall(api: unknown): api is ExtensionsApiWithLocalInstall {
   return typeof api === 'object' && api !== null && 'installFromLocal' in api && typeof api.installFromLocal === 'function'
 }
@@ -47,9 +54,52 @@ function hasDownloadControls(api: unknown): api is ModelApiWithDownloadControls 
 }
 
 type ModelDownloadApi = {
-  download: (repoId: string, modelId: string, skipPrefixes?: string[]) => Promise<ModelDownloadResult>
+  download: (repoId: string, modelId: string, skipPrefixes?: string[], includePrefixes?: string[]) => Promise<ModelDownloadResult>
   downloadAssets: (modelId: string) => Promise<ModelDownloadResult>
+  downloadSources: (modelId: string) => Promise<ModelDownloadResult>
   downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
+}
+
+
+export type InstallAllCandidate = {
+  node: ExtensionNode
+  fullId: string
+  weightOwnerId: string
+}
+
+function downloadPlanIdentity(node: ExtensionNode): string {
+  if (node.httpsDownloads?.length) return `https:${JSON.stringify(node.httpsDownloads)}`
+  if (node.hfDownloads?.length) return `hf-assets:${JSON.stringify(node.hfDownloads)}`
+  if (node.hasModelSources) return `sources:${JSON.stringify(node.modelSources ?? [])}`
+  if (node.hfRepo) return `legacy:${node.hfRepo}:${JSON.stringify(node.hfSkipPrefixes ?? [])}:${JSON.stringify(node.hfIncludePrefixes ?? [])}`
+  return 'none'
+}
+
+export function buildInstallAllQueue(
+  candidates: readonly InstallAllCandidate[],
+  installedIds: readonly string[],
+  downloadingById: Record<string, unknown>,
+): InstallAllCandidate[] {
+  const installed = new Set(installedIds)
+  const activeCapabilityIds = new Set(Object.keys(downloadingById))
+  const activeOwnerIds = new Set(
+    candidates
+      .filter((candidate) => activeCapabilityIds.has(candidate.fullId))
+      .map((candidate) => candidate.weightOwnerId),
+  )
+  const queuedPlanIds = new Set<string>()
+  const queue: InstallAllCandidate[] = []
+
+  for (const candidate of candidates) {
+    if (installed.has(candidate.fullId) || activeCapabilityIds.has(candidate.fullId)) continue
+    if (activeOwnerIds.has(candidate.weightOwnerId)) continue
+    const planId = `${candidate.weightOwnerId}::${downloadPlanIdentity(candidate.node)}`
+    if (queuedPlanIds.has(planId)) continue
+    queuedPlanIds.add(planId)
+    queue.push(candidate)
+  }
+
+  return queue
 }
 
 export function requestModelNodeDownload(
@@ -59,7 +109,8 @@ export function requestModelNodeDownload(
 ): Promise<ModelDownloadResult> {
   if (node.httpsDownloads?.length) return modelApi.downloadHttpsAssets(fullId)
   if (node.hfDownloads?.length) return modelApi.downloadAssets(fullId)
-  if (node.hfRepo) return modelApi.download(node.hfRepo, fullId, node.hfSkipPrefixes)
+  if (node.hasModelSources) return modelApi.downloadSources(fullId)
+  if (node.hfRepo) return modelApi.download(node.hfRepo, fullId, node.hfSkipPrefixes, node.hfIncludePrefixes)
   return Promise.resolve({
     success: false,
     error: 'Model node does not declare downloadable assets.',
@@ -76,9 +127,10 @@ function loadPersistedDownloadFailures(): Record<string, ModelDownloadFailure> {
   if (typeof window === 'undefined' || !window.localStorage) return {}
   try {
     const value = JSON.parse(window.localStorage.getItem(MODEL_DOWNLOAD_FAILURES_STORAGE_KEY) ?? '{}')
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, ModelDownloadFailure>
-      : {}
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(
+      Object.entries(value).filter(([, failure]) => isValidModelDownloadFailure(failure)),
+    ) as Record<string, ModelDownloadFailure>
   } catch {
     return {}
   }
@@ -92,7 +144,7 @@ export function pruneStaleDownloadFailures(
     modelExtensions
       .filter((extension): extension is Extract<AnyExtension, { type: 'model' }> => extension.type === 'model')
       .flatMap((extension) => extension.nodes
-        .filter((node) => node.httpsDownloads?.length || node.hfDownloads?.length || node.hfRepo)
+        .filter(nodeHasManagedWeights)
         .map((node) => node.capabilityId ?? `${extension.id}/${node.id}`)),
   )
 
@@ -251,13 +303,13 @@ export default function ModelsPage(): JSX.Element {
   )
 
   // Model weight state (needed for node install status + uninstall cleanup)
-  const [downloading, setDownloading] = useState<Record<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>>({})
+  const [downloading, setDownloading] = useState<Record<string, DownloadingState>>({})
   const [downloadFailures, setDownloadFailures] = useState<Record<string, ModelDownloadFailure>>(loadPersistedDownloadFailures)
 
   // Uninstall modal state
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
   const [uninstallError,  setUninstallError]  = useState<string | null>(null)
-  const [modelsToDelete,  setModelsToDelete]  = useState<Set<string>>(new Set())
+  const [,               setModelsToDelete]  = useState<Set<string>>(new Set())
 
   // Search / filter / sort / detail drawer
   const [search, setSearch]       = useState('')
@@ -307,12 +359,37 @@ export default function ModelsPage(): JSX.Element {
       repoIndex,
       totalRepos,
       status,
+      bytesDownloaded,
+      totalBytes,
+      stalledSeconds,
+      paused,
+      cancelled,
     }) => {
       const id = capabilityId ?? modelId
       if (!id) return
+      if (cancelled) {
+        setDownloading((prev) => {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
+        return
+      }
       setDownloading((prev) => ({
         ...prev,
-        [id]: { percent, file, fileIndex, totalFiles, repoIndex, totalRepos, status },
+        [id]: {
+          percent: percent ?? prev[id]?.percent ?? 0,
+          file,
+          fileIndex,
+          totalFiles,
+          repoIndex,
+          totalRepos,
+          status,
+          bytesDownloaded,
+          totalBytes,
+          stalledSeconds,
+          ...(paused !== undefined ? { paused } : {}),
+        },
       }))
       if (percent === 100) {
         setDownloadFailures((prev) => {
@@ -392,22 +469,37 @@ export default function ModelsPage(): JSX.Element {
     })
     setDownloadFailures((prev) => ({
       ...prev,
-      [fullId]: result.failure ?? {
+      [fullId]: result.failure && isValidModelDownloadFailure(result.failure) ? result.failure : {
         code: 'download_failed',
         stage: 'download',
         message: result.error ?? 'Model asset download failed.',
-        retryable: true,
+        retryable: false,
       },
     }))
   }
 
-  function handleInstallAll(ext: AnyExtension) {
+  async function handleInstallAll(ext: AnyExtension) {
     if (ext.type !== 'model') return
-    for (const node of ext.nodes) {
-      if (!node.hfRepo) continue
-      const fullId = `${ext.id}/${node.id}`
-      if (installedVariantIds.includes(fullId) || downloading[fullId]) continue
-      handleInstallNode(node, fullId)
+    const metadataByCapabilityId = new Map(
+      ownershipMetadata.map((ownership) => [ownership.capabilityId, ownership]),
+    )
+    const candidates = ext.nodes
+      .filter(nodeHasManagedWeights)
+      .map((node) => {
+        const fullId = node.capabilityId ?? `${ext.id}/${node.id}`
+        return {
+          node,
+          fullId,
+          weightOwnerId: metadataByCapabilityId.get(fullId)?.weightOwnerId ?? node.weightOwnerId ?? fullId,
+        }
+      })
+      .filter((candidate) => {
+        const failure = downloadFailures[candidate.fullId]
+        return failure === undefined || isRetryableModelDownloadFailure(failure)
+      })
+
+    for (const candidate of buildInstallAllQueue(candidates, installedVariantIds, downloading)) {
+      await handleInstallNode(candidate.node, candidate.fullId)
     }
   }
 
@@ -445,9 +537,13 @@ export default function ModelsPage(): JSX.Element {
     })
   }
 
-  async function handleUninstallNode(fullId: string) {
-    await window.electron.model.delete(fullId)
+  async function handleUninstallNode(fullId: string): Promise<{ success: boolean; error?: string; warning?: string; skipped?: boolean }> {
+    const result = await window.electron.model.delete(fullId)
+    if (!result.success || result.skipped) {
+      return result
+    }
     await refreshModelOwnership()
+    return result
   }
 
   // ── GitHub extension install ───────────────────────────────────────────────
@@ -488,8 +584,8 @@ export default function ModelsPage(): JSX.Element {
   function openUninstallModal(extId: string) {
     const ext = allExtensions.find((e) => e.id === extId)
     if (ext?.type === 'model') {
-      const installedModels = ext.nodes.filter((n) => installedVariantIds.includes(`${extId}/${n.id}`))
-      setModelsToDelete(new Set(installedModels.map((n) => `${extId}/${n.id}`)))
+      const installedModels = ext.nodes.filter((n) => installedVariantIds.includes(n.capabilityId ?? `${extId}/${n.id}`))
+      setModelsToDelete(new Set(installedModels.map((n) => n.capabilityId ?? `${extId}/${n.id}`)))
     } else {
       setModelsToDelete(new Set())
     }
@@ -497,9 +593,6 @@ export default function ModelsPage(): JSX.Element {
   }
 
   async function handleUninstallExtension(extId: string) {
-    for (const modelId of modelsToDelete) {
-      await window.electron.model.delete(modelId)
-    }
     const result = await uninstallExt(extId)
     if (!result.success) {
       // Keep the dialog open so the failure is visible (locked folder, etc.)
@@ -881,6 +974,8 @@ export default function ModelsPage(): JSX.Element {
           ext={selectedExt}
           installedIds={installedVariantIds}
           downloading={downloading}
+          downloadFailures={downloadFailures}
+          ownershipStateById={ownershipStateById}
           loadError={extLoadError(selectedExt)}
           disabled={extensionActionsDisabled}
           onInstall={handleInstallNode}
@@ -899,7 +994,7 @@ export default function ModelsPage(): JSX.Element {
       {uninstallTarget && (() => {
         const ext = allExtensions.find((e) => e.id === uninstallTarget)
         const installedModels = ext?.type === 'model'
-          ? ext.nodes.filter((n) => installedVariantIds.includes(`${uninstallTarget}/${n.id}`))
+          ? ext.nodes.filter((n) => installedVariantIds.includes(n.capabilityId ?? `${uninstallTarget}/${n.id}`))
           : []
 
         return createPortal(
@@ -932,31 +1027,17 @@ export default function ModelsPage(): JSX.Element {
                 {installedModels.length > 0 && (
                   <div className="flex flex-col gap-2 px-1">
                     <p className="text-[11px] font-medium text-zinc-400">
-                      Also delete downloaded model weights:
+                      Downloaded model weights owned only by this extension will also be deleted.
                     </p>
                     {installedModels.map((v) => {
-                      const id      = `${uninstallTarget}/${v.id}`
-                      const checked = modelsToDelete.has(id)
+                      const id      = v.capabilityId ?? `${uninstallTarget}/${v.id}`
                       return (
-                        <label
+                        <div
                           key={v.id}
-                          className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-zinc-800/60 border border-zinc-700/40 cursor-pointer hover:border-zinc-600/60 transition-colors"
+                          className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-zinc-800/60 border border-zinc-700/40"
                         >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => {
-                              setModelsToDelete((prev) => {
-                                const next = new Set(prev)
-                                if (checked) next.delete(id)
-                                else next.add(id)
-                                return next
-                              })
-                            }}
-                            className="accent-accent w-3.5 h-3.5 rounded"
-                          />
                           <span className="text-xs text-zinc-200">{formatModelName(id)}</span>
-                        </label>
+                        </div>
                       )
                     })}
                   </div>

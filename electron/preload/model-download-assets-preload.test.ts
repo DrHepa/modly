@@ -36,3 +36,14 @@ test('preload HTTPS asset download sends only the canonical modelId payload', as
     args: [{ modelId: 'gaussiangpt/vfront' }],
   }])
 })
+
+
+test('shared Electron window contract uses the full ModelDownloadProgress payload', async () => {
+  const source = await import('node:fs/promises').then(({ readFile }) => readFile(
+    new URL('../../src/shared/types/electron.d.ts', import.meta.url),
+    'utf8',
+  ))
+
+  assert.match(source, /interface ModelDownloadProgress[\s\S]*bytesDownloaded\?: number[\s\S]*totalBytes\?: number[\s\S]*stalledSeconds\?: number/)
+  assert.match(source, /onProgress:\s*\(cb:\s*\(data:\s*ModelDownloadProgress\) => void\) => void/)
+})

@@ -95,7 +95,7 @@ function modelFreeProcessCapabilityFixture(runtimeSha256 = 'c'.repeat(64)): Agen
 
 function modelAccessProcessCapabilityFixture(): AgentCapabilitySnapshotV1 {
   const runtimeFiles = [{
-    path: 'processor.pyz', device: '1', inode: '2', uid: 1000, gid: 1000,
+    path: 'processor.py', device: '1', inode: '2', uid: 1000, gid: 1000,
     mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
   }]
   const resourceFiles: never[] = []
@@ -137,10 +137,10 @@ function modelAccessProcessCapabilityFixture(): AgentCapabilitySnapshotV1 {
       ],
     },
     execution: {
-      kind: 'process', schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+      kind: 'process', schema: 'modly.agent-process-execution.v1', entry: 'processor.py',
       runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
       bindingHash: sha256Canonical({
-        schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
+        schema: 'modly.agent-process-execution.v1', entry: 'processor.py', runtimeHash, artifacts,
       }),
     },
   })

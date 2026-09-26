@@ -425,7 +425,28 @@ test('allows non-video sources connected to Preview Video nodes at connect time'
   assert.equal(issue, null)
 })
 
-test('accepts video extension outputs connected to Preview Video nodes', () => {
+test('accepts model video extension outputs connected to Preview Video nodes', () => {
+  const source = createNode('source-node', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} })
+  const target = createNode('target-node', 'previewVideoNode')
+
+  const issue = validateProcessConnection({
+    connection: createConnection({}),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [createModelExtension({
+      id: 'ext/video-producer',
+      extensionId: 'ext',
+      nodeId: 'video-producer',
+      name: 'Video Producer',
+      input: 'image',
+      output: 'video',
+    })],
+  })
+
+  assert.equal(issue, null)
+})
+
+test('rejects process video outputs connected at connect time', () => {
   const source = createNode('source-node', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} })
   const target = createNode('target-node', 'previewVideoNode')
 
@@ -436,10 +457,24 @@ test('accepts video extension outputs connected to Preview Video nodes', () => {
     allExtensions: [createVideoProcessExtension()],
   })
 
-  assert.equal(issue, null)
+  assert.match(issue?.message ?? '', /Process extensions do not support video inputs or outputs/)
 })
 
-test('rejects persisted video outputs wired into image preview nodes before run', () => {
+test('rejects process video inputs connected at connect time', () => {
+  const source = createNode('source-node', 'videoNode')
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+
+  const issue = validateProcessConnection({
+    connection: createConnection({ targetHandle: 'clip' }),
+    nodes: [source, target],
+    edges: [],
+    allExtensions: [createProcessExtension([{ name: 'clip', type: 'video' }])],
+  })
+
+  assert.match(issue?.message ?? '', /Process extensions do not support video inputs or outputs/)
+})
+
+test('rejects persisted process video outputs before run', () => {
   const source = createNode('video-source', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} })
   const target = createNode('preview-image', 'previewImageNode')
 
@@ -449,20 +484,10 @@ test('rejects persisted video outputs wired into image preview nodes before run'
     allExtensions: [createVideoProcessExtension()],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'run',
-    code: 'type-mismatch',
-    message: 'Port "image" expects image but received video.',
-    targetNodeId: 'preview-image',
-    targetHandle: null,
-    portName: 'image',
-    expectedType: 'image',
-    actualType: 'video',
-    sourceNodeId: 'video-source',
-  })
+  assert.match(issue?.message ?? '', /Process extensions do not support video inputs or outputs/)
 })
 
-test('preserves video source type when validating named process ports before run', () => {
+test('rejects legacy persisted video source into process ports before run', () => {
   const source = createNode('video-source', 'videoNode', {
     enabled: true,
     params: { videoPath: 'Workflows/Inputs/Videos/source.mp4' },
@@ -483,15 +508,5 @@ test('preserves video source type when validating named process ports before run
     ])],
   })
 
-  assert.deepEqual(issue, {
-    phase: 'run',
-    code: 'type-mismatch',
-    message: 'Port "reference_image" expects image but received video.',
-    targetNodeId: 'target-node',
-    targetHandle: 'reference_image',
-    portName: 'reference_image',
-    expectedType: 'image',
-    actualType: 'video',
-    sourceNodeId: 'video-source',
-  })
+  assert.match(issue?.message ?? '', /Process extensions do not support video inputs or outputs/)
 })

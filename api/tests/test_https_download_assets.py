@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import httpx
@@ -58,6 +59,52 @@ class _ChunkStream(httpx.AsyncByteStream):
         return None
 
 
+class _HangingStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.started = False
+        self.cancelled = False
+        self.finalized = False
+        self.closed = False
+
+    async def __aiter__(self):
+        self.started = True
+        try:
+            await asyncio.sleep(60)
+            yield b"never"
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.finalized = True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _DelayedChunkStream(httpx.AsyncByteStream):
+    def __init__(self, first: bytes, second: bytes, delay: float):
+        self._first = first
+        self._second = second
+        self._delay = delay
+        self.cancelled = False
+        self.finalized = False
+        self.closed = False
+
+    async def __aiter__(self):
+        try:
+            yield self._first
+            await asyncio.sleep(self._delay)
+            yield self._second
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.finalized = True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def _client_factory(handler):
     return lambda: httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
@@ -72,6 +119,7 @@ def _collect(
     *,
     handler,
     resolver=_public_resolver,
+    check_download_control=None,
 ) -> list[dict]:
     async def collect() -> list[dict]:
         return [
@@ -82,6 +130,7 @@ def _collect(
                 plan,
                 client_factory=_client_factory(handler),
                 resolve_host=resolver,
+                check_download_control=check_download_control,
             )
         ]
 
@@ -442,6 +491,115 @@ def test_failed_downloads_remove_temp_files_and_never_publish_marker(
     ] == []
 
 
+def test_stream_https_download_times_out_stalled_mid_body(monkeypatch, tmp_path: Path):
+    import services.https_download_assets as assets_module
+
+    monkeypatch.setattr(assets_module, "_READ_CONTROL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(assets_module, "_MAX_STALL_SECONDS", 0.02)
+
+    stream = _HangingStream()
+
+    def handler(_request: httpx.Request):
+        return httpx.Response(200, stream=stream)
+
+    started = time.monotonic()
+    events = _collect(
+        tmp_path / "owner",
+        "demo/generate",
+        [_asset("model.bin", b"model")],
+        handler=handler,
+    )
+
+    assert time.monotonic() - started < 1.0
+    assert events[-1]["error"]["code"] == "download_failed"
+    assert "stalled" in events[-1]["error"]["message"].lower()
+    assert stream.cancelled is True
+    assert stream.finalized is True
+    assert stream.closed is True
+    assert not (tmp_path / "owner" / "model.bin").exists()
+
+
+def test_stream_https_download_keeps_delayed_async_generator_pending(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import services.https_download_assets as assets_module
+
+    monkeypatch.setattr(assets_module, "_MAX_STALL_SECONDS", 2.0)
+    payload = b"slow-model-payload"
+    stream = _DelayedChunkStream(payload[:5], payload[5:], 0.6)
+
+    def handler(_request: httpx.Request):
+        return httpx.Response(200, stream=stream)
+
+    owner = tmp_path / "owner"
+    started = time.monotonic()
+    events = _collect(
+        owner,
+        "demo/generate",
+        [_asset("model.bin", payload)],
+        handler=handler,
+    )
+
+    assert time.monotonic() - started >= 0.5
+    assert events[-1]["status"] == "done"
+    assert owner.joinpath("model.bin").read_bytes() == payload
+    assert stream.cancelled is False
+    assert stream.finalized is True
+    assert stream.closed is True
+
+
+def test_stream_https_download_polls_owner_control_while_body_is_stalled(monkeypatch, tmp_path: Path):
+    import services.https_download_assets as assets_module
+
+    monkeypatch.setattr(assets_module, "_READ_CONTROL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(assets_module, "_MAX_STALL_SECONDS", 1.0)
+
+    class Paused(Exception):
+        pass
+
+    stream = _HangingStream()
+
+    def handler(_request: httpx.Request):
+        return httpx.Response(200, stream=stream)
+
+    checks = 0
+    stalled_checks = 0
+
+    def check_control():
+        nonlocal checks, stalled_checks
+        checks += 1
+        if stream.started:
+            stalled_checks += 1
+            if stalled_checks >= 2:
+                raise Paused("owner-paused")
+
+    async def collect() -> list[dict]:
+        return [
+            event
+            async for event in stream_https_asset_downloads(
+                tmp_path / "owner",
+                "demo/generate",
+                [_asset("model.bin", b"model")],
+                client_factory=_client_factory(handler),
+                resolve_host=_public_resolver,
+                check_download_control=check_control,
+                control_exceptions=(Paused,),
+            )
+        ]
+
+    with pytest.raises(Paused):
+        asyncio.run(collect())
+    assert checks >= 3
+    assert stalled_checks == 2
+    assert stream.cancelled is True
+    assert stream.finalized is True
+    assert stream.closed is True
+    owner = tmp_path / "owner"
+    assert not owner.joinpath("model.bin").exists()
+    assert list(owner.glob("*.part")) == []
+
+
 def test_marker_is_not_published_when_a_later_asset_fails(tmp_path: Path):
     owner = tmp_path / "owner"
     first_payload = b"first"
@@ -502,12 +660,18 @@ def test_success_publishes_exact_ordered_full_model_marker(tmp_path: Path):
         "status": "preparing",
         "fileIndex": 0,
         "totalFiles": 2,
+        "bytesDownloaded": 0,
+        "totalBytes": 11,
+        "stalledSeconds": 0,
     }
     assert events[-1] == {
         "percent": 100,
         "status": "done",
         "fileIndex": 2,
         "totalFiles": 2,
+        "bytesDownloaded": 11,
+        "totalBytes": 11,
+        "stalledSeconds": 0,
     }
     assert (owner / "first.bin").read_bytes() == payloads["first.bin"]
     assert (owner / "second.bin").read_bytes() == payloads["second.bin"]
@@ -547,6 +711,31 @@ def test_readiness_detects_same_size_tamper_after_publish(tmp_path: Path):
     assert https_download_assets_ready(owner, "demo/generate", plan)
 
     (owner / "model.bin").write_bytes(b"tampr")
+    assert not https_download_assets_ready(owner, "demo/generate", plan)
+
+
+def test_readiness_rejects_symlinked_owner_and_marker_parent(tmp_path: Path):
+    payload = b"model"
+    plan = [_asset("model.bin", payload)]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    owner = tmp_path / "owner"
+    try:
+        owner.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Symlinks unavailable: {error}")
+    assert not https_download_assets_ready(owner, "demo/generate", plan)
+
+    owner.unlink()
+    owner.mkdir()
+    _collect(owner, "demo/generate", plan, handler=lambda _request: httpx.Response(200, content=payload))
+    marker_dir = owner / MARKER_RELATIVE_PATH.parent
+    marker_path = owner / MARKER_RELATIVE_PATH
+    marker_path.unlink()
+    marker_dir.rmdir()
+    marker_dir.symlink_to(tmp_path / "marker-outside", target_is_directory=True)
+    (tmp_path / "marker-outside").mkdir()
+    (tmp_path / "marker-outside" / MARKER_RELATIVE_PATH.name).write_text("{}", encoding="utf-8")
     assert not https_download_assets_ready(owner, "demo/generate", plan)
 
 
@@ -670,8 +859,10 @@ def test_https_route_resolves_plan_only_from_canonical_model_id(
     )
     monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
 
-    async def fake_stream(owner_dir, model_id, resolved_plan):
-        calls.append((owner_dir, model_id, resolved_plan))
+    async def fake_stream(owner_dir, model_id, resolved_plan, check_download_control=None, **_kwargs):
+        calls.append((owner_dir, model_id, resolved_plan, check_download_control))
+        assert check_download_control is not None
+        check_download_control()
         yield {"percent": 100, "status": "done"}
 
     monkeypatch.setattr(
@@ -687,6 +878,7 @@ def test_https_route_resolves_plan_only_from_canonical_model_id(
         "/model/https-download-assets",
         params={
             "model_id": "demo/generate",
+            "target_owner_id": "demo/generate",
             "url": "https://attacker.example/private.bin",
         },
     )
@@ -696,13 +888,13 @@ def test_https_route_resolves_plan_only_from_canonical_model_id(
         "percent": 100,
         "status": "done",
     }
-    assert calls == [
-        (
-            tmp_path / "demo/generate",
-            "demo/generate",
-            plan,
-        )
-    ]
+    assert len(calls) == 1
+    assert calls[0][0:3] == (
+        tmp_path / "demo/generate",
+        "demo/generate",
+        plan,
+    )
+    assert "demo/generate" not in model_router._download_controls
 
 
 @pytest.mark.parametrize(
@@ -918,3 +1110,129 @@ def test_registry_rejects_https_plan_on_shared_weight_owner(
         "node-specific weight owner" in error
         for error in registry.load_errors().values()
     )
+
+
+def test_https_download_assets_rejects_mismatched_target_owner_before_streaming(monkeypatch, tmp_path: Path):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routers import model as model_router
+
+    plan = [_asset("model.bin", b"model")]
+    calls = []
+
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_https_download_plan",
+        lambda model_id: plan if model_id == "demo/generate" else None,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda model_id: tmp_path / "demo" / "shared-owner",
+    )
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+
+    async def fake_stream(*_args, **_kwargs):
+        calls.append("streamed")
+        yield {"percent": 100, "status": "done"}
+
+    monkeypatch.setattr(model_router, "stream_https_asset_downloads", fake_stream)
+
+    app = FastAPI()
+    app.include_router(model_router.router, prefix="/model")
+    client = TestClient(app)
+    response = client.get(
+        "/model/https-download-assets",
+        params={"model_id": "demo/generate", "target_owner_id": "demo/generate"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["code"] == "target_owner_mismatch"
+    assert detail["stage"] == "request"
+    assert detail["retryable"] is False
+    assert "Target owner" in detail["message"]
+    assert calls == []
+    assert model_router._download_controls == {}
+
+
+def test_https_download_assets_rejects_unsafe_target_owner_before_streaming(monkeypatch, tmp_path: Path):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routers import model as model_router
+
+    plan = [_asset("model.bin", b"model")]
+    calls = []
+
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_https_download_plan",
+        lambda model_id: plan if model_id == "demo/generate" else None,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda model_id: tmp_path / "demo" / "generate",
+    )
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+
+    async def fake_stream(*_args, **_kwargs):
+        calls.append("streamed")
+        yield {"percent": 100, "status": "done"}
+
+    monkeypatch.setattr(model_router, "stream_https_asset_downloads", fake_stream)
+
+    app = FastAPI()
+    app.include_router(model_router.router, prefix="/model")
+    client = TestClient(app)
+    response = client.get(
+        "/model/https-download-assets",
+        params={"model_id": "demo/generate", "target_owner_id": "demo/../generate"},
+    )
+
+    assert response.status_code == 400
+    assert "Invalid target owner ID" in response.json()["detail"]
+    assert calls == []
+    assert model_router._download_controls == {}
+
+
+def test_https_download_assets_endpoint_uses_owner_scoped_control_for_cancel(monkeypatch, tmp_path: Path):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routers import model as model_router
+
+    plan = [_asset("model.bin", b"model")]
+
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_https_download_plan",
+        lambda model_id: plan if model_id == "demo/generate" else None,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda model_id: tmp_path / "demo" / "shared-owner",
+    )
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+
+    async def fake_stream(owner_dir, model_id, resolved_plan, check_download_control=None, **_kwargs):
+        assert owner_dir == tmp_path / "demo/shared-owner"
+        assert check_download_control is not None
+        model_router._download_controls["demo/shared-owner"]["cancel"].set()
+        check_download_control()
+        yield {"percent": 100, "status": "done"}
+
+    monkeypatch.setattr(model_router, "stream_https_asset_downloads", fake_stream)
+
+    app = FastAPI()
+    app.include_router(model_router.router, prefix="/model")
+    client = TestClient(app)
+    response = client.get("/model/https-download-assets", params={"model_id": "demo/generate"})
+
+    assert response.status_code == 200
+    events = [json.loads(block.removeprefix("data: ")) for block in response.text.strip().split("\n\n")]
+    assert events[-1] == {"cancelled": True, "status": "cancelled"}
+    assert "demo/shared-owner" not in model_router._download_controls

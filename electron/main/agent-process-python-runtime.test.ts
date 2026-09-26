@@ -259,7 +259,7 @@ test('active snapshot leases protect concurrent prepared digests from cache swee
   }
 })
 
-test('a real local Python 3.12 venv snapshot launches a tiny zipapp', async (t) => {
+test('a real local Python 3.12 venv snapshot launches ordinary processor.py in isolated mode', async (t) => {
   if (process.platform !== 'linux') return t.skip('Linux venv and proc-fd semantics are required')
   const root = await mkdtemp(join(tmpdir(), 'modly-process-real-python-'))
   const extensionDir = join(root, 'extension')
@@ -272,17 +272,14 @@ test('a real local Python 3.12 venv snapshot launches a tiny zipapp', async (t) 
     ])).stdout.trim()
     await mkdir(extensionDir, { recursive: true })
     await execFileAsync('python3.12', ['-m', 'venv', '--without-pip', sourceRoot])
-    const appDir = join(root, 'zipapp')
-    const pyz = join(root, 'probe.pyz')
-    await mkdir(appDir)
-    await writeFile(join(appDir, '__main__.py'), 'import json,sys\nprint(json.dumps({"ok": True, "prefix": sys.prefix}))\n')
-    await execFileAsync('python3.12', ['-m', 'zipapp', appDir, '-o', pyz])
+    const processor = join(extensionDir, 'processor.py')
+    await writeFile(processor, 'import json,sys\nprint(json.dumps({"ok": True, "prefix": sys.prefix}))\n')
 
     const binding = await bindExtensionPythonRuntime(extensionDir, {
       kind: 'extension-python-venv-v1', interpreter: 'bin/python',
     }, executable)
     prepared = await prepareExtensionPythonRuntimeSnapshot(extensionDir, binding, cacheRoot, executable)
-    const result = await execFileAsync(prepared.interpreterPath, [pyz])
+    const result = await execFileAsync(prepared.interpreterPath, ['-I', '-B', processor])
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, prefix: prepared.rootPath })
     assert.equal(await realpath(prepared.interpreterPath), join(prepared.rootPath, 'bin', 'python3.12'))
   } finally {
@@ -311,7 +308,8 @@ test('Python sandbox launch selects only the snapshotted interpreter and isolate
     && launch.args[index + 1] === '/proc/self/fd/8' && launch.args[index + 2] === '/run/modly/model'))
   assert.ok(launch.args.includes('--unshare-all'))
   assert.ok(launch.args.some((value, index) => value === '--ro-bind-fd'
-    && launch.args[index + 1] === '3' && launch.args[index + 2] === '/app/process.pyz'))
-  assert.deepEqual(launch.args.slice(-2), ['/runtime/bin/python', '/app/process.pyz'])
+    && launch.args[index + 1] === '3' && launch.args[index + 2] === '/app/processor.py'))
+  assert.deepEqual(launch.args.slice(-4), ['/runtime/bin/python', '-I', '-B', '/app/processor.py'])
+  assert.equal(launch.args.includes('/app/process.pyz'), false)
   assert.equal(JSON.stringify(launch).includes('/extension/venv'), false)
 })

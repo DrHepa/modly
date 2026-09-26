@@ -12,7 +12,7 @@ export interface ModelOwnershipCapabilityState extends ModelOwnershipMetadata {
 
 function isOwnershipNode(node: ExtensionNode): node is ExtensionNode & ModelOwnershipMetadata {
   return Boolean(
-    (node.hfRepo || node.hfDownloads?.length || node.httpsDownloads?.length) &&
+    (node.hfRepo || node.hfDownloads?.length || node.httpsDownloads?.length || node.hasModelSources) &&
     node.capabilityId &&
     node.bundleId &&
     node.weightOwnerId &&
@@ -29,6 +29,9 @@ export function collectModelOwnershipMetadata(extensions: readonly ModelExtensio
     legacyPaths: [...node.legacyPaths],
     ...(node.hfDownloads ? { hfDownloads: node.hfDownloads } : {}),
     ...(node.httpsDownloads ? { httpsDownloads: node.httpsDownloads } : {}),
+    ...(node.hasModelSources ? { hasModelSources: true } : {}),
+    ...(node.modelSources ? { modelSources: node.modelSources } : {}),
+    ...(node.downloadCheck ? { downloadCheck: node.downloadCheck } : {}),
   })))
 }
 
@@ -37,14 +40,28 @@ export function collectReadyOwnerIds(
   downloadedCapabilityIds: Iterable<string>,
 ): string[] {
   const ownershipByCapabilityId = new Map(capabilities.map((capability) => [capability.capabilityId, capability]))
-  const readyOwnerIds = new Set<string>()
+  const readyIds = new Set<string>()
 
   for (const capabilityId of downloadedCapabilityIds) {
     const ownership = ownershipByCapabilityId.get(capabilityId)
-    if (ownership) readyOwnerIds.add(ownership.weightOwnerId)
+    if (ownership && isCapabilitySpecificReadiness(ownership)) {
+      readyIds.add(ownership.capabilityId)
+    } else if (ownership) {
+      readyIds.add(ownership.weightOwnerId)
+    } else {
+      readyIds.add(capabilityId)
+    }
   }
 
-  return [...readyOwnerIds]
+  return [...readyIds]
+}
+
+function isCapabilitySpecificReadiness(capability: ModelOwnershipMetadata): boolean {
+  return Boolean(
+    capability.hasModelSources ||
+    capability.hfDownloads?.length ||
+    capability.httpsDownloads?.length,
+  )
 }
 
 function createSharedWarning(
@@ -80,7 +97,9 @@ export function deriveModelOwnershipState(
   }, {})
 
   return capabilities.reduce<Record<string, ModelOwnershipCapabilityState>>((state, capability) => {
-    const downloaded = readyOwnerIds.has(capability.weightOwnerId)
+    const downloaded = isCapabilitySpecificReadiness(capability)
+      ? readyOwnerIds.has(capability.capabilityId)
+      : readyOwnerIds.has(capability.weightOwnerId) || readyOwnerIds.has(capability.capabilityId)
     const isOwnerDownloading = downloadingOwnerIds.has(capability.weightOwnerId)
     const ownerCapabilityIds = groupedCapabilityIds[capability.weightOwnerId] ?? []
     const ownerPeerCapabilityIds = ownerCapabilityIds

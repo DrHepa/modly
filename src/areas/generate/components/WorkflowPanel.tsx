@@ -993,7 +993,6 @@ function EmbeddedCanvas({ workflow, allExtensions }: {
     if (runState.status !== 'done' || !runState.outputUrl) return
     const out = nodes.find((n) => n.type === 'outputNode')
     if (out) updateNodeData(out.id, { params: { outputUrl: runState.outputUrl } })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- react to run completion; nodes/updateNodeData read at that point
   }, [runState.status, runState.outputUrl])
 
   const activeGraph = useMemo(() => deriveActiveWorkflowGraph(
@@ -1133,7 +1132,6 @@ export default function WorkflowPanel() {
     [modelExtensions, processExtensions],
   )
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
   useEffect(() => { load(); loadExtensions() }, [])
 
   // Sync when navigated here from the workflow editor (activeId set externally)
@@ -1143,7 +1141,6 @@ export default function WorkflowPanel() {
 
   useEffect(() => {
     if (!selectedId && workflows.length > 0) setSelectedId(workflows[0].id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- default selection reacts to workflows list only
   }, [workflows])
 
   const workflow = workflows.find((w) => w.id === selectedId) ?? null

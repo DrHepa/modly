@@ -1,5 +1,5 @@
 export const ARTIFACT_KINDS = [
-  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+  'image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video',
   'plan', 'source', 'step', 'glb', 'blend',
 ] as const
 export const ARTIFACT_VERSION_ROLES = ['original', 'current', 'edited'] as const
@@ -72,6 +72,38 @@ export interface SceneArtifactManifestV1 {
   preview?: SceneArtifactManifestPreview
   initialView?: SceneArtifactManifestInitialView
   assets: unknown[]
+}
+
+export interface CaptureFrameV1 {
+  index: number
+  path: string
+  width: number
+  height: number
+  byteSize: number
+  timestampMs?: number
+}
+
+export interface CaptureVideoV1 {
+  path: string
+  width: number
+  height: number
+  byteSize: number
+  frameCount: number
+  durationMs?: number
+  frameRate?: number
+}
+
+export interface CaptureArtifactManifestV1 {
+  schema: 'modly.capture-manifest.v1'
+  captureRoot: string
+  kind: 'frames' | 'video'
+  frames?: CaptureFrameV1[]
+  video?: CaptureVideoV1
+  provenance: {
+    source: string
+    ordering: 'manifest-index' | 'decode-index'
+    [key: string]: unknown
+  }
 }
 
 export interface ArtifactLineage {

@@ -191,30 +191,49 @@ test('keeps legacy primary output routing for stale source handles', () => {
   assert.equal(legacy.inputs?.reference_image.filePath, '/tmp/primary.png')
 })
 
-test('preserves video source type in named process execution inputs', () => {
+test('rejects video source type in named process execution inputs', () => {
   const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
   const video = createNode('video-source', 'videoNode', {
     enabled: true,
     params: { videoPath: 'Workflows/Inputs/Videos/source.mp4' },
   })
 
-  const input = buildProcessExecutionInput({
-    node: target,
-    nodes: [video, target],
-    edges: [
-      { id: 'edge-video', source: 'video-source', target: 'target-node', targetHandle: 'reference_image' },
-    ],
-    allExtensions: [createProcessExtension([
-      { name: 'reference_image', type: 'image' },
-    ])],
-    nodeOutputs: new Map([
-      ['video-source', { filePath: '/tmp/source.mp4' }],
-    ]),
-  })
+  assert.throws(
+    () => buildProcessExecutionInput({
+      node: target,
+      nodes: [video, target],
+      edges: [
+        { id: 'edge-video', source: 'video-source', target: 'target-node', targetHandle: 'reference_image' },
+      ],
+      allExtensions: [createProcessExtension([
+        { name: 'reference_image', type: 'image' },
+      ])],
+      nodeOutputs: new Map([
+        ['video-source', { filePath: '/tmp/source.mp4' }],
+      ]),
+    }),
+    /Process extensions do not support video inputs or outputs/,
+  )
+})
 
-  assert.deepEqual(input.inputs?.reference_image, {
-    type: 'video',
-    filePath: '/tmp/source.mp4',
-    sourceNodeId: 'video-source',
-  })
+test('rejects process extensions that declare named video inputs before input construction', () => {
+  const target = createNode('target-node', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
+  const image = createNode('image-source', 'imageNode')
+
+  assert.throws(
+    () => buildProcessExecutionInput({
+      node: target,
+      nodes: [image, target],
+      edges: [
+        { id: 'edge-image', source: 'image-source', target: 'target-node', targetHandle: 'clip' },
+      ],
+      allExtensions: [createProcessExtension([
+        { name: 'clip', type: 'video' },
+      ])],
+      nodeOutputs: new Map([
+        ['image-source', { filePath: '/tmp/reference.png' }],
+      ]),
+    }),
+    /Process extensions do not support video inputs or outputs/,
+  )
 })

@@ -506,7 +506,7 @@ test('delete waits for attachment and corrupt-backup cleanup before confirming',
 })
 
 test('remove and delete fail closed when privacy cleanup fails', async () => {
-  await withStore(async (store, root) => {
+  await withStore(async (store, root, clock) => {
     let session = await store.create({ title: 'Protected' })
     session = await store.addAttachment({
       sessionId: session.id,
@@ -517,6 +517,7 @@ test('remove and delete fail closed when privacy cleanup fails', async () => {
     const managedFile = path.join(root, 'agent-session-attachments', session.id, `${attachment.id}.png`)
     const injected = new AgentSessionStore({
       rootDir: root,
+      now: () => clock.now,
       removePath: async (target: string, options?: Parameters<typeof rm>[1]) => {
         if (target === managedFile || target.endsWith(session.id) || target.includes('agent-sessions.corrupt-')) {
           throw new Error('injected cleanup failure')

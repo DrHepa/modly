@@ -125,7 +125,7 @@ test('extension Python runtime and model access bindings are exact and transitiv
     bindingHash: sha256Canonical({ schema: 'modly.extension-python-runtime-binding.v1', ...runtimeUnsigned }),
   }
   const runtimeFiles = [{
-    path: 'processor.pyz', device: '1', inode: '2', uid: 1000, gid: 1000,
+    path: 'processor.py', device: '1', inode: '2', uid: 1000, gid: 1000,
     mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
   }]
   const resourceFiles: never[] = []
@@ -142,15 +142,15 @@ test('extension Python runtime and model access bindings are exact and transitiv
   const execution = {
     kind: 'process' as const,
     schema: 'modly.agent-process-execution.v1' as const,
-    entry: 'processor.pyz', runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
+    entry: 'processor.py', runtimeFiles, resourceFiles, runtime, modelAccess, runtimeHash, artifacts,
     bindingHash: sha256Canonical({
-      schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz', runtimeHash, artifacts,
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.py', runtimeHash, artifacts,
     }),
   }
   const unsigned = {
     schema: 'modly.agent-capability.v1' as const,
     version: 1 as const,
-    id: 'python-tools/run', displayName: 'Run Python', description: 'Run a Python zipapp.',
+    id: 'python-tools/run', displayName: 'Run Python', description: 'Run a Python process.',
     extension: { id: 'python-tools', name: 'Python Tools' },
     node: { id: 'run', input: 'text' as const, output: 'text' as const, paramsSchema: [] },
     execution,
@@ -166,7 +166,7 @@ test('extension Python runtime and model access bindings are exact and transitiv
     modelAccess: undefined,
     runtimeHash: runtimeHashWithoutModelAccess,
     bindingHash: sha256Canonical({
-      schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.py',
       runtimeHash: runtimeHashWithoutModelAccess, artifacts,
     }),
   }
@@ -187,7 +187,7 @@ test('extension Python runtime and model access bindings are exact and transitiv
       runtime: changedRuntime,
       runtimeHash: changedRuntimeHash,
       bindingHash: sha256Canonical({
-        schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
+        schema: 'modly.agent-process-execution.v1', entry: 'processor.py',
         runtimeHash: changedRuntimeHash, artifacts,
       }),
     }
@@ -205,6 +205,56 @@ test('extension Python runtime and model access bindings are exact and transitiv
     ...snapshot,
     execution: { ...execution, modelAccess: { ...modelAccess, profile: 'unsupported' } },
   }), /modelAccess/i)
+
+  const signedSnapshot = (input: {
+    entry: string
+    runtimeFiles: typeof runtimeFiles
+    runtime?: typeof runtime
+    modelAccess?: typeof modelAccess
+  }): unknown => {
+    const candidateRuntimeHash = sha256Canonical({
+      runtimeFiles: input.runtimeFiles,
+      resourceFiles,
+      ...(input.runtime ? { runtime: input.runtime } : {}),
+      ...(input.modelAccess ? { modelAccess: input.modelAccess } : {}),
+    })
+    const candidateExecution = {
+      kind: 'process' as const,
+      schema: 'modly.agent-process-execution.v1' as const,
+      entry: input.entry,
+      runtimeFiles: input.runtimeFiles,
+      resourceFiles,
+      ...(input.runtime ? { runtime: input.runtime } : {}),
+      ...(input.modelAccess ? { modelAccess: input.modelAccess } : {}),
+      runtimeHash: candidateRuntimeHash,
+      artifacts,
+      bindingHash: sha256Canonical({
+        schema: 'modly.agent-process-execution.v1',
+        entry: input.entry,
+        runtimeHash: candidateRuntimeHash,
+        artifacts,
+      }),
+    }
+    const candidateUnsigned = { ...unsigned, execution: candidateExecution }
+    return { ...candidateUnsigned, hash: sha256Canonical(candidateUnsigned) }
+  }
+
+  assert.throws(() => assertAgentCapabilitySnapshotV1(signedSnapshot({
+    entry: 'processor.pyz',
+    runtimeFiles: [{ ...runtimeFiles[0], path: 'processor.pyz' }],
+    runtime,
+    modelAccess,
+  })), /file identities|Python runtime/i)
+  assert.throws(() => assertAgentCapabilitySnapshotV1(signedSnapshot({
+    entry: 'processor.py',
+    runtimeFiles,
+  })), /file identities|Python runtime/i)
+  assert.throws(() => assertAgentCapabilitySnapshotV1(signedSnapshot({
+    entry: 'processor.py',
+    runtimeFiles: [{ ...runtimeFiles[0], mode: 0o700 }],
+    runtime,
+    modelAccess,
+  })), /file identities|Python runtime/i)
 })
 
 test('action hashes bind normalized arguments, capability, model, artifacts, scope, and expiry', () => {

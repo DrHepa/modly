@@ -6,6 +6,13 @@ import { SCENE_IMPORT_MESH_ALLOWED_EXTENSIONS } from './scene-import-service.ts'
 import { ARTIFACT_KINDS, type ArtifactKind } from '../../src/shared/types/artifacts.ts'
 import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest.ts'
 import {
+  normalizeModelSources,
+  normalizeWeightGroupReferences,
+  normalizeWeightGroups,
+  validateModelNodeIds,
+  type ModelSource,
+} from './model-sources.ts'
+import {
   normalizeHttpsDownloads,
   type HttpsDownloadAsset,
 } from './https-download-manifest.ts'
@@ -223,7 +230,7 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio', 'video'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'], boundary: 'ui_only', headless: false },
     },
   },
 ]
@@ -240,6 +247,7 @@ export type ParsedManifest = {
   type?: 'model' | 'process'
   entry?: string
   mcp?: unknown
+  weight_groups?: unknown
   nodes?: {
     id: string
     name?: string
@@ -251,9 +259,12 @@ export type ParsedManifest = {
     hf_repo?: string
     hf_downloads?: unknown
     https_downloads?: unknown
+    model_sources?: unknown
     download_check?: string
     hf_skip_prefixes?: string[]
+    hf_include_prefixes?: string[]
     weight_owner_id?: string
+    weight_groups?: unknown
     process_owner_id?: string
     automation?: PartialCapabilityAutomationMetadata
     agent?: unknown
@@ -288,8 +299,11 @@ export type ListedExtensionNode<
   hfRepo?: string
   hfDownloads?: HfDownloadDescriptor[]
   httpsDownloads?: HttpsDownloadAsset[]
+  hasModelSources?: boolean
+  modelSources?: ModelSource[]
   downloadCheck?: string
   hfSkipPrefixes?: string[]
+  hfIncludePrefixes?: string[]
   capabilityId?: string
   bundleId?: string
   weightOwnerId?: string
@@ -329,10 +343,13 @@ type PartialCapabilityAutomationMetadata = {
 }
 
 const LEGACY_PROCESS_ARTIFACT_KINDS = [
-  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+  'image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video',
 ] as const satisfies readonly ArtifactKind[]
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(LEGACY_PROCESS_ARTIFACT_KINDS)
 const GOVERNED_AGENT_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
+const AGENT_ONLY_ARTIFACT_KINDS = new Set<ArtifactKind>(
+  ARTIFACT_KINDS.filter((kind) => !CAPABILITY_ARTIFACT_KINDS.has(kind)),
+)
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
 const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process', 'skills'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
@@ -345,6 +362,16 @@ function isPlainOwnRecord(value: unknown): value is Record<string, unknown> {
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => allowed.has(key))
+}
+
+export function projectAgentOnlyNodesForLegacy(manifest: ParsedManifest): ParsedManifest {
+  if (!Array.isArray(manifest.nodes)) return manifest
+  const nodes = manifest.nodes.filter((node) => {
+    if (!isPlainOwnRecord(node) || !Object.hasOwn(node, 'agent')) return true
+    return !AGENT_ONLY_ARTIFACT_KINDS.has(node.input as ArtifactKind)
+      && !AGENT_ONLY_ARTIFACT_KINDS.has(node.output as ArtifactKind)
+  })
+  return nodes.length === manifest.nodes.length ? manifest : { ...manifest, nodes }
 }
 
 function isSafeDisplayText(value: unknown, maxLength: number): value is string {
@@ -505,20 +532,90 @@ function normalizeWorkflowNodes(
     .filter((node): node is ListedWorkflowNode => Boolean(node))
 }
 
+function normalizeInputContract(
+  inputContract: LegacyProcessPortContract[] | undefined,
+  context: string,
+): LegacyProcessPortContract[] | undefined {
+  if (inputContract === undefined) return undefined
+  if (!Array.isArray(inputContract)) {
+    throw new Error(`${context}.input_contract must be an array`)
+  }
+
+  return inputContract.map((contract, index) => {
+    if (!isPlainOwnRecord(contract)) {
+      throw new Error(`${context}.input_contract[${index}] must be an object`)
+    }
+
+    const record = contract as LegacyProcessPortContract
+    if (record.name !== undefined && (typeof record.name !== 'string' || !record.name.trim())) {
+      throw new Error(`${context}.input_contract[${index}].name must be a non-empty string`)
+    }
+    if (record.id !== undefined && (typeof record.id !== 'string' || !record.id.trim())) {
+      throw new Error(`${context}.input_contract[${index}].id must be a non-empty string`)
+    }
+    if (record.label !== undefined && typeof record.label !== 'string') {
+      throw new Error(`${context}.input_contract[${index}].label must be a string`)
+    }
+    if (record.type !== undefined && (typeof record.type !== 'string' || !record.type.trim())) {
+      throw new Error(`${context}.input_contract[${index}].type must be a non-empty string`)
+    }
+    if (record.required !== undefined && typeof record.required !== 'boolean') {
+      throw new Error(`${context}.input_contract[${index}].required must be a boolean`)
+    }
+    return record
+  })
+}
+
+function suppliedPortName(
+  input: Record<string, unknown>,
+  context: string,
+  index: number,
+): string {
+  const name = input.name !== undefined ? input.name : input.id
+  if (typeof name !== 'string' || !name.trim()) {
+    throw new Error(`${context}[${index}].name must be a non-empty string`)
+  }
+  return name.trim()
+}
+
+function contractPortName(contract: LegacyProcessPortContract | undefined): string | undefined {
+  const name = contract?.name ?? contract?.id
+  return name === undefined ? undefined : name.trim()
+}
+
+function allocateLegacyPortName(baseName: string, usedNames: Set<string>): string {
+  // Legacy strings retain their type name when it is available. Repeated or
+  // explicitly-colliding names receive _2, _3, ... in declaration order so
+  // positional slot identity is retained without renaming supplied names.
+  if (!usedNames.has(baseName)) {
+    usedNames.add(baseName)
+    return baseName
+  }
+
+  let suffix = 2
+  let candidate = `${baseName}_${suffix}`
+  while (usedNames.has(candidate)) {
+    suffix += 1
+    candidate = `${baseName}_${suffix}`
+  }
+  usedNames.add(candidate)
+  return candidate
+}
+
 function normalizeLegacyProcessPort(
   inputType: ProcessPortType,
   contract: LegacyProcessPortContract | undefined,
+  name: string,
 ): ProcessPort {
   const normalizedContractType = normalizeLegacyArtifactKind(contract?.type)
   const contractType = typeof normalizedContractType === 'string' && normalizedContractType.trim().length > 0
     ? normalizedContractType
     : undefined
   const type = contractType ?? inputType
-  const fallbackName = contract?.name?.trim() || contract?.id?.trim() || String(type)
   const fallbackLabel = contract?.label?.trim()
 
   return {
-    name: fallbackName,
+    name,
     ...(fallbackLabel ? { label: fallbackLabel } : {}),
     type,
     required: contract?.required ?? true,
@@ -546,23 +643,52 @@ function normalizeProcessPorts(
 ): ProcessPort[] | undefined {
   if (!Array.isArray(inputs) || inputs.length === 0) return undefined
 
+  const normalizedContract = normalizeInputContract(inputContract, context)
+  const explicitNames: Array<{ name: string }> = []
+  for (const [index, input] of inputs.entries()) {
+    if (typeof input === 'string') {
+      const contractName = contractPortName(normalizedContract?.[index])
+      if (contractName !== undefined) explicitNames.push({ name: contractName })
+      continue
+    }
+    if (!isPlainOwnRecord(input)) {
+      throw new Error(`${context}[${index}] must be a string or object`)
+    }
+    explicitNames.push({ name: suppliedPortName(input, context, index) })
+  }
+  assertUniquePortNames(explicitNames, `${context}.explicit`)
+  const usedNames = new Set(explicitNames.map((port) => port.name))
+
   const ports = inputs
     .map((input, index) => {
       if (typeof input === 'string') {
         const normalizedInput = normalizeLegacyArtifactKind(input)
         if (typeof normalizedInput !== 'string' || normalizedInput.trim().length === 0) {
-          return undefined
+          throw new Error(`${context}[${index}] must be a non-empty string`)
         }
-        return normalizeLegacyProcessPort(normalizedInput, inputContract?.[index])
+        const contract = normalizedContract?.[index]
+        const name = contractPortName(contract)
+          ?? allocateLegacyPortName(String(normalizedInput), usedNames)
+        return normalizeLegacyProcessPort(normalizedInput, contract, name)
+      }
+
+      if (!isPlainOwnRecord(input)) {
+        throw new Error(`${context}[${index}] must be a string or object`)
       }
 
       const normalizedType = normalizeLegacyArtifactKind(input.type)
       if (typeof normalizedType !== 'string' || normalizedType.trim().length === 0) {
-        return undefined
+        throw new Error(`${context}[${index}].type must be a non-empty string`)
+      }
+      if (input.label !== undefined && typeof input.label !== 'string') {
+        throw new Error(`${context}[${index}].label must be a string`)
+      }
+      if (input.required !== undefined && typeof input.required !== 'boolean') {
+        throw new Error(`${context}[${index}].required must be a boolean`)
       }
 
       const base = {
-        name: input.name || (input as { id?: string }).id,
+        name: suppliedPortName(input, context, index),
         ...(input.label ? { label: input.label } : {}),
         type: normalizedType,
         required: input.required ?? true,
@@ -579,7 +705,6 @@ function normalizeProcessPorts(
         ordered: true as const,
       }
     })
-    .filter((input): input is ProcessPort => Boolean(input))
 
   assertUniquePortNames(ports, context)
   return ports
@@ -749,6 +874,10 @@ export function parseExtensionManifest(
     }
   }
   const workflowNodes = normalizeWorkflowNodes(parsed.workflow_nodes, extensionId)
+  const weightGroups = normalizeWeightGroups(parsed)
+  if (weightGroups || (parsed.nodes ?? []).some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
+    validateModelNodeIds(parsed.nodes ?? [])
+  }
 
   const common = {
     id: extensionId,
@@ -789,6 +918,12 @@ export function parseExtensionManifest(
       extensionType === 'process',
     )
     const legacyPaths = [...(legacyPathsByOwner.get(weightOwnerId) ?? [capabilityId])]
+    const modelSources = normalizeModelSources(node)
+    const groupRefs = normalizeWeightGroupReferences(
+      node,
+      weightGroups,
+      `nodes[${node.id}].weight_groups`,
+    ) ?? []
     const hfDownloads = normalizeHfDownloads(node.hf_downloads, `${capabilityId}.hf_downloads`)
     const httpsDownloads = normalizeHttpsDownloads(
       node.https_downloads,
@@ -801,7 +936,9 @@ export function parseExtensionManifest(
       )
     }
     const hasModelAssets = Boolean(
-      httpsDownloads
+      modelSources
+      || groupRefs.length > 0
+      || httpsDownloads
       || hfDownloads
       || node.hf_repo
       || node.download_check
@@ -842,8 +979,10 @@ export function parseExtensionManifest(
       hfRepo: node.hf_repo,
       ...(hfDownloads ? { hfDownloads } : {}),
       ...(httpsDownloads ? { httpsDownloads } : {}),
+      ...(modelSources || groupRefs.length > 0 ? { hasModelSources: true, modelSources: modelSources ?? [] } : {}),
       downloadCheck: node.download_check,
       hfSkipPrefixes: node.hf_skip_prefixes,
+      ...(node.hf_include_prefixes ? { hfIncludePrefixes: node.hf_include_prefixes } : {}),
       ...automationMetadata,
       ...(agentResult.declaration ? { agent: agentResult.declaration } : {}),
       ...(agentResult.error ? { agentError: agentResult.error } : {}),
@@ -960,7 +1099,9 @@ export async function readExtensionsFromDir(
         if (!manifest) return fallback
 
         try {
-          return parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin)
+          return parseExtensionManifest(
+            projectAgentOnlyNodesForLegacy(manifest), entry.name, trustedRepos, isBuiltin,
+          )
         } catch {
           return fallback
         }
@@ -1021,7 +1162,9 @@ export async function readExtensionsFromDirDetailed(
 
         try {
           return {
-            extension: parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin),
+            extension: parseExtensionManifest(
+              projectAgentOnlyNodesForLegacy(manifest), entry.name, trustedRepos, isBuiltin,
+            ),
             errors,
           }
         } catch (error) {
@@ -1082,7 +1225,8 @@ export async function readResolvedExtensionsFromDirDetailed(
 
         if (manifest) {
           try {
-            extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin, {
+            const listingManifest = validateAgentJson ? manifest : projectAgentOnlyNodesForLegacy(manifest)
+            extension = parseExtensionManifest(listingManifest, entry.name, trustedRepos, isBuiltin, {
               governedAgentKinds: validateAgentJson,
             })
           } catch (error) {

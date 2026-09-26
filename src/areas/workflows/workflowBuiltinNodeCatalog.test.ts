@@ -90,6 +90,25 @@ test('workflow built-in catalog exposes Load Scene with scene-focused copy', asy
   }
 })
 
+test('workflow built-in catalog exposes Load Capture as a first-class capture source', async () => {
+  const { module, cleanup } = await loadCatalogModule()
+
+  try {
+    const panelNodes = module.WORKFLOW_BUILTIN_PANEL_NODES as BuiltinCatalogNode[]
+    const paletteNodes = module.WORKFLOW_BUILTIN_PALETTE_NODES as BuiltinCatalogNode[]
+    const panelEntry = panelNodes.find((node) => node.type === 'captureNode')
+    const paletteEntry = paletteNodes.find((node) => node.type === 'captureNode')
+
+    assert.deepEqual(
+      [panelEntry?.label, paletteEntry?.label, module.WORKFLOW_BUILTIN_NODE_TYPES.includes('captureNode')],
+      ['Load Capture', 'Load Capture', true],
+    )
+    assert.match(paletteEntry?.description ?? '', /capture manifest|ordered frames|video/i)
+  } finally {
+    await cleanup()
+  }
+})
+
 
 test('workflow built-in catalog leaves Preview Video to extension-provided utility nodes', async () => {
   const { module, cleanup } = await loadCatalogModule()

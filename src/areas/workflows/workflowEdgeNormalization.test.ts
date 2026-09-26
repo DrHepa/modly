@@ -139,7 +139,7 @@ test('collapses stale named model source handles while preserving named process 
   assert.deepEqual(result.edges[0], { id: 'edge', source: 'source', sourceHandle: null, target: 'target', targetHandle: 'prompt' })
 })
 
-test('keeps ambiguous multi-input targets unresolved instead of guessing', () => {
+test('maps legacy input-0 targets to the first declared multi-input process port', () => {
   const source = createNode('source', 'imageNode')
   const target = createNode('target', 'extensionNode', { extensionId: 'ext/process', enabled: true, params: {} })
 
@@ -175,6 +175,50 @@ test('maps missing model target handles to the first declared named input port',
   })
 
   assert.deepEqual(result.edges.map((edge: WFEdge) => edge.targetHandle), ['front', 'front'])
+})
+
+test('maps positional model target handles by declared input order', () => {
+  const source = createNode('source', 'imageNode')
+  const target = createNode('target', 'extensionNode', { extensionId: 'ext/model', enabled: true, params: {} })
+
+  const result = normalizeWorkflowEdges({
+    nodes: [source, target],
+    edges: [
+      { id: 'front', source: source.id, target: target.id, targetHandle: 'input-0' },
+      { id: 'left', source: source.id, target: target.id, targetHandle: 'input-1' },
+      { id: 'right', source: source.id, target: target.id, targetHandle: 'input-2' },
+    ],
+    allExtensions: [createModelExtension({
+      inputs: [
+        { name: 'image', type: 'image' },
+        { name: 'image_2', type: 'image', required: false },
+        { name: 'image_3', type: 'image', required: false },
+      ],
+    })],
+  })
+
+  assert.equal(result.changed, true)
+  assert.deepEqual(result.edges.map((edge: WFEdge) => edge.targetHandle), ['image', 'image_2', 'image_3'])
+})
+
+test('falls back out-of-range positional model target handles to the first declared input', () => {
+  const source = createNode('source', 'imageNode')
+  const target = createNode('target', 'extensionNode', { extensionId: 'ext/model', enabled: true, params: {} })
+
+  const result = normalizeWorkflowEdges({
+    nodes: [source, target],
+    edges: [{ id: 'edge', source: source.id, target: target.id, targetHandle: 'input-3' }],
+    allExtensions: [createModelExtension({
+      inputs: [
+        { name: 'image', type: 'image' },
+        { name: 'image_2', type: 'image', required: false },
+        { name: 'image_3', type: 'image', required: false },
+      ],
+    })],
+  })
+
+  assert.equal(result.changed, true)
+  assert.equal(result.edges[0].targetHandle, 'image')
 })
 
 test('falls back unknown model target handles to the first declared input', () => {

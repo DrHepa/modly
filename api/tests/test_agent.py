@@ -835,11 +835,17 @@ def test_chat_rejects_malformed_ollama_url_before_client_or_stream(monkeypatch):
     assert raised.value.detail["proposals"] == []
 
 
-def test_project_python_runner_selects_direct_action_contract_tests():
+def test_project_python_runner_selects_required_focused_contract_tests():
     runner = Path(__file__).resolve().parents[2] / "scripts" / "run-pytests.mjs"
     source = runner.read_text(encoding="utf-8")
 
-    assert "'tests/test_agent_direct_actions.py'," in source
+    required_tests = (
+        "tests/test_agent_direct_actions.py",
+        "tests/test_hf_download_assets.py",
+        "tests/test_https_download_assets.py",
+    )
+    for required_test in required_tests:
+        assert f"'{required_test}'," in source
 
 
 def test_agent_executes_streamed_tools_with_tool_names_then_returns_final_round(monkeypatch):

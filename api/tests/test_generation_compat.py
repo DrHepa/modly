@@ -2,6 +2,8 @@ import asyncio
 import logging
 import time
 import json
+import struct
+import zlib
 
 
 def assert_backend_ready(client) -> None:
@@ -249,6 +251,69 @@ def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_
     assert none_mismatch.status_code == 400
     assert none_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'scene' but this endpoint received 'none'."
 
+
+def test_generate_from_artifact_routes_validated_capture_and_strips_reserved_params(
+    client,
+    api_modules,
+    monkeypatch,
+):
+    from services.capture_input import TypedModelInput
+    from services.generator_registry import generator_registry
+
+    workspace = api_modules["workspace_dir"]
+    capture = workspace / "Captures" / "chair"
+    frames = capture / "frames"
+    frames.mkdir(parents=True)
+    frame = frames / "0000.png"
+
+    def chunk(name: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + name + payload + struct.pack(">I", zlib.crc32(name + payload) & 0xFFFFFFFF)
+
+    raw = b"\x00" + (b"\xff\x00\x00" * 2)
+    frame.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+    manifest = capture / "capture-manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": "modly.capture-manifest.v1",
+        "captureRoot": ".",
+        "kind": "frames",
+        "frames": [{"index": 0, "path": "frames/0000.png", "width": 2, "height": 1, "byteSize": frame.stat().st_size}],
+        "provenance": {"source": "test", "ordering": "manifest-index"},
+    }))
+    generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "capture"
+    captured = {}
+
+    def generate(model_input, params, progress_cb=None, cancel_event=None):
+        captured["input"] = model_input
+        captured["params"] = dict(params)
+        output = workspace / "CaptureRuns" / "capture.glb"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"glb")
+        return output
+
+    monkeypatch.setattr(api_modules["fake_generator"], "generate", generate)
+    response = client.post("/generate/from-artifact", json={
+        "input_kind": "capture",
+        "input_path": "Captures/chair/capture-manifest.json",
+        "model_id": api_modules["valid_model_id"],
+        "collection": "CaptureRuns",
+        "params": {
+            "quality": "high",
+            "capture_manifest_path": "/forged/outside.json",
+            "typed_input_path": "/forged/typed.json",
+        },
+    })
+
+    assert response.status_code == 200
+    status = client.get(f"/generate/status/{response.json()['job_id']}").json()
+    assert status["status"] == "done"
+    assert captured["input"] == TypedModelInput("capture", manifest.resolve())
+    assert captured["params"]["capture_manifest_path"] == str(manifest.resolve())
+    assert "typed_input_path" not in captured["params"]
 
 def test_generate_from_image_accepts_legacy_missing_input_metadata(client, api_modules, image_upload):
     assert_backend_ready(client)

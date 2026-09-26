@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionNode, ProcessPort } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ModelDownloadFailure, ProcessPort } from '@shared/types/electron.d'
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -16,6 +16,28 @@ export interface DownloadInfo {
 
 export type DownloadMap = Record<string, DownloadInfo>
 
+export function isValidModelDownloadFailure(value: unknown): value is ModelDownloadFailure {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const failure = value as Record<string, unknown>
+  const optionalFieldsAreValid = ['repoId', 'sourceId', 'file'].every((field) => (
+    failure[field] === undefined
+      || (typeof failure[field] === 'string' && failure[field].trim().length > 0)
+  ))
+  return typeof failure.code === 'string' && failure.code.trim().length > 0
+    && typeof failure.stage === 'string' && failure.stage.trim().length > 0
+    && typeof failure.message === 'string' && failure.message.trim().length > 0
+    && typeof failure.retryable === 'boolean'
+    && optionalFieldsAreValid
+}
+
+export function isRetryableModelDownloadFailure(value: unknown): value is ModelDownloadFailure {
+  return isValidModelDownloadFailure(value) && value.retryable === true
+}
+
+export function nodeHasManagedWeights(node: ExtensionNode): boolean {
+  return Boolean(node.hfRepo || node.hfDownloads?.length || node.httpsDownloads?.length || node.hasModelSources)
+}
+
 export type NodeUiState =
   | { kind: 'ready' }                          // no weights required
   | { kind: 'available' }                      // weights not downloaded yet
@@ -29,7 +51,7 @@ export function getNodeState(
   downloading: DownloadMap,
 ): NodeUiState {
   const fullId = `${extId}/${node.id}`
-  if (!node.hfRepo) return { kind: 'ready' }
+  if (!nodeHasManagedWeights(node)) return { kind: 'ready' }
   const dl = downloading[fullId]
   if (dl) return { kind: 'downloading', dl }
   if (installedIds.includes(fullId)) return { kind: 'installed' }
@@ -187,7 +209,11 @@ export function NodeInstallControl({ state, disabled, onInstall, onPause, onResu
           </span>
         </span>
         <button
-          onClick={(e) => { e.stopPropagation(); paused ? onResume() : onPause() }}
+          onClick={(e) => {
+            e.stopPropagation()
+            if (paused) onResume()
+            else onPause()
+          }}
           title={paused ? 'Resume download' : 'Pause download'}
           className="p-1 rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
         >

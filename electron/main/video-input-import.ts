@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { copyFile, mkdir, realpath, stat } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, realpath, stat } from 'node:fs/promises'
 import { randomUUID as systemRandomUUID } from 'node:crypto'
 import { basename, extname, isAbsolute, join, relative } from 'node:path'
 
@@ -15,6 +15,8 @@ export type ImportVideoInputArgs = {
   randomUUID?: () => string
 }
 
+const MAX_VIDEO_BYTES = 8 * 1024 ** 3
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi'])
 const DURABLE_WORKSPACE_ROOTS = new Set(['Workflows', 'Exports'])
 
 function isWithinWorkspace(filePath: string, workspaceDir: string): boolean {
@@ -49,6 +51,12 @@ function hasErrorCode(error: unknown, code: string): boolean {
     && error !== null
     && 'code' in error
     && error.code === code
+}
+
+function validateVideoFileInfo(info: { isFile(): boolean; size: number }, sourcePath: string): void {
+  if (!info.isFile()) throw new Error('Selected video path must reference a regular file.')
+  if (info.size <= 0 || info.size > MAX_VIDEO_BYTES) throw new Error('Selected video must be between 1 byte and 8 GiB.')
+  if (!VIDEO_EXTENSIONS.has(extname(sourcePath).toLowerCase())) throw new Error('Selected video uses an unsupported extension.')
 }
 
 async function ensureSafeDestinationDirectory(
@@ -86,15 +94,16 @@ export async function importVideoInputToWorkspace({
   }
 
   const displayName = basename(sourcePath)
+  const sourceLinkInfo = await lstat(sourcePath)
+  if (sourceLinkInfo.isSymbolicLink()) throw new Error('Selected video path must not be a symbolic link.')
+  validateVideoFileInfo(sourceLinkInfo, sourcePath)
 
   await mkdir(workspaceDir, { recursive: true })
   const canonicalWorkspace = await realpath(workspaceDir)
   const canonicalSource = await realpath(sourcePath)
 
   const sourceStat = await stat(canonicalSource)
-  if (!sourceStat.isFile()) {
-    throw new Error('Selected video path must reference a regular file.')
-  }
+  validateVideoFileInfo(sourceStat, sourcePath)
 
   if (isWithinDurableWorkspaceRoot(canonicalSource, canonicalWorkspace)) {
     return {
@@ -108,20 +117,17 @@ export async function importVideoInputToWorkspace({
     'Workflows',
     canonicalWorkspace,
   )
-  const canonicalInputsDirectory = await ensureSafeDestinationDirectory(
-    canonicalWorkflowsDirectory,
-    'Inputs',
-    canonicalWorkspace,
-  )
   const canonicalDestinationDirectory = await ensureSafeDestinationDirectory(
-    canonicalInputsDirectory,
-    'Videos',
+    canonicalWorkflowsDirectory,
+    'Imported Videos',
     canonicalWorkspace,
   )
 
   const uniqueName = `${randomUUID()}-${safeVideoName(displayName)}`
   const destinationPath = join(canonicalDestinationDirectory, uniqueName)
   await copyFile(canonicalSource, destinationPath, constants.COPYFILE_EXCL)
+  const copied = await lstat(destinationPath)
+  if (!copied.isFile() || copied.size !== sourceStat.size) throw new Error('Imported video copy could not be verified.')
 
   return {
     workspacePath: toWorkspacePath(canonicalWorkspace, destinationPath),

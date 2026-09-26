@@ -8,7 +8,7 @@ import { deriveActiveWorkflowGraph } from './workflowActiveGraph.ts'
 
 type ArtifactType = ArtifactKind
 
-const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'audio', 'video'])
+const ARTIFACT_KIND_SET = new Set<ArtifactKind>(['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'])
 
 function asArtifactKind(value: string | undefined): ArtifactKind | undefined {
   return typeof value === 'string' && ARTIFACT_KIND_SET.has(value as ArtifactKind)
@@ -17,7 +17,7 @@ function asArtifactKind(value: string | undefined): ArtifactKind | undefined {
 }
 
 type ProcessRulePhase = 'connect' | 'run'
-type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target' | 'min-items' | 'max-items'
+type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target' | 'min-items' | 'max-items' | 'unsupported-video-process'
 
 export type ProcessConnectionRuleIssue = {
   phase: ProcessRulePhase
@@ -80,6 +80,31 @@ function getPortAwareTargetExtension(node: WFNode | undefined, allExtensions: Wo
   return extension
 }
 
+function hasProcessVideoShape(extension: WorkflowExtension | undefined): boolean {
+  return Boolean(extension && extension.type !== 'model' && (
+    extension.input === 'video'
+    || extension.output === 'video'
+    || (extension.inputs ?? []).some((port) => port.type === 'video')
+  ))
+}
+
+function createProcessVideoIssue(args: {
+  phase: ProcessRulePhase
+  targetNodeId: string
+  targetHandle?: string | null
+  portName?: string | null
+  sourceNodeId?: string
+}): ProcessConnectionRuleIssue {
+  return createIssue({
+    phase: args.phase,
+    code: 'unsupported-video-process',
+    targetNodeId: args.targetNodeId,
+    targetHandle: args.targetHandle ?? null,
+    portName: args.portName ?? null,
+    ...(args.sourceNodeId ? { sourceNodeId: args.sourceNodeId } : {}),
+  })
+}
+
 function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): ProcessConnectionRuleIssue {
   if (issue.code === 'inputless-target') {
     return {
@@ -92,6 +117,13 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
     return {
       ...issue,
       message: `Port "${issue.portName}" expects ${issue.expectedType} but received ${issue.actualType}.`,
+    }
+  }
+
+  if (issue.code === 'unsupported-video-process') {
+    return {
+      ...issue,
+      message: 'Process extensions do not support video inputs or outputs.',
     }
   }
 
@@ -125,15 +157,48 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
 }
 
 export function validateProcessConnection({ connection, nodes, edges, allExtensions }: ConnectionValidationContext): ProcessConnectionRuleIssue | null {
-  void connection
-  void nodes
   void edges
-  void allExtensions
+  const sourceNode = getNodeById(nodes, connection.source)
+  const targetNode = getNodeById(nodes, connection.target)
+  const sourceExtension = getExtensionForNode(sourceNode, allExtensions)
+  const targetExtension = getExtensionForNode(targetNode, allExtensions)
+  const sourceType = resolveNodeOutputType(sourceNode, allExtensions)
+
+  if (hasProcessVideoShape(sourceExtension)) {
+    return createProcessVideoIssue({
+      phase: 'connect',
+      targetNodeId: connection.target ?? '',
+      targetHandle: connection.targetHandle ?? null,
+      sourceNodeId: connection.source ?? undefined,
+    })
+  }
+
+  if (hasProcessVideoShape(targetExtension) || (Boolean(targetExtension) && targetExtension?.type !== 'model' && sourceType === 'video')) {
+    const targetPort = targetExtension ? getProcessTargetPort(targetExtension, connection.targetHandle ?? null) : null
+    return createProcessVideoIssue({
+      phase: 'connect',
+      targetNodeId: connection.target ?? '',
+      targetHandle: connection.targetHandle ?? null,
+      portName: targetPort?.name ?? null,
+      sourceNodeId: connection.source ?? undefined,
+    })
+  }
+
   return null
 }
 
 export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: ValidationContext): ProcessConnectionRuleIssue | null {
   const activeGraph = deriveActiveWorkflowGraph(nodes, edges)
+
+  for (const node of activeGraph.nodes) {
+    const extension = getExtensionForNode(node, allExtensions)
+    if (hasProcessVideoShape(extension)) {
+      return createProcessVideoIssue({
+        phase: 'run',
+        targetNodeId: node.id,
+      })
+    }
+  }
 
   for (const node of activeGraph.nodes) {
     const previewTargetKind = previewNodeTargetArtifactKind(node.type)
@@ -230,6 +295,15 @@ export function validateWorkflowProcessRun({ nodes, edges, allExtensions }: Vali
       for (const edge of portEdges) {
         const sourceNode = getNodeById(activeGraph.nodes, edge.source)
         const actualType = resolveNodeOutputType(sourceNode, allExtensions)
+        if (extension.type !== 'model' && actualType === 'video') {
+          return createProcessVideoIssue({
+            phase: 'run',
+            targetNodeId: node.id,
+            targetHandle: port.name,
+            portName: port.name,
+            sourceNodeId: sourceNode?.id,
+          })
+        }
         if (actualType && actualType !== port.type) {
           const expectedType = asArtifactKind(port.type)
           return createIssue({

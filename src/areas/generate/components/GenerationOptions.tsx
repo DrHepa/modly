@@ -309,7 +309,6 @@ export default function GenerationOptions(): JSX.Element {
         initDefaults(params)
       })
       .catch(() => setSchema([]))
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- refetch only when model/apiUrl change; initDefaults is local
   }, [generationOptions.modelId, apiUrl])
 
   function initDefaults(params: ParamSchema[]) {
@@ -350,7 +349,6 @@ export default function GenerationOptions(): JSX.Element {
         }
       })
       .catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once backend is ready; getAllModelsStatus is re-created each render (would loop)
   }, [apiUrl])
 
   const modelParamSections = partitionAdvancedParams(schema)

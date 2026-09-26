@@ -192,6 +192,15 @@ beforeEach(() => {
               assets: [],
             }), 'utf8').toString('base64')
           }
+          if (filePath.endsWith('/capture-manifest.json')) {
+            return Buffer.from(JSON.stringify({
+              schema: 'modly.capture-manifest.v1',
+              captureRoot: '.',
+              kind: 'frames',
+              frames: [{ index: 0, path: 'frame.png', width: 1, height: 1, byteSize: 1 }],
+              provenance: { source: 'test', ordering: 'manifest-index' },
+            }), 'utf8').toString('base64')
+          }
           return Buffer.from('fs-bytes').toString('base64')
         },
       },
@@ -331,6 +340,23 @@ function createNamedImageModelExtension(overrides: ModelWorkflowExtensionOverrid
       { name: 'left', type: 'image', required: false },
       { name: 'back', type: 'image', required: false },
       { name: 'right', type: 'image', required: false },
+    ],
+    ...overrides,
+  })
+}
+
+function createPositionalImageModelExtension(overrides: ModelWorkflowExtensionOverrides = {}): ModelWorkflowExtension {
+  return createWorkflowExtension({
+    id: 'legacy/dreamstyle',
+    extensionId: 'legacy',
+    nodeId: 'dreamstyle',
+    type: 'model',
+    input: 'image',
+    output: 'mesh',
+    inputs: [
+      { name: 'image', type: 'image', required: true },
+      { name: 'image_2', type: 'image', required: true },
+      { name: 'image_3', type: 'image', required: true },
     ],
     ...overrides,
   })
@@ -900,6 +926,96 @@ test('workflowRunStore preserves legacy front routing for named image ports', as
   assert.equal(postCalls.length, 1)
   assert.equal((postCalls[0].data.get('image') as File).name, 'front-view.png')
   assert.deepEqual(fsReadCalls, ['/tmp/front-view.png'])
+})
+
+test('workflowRunStore routes legacy positional image slots in order and preserves secondary gaps', async () => {
+  const ext = createPositionalImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'primary-source', filePath: '/tmp/primary.png', targetHandle: 'image' },
+      { id: 'third-source', filePath: '/tmp/third.png', targetHandle: 'image_3' },
+    ],
+  })
+  const postCalls: FormData[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-positional-images' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/positional-images.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal((postCalls[0].get('image') as File).name, 'primary.png')
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
+    extra_image_paths: [null, '/tmp/third.png'],
+  })
+  assert.deepEqual(fsReadCalls, ['/tmp/primary.png'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore normalizes raw positional image handles at runtime before dispatch', async () => {
+  const ext = createPositionalImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {},
+    }),
+    imageSources: [
+      { id: 'primary-source', filePath: '/tmp/primary.png', targetHandle: 'input-0' },
+      { id: 'third-source', filePath: '/tmp/third.png', targetHandle: 'input-2' },
+    ],
+  })
+  const postCalls: FormData[] = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-raw-positional-images' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/raw-positional-images.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal((postCalls[0].get('image') as File).name, 'primary.png')
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
+    extra_image_paths: [null, '/tmp/third.png'],
+  })
+  assert.deepEqual(fsReadCalls, ['/tmp/primary.png'])
+  assert.equal(workflow.edges.find((edge) => edge.id === 'edge-primary-source')?.targetHandle, 'input-0')
+  assert.equal(workflow.edges.find((edge) => edge.id === 'edge-third-source')?.targetHandle, 'input-2')
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
 test('workflowRunStore keeps an untargeted legacy image edge as primary for named-input model nodes', async () => {
@@ -1556,7 +1672,7 @@ test('buildModelGenerationRequest accepts scene model inputs as scene path param
   })
 })
 
-test('workflowRunStore dispatches scene-capability model nodes to /generate/from-scene as JSON without reading image bytes', async () => {
+test('workflowRunStore dispatches scene-capability model nodes to /generate/from-artifact as JSON without reading image bytes', async () => {
   const ext = createWorkflowExtension({
     id: 'hy-world-2/worldstereo-2',
     extensionId: 'hy-world-2',
@@ -1608,9 +1724,10 @@ test('workflowRunStore dispatches scene-capability model nodes to /generate/from
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
   assert.equal(postCalls.length, 1)
-  assert.equal(postCalls[0].path, '/generate/from-scene')
+  assert.equal(postCalls[0].path, '/generate/from-artifact')
   assert.deepEqual(postCalls[0].data, {
-    scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
+    input_kind: 'scene',
+    input_path: 'Default/worlds/hero-scene/scene-manifest.json',
     model_id: ext.id,
     collection: 'Workflows',
     remesh: 'none',
@@ -1631,6 +1748,81 @@ test('workflowRunStore dispatches scene-capability model nodes to /generate/from
     filePath: '/workspace/Default/worlds/hero-scene/scene-manifest.json',
     outputType: 'scene',
   })
+})
+
+test('workflowRunStore dispatches Load Capture to a capture model through the typed artifact route', async () => {
+  const ext = createWorkflowExtension({
+    id: 'pixal3d/generate-mv', extensionId: 'pixal3d', nodeId: 'generate-mv',
+    type: 'model', input: 'capture', output: 'mesh',
+  })
+  const workflow: Workflow = {
+    id: 'workflow-capture-model', name: 'Capture Dispatch', description: '',
+    nodes: [
+      createNode('capture-source', 'captureNode', { enabled: true, params: { path: 'Captures/chair' } }),
+      createNode('capture-model', 'extensionNode', { extensionId: ext.id, enabled: true, params: { num_views: 4 } }),
+    ],
+    edges: [{ id: 'edge-capture', source: 'capture-source', target: 'capture-model' }],
+    createdAt: '2026-09-20T00:00:00.000Z', updatedAt: '2026-09-20T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown> })
+      return { data: { job_id: 'job-capture-1' } }
+    },
+    async get() { return { data: { status: 'done', output_url: '/workspace/Workflows/capture.glb', output_kind: 'mesh' } } },
+  }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(postCalls[0].path, '/generate/from-artifact')
+  assert.deepEqual(postCalls[0].data, {
+    input_kind: 'capture', input_path: 'Captures/chair/capture-manifest.json',
+    model_id: ext.id, collection: 'Workflows', remesh: 'none', enable_texture: false,
+    texture_resolution: 1024, params: { num_views: 4 },
+  })
+  assert.deepEqual(fsReadCalls, ['/workspace/Captures/chair/capture-manifest.json'])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore dispatches Load Capture to Pixal3D scene-from-estimates and preserves scene output kind', async () => {
+  const ext = createWorkflowExtension({
+    id: 'pixal3d/scene-from-estimates', extensionId: 'pixal3d', nodeId: 'scene-from-estimates',
+    type: 'model', input: 'capture', output: 'scene',
+  })
+  const workflow: Workflow = {
+    id: 'workflow-capture-scene', name: 'Capture Scene Prep', description: '',
+    nodes: [
+      createNode('capture-source', 'captureNode', { enabled: true, params: { path: 'Captures/room' } }),
+      createNode('scene-prep', 'extensionNode', { extensionId: ext.id, enabled: true, params: { track_min_length: 3 } }),
+    ],
+    edges: [{ id: 'edge-capture-scene', source: 'capture-source', target: 'scene-prep' }],
+    createdAt: '2026-09-20T00:00:00.000Z', updatedAt: '2026-09-20T00:00:00.000Z',
+  }
+  const postCalls: Array<{ path: string; data: Record<string, unknown> }> = []
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      postCalls.push({ path, data: data as Record<string, unknown> })
+      return { data: { job_id: 'job-capture-scene-1' } }
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/Workflows/prepared/scene-manifest.json', output_kind: 'scene' } }
+    },
+  }
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(postCalls[0].path, '/generate/from-artifact')
+  assert.deepEqual(postCalls[0].data, {
+    input_kind: 'capture', input_path: 'Captures/room/capture-manifest.json',
+    model_id: ext.id, collection: 'Workflows', remesh: 'none', enable_texture: false,
+    texture_resolution: 1024, params: { track_min_length: 3 },
+  })
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['scene-prep']?.legacy?.outputType, 'scene')
 })
 
 test('workflowRunStore sends Load Scene outputs to downstream scene process nodes without rerouting through image handling', async () => {
@@ -1726,7 +1918,58 @@ test('workflowRunStore sends resolved process image-to-mesh nodes through runPro
   assert.deepEqual(useWorkflowRunStore.getState().nodeArtifacts['process-node']?.kind, 'mesh')
 })
 
-test('workflowRunStore captures video process outputs for video preview nodes without publishing them to Generate Viewer3D', async () => {
+
+test('workflowRunStore accepts model image-to-video outputs and records video artifacts', async () => {
+  const ext = createWorkflowExtension({
+    id: 'wan22/image-to-video',
+    extensionId: 'wan22',
+    nodeId: 'image-to-video',
+    name: 'Wan Image To Video',
+    type: 'model',
+    input: 'image',
+    output: 'video',
+    params: [],
+  })
+  const workflow = createWorkflow(createNode('model-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: {},
+  }))
+  const postCalls: Array<{ path: string; data: FormData; config: unknown }> = []
+
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+
+  axiosClientMock = {
+    async post(path: string, data?: unknown, config?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push({ path, data: data as FormData, config })
+        return { data: { job_id: 'job-video-output' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get(path: string) {
+      assert.equal(path, '/generate/status/job-video-output')
+      return { data: { status: 'done', output_url: '/workspace/Workflows/generated.mp4', output_kind: 'video' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.equal(postCalls[0].path, '/generate/from-image')
+  assert.equal(postCalls[0].data.get('model_id'), ext.id)
+  assert.equal(runProcessCalls.length, 0)
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'video')
+  assert.deepEqual(useWorkflowRunStore.getState().nodeVideoOutputs, {
+    'model-node': '/workspace/Workflows/generated.mp4',
+  })
+})
+
+test('workflowRunStore rejects unsupported video process outputs before runProcess', async () => {
   const ext = createWorkflowExtension({
     id: 'vendor/image-to-video',
     extensionId: 'vendor-video-process',
@@ -1747,13 +1990,55 @@ test('workflowRunStore captures video process outputs for video preview nodes wi
 
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
-  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
-  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/video/generated.mp4')
-  assert.equal(useWorkflowRunStore.getState().runState.artifact?.kind, 'video')
-  assert.deepEqual(useWorkflowRunStore.getState().nodeVideoOutputs, {
-    'video-node': '/workspace/video/generated.mp4',
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /unsupported video input or output declaration/i)
+  assert.deepEqual(runProcessCalls, [])
+})
+
+test('workflowRunStore rejects legacy persisted video inputs before process runProcess', async () => {
+  const ext = createWorkflowExtension({
+    id: 'vendor/refiner',
+    extensionId: 'vendor-process',
+    nodeId: 'refiner',
+    type: 'process',
+    input: 'image',
+    output: 'mesh',
+    inputs: [{ name: 'reference_image', type: 'image' }],
   })
-  assert.equal(useAppStore.getState().currentJob?.outputUrl, undefined)
+  const workflow: Workflow = {
+    id: 'workflow-process-video-input',
+    name: 'Process Video Input',
+    description: '',
+    nodes: [
+      createNode('video-source', 'videoNode', {
+        enabled: true,
+        params: { videoPath: 'Workflows/Inputs/Videos/source.mp4' },
+      }),
+      createNode('process-node', 'extensionNode', {
+        extensionId: ext.id,
+        enabled: true,
+        params: {},
+      }),
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-video', source: 'video-source', target: 'process-node', targetHandle: 'reference_image' },
+      { id: 'edge-output', source: 'process-node', target: 'output-node' },
+    ],
+    createdAt: '2026-04-15T00:00:00.000Z',
+    updatedAt: '2026-04-15T00:00:00.000Z',
+  }
+
+  window.electron.extensions.runProcess = async (extensionId: string, input: unknown, params: Record<string, unknown>) => {
+    runProcessCalls.push({ extensionId, input, params })
+    return { success: true, result: { filePath: '/workspace/mesh/generated.glb' } }
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Process extensions do not support video inputs or outputs/)
+  assert.deepEqual(runProcessCalls, [])
 })
 
 test('workflowRunStore hydrates missing defaults for legacy process nodes before runProcess', async () => {
@@ -3899,7 +4184,7 @@ test('workflowRunStore dispatches video models as path-only JSON without multipa
   axiosClientMock = {
     async post(path: string, data?: unknown, config?: unknown) {
       postCalls.push({ path, data: data as Record<string, unknown>, config })
-      if (path === '/generate/from-video') return { data: { job_id: 'job-video-model' } }
+      if (path === '/generate/from-artifact') return { data: { job_id: 'job-video-model' } }
       throw new Error(`Unexpected axios.post call: ${path}`)
     },
     async get(path: string) {
@@ -3912,9 +4197,10 @@ test('workflowRunStore dispatches video models as path-only JSON without multipa
 
   assert.equal(postCalls.length, 1)
   const call = postCalls[0]
-  assert.equal(call.path, '/generate/from-video')
+  assert.equal(call.path, '/generate/from-artifact')
   assert.deepEqual(call.data, {
-    video_path: 'Workflows/Inputs/Videos/turntable.mp4',
+    input_kind: 'video',
+    input_path: 'Workflows/Inputs/Videos/turntable.mp4',
     model_id: ext.id,
     collection: 'Workflows',
     remesh: 'none',

@@ -3,7 +3,7 @@
  * Output: out/builtin-extensions/{id}/processor.js + manifest.json
  */
 
-import { execSync }                                           from 'child_process'
+import { execFileSync }                                       from 'child_process'
 import { readdirSync, existsSync, cpSync, mkdirSync, statSync } from 'fs'
 import { join, dirname }                                      from 'path'
 import { fileURLToPath }                                      from 'url'
@@ -12,6 +12,15 @@ const root   = join(dirname(fileURLToPath(import.meta.url)), '..')
 const srcDir = join(root, 'src', 'areas', 'workflows', 'nodes')
 const outDir = join(root, 'out', 'builtin-extensions')
 
+function runNpm(args, cwd) {
+  const options = { cwd, stdio: 'inherit' }
+  if (process.env.npm_execpath) {
+    execFileSync(process.execPath, [process.env.npm_execpath, ...args], options)
+    return
+  }
+  execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, options)
+}
+
 if (!existsSync(srcDir)) {
   console.log('[build-builtins] No builtin-extensions directory found, skipping.')
   process.exit(0)
@@ -19,9 +28,13 @@ if (!existsSync(srcDir)) {
 
 // 1. Compile TypeScript
 console.log('[build-builtins] Compiling TypeScript…')
-execSync('npx tsc -p tsconfig.builtins.json', { cwd: root, stdio: 'inherit' })
+execFileSync(process.execPath, [
+  join(root, 'node_modules', 'typescript', 'bin', 'tsc'),
+  '-p',
+  'tsconfig.builtins.json',
+], { cwd: root, stdio: 'inherit' })
 
-// 2. Copy manifest.json, and optionally package.json + npm install
+// 2. Copy manifests and lockfile-backed packages, then run npm ci.
 for (const id of readdirSync(srcDir)) {
   const extSrcDir = join(srcDir, id)
   if (!statSync(extSrcDir).isDirectory()) continue
@@ -41,13 +54,15 @@ for (const id of readdirSync(srcDir)) {
 
   const pkgSrc = join(extSrcDir, 'package.json')
   if (existsSync(pkgSrc)) {
+    const lockSrc = join(extSrcDir, 'package-lock.json')
+    if (!existsSync(lockSrc)) {
+      throw new Error(`[build-builtins] ${id}: package-lock.json is required`)
+    }
     cpSync(pkgSrc, join(extOutDir, 'package.json'))
-    console.log(`[build-builtins] ${id}: Installing npm dependencies…`)
-    execSync('npm install --omit=dev --no-audit --no-fund', {
-      cwd:   extOutDir,
-      stdio: 'inherit',
-    })
-    console.log(`[build-builtins] ${id}: npm install done`)
+    cpSync(lockSrc, join(extOutDir, 'package-lock.json'))
+    console.log(`[build-builtins] ${id}: Installing locked npm dependencies with npm ci…`)
+    runNpm(['ci', '--offline', '--omit=dev', '--no-audit', '--no-fund'], extOutDir)
+    console.log(`[build-builtins] ${id}: npm ci done`)
   }
 
   // Copy any Python processor files

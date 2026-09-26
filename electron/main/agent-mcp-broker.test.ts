@@ -789,11 +789,8 @@ test('owned stdio transport kills the complete detached process group without or
     cwd: process.cwd(),
     terminationGraceMs: 50,
   })
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js')
-  const client = new Client({ name: 'process-tree-test', version: '1.0.0' }, { capabilities: {} })
   try {
-    await client.connect(transport)
-    const pending = client.callTool({ name: 'hang', arguments: {} }).catch(() => undefined)
+    await transport.start()
     let pids: { parent: number, child: number } | undefined
     for (let attempt = 0; attempt < 100; attempt += 1) {
       try { pids = JSON.parse(await readFile(pidFile, 'utf8')) as { parent: number, child: number }; break } catch {
@@ -802,7 +799,6 @@ test('owned stdio transport kills the complete detached process group without or
     }
     assert.ok(pids)
     await transport.close()
-    await pending
     for (const pid of [pids.parent, pids.child]) {
       assert.throws(() => process.kill(pid, 0), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ESRCH')
     }
@@ -863,7 +859,8 @@ test('broker source has no renderer IPC or legacy extensions:runProcess path', a
   const source = await readFile(new URL('./agent-mcp-broker.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /ipcMain|ipcRenderer|extensions:runProcess|runProcessExtensionWithDeps/)
   assert.match(source, /signalOwnedProcessGroup\(pid, startTime, 'SIGTERM'\)/)
-  assert.match(source, /signalOwnedProcessGroup\(pid, startTime, 'SIGKILL'\)/)
+  assert.match(source, /waitForProcessGroupExit\(pid, terminationGraceMs\)/)
+  assert.match(source, /signalOwnedProcessGroup\(pid, startTime, 'SIGKILL', \{ leaderMayHaveExited: true \}\)/)
   assert.match(source, /sha256 !== identity\.sha256/)
   assert.match(source, /inheritedHandles, ownsInheritedHandles: false/)
   assert.match(source, /'--ro-bind-fd'/)

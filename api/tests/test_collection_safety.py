@@ -16,7 +16,6 @@ def test_sanitize_collection_name_rejects_dot_segments(collection):
     ("endpoint", "declared_input"),
     [
         ("image", "image"),
-        ("video", "video"),
         ("text", "text"),
         ("none", "none"),
         ("scene", "scene"),
@@ -59,12 +58,7 @@ def test_generation_endpoints_keep_dot_segment_collections_in_workspace(
             "collection": "..",
             "params": {},
         }
-        if endpoint == "video":
-            video_path = workspace_dir / "Inputs" / "safe.capture"
-            video_path.parent.mkdir(parents=True)
-            video_path.write_bytes(b"video")
-            payload["video_path"] = "Inputs/safe.capture"
-        elif endpoint == "text":
+        if endpoint == "text":
             payload["prompt"] = "Create a safe mesh"
         elif endpoint == "scene":
             scene_path = workspace_dir / "Scenes" / "safe.json"

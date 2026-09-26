@@ -368,7 +368,7 @@ function resolveAssetLibraryPreviewKind(workspacePath: string): AssetLibraryPrev
 }
 
 function isArtifactKind(value: unknown): value is ArtifactKind {
-  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'audio'
+  return value === 'image' || value === 'text' || value === 'mesh' || value === 'scene' || value === 'capture' || value === 'audio'
 }
 
 function isAssetLibraryManifestCapability(value: unknown): value is AssetLibraryManifestCapability {

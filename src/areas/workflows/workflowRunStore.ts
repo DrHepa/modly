@@ -43,8 +43,10 @@ import {
   type LegacyWorkflowOutput,
 } from './workflowArtifacts.ts'
 import { resolveSceneSourceManifest } from './workflowSceneSource.ts'
+import { resolveCaptureSourceManifest } from './workflowCaptureSource.ts'
 import { routeWorkflowOutputToWorlds } from './workflowWorldsOutput.ts'
 import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from './workflowActiveGraph.ts'
+import { normalizeWorkflowEdges } from './workflowEdgeNormalization.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -605,6 +607,11 @@ type ModelGenerationRequest =
       scenePath: string
       params: Record<string, unknown>
     }
+  | {
+      kind: 'capture'
+      capturePath: string
+      params: Record<string, unknown>
+    }
 
 type ModelGenerationStatus = {
   status: string
@@ -617,6 +624,7 @@ type ModelGenerationStatus = {
 }
 
 const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
+const RESERVED_MODEL_IMAGE_VIEW_NAMES = new Set(['front', 'left', 'back', 'right'])
 
 function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
   const norm = filePath.replace(/\\/g, '/')
@@ -682,35 +690,51 @@ function resolveModelImageRouting(args: {
   allExtensions: WorkflowExtension[]
 }): {
   applies: boolean
+  primaryPath?: string
   frontPath?: string
   sideParams: Record<string, string>
+  extraImagePaths?: Array<string | undefined>
 } {
-  const namedImagePorts = new Set(
-    args.ext.inputs?.filter((port) => port.type === 'image').map((port) => port.name) ?? [],
-  )
+  const imagePorts = args.ext.inputs?.filter((port) => port.type === 'image') ?? []
+  const namedImagePorts = new Set(imagePorts.map((port) => port.name))
 
-  if (namedImagePorts.size === 0) {
+  if (imagePorts.length === 0) {
     return { applies: false, sideParams: {} }
   }
 
   const routed = new Map<string, string>()
+  let untargetedPrimaryPath: string | undefined
   for (const edge of args.incomingEdges) {
     const handle = edge.targetHandle ?? undefined
-    if (!handle || !namedImagePorts.has(handle)) continue
-
     const src = resolveRunEdgeOutput(edge, args.nodeOutputs)
     if (!src?.filePath || src.outputType !== 'image') continue
-    routed.set(handle, src.filePath)
+    if (handle && namedImagePorts.has(handle)) {
+      routed.set(handle, src.filePath)
+    } else if (untargetedPrimaryPath === undefined) {
+      // Missing/stale handles are still the legacy primary edge; a declared
+      // positional secondary handle must never be promoted into this slot.
+      untargetedPrimaryPath = src.filePath
+    }
   }
+
+  const primaryPort = imagePorts[0]
+  const primaryPath = primaryPort
+    ? routed.get(primaryPort.name) ?? untargetedPrimaryPath
+    : untargetedPrimaryPath
+  const hasNamedViewLayout = imagePorts.some((port) => RESERVED_MODEL_IMAGE_VIEW_NAMES.has(port.name))
 
   return {
     applies: true,
+    primaryPath,
     frontPath: routed.get('front'),
     sideParams: {
       ...(routed.get('left') ? { left_image_path: routed.get('left')! } : {}),
       ...(routed.get('back') ? { back_image_path: routed.get('back')! } : {}),
       ...(routed.get('right') ? { right_image_path: routed.get('right')! } : {}),
     },
+    ...(hasNamedViewLayout || imagePorts.length < 2
+      ? {}
+      : { extraImagePaths: imagePorts.slice(1).map((port) => routed.get(port.name)) }),
   }
 }
 
@@ -777,6 +801,7 @@ function isArtifactKind(value: string | undefined): value is ArtifactRef['kind']
     || value === 'text'
     || value === 'mesh'
     || value === 'scene'
+    || value === 'capture'
     || value === 'audio'
 }
 
@@ -789,6 +814,7 @@ export function buildModelGenerationRequest(args: {
   nodeInputMeshPath?: string
   routedMeshParams?: Record<string, string>
   routedSideParams?: Record<string, string>
+  routedExtraImagePaths?: Array<string | undefined>
   selectedImagePath?: string
   selectedImageData?: string
   workspaceDir: string
@@ -802,6 +828,7 @@ export function buildModelGenerationRequest(args: {
     nodeInputMeshPath,
     routedMeshParams = {},
     routedSideParams = {},
+    routedExtraImagePaths,
     selectedImagePath,
     selectedImageData,
     workspaceDir,
@@ -877,6 +904,18 @@ export function buildModelGenerationRequest(args: {
     }
   }
 
+  if (input === 'capture') {
+    const activeCapturePath = nodeInputPath
+    if (!activeCapturePath) {
+      throw new Error(`Missing required capture input for extension ${ext.id}`)
+    }
+    return {
+      kind: 'capture',
+      capturePath: normalizeWorkflowPath(activeCapturePath, workspaceDir),
+      params: nodeParams,
+    }
+  }
+
   if (input === 'video') {
     const activeVideoPath = nodeInputPath
     if (!activeVideoPath) {
@@ -900,7 +939,13 @@ export function buildModelGenerationRequest(args: {
   if (nodeInputMeshPath) {
     extraParams.mesh_path = normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
   }
-  const params = { ...sanitizedNodeParams, ...routedSideParams, ...routedMeshParams, ...extraParams }
+  const params = {
+    ...sanitizedNodeParams,
+    ...routedSideParams,
+    ...routedMeshParams,
+    ...extraParams,
+    ...(routedExtraImagePaths !== undefined ? { extra_image_paths: routedExtraImagePaths } : {}),
+  }
 
   const activeImagePath = nodeInputPath ?? selectedImagePath
   if (!activeImagePath) {
@@ -980,9 +1025,14 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
     clearPendingCheckpointState()
     _liveParams.current = new Map(workflow.nodes.map((node) => [node.id, { ...(node.data.params ?? {}) }]))
 
-    const appState     = useAppStore.getState()
-    const apiUrl       = appState.apiUrl
-    const activeGraph  = deriveActiveWorkflowGraph(workflow.nodes, workflow.edges)
+    const appState = useAppStore.getState()
+    const apiUrl = appState.apiUrl
+    const normalizedWorkflowEdges = normalizeWorkflowEdges({
+      nodes: workflow.nodes,
+      edges: workflow.edges,
+      allExtensions,
+    })
+    const activeGraph = deriveActiveWorkflowGraph(workflow.nodes, normalizedWorkflowEdges.edges)
     const ordered      = topoSortWorkflowNodes(activeGraph.nodes, activeGraph.edges)
     const execNodes    = ordered.filter((n) =>
       n.type === 'extensionNode' || n.type === 'waitNode' || n.type === 'landmarksNode' || n.type === 'forEachNode',
@@ -1194,6 +1244,22 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
               throw new Error(`Load Scene: ${resolution.error}`)
             }
             const output = { filePath: resolution.manifestAbsolutePath, outputType: 'scene' }
+            nodeOutputs.set(node.id, output)
+            rememberArtifactOutput(node.id, output)
+          }
+        }
+        if (node.type === 'captureNode') {
+          const capturePath = node.data.params?.path as string | undefined
+          if (capturePath) {
+            const resolution = await resolveCaptureSourceManifest({
+              capturePath,
+              workspaceDir,
+              readFileBase64: window.electron.fs.readFileBase64,
+            })
+            if (!resolution.ok) {
+              throw new Error(`Load Capture: ${resolution.error}`)
+            }
+            const output = { filePath: resolution.manifestAbsolutePath, outputType: 'capture' }
             nodeOutputs.set(node.id, output)
             rememberArtifactOutput(node.id, output)
           }
@@ -1502,6 +1568,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
         const dispatch = resolveWorkflowDispatch(node, allExtensions)
         const { ext, mode } = dispatch
+        const usesVideoInput = ext.input === 'video' || (ext.inputs ?? []).some((port) => port.type === 'video')
+        if ((ext.type !== 'model' && (ext.output === 'video' || usesVideoInput))
+          || (ext.type === 'model' && usesVideoInput && ((ext.inputs ?? []).length > 0 || ext.input !== 'video'))) {
+          throw new Error(`${ext.name} uses an unsupported video input or output declaration`)
+        }
         const liveNodeParams = _liveParams.current.get(node.id)
         const hydratedParams = hydrateWorkflowNodeParams(ext, liveNodeParams ?? (node.data.params as Record<string, unknown> | undefined))
         const artifactProvenance = {
@@ -1548,10 +1619,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             if (!src) continue
             if (src.outputType === 'mesh')        nodeInputMeshPath = src.filePath
             else if (src.outputType === 'image') {
-              const targetHandle = edge.targetHandle ?? undefined
-              if (!modelImageRouting.applies || !['left', 'back', 'right'].includes(targetHandle ?? '')) {
-                nodeInputPath = src.filePath
-              }
+              if (!modelImageRouting.applies) nodeInputPath = src.filePath
             }
             else if (src.filePath !== undefined)  nodeInputPath     = src.filePath
             if (src.text !== undefined)           nodeInputText     = src.text
@@ -1576,8 +1644,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           }
         }
 
-        if (modelImageRouting.applies && modelImageRouting.frontPath) {
-          nodeInputPath = modelImageRouting.frontPath
+        if (modelImageRouting.applies && modelImageRouting.primaryPath) {
+          nodeInputPath = modelImageRouting.primaryPath
         }
 
         const routedMeshParams: Record<string, string> = {}
@@ -1614,6 +1682,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             nodeInputMeshPath,
             routedMeshParams,
             routedSideParams: modelImageRouting.sideParams,
+            routedExtraImagePaths: modelImageRouting.extraImagePaths,
             selectedImagePath,
             selectedImageData,
             workspaceDir,
@@ -1623,9 +1692,10 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
 
           const { data } = await (request.kind === 'none'
             ? client.post<{ job_id: string }>('/generate/from-none', request.payload)
-              : request.kind === 'scene'
-                ? client.post<{ job_id: string }>('/generate/from-scene', {
-                scene_path: request.scenePath,
+              : request.kind === 'scene' || request.kind === 'capture' || request.kind === 'video'
+                ? client.post<{ job_id: string }>('/generate/from-artifact', {
+                input_kind: request.kind,
+                input_path: request.kind === 'scene' ? request.scenePath : request.kind === 'capture' ? request.capturePath : request.videoPath,
                 model_id: node.data.extensionId ?? '',
                 collection: 'Workflows',
                 remesh: 'none',
@@ -1633,16 +1703,6 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
                 texture_resolution: 1024,
                 params: request.params,
               })
-              : request.kind === 'video'
-                ? client.post<{ job_id: string }>('/generate/from-video', {
-                  video_path: request.videoPath,
-                  model_id: node.data.extensionId ?? '',
-                  collection: 'Workflows',
-                  remesh: 'none',
-                  enable_texture: false,
-                  texture_resolution: 1024,
-                  params: request.params,
-                })
                 : request.kind === 'image'
                   ? (async () => {
                     const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))

@@ -23,7 +23,21 @@ from urllib.parse import urlparse
 from services.generators.base import BaseGenerator
 from services.hf_download_assets import validate_hf_downloads
 from services.https_download_assets import validate_https_downloads
+from services.model_sources import (
+    model_sources_are_downloaded,
+    normalize_model_sources,
+    normalize_weight_groups,
+    normalize_weight_group_references,
+    resolve_model_root,
+    resolve_weight_group_root,
+    safe_owner_model_id,
+    safe_source_id,
+    validate_model_node_ids,
+    weight_group_sources_are_downloaded,
+)
 from services.extension_process import ExtensionProcess, _venv_python
+from services.download_check import validate_download_check
+from services.capture_input import _declared_input_type, _iter_declared_input_types
 
 # ------------------------------------------------------------------ #
 # Global paths
@@ -54,6 +68,7 @@ _MODEL_INPUT_KINDS = frozenset({
     "text",
     "mesh",
     "scene",
+    "capture",
     "audio",
     "video",
     "none",
@@ -63,6 +78,16 @@ _MODEL_INPUT_KINDS = frozenset({
 def normalize_model_input(value):
     return value
 
+
+
+def validate_model_node_video_shape(node: dict, *, context: str) -> None:
+    declared = node.get("inputs")
+    inputs = list(_iter_declared_input_types(node))
+    primary = _declared_input_type(node.get("input")) or "image"
+    if "video" in inputs and (declared is not None or primary != "video" or inputs != ["video"]):
+        raise ValueError(f'{context} must declare video as its single input field')
+    if primary == "video" and declared is not None:
+        raise ValueError(f'{context} must declare video as its single input field')
 
 def validate_model_input(value, context: str = "input") -> str:
     """Validate the invocation input declared by one model node."""
@@ -125,7 +150,36 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
             ext_id     = manifest["id"]
             class_name = manifest["generator_class"]
 
-            nodes = [n for n in manifest.get("nodes", []) if n.get("id")]
+            if "model_sources" in manifest:
+                raise ValueError("model_sources must be declared on a model node")
+
+            weight_groups = normalize_weight_groups(manifest)
+
+            raw_nodes = manifest.get("nodes", [])
+            if not isinstance(raw_nodes, list):
+                raise ValueError("nodes must be an array")
+            nodes = [n for n in raw_nodes if isinstance(n, dict) and n.get("id")]
+            uses_shared_weights = weight_groups is not None or any(
+                "weight_groups" in node for node in nodes
+            )
+            if uses_shared_weights or any("model_sources" in node for node in nodes):
+                validate_model_node_ids(raw_nodes)
+            group_by_id = {group["id"]: group for group in weight_groups or []}
+            for node in nodes:
+                node_id = safe_source_id(node.get("id"), "model node id")
+                validate_model_node_video_shape(node, context=f'model node "{node_id}"')
+                from services.capture_input import validate_typed_model_node_inputs
+                validate_typed_model_node_inputs(node)
+                normalize_weight_group_references(
+                    node,
+                    weight_groups,
+                    field_name=f"nodes[{node_id}].weight_groups",
+                )
+                if "weight_groups" in node and "hf_repo" in node:
+                    raise ValueError(
+                        f'model node "{node_id}" must use model_sources for private '
+                        "weights when weight_groups are declared"
+                    )
 
             # --- Subprocess mode (new): venv present → use ExtensionProcess ---
             # Also force subprocess mode for extensions that ship a build_vendor.py
@@ -148,13 +202,19 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
 
             legacy_paths_by_owner: Dict[str, list[str]] = {}
             for node in nodes:
-                owner_id = node.get("weight_owner_id") or node["id"]
+                owner_id = safe_source_id(node.get("weight_owner_id") or node["id"], "weight_owner_id")
                 weight_owner_id = f"{ext_id}/{owner_id}"
                 legacy_paths_by_owner.setdefault(weight_owner_id, []).append(f"{ext_id}/{node['id']}")
 
             if nodes:
                 for node in nodes:
-                    owner_id = node.get("weight_owner_id") or node["id"]
+                    model_sources = normalize_model_sources(node)
+                    group_ids = normalize_weight_group_references(
+                        node,
+                        weight_groups,
+                        field_name=f"nodes[{node['id']}].weight_groups",
+                    ) or []
+                    owner_id = safe_source_id(node.get("weight_owner_id") or node["id"], "weight_owner_id")
                     weight_owner_id = f"{ext_id}/{owner_id}"
                     legacy_paths = list(legacy_paths_by_owner.get(weight_owner_id, [f"{ext_id}/{node['id']}"]))
                     node_manifest = {
@@ -166,6 +226,7 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         "node_id":          node["id"],
                         "name":             node.get("name", node["id"]),
                         "hf_repo":          node.get("hf_repo", ""),
+                        "model_sources":    model_sources,
                         "hf_downloads":       validate_hf_downloads(
                             node["hf_downloads"],
                             context="{}/{}.hf_downloads".format(ext_id, node["id"]),
@@ -173,14 +234,19 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         "https_downloads":  node.get("https_downloads", []),
                         "download_check":   node.get("download_check", ""),
                         "hf_skip_prefixes": node.get("hf_skip_prefixes", []),
+                        "hf_include_prefixes": node.get("hf_include_prefixes", []),
                         "params_schema":    node.get("params_schema", []),
                         "input":            normalize_model_input(node.get("input", "image")),
+                        "inputs":           node.get("inputs"),
                         "output":           node.get("output", "mesh"),
+                        "weight_groups":    [group_by_id[group_id] for group_id in group_ids],
                         "weight_owner_id":  weight_owner_id,
                         "shared_owner":     len(legacy_paths) > 1,
                         "legacy_paths":     legacy_paths,
                     }
                     full_id = f"{ext_id}/{node['id']}"
+                    if model_sources is None:
+                        node_manifest.pop("model_sources", None)
                     result[full_id] = (cls_or_None, node_manifest, ext_dir)
                     if subprocess_mode:
                         if has_venv:
@@ -191,6 +257,9 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
                         print(f"[Registry] Loaded node: {full_id} ({class_name})")
             else:
                 # No nodes defined — register by ext_id as fallback
+                validate_model_node_video_shape(manifest, context=f'model extension "{ext_id}"')
+                from services.capture_input import validate_typed_model_node_inputs
+                validate_typed_model_node_inputs(manifest)
                 result[ext_id] = (cls_or_None, manifest, ext_dir)
                 if subprocess_mode:
                     if has_venv:
@@ -208,7 +277,13 @@ def _discover_extensions() -> Dict[str, Tuple[type, dict]]:
 
 def canonical_model_dir(models_dir: Path, manifest: dict) -> Path:
     owner_id = manifest.get("weight_owner_id") or manifest.get("id")
-    return models_dir / owner_id
+    if isinstance(owner_id, str) and owner_id.count("/") == 0:
+        model_id = manifest.get("id")
+        extension_id = manifest.get("bundle_id")
+        if not extension_id and isinstance(model_id, str) and "/" in model_id:
+            extension_id = model_id.split("/", 1)[0]
+        owner_id = f"{extension_id}/{owner_id}"
+    return resolve_model_root(models_dir, safe_owner_model_id(owner_id))
 
 
 def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
@@ -220,7 +295,7 @@ def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
     # first existing legacy alias in manifest order. We do NOT merge aliases or
     # move files automatically because that could delete valid shared weights.
     for legacy_path in manifest.get("legacy_paths", [manifest.get("id")]):
-        legacy_dir = models_dir / legacy_path
+        legacy_dir = resolve_model_root(models_dir, safe_owner_model_id(legacy_path, "legacy model path"))
         if legacy_dir == canonical_dir:
             continue
         if legacy_dir.exists():
@@ -230,7 +305,7 @@ def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
 
 
 def validate_download_plan_exclusivity(manifest: dict, model_id: str) -> None:
-    """Reject manifests whose effective source declarations are ambiguous."""
+    """Reject manifests whose source declarations would have ambiguous precedence."""
     kinds = []
     if "model_sources" in manifest:
         kinds.append("model_sources")
@@ -340,8 +415,18 @@ class GeneratorRegistry:
                     gen.hf_downloads      = manifest.get("hf_downloads", [])
                     gen.https_downloads   = manifest.get("https_downloads", [])
                     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
+                    gen.hf_include_prefixes = manifest.get("hf_include_prefixes", [])
                     gen.download_check   = manifest.get("download_check", "")
                     gen._params_schema   = manifest.get("params_schema", [])
+
+                gen.shared_model_dirs = {
+                    group["id"]: resolve_weight_group_root(
+                        MODELS_DIR,
+                        manifest.get("ext_id", model_id.split("/", 1)[0]),
+                        group["id"],
+                    )
+                    for group in manifest.get("weight_groups", [])
+                }
 
                 self._generators[model_id] = gen
                 self._manifests[model_id]  = manifest
@@ -398,15 +483,24 @@ class GeneratorRegistry:
     # Generator access
     # ------------------------------------------------------------------ #
 
-    def get_active(self) -> BaseGenerator:
-        """Returns the active generator. Downloads and loads if necessary."""
-        gen = self._sync_generator_model_dir(self._active_id)
+    def get_loaded(self, model_id: str) -> BaseGenerator:
+        """Returns the requested generator. Downloads and loads if necessary."""
+        gen = self._sync_generator_model_dir(model_id)
+        downloaded = self._is_downloaded(model_id, gen)
+        if (
+            "model_sources" in self._manifests[model_id]
+            or self._manifests[model_id].get("weight_groups")
+        ) and not downloaded:
+            raise RuntimeError(
+                "Model sources are incomplete. Download this node's shared and private weights "
+                "from the Modly Models page before generation."
+            )
         if not gen.is_loaded():
-            if not gen.is_downloaded():
-                gen.model_dir = self.canonical_model_dir(self._active_id)
+            if not downloaded:
+                gen.model_dir = self.canonical_model_dir(model_id)
                 if getattr(gen, "https_downloads", []):
                     raise RuntimeError(
-                        f"[{self._active_id}] Manifest-owned https_downloads "
+                        f"[{model_id}] Manifest-owned https_downloads "
                         "assets must be installed from the Models UI before "
                         "loading this model."
                     )
@@ -419,6 +513,10 @@ class GeneratorRegistry:
                     gen._auto_download()
             gen.load()
         return gen
+
+    def get_active(self) -> BaseGenerator:
+        """Returns the active generator. Downloads and loads if necessary."""
+        return self.get_loaded(self._active_id)
 
     def get_generator(self, model_id: str) -> BaseGenerator:
         if model_id not in self._generators:
@@ -452,6 +550,64 @@ class GeneratorRegistry:
             context=f"{model_id}.https_downloads",
         ) if plan else []
 
+    def get_model_sources_plan(self, model_id: str) -> list[dict]:
+        """Return the exact manifest-owned multi-source plan for a canonical model ID."""
+        manifest = self.get_manifest(model_id)
+        plan = manifest.get("model_sources", [])
+        return normalize_model_sources({"model_sources": plan}) if plan else []
+
+    def get_weight_group_sources_plan(
+        self, model_id: str, target_owner_id: str
+    ) -> tuple[Path, list[dict]]:
+        """Return a node-authorized shared group plan and its confined root."""
+        manifest = self.get_manifest(model_id)
+        parts = target_owner_id.split("/")
+        if len(parts) != 3 or parts[1] != "_shared":
+            raise ValueError("Shared target must be extension/_shared/group")
+        extension_id = manifest.get("ext_id", model_id.split("/", 1)[0])
+        if parts[0] != extension_id:
+            raise ValueError("Shared target belongs to another extension")
+        group = next(
+            (candidate for candidate in manifest.get("weight_groups", []) if candidate.get("id") == parts[2]),
+            None,
+        )
+        if group is None:
+            raise ValueError("Model node does not reference the requested weight group")
+        sources = normalize_model_sources(
+            {"model_sources": group.get("model_sources")},
+            field_name=f"weight_groups[{parts[2]}].model_sources",
+        )
+        if not sources:
+            raise ValueError("Weight group does not declare model sources")
+        return resolve_weight_group_root(MODELS_DIR, extension_id, parts[2]), sources
+
+    def get_legacy_hf_download_plan(self, model_id: str) -> dict:
+        """Return the exact manifest-owned legacy Hugging Face plan."""
+        manifest = self.get_manifest(model_id)
+        repo_id = manifest.get("hf_repo", "")
+        if repo_id in (None, ""):
+            return {}
+        if not isinstance(repo_id, str) or re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$", repo_id) is None:
+            raise ValueError(f"{model_id}.hf_repo must be a safe owner/repository ID")
+        if manifest.get("model_sources") or manifest.get("hf_downloads"):
+            return {}
+        skip = manifest.get("hf_skip_prefixes", [])
+        include = manifest.get("hf_include_prefixes", [])
+        for field, prefixes in (("hf_skip_prefixes", skip), ("hf_include_prefixes", include)):
+            if not isinstance(prefixes, list) or any(not isinstance(prefix, str) or not prefix.strip() or prefix != prefix.strip() for prefix in prefixes):
+                raise ValueError(f"{model_id}.{field} must be an array of non-empty strings")
+        download_check = manifest.get("download_check", "")
+        if download_check:
+            validate_download_check(download_check)
+        elif download_check not in ("", None):
+            raise ValueError(f"{model_id}.download_check must be a safe relative path")
+        return {
+            "repo_id": repo_id,
+            "download_check": download_check,
+            "hf_skip_prefixes": skip,
+            "hf_include_prefixes": include,
+        }
+
     def get_model_input(self, model_id: str) -> str:
         """Return the validated invocation input for a canonical model ID."""
         manifest = self.get_manifest(model_id)
@@ -476,16 +632,38 @@ class GeneratorRegistry:
     # Status
     # ------------------------------------------------------------------ #
 
-    def active_status(self) -> dict:
-        gen      = self._sync_generator_model_dir(self._active_id)
-        manifest = self._manifests[self._active_id]
+    def _is_downloaded(self, model_id: str, gen: BaseGenerator) -> bool:
+        manifest = self._manifests[model_id]
+        private_ready = True
+        if "model_sources" in manifest:
+            private_ready = model_sources_are_downloaded(
+                MODELS_DIR, manifest.get("weight_owner_id") or model_id, manifest["model_sources"]
+            )
+        shared_ready = all(
+            weight_group_sources_are_downloaded(
+                MODELS_DIR,
+                manifest.get("ext_id", model_id.split("/", 1)[0]),
+                group,
+            )
+            for group in manifest.get("weight_groups", [])
+        )
+        if "model_sources" in manifest or manifest.get("weight_groups"):
+            return private_ready and shared_ready
+        return gen.is_downloaded()
+
+    def model_status(self, model_id: str) -> dict:
+        gen      = self._sync_generator_model_dir(model_id)
+        manifest = self._manifests[model_id]
         return {
-            "id":         self._active_id,
+            "id":         model_id,
             "name":       manifest.get("name", gen.DISPLAY_NAME),
-            "input":      self.get_model_input(self._active_id),
-            "downloaded": gen.is_downloaded(),
+            "input":      self.get_model_input(model_id),
+            "downloaded": self._is_downloaded(model_id, gen),
             "loaded":     gen.is_loaded(),
         }
+
+    def active_status(self) -> dict:
+        return self.model_status(self._active_id)
 
     def all_status(self) -> list:
         result = []
@@ -501,7 +679,7 @@ class GeneratorRegistry:
                 "hf_repo":     manifest.get("hf_repo", ""),
                 "tags":        manifest.get("tags", []),
                 "input":       self.get_model_input(model_id),
-                "downloaded":  gen.is_downloaded(),
+                "downloaded":  self._is_downloaded(model_id, gen),
                 "loaded":      gen.is_loaded(),
                 "active":      model_id == self._active_id,
             })
@@ -580,6 +758,15 @@ class GeneratorRegistry:
             _self_module.MODELS_DIR = models_dir
             for model_id, gen in self._generators.items():
                 gen.model_dir = resolve_active_model_dir(models_dir, self._manifests[model_id])
+                manifest = self._manifests[model_id]
+                gen.shared_model_dirs = {
+                    group["id"]: resolve_weight_group_root(
+                        models_dir,
+                        manifest.get("ext_id", model_id.split("/", 1)[0]),
+                        group["id"],
+                    )
+                    for group in manifest.get("weight_groups", [])
+                }
 
         if workspace_dir is not None:
             workspace_dir.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,8 @@ import threading
 import time
 from pathlib import Path
 
+from services.capture_input import TypedModelInput
+from services.video_input import validate_video_input, video_snapshot_to_dict
 from services.extension_process import (
     ExtensionProcess,
     _RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS,
@@ -463,10 +465,17 @@ def test_extension_process_preserves_legacy_image_message(monkeypatch, tmp_path)
     assert "input" not in message
 
 
-def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tmp_path):
+def test_extension_process_sends_typed_video_snapshot_outside_params(monkeypatch, tmp_path):
+    import services.generator_registry as registry_module
+
+    workspace = tmp_path / "workspace"
+    video_path = workspace / "Workflows" / "Imported Videos" / "clip.mp4"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2")
+    path, snapshot = validate_video_input(workspace, "Workflows/Imported Videos/clip.mp4")
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace)
     process = ExtensionProcess(tmp_path, {"id": "demo/video", "input": "video"})
     sent: list[dict] = []
-    video_path = tmp_path / "clip.mp4"
 
     class RunningProc:
         def poll(self):
@@ -485,11 +494,11 @@ def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tm
         },
     )
 
-    process.generate(video_path, {"quality": "draft"})
+    process.generate(TypedModelInput("video", path, snapshot), {"quality": "draft"})
 
     message = sent[0]
     assert set(message) == {"action", "id", "input", "params", "outputs_dir"}
-    assert message["input"] == {"kind": "video", "path": str(video_path)}
+    assert message["input"] == {"kind": "video", "path": str(path), "snapshot": video_snapshot_to_dict(snapshot)}
     assert message["params"] == {"quality": "draft"}
     assert "path" not in message["params"]
     assert "image_b64" not in message

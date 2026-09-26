@@ -494,7 +494,6 @@ function CanvasCapture({
   const { gl } = useThree()
   useEffect(() => {
     domRef.current = gl.domElement
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- domRef is a stable ref
   }, [gl])
   return null
 }

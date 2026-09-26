@@ -27,11 +27,11 @@ function batch(snapshot: WorldProjectSnapshotV1, id: string): WorldCommandBatchV
   return { schema: WORLD_COMMAND_BATCH_SCHEMA, transactionId: id, projectId: snapshot.project.projectId,
     baseRevision: snapshot.project.revision, origin: 'ui', commands: [{ type: 'rename-project', name: id }] }
 }
-async function seed(repo: WorldProjectRepository) {
+async function seed(repo: WorldProjectRepository, count = 2) {
   const created = await repo.create({ name: 'Bridge', initialSceneName: 'Scene' })
   assert.equal(created.ok, true)
   let snapshot = created.value.snapshot
-  for (let index = 0; index < 2; index += 1) {
+  for (let index = 0; index < count; index += 1) {
     const applied = await repo.applyCommands({ projectKey, batch: batch(snapshot, `tx:seed-${index}`) })
     assert.equal(applied.ok, true)
     snapshot = applied.value.snapshot
@@ -279,8 +279,14 @@ test('new backup bridge owns proof bytes independently of awaited write buffers 
     const root = await mkdtemp(join(tmpdir(), `modly-bridge-buffer-${mutation}-`))
     t.after(() => rm(root, { recursive: true, force: true }))
     const stages: string[] = []
-    const repo = repository(root, { failureCheckpoint: (stage) => { stages.push(stage) } })
+    let armed = false, sourceHits = 0, priorHits = 0
+    const repo = repository(root, { failureCheckpoint: (stage) => { stages.push(stage) }, backupCostObserver: (record) => {
+      if (!armed || record.edge !== 'settled' || record.kind !== 'cache-hit') return
+      if (record.phase === 'prior-proof') priorHits += 1
+      if (record.phase === 'pack-ledger') sourceHits += 1
+    } })
     const snapshot = await seed(repo)
+    armed = true
     const request = batch(snapshot, `tx:buffer-${mutation}`)
     const target = newBackup(root, request)
     const before = await capturePrimary(root)
@@ -322,6 +328,8 @@ test('new backup bridge owns proof bytes independently of awaited write buffers 
       })
     } finally { restore() }
     assert.equal(mutated, 2)
+    assert.equal(priorHits, 2, 'Warm primary proofs precede the real source bridge')
+    assert.equal(sourceHits, 2, 'The packed source and primary tail reuse independent proof bytes before writing')
     assert.equal(measured.value.ok, mutation !== 'forged-destination')
     assert.equal(measured.first?.semantic, mutation === 'late-valid-destination' ? 0 : mutation === 'forged-destination' ? 1 : 2)
     if (!measured.value.ok) await assertUnpublished(root, before, stages)
@@ -420,8 +428,12 @@ test('new backup bridge invalidates irreversibly during awaited pack writes on r
     const firstRoot = join(root, 'first'), secondRoot = join(root, 'second')
     let workspace = firstRoot
     const stages: string[] = []
-    const repo = repository(firstRoot, { getWorkspaceRoot: () => workspace, failureCheckpoint: (stage) => { stages.push(stage) } })
-    const snapshot = await seed(repo)
+    let armed = false
+    const records: Array<{ invocation: number; phase: string; kind: string; edge: string }> = []
+    const repo = repository(firstRoot, { getWorkspaceRoot: () => workspace, failureCheckpoint: (stage) => { stages.push(stage) },
+      backupCostObserver: (record) => { if (armed) records.push(record) } })
+    const snapshot = await seed(repo, 3)
+    armed = true
     if (mutation === 'namespace') await cp(join(firstRoot, 'Worlds'), join(secondRoot, 'Worlds'), { recursive: true })
     const request = batch(snapshot, `tx:drift-${mutation}`)
     const target = newBackup(firstRoot, request)
@@ -473,8 +485,12 @@ test('new backup bridge invalidates irreversibly during awaited pack writes on r
       })
     } finally { restore(); resetRuntime() }
     assert.equal(injected, true)
+    const outer = records.filter((record) => record.invocation === records[0].invocation && record.edge === 'settled' && record.kind === 'cache-hit')
+    assert.equal(outer.filter((record) => record.phase === 'prior-proof').length, 3)
+    assert.equal(outer.filter((record) => record.phase === 'pack-ledger').length, 1,
+      'The first sealed packed source hits; the second packed receipt cannot reuse the invalidated lease')
     assert.equal(measured.value.ok, mutation === 'clone' || mutation === 'namespace')
-    if (measured.value.ok) assert.equal(measured.first?.semantic, 2, 'Both destination receipts replay after invalidation, even after runtime restoration')
+    if (measured.value.ok) assert.equal(measured.first?.semantic, 3, 'All destination receipts replay after invalidation, even after runtime restoration')
     else { assert.equal(measured.value.error.code, 'recovery_failed'); await assertUnpublished(firstRoot, before, stages) }
     assert.equal(ambientKeyCalls, 0, 'No logical-key encoding occurs in the polluted runtime')
     t.diagnostic(`${mutation}: first=${JSON.stringify(measured.first)}, total=${JSON.stringify(measured.total)}`)

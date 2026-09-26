@@ -573,6 +573,109 @@ function countFine(records: readonly FineBackupRecord[], kind: string): number {
   return records.filter((record) => record.edge === 'settled' && record.kind === kind).length
 }
 
+type SourceProofArguments = [Buffer, string, string, TestDurableTransaction,
+  { layout: string; backupRelativePath: string; indexSha256: string; packSha256: string; packByteLength: number; offset: number; length: number }, unknown]
+
+// Intercept the real operation-created capability, not a synthetic exported cache or verifier.
+function interceptPackedSource(repository: WorldProjectRepository, before: (args: SourceProofArguments) => void) {
+  const observable = repository as unknown as { createBackup: (...args: unknown[]) => Promise<unknown> }
+  const original = observable.createBackup
+  observable.createBackup = async function (...args) {
+    const scope = args[3] as { createBackupBridge: (...args: unknown[]) => { sourceScope: (...args: SourceProofArguments) => unknown } }
+    const create = scope.createBackupBridge
+    scope.createBackupBridge = function (...bridgeArgs) {
+      const bridge = create.apply(this, bridgeArgs)
+      if (bridge) bridge.sourceScope = new Proxy(bridge.sourceScope, { apply(target, receiver, sourceArgs: SourceProofArguments) {
+        before(sourceArgs)
+        return Reflect.apply(target, receiver, sourceArgs)
+      } })
+      return bridge
+    }
+    try { return await original.apply(this, args) } finally { scope.createBackupBridge = create }
+  }
+  return () => { observable.createBackup = original }
+}
+
+test('sealed packed source requires its exact authority and bytes after warm prior-proof hits', async (t) => {
+  for (const mutation of ['none', 'primary-backing-store', 'index', 'foreign-path', 'pack-hash', 'pack-length', 'offset', 'length', 'canonical', 'bytes'] as const) await t.test(mutation, async () => {
+    const root = await mkdtemp(join(tmpdir(), `modly-world-source-seal-${mutation}-`))
+    t.after(() => rm(root, { recursive: true, force: true }))
+    const records: FineBackupRecord[] = []
+    const primaryTransports: Buffer[] = []
+    const originalOpen = fsPromises.open
+    const restoreOpen = mutation === 'primary-backing-store' ? replaceBuiltinOpen((async (path, flags, mode) => {
+      const handle = await originalOpen(path, flags, mode)
+      if (!String(path).includes('/.modly/transactions/') || !String(path).endsWith('/result.v1.json') || flags === 'wx') return handle
+      return new Proxy(handle, { get(target, property) {
+        if (property === 'read') return async (buffer: Buffer, offset: number, length: number, position: number) => {
+          const result = await target.read(buffer, offset, length, position)
+          primaryTransports.push(buffer)
+          return result
+        }
+        const value = Reflect.get(target, property)
+        return typeof value === 'function' ? value.bind(target) : value
+      } })
+    }) as OpenFunction) : () => {}
+    t.after(restoreOpen)
+    const repository = createRepository(root, fineObserverOptions((record) => { records.push(record) }))
+    let snapshot = await seedFineBackup(repository)
+    for (let index = 1; index < 3; index += 1) {
+      const applied = await repository.applyCommands({ projectKey: PROJECT_KEY_A, batch: renameBatch(snapshot, `tx:source-seed-${index}`) })
+      assert.equal(applied.ok, true)
+      if (!applied.ok) return
+      snapshot = applied.value.snapshot
+    }
+    records.length = 0
+    let intercepted = 0
+    const restore = interceptPackedSource(repository, (args) => {
+      if (args[4].layout !== 'backup-pack' || intercepted++) return
+      assert.equal(countFine(records.filter((record) => record.phase === 'prior-proof'), 'cache-hit'), 3,
+        'The actual preceding stable verification hit all warm primary proofs before the sealed source call')
+      if (mutation === 'primary-backing-store') {
+        assert.ok(primaryTransports.length > 0, 'Retain actual read transports including original proof admissions')
+        for (const bytes of primaryTransports) new Uint8Array(bytes.buffer).fill(0x20)
+      }
+      args[4] = { ...args[4] }
+      if (mutation === 'index') args[4].indexSha256 = '0'.repeat(64)
+      if (mutation === 'foreign-path') args[4].backupRelativePath = `.modly/backups/2-${'a'.repeat(64)}`
+      if (mutation === 'pack-hash') args[4].packSha256 = '0'.repeat(64)
+      if (mutation === 'pack-length') args[4].packByteLength += 1
+      if (mutation === 'offset') args[4].offset += 1
+      if (mutation === 'length') args[4].length += 1
+      if (mutation === 'canonical') {
+        const batch: WorldCommandBatchV1 = JSON.parse(args[3].canonicalPayload)
+        batch.origin = 'workflow'
+        const payload = canonicalWorldCommandBatchPayload(batch)
+        args[3] = { ...args[3], canonicalPayload: payload, payloadSha256: sha256Bytes(payload),
+          transactionDigest: sha256Bytes(`${batch.transactionId}\n${payload}`) }
+      }
+      if (mutation === 'bytes') {
+        const changed = Buffer.from(args[0])
+        const offset = changed.indexOf('"newRevision":1')
+        assert.ok(offset >= 0)
+        changed[offset + '"newRevision":'.length] = '0'.charCodeAt(0)
+        assert.equal(changed.byteLength, args[0].byteLength)
+        assert.equal(changed.equals(args[0]), false)
+        args[0] = changed
+      }
+    })
+    let applied: Awaited<ReturnType<WorldProjectRepository['applyCommands']>>
+    try { applied = await repository.applyCommands({ projectKey: PROJECT_KEY_A, batch: renameBatch(snapshot, `tx:source-${mutation}`) }) }
+    finally { restore(); restoreOpen() }
+    assert.equal(applied.ok, true, 'Valid authority mismatches replay; corrupted source proof takes the unchanged full-primary fallback')
+    assert.equal(intercepted, mutation === 'bytes' ? 1 : 2, 'The real two-receipt packed overlap reached the source bridge')
+    const pack = records.filter((record) => record.phase === 'pack-ledger')
+    const exact = mutation === 'none' || mutation === 'primary-backing-store'
+    assert.equal(countFine(pack, 'cache-miss'), exact ? 0 : 1)
+    assert.equal(countFine(pack, 'cache-hit'), mutation === 'bytes' || exact ? 3 : 2)
+    assert.equal(countFine(pack, 'replay'), exact || mutation === 'bytes' ? 0 : 1)
+    if (applied.ok) {
+      assert.deepEqual(applied.value.inverse.snapshot, snapshot)
+      assert.deepEqual(assertOpened(await createRepository(root).open({ projectKey: PROJECT_KEY_A })).snapshot, applied.value.snapshot)
+    }
+  })
+})
+
 test('backup pack source reuses prior suffix for warm capped ledger and keeps self-contained hashes', { timeout: 180_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'modly-world-backup-source-incremental-'))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -852,7 +955,7 @@ test('publication retirement retains next-ledger primaries and independently cap
   assert.equal(measured.value.ok, true)
   if (!measured.value.ok) return
   t.diagnostic(`Publication structural counts, not timing: ${JSON.stringify({ counts: measured.counts, first: measured.firstBackup })}`)
-  assert.deepEqual(measured.counts, { semantic: 63, hash: 448 })
+  assert.deepEqual(measured.counts, { semantic: 1, hash: 448 })
   assert.deepEqual(measured.firstBackup, { semantic: 0, hash: 64 })
   assert.deepEqual(measured.value.value, expected)
   assert.equal(expected.newRevision, snapshot.project.revision + 1)
@@ -922,7 +1025,7 @@ test('publication retirement discards staged and settled bridge authority change
       assert.deepEqual(await readFile(statePath), stateBytes, 'No prior durable ledger was replaced')
     })
     assert.equal(retried.value.ok, true)
-    assert.deepEqual(retried.counts, { semantic: 63, hash: 544 }, 'Dirty survivor housekeeping retains its additional 96 fresh hashes')
+    assert.deepEqual(retried.counts, { semantic: 1, hash: 544 }, 'Dirty survivor housekeeping retains its additional 96 fresh hashes')
     // The old namespace remains warm despite local removal; every restored pack range is freshly hashed twice.
     assert.deepEqual(retried.firstBackup, { semantic: 0, hash: 64 }, 'Failed retirement never mutates the persistent old-backup authority')
     t.diagnostic(`${failStage} rollback structural counts, not timing: ${JSON.stringify({ total: retried.counts, oldBackup: retried.firstBackup })}`)
@@ -979,7 +1082,7 @@ test('publication retirement cannot revive after intrinsic drift is restored at 
     }))
     assert.equal(next.value.ok, true)
     if (!next.value.ok) return
-    assert.deepEqual(next.counts, { semantic: phase === 'cold' ? 127 : 63, hash: 448 }, 'Restoration starts a new cold lease, not old candidates')
+    assert.deepEqual(next.counts, { semantic: phase === 'cold' ? 65 : 1, hash: 448 }, 'Restoration starts a new cold lease, not old candidates')
     assert.deepEqual(next.firstBackup, { semantic: 0, hash: 64 })
     snapshot = next.value.value.snapshot
     rows.push({ phase, total: next.counts, first: next.firstBackup })
@@ -1794,7 +1897,7 @@ test('apply-local durable proof cache keeps newer namespace after overlapping wo
     }), 'ordinary')
     assert.equal(measured.value.ok, true)
     t.diagnostic(`Overlapping namespaces kept the newer hot cache: ${JSON.stringify(measured.counts)}`)
-    assert.deepEqual(measured.counts, { semantic: 2, hash: 29 })
+    assert.deepEqual(measured.counts, { semantic: 1, hash: 29 })
   } finally {
     releaseHeld()
     await firstPending.catch(() => undefined)
@@ -1914,6 +2017,40 @@ test('apply-local durable proofs evict real valid results within the byte budget
   assert.ok(measured.counts.semantic > 1 && measured.counts.semantic <= measured.counts.hash, 'Real eviction must force additional semantic verification, not invalidate commands')
   assert.deepEqual(measured.value.value.warnings, [])
   assert.deepEqual(assertOpened(await repository.open({ projectKey: PROJECT_KEY_A })).snapshot, measured.value.value.snapshot)
+})
+
+test('sealed packed source falls back under capture pressure after real warm primary hits', { timeout: 180_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'modly-world-source-pressure-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const records: FineBackupRecord[] = []
+  const repository = createRepository(root, fineObserverOptions((record) => { records.push(record) }))
+  let snapshot = await seedLargeProofScene(root, repository, 3, 525)
+  for (let index = 0; index < 5; index += 1) {
+    const result = await repository.applyCommands({ projectKey: PROJECT_KEY_A, batch: renameBatch(snapshot, `tx:source-pressure-${index}`) })
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    snapshot = result.value.snapshot
+  }
+  records.length = 0
+  const measured = await withNewBackupCoverage(repository, snapshot.project.revision, () => repository.applyCommands({
+    projectKey: PROJECT_KEY_A, batch: renameBatch(snapshot, 'tx:source-pressure-next'),
+  }))
+  assert.equal(measured.value.ok, true)
+  assert.equal(measured.counts.hash, 71)
+  assert.equal(measured.firstBackup.hash, 10)
+  assert.ok(countFine(records.filter((record) => record.phase === 'prior-proof'), 'cache-hit') > 0)
+  const lookups = records.filter((record) => record.phase === 'pack-ledger' && record.kind === 'proof-lookup' && record.edge === 'begin')
+  assert.equal(lookups.length, 5)
+  const packed = lookups.slice(0, 4).map((start) => {
+    const end = records.find((record) => record.span === start.span && record.edge === 'settled')!
+    const inside = records.filter((record) => record.sequence > start.sequence && record.sequence < end.sequence)
+    return { hit: countFine(inside, 'cache-hit'), miss: countFine(inside, 'cache-miss'), replay: countFine(inside, 'replay') }
+  })
+  assert.ok(packed.some((row) => row.hit === 1), 'A real sealed old-pack range reuses a warm primary proof')
+  assert.ok(packed.some((row) => row.miss === 1 && row.replay === 1), 'Another sealed old-pack range replays after capture pressure evicts its primary')
+  assert.ok(countFine(records.filter((record) => record.phase === 'pack-ledger'), 'cache-evict') > 0)
+  t.diagnostic(`Charged source/capture pressure, not timing: ${JSON.stringify({ packed, total: measured.counts })}`)
+  if (measured.value.ok) assert.deepEqual(assertOpened(await createRepository(root).open({ projectKey: PROJECT_KEY_A })).snapshot, measured.value.value.snapshot)
 })
 
 test('apply-local durable proof cache refreshes committed hit recency after success', { timeout: 180_000 }, async (t) => {
@@ -3453,7 +3590,7 @@ function assertFineGrammar(records: readonly FineBackupRecord[]) {
   if (terminalFault) assert.ok(terminalFault.sequence > rootSettlement!.sequence)
 }
 
-test('backup fine observer records mature H32/100entities original costs', { timeout: 170_000 }, async (t) => {
+test('backup fine observer reuses sealed source proofs for mature H32/100entities with unchanged physical work', { timeout: 170_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'modly-world-fine-mature-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const records: FineBackupRecord[] = []
@@ -3474,6 +3611,11 @@ test('backup fine observer records mature H32/100entities original costs', { tim
   assert.equal(count('file-sync'), 5)
   assert.equal(count('directory-sync'), 4)
   assert.equal(count('write-file'), 4)
+  for (const phase of ['prior-proof', 'pack-ledger']) {
+    const scoped = records.filter((record) => record.phase === phase)
+    assert.equal(countFine(scoped, 'cache-hit'), 32, `${phase}: all freshly read receipts reuse exact owned proofs`)
+    assert.equal(countFine(scoped, 'replay'), 0, `${phase}: no duplicate semantic replay`)
+  }
   const writes = settled.filter((record) => record.kind === 'write-positional')
   assert.equal(writes.length, 32)
   assert.deepEqual(writes.map((record) => record.ledgerIndex), Array.from({ length: 32 }, (_, index) => index))

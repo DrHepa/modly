@@ -200,7 +200,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
   }
   try {
     initialHead = git(['rev-parse', 'HEAD']).trim(); initialBranch = git(['branch', '--show-current']).trim()
-    if (initialHead !== '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
+    if (initialHead !== '416fcfa079aa3e569e8dd460c64c7462fac7850b' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
     const worldSculpt = worldSculptSource ? await readWorldSculptBuildInput(worldSculptSource.path, worldSculptSource.sha256) : null
     if (worldSculpt) {
       const bundledPath = path.join(outputDirectory, WORLD_SCULPT_BUNDLED_RELATIVE_PATH)
@@ -284,7 +284,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
     const repositoryAdmission = { schema: 'modly.worlds-authoring-repository-admission.v1', root: repositoryRoot, head: initialHead, branch: initialBranch }
     const manifest = {
       schema: 'modly.worlds-authoring-build.v1', scope: 'source-level-full-Workbench-native-authoring', execution: 'NOT_RUN', nativeMode,
-      ...(localAi ? { runtimeMode: 'local-ai', localAi, pythonIdentity, reviewedAiModel, aiAcceptance: 'NOT_RUN; two actual tool-query/proposal chats, native Reject/Apply and fresh geometry/disk witnesses required; operator tool-review acknowledgement is not runtime capability proof' } : {}),
+      ...(localAi ? { runtimeMode: 'local-ai', localAi, pythonIdentity, reviewedAiModel, aiAcceptance: 'NOT_RUN; one actual tool-query camera proposal, canonical direct auto-apply, native Undo/Redo and fresh camera Inspector/disk witnesses required; operator tool-review acknowledgement is not runtime capability proof' } : {}),
       ...(worldSculpt ? { runtimeMode: 'worldsculpt-navigation', worldSculptInput: { schema: 'modly.worlds-authoring-worldsculpt-input.v1', sourceIdentity: worldSculpt.sourceIdentity, bundled: { relativePath: WORLD_SCULPT_BUNDLED_RELATIVE_PATH, ...digest(worldSculpt.bytes) }, workspaceRelativePath: WORLD_SCULPT_WORKSPACE_RELATIVE_PATH }, worldSculptAcceptance: 'NOT_RUN; production-library add plus trusted native Inspect/Fly/Run evidence and fresh durable reopen required' } : {}),
       builtAt: new Date().toISOString(), repositoryRoot, repositoryAdmission, outputDirectory, initialHead, initialBranch, nodePath, electronPath, versions,
       outputs, sourceInputs: [...sources.values()].sort((a, b) => a.path.localeCompare(b.path)),

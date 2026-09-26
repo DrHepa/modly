@@ -12,7 +12,8 @@ export interface Invocation {
 export interface Shot { width: number; height: number; pixels: Buffer }
 export interface DriverPorts {
   seed: SeedEvidence
-  guard(): void
+  guard(contents?: WebContents): void
+  inputGuard(contents: WebContents): void
   applies(): readonly Invocation[]
   arm(entityId: string, baseRevision: number, sceneId?: string): void
   held(): boolean
@@ -30,6 +31,11 @@ export interface UiAuthoredBaseline {
   names: { a: string; b: string }; seed: SeedEvidence
 }
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+export function sendNativeInput(contents: WebContents, ports: CommonDriverPorts, event: Parameters<WebContents['sendInputEvent']>[0]): void {
+  // Every event, including releases, rechecks the exact focused owner synchronously.
+  ports.inputGuard(contents)
+  contents.sendInputEvent(event)
+}
 export function waitForOwnedWindowFocus(window: Pick<BrowserWindow, 'on' | 'removeListener' | 'isDestroyed' | 'isFocused'>, options: {
   deadline: number; signal: AbortSignal; assertOwned(): void
 }): Promise<{ focusedAt: string; observedBy: 'already-focused' | 'native-focus-event' }> {
@@ -101,17 +107,20 @@ export async function waitFor(contents: WebContents, ports: CommonDriverPorts, p
   const deadline = Date.now() + ms
   let last: AuthoringView | undefined
   while (Date.now() < deadline) {
-    ports.guard()
+    ports.guard(contents)
     // The observation capability is installed synchronously before the full Workbench mounts.
     const ready = await contents.executeJavaScript('typeof window.worldsAuthoringObserve === "function"', false)
-    if (ready) { last = await readView(contents); healthy(last, denied); if (predicate(last)) return last }
+    ports.guard(contents)
+    if (ready) { last = await readView(contents); ports.guard(contents); healthy(last, denied); if (predicate(last)) return last }
     await delay(40)
   }
   ports.record(`timeout-${label}`, last ?? null)
   throw new Error(`${label} was not reached within ${ms} ms`)
 }
 export async function paint(contents: WebContents, ports: CommonDriverPorts, denied = false): Promise<AuthoringView> {
+  ports.guard(contents)
   const before = await readView(contents)
+  ports.guard(contents)
   return waitFor(contents, ports, (value) => !!value.canvas && value.canvas.frame > (before.canvas?.frame ?? 0) + 1, 'actual-paint', 2000, denied)
 }
 interface NativeClickPointObservation {
@@ -134,7 +143,7 @@ export async function observeNativeClickPoint(contents: WebContents, kind: Nativ
     const matches = kind === 'ai-toggle' ? [...document.querySelectorAll('[aria-label="Worlds AI"] .worlds-ai-drawer__bar button[aria-controls="worlds-ai-content"]')]
       : kind === 'ai-prompt' ? [...prompt]
       : kind === 'ai-model' ? [...picker]
-      : kind === 'ai-option' ? (picker.length === 1 ? [...picker[0].parentElement.querySelectorAll(':scope > div > button')].filter(e => e.querySelector('span')?.textContent === name) : [])
+      : kind === 'ai-option' ? (picker.length === 1 ? [...picker[0].parentElement.querySelectorAll(':scope > div > button')].filter(e => e.querySelector('span')?.textContent?.trim() === 'Ollama · ' + name) : [])
       : kind === 'ai-thinking' ? (prompt.length === 1 && ['Thinking: auto', 'Thinking: on', 'Thinking: off'].includes(name)
         ? [...prompt[0].parentElement.querySelectorAll('button[title]')].filter(e => e.getAttribute('title') === name) : [])
       : kind === 'tree'
@@ -163,7 +172,7 @@ export async function click(contents: WebContents, ports: CommonDriverPorts, kin
   ports.guard()
   const point = await target(contents, kind, name)
   ports.record(`native-click-${name}`, { at: new Date().toISOString(), ...point })
-  contents.sendInputEvent({ type: 'mouseMove', ...point })
+  sendNativeInput(contents, ports, { type: 'mouseMove', ...point })
   await contents.executeJavaScript(`new Promise((resolve, reject) => {
     let firstFrame, secondFrame;
     const timer = setTimeout(() => {
@@ -177,8 +186,8 @@ export async function click(contents: WebContents, ports: CommonDriverPorts, kin
   ports.record(`native-click-hover-${name}`, { at: new Date().toISOString(), ...hovered })
   assertNativeClickPointStable(point, hovered, name)
   ports.guard()
-  contents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
-  contents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
 }
 function stableTransform(a: WorldTransform, b: WorldTransform, epsilon = 1e-8): void {
   for (const axis of ['position', 'rotation', 'scale'] as const) for (let i = 0; i < 3; i += 1) assert.ok(Math.abs(a[axis][i] - b[axis][i]) < epsilon, `${axis}[${i}] changed unexpectedly`)
@@ -322,16 +331,16 @@ async function down(contents: WebContents, ports: CommonDriverPorts, handle: Han
   }
   admission()
   assert.equal(captured.canvas?.gizmo?.enabled, true, 'Actual enabled native control is required; disabled noninteraction is not denial')
-  contents.sendInputEvent({ type: 'mouseMove', ...handle.start })
+  sendNativeInput(contents, ports, { type: 'mouseMove', ...handle.start })
   await paint(contents, ports, denied)
   const hovered = await waitFor(contents, ports, (view) => { admission(); return isNativeHandleHover(view, handle, id, captured) }, 'real-handle-hover', 1500, denied)
   ports.record('native-handle-fixed-point', { handle, canvas: hovered.canvas, trace: hovered.trace.find((item) => item.sequence === hovered.canvas?.gizmo?.pointerHit?.sequence) })
   admission()
-  contents.sendInputEvent({ type: 'mouseDown', ...handle.start, button: 'left', clickCount: 1 })
+  sendNativeInput(contents, ports, { type: 'mouseDown', ...handle.start, button: 'left', clickCount: 1 })
   markDown()
   await waitFor(contents, ports, (view) => view.canvas?.gizmo?.entityId === id && view.canvas.gizmo.dragging && view.canvas.gizmo.axis === handle.axis, 'real-handle-pointerdown', 1500, denied)
 }
-function up(contents: WebContents, handle: HandleCandidate): void { contents.sendInputEvent({ type: 'mouseUp', ...handle.end, button: 'left', clickCount: 1 }) }
+function up(contents: WebContents, ports: CommonDriverPorts, handle: HandleCandidate): void { sendNativeInput(contents, ports, { type: 'mouseUp', ...handle.end, button: 'left', clickCount: 1 }) }
 type PaintColor = 'red' | 'blue' | 'neutral'
 function colorCount(shot: Shot, bounds: Rect, color: PaintColor, exclude?: Rect): number {
   let count = 0
@@ -391,8 +400,8 @@ function appliesCompleted(ports: CommonDriverPorts, count: number, origin: strin
 
 export function key(contents: WebContents, ports: CommonDriverPorts, keyCode: string, modifiers: 'control'[] = []): void {
   ports.guard()
-  contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
-  contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
+  sendNativeInput(contents, ports, { type: 'keyDown', keyCode, modifiers })
+  sendNativeInput(contents, ports, { type: 'keyUp', keyCode, modifiers })
 }
 
 export async function selectValue(contents: WebContents, ports: CommonDriverPorts, name: string, value: string): Promise<void> {
@@ -424,7 +433,7 @@ async function numeric(contents: WebContents, ports: CommonDriverPorts, sceneId:
   const offset = ports.applies().length, label = `${field[0].toUpperCase()}${field.slice(1)}:${['X', 'Y', 'Z'][axis]}`
   await click(contents, ports, 'number', label)
   key(contents, ports, 'A', ['control'])
-  for (const character of String(input)) { ports.guard(); contents.sendInputEvent({ type: 'char', keyCode: character }) }
+  for (const character of String(input)) { ports.guard(); sendNativeInput(contents, ports, { type: 'char', keyCode: character }) }
   key(contents, ports, 'Return')
   view = await waitFor(contents, ports, (current) => isNativeNumericCommitSettled(current, before.project.revision + 1), `numeric-${sceneId}-${label}`, 12000)
   assertNativeNumericCommit(before, snapshot(view), sceneId, id, field, axis, value, appliesCompleted(ports, offset + 1, 'ui'))
@@ -558,7 +567,7 @@ export async function runAuthoringInteractions(initialContents: WebContents, por
     await down(contents, ports, handle, cId, view, () => { pointerDown = true })
     const previewSamples: AuthoringView[] = []
     for (let step = 1; step <= 8; step += 1) {
-      contents.sendInputEvent({ type: 'mouseMove', x: Math.round(handle.start.x + (handle.end.x - handle.start.x) * step / 8), y: Math.round(handle.start.y + (handle.end.y - handle.start.y) * step / 8), button: 'left', modifiers: ['leftbuttondown'] })
+      sendNativeInput(contents, ports, { type: 'mouseMove', x: Math.round(handle.start.x + (handle.end.x - handle.start.x) * step / 8), y: Math.round(handle.start.y + (handle.end.y - handle.start.y) * step / 8), button: 'left', modifiers: ['leftbuttondown'] })
       view = await paint(contents, ports)
       assert.deepEqual(snapshot(view), before, 'A pointer preview changed the canonical revision/document')
       assert.deepEqual(view.editor.session, beforeSession, 'Preview altered command history or receipts')
@@ -581,7 +590,7 @@ export async function runAuthoringInteractions(initialContents: WebContents, por
     await ports.pass('native-drag-preview')
 
     ports.stage('pending-selection-and-overlap-denial')
-    up(contents, handle); pointerDown = false
+    up(contents, ports, handle); pointerDown = false
     view = await waitFor(contents, ports, (value) => ports.held() && value.statuses.includes('Saving transform…'), 'held-production-transform')
     assert.equal(ports.applies().length, offset + 2)
     const held = ports.applies()[offset + 1]
@@ -625,7 +634,7 @@ export async function runAuthoringInteractions(initialContents: WebContents, por
     await down(contents, ports, overlap, ports.seed.bId, view, () => { pointerDown = true }, true, assertHeldPreview)
     const deniedSamples: AuthoringView[] = []
     for (let step = 1; step <= 3; step += 1) {
-      contents.sendInputEvent({ type: 'mouseMove', x: Math.round(overlap.start.x + (overlap.end.x - overlap.start.x) * step / 3), y: Math.round(overlap.start.y + (overlap.end.y - overlap.start.y) * step / 3), button: 'left', modifiers: ['leftbuttondown'] })
+      sendNativeInput(contents, ports, { type: 'mouseMove', x: Math.round(overlap.start.x + (overlap.end.x - overlap.start.x) * step / 3), y: Math.round(overlap.start.y + (overlap.end.y - overlap.start.y) * step / 3), button: 'left', modifiers: ['leftbuttondown'] })
       view = await paint(contents, ports, true)
       assert.deepEqual(view.editor.session, beforeSession); assert.equal(ports.applies().length, offset + 2); assert.ok(ports.held())
       assert.deepEqual(view.canvas!.camera, selectedPending.canvas!.camera)
@@ -633,7 +642,7 @@ export async function runAuthoringInteractions(initialContents: WebContents, por
       stableTransform(model(view, cId).transform, model(selectedPending, cId).transform)
       deniedSamples.push(view)
     }
-    up(contents, overlap); pointerDown = false
+    up(contents, ports, overlap); pointerDown = false
     view = await paint(contents, ports, true)
     assert.ok(view.alerts.includes('Wait for the current transform to finish.'), 'Overlap did not exercise the real admission denial')
     assert.deepEqual(view.editor.session, beforeSession); assert.equal(ports.applies().length, offset + 2)
@@ -724,6 +733,6 @@ export async function runAuthoringInteractions(initialContents: WebContents, por
   } finally {
     // Abort unforwarded IPC instead of accidentally saving after a failed assertion.
     ports.abort()
-    if (pointerDown && lastHandle && !contents.isDestroyed()) up(contents, lastHandle)
+    if (pointerDown && lastHandle && !contents.isDestroyed()) up(contents, ports, lastHandle)
   }
 }

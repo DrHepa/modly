@@ -25,6 +25,64 @@ export function parseReviewedAiModel(value: unknown): Readonly<ReviewedAiModel> 
   if (record.toolsReviewed !== true || parseLocalAiModels({ models: [{ name: record.name, digest: record.digest }] }).size !== 1) throw new Error('Explicit reviewed tool-capable model identity required')
   return Object.freeze({ name: record.name as string, digest: record.digest as string, toolsReviewed: true })
 }
+
+export function normalizeWorldsModelControlLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const match = /^(?:Ollama|OpenAI) · (.+?)(?: · (?:Not installed|Remote))?$/.exec(value.trim())
+  if (!match) return null
+  const model = match[1]
+  return model.length > 0 && model.length <= 200 && model.trim() === model && !/[\u0000-\u001f\u007f]/.test(model)
+    ? model
+    : null
+}
+
+function worldInspectorElement(node: Node | null): Element | null {
+  return node?.nodeType === 1 ? node as Element : null
+}
+
+function worldInspectorParent(node: Node | null): Node | null {
+  return node?.parentNode as Node | null
+}
+
+function worldInspectorAncestor(node: Node, predicate: (element: Element) => boolean): Element | null {
+  for (let current: Node | null = worldInspectorParent(node); current; current = worldInspectorParent(current)) {
+    const element = worldInspectorElement(current)
+    if (element && predicate(element)) return element
+  }
+  return null
+}
+
+function worldInspectorDirectChild(element: Element | null, predicate: (child: Element) => boolean): Element | null {
+  if (!element) return null
+  for (const node of Array.from(element.childNodes)) {
+    const child = worldInspectorElement(node)
+    if (child && predicate(child)) return child
+  }
+  return null
+}
+
+function worldInspectorDirectText(element: Element | null): string {
+  if (!element) return ''
+  return Array.from(element.childNodes)
+    .filter((node) => node.nodeType === 3)
+    .map((node) => node.textContent ?? '')
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Read-only fixture normalization for the production Inspector's nested unit markup. */
+export function worldInspectorNumberFieldLabel(input: Node): string {
+  const label = worldInspectorAncestor(input, (element) => element.tagName.toUpperCase() === 'LABEL')
+  const field = worldInspectorDirectText(worldInspectorDirectChild(label, (element) => element.tagName.toUpperCase() === 'SPAN'))
+  const fieldset = worldInspectorAncestor(input, (element) => element.tagName.toUpperCase() === 'FIELDSET')
+  const legend = worldInspectorDirectText(worldInspectorDirectChild(fieldset, (element) => element.tagName.toUpperCase() === 'LEGEND'))
+  const section = worldInspectorAncestor(input, (element) => element.tagName.toUpperCase() === 'SECTION'
+    && (element.getAttribute('class') ?? '').split(/\s+/).includes('worlds-inspector-section'))
+  const headingContainer = worldInspectorDirectChild(section, (element) => (element.getAttribute('class') ?? '').split(/\s+/).includes('worlds-inspector-section__heading'))
+  const heading = worldInspectorDirectText(worldInspectorDirectChild(headingContainer, (element) => element.tagName.toUpperCase() === 'H3'))
+  return `${legend || heading}:${field}`
+}
 export const LOCAL_AI_SESSION_METHODS = ['list', 'create', 'read', 'activate', 'appendMessage'] as const
 function aiRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw new Error('Invalid local-AI record')
@@ -252,7 +310,7 @@ export const CHECK_NAMES = [
   'native-redo', 'fresh-repository-and-renderer-reopen',
 ] as const
 export const UI_CHECK_NAMES = ['native-ui-project-and-both-scenes', 'native-numeric-authoring', 'native-both-scenes-reopen'] as const
-export const AI_CHECK_NAMES = ['actual-model-discovery', 'actual-ai-reject', 'actual-ai-apply-and-history', 'actual-ai-both-scenes-reopen'] as const
+export const AI_CHECK_NAMES = ['actual-model-discovery', 'actual-ai-camera-auto-apply-and-history', 'actual-ai-camera-reopen'] as const
 export const NAVIGATION_CHECK_NAMES = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation'] as const
 export type CheckName = typeof CHECK_NAMES[number] | typeof UI_CHECK_NAMES[number] | typeof AI_CHECK_NAMES[number] | typeof NAVIGATION_CHECK_NAMES[number]
 export interface Check { name: CheckName; status: 'UNREACHED' | 'PASS' | 'FAIL'; reason?: string }
@@ -365,6 +423,7 @@ export interface AiReviewObservation {
   selectedModel: string | null; modelOptions: string[]; busy: boolean; focused: boolean; status: string
   details: Array<{ entityName: string; property: string; before: string; after: string }>
   warnings: string[]; applyEnabled: boolean; rejectEnabled: boolean
+  manualControls: { apply: number; reject: number }
 }
 export interface AuthoringView {
   bootId: string; at: string; environment: { sandboxed: boolean; contextIsolated: boolean }

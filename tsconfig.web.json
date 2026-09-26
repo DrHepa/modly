@@ -21,6 +21,9 @@
   "include": ["src/**/*"],
   "exclude": [
     "src/areas/workflows/nodes/mesh-exporter",
-    "src/areas/workflows/nodes/mesh-optimizer"
+    "src/areas/workflows/nodes/mesh-optimizer",
+    "src/areas/worlds/components/WorldsWorkbench.diskWorkflow.test.ts",
+    "src/areas/worlds/components/WorldsWorkbench.playablePortalLoop.mounted.test.ts",
+    "src/areas/worlds/editor/worldEditorRepositoryIntegration.test.ts"
   ]
 }

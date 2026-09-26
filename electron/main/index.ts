@@ -9,11 +9,16 @@ import { initAutoUpdater } from './updater'
 import { syncBuiltinExtensions } from './builtin-sync'
 import { reconcileInterruptedExtensionInstalls } from './extension-install-recovery'
 import { getSettings } from './settings-store'
+import { installMainWindowNavigationGuard, resolveRendererDocumentUrl } from './worlds-cli-window-trust'
+
+const rendererHtmlPath = join(__dirname, '../renderer/index.html')
+const trustedRendererUrl = resolveRendererDocumentUrl(is.dev, process.env['ELECTRON_RENDERER_URL'], rendererHtmlPath)
 
 let mainWindow: BrowserWindow | null = null
 let pythonBridge: PythonBridge | null = null
 let automationHttpBridge: AutomationHttpBridge | null = null
 let ipcHandlersLifecycle: IpcHandlersLifecycle | null = null
+let ipcHandlersSetup: Promise<IpcHandlersLifecycle> | null = null
 let isQuitting = false
 
 // When the launching terminal closes, stdout/stderr become broken pipes and
@@ -71,11 +76,13 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
+  installMainWindowNavigationGuard(mainWindow.webContents, trustedRendererUrl)
+
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    mainWindow.loadURL(trustedRendererUrl)
     mainWindow.webContents.openDevTools()
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    mainWindow.loadFile(rendererHtmlPath)
   }
 }
 
@@ -120,7 +127,14 @@ app.whenReady().then(async () => {
   // Start Python FastAPI backend
   pythonBridge = new PythonBridge()
   pythonBridge.setWindowGetter(() => mainWindow)
-  ipcHandlersLifecycle = setupIpcHandlers(pythonBridge, () => mainWindow)
+  ipcHandlersSetup = setupIpcHandlers(pythonBridge, () => mainWindow, trustedRendererUrl)
+  const configuredIpcLifecycle = await ipcHandlersSetup
+  if (isQuitting) {
+    await configuredIpcLifecycle.shutdown()
+    return
+  }
+  ipcHandlersLifecycle = configuredIpcLifecycle
+  ipcHandlersSetup = null
   automationHttpBridge = new AutomationHttpBridge()
   void automationHttpBridge.start().catch((error) => {
     logger.warn(`Automation HTTP bridge failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
@@ -142,15 +156,18 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
-  if (isQuitting || (!pythonBridge && !automationHttpBridge && !ipcHandlersLifecycle)) return
+  if (isQuitting || (!pythonBridge && !automationHttpBridge && !ipcHandlersLifecycle && !ipcHandlersSetup)) return
 
   event.preventDefault()
 
   isQuitting = true
+  const ipcShutdown = ipcHandlersLifecycle
+    ? ipcHandlersLifecycle.shutdown()
+    : ipcHandlersSetup?.then((lifecycle) => lifecycle.shutdown())
 
   void Promise.allSettled([
-    ipcHandlersLifecycle?.shutdown().catch((error) => {
-      logger.warn(`Agent action lifecycle failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
+    ipcShutdown?.catch((error) => {
+      logger.warn(`IPC lifecycle failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
     }),
     automationHttpBridge?.stop().catch((error) => {
       logger.warn(`Automation HTTP bridge failed to stop cleanly: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
@@ -162,6 +179,7 @@ app.on('before-quit', (event) => {
     automationHttpBridge = null
     pythonBridge = null
     ipcHandlersLifecycle = null
+    ipcHandlersSetup = null
     app.quit()
   })
 })

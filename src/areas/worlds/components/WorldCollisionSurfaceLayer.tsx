@@ -1,5 +1,5 @@
 import { TransformControls } from '@react-three/drei'
-import { useEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
 import * as THREE from 'three'
 
 import { normalizeWorldCollisionSurface, type WorldCollisionRectGeometry, type WorldCollisionSurface, type WorldCollisionSurfaceTransform, type WorldCollisionSurfaceTuple2 } from '../worldsCollisionSurfaces.ts'
@@ -14,7 +14,7 @@ export interface WorldCollisionSurfaceLayerProps {
   transformMode: WorldsTransformMode | null
   onSelectSurface: (surfaceId: string) => void
   onTransformSurface: (surfaceId: string, transform: WorldCollisionSurfaceTransform) => void
-  draggingRef?: RefObject<boolean>
+  draggingRef?: MutableRefObject<boolean>
   onTransformDragEndSelectionBlock?: () => void
 }
 
@@ -272,7 +272,9 @@ export function WorldCollisionSurfaceLayer({
     resources: createWorldCollisionSurfaceRenderResources(surface),
   })), [layerModel.surfaces])
   const surfaceRootsRef = useRef(new Map<string, THREE.Group>())
+  const ownsDragRef = useRef(false)
   const [selectedRootObject, setSelectedRootObject] = useState<THREE.Group | null>(null)
+  const gizmoSurfaceId = layerModel.gizmoSurfaceId
 
   useEffect(() => {
     return () => {
@@ -289,6 +291,14 @@ export function WorldCollisionSurfaceLayer({
   useEffect(() => {
     setSelectedRootObject(layerModel.gizmoSurfaceId ? surfaceRootsRef.current.get(layerModel.gizmoSurfaceId) ?? null : null)
   }, [layerModel.gizmoSurfaceId, resources])
+
+  useEffect(() => {
+    return () => {
+      if (!ownsDragRef.current) return
+      ownsDragRef.current = false
+      if (draggingRef) draggingRef.current = false
+    }
+  }, [draggingRef, gizmoSurfaceId, selectedRootObject])
 
   if (layerModel.surfaces.length === 0) return null
 
@@ -330,7 +340,7 @@ export function WorldCollisionSurfaceLayer({
           </group>
         )
       })}
-      {layerModel.gizmoSurfaceId && selectedRootObject && layerModel.transformMode ? (
+      {gizmoSurfaceId && selectedRootObject && layerModel.transformMode ? (
         <TransformControls
           object={selectedRootObject}
           mode={layerModel.transformMode}
@@ -339,16 +349,18 @@ export function WorldCollisionSurfaceLayer({
           showY={layerModel.transformAxes.showY}
           showZ={layerModel.transformAxes.showZ}
           onMouseDown={() => {
+            ownsDragRef.current = true
             if (draggingRef) draggingRef.current = true
           }}
           onObjectChange={() => {
             if (transformMode === 'scale' && selectedRootObject) enforceWorldCollisionSurfacePlanarScale(selectedRootObject)
           }}
           onMouseUp={() => {
+            ownsDragRef.current = false
             if (draggingRef) draggingRef.current = false
             onTransformDragEndSelectionBlock?.()
             enforceWorldCollisionSurfacePlanarScale(selectedRootObject)
-            onTransformSurface(layerModel.gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform(selectedRootObject))
+            onTransformSurface(gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform(selectedRootObject))
           }}
         />
       ) : null}

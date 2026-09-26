@@ -4,6 +4,7 @@ import test from 'node:test'
 import * as THREE from 'three'
 
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import { updateWorldSceneItemTransforms, type WorldSceneItemTransformUpdate } from './worldsScenePlacement.ts'
 import {
   resolveWorldsBaseSceneSupportPlacement,
   resolveWorldsPendingSurfacePlacementDecision,
@@ -53,7 +54,7 @@ test('pending placement clears deterministically when downward query misses base
   assert.deepEqual(decision, { status: 'clear', transform: null, reason: 'no-hit' })
 })
 
-test('base support uses the nearest downward hit and preserves authored rotation on inclined terrain', () => {
+test('base support emits itemId updates consumed by scene transforms and preserves rotation on nearest support', () => {
   const pending = sceneItem('pending', 'asset', [0.1, 1.15, 0.2], [0.3, 0.4, 0.1])
   const nearBase = sceneItem('near-base', 'base-scene', [0, 1, 0])
   const farBase = sceneItem('far-base', 'base-scene', [0, 0, 0])
@@ -78,6 +79,14 @@ test('base support uses the nearest downward hit and preserves authored rotation
   })
 
   assert.equal(result.status, 'applied')
+  if (result.status !== 'applied') assert.fail('Expected applied base support')
+  const updates: WorldSceneItemTransformUpdate[] = result.updates
+  assert.equal(updates[0]!.itemId, pending.id)
+  assert.equal('id' in updates[0]!, false)
+  const updatedItems = updateWorldSceneItemTransforms([pending, nearBase, farBase], updates)
+  assert.deepEqual(updatedItems[0]!.transform, updates[0]!.transform)
+  assert.equal(updatedItems[1], nearBase)
+  assert.equal(updatedItems[2], farBase)
   assert.equal(result.sourceId, nearBase.id)
   assert.deepEqual(result.updates[0]!.transform.rotation, [0.3, 0.4, 0.1])
   assert.ok(Math.abs(result.correctionDelta[1]) > EPSILON)

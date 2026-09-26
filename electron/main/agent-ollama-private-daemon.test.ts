@@ -7,7 +7,9 @@ import test from 'node:test'
 
 import { openPinnedAgentExecutable, type AgentOwnedProcess } from './agent-owned-process.ts'
 import {
+  AGENT_PRIVATE_OLLAMA_MAX_READINESS_ATTEMPTS,
   AgentPrivateOllamaDaemonError,
+  _testOnlyWaitForAgentPrivateOllamaReadiness,
   buildAgentPrivateOllamaLaunch,
   normalizeAgentOllamaDigest,
   probeAgentPrivateOllamaDaemon,
@@ -16,6 +18,52 @@ import {
 import type { OpenAgentOllamaGpuDeviceAuthority } from './agent-ollama-gpu-device-authority.ts'
 import type { OpenVerifiedOllamaModel } from './agent-ollama-model-store.ts'
 import type { OpenAgentOllamaRuntimeTree } from './agent-ollama-runtime-tree.ts'
+
+let loopbackListenSupport: Promise<boolean> | undefined
+
+function listenOnLoopback(server: Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      server.off('listening', onListening)
+      server.off('error', onError)
+    }
+    const onListening = () => { cleanup(); resolve() }
+    const onError = (error: Error) => { cleanup(); reject(error) }
+    server.once('listening', onListening)
+    server.once('error', onError)
+    try {
+      server.listen(port, '127.0.0.1')
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
+  })
+}
+
+function closeListeningServer(server: Server): Promise<void> {
+  if (!server.listening) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve())
+  })
+}
+
+async function probeLoopbackListenSupport(): Promise<boolean> {
+  const server = createServer()
+  try {
+    await listenOnLoopback(server, 0)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EPERM' || code === 'EACCES') return false
+    throw error
+  } finally {
+    await closeListeningServer(server)
+  }
+}
+
+function canListenOnLoopback(): Promise<boolean> {
+  return loopbackListenSupport ??= probeLoopbackListenSupport()
+}
 
 function fakeModel(root: string): OpenVerifiedOllamaModel {
   let closed = false
@@ -238,6 +286,7 @@ test('Ollama readiness digest normalization accepts only exact lowercase SHA-256
 
 test('private Ollama daemon verifies version and exact alias before forwarding bounded Responses', async (t) => {
   if (process.platform !== 'linux') return t.skip('private Ollama daemon is Linux-only')
+  if (!await canListenOnLoopback()) return t.skip('IPv4 loopback listen is unavailable in this test environment')
   const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-test-'))
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
@@ -315,7 +364,7 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
         response.statusCode = 404
         response.end()
       })
-      await new Promise<void>((resolve) => server.listen(43124, '127.0.0.1', resolve))
+      await listenOnLoopback(server, 43124)
       return fakeOwned(server)
     },
   })
@@ -350,6 +399,7 @@ test('private Ollama daemon verifies version and exact alias before forwarding b
 
 test('private Ollama daemon retries a collided random loopback port without shared-daemon fallback', async (t) => {
   if (process.platform !== 'linux') return t.skip('private Ollama daemon is Linux-only')
+  if (!await canListenOnLoopback()) return t.skip('IPv4 loopback listen is unavailable in this test environment')
   const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-collision-'))
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
@@ -376,7 +426,7 @@ test('private Ollama daemon retries a collided random loopback port without shar
         else if (request.url === '/api/show') response.end('{"details":{"format":"gguf"}}')
         else { response.statusCode = 404; response.end('{}') }
       })
-      await new Promise<void>((resolve) => server.listen(43127, '127.0.0.1', resolve))
+      await listenOnLoopback(server, 43127)
       return fakeOwned(server)
     },
   })
@@ -415,8 +465,51 @@ test('private Ollama daemon fails closed on early non-zero exit', async (t) => {
   await rm(root, { recursive: true, force: true })
 })
 
+test('private Ollama readiness exhausts the production attempt cap under a deterministic backoff clock', async () => {
+  const readinessMs = 1_000_000
+  const delays: number[] = []
+  let now = 0
+  let requests = 0
+  let revalidations = 0
+  const owned: AgentOwnedProcess = {
+    pid: 12345,
+    stderr: '',
+    exited: new Promise(() => undefined),
+    revalidate: async () => { revalidations += 1 },
+    close: async () => undefined,
+  }
+
+  await assert.rejects(_testOnlyWaitForAgentPrivateOllamaReadiness({
+    process: owned,
+    endpoint: 'http://127.0.0.1:43129',
+    readinessMs,
+    signal: new AbortController().signal,
+    fetchImpl: async (input) => {
+      requests += 1
+      assert.equal(String(input), 'http://127.0.0.1:43129/api/version')
+      return new Response('{}', { status: 200 })
+    },
+  }, {
+    now: () => now,
+    delay: async (milliseconds, signal) => {
+      assert.equal(signal?.aborted, false)
+      delays.push(milliseconds)
+      now += milliseconds
+    },
+  }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'daemon_timeout')
+
+  assert.equal(requests, AGENT_PRIVATE_OLLAMA_MAX_READINESS_ATTEMPTS)
+  assert.equal(delays.length, AGENT_PRIVATE_OLLAMA_MAX_READINESS_ATTEMPTS)
+  assert.deepEqual(delays.slice(0, 5), [50, 100, 200, 400, 500])
+  assert.equal(delays.slice(5).every((milliseconds) => milliseconds === 500), true)
+  assert.equal(now, delays.reduce((total, milliseconds) => total + milliseconds, 0))
+  assert.equal(now < readinessMs, true, 'the attempt cap, not the synthetic deadline, must terminate readiness')
+  assert.equal(revalidations, 0)
+})
+
 test('private Ollama daemon bounds readiness and cleans every timed-out attempt', async (t) => {
   if (process.platform !== 'linux') return t.skip('private Ollama daemon is Linux-only')
+  const requestsPerRejectedReadinessAttempt = 2
   const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-timeout-'))
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const model = fakeModel(root)
@@ -454,7 +547,9 @@ test('private Ollama daemon bounds readiness and cleans every timed-out attempt'
       },
     }), (error: unknown) => error instanceof AgentPrivateOllamaDaemonError && error.code === 'daemon_timeout')
     assert.equal(closes, 3)
-    assert.equal(requests > 0 && requests <= 18, true, 'bounded backoff must prevent a hot-loop request storm')
+    assert.equal(requests > 0, true)
+    assert.equal(requests % requestsPerRejectedReadinessAttempt, 0)
+    t.diagnostic(`deadline-bounded readiness requests=${requests}`)
     assert.deepEqual(await readdir(root), [])
   } finally {
     await executable.close()
@@ -464,6 +559,7 @@ test('private Ollama daemon bounds readiness and cleans every timed-out attempt'
 
 test('private Ollama probe never mistakes a colliding shared endpoint for its owned daemon', async (t) => {
   if (process.platform !== 'linux') return t.skip('private Ollama daemon is Linux-only')
+  if (!await canListenOnLoopback()) return t.skip('IPv4 loopback listen is unavailable in this test environment')
   const root = await mkdtemp(join(tmpdir(), 'modly-private-ollama-decoy-'))
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'fake executable')
   const port = 43128
@@ -472,7 +568,7 @@ test('private Ollama probe never mistakes a colliding shared endpoint for its ow
     if (request.url === '/api/version') response.end('{"version":"0.32.5"}')
     else { response.statusCode = 404; response.end('{}') }
   })
-  await new Promise<void>((resolve) => decoy.listen(port, '127.0.0.1', resolve))
+  await listenOnLoopback(decoy, port)
   let closes = 0
   let probeArgs: readonly string[] = []
   try {
@@ -515,7 +611,7 @@ test('private Ollama probe never mistakes a colliding shared endpoint for its ow
     assert.equal(probeArgs.some((entry, index) => entry === '--proc' && probeArgs[index + 1] === '/proc'), true)
     assert.equal(probeArgs.some((entry, index) => entry === '--dev' && probeArgs[index + 1] === '/dev'), true)
   } finally {
-    await new Promise<void>((resolve) => decoy.close(() => resolve()))
+    await closeListeningServer(decoy)
     await executable.close()
     await rm(root, { recursive: true, force: true })
   }

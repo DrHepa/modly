@@ -6,7 +6,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { resolveSceneSourceManifest } from './workflowSceneSource'
-import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
+import { routeWorkflowOutputToWorlds } from './workflowWorldsOutput.ts'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import type { Workflow, WFNode, WFEdge, HumanoidDraftSidecarReadResult, HumanoidPromotionSidecarReadResult, RigMetaSidecarReadResult } from '@shared/types/electron.d'
@@ -1153,7 +1153,11 @@ async function executeExtensionNode(
     const worldsUrl = selectedOutput?.filePath ? toWorkspaceUrl(selectedOutput.filePath, workspaceDir) : undefined
     if (worldsUrl && targetType === 'addToWorldsNode') {
       const kind = selectedOutput?.outputType
-      await addWorkflowOutputUrlToWorlds(worldsUrl, isArtifactKind(kind) ? kind : undefined)
+      const outputKey = runEdgeOutputKey(ctx, edge)
+      await routeWorkflowOutputToWorlds(worldsUrl, isArtifactKind(kind) ? kind : undefined, {
+        runId: ctx.runId, sourceNodeId: edge.source, targetNodeId: edge.target,
+        artifactId: outputKey ? ctx.nodeArtifacts.get(outputKey)?.id : undefined,
+      })
       assertCurrentContext(ctx)
     }
   }
@@ -1196,7 +1200,12 @@ async function pushBranchSceneMesh(ctx: RunContext, waitId: string): Promise<voi
       : isSceneMeshOutput(sourceOutput) ? toWorkspaceUrl(sourceOutput.filePath, ctx.workspaceDir) : undefined
     if (url) {
       if (node.type === 'addToWorldsNode') {
-        await addWorkflowOutputUrlToWorlds(url, sourceOutput?.outputType)
+        const outputKey = runEdgeOutputKey(ctx, inEdge)
+        await routeWorkflowOutputToWorlds(url, isArtifactKind(sourceOutput?.outputType) ? sourceOutput.outputType : undefined, {
+          runId: ctx.runId, sourceNodeId: inEdge.source, targetNodeId: inEdge.target,
+          artifactId: outputKey ? ctx.nodeArtifacts.get(outputKey)?.id : undefined,
+        })
+        assertCurrentContext(ctx)
       } else {
         ctx.lastSceneMesh = url
         const outputKey = runEdgeOutputKey(ctx, inEdge)

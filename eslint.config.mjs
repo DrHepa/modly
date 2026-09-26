@@ -14,6 +14,10 @@ export default tseslint.config(
       'arch/**',
       'docs/**',
       '**/*.test.mjs',
+      '**/dist/**',
+      '**/out/**',
+      '**/node_modules/**',
+      'docs/worlds-engine-evidence/**',
       '**/*.d.ts',
       'electron/**/*.js',
       'src/**/*.js',
@@ -39,7 +43,8 @@ export default tseslint.config(
   },
   // Main / preload / scripts (Node environment)
   {
-    files: ['electron/**/*.{ts,mts,mjs}', 'scripts/**/*.{js,mjs,cjs}', 'tools/**/*.{ts,mjs}', 'electron.vite.config.ts'],
+    files: ['electron/**/*.{ts,mts,mjs}', 'scripts/**/*.{js,mjs,cjs,ts}', 'tools/**/*.{ts,mjs}', 'electron.vite.config.ts'],
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
     languageOptions: {
       globals: { ...globals.node }
     }

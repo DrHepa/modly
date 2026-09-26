@@ -30,16 +30,16 @@ const model: AgentOllamaModelSnapshotV1 = {
 
 const processor = String.raw`
 import { createHash } from 'node:crypto'
+import { readFileSync, writeSync } from 'node:fs'
 import { readFile, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
-const request = JSON.parse(await new Promise((resolve) => {
-  let value = ''
-  process.stdin.setEncoding('utf8')
-  process.stdin.on('data', (chunk) => { value += chunk })
-  process.stdin.on('end', () => resolve(value))
-}))
+const writeProtocolMessage = (message) => {
+  writeSync(1, Buffer.from(JSON.stringify(message) + '\n'))
+}
+
+const request = JSON.parse(readFileSync(0, 'utf8'))
 if (!process.argv[1]?.startsWith('/proc/self/fd/')) throw new Error('runtime was not launched from an inherited fd')
 if ('modelAccess' in request.trustedContext || 'socketPath' in request.trustedContext || 'bearerToken' in request.trustedContext || 'responsesPath' in request.trustedContext) throw new Error('model or network authority was exposed')
 if ('copyPath' in (request.trustedContext.inputArtifacts[0] ?? {})) throw new Error('copied input path was exposed')
@@ -66,7 +66,7 @@ if (mode === 'hang') {
   process.on('SIGTERM', () => process.exit(0))
   setInterval(() => {}, 1000)
 } else if (mode === 'log-flood') {
-  process.stdout.write(JSON.stringify({ type: 'log', message: 'x'.repeat(4096) }) + '\n')
+  writeProtocolMessage({ type: 'log', message: 'x'.repeat(4096) })
 } else if (mode.startsWith('terminal-error')) {
   const frame = {
     type: 'error', code: 'model_binding_unavailable',
@@ -76,11 +76,11 @@ if (mode === 'hang') {
   if (mode === 'terminal-error-code') frame.code = '../escape'
   if (mode === 'terminal-error-message') frame.message = 'unsafe\nmessage'
   if (mode === 'terminal-error-artifacts') frame.artifacts = []
-  process.stdout.write(JSON.stringify(frame) + '\n')
+  writeProtocolMessage(frame)
   if (mode === 'terminal-error-after') {
-    process.stdout.write(JSON.stringify({ type: 'log', message: 'must be rejected' }) + '\n')
+    writeProtocolMessage({ type: 'log', message: 'must be rejected' })
   }
-  if (mode === 'terminal-error-stderr') process.stderr.write('must be rejected')
+  if (mode === 'terminal-error-stderr') writeSync(2, Buffer.from('must be rejected'))
 } else {
   const plan = await descriptor('plan.md', 'plan', 'text/markdown', '# Plan\n' + inputText)
   const glb = await descriptor('model.glb', 'glb', 'model/gltf-binary', 'glTF')
@@ -97,11 +97,11 @@ if (mode === 'hang') {
     await unlink(join(out, 'model.glb'))
     await symlink(join(out, 'real.glb'), join(out, 'model.glb'))
   }
-  process.stdout.write(JSON.stringify({
+  writeProtocolMessage({
     schema: 'modly.agent-process-result.v1', type: 'result', artifacts: [plan, glb],
-  }) + '\n')
+  })
   if (mode === 'terminal-after') {
-    process.stdout.write(JSON.stringify({ type: 'log', message: 'must be rejected' }) + '\n')
+    writeProtocolMessage({ type: 'log', message: 'must be rejected' })
   }
 }
 `

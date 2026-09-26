@@ -66,7 +66,7 @@ export function updateWorldCollisionSurfaceTransform(
   surfaces: readonly WorldCollisionSurface[],
   surfaceId: string,
   transform: WorldCollisionSurfaceTransform,
-): WorldCollisionSurface[] {
+): readonly WorldCollisionSurface[] {
   let changed = false
   const nextSurfaces = surfaces.map((surface) => {
     if (surface.id !== surfaceId) return surface
@@ -85,7 +85,7 @@ export function updateWorldCollisionSurfaceRectGeometry(
   surfaces: readonly WorldCollisionSurface[],
   surfaceId: string,
   geometry: WorldCollisionRectGeometry,
-): WorldCollisionSurface[] {
+): readonly WorldCollisionSurface[] {
   let changed = false
   const nextSurfaces = surfaces.map((surface) => {
     if (surface.id !== surfaceId) return surface
@@ -93,6 +93,7 @@ export function updateWorldCollisionSurfaceRectGeometry(
 
     const normalized = normalizeWorldCollisionSurface({
       ...cloneWorldCollisionSurface(surface),
+      shape: surface.shape,
       geometry: {
         halfWidth: geometry.halfWidth,
         halfHeight: geometry.halfHeight,
@@ -109,7 +110,7 @@ export function updateWorldCollisionSurfaceTriangleGeometry(
   surfaces: readonly WorldCollisionSurface[],
   surfaceId: string,
   vertices: WorldCollisionTriGeometry['vertices'],
-): WorldCollisionSurface[] {
+): readonly WorldCollisionSurface[] {
   let changed = false
   const nextSurfaces = surfaces.map((surface) => {
     if (surface.id !== surfaceId) return surface
@@ -117,8 +118,9 @@ export function updateWorldCollisionSurfaceTriangleGeometry(
 
     const normalized = normalizeWorldCollisionSurface({
       ...cloneWorldCollisionSurface(surface),
+      shape: surface.shape,
       geometry: {
-        vertices: vertices.map((vertex) => [...vertex]) as WorldCollisionTriGeometry['vertices'],
+        vertices,
       },
     })
     if (!normalized || normalized.shape !== 'tri') return surface

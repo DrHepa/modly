@@ -18,6 +18,13 @@ test('Add to Worlds is wired as a mesh terminal without changing Add to Scene', 
   assert.match(processExecutionSource, /node\.type === 'outputNode' \|\| node\.type === 'addToWorldsNode'/)
   assert.match(nodeBehaviorsSource, /outputNode:\s*\{\s*sceneOutput: true,\s*branchConsumer: true\s*\}/)
   assert.match(runStoreSource, /interface RunContext\s*\{[^}]*nodeOutputs:\s*Map<string, NodeOutput>[^}]*nodeMap:\s*Map<string, WFNode>/)
+  assert.match(nodeBehaviorsSource, /addToSceneNode:\s*\{[^}]*sceneOutput: true/ )
+  assert.match(runStoreSource, /targetType === 'addToWorldsNode'/)
+  assert.match(runStoreSource, /isSceneOutput\(targetType\)/)
+  assert.match(runStoreSource, /const runId = crypto\.randomUUID\(\)\s*const jobId = runId/)
+  assert.match(runStoreSource, /id:\s*jobId/)
+  assert.match(runStoreSource, /runId: ctx\.runId, sourceNodeId: inEdge\.source, targetNodeId: inEdge\.target/)
+  assert.match(runStoreSource, /artifactId: outputKey \? ctx\.nodeArtifacts\.get\(outputKey\)\?\.id : undefined/)
   assert.match(
     runStoreSource,
     /for \(const edge of workflow\.edges\.filter\(\(candidate\) => candidate\.source === node\.id\)\) \{\s*const targetType = nodeMap\.get\(edge\.target\)\?\.type\s*const selectedOutput = resolveSource\(edge\)/,
@@ -28,11 +35,13 @@ test('Add to Worlds is wired as a mesh terminal without changing Add to Scene', 
   )
   assert.match(
     runStoreSource,
-    /if \(worldsUrl && targetType === 'addToWorldsNode'\) \{\s*const kind = selectedOutput\?\.outputType\s*await addWorkflowOutputUrlToWorlds\(worldsUrl, isArtifactKind\(kind\) \? kind : undefined\)/,
+    /if \(worldsUrl && targetType === 'addToWorldsNode'\) \{\s*const kind = selectedOutput\?\.outputType\s*const outputKey = runEdgeOutputKey\(ctx, edge\)\s*await routeWorkflowOutputToWorlds\(worldsUrl, isArtifactKind\(kind\) \? kind : undefined, \{\s*runId: ctx\.runId, sourceNodeId: edge\.source, targetNodeId: edge\.target,\s*artifactId: outputKey \? ctx\.nodeArtifacts\.get\(outputKey\)\?\.id : undefined,\s*\}\)/,
   )
   const worldsOutputSource = await readFile(path.join(workflowsRoot, 'workflowWorldsOutput.ts'), 'utf8')
   assert.match(worldsOutputSource, /useAppStore\.getState\(\)\.apiUrl/)
   assert.match(worldsOutputSource, /libraryApi\.read\(\{ workspacePath \}\)/)
   assert.match(worldsOutputSource, /resolveWorldRenderable\(\{ workspacePath, apiUrl, .*plyKind/s)
+  assert.match(worldsOutputSource, /worldEditorCommandPort/)
+  assert.doesNotMatch(worldsOutputSource, /worldsSceneStore|useWorldsSceneStore/)
   assert.match(edgeColorsSource, /targetNodeType === 'outputNode' \|\| targetNodeType === 'addToWorldsNode'/)
 })

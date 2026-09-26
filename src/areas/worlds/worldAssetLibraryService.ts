@@ -3,8 +3,11 @@ import type {
   AssetLibraryListResult,
   AssetLibraryOpenRequest,
   AssetLibraryOpenResult,
+  AssetLibraryReadRequest,
+  AssetLibraryReadResult,
 } from '../../shared/types/assetLibrary.ts'
 import type { WorkspaceAssetLibraryEntry } from '../../shared/components/WorkspaceAssetLibrary.tsx'
+import { normalizeWorldWorkspacePath } from './core/worldDocuments.ts'
 import {
   resolveWorldRenderable,
   type WorldRenderable,
@@ -15,9 +18,18 @@ import { listAssetLibraryEntries, readAssetLibraryEntry, openAssetLibraryEntry }
 import { projectAssetLibraryEntry } from '../generate/assetLibraryProjection.ts'
 import { isSafeViewerWorkspaceRelativePath } from '../generate/viewerAssetTarget.ts'
 
-export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Gaussian PLY' | 'Scene manifest' | 'Pose clip' | 'Unsupported' | 'Unavailable'
+export type WorldAssetLibraryType = 'GLB model' | 'GLTF scene' | 'PLY mesh' | 'PLY points' | 'Gaussian PLY' | 'Scene manifest' | 'Pose clip' | 'Audio' | 'Unsupported' | 'Unavailable'
 
 export type WorldAssetLibraryRenderable =
+  | (WorkspaceAssetLibraryEntry & {
+      id: string
+      name: string
+      type: 'Audio'
+      openable: true
+      workspacePath: string
+      audio: true
+      audioFormat: 'wav' | 'mp3' | 'ogg' | 'flac'
+    })
   | (WorkspaceAssetLibraryEntry & {
       id: string
       name: string
@@ -51,6 +63,7 @@ export type WorldAssetLibraryRenderable =
       openable: false
       workspacePath: string
       reason: WorldUnsupportedReason
+      plyKind?: AssetLibraryEntry['plyKind']
     })
 
 export type WorldAssetLibraryListResult =
@@ -59,6 +72,10 @@ export type WorldAssetLibraryListResult =
 
 export type WorldAssetLibraryOpenResult =
   | { success: true; asset: WorldAssetLibraryRenderable }
+  | { success: false; error: string }
+
+export type WorldAssetLibraryAudioReadResult =
+  | { success: true; audio: { workspacePath: string; format: 'wav' | 'mp3' | 'ogg' | 'flac'; name: string } }
   | { success: false; error: string }
 
 export async function listWorldAssetLibraryRenderables(apiUrl: string): Promise<WorldAssetLibraryListResult> {
@@ -71,6 +88,13 @@ export async function openWorldAssetLibraryRenderable(request: AssetLibraryOpenR
   const read = typeof request?.workspacePath === 'string' && ['.ply', '.json'].includes(getExtension(request.workspacePath))
   const result = await (read ? readAssetLibraryEntry(request) : openAssetLibraryEntry(request))
   return projectWorldAssetLibraryOpenResult(result, apiUrl)
+}
+
+export function readWorldAssetLibraryAudio(request: AssetLibraryReadRequest): Promise<WorldAssetLibraryAudioReadResult> {
+  if (!isCanonicalSafeWorkspacePath(request.workspacePath) || request.sourceWorkspacePath) {
+    return Promise.reject(new Error('Unsafe workspace asset-library path.'))
+  }
+  return readAssetLibraryEntry(request).then((result) => projectWorldAssetLibraryAudioReadResult(result, request.workspacePath))
 }
 
 export function projectWorldAssetLibraryListResult(result: AssetLibraryListResult, apiUrl: string): WorldAssetLibraryListResult {
@@ -114,6 +138,11 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     displayName: name,
   }
 
+  const audioFormat = resolveAudioFormat(entry)
+  if (audioFormat && isCanonicalSafeWorkspacePath(entry.workspacePath)) {
+    return { ...baseEntry, type: 'Audio', openable: true, audio: true, audioFormat }
+  }
+
   if (entry.capability === 'scene-manifest' || entry.manifest?.capability === 'scene-manifest') {
     return {
       ...baseEntry,
@@ -121,6 +150,17 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
       type: 'Scene manifest',
       openable: true,
       sceneManifest: true,
+    }
+  }
+
+
+  if (renderable.openable) {
+    return {
+      ...baseEntry,
+      name,
+      type: describeRenderableType(renderable),
+      openable: true,
+      item: renderable.item,
     }
   }
 
@@ -155,16 +195,6 @@ function projectWorldAssetLibraryEntry(entry: AssetLibraryEntry, apiUrl: string)
     }
   }
 
-  if (renderable.openable) {
-    return {
-      ...baseEntry,
-      name,
-      type: describeRenderableType(renderable),
-      openable: true,
-      item: renderable.item,
-    }
-  }
-
   return {
     ...baseEntry,
     name,
@@ -178,7 +208,29 @@ function isWorldLibraryCandidate(entry: AssetLibraryEntry): boolean {
   if (entry.capability === 'generated-world' || entry.capability === 'scene-manifest' || entry.capability === 'mesh' || entry.capability === 'rigged-mesh' || entry.capability === 'animation-motion') {
     return true
   }
+  if (entry.previewKind === 'audio' && resolveAudioFormat(entry)) return true
   return ['.ply', '.glb', '.gltf', '.spz'].includes(getExtension(entry.workspacePath))
+}
+
+function projectWorldAssetLibraryAudioReadResult(result: AssetLibraryReadResult, requestedPath: string): WorldAssetLibraryAudioReadResult {
+  if (result.success !== true) return result
+  if (result.entry.workspacePath !== requestedPath || !isCanonicalSafeWorkspacePath(result.entry.workspacePath)) {
+    return { success: false, error: 'Workspace asset-library returned a mismatched or unsafe audio path.' }
+  }
+  const format = resolveAudioFormat(result.entry)
+  if (result.preview.kind !== 'audio' || !format || result.preview.audioKind !== format) {
+    return { success: false, error: 'Workspace asset-library entry is not compatible audio.' }
+  }
+  return {
+    success: true,
+    audio: { workspacePath: result.entry.workspacePath, format, name: resolveName(result.entry) },
+  }
+}
+
+function resolveAudioFormat(entry: AssetLibraryEntry): 'wav' | 'mp3' | 'ogg' | 'flac' | null {
+  if (entry.previewKind !== 'audio') return null
+  const extension = getExtension(entry.workspacePath).slice(1)
+  return extension === 'wav' || extension === 'mp3' || extension === 'ogg' || extension === 'flac' ? extension : null
 }
 
 function describeRenderableType(renderable: Extract<WorldRenderable, { openable: true }>): WorldAssetLibraryType {
@@ -216,6 +268,10 @@ function assertPlyHeader(value: unknown): void {
       && ['header-too-large', 'incomplete-header', 'invalid-header-encoding'].includes(value.reason)) return
   }
   throw new Error('Invalid asset library PLY header evidence.')
+}
+
+function isCanonicalSafeWorkspacePath(workspacePath: string): boolean {
+  return normalizeWorldWorkspacePath(workspacePath) === workspacePath
 }
 
 function getExtension(workspacePath: string): string {

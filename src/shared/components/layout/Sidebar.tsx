@@ -59,10 +59,14 @@ const NAV_ITEMS: { id: Page; label: string; icon: JSX.Element }[] = [
 ]
 
 export default function Sidebar(): JSX.Element {
-  const { currentPage, navigate } = useNavStore()
+  const { currentPage, navigate, navigationError, dismissNavigationError } = useNavStore()
 
   return (
     <aside className="flex flex-col w-14 bg-surface-500 border-r border-zinc-800 py-2">
+      {currentPage === 'worlds' && navigationError ? <div role="alert" className="fixed left-16 bottom-4 z-50 max-w-sm rounded border border-amber-500 bg-surface-500 p-3 text-sm text-white shadow-lg">
+        <p>{navigationError}</p>
+        <button type="button" className="mt-2 underline" onClick={dismissNavigationError}>Dismiss warning</button>
+      </div> : null}
       {NAV_ITEMS.map((item) => {
         const active = currentPage === item.id
         return (

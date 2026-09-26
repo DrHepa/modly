@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+IFS=$(printf '\040\011\012_')
+IFS=${IFS%_}
+
+[ "$#" -eq 0 ] \
+  || { printf '%s\n' 'World FFmpeg clean package does not accept arguments.' >&2; exit 2; }
+
+script_path=$0
+case "$script_path" in
+  /*) ;;
+  *) script_path=$PWD/$script_path ;;
+esac
+script_directory=${script_path%/*}
+CDPATH= cd -- "$script_directory"
+script_directory=$PWD
+
+linux_electron=$script_directory/../node_modules/electron/dist/electron
+darwin_electron=$script_directory/../node_modules/electron/dist/Electron.app/Contents/MacOS/Electron
+if [ -f "$linux_electron" ] && [ ! -e "$darwin_electron" ]; then
+  electron_executable=$linux_electron
+elif [ -f "$darwin_electron" ] && [ ! -e "$linux_electron" ]; then
+  electron_executable=$darwin_electron
+else
+  printf '%s\n' 'unsupported-target: pinned Electron runtime layout is unavailable or ambiguous.' >&2
+  exit 2
+fi
+[ -x "$electron_executable" ] \
+  || { printf '%s\n' 'The pinned Electron runtime is not executable.' >&2; exit 2; }
+bootstrap_script=$script_directory/world-ffmpeg-package-bootstrap.mjs
+[ -f "$bootstrap_script" ] \
+  || { printf '%s\n' 'The clean package bootstrap entry is unavailable.' >&2; exit 2; }
+
+# /usr/bin/env is the OS boundary. The first Node runtime is the repo-pinned
+# Electron 44 binary in run-as-Node mode and receives no ambient preload,
+# loader, shell-startup, PATH, or package-tool override authority.
+exec /usr/bin/env -i \
+  ELECTRON_RUN_AS_NODE=1 \
+  LANG=C \
+  LC_ALL=C \
+  TZ=UTC \
+  PATH=/usr/bin:/bin \
+  WORLD_FFMPEG_CLEAN_BOOTSTRAP=modly.world-ffmpeg-package-bootstrap.v1 \
+  WORLD_FFMPEG_BOOTSTRAP_EXECUTABLE="$electron_executable" \
+  WORLD_FFMPEG_BUILD_TRUST_FILE="${WORLD_FFMPEG_BUILD_TRUST_FILE-}" \
+  ELECTRON_BUILDER_CACHE="${ELECTRON_BUILDER_CACHE-}" \
+  "$electron_executable" "$bootstrap_script"

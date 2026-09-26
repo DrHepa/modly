@@ -56,11 +56,11 @@ const compatibleArtifact: KimodoMotionArtifact = {
   diagnostics: {
     runtimeStatus: 'completed',
     retargetStatus: 'completed',
-    animationMappingStatus: 'completed',
-    stabilizationStatus: 'completed',
     solverStatus: null,
     basisStatus: null,
     rootMotionStatus: null,
+    animationMappingStatus: 'completed',
+    stabilizationStatus: 'completed',
     visualQualityStatus: 'preview-only',
     sourceKind: 'kimodo-motion-json',
     mappingConfidence: 'manual',

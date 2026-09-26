@@ -54,18 +54,19 @@ export function raycastWorldsBaseScenePlacementSurface({
   const maxDistance = Number.isFinite(ray.maxDistance) && ray.maxDistance! > 0 ? ray.maxDistance! : Number.POSITIVE_INFINITY
   const raycaster = new THREE.Raycaster(origin, normalizedDirection, 0, maxDistance)
   const ignored = new Set(ignoredItemIds.filter((itemId) => typeof itemId === 'string' && itemId.length > 0))
-  let best: BaseSceneHitCandidate | null = null
+  const accumulator: { best: BaseSceneHitCandidate | null } = { best: null }
 
   for (const entry of roots) {
-    if (!entry?.root) continue
+    const root = entry?.root
+    if (!root) continue
     if (typeof entry.sourceId !== 'string' || entry.sourceId.length === 0) continue
     if (ignored.has(entry.sourceId)) continue
-    if (entry.root.visible === false) continue
+    if (root.visible === false) continue
 
-    entry.root.updateWorldMatrix(true, true)
-    entry.root.traverse((object) => {
+    root.updateWorldMatrix(true, true)
+    root.traverse((object) => {
       if (!isMeshLike(object)) return
-      if (visibilityPolicy === 'visible-only' && !isObjectVisibleInHierarchy(object, entry.root)) return
+      if (visibilityPolicy === 'visible-only' && !isObjectVisibleInHierarchy(object, root)) return
       if (object.userData.worldsSelectionHitbox === true) return
       if (object.userData.worldsSelectionSilhouette === true) return
       if (object.userData.worldsCollisionSurface === true) return
@@ -76,17 +77,19 @@ export function raycastWorldsBaseScenePlacementSurface({
       for (const intersection of intersections) {
         const candidate = buildHitCandidate(entry.sourceId, object, intersection, normalizedDirection)
         if (!candidate) continue
+        const best = accumulator.best
         if (
           !best
           || candidate.distance < best.distance - EPSILON
           || (Math.abs(candidate.distance - best.distance) <= EPSILON && candidate.sourceId < best.sourceId)
         ) {
-          best = candidate
+          accumulator.best = candidate
         }
       }
     })
   }
 
+  const best = accumulator.best
   if (!best) return null
   return {
     source: 'base-scene',

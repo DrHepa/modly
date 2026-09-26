@@ -58,6 +58,12 @@ if (!found) {
 }
 
 const [cmd, prefix] = found
+const cliTestsResult = spawnSync(cmd, [...prefix, '-m', 'unittest', 'discover', '-s', join(apiDir, '..', 'tools', 'modly-cli'), '-p', 'test*.py'], {
+  cwd: join(apiDir, '..'),
+  stdio: 'inherit',
+})
+const cliTestsStatus = childExitCode(cliTestsResult, 'Modly CLI unittest')
+if (cliTestsStatus !== 0) process.exit(cliTestsStatus)
 const unittestResult = spawnSync(cmd, [...prefix, '-m', 'unittest', 'discover', '-s', 'tests'], {
   cwd: apiDir,
   stdio: 'inherit',
@@ -71,6 +77,7 @@ const pytestResult = spawnSync(cmd, [
   'pytest',
   'tests/test_agent.py',
   'tests/test_agent_direct_actions.py',
+  'tests/test_agent_worlds.py',
   'tests/test_collection_safety.py',
   'tests/test_generation_inputs.py',
   'tests/test_video_generation.py',

@@ -136,7 +136,7 @@ export function updateWorldSceneItemTransforms(
   if (updatesById.size === 0) return sceneItems
 
   let changed = false
-  const nextItems = sceneItems.map((item) => {
+  const nextItems = sceneItems.map((item): WorldSceneItem => {
     const transform = updatesById.get(item.id)
     if (!transform) return item
     changed = true
@@ -296,7 +296,7 @@ export function updateWorldCollisionZoneTransform(
 ): WorldCollisionZone[] {
   const nextScale = transform.scale.map((component) => Math.max(component, 0.05)) as [number, number, number]
   let changed = false
-  const nextZones = collisionZones.map((zone) => {
+  const nextZones = collisionZones.map((zone): WorldCollisionZone => {
     if (zone.id !== zoneId) return zone
     changed = true
     return {

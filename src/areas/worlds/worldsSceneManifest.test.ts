@@ -201,7 +201,7 @@ test('buildWorldsSceneManifest writes an optional collision surface fragment wit
 
   const manifest = buildWorldsSceneManifest([sceneItem()], [rect!, tri!])
 
-  assert.equal(manifest.assets[0].collision, undefined)
+  assert.equal(Object.hasOwn(manifest.assets[0], 'collision'), false)
   assert.equal(manifest.collisionSurfaces?.schema, WORLDS_COLLISION_SURFACE_MANIFEST_SCHEMA)
   assert.deepEqual(manifest.collisionSurfaces?.surfaces, [
     {

@@ -68,6 +68,8 @@ export class PythonBridge {
         // llm_server.py keeps everything of the local LLM here: engine, GGUF models, logs, config.
         MODLY_LLM_DIR:          this.resolveAgentDir(),
         SELECTED_MODEL_ID:      process.env['SELECTED_MODEL_ID'] ?? '',
+        // Server-side only: renderer/settings/preload never receive the OpenAI key.
+        OPENAI_API_KEY:         process.env['OPENAI_API_KEY'] ?? '',
         HUGGING_FACE_HUB_TOKEN: this.resolveHfToken(),
         HF_TOKEN:               this.resolveHfToken(),
       },

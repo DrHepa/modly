@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 
 export type ThinkingMode = 'auto' | 'on' | 'off'
+export type WorldsAiProvider = 'ollama' | 'openai'
 
 export type ProviderId = 'local' | 'ollama' | 'openai' | 'anthropic' | 'mistral' | 'groq' | 'openrouter' | 'custom'
 
@@ -45,11 +46,15 @@ interface AgentSettings {
   localModel:      string                          // catalog id or custom:<file>
   external:        Partial<Record<ProviderId, ExternalConfig>>
   defaultThinking: ThinkingMode
+  worldsProvider: WorldsAiProvider
+  worldsOpenAiModel: string
 
   setProvider:        (provider: ProviderId)                        => void
   setLocalModel:      (model: string)                               => void
   setExternal:        (provider: ProviderId, cfg: ExternalConfig)   => void
   setDefaultThinking: (mode: ThinkingMode)                          => void
+  setWorldsProvider: (provider: WorldsAiProvider) => void
+  setWorldsOpenAiModel: (model: string) => void
 }
 
 // ─── Secure persistence ────────────────────────────────────────────────────────
@@ -118,11 +123,15 @@ export const useAgentStore = create<AgentSettings>()(
       localModel:      DEFAULT_LOCAL_MODEL,
       external:        {},
       defaultThinking: 'auto',
+      worldsProvider: 'ollama',
+      worldsOpenAiModel: 'gpt-5.1',
 
       setProvider:        (provider)       => set({ provider }),
       setLocalModel:      (model)          => set({ localModel: model }),
       setExternal:        (provider, cfg)  => set((s) => ({ external: { ...s.external, [provider]: cfg } })),
       setDefaultThinking: (mode)           => set({ defaultThinking: mode }),
+      setWorldsProvider: (provider) => set({ worldsProvider: provider }),
+      setWorldsOpenAiModel: (model) => set({ worldsOpenAiModel: model }),
     }),
     {
       name: 'modly-agent-settings',

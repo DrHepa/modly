@@ -1,4 +1,4 @@
-import type { SceneArtifactManifestInitialView, SceneArtifactManifestPreview, SceneArtifactManifestV1 } from '../../shared/types/artifacts'
+import type { SceneArtifactManifestInitialView, SceneArtifactManifestPreview, SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
 
 export const SCENE_MANIFEST_FILE_NAME = 'scene-manifest.json'
 

@@ -7,6 +7,20 @@ import { raycastWorldsBaseScenePlacementSurface } from './worldsBaseSceneRaycast
 
 const EPSILON = 1e-6
 
+test('null and undefined base roots are skipped without hiding a valid nearest hit', () => {
+  const root = createRootWithMesh(createTriangleMesh([
+    [0, 0, 0],
+    [2, 0, 0],
+    [0, 0, 2],
+  ]))
+  const hit = raycastWorldsBaseScenePlacementSurface({
+    ray: { origin: [0.25, 2, 0.25], direction: [0, -1, 0], maxDistance: 10 },
+    roots: [{ sourceId: 'missing', root: null }, { sourceId: 'loading', root: undefined }, { sourceId: 'floor', root }],
+  })
+  assert.equal(hit?.sourceId, 'floor')
+  assertVectorClose(hit!.point, [0.25, 0, 0.25])
+})
+
 test('horizontal mesh hit returns point normal and triangle', () => {
   const root = createRootWithMesh(createTriangleMesh([
     [0, 0, 0],

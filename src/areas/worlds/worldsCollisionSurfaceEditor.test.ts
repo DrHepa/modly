@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createWorldCollisionSurfacePreset } from './worldsCollisionSurfaces.ts'
+import { createWorldCollisionSurfacePreset, type WorldCollisionTriGeometry } from './worldsCollisionSurfaces.ts'
 import {
   addWorldCollisionSurface,
   createWorldCollisionSurfaceId,
@@ -40,7 +40,7 @@ test('collision surface editor adds each preset with optional anchor transform',
 test('collision surface editor updates transform and geometry immutably', () => {
   const rect = createWorldCollisionSurfacePreset('rectangle', { id: 'surface-1' })!
   const tri = createWorldCollisionSurfacePreset('triangle', { id: 'surface-2' })!
-  const surfaces = [rect, tri]
+  const surfaces = Object.freeze([rect, tri])
 
   const nextTransform = updateWorldCollisionSurfaceTransform(surfaces, 'surface-1', {
     position: [5, 6, 7],
@@ -104,7 +104,7 @@ test('collision surface editor duplicates with deterministic offset and unique i
 test('collision surface editor invalid updates fail safely', () => {
   const rect = createWorldCollisionSurfacePreset('rectangle', { id: 'surface-1' })!
   const tri = createWorldCollisionSurfacePreset('triangle', { id: 'surface-2' })!
-  const surfaces = [rect, tri]
+  const surfaces = Object.freeze([rect, tri])
 
   assert.equal(updateWorldCollisionSurfaceTransform(surfaces, 'missing', rect.transform), surfaces)
   assert.equal(updateWorldCollisionSurfaceTransform(surfaces, 'surface-1', {
@@ -116,4 +116,33 @@ test('collision surface editor invalid updates fail safely', () => {
   assert.equal(updateWorldCollisionSurfaceRectGeometry(surfaces, 'surface-1', { halfWidth: 0, halfHeight: 1 }), surfaces)
   assert.equal(updateWorldCollisionSurfaceTriangleGeometry(surfaces, 'surface-1', [[0, 0], [0, 1], [1, 0]]), surfaces)
   assert.equal(updateWorldCollisionSurfaceTriangleGeometry(surfaces, 'surface-2', [[0, 0], [1, 1], [2, 2]]), surfaces)
+})
+
+test('triangle geometry updates reject an invalid extra vertex without changing frozen surface identity', () => {
+  const triangle = createWorldCollisionSurfacePreset('triangle', { id: 'triangle-1' })
+  assert.ok(triangle)
+  const surfaces = Object.freeze([triangle])
+  const vertices: WorldCollisionTriGeometry['vertices'] = [[0, 0], [0, 1], [1, 0]]
+  vertices.push([Number.NaN, 1])
+
+  assert.equal(updateWorldCollisionSurfaceTriangleGeometry(surfaces, 'triangle-1', vertices), surfaces)
+})
+
+test('triangle geometry updates clone valid vertices without aliasing caller input', () => {
+  const triangle = createWorldCollisionSurfacePreset('triangle', { id: 'triangle-1' })
+  assert.ok(triangle?.shape === 'tri')
+  const surfaces = Object.freeze([triangle])
+  const vertices: WorldCollisionTriGeometry['vertices'] = [[0, 0], [0, 1], [1, 0]]
+  const updated = updateWorldCollisionSurfaceTriangleGeometry(surfaces, 'triangle-1', vertices)
+  const surface = updated[0]
+
+  assert.notEqual(updated, surfaces)
+  assert.ok(surface?.shape === 'tri')
+  assert.notEqual(surface.geometry.vertices, vertices)
+  for (let index = 0; index < vertices.length; index += 1) {
+    assert.notEqual(surface.geometry.vertices[index], vertices[index])
+  }
+  vertices[0][0] = 99
+  assert.deepEqual(surface.geometry.vertices, [[0, 0], [0, 1], [1, 0]])
+  assert.deepEqual(triangle.geometry.vertices, [[-0.5, -0.5], [-0.5, 0.5], [0.5, -0.5]])
 })

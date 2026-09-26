@@ -30,9 +30,21 @@ export function resolveViewerModelSource(
     }
   }
 
-  return target.kind === 'final'
-    ? { kind: target.kind, modelUrl: target.modelUrl, isCheckpointPreview: target.isCheckpointPreview, label: target.label }
-    : { kind: target.kind, modelUrl: target.modelUrl, isCheckpointPreview: target.isCheckpointPreview, label: target.label }
+  if (target.kind === 'final') {
+    return {
+      kind: target.kind,
+      modelUrl: target.modelUrl,
+      isCheckpointPreview: target.isCheckpointPreview,
+      label: target.label,
+    }
+  }
+
+  return {
+    kind: target.kind,
+    modelUrl: target.modelUrl,
+    isCheckpointPreview: target.isCheckpointPreview,
+    label: target.label,
+  }
 }
 
 function isViewerAssetTarget(value: GenerationJob | ViewerAssetTarget | null): value is ViewerAssetTarget {

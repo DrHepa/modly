@@ -18,7 +18,7 @@ const PRIVATE_ALIAS = /^modly-private-[a-f0-9]{16,64}:latest$/
 const DEFAULT_READINESS_MS = 15_000
 const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_READINESS_BYTES = 1024 * 1024
-const MAX_READINESS_ATTEMPTS = 64
+export const AGENT_PRIVATE_OLLAMA_MAX_READINESS_ATTEMPTS = 64
 const RAW_SHA256 = /^[a-f0-9]{64}$/
 const PREFIXED_SHA256 = /^sha256:[a-f0-9]{64}$/
 const PRIVATE_RUNTIME_ROOT = '/run/modly-ollama-runtime'
@@ -340,7 +340,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-async function waitForReadiness(input: {
+type AgentPrivateOllamaReadinessInput = {
   process: AgentOwnedProcess
   endpoint: string
   alias?: string
@@ -348,21 +348,33 @@ async function waitForReadiness(input: {
   readinessMs: number
   signal: AbortSignal
   fetchImpl: typeof globalThis.fetch
-}): Promise<void> {
+}
+
+type AgentPrivateOllamaReadinessTiming = Readonly<{
+  now: () => number
+  delay: (milliseconds: number, signal?: AbortSignal) => Promise<void>
+}>
+
+async function waitForReadiness(
+  input: AgentPrivateOllamaReadinessInput,
+  timing?: AgentPrivateOllamaReadinessTiming,
+): Promise<void> {
+  const now = timing?.now ?? Date.now
+  const wait = timing?.delay ?? delay
   const approvedDigest = input.alias === undefined ? undefined : normalizeAgentOllamaDigest(input.digest)
   if (input.alias !== undefined && (!approvedDigest || approvedDigest !== input.digest)) {
     throw new AgentPrivateOllamaDaemonError('invalid_binding')
   }
-  const deadline = Date.now() + input.readinessMs
+  const deadline = now() + input.readinessMs
   let attempts = 0
   let backoffMs = 50
   let exited: { code: number | null, signal: NodeJS.Signals | null } | undefined
   void input.process.exited.then((value) => { exited = value })
-  while (Date.now() < deadline && attempts < MAX_READINESS_ATTEMPTS && !input.signal.aborted) {
+  while (now() < deadline && attempts < AGENT_PRIVATE_OLLAMA_MAX_READINESS_ATTEMPTS && !input.signal.aborted) {
     attempts += 1
     if (exited) throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
     const attempt = new AbortController()
-    const timeout = setTimeout(() => attempt.abort(), Math.min(500, Math.max(1, deadline - Date.now())))
+    const timeout = setTimeout(() => attempt.abort(), Math.min(500, Math.max(1, deadline - now())))
     timeout.unref()
     try {
       const version = await fetchJson(input.fetchImpl, input.endpoint, '/api/version', { signal: attempt.signal }, MAX_READINESS_BYTES)
@@ -402,12 +414,19 @@ async function waitForReadiness(input: {
     } finally {
       clearTimeout(timeout)
     }
-    const remaining = deadline - Date.now()
-    if (remaining > 0) await delay(Math.min(backoffMs, remaining), input.signal).catch(() => undefined)
+    const remaining = deadline - now()
+    if (remaining > 0) await wait(Math.min(backoffMs, remaining), input.signal).catch(() => undefined)
     backoffMs = Math.min(backoffMs * 2, 500)
   }
   if (input.signal.aborted) throw new AgentPrivateOllamaDaemonError('daemon_unavailable')
   throw new AgentPrivateOllamaDaemonError('daemon_timeout')
+}
+
+export function _testOnlyWaitForAgentPrivateOllamaReadiness(
+  input: AgentPrivateOllamaReadinessInput,
+  timing: AgentPrivateOllamaReadinessTiming,
+): Promise<void> {
+  return waitForReadiness(input, timing)
 }
 
 async function createAliasManifest(root: string, bytes: Buffer): Promise<{

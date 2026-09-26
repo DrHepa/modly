@@ -19,7 +19,7 @@ import type { RigMetaNamingMap } from './rigMetaNaming.ts'
 import type { RigRenamePlan } from './rigRenamePlan.ts'
 import { collectRigSkeletonBinding, translateKimodoTargetTracks, type RigSkeletonSummary } from './rigSkeleton.ts'
 
-const rigSummary: RigSkeletonSummary = {
+const rigSummary: RigSkeletonSummary & { sourceWorkspacePath: string } = {
   hasRig: true,
   sourceWorkspacePath: 'Workflows/generated/hero.glb',
   skeletonContextId: 'rig:Hero|skeleton:0',

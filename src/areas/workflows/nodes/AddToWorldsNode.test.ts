@@ -108,7 +108,9 @@ test('workflow Worlds output source resolves PLY through the library boundary be
   const source = await readFile(path.join(import.meta.dirname, '../workflowWorldsOutput.ts'), 'utf8')
   assert.match(source, /libraryApi\.read\(\{ workspacePath \}\)/)
   assert.match(source, /resolveWorldRenderable\(\{ workspacePath, apiUrl, .*plyKind/s)
-  assert.match(source, /pendingSurfacePlacementItemId: shouldPendingWorldsSurfacePlacement\(sceneState\.sceneItems, renderable\.item\)/)
+  assert.match(source, /legacyWorldsCommandBridge/)
+  assert.match(source, /worldEditorCommandPort/)
+  assert.doesNotMatch(source, /worldsSceneStore|useWorldsSceneStore/)
 })
 
 

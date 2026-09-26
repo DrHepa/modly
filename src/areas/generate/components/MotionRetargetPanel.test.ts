@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import type { MotionRetargetPanelMappingRow } from './MotionRetargetPanel'
 
 const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
@@ -697,7 +698,7 @@ test('MotionRetargetPanel target selection routes sourceBoneId and target RigBon
 
 test('MotionRetargetPanel mapping rows expose role and chain hints instead of only raw source labels', async () => {
   await withMotionRetargetPanelModule((module) => {
-    const rows = module.resolveMotionRetargetPanelMappingRows({
+    const rows: MotionRetargetPanelMappingRow[] = module.resolveMotionRetargetPanelMappingRows({
       ...motionSession,
       sourceBones: [
         { sourceBoneId: 'source:left-hand', label: 'Left Hand', rawLabel: 'L_Wrist_JNT', path: ['Root', 'L_Wrist_JNT'], role: 'left_hand', chain: 'left_arm' },

@@ -93,6 +93,7 @@ export function normalizeWorldCollisionSurface(surface: WorldCollisionSurface): 
 
   const preset = surface.preset
   if (preset && !isSurfacePreset(preset)) return null
+  if (preset && !isWorldCollisionSurfacePresetCompatibleWithShape(preset, surface.shape)) return null
 
   const label = typeof surface.label === 'string' && surface.label.trim().length > 0 ? surface.label.trim() : undefined
   const transform: WorldCollisionSurfaceTransform = {
@@ -142,6 +143,24 @@ export function isValidWorldCollisionSurface(surface: WorldCollisionSurface): bo
   return normalizeWorldCollisionSurface(surface) !== null
 }
 
+export function isWorldCollisionSurfacePresetCompatibleWithShape(
+  preset: WorldCollisionSurfacePreset,
+  shape: WorldCollisionSurfaceShape,
+): boolean {
+  return shape === 'rect'
+    ? preset === 'rectangle' || preset === 'square' || preset === 'wall' || preset === 'floor' || preset === 'ramp'
+    : preset === 'triangle'
+}
+
+export type WorldCollisionSurfacePresetDefinition = {
+  label: string
+  sidedness: WorldCollisionSurfaceSidedness
+  transform: WorldCollisionSurfaceTransform
+} & (
+  | { shape: 'rect'; geometry: WorldCollisionRectGeometry }
+  | { shape: 'tri'; geometry: WorldCollisionTriGeometry }
+)
+
 export function createWorldCollisionSurfacePreset(
   preset: WorldCollisionSurfacePreset,
   options: {
@@ -184,13 +203,7 @@ export function createWorldCollisionSurfacePreset(
 
 export function getWorldCollisionSurfacePresetDefinition(
   preset: WorldCollisionSurfacePreset,
-): {
-  label: string
-  sidedness: WorldCollisionSurfaceSidedness
-  transform: WorldCollisionSurfaceTransform
-  shape: WorldCollisionSurfaceShape
-  geometry: WorldCollisionRectGeometry | WorldCollisionTriGeometry
-} {
+): WorldCollisionSurfacePresetDefinition {
   switch (preset) {
     case 'rectangle':
       return {

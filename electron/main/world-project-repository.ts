@@ -148,6 +148,7 @@ interface DurableResultProofScope {
 interface NewBackupSemanticBridge {
   sourceScope: DurableResultProofScope
   destinationScope: DurableResultProofScope
+  sealSourcePlan(projectRoot: string, previous: LoadedReadyProject, plan: IncrementalBackupPackPlan): void
   sealDestination(indexSha256: string, packSha256: string, packByteLength: number): void
   discard(): void
 }
@@ -1616,6 +1617,7 @@ export class WorldProjectRepository {
           throw new RepositoryFault('recovery_failed', true)
         }
       }
+      if (incrementalPlan) bridge?.sealSourcePlan(projectRoot, previous, incrementalPlan)
       await rejectSymlinkIfPresent(packPath)
       const packHandle = await open(packPath, 'wx', 0o600)
       let packError: unknown
@@ -3422,8 +3424,12 @@ function createDurableResultProofCache(): DurableResultProofCache {
         let sealedIndexSha256: string | undefined
         let sealedPackSha256: string | undefined
         let sealedPackByteLength: number | undefined
+        let sourceAuthorities: Set<string> | undefined
+        let sourceAuthorityCharge = 0
         destroyBridge = () => {
           active = false
+          sourceAuthorities = undefined
+          sourceAuthorityCharge = 0
           sealedIndexSha256 = sealedPackSha256 = undefined
           sealedPackByteLength = undefined
           captured.clear()
@@ -3431,8 +3437,24 @@ function createDurableResultProofCache(): DurableResultProofCache {
           bridgeBytes = 0
         }
         const sourceScope = ((bytes, currentProjectKey, projectId, transaction, source, backupCost) => {
-          // Verify once at the ordinary source boundary; capture synchronously before any write await.
-          const chainProof = scope(bytes, currentProjectKey, projectId, transaction, source, backupCost)
+          let reused: DurableResultChainProof | undefined
+          if (active && usable() && source?.layout === 'backup-pack' && sourceAuthorities?.has(
+            JSON.stringify([...authority(currentProjectKey, projectId, transaction), source]),
+          )) {
+            const primaryKey = JSON.stringify([...authority(currentProjectKey, projectId, transaction), { layout: 'primary-legacy' }])
+            const primary = operationEntries.get(primaryKey)
+            // Only this validated old-pack plan may reuse exact independently owned primary bytes.
+            // The fresh range read/hash still precedes this synchronous check; no source proof is pinned.
+            if (primary?.sourceLayout === 'primary-legacy' && primary.bytes.byteLength === bytes.byteLength
+              && source.length === bytes.byteLength && primary.bytes.equals(bytes) && usable()) {
+              operationEntries.delete(primaryKey)
+              operationEntries.set(primaryKey, primary)
+              backupCost?.cache('cache-hit', bytes.byteLength)
+              reused = primary.proof
+            }
+          }
+          // Missing/evicted/ineligible authority still takes ordinary semantic verification.
+          const chainProof = reused ?? scope(bytes, currentProjectKey, projectId, transaction, source, backupCost)
           if (!active || !usable()) return chainProof
           // The writer appends these freshly verified receipts sequentially, including uncached ones.
           const offset = nextOffset
@@ -3452,7 +3474,7 @@ function createDurableResultProofCache(): DurableResultProofCache {
           backupCost?.cache('cache-admit', ownedBytes.byteLength)
           if (nextTransactionDigests && !nextTransactionDigests.has(transaction.transactionDigest) && usable()) {
             // Only an independently owned, admitted capture can retire its exact ordinary primary key.
-            const primaryKey = JSON.stringify([...authority(currentProjectKey, projectId, transaction), normalizeDurableProofSource(source)])
+            const primaryKey = JSON.stringify([...authority(currentProjectKey, projectId, transaction), { layout: 'primary-legacy' }])
             const primary = operationEntries.get(primaryKey)
             if (primary?.sourceLayout === 'primary-legacy' && primary.transactionDigest === transaction.transactionDigest) {
               backupCost?.cache('cache-evict', primary.bytes.byteLength)
@@ -3511,11 +3533,29 @@ function createDurableResultProofCache(): DurableResultProofCache {
         return {
           sourceScope,
           destinationScope,
+          sealSourcePlan(projectRoot, previous, plan) {
+            if (!active || !usable() || sourceAuthorities || nextOffset !== 0
+              || plan.overlapLength <= 0 || plan.overlapLength > WORLD_PROJECT_TRANSACTION_LEDGER_LIMIT) return
+            // Called only after index/state validation and whole-pack hashing/settlement. Retain
+            // bounded charged primitive identities, not the mutable plan, bytes, or chain proofs.
+            const keys = previous.state.transactions.slice(0, plan.overlapLength).map((transaction) =>
+              JSON.stringify([...authority(previous.projectKey, previous.state.projectId, transaction),
+                packedProofAuthority(projectRoot, plan.backupRoot, plan.packed, transaction)]))
+            const charge = DURABLE_PROOF_METADATA_CHARGE
+              + keys.reduce((total, key) => total + key.length * 2 + DURABLE_PROOF_METADATA_CHARGE, 0)
+            if (charge > DURABLE_PROOF_BYTE_LIMIT || !makeRoom(charge)) return
+            sourceAuthorities = new Set(keys)
+            sourceAuthorityCharge = charge
+            bridgeBytes += charge
+          },
           sealDestination(indexSha256, packSha256, packByteLength) {
             if (!active || !usable() || sealedIndexSha256 !== undefined || nextOffset !== packByteLength) {
               destroyBridge()
               return
             }
+            sourceAuthorities = undefined
+            bridgeBytes -= sourceAuthorityCharge
+            sourceAuthorityCharge = 0
             // Retain primitives only; no generated index object or I/O-owned buffer enters the seal.
             sealedIndexSha256 = indexSha256
             sealedPackSha256 = packSha256

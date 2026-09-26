@@ -433,7 +433,8 @@ async function numeric(contents: WebContents, ports: CommonDriverPorts, sceneId:
   return paint(contents, ports)
 }
 
-export async function runUiAuthoredScenes(contents: WebContents, ports: CommonDriverPorts): Promise<UiAuthoredBaseline> {
+export async function runUiAuthoredScenes(contents: WebContents, ports: CommonDriverPorts, additionalAssetCount = 0): Promise<UiAuthoredBaseline> {
+  assert.ok(Number.isSafeInteger(additionalAssetCount) && additionalAssetCount >= 0 && additionalAssetCount <= 1, 'Bounded additional asset count required')
   await waitFor(contents, ports, (view) => view.hostSetupComplete && view.editor.lifecycle === 'closed' && !view.editor.session, 'empty-native-Workbench')
   assert.equal(ports.applies().length, 0)
   await click(contents, ports, 'button', 'New World project')
@@ -456,7 +457,7 @@ export async function runUiAuthoredScenes(contents: WebContents, ports: CommonDr
     }
     const sceneId = view.editor.activeSceneId!, ids: string[] = [], names: string[] = []
     await click(contents, ports, 'button', 'Assets')
-    view = await waitFor(contents, ports, (current) => current.assetButtons.length === 2, 'actual-production-library-assets')
+    view = await waitFor(contents, ports, (current) => current.assetButtons.length === UI_ASSET_PATHS.length + additionalAssetCount, 'actual-production-library-assets')
     for (const [assetIndex, path] of UI_ASSET_PATHS.entries()) {
       const matches = view.assetButtons.filter((label) => label.includes(path.split('/').at(-1)!))
       assert.equal(matches.length, 1, 'Actual discoverable input must have one Assets action')

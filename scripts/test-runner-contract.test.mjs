@@ -584,8 +584,16 @@ test('node dispatch proof expects expanded authoring guard inventory instead of 
   assert.equal(actualTapNames.length, EXPECTED_AUTHORING_GUARD_TEST_COUNT)
   assert.equal(actualSpecNames.length, EXPECTED_AUTHORING_GUARD_TEST_COUNT)
   for (const name of REQUIRED_AUTHORING_GUARD_TEST_NAMES) assert.ok(actualSpecNames.includes(name), name)
+  for (const name of [
+    'WSNAV1 WorldSculpt navigation requires inherited display and excludes local AI',
+    'WSNAV2 WorldSculpt build input admission rejects aliases nonregular files and invalid GLB bytes',
+    'WSNAV3 WorldSculpt runtime contract exposes only one hash-bound private path',
+    'WSNAV4 native navigation terminal rejects untrusted input pointer lock GPU and cleanup failures',
+    'WSNAV5 renderer observation treats absent OrbitControls as pending without weakening navigation readiness',
+    'WSNAV6 durable witness replays actual v2 and retains exact v1 compatibility',
+  ]) assert.equal(REQUIRED_AUTHORING_GUARD_TEST_NAMES.filter((candidate) => candidate === name).length, 1, name)
   assert.throws(() => assertAuthoringGuardInventory(tap.replace('N4 both authored scenes', 'N4 stale authored scenes')))
-  assert.throws(() => assertAuthoringGuardInventory(REQUIRED_AUTHORING_GUARD_TEST_NAMES.map((name) => `✔ ${name} (1.0ms)`).join('\n')), /297/)
+  assert.throws(() => assertAuthoringGuardInventory(REQUIRED_AUTHORING_GUARD_TEST_NAMES.map((name) => `✔ ${name} (1.0ms)`).join('\n')), new RegExp(String(EXPECTED_AUTHORING_GUARD_TEST_COUNT)))
 
   const parentEnv = { PATH: '/bin', WORLD_AUTHORING_GUARD_TEST_ROOT: '/tmp/leaked-root' }
   const childEnv = createAuthoringGuardChildEnvironment(parentEnv)

@@ -1,5 +1,6 @@
 // Fixture guards only. Importing the native runner must never launch it.
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter, getEventListeners } from 'node:events'
 import test, { after } from 'node:test'
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
@@ -56,6 +57,436 @@ test('N2 preserves every inherited environment field and never creates display a
   assert.deepEqual(environment, { DISPLAY: ':1', XAUTHORITY: '/host/current/Xauthority', HOME: '/host/home', PATH: '/host/path', WAYLAND_DISPLAY: 'wayland-0', CUSTOM_HOST_SENTINEL: 'untouched' })
   assert.throws(() => inheritedDisplayEnvironment({}, '/tmp/fixture/run-a', 'a'.repeat(64)), /DISPLAY/)
   assert.throws(() => inheritedDisplayEnvironment({ DISPLAY: ':1', WORLD_AUTHORING_RUN_DIRECTORY: '/other' }, '/tmp/fixture/run-a', 'a'.repeat(64)), /reserved/)
+})
+
+test('WSNAV1 WorldSculpt navigation requires inherited display and excludes local AI', () => {
+  const sha = '9b299c9ae4f7ded566a7006a9e5b2fc046eeccbcf28ad8df4163580248db2725'
+  const source = '/tmp/reviewed-worldsculpt/scene.glb'
+  const buildArgs = [
+    '--build-only',
+    '--inherited-display',
+    '--worldsculpt-navigation',
+    `--worldsculpt-source=${source}`,
+    `--worldsculpt-sha256=${sha}`,
+  ]
+  assert.deepEqual(parseBuildArguments(buildArgs), {
+    buildOnly: true,
+    nativeMode: 'inherited-display',
+    runtimeMode: 'worldsculpt-navigation',
+    worldSculptSource: { path: source, sha256: sha },
+  })
+  const reviewed = `--reviewed-build-sha256=${'a'.repeat(64)}`
+  assert.deepEqual(parseRunArguments([reviewed, '--inherited-display', '--worldsculpt-navigation']), {
+    buildSha256: 'a'.repeat(64),
+    mode: 'inherited-display',
+    runtimeMode: 'worldsculpt-navigation',
+  })
+  for (const invalid of [
+    buildArgs.filter((value) => value !== '--inherited-display'),
+    buildArgs.filter((value) => !value.startsWith('--worldsculpt-source=')),
+    buildArgs.filter((value) => !value.startsWith('--worldsculpt-sha256=')),
+    [...buildArgs, '--local-ai'],
+    [...buildArgs, '--ai-model=model'],
+    [...buildArgs.slice(0, -1), '--worldsculpt-sha256=ABC'],
+  ]) assert.throws(() => parseBuildArguments(invalid))
+  assert.throws(() => parseRunArguments([reviewed, '--worldsculpt-navigation']))
+  assert.throws(() => parseRunArguments([reviewed, '--inherited-display', '--worldsculpt-navigation', '--local-ai']))
+
+  assert.equal(typeof aiPolicies.createWorldSculptPointerLockPermissionPolicy, 'function')
+  const owner = Object.freeze({ id: 'owned-current-web-contents' })
+  const staleOwner = Object.freeze({ id: 'stale-web-contents' })
+  let currentOwner = owner
+  const denied = []
+  const permissionPolicy = aiPolicies.createWorldSculptPointerLockPermissionPolicy({
+    runtimeMode: 'worldsculpt-navigation',
+    expectedOrigin: 'http://127.0.0.1:43123',
+    expectedDocumentUrl: 'http://127.0.0.1:43123/index.html',
+    getOwnedWebContents: () => currentOwner,
+    onDeniedRequest: (permission) => denied.push(permission),
+  })
+  const requestDetails = { requestingUrl: 'http://127.0.0.1:43123/index.html', isMainFrame: true }
+  const checkDetails = { ...requestDetails }
+  const decisions = []
+  permissionPolicy.request(owner, 'pointerLock', (granted) => decisions.push(granted), requestDetails)
+  assert.deepEqual(decisions, [true]); assert.deepEqual(denied, [])
+  assert.equal(permissionPolicy.check(owner, 'pointerLock', 'http://127.0.0.1:43123', checkDetails), true)
+
+  for (const [label, webContents, permission, requestingOrigin, details] of [
+    ['wrong owner', staleOwner, 'pointerLock', 'http://127.0.0.1:43123', requestDetails],
+    ['wrong permission', owner, 'geolocation', 'http://127.0.0.1:43123', requestDetails],
+    ['wrong origin', owner, 'pointerLock', 'http://127.0.0.1:43124', { ...requestDetails, requestingUrl: 'http://127.0.0.1:43124/index.html' }],
+    ['wrong document', owner, 'pointerLock', 'http://127.0.0.1:43123', { ...requestDetails, requestingUrl: 'http://127.0.0.1:43123/other.html' }],
+    ['subframe', owner, 'pointerLock', 'http://127.0.0.1:43123', { ...requestDetails, isMainFrame: false }],
+  ]) {
+    const requestDecision = []
+    permissionPolicy.request(webContents, permission, (granted) => requestDecision.push(granted), details)
+    assert.deepEqual(requestDecision, [false], label)
+    assert.equal(denied.at(-1), permission, `${label} must retain fatal request denial`)
+    assert.equal(permissionPolicy.check(webContents, permission, requestingOrigin, details), false, label)
+  }
+  currentOwner = staleOwner
+  const staleDecision = []
+  permissionPolicy.request(owner, 'pointerLock', (granted) => staleDecision.push(granted), requestDetails)
+  assert.deepEqual(staleDecision, [false], 'Replaced renderer must lose pointer-lock authority')
+  assert.equal(permissionPolicy.check(owner, 'pointerLock', 'http://127.0.0.1:43123', checkDetails), false)
+
+  const otherMode = aiPolicies.createWorldSculptPointerLockPermissionPolicy({
+    runtimeMode: 'authoring', expectedOrigin: 'http://127.0.0.1:43123', expectedDocumentUrl: requestDetails.requestingUrl,
+    getOwnedWebContents: () => owner, onDeniedRequest: (permission) => denied.push(`other:${permission}`),
+  })
+  assert.equal(otherMode.check(owner, 'pointerLock', 'http://127.0.0.1:43123', checkDetails), false)
+  const otherModeDecision = []
+  otherMode.request(owner, 'pointerLock', (granted) => otherModeDecision.push(granted), requestDetails)
+  assert.deepEqual(otherModeDecision, [false]); assert.equal(denied.at(-1), 'other:pointerLock')
+})
+
+test('WSNAV2 WorldSculpt build input admission rejects aliases nonregular files and invalid GLB bytes', async () => {
+  const fixture = await import('../worlds-authoring-electron-fixture.mjs')
+  assert.equal(typeof fixture.readWorldSculptBuildInput, 'function')
+  const directory = await mkdtemp(path.join(evidenceRoot, 'worldsculpt-input-'))
+  const source = path.join(directory, 'scene.glb')
+  const bytes = Buffer.alloc(12)
+  bytes.write('glTF', 0, 'ascii'); bytes.writeUInt32LE(2, 4); bytes.writeUInt32LE(bytes.length, 8)
+  await writeFile(source, bytes, { mode: 0o600 })
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  const admitted = await fixture.readWorldSculptBuildInput(source, sha256)
+  assert.deepEqual(admitted.bytes, bytes)
+  assert.deepEqual(Object.keys(admitted.sourceIdentity).sort(), ['bytes', 'device', 'inode', 'mode', 'sha256', 'uid'].sort())
+  assert.equal(admitted.sourceIdentity.bytes, bytes.length)
+  assert.equal(admitted.sourceIdentity.sha256, sha256)
+  assert.equal(Object.values(admitted.sourceIdentity).includes(source), false, 'Runtime-safe identity must not retain the user path')
+
+  await assert.rejects(fixture.readWorldSculptBuildInput(source, '0'.repeat(64)), /digest/i)
+  const malformed = path.join(directory, 'malformed.glb')
+  await writeFile(malformed, Buffer.from('not a GLB'))
+  await assert.rejects(fixture.readWorldSculptBuildInput(malformed, createHash('sha256').update(Buffer.from('not a GLB')).digest('hex')), /GLB/i)
+  const alias = path.join(directory, 'alias.glb')
+  await symlink(source, alias)
+  await assert.rejects(fixture.readWorldSculptBuildInput(alias, sha256), /regular|alias|canonical/i)
+  await assert.rejects(fixture.readWorldSculptBuildInput(directory, sha256), /regular/i)
+  const nested = path.join(directory, 'nested'); await mkdir(nested)
+  await assert.rejects(fixture.readWorldSculptBuildInput(`${nested}/../scene.glb`, sha256), /canonical/i)
+})
+
+test('WSNAV3 WorldSculpt runtime contract exposes only one hash-bound private path', async () => {
+  const runner = await import('./run.mjs')
+  assert.equal(typeof runner.validateRunnerWorldSculptInput, 'function')
+  assert.equal(typeof aiPolicies.parseWorldSculptInputContract, 'function')
+  const sha256 = '9b299c9ae4f7ded566a7006a9e5b2fc046eeccbcf28ad8df4163580248db2725'
+  const input = {
+    schema: 'modly.worlds-authoring-worldsculpt-input.v1',
+    sourceIdentity: { bytes: 117940, sha256, device: '1', inode: '2', uid: 1000, mode: 0o664 },
+    bundled: { relativePath: 'inputs/worldsculpt-scene.glb', bytes: 117940, sha256 },
+    workspaceRelativePath: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+  }
+  assert.deepEqual(aiPolicies.parseWorldSculptInputContract(structuredClone(input)), input)
+  const build = { runtimeMode: 'worldsculpt-navigation', worldSculptInput: structuredClone(input), outputs: { [input.bundled.relativePath]: { bytes: 117940, sha256 } } }
+  assert.deepEqual(runner.validateRunnerWorldSculptInput(build, 'worldsculpt-navigation'), input)
+  assert.equal(JSON.stringify(input).includes('/home/'), false, 'Electron contract must not receive the original user path')
+
+  for (const mutate of [
+    (value) => { value.sourcePath = '/home/user/original.glb' },
+    (value) => { value.workspaceRelativePath = 'Workflows/other/scene.glb' },
+    (value) => { value.bundled.relativePath = 'inputs/other.glb' },
+    (value) => { value.bundled.sha256 = '0'.repeat(64) },
+    (value) => { value.sourceIdentity.bytes += 1 },
+  ]) {
+    const invalid = structuredClone(input); mutate(invalid)
+    assert.throws(() => aiPolicies.parseWorldSculptInputContract(invalid))
+  }
+  assert.throws(() => runner.validateRunnerWorldSculptInput({ runtimeMode: 'worldsculpt-navigation', outputs: {} }, 'worldsculpt-navigation'))
+  assert.throws(() => runner.validateRunnerWorldSculptInput(build, 'authoring'))
+  assert.throws(() => runner.validateRunnerWorldSculptInput({ runtimeMode: 'authoring', outputs: {}, worldSculptInput: input }, 'authoring'))
+})
+
+test('WSNAV4 native navigation terminal rejects untrusted input pointer lock GPU and cleanup failures', async () => {
+  const runner = await import('./run.mjs')
+  assert.equal(typeof runner.assertActualWorldSculptNavigationTerminal, 'function')
+  const checks = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation']
+    .map((name) => ({ name, status: 'PASS' }))
+  const navigation = {
+    schema: 'modly.worldsculpt-navigation-acceptance.v1', phase: 'complete',
+    source: { bytes: 117940, sourceSha256: 'a'.repeat(64), bundledSha256: 'a'.repeat(64), workspaceSha256: 'a'.repeat(64), servedSha256: 'a'.repeat(64) },
+    inputTrace: [
+      { trusted: true, type: 'pointerdown', code: null, movementX: 0, movementY: 0 },
+      { trusted: true, type: 'pointermove', code: null, movementX: 14, movementY: -6 },
+      { trusted: true, type: 'keydown', code: 'KeyW', movementX: null, movementY: null },
+      { trusted: true, type: 'keydown', code: 'Digit3', movementX: null, movementY: null },
+    ],
+    pointerLock: { changes: 2, errors: 0, acquired: true, retainedFlyToRun: true, released: true },
+    graphics: { contextLost: false, drawingBuffer: [1200, 700], renderer: 'WebKit WebGL', unmaskedRenderer: 'ANGLE (NVIDIA GB10, Vulkan)' },
+    isolation: { canonicalUnchangedDuringNavigation: true, applyCountUnchanged: true, historyUnchanged: true, freshReopenMatched: true, observationCapabilityImmutable: true },
+    run: { groundOnlyFallback: true, colliderBacked: false, yPinned: true, horizontalMoved: true, rollZero: true },
+    screenshots: ['12-worldsculpt-inspect-framed.png', '13-worldsculpt-inspect-orbit.png', '14-worldsculpt-fly-locked.png', '15-worldsculpt-run-ground-only.png', '16-worldsculpt-restored-inspect.png'],
+  }
+  const result = { status: 'PASS', checks, errors: [], evidence: { worldSculptNavigation: navigation } }
+  assert.doesNotThrow(() => runner.assertActualWorldSculptNavigationTerminal(result))
+  for (const [label, mutate] of [
+    ['untrusted', (value) => { value.evidence.worldSculptNavigation.inputTrace[0].trusted = false }],
+    ['lock error', (value) => { value.evidence.worldSculptNavigation.pointerLock.errors = 1 }],
+    ['lock unavailable', (value) => { value.evidence.worldSculptNavigation.pointerLock.acquired = false }],
+    ['context lost', (value) => { value.evidence.worldSculptNavigation.graphics.contextLost = true }],
+    ['software GPU', (value) => { value.evidence.worldSculptNavigation.graphics.renderer = 'ANGLE (SwiftShader)' }],
+    ['generic masked GPU with unavailable identity', (value) => { value.evidence.worldSculptNavigation.graphics.renderer = 'WebKit WebGL'; value.evidence.worldSculptNavigation.graphics.unmaskedRenderer = null }],
+    ['generic unmasked GPU identity', (value) => { value.evidence.worldSculptNavigation.graphics.unmaskedRenderer = 'WebKit WebGL' }],
+    ['unknown unmasked GPU identity', (value) => { value.evidence.worldSculptNavigation.graphics.unmaskedRenderer = 'Unknown GPU' }],
+    ['empty unmasked GPU identity', (value) => { value.evidence.worldSculptNavigation.graphics.unmaskedRenderer = '' }],
+    ['observation mutation', (value) => { value.evidence.worldSculptNavigation.isolation.observationCapabilityImmutable = false }],
+    ['cleanup', (value) => { value.errors.push('unexpected cleanup failure') }],
+    ['collider claim', (value) => { value.evidence.worldSculptNavigation.run.colliderBacked = true }],
+  ]) {
+    const invalid = structuredClone(result); mutate(invalid)
+    assert.throws(() => runner.assertActualWorldSculptNavigationTerminal(invalid), undefined, label)
+  }
+})
+
+test('WSNAV5 renderer observation treats absent OrbitControls as pending without weakening navigation readiness', async () => {
+  assert.equal(typeof aiPolicies.parseObservedOrbitEnabled, 'function')
+  const diagnostics = []
+  const observe = (controls) => {
+    try { return { controls: { orbitEnabled: aiPolicies.parseObservedOrbitEnabled(controls) } } }
+    catch (error) { diagnostics.push(String(error)); return null }
+  }
+
+  const beforeMount = observe(undefined)
+  assert.equal(beforeMount.controls.orbitEnabled, null)
+  assert.deepEqual(diagnostics, [], 'A control-less pre-mount observation must not poison later readiness')
+  const mounted = observe({ enabled: true })
+  assert.equal(mounted.controls.orbitEnabled, true)
+  assert.deepEqual(diagnostics, [], 'Absent then valid controls in one lifecycle must remain diagnostic-free')
+  assert.equal(beforeMount.controls.orbitEnabled === true, false, 'Pending controls cannot satisfy Inspect readiness')
+  assert.equal(beforeMount.controls.orbitEnabled === false, false, 'Pending controls cannot satisfy Fly/Run readiness')
+  assert.equal(observe({ enabled: false }).controls.orbitEnabled, false)
+
+  for (const malformed of [{}, { enabled: 'true' }, false, []]) {
+    assert.throws(() => aiPolicies.parseObservedOrbitEnabled(malformed), /OrbitControls public runtime contract changed/)
+  }
+  assert.equal(observe({ enabled: 'true' }), null)
+  assert.match(diagnostics.at(-1), /OrbitControls public runtime contract changed/, 'Present malformed controls remain fatal to fixture health')
+
+  const canvas = { canvasUuid: 'canvas:owned', rect: { x: 10, y: 20, width: 400, height: 300 } }
+  const emptyObservation = {
+    point: { x: 50, y: 60 }, canvasUuid: canvas.canvasUuid, hitCanvas: true,
+    interactionHitCount: 0, firstEntityId: null, firstHitKind: null,
+  }
+  const entityObservation = {
+    point: { x: 210, y: 170 }, canvasUuid: canvas.canvasUuid, hitCanvas: true,
+    interactionHitCount: 2, firstEntityId: 'entity:worldsculpt', firstHitKind: 'selection-hitbox',
+  }
+  assert.equal(typeof aiPolicies.admitCanvasInteractionPoint, 'function')
+  const emptyPoint = aiPolicies.admitCanvasInteractionPoint(emptyObservation, { ...canvas, entityId: null })
+  const entityPoint = aiPolicies.admitCanvasInteractionPoint(entityObservation, { ...canvas, entityId: 'entity:worldsculpt' })
+  assert.deepEqual(emptyPoint, emptyObservation.point); assert.notEqual(emptyPoint, emptyObservation.point); assert.equal(Object.isFrozen(emptyPoint), true)
+  assert.deepEqual(entityPoint, entityObservation.point); assert.notEqual(entityPoint, entityObservation.point); assert.equal(Object.isFrozen(entityPoint), true)
+  const admittedCopies = { empty: structuredClone(emptyPoint), entity: structuredClone(entityPoint) }
+  emptyObservation.point.x = 99; entityObservation.point.y = 199
+  assert.deepEqual(emptyPoint, admittedCopies.empty, 'Admitted empty point must not alias renderer observation')
+  assert.deepEqual(entityPoint, admittedCopies.entity, 'Admitted entity point must not alias renderer observation')
+
+  for (const [label, base, expected, mutate] of [
+    ['missing', null, { ...canvas, entityId: null }, () => {}],
+    ['wrong canvas', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.canvasUuid = 'canvas:stale' }],
+    ['occluded DOM', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.hitCanvas = false }],
+    ['outside Canvas', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.point.x = 9 }],
+    ['noninteger point', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.point.y = 60.5 }],
+    ['empty ray hit', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.interactionHitCount = 1 }],
+    ['empty entity alias', structuredClone(emptyObservation), { ...canvas, entityId: null }, (value) => { value.firstEntityId = 'entity:worldsculpt'; value.firstHitKind = 'model' }],
+    ['wrong entity', structuredClone(entityObservation), { ...canvas, entityId: 'entity:worldsculpt' }, (value) => { value.firstEntityId = 'entity:other' }],
+    ['missing entity hit', structuredClone(entityObservation), { ...canvas, entityId: 'entity:worldsculpt' }, (value) => { value.interactionHitCount = 0 }],
+    ['invalid hit kind', structuredClone(entityObservation), { ...canvas, entityId: 'entity:worldsculpt' }, (value) => { value.firstHitKind = 'grid' }],
+  ]) {
+    const value = base === null ? null : structuredClone(base); mutate(value)
+    const beforeAdmission = structuredClone(value)
+    assert.throws(() => aiPolicies.admitCanvasInteractionPoint(value, expected), undefined, label)
+    assert.deepEqual(value, beforeAdmission, `${label} denial must not mutate the observation`)
+  }
+
+  const beforeCamera = Array.from({ length: 32 }, (_, index) => index / 10)
+  const afterCamera = [...beforeCamera]; afterCamera[12] += 2
+  const framedCorners = Array.from({ length: 8 }, (_, index) => ({
+    world: [index & 1, (index >> 1) & 1, (index >> 2) & 1],
+    ndc: [(index & 1) ? 0.5 : -0.5, (index & 2) ? 0.4 : -0.4, 0.2],
+    depth: 2.1,
+  }))
+  const focusTrace = [{ sequence: 8, at: '2026-09-26T00:00:00.000Z', type: 'dblclick', trusted: true,
+    x: 210, y: 170, buttons: 0, movementX: 0, movementY: 0, code: null,
+    target: 'CANVAS:', canvasUuid: canvas.canvasUuid, frame: 12 }]
+  const focusInput = {
+    beforeCamera, afterCamera, beforeBounds: { x: 60, y: 120, width: 300, height: 30 },
+    afterBounds: { x: 80, y: 125, width: 260, height: 26 }, afterWorldCorners: framedCorners,
+    trace: focusTrace, traceStart: 7, point: { x: 210, y: 170 }, canvasUuid: canvas.canvasUuid,
+  }
+  assert.equal(typeof aiPolicies.admitNativeCanvasFocusEvidence, 'function')
+  const focusEvidence = aiPolicies.admitNativeCanvasFocusEvidence(focusInput)
+  assert.deepEqual(focusEvidence, { dblclickSequence: 8 }); assert.equal(Object.isFrozen(focusEvidence), true)
+  const alreadyFitted = structuredClone(focusInput)
+  alreadyFitted.afterCamera = [...alreadyFitted.beforeCamera]; alreadyFitted.afterBounds = structuredClone(alreadyFitted.beforeBounds)
+  assert.deepEqual(aiPolicies.admitNativeCanvasFocusEvidence(alreadyFitted), { dblclickSequence: 8 },
+    'A trusted focus gesture on an already-fitted clean scene may legitimately leave the camera unchanged')
+  const preservedFocusInput = structuredClone(focusInput)
+  aiPolicies.admitNativeCanvasFocusEvidence(focusInput)
+  assert.deepEqual(focusInput, preservedFocusInput, 'Focus evidence admission must be read-only')
+  for (const [label, mutate] of [
+    ['untrusted double click', (value) => { value.trace[0].trusted = false }],
+    ['wrong event', (value) => { value.trace[0].type = 'click' }],
+    ['stale sequence', (value) => { value.trace[0].sequence = value.traceStart }],
+    ['wrong Canvas', (value) => { value.trace[0].canvasUuid = 'canvas:other' }],
+    ['retargeted point', (value) => { value.trace[0].x += 1 }],
+    ['nonfinite camera', (value) => { value.afterCamera[0] = Number.NaN }],
+    ['invalid projected bounds', (value) => { value.afterBounds.width = 0 }],
+    ['missing framed geometry', (value) => { value.afterWorldCorners = [] }],
+    ['outside padded frame', (value) => { value.afterWorldCorners[0].ndc[0] = 0.93 }],
+    ['behind camera', (value) => { value.afterWorldCorners[0].depth = 0 }],
+    ['nonfinite geometry', (value) => { value.afterWorldCorners[0].world[1] = Number.NaN }],
+  ]) {
+    const invalid = structuredClone(focusInput); mutate(invalid)
+    const beforeDenial = structuredClone(invalid)
+    assert.throws(() => aiPolicies.admitNativeCanvasFocusEvidence(invalid), undefined, label)
+    assert.deepEqual(invalid, beforeDenial, `${label} denial must not mutate the focus evidence input`)
+  }
+
+  const rendererSource = await readFile(new URL('./renderer.tsx', import.meta.url), 'utf8')
+  assert.match(rendererSource, /const orbitEnabled = parseObservedOrbitEnabled\(record\(state\)\.controls\)/,
+    'Actual renderer observer must use the pending-aware parser')
+  assert.match(rendererSource, /controls: \{ orbitEnabled \}/,
+    'Actual renderer DTO must publish the parser result without fabricating a control state')
+  assert.match(rendererSource, /interactionTargets: observeCanvasInteractionTargets/,
+    'Renderer must publish bounded read-only Canvas hit admission')
+  assert.doesNotMatch(rendererSource, /state\.raycaster\.setFromCamera/,
+    'Read-only fixture observation must not mutate the production raycaster')
+  assert.match(rendererSource, /'dblclick'/, 'Renderer trace must observe the trusted production focus gesture')
+  const sharedSource = await readFile(new URL('./shared.ts', import.meta.url), 'utf8')
+  assert.match(sharedSource, /controls: \{ orbitEnabled: boolean \| null \}/,
+    'Shared observation DTO must preserve the explicit pending state')
+  const navigationSource = await readFile(new URL('./navigation-driver.ts', import.meta.url), 'utf8')
+  assert.match(navigationSource, /controls\.orbitEnabled === false/, 'Fly/Run readiness must remain strictly disabled')
+  assert.match(navigationSource, /controls\.orbitEnabled === true/, 'Inspect readiness must remain strictly enabled')
+  assert.match(navigationSource, /nativeCanvasDoubleClick/, 'Navigation must focus through real native double-click input')
+  assert.equal([...navigationSource.matchAll(/prepareWorldSculptVisualProof\(/g)].length, 3,
+    'One helper and exactly two strict visual checks must share the closeup preparation')
+  assert.doesNotMatch(navigationSource, /focused\.bounds\.width > initialBounds\.width|changed\(focus\.beforeCamera/,
+    'Already-fitted clean scenes must not require camera motion or projected enlargement')
+  assert.match(navigationSource, /click\(contents, ports, 'button', 'Add scene'\)/,
+    'WorldSculpt must use the real scene-add UI before import')
+  assert.match(navigationSource, /assertSuccessfulUiApply\(beforeSceneAdd,[^;]+\['add-scene'\]\)/s,
+    'Empty-scene setup must prove one canonical add-scene revision')
+  assert.match(navigationSource, /assertSuccessfulUiApply\(beforeAdd,[^;]+\['add-resource', 'add-entity'\]\)/s,
+    'WorldSculpt import must prove the canonical resource/entity revision')
+  assert.equal([...navigationSource.matchAll(/assertReopenedAuthoringVisual\(/g)].length, 2,
+    'Both strict visual paint checks must remain present')
+})
+
+test('WSNAV6 durable witness replays actual v2 and retains exact v1 compatibility', async () => {
+  const [{ WorldProjectRepository }, commands, documents, model] = await Promise.all([
+    import('../../electron/main/world-project-repository.ts'),
+    import('../../src/areas/worlds/core/worldCommands.ts'),
+    import('../../src/areas/worlds/core/worldDocuments.ts'),
+    import('../../src/areas/worlds/core/worldModel.ts'),
+  ])
+  const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const implementation = oneSeam(source, /(function assertStoredResult\([\s\S]*?\n})\nasync function captureStoredWitness/g, 'actual durable result witness')
+  const makeComparator = await inertFunction(`${implementation}\nreturn assertStoredResult`, [
+    'assert', 'hash', 'parseWorldCommandBatch', 'canonicalWorldCommandBatchPayload', 'applyWorldCommandBatch', 'validateWorldProjectSnapshot',
+  ])
+  const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+  const compare = makeComparator(assert, digest, commands.parseWorldCommandBatch, commands.canonicalWorldCommandBatchPayload,
+    commands.applyWorldCommandBatch, documents.validateWorldProjectSnapshot)
+  assert.equal([...source.matchAll(/assertStoredResult\(/g)].length, 4,
+    'Immediate capture, historical checkpoints, and normalized AI witnesses must share one comparator')
+
+  const root = await mkdtemp(path.join(evidenceRoot, 'durable-witness-'))
+  const projectKey = 'world-11111111111111111111111111111111'
+  const repository = new WorldProjectRepository({
+    getWorkspaceRoot: () => root,
+    createProjectKey: () => projectKey,
+    createSceneKey: () => 'scene-22222222222222222222222222222222',
+    now: () => new Date('2026-09-26T00:00:00.000Z'),
+  })
+  const created = await repository.create({ name: 'Durable witness', initialSceneName: 'Scene' })
+  assert.equal(created.ok, true)
+  if (!created.ok) return
+  const sceneId = created.value.snapshot.project.startSceneId
+  const addBatch = {
+    schema: model.WORLD_COMMAND_BATCH_SCHEMA,
+    transactionId: 'tx:fixture-durable-add', projectId: created.value.snapshot.project.projectId,
+    baseRevision: created.value.snapshot.project.revision, origin: 'ui',
+    commands: [
+      { type: 'add-resource', resource: { id: 'resource:fixture-model', type: 'model', name: 'fixture.glb', workspacePath: 'Exports/Fixture/fixture.glb', format: 'glb' } },
+      { type: 'add-entity', sceneId, entity: { id: 'entity:fixture-model', name: 'fixture.glb', parentId: null,
+        enabled: true, locked: false, tags: [], transform: structuredClone(before), components: [{ id: 'component:fixture-renderable', type: 'renderable', enabled: true,
+          resourceId: 'resource:fixture-model', visible: true, castShadow: true, receiveShadow: true,
+          material: { baseColor: '#ffffff', metallic: 0, roughness: 1, opacity: 1 } }] } },
+    ],
+  }
+  const added = await repository.applyCommands({ projectKey, batch: addBatch })
+  assert.equal(added.ok, true)
+  if (!added.ok) return
+
+  const projectRoot = path.join(root, 'Worlds', projectKey)
+  const readStored = async (transactionId) => {
+    const state = JSON.parse(await readFile(path.join(projectRoot, '.modly/state.v1.json'), 'utf8'))
+    const transaction = state.transactions.find((entry) => entry.transactionId === transactionId)
+    assert.ok(transaction)
+    const bytes = await readFile(path.join(projectRoot, '.modly/transactions', transaction.transactionDigest, 'after/result.v1.json'))
+    return { bytes, transaction }
+  }
+  const firstStored = await readStored(addBatch.transactionId)
+  const compact = JSON.parse(firstStored.bytes.toString('utf8'))
+  assert.equal(compact.schema, 'modly.world-command-result.v2')
+  assert.equal(Object.hasOwn(compact, 'snapshot'), false, 'Compact v2 must remain compact')
+  assert.doesNotThrow(() => compare(firstStored.bytes, firstStored.transaction, added.value))
+
+  const patchBatch = {
+    schema: model.WORLD_COMMAND_BATCH_SCHEMA,
+    transactionId: 'tx:fixture-durable-transform', projectId: added.value.snapshot.project.projectId,
+    baseRevision: added.value.snapshot.project.revision, origin: 'ui',
+    commands: [{ type: 'patch-entity', sceneId, entityId: 'entity:fixture-model', patch: {
+      transform: { position: [3, 2, 1], rotation: [0.1, 0.2, 0.3], scale: [2, 2, 2] },
+    } }],
+  }
+  const patched = await repository.applyCommands({ projectKey, batch: patchBatch })
+  assert.equal(patched.ok, true)
+  if (!patched.ok) return
+  const secondStored = await readStored(patchBatch.transactionId)
+  assert.doesNotThrow(() => compare(secondStored.bytes, secondStored.transaction, patched.value))
+  assert.doesNotThrow(() => compare(firstStored.bytes, firstStored.transaction, added.value), 'Historical evidence remains valid after later commands')
+
+  const legacy = {
+    schema: 'modly.world-command-result.v1', transactionId: added.value.receipt.transactionId,
+    snapshot: structuredClone(added.value.snapshot), newRevision: added.value.newRevision,
+    changes: [...added.value.changes], warnings: [...added.value.warnings], inverse: structuredClone(added.value.inverse),
+  }
+  const retarget = (record, transaction = structuredClone(firstStored.transaction), value = structuredClone(added.value)) => {
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`), resultSha256 = digest(bytes)
+    transaction.resultSha256 = resultSha256; value.receipt.resultSha256 = resultSha256
+    return { bytes, transaction, value }
+  }
+  const legacyControl = retarget(legacy)
+  assert.doesNotThrow(() => compare(legacyControl.bytes, legacyControl.transaction, legacyControl.value))
+
+  const rejects = (label, mutate) => {
+    const record = structuredClone(compact), transaction = structuredClone(firstStored.transaction), value = structuredClone(added.value)
+    mutate({ record, transaction, value })
+    const control = retarget(record, transaction, value)
+    assert.throws(() => compare(control.bytes, control.transaction, control.value), undefined, label)
+  }
+  rejects('unknown schema', ({ record }) => { record.schema = 'modly.world-command-result.v3' })
+  rejects('extra field', ({ record }) => { record.snapshot = structuredClone(added.value.snapshot) })
+  rejects('missing field', ({ record }) => { delete record.warnings })
+  rejects('altered inverse', ({ record }) => { record.inverse.snapshot.project.name = 'Corrupt prior snapshot' })
+  rejects('wrong transaction', ({ record }) => { record.transactionId = 'tx:other' })
+  rejects('wrong revision', ({ record }) => { record.newRevision += 1 })
+  rejects('altered changes', ({ record }) => { record.changes = ['corrupt-change'] })
+  rejects('altered warnings', ({ record }) => { record.warnings = ['corrupt-warning'] })
+  rejects('wrong reconstructed IPC snapshot', ({ value }) => { value.snapshot.project.name = 'Corrupt accepted snapshot' })
+  rejects('wrong payload hash', ({ transaction, value }) => { transaction.payloadSha256 = '0'.repeat(64); value.receipt.payloadSha256 = transaction.payloadSha256 })
+  rejects('wrong transaction digest', ({ transaction }) => { transaction.transactionDigest = '0'.repeat(64) })
+  rejects('wrong canonical project binding', ({ transaction, value }) => {
+    const batch = JSON.parse(transaction.canonicalPayload); batch.projectId = 'project:other'
+    transaction.canonicalPayload = commands.canonicalWorldCommandBatchPayload(batch)
+    transaction.payloadSha256 = digest(Buffer.from(transaction.canonicalPayload)); value.receipt.payloadSha256 = transaction.payloadSha256
+    transaction.transactionDigest = digest(Buffer.from(`${transaction.transactionId}\n${transaction.canonicalPayload}`))
+  })
 })
 
 const authoredSnapshot = () => ({ project: { projectId: 'project:observed', revision: 8, scenes: [{ id: 'scene:first' }, { id: 'scene:second' }] }, scenes: ['scene:first', 'scene:second'].map((sceneId) => ({ sceneId, entities: [
@@ -676,7 +1107,7 @@ test('AI2 runner admission forwards exactly the reviewed runtime mode and reserv
 })
 
 test('P1 repository admissions bind relocated main and runner consumers before source reads or spawning', async () => {
-  const head = '3807bb10ca60e071d183a30392e0c0ed1ae7534e', branch = 'codex/worlds-engine'
+  const head = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61', branch = 'codex/worlds-engine'
   const admission = { schema: 'modly.worlds-authoring-repository-admission.v1', root: canonicalRoot, head, branch }
   assert.equal(aiPolicies.validateRepositoryAdmission(admission, canonicalRoot, head, branch), admission)
   for (const mutate of [
@@ -828,9 +1259,9 @@ test('ML3 actual manifest constructor retains qualified successful compiler warn
   const expression = source.match(/    const manifest = ([\s\S]*?)\n    const manifestBytes/)?.[1]
   assert.ok(expression, 'Existing actual manifest construction seam is required')
   const warnings = [{ id: 'qualified-warning', text: 'Actual returned warning', location: { file: sceneSource, line: 9, column: 0 }, notes: [], detail: undefined }]
-  const names = ['localAi', 'nativeMode', 'repositoryRoot', 'repositoryAdmission', 'outputDirectory', 'initialHead', 'initialBranch', 'nodePath', 'electronPath', 'versions', 'outputs', 'sources', 'incidentalArtifacts', 'moduleGraphs', 'renderer', 'builds', 'mainTranslationWarnings']
+  const names = ['localAi', 'worldSculpt', 'nativeMode', 'repositoryRoot', 'repositoryAdmission', 'outputDirectory', 'initialHead', 'initialBranch', 'nodePath', 'electronPath', 'versions', 'outputs', 'sources', 'incidentalArtifacts', 'moduleGraphs', 'renderer', 'builds', 'mainTranslationWarnings']
   const admission = { schema: 'modly.worlds-authoring-repository-admission.v1', root: canonicalRoot, head: 'head', branch: 'branch' }
-  const manifest = new Function(...names, `return (${expression})`)(null, 'owned-xvfb', canonicalRoot, admission, evidenceRoot, 'head', 'branch', '/node', '/electron', {}, { 'main.cjs': {} }, new Map(), new Map(), [], { plugins: [], worker: { plugins: () => [] } }, [{ warnings }, { warnings: [] }], [])
+  const manifest = new Function(...names, `return (${expression})`)(null, null, 'owned-xvfb', canonicalRoot, admission, evidenceRoot, 'head', 'branch', '/node', '/electron', {}, { 'main.cjs': {} }, new Map(), new Map(), [], { plugins: [], worker: { plugins: () => [] } }, [{ warnings }, { warnings: [] }], [])
   assert.deepEqual(manifest.compilerDiagnostics, { schema: 'modly.worlds-authoring-compiler-diagnostics.v1', esbuild: [{ entry: 'main', warnings }, { entry: 'preload', warnings: [] }], mainTranslationWarnings: [] })
   assert.deepEqual(Object.keys(manifest.outputs), ['main.cjs'])
 })
@@ -1302,7 +1733,6 @@ test('AI7 real preview/discard forwarding stays outside canonical mutation accou
   assert.equal(previews.length, 1); assert.equal(discards.length, 1)
 })
 
-import { createHash } from 'node:crypto'
 import { parseWorldAiChatResponse } from '../../src/areas/worlds/editor/worldAiChatAdapter.ts'
 import { canonicalWorldCommandBatchPayload } from '../../src/areas/worlds/core/worldCommands.ts'
 test('AI8 bounded received response custody precedes JSON/DTO decoding failures', async () => {
@@ -1371,37 +1801,38 @@ function completeActualAiPolicyControl() {
 test('AI9 actual native terminal rejects startup-only empty AI evidence', async () => {
   const source = await readFile(new URL('./run.mjs', import.meta.url), 'utf8')
   const body = oneSeam(source, /(    assert.equal\(result.status, 'PASS'[\s\S]*?\n    return)/g, 'inherited native terminal')
-  const finish = new Function('result', 'assert', 'localAi', 'assertActualAiTerminal', body)
+  const finish = new Function('result', 'assert', 'localAi', 'worldSculptInput', 'assertActualAiTerminal', 'assertActualWorldSculptNavigationTerminal', body)
   const accepted = completeActualAiPolicyControl()
-  assert.doesNotThrow(() => finish(accepted, assert, true, runnerPolicy.assertActualAiTerminal), 'Complete synthetic policy control must be accepted')
-  assert.doesNotThrow(() => finish({ status: 'PASS', checks: [{ status: 'PASS' }] }, assert, null, runnerPolicy.assertActualAiTerminal), 'Non-AI authoring remains unchanged')
-  for (const bad of [{ status: 'PASS', checks: [{ status: 'PASS' }] }, { ...accepted, evidence: { actualApi: { queries: [], chats: [], discoveries: [] } } }]) assert.throws(() => finish(bad, assert, true, runnerPolicy.assertActualAiTerminal), /AI|actual|query|proposal/i, 'Startup-only cannot satisfy actual AI acceptance')
+  const invoke = (result, localAi = true) => finish(result, assert, localAi, null, runnerPolicy.assertActualAiTerminal, runnerPolicy.assertActualWorldSculptNavigationTerminal)
+  assert.doesNotThrow(() => invoke(accepted), 'Complete synthetic policy control must be accepted')
+  assert.doesNotThrow(() => invoke({ status: 'PASS', checks: [{ status: 'PASS' }] }, null), 'Non-AI authoring remains unchanged')
+  for (const bad of [{ status: 'PASS', checks: [{ status: 'PASS' }] }, { ...accepted, evidence: { actualApi: { queries: [], chats: [], discoveries: [] } } }]) assert.throws(() => invoke(bad), /AI|actual|query|proposal/i, 'Startup-only cannot satisfy actual AI acceptance')
   const paths = ['schema', 'phase', 'admittedModel', 'discovery', 'counters', 'turns', 'sourceWitnesses', 'undo', 'redo', 'reopened']
-  for (const path of paths) { const bad = structuredClone(accepted); delete bad.evidence.actualAi[path]; assert.throws(() => finish(bad, assert, true, runnerPolicy.assertActualAiTerminal), undefined, `Missing ${path} must be refused`) }
+  for (const path of paths) { const bad = structuredClone(accepted); delete bad.evidence.actualAi[path]; assert.throws(() => invoke(bad), undefined, `Missing ${path} must be refused`) }
   const corruptions = [(a) => a.turns.pop(), (a) => a.discovery.response.models[0].digest = `sha256:${'c'.repeat(64)}`, (a) => a.turns[0].responseReceipt.validation = 'pending', (a) => a.turns[0].queries.pop(), (a) => a.turns[1].queries[1].result.value.context.requestId = 'stale', (a) => a.turns[0].beforeDecision.history.undo++, (a) => a.turns[0].decision.after.documents = [], (a) => a.turns[0].decision.discarded.result.ok = false, (a) => a.turns[1].decision.input.trusted = false, (a) => a.turns[1].decision.invocation.request.batch.transactionId = 'different', (a) => a.turns[1].decision.invocation.request.aiAuthority.context.editorEpoch++, (a) => a.turns[1].decision.invocation.result.value.idempotent = true, (a) => a.turns[1].decision.stored.verified = false, (a) => a.sourceWitnesses[0].input.sha256 = '0'.repeat(64), (a) => a.undo.result.value.snapshot.project.revision--, (a) => a.redo.result.ok = false, (a) => a.reopened[0].bootId = 'old', (a) => a.reopened[1].canonicalDiskMatches = false, (a) => a.reopened[1].model.triangles = 0, (a) => a.reopened[1].model.worldCorners.pop(), (a) => delete a.reopened[1].screenshot]
-  for (const corrupt of corruptions) { const bad = structuredClone(accepted); corrupt(bad.evidence.actualAi); assert.throws(() => finish(bad, assert, true, runnerPolicy.assertActualAiTerminal), undefined, 'Required actual witness corruption must be refused') }
+  for (const corrupt of corruptions) { const bad = structuredClone(accepted); corrupt(bad.evidence.actualAi); assert.throws(() => invoke(bad), undefined, 'Required actual witness corruption must be refused') }
   for (const event of ['undo', 'redo']) {
     for (const field of ['transactionId', 'snapshot', 'inverse']) {
       const missing = structuredClone(accepted); delete missing.evidence.actualAi[event].stored[field]
-      assert.throws(() => finish(missing, assert, true, runnerPolicy.assertActualAiTerminal), undefined, `${event} missing stored ${field} must be refused`)
+      assert.throws(() => invoke(missing), undefined, `${event} missing stored ${field} must be refused`)
       const corrupt = structuredClone(accepted), stored = corrupt.evidence.actualAi[event].stored
       if (field === 'transactionId') stored.transactionId = 'tx:unrelated-synthetic-policy-control'
       else if (field === 'snapshot') stored.snapshot.project.revision++
       else stored.inverse.snapshot.project.revision++
-      assert.throws(() => finish(corrupt, assert, true, runnerPolicy.assertActualAiTerminal), undefined, `${event} independently corrupt stored ${field} must be refused`)
+      assert.throws(() => invoke(corrupt), undefined, `${event} independently corrupt stored ${field} must be refused`)
     }
     for (const field of ['receipt', 'transactionId', 'inverse']) {
       const missing = structuredClone(accepted), result = missing.evidence.actualAi[event].result.value
       if (field === 'transactionId') delete result.receipt.transactionId
       else delete result[field]
-      assert.throws(() => finish(missing, assert, true, runnerPolicy.assertActualAiTerminal), undefined, `${event} missing result ${field} must be refused`)
+      assert.throws(() => invoke(missing), undefined, `${event} missing result ${field} must be refused`)
     }
     for (const field of ['transactionId', 'snapshot', 'inverse']) {
       const missing = structuredClone(accepted), history = missing.evidence.actualAi[event]
       delete history.stored[field]
       if (field === 'transactionId') delete history.result.value.receipt.transactionId
       else delete history.result.value[field]
-      assert.throws(() => finish(missing, assert, true, runnerPolicy.assertActualAiTerminal), undefined, `${event} missing both ${field} copies must not compare undefined equal`)
+      assert.throws(() => invoke(missing), undefined, `${event} missing both ${field} copies must not compare undefined equal`)
     }
   }
 })
@@ -1427,8 +1858,8 @@ test('AI11 main AI stage reacquires current owned renderer after authoring repla
   const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
   const body = oneSeam(source, /(  if \(inheritedDisplay\) \{\n    const authored = await runUiAuthoredScenes[\s\S]*?)\n  guard\(\); verifySources\(\)/g, 'existing main orchestration')
   const currentWindow = { webContents: { id: 'initial' }, isDestroyed: () => false }, calls = []
-  const make = await inertFunction(`return (async () => {${body}})()`, ['inheritedDisplay', 'contents', 'ports', 'runUiAuthoredScenes', 'runAuthoringInteractions', 'seed', 'assert', 'localAi', 'currentWindow', 'runActualOllamaDriver', 'aiPorts', 'assertCurrentAiContents', 'report', 'evidence'])
-  await make(true, currentWindow.webContents, {}, async () => ({ seed: {} }), async () => { currentWindow.webContents = { id: 'current' } }, {}, assert, true, currentWindow, async (contents) => calls.push(contents.id), {}, (contents) => assert.equal(contents, currentWindow.webContents), { localAi: {} }, { actualApi: {} })
+  const make = await inertFunction(`return (async () => {${body}})()`, ['inheritedDisplay', 'contents', 'ports', 'runUiAuthoredScenes', 'runAuthoringInteractions', 'seed', 'assert', 'localAi', 'worldSculptInput', 'currentWindow', 'runActualOllamaDriver', 'aiPorts', 'assertCurrentAiContents', 'report', 'evidence'])
+  await make(true, currentWindow.webContents, {}, async () => ({ seed: {} }), async () => { currentWindow.webContents = { id: 'current' } }, {}, assert, true, null, currentWindow, async (contents) => calls.push(contents.id), {}, (contents) => assert.equal(contents, currentWindow.webContents), { localAi: {} }, { actualApi: {} })
   assert.deepEqual(calls, ['current'], 'AI input must use the current owned generation, never stale initial contents')
 })
 
@@ -1731,7 +2162,7 @@ async function ownedLifecycleMain(terminalPorts = {}) {
   }
   const session = { fromPartition: () => ({ webRequest: { onBeforeRequest: (callback) => events.push(callback === null ? 'session:disposed' : 'session:registered') }, setPermissionRequestHandler() {}, setPermissionCheckHandler() {} }) }
   const persist = async () => { events.push('persist'); if (holdPersist) await new Promise((resolve) => { releasePersist = resolve }); events.push('persist:complete') }
-  const params = ['app', 'BrowserWindow', 'ipcMain', 'session', 'assert', 'evidence', 'errors', 'report', 'checks', 'cleanup', 'network', 'now', 'writeFileSync', 'reportPath', 'path', 'bundle', 'build', 'assetPaths', 'localAi', 'isLocalAiRoute', 'waitForOwnedWindowFocus', 'execution', 'readView', 'writeFile', 'runDirectory', 'abortGate', 'bounded', 'stopLocalAi', 'diskManifest', 'workspace', 'persist', 'watchdog', 'onViolation', 'gate']
+  const params = ['app', 'BrowserWindow', 'ipcMain', 'session', 'assert', 'evidence', 'errors', 'report', 'checks', 'cleanup', 'network', 'now', 'writeFileSync', 'reportPath', 'path', 'bundle', 'build', 'assetPaths', 'runtimeMode', 'createWorldSculptPointerLockPermissionPolicy', 'localAi', 'isLocalAiRoute', 'waitForOwnedWindowFocus', 'execution', 'readView', 'writeFile', 'runDirectory', 'abortGate', 'bounded', 'stopLocalAi', 'diskManifest', 'workspace', 'persist', 'watchdog', 'onViolation', 'gate']
   // Bind the actual expression only to observe its exceptional completion; its body is unchanged.
   const observedPipeline = pipeline.replace(/^void /, 'const terminal = ')
   const make = await inertFunction(`${variables}\n${functions}\n${registration}\n${windows}\n${observedPipeline}\nreturn {openWindow, fail, terminal, state: () => ({firstFailure, currentWindow, generation, stopping, terminalExitAuthorized, records: evidence.lifecycle ?? []}), setStage: name => {currentStage = name}, setStopping: value => {stopping = value}, setServer: value => {server = value}, addChannel: name => ownedChannels.push(name)}`, params)
@@ -1739,7 +2170,7 @@ async function ownedLifecycleMain(terminalPorts = {}) {
     events.push('snapshot')
     if (terminalPorts.finalWriteError && events.includes('persist:complete')) { events.push('controlled:final-write'); throw terminalPorts.finalWriteError }
     snapshots.push(JSON.parse(bytes))
-  }, '/tmp/inert-lifecycle-report.json', path, '/tmp/modly-worlds-authoring-ui-inert', { outputs: { 'renderer/index.html': {} } }, [], { cleanupSeconds: 8 }, () => false,
+  }, '/tmp/inert-lifecycle-report.json', path, '/tmp/modly-worlds-authoring-ui-inert', { outputs: { 'renderer/index.html': {} } }, [], 'authoring', () => ({ request() {}, check: () => false }), { cleanupSeconds: 8 }, () => false,
     async (_window, options) => { options.assertOwned(); return { focusedAt: 'controlled:at' } }, execution, async () => ({}), async () => {}, '/tmp/inert-run', () => {}, async (operation) => operation,
     async () => { events.push('api:closed'); cleanup.push({ actualApiClosed: true }); apiClosedResolve() }, async () => { events.push('manifest'); return [] }, '/tmp/inert-workspace', persist, null, () => {}, null)
   main.setStage(checks[0].name)

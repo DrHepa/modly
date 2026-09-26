@@ -39,6 +39,12 @@ const pointsFixture = path.join(projectRoot, 'src/areas/worlds/__fixtures__/colo
 type Host = {
   type: string; props: Record<string, any>; children: Host[]; object?: THREE.Object3D
   parent?: Host; resource?: THREE.BufferGeometry | THREE.Material; focus?: () => void
+  ownerDocument?: NavigationTestDocument
+  addEventListener?: (type: string, listener: NavigationTestListener | null) => void
+  removeEventListener?: (type: string, listener: NavigationTestListener | null) => void
+  emit?: (type: string, event?: NavigationTestEvent) => NavigationTestEvent
+  contains?: (value: unknown) => boolean
+  closest?: () => null
 }
 type WorldsCameraFitSnapshotRef = { current: WorldsCameraFitSnapshot | null }
 type WorldsTestOrbitControls = ReturnType<typeof worldsFitControls>
@@ -238,7 +244,7 @@ class NavigationTestWindow extends NavigationTestEventTarget {
 
 class NavigationTestDocument extends NavigationTestEventTarget {
   readonly defaultView = new NavigationTestWindow()
-  activeElement: NavigationTestNode | null = null
+  activeElement: NavigationTestNode | Host | null = null
   pointerLockElement: NavigationTestNode | null = null
   hidden = false
   exitPointerLockCalls = 0
@@ -281,7 +287,7 @@ function createNavigationKeyboardEvent(code: string, target: NavigationTestNode)
   }
 }
 
-async function loadViewerInteractionModule(withGeometry = false, withFitCamera = false) {
+async function loadViewerInteractionModule(withGeometry = false, withFitCamera = false, withNavigation = false) {
   const tempDir = await mkdtemp(path.join('/tmp', 'worlds-viewer-interaction-test-'))
   const outfile = path.join(tempDir, 'WorldsViewer.interaction.bundle.mjs')
   await writeFile(path.join(tempDir, 'package.json'), JSON.stringify({ type: 'module' }))
@@ -297,12 +303,27 @@ async function loadViewerInteractionModule(withGeometry = false, withFitCamera =
     plugins: [{
       name: 'worlds-viewer-interaction-mocks',
       setup(build) {
-        if (withFitCamera) build.onLoad({ filter: /WorldsViewer\.tsx$/ }, async () => ({
-          contents: `${await readFile(viewerEntry, 'utf8')}\nexport { SceneFitController as TestSceneFitController, WorldSceneItemErrorBoundary as TestRenderBoundary, PlySceneObject as TestPlySceneObject };\nexport const testUpdateRenderLoadState = (...args) => updateWorldsRenderLoadState(...args);\nexport { fitTestCamera, fitTestBoundsCalls } from '@react-three/fiber';`,
+        if (withFitCamera || withNavigation) build.onLoad({ filter: /WorldsViewer\.tsx$/ }, async () => ({
+          contents: `${await readFile(viewerEntry, 'utf8')}\nexport { SceneFitController as TestSceneFitController, WorldSceneItemErrorBoundary as TestRenderBoundary, PlySceneObject as TestPlySceneObject };\nexport const testUpdateRenderLoadState = (...args) => updateWorldsRenderLoadState(...args);\nexport { fitTestCamera, fitTestBoundsCalls, navigationTestDom } from '@react-three/fiber';`,
           loader: 'tsx', resolveDir: path.dirname(viewerEntry),
         }))
+        const navigationDomMock = withNavigation ? `
+          class TestEventTarget {
+            constructor(){ this.listeners = new Map(); }
+            addEventListener(type, listener){ const values = this.listeners.get(type) ?? new Set(); values.add(listener); this.listeners.set(type, values); }
+            removeEventListener(type, listener){ this.listeners.get(type)?.delete(listener); }
+            listenerCount(type){ return this.listeners.get(type)?.size ?? 0; }
+            emit(type, event = {}){ const payload = { target: this, ...event }; for (const listener of [...(this.listeners.get(type) ?? [])]) listener(payload); return payload; }
+          }
+          const ownerWindow = new TestEventTarget();
+          const ownerDocument = new TestEventTarget(); ownerDocument.defaultView = ownerWindow; ownerDocument.pointerLockElement = null; ownerDocument.activeElement = null; ownerDocument.hidden = false; ownerDocument.exitPointerLockCalls = 0;
+          ownerDocument.exitPointerLock = () => { ownerDocument.exitPointerLockCalls += 1; ownerDocument.pointerLockElement = null; ownerDocument.emit('pointerlockchange'); };
+          const canvas = new TestEventTarget(); canvas.ownerDocument = ownerDocument; canvas.requestPointerLockCalls = 0;
+          canvas.requestPointerLock = async () => { canvas.requestPointerLockCalls += 1; ownerDocument.pointerLockElement = canvas; ownerDocument.emit('pointerlockchange'); };
+          export const navigationTestDom = { ownerDocument, ownerWindow, canvas };
+        ` : 'export const navigationTestDom = null;'
         const mocks = new Map<string, string>([
-          ['@react-three/fiber', `import { createElement } from 'react'; import * as THREE from 'three'; export const fitTestCamera = new THREE.PerspectiveCamera(45, 1, .01, 500); fitTestCamera.position.set(2.4, 1.8, 2.8); export const fitTestBoundsCalls = { refresh: 0 }; export function Canvas(props){ return createElement('canvas-mock', props, props.children); } export function useFrame(){} export function useThree(){ return { camera: ${withFitCamera ? 'fitTestCamera' : 'new THREE.PerspectiveCamera()'}, gl: { domElement: {} }, scene: new THREE.Scene() }; }`],
+          ['@react-three/fiber', `import { createElement } from 'react'; import * as THREE from 'three'; export const fitTestCamera = new THREE.PerspectiveCamera(45, 1, .01, 500); fitTestCamera.position.set(2.4, 1.8, 2.8); export const fitTestBoundsCalls = { refresh: 0 }; ${navigationDomMock} export function Canvas(props){ return createElement('canvas-mock', props, props.children); } export function useFrame(){} export function useThree(){ return { camera: ${withFitCamera || withNavigation ? 'fitTestCamera' : 'new THREE.PerspectiveCamera()'}, gl: { domElement: ${withNavigation ? 'navigationTestDom.canvas' : '{}'} }, scene: new THREE.Scene() }; }`],
           ['@react-three/drei', `import { createElement, Fragment, forwardRef, useImperativeHandle } from 'react'; import * as THREE from 'three'; import { fitTestBoundsCalls } from '@react-three/fiber'; export function Bounds(props){ return createElement(Fragment, null, props.children); } export function Environment(props){ return createElement(Fragment, null, props.children); } export function GizmoHelper(props){ return createElement(Fragment, null, props.children); } export function GizmoViewport(){ return null; } export function Html(props){ return createElement('html-mock', null, props.children); } export function Lightformer(){ return null; } export const OrbitControls = forwardRef(function OrbitControls(_props, ref){ useImperativeHandle(ref, () => ({ target: new THREE.Vector3(), update(){}, saveState(){}, maxDistance: Infinity })); return null; }); export function TransformControls(props){ return createElement('transform-controls', props); } export function useBounds(){ return { refresh(){ fitTestBoundsCalls.refresh++; return this; }, clip(){ return this; }, fit(){ return this; }, getSize(){ return { center: new THREE.Vector3(), size: new THREE.Vector3(${withFitCamera ? '1, 1, 1' : ''}), distance: ${withFitCamera ? '1.670244640136808' : '0'} }; } }; }
             // Match useGLTF asset identity; each test loads its own isolated mock module.
             const gltfAssets = new Map();
@@ -326,9 +347,9 @@ async function loadViewerInteractionModule(withGeometry = false, withFitCamera =
           ['@react-three/postprocessing', `import { createElement, Fragment } from 'react'; export function Select(props){ return createElement(Fragment, null, props.children); } export function Selection(props){ return createElement(Fragment, null, props.children); }`],
           ['./WorldViewportGraphics.tsx', `export function WorldViewportGraphics(){ return null; }`],
           ['./WorldViewportBoundary.tsx', `export function WorldCanvasLifecycle(){ return null; }`],
-          ['./WorldsViewportNavigationControls.tsx', `export function WorldsViewportNavigationControls(){ return null; }`],
-          ['./WorldsViewportModeControl.tsx', `import { createElement, Fragment } from 'react'; export function WorldsViewportModeControl(props){ return createElement(Fragment, null, ['inspect', 'fly', 'run'].map((mode) => createElement('button', { key: mode, type: 'button', 'aria-label': mode, onClick: () => props.onModeChange(mode) }, mode)), createElement('button', { type: 'button', 'aria-label': 'Frame scene', onClick: props.onFrameScene }, 'Frame scene')); }`],
+          ['./WorldsViewportModeControl.tsx', `import { createElement, Fragment } from 'react'; export function WorldsViewportModeControl(props){ return createElement(Fragment, null, ['inspect', 'fly', 'run'].map((mode) => createElement('button', { key: mode, type: 'button', role: 'radio', 'aria-checked': props.mode === mode, 'aria-label': mode, onClick: () => props.onModeChange(mode) }, mode)), createElement('button', { type: 'button', 'aria-label': 'Frame scene', onClick: props.onFrameScene }, 'Frame scene')${withNavigation ? ", createElement('span', { role: 'status', 'data-navigation-status': true }, props.status)" : ''}); }`],
         ])
+        if (!withNavigation) mocks.set('./WorldsViewportNavigationControls.tsx', 'export function WorldsViewportNavigationControls(){ return null; }')
         build.onResolve({ filter: /.*/ }, (args) => mocks.has(args.path) ? { path: args.path, namespace: 'worlds-viewer-mock' } : undefined)
         build.onLoad({ filter: /.*/, namespace: 'worlds-viewer-mock' }, (args) => ({ contents: mocks.get(args.path) ?? '', loader: 'js', resolveDir: projectRoot }))
       },
@@ -396,6 +417,7 @@ function projectSnapshot() {
 
 function mounted(withObjects = false) {
   let focusedHost: Host | null = null
+  const hostDocument = new NavigationTestDocument()
   const owned = new Set<THREE.BufferGeometry | THREE.Material>()
   const own = <T extends THREE.BufferGeometry | THREE.Material>(resource: T): T => { owned.add(resource); return resource }
   const disposeOwned = (resource: THREE.BufferGeometry | THREE.Material | THREE.Material[] | undefined) => {
@@ -505,7 +527,26 @@ function mounted(withObjects = false) {
         else own(object.material)
       }
       const node: Host = { type, props, children: [], object, resource: createResource(type, props) }
-      if (type === 'button') node.focus = () => { focusedHost = node }
+      const listeners = new Map<string, Set<NavigationTestListener>>()
+      node.ownerDocument = hostDocument
+      node.addEventListener = (eventType, listener) => {
+        if (!listener) return
+        const values = listeners.get(eventType) ?? new Set<NavigationTestListener>()
+        values.add(listener)
+        listeners.set(eventType, values)
+      }
+      node.removeEventListener = (eventType, listener) => { if (listener) listeners.get(eventType)?.delete(listener) }
+      node.emit = (eventType, event = {}) => {
+        const payload = { target: node, ...event }
+        for (const listener of [...(listeners.get(eventType) ?? [])]) {
+          if (typeof listener === 'function') listener(payload as unknown as Event)
+          else listener.handleEvent(payload as unknown as Event)
+        }
+        return payload
+      }
+      node.contains = (value) => value === node || node.children.some((child) => child.contains?.(value))
+      node.closest = () => null
+      node.focus = () => { focusedHost = node; hostDocument.activeElement = node }
       update(node, props)
       return node
     },
@@ -1451,6 +1492,86 @@ test('WorldsViewer keeps camera navigation state local with pan zoom look and ke
     assert.equal(viewerSource.includes('WorldSceneItem') && viewerSource.includes('cameraState:'), false)
   } finally {
     await cleanup()
+  }
+})
+
+test('mounted WorldsViewer Frame scene keeps actual navigation status canonical and releases owned modes without document writes', async () => {
+  const loaded = await loadViewerInteractionModule(false, true, true)
+  const host = mounted()
+  const module = loaded.module as {
+    WorldsViewer: ComponentType<Record<string, unknown>>
+    fitTestCamera: THREE.PerspectiveCamera
+    navigationTestDom: {
+      ownerDocument: { pointerLockElement: unknown; exitPointerLockCalls: number; listenerCount: (type: string) => number }
+      canvas: { emit: (type: string, event?: Record<string, unknown>) => unknown; requestPointerLockCalls: number; listenerCount: (type: string) => number }
+    }
+  }
+  const canonicalStatus = 'Inspect mode. Orbit, pan, select, and edit.'
+  const savedView = { position: [8, 5, 12] as [number, number, number], target: [0, 1, 0] as [number, number, number], up: [0, 1, 0] as [number, number, number] }
+  const documentWrites: string[] = []
+  const write = (name: string) => () => { documentWrites.push(name) }
+  const status = () => {
+    const node = findHost(host.container, (candidate) => candidate.props['data-navigation-status'] === true)
+    assert.ok(node, 'actual parent status must be observable through its mode-control boundary')
+    return getHostText(node)
+  }
+  const button = (label: string) => {
+    const node = findHost(host.container, (candidate) => candidate.props['aria-label'] === label)
+    assert.ok(node, `${label} control must be mounted`)
+    return node
+  }
+  const click = async (label: string) => {
+    button(label).props.onClick()
+    await settleMounted(host)
+  }
+
+  try {
+    host.render(createElement(module.WorldsViewer, {
+      project: projectDocument(), items: [], initialView: savedView,
+      showAuthoringToolbar: false, showPlaybackControls: false, useStudioLights: false,
+      onSelectItem: write('select-item'), onAddCollisionSurface: write('add-collision'),
+      onCollisionEditModeChange: write('collision-edit'), onSelectCollisionSurface: write('select-collision'),
+      onTransformModeChange: write('transform-mode'), onTransformItem: write('transform-item'),
+      onTransformItems: write('transform-items'), onTransformCollisionSurface: write('transform-collision'),
+      onRemoveCollisionSurface: write('remove-collision'), onRemoveItem: write('remove-item'),
+      onToggleBaseSceneItem: write('toggle-base'), onCommitPendingSurfacePlacement: write('commit-placement'),
+      onClearPendingSurfacePlacement: write('clear-placement'),
+    }))
+    await settleMounted(host)
+    assert.equal(module.navigationTestDom.ownerDocument.listenerCount('pointerlockchange'), 1, 'the production navigation controller must own pointer-lock observation')
+    assert.equal(module.navigationTestDom.canvas.listenerCount('pointerdown'), 1, 'the production navigation controller must own Canvas pointer input')
+    assert.equal(status(), canonicalStatus)
+    assert.deepEqual(module.fitTestCamera.position.toArray(), savedView.position)
+
+    for (const changedPosition of [[30, 15, 25], [-9, -8, -7]]) {
+      module.fitTestCamera.position.fromArray(changedPosition)
+      await click('Frame scene')
+      assert.equal(status(), canonicalStatus, 'repeated Inspect framing must not leave a stale transient status')
+      assert.deepEqual(module.fitTestCamera.position.toArray(), savedView.position, 'the existing saved-view reset remains authoritative')
+      assert.equal(button('inspect').props['aria-checked'], true)
+    }
+
+    for (const mode of ['fly', 'run'] as const) {
+      await click(mode)
+      assert.equal(button(mode).props['aria-checked'], true)
+      module.navigationTestDom.canvas.emit('pointerdown', { button: 0 })
+      await settleMounted(host)
+      assert.equal(module.navigationTestDom.ownerDocument.pointerLockElement, module.navigationTestDom.canvas)
+      assert.equal(status(), `${mode === 'fly' ? 'Fly' : 'Run'} mode. Pointer locked.`)
+      module.fitTestCamera.position.set(20, 10, 15)
+      await click('Frame scene')
+      assert.equal(button('inspect').props['aria-checked'], true)
+      assert.equal(module.navigationTestDom.ownerDocument.pointerLockElement, null, `${mode} pointer lock must be released by Frame scene`)
+      assert.equal(status(), canonicalStatus)
+      assert.deepEqual(module.fitTestCamera.position.toArray(), savedView.position)
+    }
+
+    assert.ok(module.navigationTestDom.ownerDocument.exitPointerLockCalls >= 2)
+    assert.ok(module.navigationTestDom.canvas.requestPointerLockCalls >= 2)
+    assert.deepEqual(documentWrites, [], 'camera navigation and framing must remain outside the canonical document command path')
+  } finally {
+    host.render(null)
+    await loaded.cleanup()
   }
 })
 

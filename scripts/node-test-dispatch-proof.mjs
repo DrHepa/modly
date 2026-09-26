@@ -14,6 +14,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const REQUIRED_AUTHORING_GUARD_TEST_NAMES = Object.freeze([
   'N1 admits only separately reviewed inherited-display mode without native flags',
   'N2 preserves every inherited environment field and never creates display authentication',
+  'WSNAV1 WorldSculpt navigation requires inherited display and excludes local AI',
+  'WSNAV2 WorldSculpt build input admission rejects aliases nonregular files and invalid GLB bytes',
+  'WSNAV3 WorldSculpt runtime contract exposes only one hash-bound private path',
+  'WSNAV4 native navigation terminal rejects untrusted input pointer lock GPU and cleanup failures',
+  'WSNAV5 renderer observation treats absent OrbitControls as pending without weakening navigation readiness',
+  'WSNAV6 durable witness replays actual v2 and retains exact v1 compatibility',
   'N3 numeric evidence rejects no-op, wrong captured owner and unrelated canonical changes',
   'N4 both authored scenes require models, one primary camera, light and a genuinely fresh reopen',
   'F1 binds held and committed transforms to the same final preview, not any nonzero change',
@@ -30,7 +36,7 @@ export const REQUIRED_AUTHORING_GUARD_TEST_NAMES = Object.freeze([
   'AI1P local-AI paths materialize only from a canonical relocated repository root',
   'P1 repository admissions bind relocated main and runner consumers before source reads or spawning',
 ])
-export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 297
+export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 303
 
 export function parseAuthoringGuardTapNames(stdout) {
   return [...stdout.matchAll(/^ok \d+ - (.+)$/gm)].map((match) => match[1])

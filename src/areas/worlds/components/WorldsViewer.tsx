@@ -347,7 +347,6 @@ export function WorldsViewer({
   }, [])
   const handleFrameScene = useCallback(() => {
     setControlMode('inspect')
-    setNavigationStatus('Inspect mode. Framing scene.')
     setCameraState((state) => ({ ...state, resetToken: state.resetToken + 1 }))
   }, [])
   useEffect(() => {

@@ -15,14 +15,16 @@ import { AutomationHttpBridge } from '../../electron/main/automation-http-bridge
 import { AgentSessionStore } from '../../electron/main/agent-session-store.ts'
 import { sameWorldAiContext, WORLD_AI_QUERY_BYTES, type WorldAiContext } from '../../src/areas/worlds/core/worldAiContract.ts'
 import { parseWorldAiChatResponse } from '../../src/areas/worlds/editor/worldAiChatAdapter.ts'
-import { canonicalWorldCommandBatchPayload } from '../../src/areas/worlds/core/worldCommands.ts'
+import { applyWorldCommandBatch, canonicalWorldCommandBatchPayload, parseWorldCommandBatch } from '../../src/areas/worlds/core/worldCommands.ts'
+import { validateWorldProjectSnapshot } from '../../src/areas/worlds/core/worldDocuments.ts'
 import { observeWorldAiSource } from '../../electron/main/world-ai-resource-observations.ts'
 import { runActualOllamaDriver, type AiDriverPorts, type AiQueryCapture, type AiPreviewCapture, type AiDiscardCapture, type AiHttpReceipt } from './ai-driver.ts'
 import { WORLD_PROJECT_CHANNELS, type WorldProjectCommandRequest, type WorldProjectCommandResult, type WorldProjectCommandSuccess } from '../../src/shared/types/worldProjects.ts'
 import type { AssetLibraryListResult } from '../../src/shared/types/assetLibrary.ts'
-import { ASSET_PATHS, UI_ASSET_PATHS, provisionAuthoringInputs, seedAuthoring } from './scene.ts'
+import { ASSET_PATHS, UI_ASSET_PATHS, WORLD_SCULPT_ASSET_PATHS, provisionAuthoringInputs, seedAuthoring } from './scene.ts'
 import { runAuthoringInteractions, runUiAuthoredScenes, readView, waitForOwnedWindowFocus, type DriverPorts, type Invocation } from './driver.ts'
-import { CHECK_NAMES, UI_CHECK_NAMES, PROJECT_KEY, SCENE_KEY, SCENE_ID, type AuthoringView, type Check, type CheckName, type SeedEvidence } from './shared.ts'
+import { runWorldSculptNavigationAcceptance } from './navigation-driver.ts'
+import { CHECK_NAMES, UI_CHECK_NAMES, NAVIGATION_CHECK_NAMES, PROJECT_KEY, SCENE_KEY, SCENE_ID, createWorldSculptPointerLockPermissionPolicy, parseWorldSculptInputContract, type AuthoringView, type Check, type CheckName, type SeedEvidence } from './shared.ts'
 import { AI_CHECK_NAMES, LOCAL_AI_PATH_ADMISSION, LOCAL_AI_SESSION_METHODS, createLocalAiConfig, validateLocalAiConfig, validateRepositoryAdmission, parseReviewedAiModel, localAiBridgeEnvironment, parseOwnedBridgeOrigin, localAiPythonArguments, parseUvicornAddress, isLocalAiRoute, isLocalAiHttpRequest, parseLocalAiModels, parseLocalAiChat } from './shared.ts'
 
 interface Digest { bytes: number; sha256: string }
@@ -40,7 +42,7 @@ interface BuildManifest {
 }
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 const now = () => new Date().toISOString()
-const reviewedRepositoryHead = '3807bb10ca60e071d183a30392e0c0ed1ae7534e'
+const reviewedRepositoryHead = '2111f62cf2042e8ca8826f2e5dc99e3bd8dc9b61'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 const sourceRepositoryRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
 const bundle = realpathSync(__dirname)
@@ -63,19 +65,24 @@ const nativeMode = build.nativeMode ?? 'owned-xvfb'
 assert.ok(nativeMode === 'owned-xvfb' || nativeMode === 'inherited-display')
 const inheritedDisplay = nativeMode === 'inherited-display'
 const runtimeMode = build.runtimeMode ?? 'authoring'
-assert.ok(runtimeMode === 'authoring' || runtimeMode === 'local-ai')
+assert.ok(runtimeMode === 'authoring' || runtimeMode === 'local-ai' || runtimeMode === 'worldsculpt-navigation')
 const expectedLocalAi = createLocalAiConfig(
   path.join(repositoryAdmission.root, LOCAL_AI_PATH_ADMISSION.apiRootRelative),
   path.join(repositoryAdmission.root, LOCAL_AI_PATH_ADMISSION.pythonPathRelative),
 )
 const localAi = runtimeMode === 'local-ai' ? validateLocalAiConfig(build.localAi, expectedLocalAi) : null
+const worldSculptInput = runtimeMode === 'worldsculpt-navigation' ? parseWorldSculptInputContract(build.worldSculptInput) : null
 const reviewedAiModel = localAi ? parseReviewedAiModel(build.reviewedAiModel) : null
 if (localAi) {
   assert.equal(inheritedDisplay, true)
   assert.equal(process.env.WORLD_AUTHORING_RUNTIME_MODE, runtimeMode)
   assert.equal(process.env.WORLD_AUTHORING_LOCAL_AI_CONFIG, JSON.stringify(localAi))
+} else if (worldSculptInput) {
+  assert.equal(inheritedDisplay, true); assert.equal(process.env.WORLD_AUTHORING_RUNTIME_MODE, runtimeMode)
+  assert.equal(build.localAi, undefined); assert.equal(build.reviewedAiModel, undefined)
+  assert.equal(process.env.WORLD_AUTHORING_LOCAL_AI_CONFIG, undefined)
 } else {
-  assert.equal(build.localAi, undefined); assert.equal(process.env.WORLD_AUTHORING_RUNTIME_MODE, undefined)
+  assert.equal(build.localAi, undefined); assert.equal(build.worldSculptInput, undefined); assert.equal(process.env.WORLD_AUTHORING_RUNTIME_MODE, undefined)
   assert.equal(process.env.WORLD_AUTHORING_LOCAL_AI_CONFIG, undefined)
 }
 if (!inheritedDisplay) for (const [key, value] of Object.entries(process.env)) {
@@ -135,8 +142,8 @@ app.on('window-all-closed', onOwnedWindowsClosed)
 app.on('before-quit', onOwnedBeforeQuit)
 app.on('will-quit', onOwnedWillQuit)
 
-const checks: Check[] = [...CHECK_NAMES, ...(inheritedDisplay ? UI_CHECK_NAMES : []), ...(localAi ? AI_CHECK_NAMES : [])].map((name) => ({ name, status: 'UNREACHED', reason: 'Not yet reached; positive Canvas is required.' }))
-const assetPaths: readonly string[] = inheritedDisplay ? UI_ASSET_PATHS : ASSET_PATHS
+const checks: Check[] = [...CHECK_NAMES, ...(inheritedDisplay ? UI_CHECK_NAMES : []), ...(localAi ? AI_CHECK_NAMES : []), ...(worldSculptInput ? NAVIGATION_CHECK_NAMES : [])].map((name) => ({ name, status: 'UNREACHED', reason: 'Not yet reached; positive Canvas is required.' }))
+const assetPaths: readonly string[] = inheritedDisplay ? [...UI_ASSET_PATHS, ...(worldSculptInput ? WORLD_SCULPT_ASSET_PATHS : [])] : ASSET_PATHS
 const applies: Invocation[] = []
 const storedWitnesses: StoredWitness[] = []
 const ipcTrace: unknown[] = [], network: unknown[] = [], errors: string[] = [], cleanup: unknown[] = []
@@ -145,7 +152,7 @@ const evidence: Record<string, unknown> = {}
 const report: Record<string, unknown> = {
   schema: 'modly.worlds-authoring-run.v1', scope: 'source-level-full-Workbench-native-authoring', status: 'RUNNING',
   included: ['unchanged-full-WorldsWorkbench', 'default-controller-hook-service', 'shared-transform-admission', 'production-projection-SceneDock-Inspector-Viewer-Canvas-drei', 'trusted-native-pointer-input', 'real-production-IPC-repository-history', 'independent-disk-and-renderer-reopen'],
-  excluded: ['engine-completion', 'primitive-authoring', ...(!inheritedDisplay ? ['asset-import-UI'] : []), ...(!localAi ? ['AI-provider'] : []), 'Timeline-authoring', 'Play', 'audio-acceptance', 'packaged-E2E', 'performance-acceptance', 'hardware-GPU-claim', 'volatile-history-persistence'],
+  excluded: ['engine-completion', 'primitive-authoring', ...(!inheritedDisplay ? ['asset-import-UI'] : []), ...(!localAi ? ['AI-provider'] : []), 'Timeline-authoring', 'Play', 'audio-acceptance', 'packaged-E2E', 'performance-acceptance', ...(!worldSculptInput ? ['hardware-GPU-claim'] : []), 'volatile-history-persistence'],
   authoringFlow: inheritedDisplay ? 'assets-only provisioning; canonical project/both scenes/entities authored through trusted native UI' : 'legacy canonical seed plus first-scene pointer/history fixture',
   artificialGate: 'One next transform apply is held in main BEFORE the unchanged handler. This run has no performance metrics or thresholds; inherited 857 ms command p95 remains FAIL.',
   startedAt: now(), runDirectory, workspace, userData, sessionData, pid: process.pid, launcher, versions: process.versions,
@@ -573,13 +580,76 @@ let seed: SeedEvidence | undefined, seedFiles: Awaited<ReturnType<typeof diskMan
 function assertStoredResult(bytes: Buffer, transaction: LedgerTransaction, value: WorldProjectCommandSuccess): void {
   const receipt = value.receipt
   for (const key of ['transactionId', 'payloadSha256', 'resultSha256', 'appliedRevision'] as const) assert.equal(transaction[key], receipt[key])
+  assert.match(transaction.payloadSha256, /^[a-f0-9]{64}$/, 'Stored result requires an actual canonical payload digest')
   assert.match(transaction.transactionDigest, /^[a-f0-9]{64}$/, 'Stored result requires an actual confined ledger digest')
   assert.equal(hash(bytes), receipt.resultSha256, 'Stored result bytes disagree with the accepted IPC receipt')
-  const stored = JSON.parse(bytes.toString('utf8'))
-  assert.equal(stored.schema, 'modly.world-command-result.v1'); assert.equal(stored.transactionId, receipt.transactionId)
-  assert.equal(stored.newRevision, receipt.appliedRevision)
-  assert.deepEqual(stored.snapshot, value.snapshot, 'Stored result snapshot disagrees with its accepted IPC snapshot')
-  assert.deepEqual(stored.inverse, value.inverse, 'Durable stored inverse disagrees with its corresponding accepted IPC inverse')
+  assert.equal(value.newRevision, receipt.appliedRevision, 'Accepted IPC revision disagrees with its receipt')
+  assert.equal(value.snapshot.project.revision, receipt.appliedRevision, 'Accepted IPC snapshot revision disagrees with its receipt')
+  assert.equal(value.idempotent, false, 'A durable command result must represent the original canonical apply')
+  assert.match(value.projectKey, /^world-[a-f0-9]{32}$/, 'Accepted IPC result requires a confined project identity')
+
+  const isRecord = (candidate: unknown): candidate is Record<string, unknown> =>
+    candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)
+  const exactRecord = (candidate: unknown, keys: readonly string[], label: string): Record<string, unknown> => {
+    assert.ok(isRecord(candidate), `${label} must be an object`)
+    assert.deepEqual(Object.keys(candidate).sort(), [...keys].sort(), `${label} has missing or unexpected fields`)
+    return candidate
+  }
+  const storedWire: unknown = JSON.parse(bytes.toString('utf8'))
+  assert.ok(isRecord(storedWire), 'Stored command result must be an object')
+  const stored = exactRecord(storedWire, storedWire.schema === 'modly.world-command-result.v1'
+    ? ['schema', 'transactionId', 'snapshot', 'newRevision', 'changes', 'warnings', 'inverse']
+    : ['schema', 'transactionId', 'newRevision', 'changes', 'warnings', 'inverse'], 'Stored command result')
+  assert.ok(stored.schema === 'modly.world-command-result.v1' || stored.schema === 'modly.world-command-result.v2', 'Stored command result schema is unsupported')
+  assert.equal(stored.transactionId, receipt.transactionId, 'Stored transaction identity disagrees with its accepted IPC receipt')
+  assert.equal(stored.newRevision, receipt.appliedRevision, 'Stored revision disagrees with its accepted IPC receipt')
+
+  assert.equal(hash(Buffer.from(transaction.canonicalPayload)), transaction.payloadSha256, 'Ledger payload digest disagrees with its canonical payload')
+  assert.equal(hash(Buffer.from(`${transaction.transactionId}\n${transaction.canonicalPayload}`)), transaction.transactionDigest,
+    'Ledger transaction digest disagrees with its canonical identity and payload')
+  const parsedBatchWire: unknown = JSON.parse(transaction.canonicalPayload)
+  const parsedBatch = parseWorldCommandBatch(parsedBatchWire)
+  assert.ok(parsedBatch.success, 'Ledger canonical payload is not a valid command batch')
+  assert.equal(canonicalWorldCommandBatchPayload(parsedBatch.value), transaction.canonicalPayload, 'Ledger payload is not canonical')
+  assert.equal(parsedBatch.value.transactionId, transaction.transactionId, 'Ledger payload transaction identity changed')
+  assert.equal(parsedBatch.value.projectId, value.snapshot.project.projectId, 'Ledger payload project identity changed')
+  assert.equal(parsedBatch.value.baseRevision + 1, transaction.appliedRevision, 'Ledger payload revision does not produce its applied revision')
+
+  const storedInverse = exactRecord(stored.inverse, ['kind', 'snapshot'], 'Stored command inverse')
+  assert.equal(storedInverse.kind, 'world-snapshot', 'Stored inverse kind changed')
+  const validatedInverse = validateWorldProjectSnapshot(storedInverse.snapshot)
+  assert.ok(validatedInverse.success, 'Stored inverse snapshot is invalid')
+  assert.equal(validatedInverse.value.project.projectId, parsedBatch.value.projectId, 'Stored inverse project identity changed')
+  assert.equal(validatedInverse.value.project.revision, parsedBatch.value.baseRevision, 'Stored inverse revision changed')
+
+  const replayed = applyWorldCommandBatch(validatedInverse.value, parsedBatch.value)
+  assert.ok(replayed.success, 'Stored command batch cannot be replayed from its inverse')
+  assert.equal(replayed.receipt.transactionId, transaction.transactionId, 'Replayed transaction identity changed')
+  assert.equal(replayed.receipt.appliedRevision, transaction.appliedRevision, 'Replayed revision changed')
+  assert.deepEqual(stored.changes, replayed.changes, 'Durable stored changes disagree with canonical replay')
+  assert.deepEqual(stored.warnings, replayed.warnings, 'Durable stored warnings disagree with canonical replay')
+  assert.deepEqual(stored.inverse, replayed.inverse, 'Durable stored inverse disagrees with canonical replay')
+  assert.deepEqual(value, {
+    projectKey: value.projectKey,
+    snapshot: replayed.snapshot,
+    newRevision: transaction.appliedRevision,
+    idempotent: false,
+    changes: replayed.changes,
+    warnings: replayed.warnings,
+    inverse: replayed.inverse,
+    receipt: {
+      transactionId: transaction.transactionId,
+      payloadSha256: transaction.payloadSha256,
+      resultSha256: transaction.resultSha256,
+      appliedRevision: transaction.appliedRevision,
+    },
+  }, 'Accepted IPC result disagrees with the canonical durable replay')
+  if (stored.schema === 'modly.world-command-result.v1') {
+    const validatedSnapshot = validateWorldProjectSnapshot(stored.snapshot)
+    assert.ok(validatedSnapshot.success, 'Legacy stored forward snapshot is invalid')
+    assert.deepEqual(stored.snapshot, replayed.snapshot, 'Legacy stored forward snapshot disagrees with canonical replay')
+    assert.deepEqual(validatedSnapshot.value, replayed.snapshot, 'Legacy stored forward snapshot normalization disagrees with canonical replay')
+  }
 }
 async function captureStoredWitness(entry: Invocation): Promise<void> {
   const result = entry.result
@@ -675,8 +745,17 @@ async function openWindow(): Promise<Electron.WebContents> {
     callback({ cancel: !accepted })
     if (!accepted) fail(new Error(`Unexpected network request ${details.method} ${details.url}`))
   })
-  isolatedSession.setPermissionRequestHandler((_webContents, permission, callback) => { callback(false); fail(new Error(`Unexpected permission request ${permission}`)) })
-  isolatedSession.setPermissionCheckHandler(() => false)
+  const pointerLockPermissionPolicy = createWorldSculptPointerLockPermissionPolicy({
+    runtimeMode,
+    expectedOrigin: origin,
+    expectedDocumentUrl: indexUrl,
+    getOwnedWebContents: () => currentWindow && !currentWindow.isDestroyed() && !currentWindow.webContents.isDestroyed()
+      ? currentWindow.webContents
+      : null,
+    onDeniedRequest: (permission) => fail(new Error(`Unexpected permission request ${permission}`)),
+  })
+  isolatedSession.setPermissionRequestHandler(pointerLockPermissionPolicy.request)
+  isolatedSession.setPermissionCheckHandler(pointerLockPermissionPolicy.check)
   const window = new BrowserWindow({ width: 1600, height: 1000, useContentSize: true, show: false, title: 'Worlds native authoring — private fixture',
     webPreferences: { preload: path.join(bundle, 'preload.cjs'), session: isolatedSession, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
   })
@@ -716,7 +795,8 @@ async function openWindow(): Promise<Electron.WebContents> {
 
 async function run(): Promise<void> {
   if (inheritedDisplay) {
-    await provisionAuthoringInputs(workspace)
+    const bundledWorldSculpt = worldSculptInput ? await readFile(path.join(bundle, worldSculptInput.bundled.relativePath)) : null
+    await provisionAuthoringInputs(workspace, worldSculptInput && bundledWorldSculpt ? { contract: worldSculptInput, bytes: bundledWorldSculpt } : undefined)
     seedRecords.push({ phase: 'INPUT_PROVISIONING_ONLY', paths: assetPaths, canonicalSeed: false, at: now() })
     const empty = await repository.list()
     assert.ok(empty.ok && empty.value.projects.length === 0, 'Native UI lane must start with no canonical projects')
@@ -828,8 +908,24 @@ async function run(): Promise<void> {
     },
   }
   if (inheritedDisplay) {
-    const authored = await runUiAuthoredScenes(contents, ports)
+    const authored = await runUiAuthoredScenes(contents, ports, worldSculptInput ? 1 : 0)
     await runAuthoringInteractions(contents, { ...ports, seed: authored.seed }, authored)
+    if (worldSculptInput) {
+      assert.ok(currentWindow)
+      const workspaceBytes = await readFile(path.join(workspace, worldSculptInput.workspaceRelativePath))
+      const servedEntry = served.get(`/workspace/${worldSculptInput.workspaceRelativePath}`)
+      assert.ok(servedEntry)
+      await runWorldSculptNavigationAcceptance(currentWindow.webContents, {
+        ...ports,
+        source: {
+          bytes: worldSculptInput.sourceIdentity.bytes,
+          sourceSha256: worldSculptInput.sourceIdentity.sha256,
+          bundledSha256: worldSculptInput.bundled.sha256,
+          workspaceSha256: hash(workspaceBytes),
+          servedSha256: hash(servedEntry.bytes),
+        },
+      }, authored)
+    }
   } else {
     assert.ok(seed)
     await runAuthoringInteractions(contents, { ...ports, seed })

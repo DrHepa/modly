@@ -1,4 +1,4 @@
-import type { SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
+import type { SceneArtifactManifestInitialView, SceneArtifactManifestPreview, SceneArtifactManifestV1 } from '../../shared/types/artifacts.ts'
 
 export const SCENE_MANIFEST_FILE_NAME = 'scene-manifest.json'
 
@@ -78,6 +78,34 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function isSafePreviewReference(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim().replace(/\\/g, '/')
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(normalized)
+    || normalized.includes('\u0000') || /%(?:25|2e|2f|5c|00)/i.test(normalized)
+    || /%(?![0-9a-f]{2})/i.test(normalized)) return false
+  return normalized.split('/').every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+}
+
+function isSceneManifestPreview(value: unknown): value is SceneArtifactManifestPreview {
+  return isPlainObject(value)
+    && (value.image === undefined || isSafePreviewReference(value.image))
+    && (value.video === undefined || isSafePreviewReference(value.video))
+}
+
+function isFiniteTriple(value: unknown): value is [number, number, number] {
+  return Array.isArray(value) && value.length === 3
+    && value.every((component) => typeof component === 'number' && Number.isFinite(component))
+}
+
+function isSceneManifestInitialView(value: unknown): value is SceneArtifactManifestInitialView {
+  if (!isPlainObject(value)) return false
+  const { position, target, up } = value
+  if (!isFiniteTriple(position) || !isFiniteTriple(target)) return false
+  if (position.every((component, index) => component === target[index])) return false
+  return up === undefined || (isFiniteTriple(up) && up.some((component) => component !== 0))
+}
+
 function normalizeSceneRoot(sceneRoot: unknown): string | undefined {
   if (typeof sceneRoot !== 'string') return undefined
   const normalized = sceneRoot.trim().replace(/\\/g, '/')
@@ -98,18 +126,40 @@ function validateSceneManifest(manifest: unknown): { ok: true; manifest: SceneAr
     return { ok: false, error: 'Scene manifest schema must be modly.scene-manifest.v1.' }
   }
 
-  const sceneRoot = normalizeSceneRoot(manifest.sceneRoot)
-  if (!sceneRoot) {
+  const rawSceneRoot = manifest.sceneRoot
+  const sceneRoot = normalizeSceneRoot(rawSceneRoot)
+  if (typeof rawSceneRoot !== 'string' || !sceneRoot) {
     return { ok: false, error: 'Scene manifest sceneRoot must be a safe relative path.' }
   }
   if (!Array.isArray(manifest.assets)) {
     return { ok: false, error: 'Scene manifest assets must be an array.' }
   }
 
+  const { preview, initialView, ...metadata } = manifest
+  if (preview !== undefined && !isPlainObject(preview)) {
+    return { ok: false, error: 'Scene manifest preview must be a JSON object.' }
+  }
+  if (preview !== undefined && !isSceneManifestPreview(preview)) {
+    return { ok: false, error: 'Scene manifest preview image/video must be safe relative file references.' }
+  }
+  if (initialView !== undefined && !isPlainObject(initialView)) {
+    return { ok: false, error: 'Scene manifest initialView must be a JSON object.' }
+  }
+  if (initialView !== undefined && !isSceneManifestInitialView(initialView)) {
+    return { ok: false, error: 'Scene manifest initialView requires distinct finite numeric position/target triples and optional non-zero finite up.' }
+  }
+
   return {
     ok: true,
     sceneRoot,
-    manifest: manifest as SceneArtifactManifestV1,
+    manifest: {
+      ...metadata,
+      schema: 'modly.scene-manifest.v1',
+      sceneRoot: rawSceneRoot,
+      assets: manifest.assets,
+      ...(preview !== undefined ? { preview } : {}),
+      ...(initialView !== undefined ? { initialView } : {}),
+    },
   }
 }
 

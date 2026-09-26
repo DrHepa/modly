@@ -2,6 +2,39 @@ import type { AnyExtension, ArtifactRegistryReadRequest, ArtifactRegistryReadRes
 import type { AgentSession, AgentSessionActivateRequest, AgentSessionAddAttachmentRequest, AgentSessionAppendMessageRequest, AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListResult, AgentSessionReadAttachmentRequest, AgentSessionReadRequest, AgentSessionRemoveAttachmentRequest, AgentSessionRenameRequest } from '../../src/shared/types/agentSessions.ts'
 import type { AgentActionDecisionRequest, AgentActionListResult, AgentActionMutationResult, AgentActionProposeRequest, AgentActionSessionGetRequest, AgentActionSessionRequest, AgentCapabilityInventoryResult, AgentModelLeaseRequest, AgentModelLeaseResult, AgentSkillContextResolveRequestV1, AgentSkillContextResolveResultV1 } from '../../src/shared/types/agentActions.ts'
 import type { AgentWorkflowCreateRequest, AgentWorkflowCreateResult } from '../../src/shared/types/agentWorkflows.ts'
+import {
+  WORLD_PROJECT_CHANNELS,
+  type WorldProjectCommandRequest,
+  type WorldProjectCommandResult,
+  type WorldProjectCreateRequest,
+  type WorldProjectCreateResult,
+  type WorldProjectDeleteRequest,
+  type WorldProjectDeleteResult,
+  type WorldProjectKeyRequest,
+  type WorldProjectListResult,
+  type WorldProjectOpenResult,
+  type WorldProjectAiPreviewRequest,
+  type WorldProjectAiPreviewResult,
+  type WorldProjectAiDiscardRequest,
+  type WorldProjectResult,
+  type WorldsCliApi,
+  type WorldsCliDirectEditReadinessRequest,
+  type WorldsCliDirectEditAdoption,
+  type WorldsCliDirectEditCorrelation,
+  type WorldsCliDirectEditRequest,
+} from '../../src/shared/types/worldProjects.ts'
+import {
+  WORLD_RENDER_CHANNELS,
+  type WorldRenderCancelRequest,
+  type WorldRenderCancelResult,
+  type WorldRenderCreateRequest,
+  type WorldRenderCreateResult,
+  type WorldRenderDeleteRequest,
+  type WorldRenderDeleteResult,
+  type WorldRenderGetResult,
+  type WorldRenderJobKeyRequest,
+  type WorldRenderListResult,
+} from '../../src/shared/types/worldRenders.ts'
 import { invokeExtensionsRunProcess } from './run-process-ipc.ts'
 
 export type IpcRendererLike = {
@@ -153,6 +186,66 @@ export function createElectronApi({ ipcRenderer, webFrame }: ElectronApiDependen
       },
       worlds: {
         writeSceneManifest: (request: WorldsSceneManifestWriteRequest): Promise<WorldsSceneManifestWriteResult> => ipcRenderer.invoke('workspace:worlds:writeSceneManifest', request) as Promise<WorldsSceneManifestWriteResult>,
+        cli: {
+          onContextRequest: (callback) => {
+            ipcRenderer.removeAllListeners('workspace:worlds:cli:contextRequest')
+            ipcRenderer.on('workspace:worlds:cli:contextRequest', (_event, nonce) => {
+              if (typeof nonce === 'string' && /^([a-f0-9]{48})$/.test(nonce)) callback(nonce)
+            })
+            return () => ipcRenderer.removeAllListeners('workspace:worlds:cli:contextRequest')
+          },
+          respondContext: (value) => ipcRenderer.invoke('workspace:worlds:cli:contextResponse', value),
+          editorLeft: () => ipcRenderer.invoke('workspace:worlds:cli:editorLeft'),
+          onDirectEditReadinessRequest: (callback) => {
+            ipcRenderer.removeAllListeners('workspace:worlds:cli:directEditReadinessRequest')
+            ipcRenderer.on('workspace:worlds:cli:directEditReadinessRequest', (_event, value) => {
+              if (isWorldsCliReadinessRequest(value)) callback(value)
+            })
+            return () => ipcRenderer.removeAllListeners('workspace:worlds:cli:directEditReadinessRequest')
+          },
+          respondDirectEditReadiness: (value) => ipcRenderer.invoke('workspace:worlds:cli:directEditReadinessResponse', value),
+          cancelDirectEditReadiness: (value) => ipcRenderer.invoke('workspace:worlds:cli:directEditReadinessCancel', value),
+          onDirectEditRequest: (callback) => {
+            ipcRenderer.removeAllListeners('workspace:worlds:cli:directEditRequest')
+            ipcRenderer.on('workspace:worlds:cli:directEditRequest', (_event, value) => {
+              if (isWorldsCliDirectEditRequest(value)) callback(value)
+            })
+            return () => ipcRenderer.removeAllListeners('workspace:worlds:cli:directEditRequest')
+          },
+          commitDirectEdit: (value) => isWorldsCliDirectEditCommit(value)
+            ? ipcRenderer.invoke('workspace:worlds:cli:directEditCommit', value)
+            : Promise.resolve({ ok: false, code: 'INVALID_REQUEST' }),
+          cancelDirectEdit: (value) => isWorldsCliDirectEditCancel(value)
+            ? ipcRenderer.invoke('workspace:worlds:cli:directEditCancel', value)
+            : Promise.resolve({ ok: false, code: 'INVALID_REQUEST' }),
+          adoptDirectEdit: (value) => isWorldsCliDirectEditAdoption(value)
+            ? ipcRenderer.invoke('workspace:worlds:cli:directEditAdopt', value)
+            : Promise.resolve({ ok: false, code: 'INVALID_REQUEST' }),
+          status: () => ipcRenderer.invoke('workspace:worlds:cli:status'),
+          revoke: () => ipcRenderer.invoke('workspace:worlds:cli:revoke'),
+          listPending: () => ipcRenderer.invoke('workspace:worlds:cli:listPending'),
+          getReview: (request) => ipcRenderer.invoke('workspace:worlds:cli:getReview', request),
+          reject: (request) => ipcRenderer.invoke('workspace:worlds:cli:reject', request),
+          apply: (request) => ipcRenderer.invoke('workspace:worlds:cli:apply', request),
+          cancelApplyIntent: (request) => ipcRenderer.invoke('workspace:worlds:cli:cancelApplyIntent', request),
+        } as WorldsCliApi,
+        projects: {
+          create: (request: WorldProjectCreateRequest): Promise<WorldProjectCreateResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.create, request) as Promise<WorldProjectCreateResult>,
+          list: (): Promise<WorldProjectListResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.list) as Promise<WorldProjectListResult>,
+          open: (request: WorldProjectKeyRequest): Promise<WorldProjectOpenResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.open, request) as Promise<WorldProjectOpenResult>,
+          previewCommands: (request: WorldProjectCommandRequest): Promise<WorldProjectCommandResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.previewCommands, request) as Promise<WorldProjectCommandResult>,
+          applyCommands: (request: WorldProjectCommandRequest): Promise<WorldProjectCommandResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.applyCommands, request) as Promise<WorldProjectCommandResult>,
+          previewAi: (request: WorldProjectAiPreviewRequest): Promise<WorldProjectAiPreviewResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.previewAi, request) as Promise<WorldProjectAiPreviewResult>,
+          discardAi: (request: WorldProjectAiDiscardRequest): Promise<WorldProjectResult<{ discarded: true }>> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.discardAi, request) as Promise<WorldProjectResult<{ discarded: true }>>,
+          delete: (request: WorldProjectDeleteRequest): Promise<WorldProjectDeleteResult> => ipcRenderer.invoke(WORLD_PROJECT_CHANNELS.delete, request) as Promise<WorldProjectDeleteResult>,
+        },
+        renders: {
+          create: (request: WorldRenderCreateRequest): Promise<WorldRenderCreateResult> => ipcRenderer.invoke(WORLD_RENDER_CHANNELS.create, request) as Promise<WorldRenderCreateResult>,
+          list: (): Promise<WorldRenderListResult> => ipcRenderer.invoke(WORLD_RENDER_CHANNELS.list) as Promise<WorldRenderListResult>,
+          get: (request: WorldRenderJobKeyRequest): Promise<WorldRenderGetResult> => ipcRenderer.invoke(WORLD_RENDER_CHANNELS.get, request) as Promise<WorldRenderGetResult>,
+          cancel: (request: WorldRenderCancelRequest): Promise<WorldRenderCancelResult> => ipcRenderer.invoke(WORLD_RENDER_CHANNELS.cancel, request) as Promise<WorldRenderCancelResult>,
+          delete: (request: WorldRenderDeleteRequest): Promise<WorldRenderDeleteResult> => ipcRenderer.invoke(WORLD_RENDER_CHANNELS.delete, request) as Promise<WorldRenderDeleteResult>,
+        },
       },
       artifacts: {
         writeSidecar: (request: ArtifactRegistryWriteRequest): Promise<ArtifactRegistryWriteResult> => ipcRenderer.invoke('workspace:artifact:writeSidecar', request) as Promise<ArtifactRegistryWriteResult>,
@@ -216,4 +309,67 @@ export function createElectronApi({ ipcRenderer, webFrame }: ElectronApiDependen
       offError:    () => ipcRenderer.removeAllListeners('setup:error'),
     }
   }
+}
+
+function isWorldsCliReadinessRequest(value: unknown): value is WorldsCliDirectEditReadinessRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  return Object.keys(record).sort().join(',') === 'baseRevision,editorEpoch,expiresAt,intentId,nonce,projectId,projectKey,sceneId'
+    && typeof record.nonce === 'string' && /^[a-f0-9]{48}$/.test(record.nonce)
+    && typeof record.intentId === 'string' && /^intent_[a-f0-9]{48}$/.test(record.intentId)
+    && typeof record.projectKey === 'string' && /^world-[a-f0-9]{32}$/.test(record.projectKey)
+    && typeof record.projectId === 'string' && /^project:[A-Za-z0-9:_-]{1,128}$/.test(record.projectId)
+    && typeof record.sceneId === 'string' && /^scene:[A-Za-z0-9:_-]{1,128}$/.test(record.sceneId)
+    && Number.isSafeInteger(record.baseRevision) && (record.baseRevision as number) >= 0
+    && Number.isSafeInteger(record.editorEpoch) && (record.editorEpoch as number) >= 0
+    && Number.isSafeInteger(record.expiresAt) && (record.expiresAt as number) > 0
+}
+
+function isWorldsCliDirectEditRequest(value: unknown): value is WorldsCliDirectEditRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  try {
+    const record = value as Record<string, unknown>
+    return Object.keys(record).sort().join(',') === 'baseRevision,editIntent,editorEpoch,expiresAt,nonce,projectId,projectKey,sceneId'
+      && typeof record.nonce === 'string' && /^[a-f0-9]{48}$/.test(record.nonce)
+      && typeof record.editIntent === 'string' && /^edit_[a-f0-9]{48}$/.test(record.editIntent)
+      && typeof record.projectKey === 'string' && /^world-[a-f0-9]{32}$/.test(record.projectKey)
+      && typeof record.projectId === 'string' && /^project:[A-Za-z0-9:_-]{1,128}$/.test(record.projectId)
+      && typeof record.sceneId === 'string' && /^scene:[A-Za-z0-9:_-]{1,128}$/.test(record.sceneId)
+      && Number.isSafeInteger(record.baseRevision) && (record.baseRevision as number) >= 0
+      && Number.isSafeInteger(record.editorEpoch) && (record.editorEpoch as number) >= 0
+      && Number.isSafeInteger(record.expiresAt) && (record.expiresAt as number) > 0
+  } catch { return false }
+}
+
+function isWorldsCliDirectEditCommit(value: unknown): value is WorldsCliDirectEditCorrelation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  try {
+    const record = value as Record<string, unknown>
+    return Object.keys(record).sort().join(',') === 'editIntent,nonce'
+      && typeof record.nonce === 'string' && /^[a-f0-9]{48}$/.test(record.nonce)
+      && typeof record.editIntent === 'string' && /^edit_[a-f0-9]{48}$/.test(record.editIntent)
+  } catch { return false }
+}
+
+function isWorldsCliDirectEditCancel(value: unknown): value is WorldsCliDirectEditCorrelation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  try {
+    const record = value as Record<string, unknown>
+    return Object.keys(record).sort().join(',') === 'editIntent,nonce'
+      && typeof record.nonce === 'string' && /^[a-f0-9]{48}$/.test(record.nonce)
+      && typeof record.editIntent === 'string' && /^edit_[a-f0-9]{48}$/.test(record.editIntent)
+  } catch { return false }
+}
+
+function isWorldsCliDirectEditAdoption(value: unknown): value is WorldsCliDirectEditAdoption {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  try {
+    const record = value as Record<string, unknown>
+    return Object.keys(record).sort().join(',') === 'editIntent,newRevision,nonce,snapshotSha256,transactionId'
+      && typeof record.nonce === 'string' && /^[a-f0-9]{48}$/.test(record.nonce)
+      && typeof record.editIntent === 'string' && /^edit_[a-f0-9]{48}$/.test(record.editIntent)
+      && typeof record.transactionId === 'string' && /^[a-f0-9]{32}$/.test(record.transactionId)
+      && Number.isSafeInteger(record.newRevision) && (record.newRevision as number) >= 1
+      && typeof record.snapshotSha256 === 'string' && /^[a-f0-9]{64}$/.test(record.snapshotSha256)
+  } catch { return false }
 }

@@ -654,6 +654,7 @@ test('normalizes asset library read requests and rejects encoded escapes plus so
 test('lists workspace asset library entries with projected registry metadata, sidecar evidence, and fallback states', async () => {
   await withTempWorkspace(async (workspaceDir) => {
     await mkdir(path.join(workspaceDir, 'Workflows', 'generated'), { recursive: true })
+    await mkdir(path.join(workspaceDir, 'Workflows', 'worldsculpt-5a9cc08eaf924e988e527f75137ea8c4'), { recursive: true })
     await mkdir(path.join(workspaceDir, 'Workflows', 'sources'), { recursive: true })
     await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
     await mkdir(path.join(workspaceDir, 'Workflows', 'landmarks', 'run-1'), { recursive: true })
@@ -662,6 +663,7 @@ test('lists workspace asset library entries with projected registry metadata, si
 
     await writeFile(path.join(workspaceDir, 'Workflows', 'sources', 'source.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'hero.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
+    await writeFile(path.join(workspaceDir, 'Workflows', 'worldsculpt-5a9cc08eaf924e988e527f75137ea8c4', 'scene.glb'), buildMinimalGlb({ asset: { version: '2.0', generator: 'WorldSculpt synthetic test fixture' }, meshes: [{ primitives: [] }] }))
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.glb'), buildMinimalGlb({ asset: { version: '2.0' } }))
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.gltf'), '{"asset":{"version":"2.0"}}', 'utf-8')
     await writeFile(path.join(workspaceDir, 'Workflows', 'generated', 'mystery.obj'), 'o hero\nv 0 0 0\n', 'utf-8')
@@ -835,6 +837,17 @@ test('lists workspace asset library entries with projected registry metadata, si
       id: 'Workflows/generated/mystery.glb',
       workspacePath: 'Workflows/generated/mystery.glb',
       displayName: 'mystery.glb',
+      sourceScope: 'workflows',
+      capability: 'mesh',
+      state: 'ready',
+      previewKind: '3d-model',
+      warnings: [],
+    })
+
+    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb')), {
+      id: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+      workspacePath: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+      displayName: 'scene.glb',
       sourceScope: 'workflows',
       capability: 'mesh',
       state: 'ready',
@@ -2387,24 +2400,23 @@ test('motion retarget sidecars validate artifact identity and correction payload
   await withTempWorkspace(async (workspaceDir) => {
     await mkdir(path.join(workspaceDir, 'Workflows', 'motion-retarget'), { recursive: true })
     const sidecarWorkspacePath = 'Workflows/motion-retarget/mrt_0123456789abcdef.motion-retarget.v1.json'
-    const sidecar = motionRetargetSidecar({
-      identity: {
-        key: 'mrt_0123456789abcdef',
-        sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
-        skeletonContextId: 'rig:Body|skeleton:0',
-        workflowId: 'workflow-kimodo-1',
-        workflowNodeId: 'node-kimodo-1',
-        bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
-        metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
-        artifactWorkspacePath: 'Workflows/generated/kimodo/source.animated.glb',
-      },
-      corrections: {
-        rootTranslationPolicy: 'preserve_scaled_npz',
-        rootMotionScale: 1.5,
-        rootOffset: { x: 0.25, y: 0, z: -0.5 },
-        previewMode: 'after',
-      },
-    })
+    const identity = {
+      key: 'mrt_0123456789abcdef',
+      sourceWorkspacePath: 'Workflows/checkpoints/source.glb',
+      skeletonContextId: 'rig:Body|skeleton:0',
+      workflowId: 'workflow-kimodo-1',
+      workflowNodeId: 'node-kimodo-1',
+      bundleWorkspacePath: 'Workflows/generated/kimodo/source-motion',
+      metadataWorkspacePath: 'Workflows/generated/kimodo/source-motion/metadata.json',
+      artifactWorkspacePath: 'Workflows/generated/kimodo/source.animated.glb',
+    }
+    const corrections = {
+      rootTranslationPolicy: 'preserve_scaled_npz',
+      rootMotionScale: 1.5,
+      rootOffset: { x: 0.25, y: 0, z: -0.5 },
+      previewMode: 'after',
+    }
+    const sidecar = motionRetargetSidecar({ identity, corrections })
 
     const writeResult = await writeMotionRetargetSidecar({
       workspaceDir,
@@ -2418,11 +2430,11 @@ test('motion retarget sidecars validate artifact identity and correction payload
     assert.deepEqual(readResult, { success: true, status: 'found', sidecarWorkspacePath, sidecar })
 
     for (const invalidSidecar of [
-      motionRetargetSidecar({ identity: { ...sidecar.identity, key: 'hero' } }),
-      motionRetargetSidecar({ identity: { ...sidecar.identity, sourceWorkspacePath: 'Workflows/checkpoints/other.glb' } }),
-      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootTranslationPolicy: 'basis_override' } }),
-      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootMotionScale: 4 } }),
-      motionRetargetSidecar({ corrections: { ...sidecar.corrections, rootOffset: { x: 0, y: Number.POSITIVE_INFINITY, z: 0 } } }),
+      motionRetargetSidecar({ identity: { ...identity, key: 'hero' } }),
+      motionRetargetSidecar({ identity: { ...identity, sourceWorkspacePath: 'Workflows/checkpoints/other.glb' } }),
+      motionRetargetSidecar({ corrections: { ...corrections, rootTranslationPolicy: 'basis_override' } }),
+      motionRetargetSidecar({ corrections: { ...corrections, rootMotionScale: 4 } }),
+      motionRetargetSidecar({ corrections: { ...corrections, rootOffset: { x: 0, y: Number.POSITIVE_INFINITY, z: 0 } } }),
     ]) {
       const invalid = await writeMotionRetargetSidecar({
         workspaceDir,

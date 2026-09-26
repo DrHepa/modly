@@ -22,6 +22,7 @@ export default tseslint.config(
       '**/dist/**',
       '**/out/**',
       '**/node_modules/**',
+      'docs/worlds-engine-evidence/**',
       '**/*.d.ts',
       '**/*.js',
       '**/*.tsbuildinfo'
@@ -38,7 +39,12 @@ export default tseslint.config(
     rules: commonTypeScriptRules
   },
   {
-    files: ['electron/**/*.ts', 'electron.vite.config.ts'],
+    files: [
+      'electron/**/*.ts',
+      'electron.vite.config.ts',
+      'scripts/verify-world-ffmpeg-package.ts',
+      'scripts/world-ffmpeg-native-e2e.ts'
+    ],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     languageOptions: {
       ecmaVersion: 'latest',

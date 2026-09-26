@@ -4,6 +4,69 @@ import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { AUTOMATION_HTTP_BRIDGE_PATH, AutomationHttpBridge } from './automation-http-bridge.ts'
 
+let loopbackListenSupport
+
+function listenOnLoopback(server, port) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      server.off('listening', onListening)
+      server.off('error', onError)
+    }
+    const onListening = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = (error) => {
+      cleanup()
+      reject(error)
+    }
+
+    server.once('listening', onListening)
+    server.once('error', onError)
+    try {
+      server.listen(port, '127.0.0.1')
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
+  })
+}
+
+function closeListeningServer(server) {
+  if (!server.listening) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve())
+  })
+}
+
+async function probeLoopbackListenSupport() {
+  const server = createServer()
+  try {
+    await listenOnLoopback(server, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') return false
+    throw error
+  } finally {
+    await closeListeningServer(server)
+  }
+}
+
+function canListenOnLoopback() {
+  return loopbackListenSupport ??= probeLoopbackListenSupport()
+}
+
+function loopbackTest(name, body) {
+  test(name, async (t) => {
+    if (!(await canListenOnLoopback())) {
+      t.skip('IPv4 loopback listeners are unavailable on this test host.')
+      return
+    }
+
+    await body(t)
+  })
+}
+
 async function startBridge(getAutomationCapabilities, options = {}) {
   const bridge = new AutomationHttpBridge({
     host: '127.0.0.1',
@@ -28,7 +91,7 @@ async function requestJson(pathname, init, bridge) {
   return fetch(`${origin}${pathname}`, init)
 }
 
-test('AutomationHttpBridge returns 200 for partial-success capability payloads', async () => {
+loopbackTest('AutomationHttpBridge returns 200 for partial-success capability payloads', async () => {
   const loggerMessages = { info: [], warn: [] }
   const partialResponse = {
     backend_ready: false,
@@ -81,7 +144,7 @@ test('AutomationHttpBridge returns 200 for partial-success capability payloads',
   }
 })
 
-test('AutomationHttpBridge returns 404 for unsupported paths', async () => {
+loopbackTest('AutomationHttpBridge returns 404 for unsupported paths', async () => {
   const bridge = await startBridge(async () => {
     throw new Error('should not be called for 404')
   })
@@ -95,7 +158,7 @@ test('AutomationHttpBridge returns 404 for unsupported paths', async () => {
   }
 })
 
-test('AutomationHttpBridge returns 405 and Allow header for non-GET methods', async () => {
+loopbackTest('AutomationHttpBridge returns 405 and Allow header for non-GET methods', async () => {
   const bridge = await startBridge(async () => {
     throw new Error('should not be called for 405')
   })
@@ -110,7 +173,7 @@ test('AutomationHttpBridge returns 405 and Allow header for non-GET methods', as
   }
 })
 
-test('AutomationHttpBridge returns 500 for unexpected bridge errors', async () => {
+loopbackTest('AutomationHttpBridge returns 500 for unexpected bridge errors', async () => {
   const loggerMessages = []
   const bridge = await startBridge(
     async () => {
@@ -145,7 +208,7 @@ test('AutomationHttpBridge returns 500 for unexpected bridge errors', async () =
   }
 })
 
-test('AutomationHttpBridge surfaces bind failures without leaving a listening server behind', async () => {
+loopbackTest('AutomationHttpBridge surfaces bind failures without leaving a listening server behind', async () => {
   const occupiedServer = createServer()
   occupiedServer.listen(0, '127.0.0.1')
   await once(occupiedServer, 'listening')

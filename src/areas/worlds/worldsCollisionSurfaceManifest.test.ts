@@ -143,7 +143,9 @@ test('collision surface manifest canonicalizes triangle winding and rejects pres
 
   assert.equal(parsed.success, true)
   if (parsed.success) {
-    assert.deepEqual(parsed.surfaces[0]?.geometry.vertices, [[-1, -1], [-1, 1], [1, -1]])
+    const surface = parsed.surfaces[0]
+    assert.ok(surface?.shape === 'tri')
+    assert.deepEqual(surface.geometry.vertices, [[-1, -1], [-1, 1], [1, -1]])
   }
 
   assert.deepEqual(parseWorldsCollisionSurfaceManifest({
@@ -159,6 +161,58 @@ test('collision surface manifest canonicalizes triangle winding and rejects pres
     success: false,
     error: 'World collision surface 1 ("tri-2") uses preset "square" which is incompatible with shape tri.',
   })
+})
+
+test('collision surface manifest rejects wrapped and accessor inputs without throwing or invoking ordinary reads', () => {
+  const source = createEmptyWorldsCollisionSurfaceManifest()
+  let reads = 0
+  const transparent = new Proxy(source, {
+    get(target, property, receiver) {
+      reads += 1
+      return Reflect.get(target, property, receiver)
+    },
+  })
+  const transparentResult = parseWorldsCollisionSurfaceManifest(transparent)
+  assert.equal(transparentResult.success, false)
+  assert.equal(reads, 0)
+
+  const throwing = new Proxy(source, {
+    get() {
+      throw new Error('wrapper trap')
+    },
+  })
+  assert.doesNotThrow(() => parseWorldsCollisionSurfaceManifest(throwing))
+  assert.equal(parseWorldsCollisionSurfaceManifest(throwing).success, false)
+
+  let getterCalls = 0
+  const accessor = { surfaces: [] as unknown[] }
+  Object.defineProperty(accessor, 'schema', {
+    enumerable: true,
+    get() {
+      getterCalls += 1
+      return WORLDS_COLLISION_SURFACE_MANIFEST_SCHEMA
+    },
+  })
+  assert.equal(parseWorldsCollisionSurfaceManifest(accessor).success, false)
+  assert.equal(getterCalls, 0)
+})
+
+test('collision surface manifest builder rejects shape-incompatible presets before emitting output', () => {
+  assert.throws(() => buildWorldsCollisionSurfaceManifest([{
+    id: 'rect-with-triangle-preset',
+    shape: 'rect',
+    preset: 'triangle',
+    transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    geometry: { halfWidth: 1, halfHeight: 1 },
+  }]), /is invalid/)
+
+  assert.throws(() => buildWorldsCollisionSurfaceManifest([{
+    id: 'tri-with-floor-preset',
+    shape: 'tri',
+    preset: 'floor',
+    transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    geometry: { vertices: [[0, 0], [0, 1], [1, 0]] },
+  }]), /is invalid/)
 })
 
 test('collision surface manifest clones on input and output boundaries', () => {

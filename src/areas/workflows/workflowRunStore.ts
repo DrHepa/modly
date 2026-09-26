@@ -43,7 +43,7 @@ import {
   type LegacyWorkflowOutput,
 } from './workflowArtifacts.ts'
 import { resolveSceneSourceManifest } from './workflowSceneSource.ts'
-import { addWorkflowOutputUrlToWorlds } from './workflowWorldsOutput.ts'
+import { routeWorkflowOutputToWorlds } from './workflowWorldsOutput.ts'
 import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from './workflowActiveGraph.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -1062,6 +1062,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
     const selectedImagePath = appState.selectedImagePath ?? ''
     const selectedImageData = overrideImageData ?? appState.selectedImageData ?? undefined
     const currentMeshUrl    = appState.currentJob?.outputUrl
+    const workflowExecutionId = crypto.randomUUID()
 
     set({
       activeWorkflowId: workflow.id,
@@ -1081,7 +1082,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
     })
 
     appState.setCurrentJob({
-      id: crypto.randomUUID(),
+      id: workflowExecutionId,
       imageFile: selectedImagePath,
       status: 'generating',
       progress: 0,
@@ -1761,9 +1762,15 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
           const selectedOutputType = selectedOutput?.outputType
           if (selectedPath?.startsWith(workspaceDir)) {
             const selectedUrl = `/workspace/${selectedPath.slice(workspaceDir.length).replace(/^\//, '')}`
-            await addWorkflowOutputUrlToWorlds(
+            await routeWorkflowOutputToWorlds(
               selectedUrl,
               isArtifactKind(selectedOutputType) ? selectedOutputType : undefined,
+              {
+                runId: workflowExecutionId,
+                sourceNodeId: edge.source,
+                targetNodeId: edge.target,
+                artifactId: nodeArtifacts.get(edge.source)?.id,
+              },
             )
           }
         }

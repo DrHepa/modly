@@ -6,7 +6,12 @@ import type {
   WorldCollisionSurfaceTransform,
   WorldCollisionTriGeometry,
 } from './worldsCollisionSurfaces.ts'
-import { cloneWorldCollisionSurface, normalizeWorldCollisionSurface } from './worldsCollisionSurfaces.ts'
+import {
+  cloneWorldCollisionSurface,
+  isWorldCollisionSurfacePresetCompatibleWithShape,
+  normalizeWorldCollisionSurface,
+} from './worldsCollisionSurfaces.ts'
+import { normalizeWorldWireValue } from './core/worldWireValidation.ts'
 
 export const WORLDS_COLLISION_SURFACE_MANIFEST_SCHEMA = 'modly.collision-surfaces.v1'
 
@@ -62,6 +67,11 @@ export function parseWorldsCollisionSurfaceManifestText(text: string): ParseWorl
 }
 
 export function parseWorldsCollisionSurfaceManifest(manifest: unknown): ParseWorldsCollisionSurfaceManifestResult {
+  const normalizedWire = normalizeWorldWireValue(manifest, 'manifest')
+  if (!normalizedWire.success) {
+    return { success: false, error: 'World collision surface manifest must be JSON-cloneable data without wrappers.' }
+  }
+  manifest = normalizedWire.value
   if (!isRecord(manifest)) {
     return { success: false, error: 'World collision surface manifest must be a JSON object.' }
   }
@@ -130,7 +140,7 @@ function parseManifestSurface(value: unknown, index: number): { success: true; s
     if (!geometry) {
       return { success: false, error: `World collision surface ${identifier} has invalid rect geometry.` }
     }
-    if (preset && !isPresetCompatibleWithShape(preset, 'rect')) {
+    if (preset && !isWorldCollisionSurfacePresetCompatibleWithShape(preset, 'rect')) {
       return { success: false, error: `World collision surface ${identifier} uses preset ${JSON.stringify(preset)} which is incompatible with shape rect.` }
     }
 
@@ -154,7 +164,7 @@ function parseManifestSurface(value: unknown, index: number): { success: true; s
     if (!geometry) {
       return { success: false, error: `World collision surface ${identifier} has invalid triangle geometry.` }
     }
-    if (preset && !isPresetCompatibleWithShape(preset, 'tri')) {
+    if (preset && !isWorldCollisionSurfacePresetCompatibleWithShape(preset, 'tri')) {
       return { success: false, error: `World collision surface ${identifier} uses preset ${JSON.stringify(preset)} which is incompatible with shape tri.` }
     }
 
@@ -192,21 +202,22 @@ function parseTransform(value: unknown): WorldCollisionSurfaceTransform | null {
 
 function parseRectGeometry(value: unknown): WorldCollisionRectGeometry | null {
   if (!isRecord(value)) return null
-  if (!Number.isFinite(value.halfWidth) || !Number.isFinite(value.halfHeight)) return null
-  if (value.halfWidth <= 0 || value.halfHeight <= 0) return null
+  const halfWidth = typeof value.halfWidth === 'number' ? value.halfWidth : null
+  const halfHeight = typeof value.halfHeight === 'number' ? value.halfHeight : null
+  if (halfWidth === null || halfHeight === null || !Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return null
+  if (halfWidth <= 0 || halfHeight <= 0) return null
   return {
-    halfWidth: value.halfWidth,
-    halfHeight: value.halfHeight,
+    halfWidth,
+    halfHeight,
   }
 }
 
 function parseTriGeometry(value: unknown): WorldCollisionTriGeometry | null {
   if (!isRecord(value) || !Array.isArray(value.vertices) || value.vertices.length !== 3) return null
-  const vertices = value.vertices.map(parseTuple2)
-  if (vertices.some((vertex) => !vertex)) return null
-  return {
-    vertices: vertices as WorldCollisionTriGeometry['vertices'],
-  }
+  const first = parseTuple2(value.vertices[0])
+  const second = parseTuple2(value.vertices[1])
+  const third = parseTuple2(value.vertices[2])
+  return first && second && third ? { vertices: [first, second, third] } : null
 }
 
 function parseTuple2(value: unknown): [number, number] | null {
@@ -234,13 +245,6 @@ function parsePreset(value: unknown): WorldCollisionSurfacePreset | null {
     || value === 'ramp'
     ? value
     : null
-}
-
-function isPresetCompatibleWithShape(preset: WorldCollisionSurfacePreset, shape: WorldCollisionSurface['shape']): boolean {
-  if (shape === 'rect') {
-    return preset === 'rectangle' || preset === 'square' || preset === 'wall' || preset === 'floor' || preset === 'ramp'
-  }
-  return preset === 'triangle'
 }
 
 function describeSurface(index: number, id?: string): string {

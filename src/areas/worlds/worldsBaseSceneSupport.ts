@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 
 import type { WorldSceneItem } from './worldRenderableResolver.ts'
+import type { WorldSceneItemTransformUpdate } from './worldsScenePlacement.ts'
 import type { WorldsCollisionBounds } from './worldsCollisionMath.ts'
 import { raycastWorldsBaseScenePlacementSurface } from './worldsBaseSceneRaycast.ts'
 import { resolveWorldsPlacementSurfaceSupport } from './worldsBaseScenePlacementSurface.ts'
@@ -26,7 +27,7 @@ export interface ResolveWorldsBaseSceneSupportPlacementInput {
 export type WorldsBaseSceneSupportPlacementResult =
   | {
     status: 'applied'
-    updates: WorldsSurfacePlacementItemTransformUpdate[]
+    updates: WorldSceneItemTransformUpdate[]
     correctionDelta: [number, number, number]
     sourceId: string
   }

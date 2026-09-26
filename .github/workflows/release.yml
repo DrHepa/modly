@@ -8,133 +8,445 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: world-ffmpeg-release-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  # ─── Create a single release ────────────────────────────────────────────────
   create-release:
     runs-on: ubuntu-latest
+    outputs:
+      WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ steps.draft.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Create release
-        run: |
-          gh release create ${{ github.ref_name }} \
-            --title "Modly Beta ${{ github.ref_name }}" \
-            --generate-notes \
-            --latest \
-            --repo ${{ github.repository }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ─── Windows build ────────────────────────────────────────────────────────────
-  build-windows:
-    needs: create-release
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Download Python embed
-        run: node scripts/download-python-embed.js
-
-      - name: Build & Package (Windows)
-        shell: bash
-        run: npm run build && npx electron-builder --win --publish never
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-
-      - name: Upload assets to release
-        shell: bash
-        run: |
-          gh release upload ${{ github.ref_name }} \
-            dist/*.exe \
-            dist/*.exe.blockmap \
-            dist/latest.yml \
-            --repo ${{ github.repository }} \
-            --clobber
+          node-version: '24'
+      - name: Reconcile exact draft or already-public release
+        id: draft
+        run: >-
+          node scripts/world-ffmpeg-release-draft.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --title "Modly Beta ${{ github.ref_name }}"
+          --target-commitish "${{ github.sha }}" --github-output "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
 
-  # ─── macOS build (arm64) ─────────────────────────────────────────────────────
-  # Build non signé / non notarisé (pas de licence Apple Developer). Le hook
-  # scripts/after-pack.js applique une signature ad-hoc, requise pour que l'app
-  # se lance sur Apple Silicon. Au premier lancement l'utilisateur doit faire
-  # clic droit > Ouvrir (Gatekeeper : "développeur non vérifié").
-  #
-  # macos-latest est un runner arm64 — pas de build pour les Mac Intel.
-  # latest-mac.yml n'est volontairement pas publié : l'auto-update est désactivé
-  # sur darwin (electron-updater exige une signature Developer ID).
-  build-macos:
-    needs: create-release
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Download Python embed
-        run: node scripts/download-python-embed.js
-
-      - name: Build & Package (macOS arm64)
-        run: npm run build && npx electron-builder --mac --arm64 --publish never
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-
-      - name: Upload assets to release
-        run: |
-          gh release upload ${{ github.ref_name }} \
-            dist/*.dmg \
-            --repo ${{ github.repository }} \
-            --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ─── Linux build ─────────────────────────────────────────────────────────────
-  build-linux:
+  publish-world-ffmpeg-source:
     needs: create-release
     runs-on: ubuntu-latest
+    outputs:
+      WORLD_FFMPEG_SOURCE_UPLOAD_RECEIPT: ${{ steps.upload.outputs.WORLD_FFMPEG_SOURCE_UPLOAD_RECEIPT }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Download Python embed
-        run: node scripts/download-python-embed.js
-
-      - name: Build & Package (Linux)
-        run: npm run build && npx electron-builder --linux --publish never
-
-      - name: Upload assets to release
+          node-version: '24'
+      - name: Fetch pinned FFmpeg corresponding-source inputs
         run: |
-          gh release upload ${{ github.ref_name }} \
-            dist/*.AppImage \
-            dist/latest-linux.yml \
-            --repo ${{ github.repository }} \
-            --clobber
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-sources" "$RUNNER_TEMP/world-ffmpeg-release"
+          npm run fetch:world-ffmpeg-sources -- --destination "$RUNNER_TEMP/world-ffmpeg-sources"
+      - name: Create atomic deterministic corresponding-source generation
+        run: |
+          npm run create:world-ffmpeg-sources -- \
+            --source-cache "$RUNNER_TEMP/world-ffmpeg-sources" \
+            --work-root "$RUNNER_TEMP/world-ffmpeg-source-work" \
+            --destination "$RUNNER_TEMP/world-ffmpeg-release" \
+            --gpg "$(command -v gpg)" --gpgv "$(command -v gpgv)"
+      - name: Reconcile exact open corresponding-source generation with release
+        id: upload
+        run: |
+          set -Eeuo pipefail
+          generation="$RUNNER_TEMP/world-ffmpeg-release/modly-world-ffmpeg-7.1.1-sources"
+          test -f "$generation/modly-world-ffmpeg-7.1.1-sources.tar.xz"
+          test -f "$generation/modly-world-ffmpeg-7.1.1-sources.tar.xz.sha256"
+          test -f "$generation/GENERATION.v1.json"
+          test -f "$generation/READY.v1.json"
+          node scripts/world-ffmpeg-source-release-uploader.mjs \
+            --generation "$generation" \
+            --tag "${{ github.ref_name }}" --repository "${{ github.repository }}" \
+            --github-output "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+
+  build-windows:
+    needs: [create-release, publish-world-ffmpeg-source]
+    runs-on: windows-latest
+    outputs:
+      WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT: ${{ steps.upload.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            gnupg
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            nasm
+            tar
+            xz
+            yasm
+      - run: npm ci
+      - name: Download Python embed (explicit network phase)
+        run: node scripts/download-python-embed.js
+      - name: Fetch pinned FFmpeg source inputs (explicit network phase)
+        shell: msys2 {0}
+        run: |
+          set -Eeuo pipefail
+          root="$(cygpath -u "$RUNNER_TEMP")"
+          mkdir -p "$root/world-ffmpeg-sources"
+          npm run fetch:world-ffmpeg-sources -- --destination "$root/world-ffmpeg-sources"
+      - name: Require release key, build, audit, sign, and install FFmpeg 7.1.1
+        shell: msys2 {0}
+        run: |
+          set -Eeuo pipefail
+          root="$(cygpath -u "$RUNNER_TEMP")"
+          mkdir -p "$root/world-ffmpeg-trust" "$root/world-ffmpeg-output"
+          node scripts/world-ffmpeg-release-key.mjs --output "$root/world-ffmpeg-release-private-key.pem"
+          npm run prepare:world-ffmpeg-build-trust -- \
+            --output "$root/world-ffmpeg-trust" --key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$root/world-ffmpeg-release-private-key.pem"
+          bash scripts/build-world-ffmpeg-runtime.sh \
+            --target win32-x64 --source-cache "$root/world-ffmpeg-sources" --source-mode acquisition \
+            --work-root "$root/world-ffmpeg-work" --output "$root/world-ffmpeg-output" \
+            --inspector "$(command -v objdump)" --gpg "$(command -v gpg)" --gpgv "$(command -v gpgv)" \
+            --signing-key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$root/world-ffmpeg-release-private-key.pem" \
+            --trusted-keys "$root/world-ffmpeg-trust/trusted-keys.v1.json"
+          npm run install:world-ffmpeg-runtime -- \
+            --target win32-x64 --source-resources "$root/world-ffmpeg-output" \
+            --repository-resources "$PWD/resources" \
+            --trust-file "$root/world-ffmpeg-trust/trusted-keys.v1.json"
+        env:
+          WORLD_FFMPEG_BUILD_JOBS: '2'
+          WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64: ${{ secrets.WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64 }}
+      - name: Build application with release trust
+        run: npm run build
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}\world-ffmpeg-trust\trusted-keys.v1.json
+      - name: Verify audited runtime and report
+        run: >-
+          npm run verify:world-ffmpeg-package -- --platform win32 --arch x64
+          --trust-file "${{ runner.temp }}\world-ffmpeg-trust\trusted-keys.v1.json"
+      - name: Run exact native fallback proof
+        run: >-
+          npm run test:world-ffmpeg-native -- --resources "${{ github.workspace }}\resources"
+          --trust-file "${{ runner.temp }}\world-ffmpeg-trust\trusted-keys.v1.json"
+      - name: Prepare pinned electron-builder cache (explicit network phase)
+        run: |
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\world-package-cache" | Out-Null
+          npm run prepare:package-tool-cache -- --target win32-x64 --cache "$env:RUNNER_TEMP\world-package-cache"
+      - name: Package offline and independently verify emitted resources
+        shell: C:\Windows\System32\cmd.exe /d /s /c "call {0}"
+        run: scripts\world-ffmpeg-clean-package.cmd > "%RUNNER_TEMP%\world-ffmpeg-package-output.txt"
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}\world-ffmpeg-trust\trusted-keys.v1.json
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}\world-package-cache
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify exact package result receipt
+        id: package
+        shell: pwsh
+        run: >-
+          node scripts/world-ffmpeg-package-result.mjs
+          --bootstrap-output "$env:RUNNER_TEMP\world-ffmpeg-package-output.txt"
+          --github-output "$env:GITHUB_OUTPUT"
+      - name: Reconcile exact open Windows package bytes and bound receipts with release
+        id: upload
+        shell: pwsh
+        run: >-
+          node scripts/world-ffmpeg-release-uploader.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --github-output "$env:GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT: ${{ steps.package.outputs.WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+
+  build-macos:
+    needs: [create-release, publish-world-ffmpeg-source]
+    runs-on: macos-26
+    outputs:
+      WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT: ${{ steps.upload.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - name: Require Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - run: npm ci
+      - name: Install native build dependencies (explicit network phase)
+        run: brew install gnupg nasm pkg-config yasm
+      - name: Download Python embed (explicit network phase)
+        run: node scripts/download-python-embed.js
+      - name: Fetch pinned FFmpeg source inputs (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-sources"
+          npm run fetch:world-ffmpeg-sources -- --destination "$RUNNER_TEMP/world-ffmpeg-sources"
+      - name: Require release key, build, audit, sign, and install FFmpeg 7.1.1
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-trust" "$RUNNER_TEMP/world-ffmpeg-output"
+          node scripts/world-ffmpeg-release-key.mjs --output "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run prepare:world-ffmpeg-build-trust -- \
+            --output "$RUNNER_TEMP/world-ffmpeg-trust" --key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run build:world-ffmpeg-runtime -- \
+            --target darwin-arm64 --source-cache "$RUNNER_TEMP/world-ffmpeg-sources" --source-mode acquisition \
+            --work-root "$RUNNER_TEMP/world-ffmpeg-work" --output "$RUNNER_TEMP/world-ffmpeg-output" \
+            --inspector /usr/bin/otool --gpg "$(command -v gpg)" --gpgv "$(command -v gpgv)" \
+            --signing-key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem" \
+            --trusted-keys "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+          npm run install:world-ffmpeg-runtime -- \
+            --target darwin-arm64 --source-resources "$RUNNER_TEMP/world-ffmpeg-output" \
+            --repository-resources "$GITHUB_WORKSPACE/resources" \
+            --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+        env:
+          WORLD_FFMPEG_BUILD_JOBS: '2'
+          WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64: ${{ secrets.WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64 }}
+      - name: Build application with release trust
+        run: npm run build
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+      - name: Verify audited runtime and report
+        run: >-
+          npm run verify:world-ffmpeg-package -- --platform darwin --arch arm64
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Run exact native fallback proof
+        run: >-
+          npm run test:world-ffmpeg-native -- --resources "$GITHUB_WORKSPACE/resources"
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Prepare pinned electron-builder cache (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-package-cache"
+          npm run prepare:package-tool-cache -- --target darwin-arm64 --cache "$RUNNER_TEMP/world-package-cache"
+      - name: Package offline and independently verify emitted resources
+        run: ./scripts/world-ffmpeg-clean-package > "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/world-package-cache
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify exact package result receipt
+        id: package
+        run: >-
+          node scripts/world-ffmpeg-package-result.mjs
+          --bootstrap-output "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Reconcile exact open macOS package bytes and bound receipts with release
+        id: upload
+        run: >-
+          node scripts/world-ffmpeg-release-uploader.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --github-output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT: ${{ steps.package.outputs.WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+
+  build-linux:
+    needs: [create-release, publish-world-ffmpeg-source]
+    runs-on: ubuntu-latest
+    outputs:
+      WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT: ${{ steps.upload.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Install native build and package dependencies (explicit network phase)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gnupg nasm pkg-config rpm xz-utils yasm
+      - name: Fetch pinned FFmpeg source inputs (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-sources"
+          npm run fetch:world-ffmpeg-sources -- --destination "$RUNNER_TEMP/world-ffmpeg-sources"
+      - name: Require release key, build, audit, sign, and install FFmpeg 7.1.1
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-trust" "$RUNNER_TEMP/world-ffmpeg-output"
+          node scripts/world-ffmpeg-release-key.mjs --output "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run prepare:world-ffmpeg-build-trust -- \
+            --output "$RUNNER_TEMP/world-ffmpeg-trust" --key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run build:world-ffmpeg-runtime -- \
+            --target linux-x64 --source-cache "$RUNNER_TEMP/world-ffmpeg-sources" --source-mode acquisition \
+            --work-root "$RUNNER_TEMP/world-ffmpeg-work" --output "$RUNNER_TEMP/world-ffmpeg-output" \
+            --inspector "$(command -v readelf)" --gpg "$(command -v gpg)" --gpgv "$(command -v gpgv)" \
+            --signing-key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem" \
+            --trusted-keys "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+          npm run install:world-ffmpeg-runtime -- \
+            --target linux-x64 --source-resources "$RUNNER_TEMP/world-ffmpeg-output" \
+            --repository-resources "$GITHUB_WORKSPACE/resources" \
+            --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+        env:
+          WORLD_FFMPEG_BUILD_JOBS: '2'
+          WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64: ${{ secrets.WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64 }}
+      - name: Build application with release trust
+        run: npm run build
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+      - name: Verify audited runtime and report
+        run: >-
+          npm run verify:world-ffmpeg-package -- --platform linux --arch x64
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Run exact native fallback proof
+        run: >-
+          npm run test:world-ffmpeg-native -- --resources "$GITHUB_WORKSPACE/resources"
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Prepare pinned electron-builder cache (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-package-cache"
+          npm run prepare:package-tool-cache -- --target linux-x64 --cache "$RUNNER_TEMP/world-package-cache"
+      - name: Package offline and independently verify emitted resources
+        run: ./scripts/world-ffmpeg-clean-package > "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/world-package-cache
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify exact package result receipt
+        id: package
+        run: >-
+          node scripts/world-ffmpeg-package-result.mjs
+          --bootstrap-output "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Reconcile exact open Linux package bytes and bound receipts with release
+        id: upload
+        run: >-
+          node scripts/world-ffmpeg-release-uploader.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --github-output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT: ${{ steps.package.outputs.WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+
+  build-linux-arm64:
+    needs: [create-release, publish-world-ffmpeg-source]
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT: ${{ steps.upload.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+    steps:
+      - name: Require Ubuntu 24.04 AArch64 baseline
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.39'
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Install native build and package dependencies (explicit network phase)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gnupg nasm pkg-config rpm xz-utils yasm
+      - name: Fetch pinned FFmpeg source inputs (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-sources"
+          npm run fetch:world-ffmpeg-sources -- --destination "$RUNNER_TEMP/world-ffmpeg-sources"
+      - name: Require release key, build, audit, sign, and install FFmpeg 7.1.1
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/world-ffmpeg-trust" "$RUNNER_TEMP/world-ffmpeg-output"
+          node scripts/world-ffmpeg-release-key.mjs --output "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run prepare:world-ffmpeg-build-trust -- \
+            --output "$RUNNER_TEMP/world-ffmpeg-trust" --key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem"
+          npm run build:world-ffmpeg-runtime -- \
+            --target linux-arm64 --source-cache "$RUNNER_TEMP/world-ffmpeg-sources" --source-mode acquisition \
+            --work-root "$RUNNER_TEMP/world-ffmpeg-work" --output "$RUNNER_TEMP/world-ffmpeg-output" \
+            --inspector "$(command -v readelf)" --gpg "$(command -v gpg)" --gpgv "$(command -v gpgv)" \
+            --signing-key-id modly-release-ffmpeg-7.1.1 \
+            --private-key "$RUNNER_TEMP/world-ffmpeg-release-private-key.pem" \
+            --trusted-keys "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+          npm run install:world-ffmpeg-runtime -- \
+            --target linux-arm64 --source-resources "$RUNNER_TEMP/world-ffmpeg-output" \
+            --repository-resources "$GITHUB_WORKSPACE/resources" \
+            --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+        env:
+          WORLD_FFMPEG_BUILD_JOBS: '2'
+          WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64: ${{ secrets.WORLD_FFMPEG_RELEASE_PRIVATE_KEY_B64 }}
+      - name: Build application with release trust
+        run: npm run build
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+      - name: Verify audited runtime and report
+        run: >-
+          npm run verify:world-ffmpeg-package -- --platform linux --arch arm64
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Run exact native fallback proof
+        run: >-
+          npm run test:world-ffmpeg-native -- --resources "$GITHUB_WORKSPACE/resources"
+          --trust-file "$RUNNER_TEMP/world-ffmpeg-trust/trusted-keys.v1.json"
+      - name: Prepare pinned electron-builder cache (explicit network phase)
+        run: |
+          mkdir -p "$RUNNER_TEMP/world-package-cache"
+          npm run prepare:package-tool-cache -- --target linux-arm64 --cache "$RUNNER_TEMP/world-package-cache"
+      - name: Package offline and independently verify emitted resources
+        run: ./scripts/world-ffmpeg-clean-package > "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+        env:
+          WORLD_FFMPEG_BUILD_TRUST_FILE: ${{ runner.temp }}/world-ffmpeg-trust/trusted-keys.v1.json
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/world-package-cache
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify exact package result receipt
+        id: package
+        run: >-
+          node scripts/world-ffmpeg-package-result.mjs
+          --bootstrap-output "$RUNNER_TEMP/world-ffmpeg-package-output.txt"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Reconcile exact open Linux ARM64 package bytes and bound receipts with release
+        id: upload
+        run: >-
+          node scripts/world-ffmpeg-release-uploader.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --github-output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT: ${{ steps.package.outputs.WORLD_FFMPEG_PACKAGE_RESULT_RECEIPT }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+
+  publish-release:
+    needs: [create-release, publish-world-ffmpeg-source, build-windows, build-macos, build-linux, build-linux-arm64]
+    runs-on: ubuntu-latest
+    outputs:
+      WORLD_FFMPEG_RELEASE_PUBLICATION_RECEIPT: ${{ steps.publish.outputs.WORLD_FFMPEG_RELEASE_PUBLICATION_RECEIPT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Reconcile exact remote release bytes before publication
+        id: publish
+        run: >-
+          node scripts/world-ffmpeg-release-finalizer.mjs
+          --tag "${{ github.ref_name }}" --repository "${{ github.repository }}"
+          --github-output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT: ${{ needs.create-release.outputs.WORLD_FFMPEG_RELEASE_DRAFT_RECEIPT }}
+          WORLD_FFMPEG_SOURCE_UPLOAD_RECEIPT: ${{ needs.publish-world-ffmpeg-source.outputs.WORLD_FFMPEG_SOURCE_UPLOAD_RECEIPT }}
+          WORLD_FFMPEG_WINDOWS_UPLOAD_RECEIPT: ${{ needs.build-windows.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+          WORLD_FFMPEG_DARWIN_UPLOAD_RECEIPT: ${{ needs.build-macos.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+          WORLD_FFMPEG_LINUX_UPLOAD_RECEIPT: ${{ needs.build-linux.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}
+          WORLD_FFMPEG_LINUX_ARM64_UPLOAD_RECEIPT: ${{ needs.build-linux-arm64.outputs.WORLD_FFMPEG_PACKAGE_UPLOAD_RECEIPT }}

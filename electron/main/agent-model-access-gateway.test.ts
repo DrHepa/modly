@@ -1,14 +1,56 @@
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
 import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 
 import {
   acquireAgentModelAccessGateway,
   AGENT_MODEL_ACCESS_SANDBOX_SOCKET,
 } from './agent-model-access-gateway.ts'
+
+const unixSocketSupport = process.platform === 'linux' ? probeUnixSocketSupport() : Promise.resolve(false)
+
+async function probeUnixSocketSupport(): Promise<boolean> {
+  const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-socket-probe-'))
+  const socketPath = join(root, 'probe.sock')
+  const server = createNetServer()
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const cleanup = () => {
+        server.off('listening', onListening)
+        server.off('error', onError)
+      }
+      const onListening = () => { cleanup(); resolveListen() }
+      const onError = (error: Error) => { cleanup(); rejectListen(error) }
+      server.once('listening', onListening)
+      server.once('error', onError)
+      server.listen(socketPath)
+    })
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EPERM' || code === 'EACCES') return false
+    throw error
+  } finally {
+    await new Promise<void>((resolveClose) => server.listening ? server.close(() => resolveClose()) : resolveClose())
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+async function skipWithoutUnixSocketSupport(t: TestContext): Promise<boolean> {
+  if (process.platform !== 'linux') {
+    t.skip('pathname AF_UNIX permissions are Linux-specific')
+    return true
+  }
+  if (!await unixSocketSupport) {
+    t.skip('pathname AF_UNIX sockets are unavailable in this test environment')
+    return true
+  }
+  return false
+}
 
 function unixRequest(input: {
   socketPath: string
@@ -42,7 +84,7 @@ function unixRequest(input: {
 }
 
 test('gateway exposes one authenticated bounded Responses request through a private Unix socket', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-test-'))
   const forwarded: unknown[] = []
   const lease = await acquireAgentModelAccessGateway({
@@ -114,7 +156,7 @@ test('gateway exposes one authenticated bounded Responses request through a priv
 })
 
 test('gateway rejects unsupported Responses modes without forwarding and closes on action abort', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-policy-test-'))
   const controller = new AbortController()
   let calls = 0
@@ -148,7 +190,7 @@ test('gateway rejects unsupported Responses modes without forwarding and closes 
 })
 
 test('gateway body idle timeout does not truncate a slower bounded inference response', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-slow-test-'))
   const lease = await acquireAgentModelAccessGateway({
     root,
@@ -181,7 +223,7 @@ test('gateway body idle timeout does not truncate a slower bounded inference res
 })
 
 test('gateway reserves a bounded active request budget after scaled sandbox preparation overhead', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-budget-test-'))
   let clock = Date.now()
   const lease = await acquireAgentModelAccessGateway({
@@ -219,7 +261,7 @@ test('gateway reserves a bounded active request budget after scaled sandbox prep
 })
 
 test('gateway rejects a request that starts without its minimum remaining lease budget', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-margin-test-'))
   let forwards = 0
   let clock = 1_000
@@ -255,7 +297,7 @@ test('gateway rejects a request that starts without its minimum remaining lease 
 })
 
 test('lease expiry during an active forward returns one structured timeout before teardown', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-expiry-test-'))
   let clock = 1_000
   let aborts = 0
@@ -295,7 +337,7 @@ test('lease expiry during an active forward returns one structured timeout befor
 })
 
 test('active request deadline returns one structured timeout and revokes the spent gateway', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-request-timeout-test-'))
   let aborts = 0
   const lease = await acquireAgentModelAccessGateway({
@@ -332,7 +374,7 @@ test('active request deadline returns one structured timeout and revokes the spe
 })
 
 test('gateway cancellation tears down one active ignored forward without a response race', async (t) => {
-  if (process.platform !== 'linux') return t.skip('pathname AF_UNIX permissions are Linux-specific')
+  if (await skipWithoutUnixSocketSupport(t)) return
   const root = await mkdtemp(join(tmpdir(), 'modly-model-gateway-cancel-test-'))
   const controller = new AbortController()
   let started!: () => void

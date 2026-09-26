@@ -18,13 +18,17 @@ test('Add to Worlds is wired as a mesh terminal without changing Add to Scene', 
   assert.match(runStoreSource, /const addToSceneNodeIds = new Set/)
   assert.match(runStoreSource, /const addToWorldsNodeIds = new Set/)
   assert.match(runStoreSource, /const sceneOutputNodeIds = new Set\(\[\.\.\.addToSceneNodeIds, \.\.\.addToWorldsNodeIds\]\)/)
+  assert.match(runStoreSource, /const workflowExecutionId = crypto\.randomUUID\(\)/)
+  assert.match(runStoreSource, /setCurrentJob\(\{\s*id: workflowExecutionId,/)
   assert.match(
     runStoreSource,
-    /await addWorkflowOutputUrlToWorlds\(\s*selectedUrl,\s*isArtifactKind\(selectedOutputType\) \? selectedOutputType : undefined,\s*\)/,
+    /await routeWorkflowOutputToWorlds\(\s*selectedUrl,\s*isArtifactKind\(selectedOutputType\) \? selectedOutputType : undefined,\s*\{\s*runId: workflowExecutionId,\s*sourceNodeId: edge\.source,\s*targetNodeId: edge\.target,\s*artifactId: nodeArtifacts\.get\(edge\.source\)\?\.id,\s*\},\s*\)/,
   )
   const worldsOutputSource = await readFile(path.join(workflowsRoot, 'workflowWorldsOutput.ts'), 'utf8')
   assert.match(worldsOutputSource, /useAppStore\.getState\(\)\.apiUrl/)
   assert.match(worldsOutputSource, /libraryApi\.read\(\{ workspacePath \}\)/)
   assert.match(worldsOutputSource, /resolveWorldRenderable\(\{ workspacePath, apiUrl, .*plyKind/s)
+  assert.match(worldsOutputSource, /worldEditorCommandPort/)
+  assert.doesNotMatch(worldsOutputSource, /worldsSceneStore|useWorldsSceneStore/)
   assert.match(edgeColorsSource, /targetNodeType === 'outputNode' \|\| targetNodeType === 'addToWorldsNode'/)
 })

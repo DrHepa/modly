@@ -1,0 +1,11 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111113; color: #f4f4f5; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.character-fixture { height: 100vh; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
+.character-fixture h1 { font-size: 18px; margin: 0; }
+.character-fixture > p { font-size: 12px; margin: 0; }
+.character-fixture .worlds-project-bar { flex-shrink: 0; }
+.character-fixture__inspector { min-height: 0; flex: 1; overflow: auto; max-width: 760px; border: 1px solid #3f3f46; }
+.character-fixture__inspector .worlds-dock-panel { height: auto; }
+.character-fixture__inspector .worlds-inspector-scroll { overflow: visible; }
+.character-fixture [role="alert"] { color: #fda4af; }

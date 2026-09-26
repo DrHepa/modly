@@ -68,6 +68,24 @@ test('normalizeWorldCollisionSurface rejects NaN, zero, and negative planar data
   }), null)
 })
 
+test('normalizeWorldCollisionSurface rejects presets that do not belong to the authored shape', () => {
+  assert.equal(normalizeWorldCollisionSurface({
+    id: 'rect-with-triangle-preset',
+    shape: 'rect',
+    preset: 'triangle',
+    transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    geometry: { halfWidth: 1, halfHeight: 1 },
+  }), null)
+
+  assert.equal(normalizeWorldCollisionSurface({
+    id: 'tri-with-floor-preset',
+    shape: 'tri',
+    preset: 'floor',
+    transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+    geometry: { vertices: [[0, 0], [0, 1], [1, 0]] },
+  }), null)
+})
+
 test('normalizeWorldCollisionSurface canonicalizes scale.y and triangle winding', () => {
   const normalized = normalizeWorldCollisionSurface({
     id: 'tri-2',
@@ -77,10 +95,10 @@ test('normalizeWorldCollisionSurface canonicalizes scale.y and triangle winding'
     geometry: { vertices: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5]] },
   })
 
-  assert.ok(normalized)
+  assert.ok(normalized?.shape === 'tri')
   assert.deepEqual(normalized?.transform.scale, [2, 1, 3])
   assert.equal(normalized?.sidedness, 'front')
-  assert.deepEqual(normalized?.geometry.vertices, [
+  assert.deepEqual(normalized.geometry.vertices, [
     [-0.5, -0.5],
     [-0.5, 0.5],
     [0.5, -0.5],

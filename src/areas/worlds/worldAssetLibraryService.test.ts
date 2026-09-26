@@ -4,10 +4,14 @@ import test from 'node:test'
 import type {
   AssetLibraryListRequest,
   AssetLibraryOpenRequest,
+  AssetLibraryReadRequest,
 } from '../../shared/types/assetLibrary.ts'
 import {
   listWorldAssetLibraryRenderables,
   openWorldAssetLibraryRenderable,
+  projectWorldAssetLibraryListResult,
+  projectWorldAssetLibraryOpenResult,
+  readWorldAssetLibraryAudio,
 } from './worldAssetLibraryService.ts'
 
 const API_URL = 'http://127.0.0.1:8000'
@@ -16,6 +20,7 @@ const originalWindow = globalThis.window
 function installLibraryWindow(stubs: {
   listCalls?: AssetLibraryListRequest[]
   openCalls?: AssetLibraryOpenRequest[]
+  readCalls?: AssetLibraryReadRequest[]
 }) {
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
@@ -92,7 +97,27 @@ function installLibraryWindow(stubs: {
                     previewKind: '3d-model',
                     warnings: [],
                   },
+                  {
+                    id: 'impact-audio',
+                    workspacePath: 'Workflows/Audio/impact.wav',
+                    displayName: 'Impact',
+                    sourceScope: 'workflows',
+                    state: 'unknown-metadata',
+                    previewKind: 'audio',
+                    warnings: [],
+                  },
                 ],
+              }
+            },
+            read: async (request: AssetLibraryReadRequest) => {
+              stubs.readCalls?.push(request)
+              return {
+                success: true,
+                entry: {
+                  id: 'impact-audio', workspacePath: request.workspacePath, displayName: 'Impact',
+                  sourceScope: 'workflows', state: 'unknown-metadata', previewKind: 'audio', warnings: [],
+                },
+                preview: { kind: 'audio', audioKind: 'wav', byteLength: 42, sourceUrl: 'workspace://impact.wav' },
               }
             },
             open: async (request: AssetLibraryOpenRequest) => {
@@ -136,7 +161,7 @@ test('world asset library service lists shared-contract workspace renderables ac
   assert.equal(result.success, true)
   if (result.success !== true) return
 
-  assert.equal(result.assets.length, 6)
+  assert.equal(result.assets.length, 7)
   assert.deepEqual(result.assets.map((asset) => ({ id: asset.id, sourceScope: asset.sourceScope, capability: asset.capability, displayName: asset.displayName, openable: asset.openable })), [
     { id: 'world-mesh', sourceScope: 'workflows', capability: 'generated-world', displayName: 'Fuse simplified', openable: true },
     { id: 'export-mesh', sourceScope: 'exports', capability: 'mesh', displayName: 'Hero export', openable: true },
@@ -144,6 +169,7 @@ test('world asset library service lists shared-contract workspace renderables ac
     { id: 'saved-scene', sourceScope: 'exports', capability: 'scene-manifest', displayName: 'Saved scene', openable: true },
     { id: 'walk-motion', sourceScope: 'workflows', capability: 'animation-motion', displayName: 'Walk motion', openable: true },
     { id: 'unsafe', sourceScope: 'workflows', capability: 'mesh', displayName: '../outside/hero.glb', openable: false },
+    { id: 'impact-audio', sourceScope: 'workflows', capability: undefined, displayName: 'Impact', openable: true },
   ])
 
   const worldMesh = result.assets[0]
@@ -181,6 +207,42 @@ test('world asset library service lists shared-contract workspace renderables ac
   }
   assert.deepEqual(result.assets[0].warnings, [])
   assert.deepEqual(result.assets[2].warnings, ['hidden detail'])
+})
+
+test('world asset library reads safe audio through preview authority without opening it as a model', async () => {
+  const readCalls: AssetLibraryReadRequest[] = []
+  installLibraryWindow({ readCalls })
+  const result = await readWorldAssetLibraryAudio({ workspacePath: 'Workflows/Audio/impact.wav' })
+  assert.deepEqual(readCalls, [{ workspacePath: 'Workflows/Audio/impact.wav' }])
+  assert.deepEqual(result, {
+    success: true,
+    audio: { workspacePath: 'Workflows/Audio/impact.wav', format: 'wav', name: 'Impact' },
+  })
+  await assert.rejects(() => readWorldAssetLibraryAudio({ workspacePath: '../impact.wav' }), /safe workspace-relative path/i)
+  await assert.rejects(() => readWorldAssetLibraryAudio({ workspacePath: 'Workflows/./Audio/impact.wav' }), /safe workspace-relative path/i)
+  await assert.rejects(() => readWorldAssetLibraryAudio({ workspacePath: './Workflows/Audio/impact.wav' }), /safe workspace-relative path/i)
+  const literal = await readWorldAssetLibraryAudio({ workspacePath: 'Workflows/Audio/impact sound – café.wav' })
+  assert.deepEqual(literal, {
+    success: true,
+    audio: { workspacePath: 'Workflows/Audio/impact sound – café.wav', format: 'wav', name: 'Impact' },
+  })
+  for (const workspacePath of [
+    'Workflows/Audio/impact%20sound.wav',
+    'Workflows/Audio/%69mpact.wav',
+    'Workflows/Audio/%2e/impact.wav',
+    'Workflows/Audio%2Fimpact.wav',
+    'Workflows/Audio%5Cimpact.wav',
+    'Workflows/Audio/impact%00.wav',
+    'Workflows/Audio/impact%0A.wav',
+    'Workflows/Audio/%252e%252e%252Fimpact.wav',
+    'Workflows/Audio/impact%2520sound.wav',
+  ]) {
+    await assert.rejects(() => readWorldAssetLibraryAudio({ workspacePath }), /safe workspace-relative path/i, workspacePath)
+  }
+  assert.deepEqual(readCalls, [
+    { workspacePath: 'Workflows/Audio/impact.wav' },
+    { workspacePath: 'Workflows/Audio/impact sound – café.wav' },
+  ])
 })
 
 test('world asset library service fails safely when IPC success payload omits entries', async () => {
@@ -226,4 +288,84 @@ test('world asset library service opens safe Workflows renderables and rejects u
     /safe workspace-relative path/i,
   )
   assert.deepEqual(openCalls, [{ workspacePath: 'Workflows/worldmirror/result/ply/fuse_post.ply' }])
+})
+
+test('world asset library projects bare WorldSculpt workflow GLBs as ready addable models', () => {
+  const entry = {
+    id: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+    workspacePath: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+    displayName: 'scene.glb',
+    sourceScope: 'workflows' as const,
+    capability: 'mesh' as const,
+    state: 'ready' as const,
+    previewKind: '3d-model' as const,
+    warnings: [],
+  }
+
+  const listed = projectWorldAssetLibraryListResult({ success: true, entries: [entry] }, API_URL)
+  const opened = projectWorldAssetLibraryOpenResult({ success: true, entry }, API_URL)
+
+  assert.equal(listed.success, true)
+  assert.equal(opened.success, true)
+  if (listed.success !== true || opened.success !== true) return
+
+  for (const asset of [listed.assets[0], opened.asset]) {
+    assert.equal(asset.sourceScope, 'workflows')
+    assert.equal(asset.capability, 'mesh')
+    assert.equal(asset.openable, true)
+    assert.equal(asset.type, 'GLB model')
+    assert.equal(asset.state, 'ready')
+    assert.equal(asset.openable === true && 'item' in asset ? asset.item.kind : 'missing', 'glb')
+    assert.equal(
+      asset.openable === true && 'item' in asset ? asset.item.workspacePath : 'missing',
+      'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+    )
+    assert.equal(
+      asset.openable === true && 'item' in asset ? asset.item.url : 'missing',
+      'http://127.0.0.1:8000/workspace/Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
+    )
+  }
+})
+
+test('animation capability GLB remains a model unless it is an actual pose-clip sidecar', () => {
+  const animatedGlb = {
+    id: 'source-driven-baseline',
+    workspacePath: 'Workflows/kimodo-20260530-114549-2332457a/.source_driven_fkik_baseline.glb',
+    displayName: '.source_driven_fkik_baseline.glb',
+    sourceScope: 'workflows' as const,
+    capability: 'animation-motion' as const,
+    state: 'ready' as const,
+    previewKind: '3d-model' as const,
+    warnings: [],
+  }
+  const listed = projectWorldAssetLibraryListResult({ success: true, entries: [animatedGlb] }, API_URL)
+  const opened = projectWorldAssetLibraryOpenResult({ success: true, entry: animatedGlb }, API_URL)
+
+  assert.equal(listed.success, true)
+  assert.equal(opened.success, true)
+  if (listed.success !== true || opened.success !== true) return
+  for (const asset of [listed.assets[0], opened.asset]) {
+    assert.equal(asset.openable, true)
+    assert.equal(asset.type, 'GLB model')
+    assert.equal(asset.openable === true && 'item' in asset ? asset.item.kind : 'missing', 'glb')
+    assert.equal(asset.openable === true && 'poseClip' in asset, false)
+  }
+
+  const poseClip = projectWorldAssetLibraryOpenResult({
+    success: true,
+    entry: {
+      ...animatedGlb,
+      id: 'walk-motion',
+      workspacePath: 'Workflows/Motions/walk.pose-clip.v1.json',
+      displayName: 'Walk motion',
+      previewKind: 'text',
+      source: { relation: 'sidecar-source', workspacePath: 'Workflows/Characters/hero.glb' },
+    },
+  }, API_URL)
+  assert.equal(poseClip.success, true)
+  if (poseClip.success === true) {
+    assert.equal(poseClip.asset.openable, true)
+    assert.equal(poseClip.asset.type, 'Pose clip')
+    assert.equal(poseClip.asset.openable === true && 'poseClip' in poseClip.asset, true)
+  }
 })

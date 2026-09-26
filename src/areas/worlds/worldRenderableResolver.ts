@@ -20,6 +20,15 @@ export interface WorldSceneItem {
   visible: boolean
   animation?: WorldSceneItemAnimationBinding
   collision?: WorldSceneItemCollision
+  /** Canonical PBR override projected for rendering only. */
+  material?: {
+    baseColor: `#${string}`
+    metallic: number
+    roughness: number
+    opacity: number
+  }
+  castShadow?: boolean
+  receiveShadow?: boolean
   transform: {
     position: [number, number, number]
     rotation: [number, number, number]

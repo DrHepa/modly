@@ -60,3 +60,7 @@ electron.vite.config.d.ts
 .agents/
 skills-lock.json
 .atl/
+
+# Local Worlds validation evidence and runtime session receipts
+docs/worlds-engine-evidence/
+:memory:.ses

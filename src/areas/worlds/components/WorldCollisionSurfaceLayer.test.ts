@@ -108,7 +108,7 @@ test('WorldCollisionSurfaceLayer builds flat rect vertices and corners from half
     ])
     assert.deepEqual(rect.indices, [0, 1, 2, 0, 2, 3])
     assert.deepEqual(rect.outlinePositions, rect.positions)
-    assert.equal(rect.positions.every((_, index) => index % 3 !== 1 || rect.positions[index] === 0), true)
+    assert.equal(rect.positions.every((_: number, index: number) => index % 3 !== 1 || rect.positions[index] === 0), true)
   } finally {
     await cleanup()
   }
@@ -175,7 +175,8 @@ test('WorldCollisionSurfaceLayer resolves a single gizmo target for the selected
     })
     assert.equal(model.gizmoSurfaceId, 'tri-1')
     assert.deepEqual(model.surfaces.filter((surface: { selected: boolean }) => surface.selected).map((surface: { id: string }) => surface.id), ['tri-1'])
-    assert.equal(componentSource.includes('layerModel.gizmoSurfaceId && selectedRootObject && layerModel.transformMode ? ('), true)
+    assert.equal(componentSource.includes('const gizmoSurfaceId = layerModel.gizmoSurfaceId'), true)
+    assert.equal(componentSource.includes('gizmoSurfaceId && selectedRootObject && layerModel.transformMode ? ('), true)
     assert.equal(componentSource.includes('<TransformControls'), true)
   } finally {
     await cleanup()
@@ -206,10 +207,10 @@ test('WorldCollisionSurfaceLayer keeps parent transform callbacks on mouse up an
 
   try {
     assert.match(componentSource, /onObjectChange=\{\(\) => \{\s*if \(transformMode === 'scale' && selectedRootObject\) enforceWorldCollisionSurfacePlanarScale\(selectedRootObject\)\s*\}\}/)
-    assert.match(componentSource, /onMouseUp=\{\(\) => \{[\s\S]*onTransformSurface\(layerModel\.gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform\(selectedRootObject\)\)/)
+    assert.match(componentSource, /onMouseUp=\{\(\) => \{[\s\S]*onTransformSurface\(gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform\(selectedRootObject\)\)/)
     const onObjectChangeBlock = componentSource.match(/onObjectChange=\{\(\) => \{[\s\S]*?\}\}/)?.[0] ?? ''
     assert.equal(onObjectChangeBlock.includes('onTransformSurface('), false)
-    assert.equal(source.includes('onTransformSurface(layerModel.gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform(selectedRootObject))'), true)
+    assert.equal(source.includes('onTransformSurface(gizmoSurfaceId, normalizeWorldCollisionSurfaceObjectTransform(selectedRootObject))'), true)
   } finally {
     await cleanup()
   }

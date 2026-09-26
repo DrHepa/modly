@@ -1,4 +1,3 @@
-import type { WorldSceneItem } from './worldRenderableResolver.ts'
 import type { WorldCollisionSurface } from './worldsCollisionSurfaces.ts'
 import {
   resolveWorldCollisionProbeTranslation,
@@ -14,16 +13,27 @@ export interface WorldsCollisionAabb {
   max: WorldsVector3Like
 }
 
-type WorldsCameraCollisionShape = WorldsCollisionAabb | WorldsCollisionBox
-
 export interface WorldsCameraState {
   speed: number
   resetToken: number
 }
 
+export const WORLDS_VIEWPORT_CONTROL_MODES = ['inspect', 'fly', 'run'] as const
+
+export type WorldsViewportControlMode = typeof WORLDS_VIEWPORT_CONTROL_MODES[number]
+
+export const DEFAULT_WORLDS_VIEWPORT_CONTROL_MODE: WorldsViewportControlMode = 'inspect'
+
 export type WorldsMovementDirection = 'forward' | 'backward' | 'left' | 'right' | 'up' | 'down'
 
 export type WorldsMovementKeyState = Partial<Record<WorldsMovementDirection, boolean>>
+
+export type WorldsNavigationKeyState = WorldsMovementKeyState & {
+  rollLeft?: boolean
+  rollRight?: boolean
+  boost?: boolean
+  jump?: boolean
+}
 
 export interface WorldsVector3Like {
   x: number
@@ -61,6 +71,48 @@ export interface ApplyWorldsKeyboardCameraPoseInput {
 export interface ApplyWorldsKeyboardCameraPoseResult {
   cameraPosition: WorldsVector3Like
   target: WorldsVector3Like
+}
+
+export interface WorldsViewportNavigationPose {
+  position: WorldsVector3Like
+  forward: WorldsVector3Like
+  up?: WorldsVector3Like
+  roll?: number
+}
+
+export interface WorldsRunNavigationState {
+  velocityY: number
+  grounded: boolean
+  usedGroundFallback: boolean
+  lastSafePosition: WorldsVector3Like
+  jumpHeld: boolean
+}
+
+export interface ApplyWorldsFlyNavigationInput {
+  pose: WorldsViewportNavigationPose
+  keys: WorldsNavigationKeyState
+  deltaSeconds: number
+  speed?: number
+}
+
+export interface ApplyWorldsRunNavigationInput {
+  pose: WorldsViewportNavigationPose
+  state: WorldsRunNavigationState
+  keys: WorldsNavigationKeyState
+  deltaSeconds: number
+  collisionSurfaces?: readonly (WorldsResolvedCollisionSurface | null | undefined)[]
+}
+
+export interface WorldsViewportNavigationResult {
+  pose: WorldsViewportNavigationPose
+  state?: WorldsRunNavigationState
+  status: 'idle' | 'moving' | 'ground-only-fallback' | 'fall-recovered'
+}
+
+export interface WorldsOrbitHandoffInput {
+  position: WorldsVector3Like
+  forward: WorldsVector3Like
+  distance?: number
 }
 
 export interface WorldsKeyboardTargetLike {
@@ -139,13 +191,40 @@ const MOVEMENT_KEY_BY_CODE: Readonly<Record<string, WorldsMovementDirection>> = 
   ShiftRight: 'down',
 }
 
-const EDITABLE_TAG_NAMES = new Set(['INPUT', 'SELECT', 'TEXTAREA'])
+const INTERACTIVE_TAG_NAMES = new Set([
+  'A',
+  'AREA',
+  'AUDIO',
+  'BUTTON',
+  'DETAILS',
+  'INPUT',
+  'LABEL',
+  'OPTGROUP',
+  'OPTION',
+  'SELECT',
+  'SUMMARY',
+  'TEXTAREA',
+  'VIDEO',
+])
 const DIALOG_SCOPE_SELECTOR = 'dialog,[role="dialog"],[aria-modal="true"]'
 const ZERO_VECTOR: WorldsVector3Like = { x: 0, y: 0, z: 0 }
 const WORLD_UP: WorldsVector3Like = { x: 0, y: 1, z: 0 }
 const DEFAULT_FORWARD: WorldsVector3Like = { x: 0, y: 0, z: -1 }
 export const WORLD_CAMERA_COLLISION_HALF_EXTENTS = { x: 0.2, y: 0.35, z: 0.2 } as const
 const WORLD_CAMERA_POSE_EPSILON = 1e-5
+const FLY_BASE_SPEED = 4
+const FLY_ROLL_SPEED = Math.PI
+const RUN_WALK_SPEED = 3
+const RUN_BOOST_SPEED = 6
+const RUN_GRAVITY = -9.81
+const RUN_JUMP_SPEED = 4.4
+const RUN_MAX_FALL_SPEED = -32
+const RUN_STEP_SECONDS = 1 / 60
+const RUN_MAX_STEPS = 4
+const RUN_FALL_RECOVERY_Y = -40
+const RUN_GROUND_PROBE_DISTANCE = 1e-3
+export const WORLD_RUN_GROUND_FALLBACK_LABEL = 'Ground-only fallback — no editor-navigation surfaces'
+export const WORLD_RUN_PROBE_HALF_EXTENTS = { x: 0.30, y: 0.90, z: 0.30 } as const
 
 export function createWorldsCameraState(overrides: Partial<WorldsCameraState> = {}): WorldsCameraState {
   return {
@@ -178,7 +257,7 @@ export function updateWorldsMovementKeys(keys: WorldsMovementKeyState, code: str
 export function shouldIgnoreWorldCameraKeyTarget(target: WorldsKeyboardTargetLike | null | undefined): boolean {
   if (!target) return false
   const tagName = target.tagName?.toUpperCase()
-  if (tagName && EDITABLE_TAG_NAMES.has(tagName)) return true
+  if (tagName && INTERACTIVE_TAG_NAMES.has(tagName)) return true
   if (target.isContentEditable) return true
   return Boolean(target.closest?.(DIALOG_SCOPE_SELECTOR))
 }
@@ -189,6 +268,62 @@ export function shouldHandleWorldCameraKeyInput({ target, activeElement, inputSc
   if (shouldIgnoreWorldCameraKeyTarget(target)) return false
   if (shouldIgnoreWorldCameraKeyTarget(activeElement)) return false
   return true
+}
+
+export function isWorldsViewportControlMode(value: unknown): value is WorldsViewportControlMode {
+  return typeof value === 'string' && (WORLDS_VIEWPORT_CONTROL_MODES as readonly string[]).includes(value)
+}
+
+export function resolveWorldsViewportModeShortcut(code: string): WorldsViewportControlMode | null {
+  if (code === 'Digit1') return 'inspect'
+  if (code === 'Digit2') return 'fly'
+  if (code === 'Digit3') return 'run'
+  return null
+}
+
+export function applyWorldsViewportModeShortcut(
+  mode: WorldsViewportControlMode,
+  code: string,
+  context: WorldsKeyboardInputContext,
+): WorldsViewportControlMode {
+  if (!shouldHandleWorldCameraKeyInput(context)) return mode
+  return resolveWorldsViewportModeShortcut(code) ?? mode
+}
+
+/**
+ * Maps viewport navigation input without reusing the legacy camera key map.
+ * Fly owns camera-local vertical motion and roll, while Run owns jump; Shift is
+ * boost-only in both modes and can therefore never also move the camera down.
+ */
+export function updateWorldsViewportNavigationKeys(
+  keys: WorldsNavigationKeyState,
+  mode: WorldsViewportControlMode,
+  code: string,
+  pressed: boolean,
+): WorldsNavigationKeyState {
+  if (mode === 'inspect') return keys
+  const direction = viewportPlanarDirection(code)
+  const modeKey = direction !== null
+    || code === 'ShiftLeft' || code === 'ShiftRight'
+    || (mode === 'fly' && (code === 'Space' || code === 'ControlLeft' || code === 'ControlRight' || code === 'KeyQ' || code === 'KeyE'))
+    || (mode === 'run' && code === 'Space')
+  if (!modeKey) return keys
+  const next = { ...keys }
+  if (direction) next[direction] = pressed
+  if (code === 'ShiftLeft' || code === 'ShiftRight') next.boost = pressed
+  if (mode === 'fly') {
+    if (code === 'Space') next.up = pressed
+    if (code === 'ControlLeft' || code === 'ControlRight') next.down = pressed
+    if (code === 'KeyQ') next.rollLeft = pressed
+    if (code === 'KeyE') next.rollRight = pressed
+  } else if (code === 'Space') {
+    next.jump = pressed
+  }
+  return next
+}
+
+export function shouldWorldsViewportModeConsumeMovement(mode: WorldsViewportControlMode): boolean {
+  return mode !== 'inspect'
 }
 
 export function deriveWorldsMovementVector(keys: WorldsMovementKeyState, axes: WorldsMovementAxes): WorldsVector3Like {
@@ -276,6 +411,172 @@ export function applyWorldsKeyboardCameraPose({
       up,
       fallbackLookDirection: forward,
     }),
+  }
+}
+
+export function createWorldsRunNavigationState(position: WorldsVector3Like): WorldsRunNavigationState {
+  return {
+    velocityY: 0,
+    grounded: false,
+    usedGroundFallback: false,
+    lastSafePosition: copyVector(position),
+    jumpHeld: false,
+  }
+}
+
+export function createWorldsOrbitTargetFromNavigation({
+  position,
+  forward,
+  distance = 4,
+}: WorldsOrbitHandoffInput): WorldsVector3Like {
+  const safeDistance = Number.isFinite(distance) && distance > 0 ? distance : 4
+  return addVectors(position, scaleVector(normalizeVector(forward) === ZERO_VECTOR ? DEFAULT_FORWARD : normalizeVector(forward), safeDistance))
+}
+
+export function getWorldsOrbitHandoffDistance(
+  position: WorldsVector3Like,
+  target: WorldsVector3Like,
+  fallbackDistance = 4,
+): number {
+  const distance = Math.hypot(target.x - position.x, target.y - position.y, target.z - position.z)
+  if (Number.isFinite(distance) && distance > WORLD_CAMERA_POSE_EPSILON) return distance
+  return Number.isFinite(fallbackDistance) && fallbackDistance > WORLD_CAMERA_POSE_EPSILON ? fallbackDistance : 4
+}
+
+export function deriveWorldsNavigationPoseFromOrbit(
+  position: WorldsVector3Like,
+  target: WorldsVector3Like,
+  fallbackForward: WorldsVector3Like = DEFAULT_FORWARD,
+): WorldsViewportNavigationPose {
+  const forward = normalizeVector(subtractVectors(target, position))
+  return {
+    position: copyVector(position),
+    forward: forward === ZERO_VECTOR ? normalizeVector(fallbackForward) : forward,
+    up: WORLD_UP,
+    roll: 0,
+  }
+}
+
+export function applyWorldsFlyNavigation({
+  pose,
+  keys,
+  deltaSeconds,
+  speed = FLY_BASE_SPEED,
+}: ApplyWorldsFlyNavigationInput): WorldsViewportNavigationResult {
+  const clampedDelta = clampNavigationDelta(deltaSeconds)
+  const forward = normalizeVector(pose.forward) === ZERO_VECTOR ? DEFAULT_FORWARD : normalizeVector(pose.forward)
+  const right = normalizeVector(crossVectors(forward, pose.up ?? WORLD_UP))
+  const up = normalizeVector(pose.up ?? WORLD_UP)
+  const movementDirection = deriveWorldsMovementVector(keys, { forward, right, up })
+  const boost = keys.boost ? 3 : 1
+  const nextRoll = (pose.roll ?? 0) + axisAmount(Boolean(keys.rollRight), Boolean(keys.rollLeft)) * FLY_ROLL_SPEED * clampedDelta
+  const delta = scaleVector(movementDirection, speed * boost * clampedDelta)
+  return {
+    pose: {
+      position: addVectors(pose.position, delta),
+      forward,
+      up,
+      roll: nextRoll,
+    },
+    status: isApproximatelyZeroVector(delta, WORLD_CAMERA_POSE_EPSILON) && nextRoll === (pose.roll ?? 0) ? 'idle' : 'moving',
+  }
+}
+
+export function applyWorldsRunNavigation({
+  pose,
+  state,
+  keys,
+  deltaSeconds,
+  collisionSurfaces = [],
+}: ApplyWorldsRunNavigationInput): WorldsViewportNavigationResult {
+  const steps = Math.max(1, Math.min(RUN_MAX_STEPS, Math.ceil(clampNavigationDelta(deltaSeconds) / RUN_STEP_SECONDS)))
+  const stepDelta = Math.min(clampNavigationDelta(deltaSeconds), RUN_STEP_SECONDS * RUN_MAX_STEPS) / steps
+  let position = copyVector(pose.position)
+  let velocityY = state.velocityY
+  let grounded = state.grounded
+  let lastSafePosition = copyVector(state.lastSafePosition)
+  let usedGroundFallback = false
+  let status: WorldsViewportNavigationResult['status'] = 'idle'
+  const surfaces = collisionSurfaces.filter(Boolean) as WorldsResolvedCollisionSurface[]
+  const horizontalForward = normalizeVector({ x: pose.forward.x, y: 0, z: pose.forward.z })
+  const forward = horizontalForward === ZERO_VECTOR ? DEFAULT_FORWARD : horizontalForward
+  const right = normalizeVector(crossVectors(forward, WORLD_UP))
+
+  if (surfaces.length === 0) {
+    usedGroundFallback = true
+    grounded = true
+    velocityY = 0
+    status = 'ground-only-fallback'
+  } else {
+    if (state.usedGroundFallback) grounded = false
+    if (!grounded && velocityY <= 0) {
+      const groundProbe = resolveWorldCameraCollisionMovement(
+        position,
+        { x: 0, y: -RUN_GROUND_PROBE_DISTANCE, z: 0 },
+        surfaces,
+        WORLD_RUN_PROBE_HALF_EXTENTS,
+      )
+      grounded = Math.abs(groundProbe.y) < RUN_GROUND_PROBE_DISTANCE
+    }
+  }
+
+  for (let index = 0; index < steps; index += 1) {
+    const horizontalDirection = deriveWorldsMovementVector({
+      forward: keys.forward,
+      backward: keys.backward,
+      left: keys.left,
+      right: keys.right,
+    }, { forward, right, up: ZERO_VECTOR })
+    const horizontalSpeed = keys.boost ? RUN_BOOST_SPEED : RUN_WALK_SPEED
+    const horizontalDelta = scaleVector(horizontalDirection, horizontalSpeed * stepDelta)
+
+    if (surfaces.length === 0) {
+      position = addVectors(position, horizontalDelta)
+      position.y = pose.position.y
+      grounded = true
+      velocityY = 0
+      continue
+    }
+
+    const jumpRequested = Boolean(keys.jump) && !state.jumpHeld && grounded
+    if (jumpRequested) {
+      velocityY = RUN_JUMP_SPEED
+      grounded = false
+    }
+    velocityY = Math.max(RUN_MAX_FALL_SPEED, velocityY + RUN_GRAVITY * stepDelta)
+    const verticalDelta = { x: 0, y: velocityY * stepDelta, z: 0 }
+    const movedHorizontal = resolveWorldCameraCollisionMovement(position, horizontalDelta, surfaces, WORLD_RUN_PROBE_HALF_EXTENTS)
+    position = addVectors(position, movedHorizontal)
+    const movedVertical = resolveWorldCameraCollisionMovement(position, verticalDelta, surfaces, WORLD_RUN_PROBE_HALF_EXTENTS)
+    position = addVectors(position, movedVertical)
+    grounded = verticalDelta.y < 0 && Math.abs(movedVertical.y) < Math.abs(verticalDelta.y)
+    if (grounded) velocityY = 0
+    if (!isApproximatelyZeroVector(horizontalDelta, WORLD_CAMERA_POSE_EPSILON) || Math.abs(verticalDelta.y) > WORLD_CAMERA_POSE_EPSILON) status = status === 'ground-only-fallback' ? status : 'moving'
+    if (grounded) lastSafePosition = copyVector(position)
+  }
+
+  if (position.y < RUN_FALL_RECOVERY_Y) {
+    position = copyVector(lastSafePosition)
+    velocityY = 0
+    grounded = true
+    status = 'fall-recovered'
+  }
+
+  return {
+    pose: {
+      position,
+      forward,
+      up: WORLD_UP,
+      roll: 0,
+    },
+    state: {
+      velocityY,
+      grounded,
+      usedGroundFallback,
+      lastSafePosition,
+      jumpHeld: Boolean(keys.jump),
+    },
+    status,
   }
 }
 
@@ -445,6 +746,14 @@ function normalizeMovementKeys(keys: WorldsMovementKeyState): Required<WorldsMov
   }
 }
 
+function viewportPlanarDirection(code: string): Extract<WorldsMovementDirection, 'forward' | 'backward' | 'left' | 'right'> | null {
+  if (code === 'KeyW' || code === 'ArrowUp') return 'forward'
+  if (code === 'KeyS' || code === 'ArrowDown') return 'backward'
+  if (code === 'KeyA' || code === 'ArrowLeft') return 'left'
+  if (code === 'KeyD' || code === 'ArrowRight') return 'right'
+  return null
+}
+
 function rotateVectorAroundAxis(vector: WorldsVector3Like, axis: WorldsVector3Like, angle: number): WorldsVector3Like {
   const normalizedAxis = normalizeVector(axis)
   if (normalizedAxis === ZERO_VECTOR) return vector
@@ -493,12 +802,25 @@ function subtractVectors(left: WorldsVector3Like, right: WorldsVector3Like): Wor
   }
 }
 
+function crossVectors(left: WorldsVector3Like, right: WorldsVector3Like): WorldsVector3Like {
+  return {
+    x: left.y * right.z - left.z * right.y,
+    y: left.z * right.x - left.x * right.z,
+    z: left.x * right.y - left.y * right.x,
+  }
+}
+
 function copyVector(vector: WorldsVector3Like): WorldsVector3Like {
   return {
     x: vector.x,
     y: vector.y,
     z: vector.z,
   }
+}
+
+function clampNavigationDelta(deltaSeconds: number): number {
+  if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) return 0
+  return Math.min(deltaSeconds, RUN_STEP_SECONDS * RUN_MAX_STEPS)
 }
 
 function normalizeVector(vector: WorldsVector3Like): WorldsVector3Like {
@@ -517,40 +839,4 @@ function isApproximatelyZeroVector(vector: WorldsVector3Like, epsilon: number): 
 
 function areApproximatelyEqualVectors(left: WorldsVector3Like, right: WorldsVector3Like, epsilon: number): boolean {
   return isApproximatelyZeroVector(subtractVectors(left, right), epsilon)
-}
-
-function normalizeWorldCameraCollisionShapes(collisions: readonly WorldsCameraCollisionShape[]): WorldsCollisionBox[] {
-  return collisions.map((collision) => isWorldsCollisionBox(collision) ? collision : worldCollisionBoxFromAabb(collision))
-}
-
-function isWorldsCollisionBox(collision: WorldsCameraCollisionShape): collision is WorldsCollisionBox {
-  return 'transform' in collision && 'halfExtents' in collision && 'worldAabb' in collision
-}
-
-function worldCollisionBoxFromAabb(collision: WorldsCollisionAabb): WorldsCollisionBox {
-  const center = {
-    x: (collision.min.x + collision.max.x) * 0.5,
-    y: (collision.min.y + collision.max.y) * 0.5,
-    z: (collision.min.z + collision.max.z) * 0.5,
-  }
-  return {
-    zoneId: collision.zoneId,
-    halfExtents: {
-      x: Math.abs(collision.max.x - collision.min.x) * 0.5,
-      y: Math.abs(collision.max.y - collision.min.y) * 0.5,
-      z: Math.abs(collision.max.z - collision.min.z) * 0.5,
-    },
-    transform: {
-      position: center,
-      axes: [
-        { x: 1, y: 0, z: 0 },
-        { x: 0, y: 1, z: 0 },
-        { x: 0, y: 0, z: 1 },
-      ],
-    },
-    worldAabb: {
-      min: { ...collision.min },
-      max: { ...collision.max },
-    },
-  }
 }

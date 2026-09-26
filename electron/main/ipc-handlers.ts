@@ -1,7 +1,7 @@
 import { ipcMain, BrowserWindow, dialog, app, shell, type IpcMainInvokeEvent } from 'electron'
 import { autoUpdater } from 'electron-updater'
-import { dirname, join } from 'path'
-import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp, symlink, lstat } from 'fs/promises'
+import { join } from 'path'
+import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp, symlink, lstat, realpath } from 'fs/promises'
 import { existsSync, mkdirSync, readdirSync, statSync } from 'fs'
 import * as os from 'os'
 import { promisify } from 'util'
@@ -49,7 +49,7 @@ import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGat
 import { assertSafeExtensionId, assertSafeOwnershipSegment, resolveExtensionPathWithinRoot } from './extension-path-guard'
 import { registerArtifactRegistryIpcHandlers } from './artifact-registry-service'
 import { updatesSupported } from './updater'
-import { isSceneManifestRecord, resolveSafeWorkspaceJsonPath } from './worlds-scene-manifest-path'
+import { writeWorldsSceneManifest } from './worlds-scene-manifest-writer'
 import { importVideoInputToWorkspace } from './video-input-import'
 import { AgentSessionStore } from './agent-session-store'
 import { AgentActionsService, AgentActionsServiceError } from './agent-actions-service'
@@ -75,6 +75,23 @@ import { registerAgentSkillContextsIpcHandlers } from './agent-skill-contexts-ip
 import { bindAgentSkillSet } from './agent-skills-manifest'
 import { AgentWorkflowAuthority, validateAgentWorkspaceSource } from './agent-workflow-authority'
 import { registerAgentWorkflowsIpcHandlers } from './agent-workflows-ipc'
+import { WorldProjectRepository } from './world-project-repository'
+import { registerWorldProjectsIpcHandlers } from './world-projects-ipc'
+import { WorldsCliTransport, worldsCliRuntimeDir, type WorldsCliEditorScope } from './worlds-cli-transport'
+import { registerWorldsCliIpcHandlers, registerWorldsCliEditorContextBroker, confirmWorldsCliEditLease, displayWorldsCliCode } from './worlds-cli-ipc'
+import { registerWorldsCliReadinessBroker } from './worlds-cli-readiness-broker'
+import { registerWorldsCliDirectEditBroker } from './worlds-cli-direct-edit-broker'
+import { createWorldsCliDirectEditDispatch } from './worlds-cli-direct-edit-dispatch'
+import { getMainWindowDocumentEpoch, isTrustedWorldsCliSender } from './worlds-cli-window-trust'
+import { WorldRenderOutputRepository } from './world-render-output-repository'
+import { WorldRenderBrowserExecutor } from './world-render-browser-executor'
+import {
+  createPackagedWorldFfmpegFallback,
+  type WorldFfmpegSpawn,
+} from './world-render-ffmpeg-encoder'
+import { WorldRenderJobService } from './world-render-job-service'
+import { initializeWorldRenderSubsystem } from './world-render-composition'
+import { registerWorldRendersIpcHandlers } from './world-renders-ipc'
 
 type WindowGetter = () => BrowserWindow | null
 const pExecFile = promisify(execFile)
@@ -407,8 +424,136 @@ export interface IpcHandlersLifecycle {
   shutdown(): Promise<void>
 }
 
-export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter): IpcHandlersLifecycle {
+export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGetter, trustedRendererUrl: string): Promise<IpcHandlersLifecycle> {
   const activeDownloads = new Map<string, { percent: number; file?: string; fileIndex?: number; totalFiles?: number; repoIndex?: number; totalRepos?: number; status?: string }>()
+  const getWorldsWorkspaceRoot = () => getSettings(app.getPath('userData')).workspaceDir
+  const isTrustedMainFrameSender = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return false
+    const event = value as IpcMainInvokeEvent
+    const window = getWindow()
+    return Boolean(window && !window.isDestroyed()
+      && event.sender === window.webContents
+      && event.senderFrame === window.webContents.mainFrame)
+  }
+  const worldProjectRepository = new WorldProjectRepository({
+    getWorkspaceRoot: getWorldsWorkspaceRoot,
+  })
+  registerWorldProjectsIpcHandlers(ipcMain, worldProjectRepository, {
+    isTrustedSender: isTrustedMainFrameSender,
+  })
+  const captureWorldsCliTrust = () => {
+    const window = getWindow()
+    if (!window || !isTrustedWorldsCliSender({ sender: window.webContents, senderFrame: window.webContents.mainFrame }, window, trustedRendererUrl)) return null
+    return { window, contents: window.webContents, frame: window.webContents.mainFrame,
+      documentUrl: trustedRendererUrl, documentEpoch: getMainWindowDocumentEpoch(window.webContents), workspaceRoot: getWorldsWorkspaceRoot() }
+  }
+  const editorBroker = registerWorldsCliEditorContextBroker(ipcMain, { getWindow, trustedRendererUrl })
+  const readinessBroker = registerWorldsCliReadinessBroker(ipcMain, { getWindow, trustedRendererUrl })
+  const directEditBroker = registerWorldsCliDirectEditBroker(ipcMain, {
+    getWindow,
+    trustedRendererUrl,
+    getWorkspaceRoot: getWorldsWorkspaceRoot,
+    readiness: readinessBroker,
+    repository: worldProjectRepository,
+  })
+  let worldsCliTransport: WorldsCliTransport | null = null
+  const dispatchWorldsCliDirectEdit = createWorldsCliDirectEditDispatch(() => worldsCliTransport, directEditBroker)
+  const readWorldsCliScope = async (): Promise<WorldsCliEditorScope | null> => {
+    const trust = captureWorldsCliTrust()
+    if (!trust) return null
+    const intent = await editorBroker.request()
+    if (!intent || !captureWorldsCliTrust() || getMainWindowDocumentEpoch(trust.contents) !== trust.documentEpoch
+      || getWindow() !== trust.window || trust.frame !== trust.contents.mainFrame) return null
+    try {
+      const canonicalWorkspace = await realpath(trust.workspaceRoot)
+      const opened = await worldProjectRepository.open({ projectKey: intent.projectKey })
+      if (!opened.ok || opened.value.status !== 'ready' || opened.value.snapshot.project.projectId !== intent.projectId
+        || opened.value.snapshot.project.revision !== intent.revision
+        || !opened.value.snapshot.project.scenes.some((scene) => scene.id === intent.sceneId)
+        || await realpath(trust.workspaceRoot) !== canonicalWorkspace || getWindow() !== trust.window
+        || getMainWindowDocumentEpoch(trust.contents) !== trust.documentEpoch) return null
+      return { ...intent, trust, canonicalWorkspace }
+    } catch { return null }
+  }
+  if (process.platform === 'linux') {
+    try {
+      const created = new WorldsCliTransport({ repository: worldProjectRepository, runtimeDir: worldsCliRuntimeDir(),
+        captureTrust: captureWorldsCliTrust, activeEditorScope: readWorldsCliScope,
+        dispatchDirectEditProposal: dispatchWorldsCliDirectEdit,
+        onPairRequest: async (isLive) => {
+          const transport = worldsCliTransport
+          const scope = await readWorldsCliScope()
+          if (!isLive() || !scope || !transport) return { ok: false }
+          const window = scope.trust.window as BrowserWindow
+          const nativeDialog = { showMessageBox: (owner: Parameters<typeof confirmWorldsCliEditLease>[0], options: {
+            type: 'question' | 'info'; title: string; message: string; detail: string; buttons: string[];
+            defaultId: number; cancelId: number; noLink: boolean
+          }) => dialog.showMessageBox(owner as BrowserWindow, options) }
+          if (!await confirmWorldsCliEditLease(window, nativeDialog, { ...scope, mode: 'edit' }) || !isLive()) return { ok: false }
+          const fresh = await readWorldsCliScope()
+          if (!fresh || fresh.editorEpoch !== scope.editorEpoch || fresh.revision !== scope.revision
+            || fresh.sceneId !== scope.sceneId || fresh.projectKey !== scope.projectKey || !isLive()) return { ok: false }
+          const pairing = await transport.beginPairing(scope, isLive)
+          if (!isLive() || !await displayWorldsCliCode(window, nativeDialog, pairing.code)) { transport.revokeSession(); return { ok: false } }
+          const verified = await readWorldsCliScope()
+          if (!verified || verified.revision !== scope.revision || verified.sceneId !== scope.sceneId
+            || verified.editorEpoch !== scope.editorEpoch || !isLive()) { transport.revokeSession(); return { ok: false } }
+          return { ok: true }
+        },
+      })
+      worldsCliTransport = created
+      // Inert until explicit native consent: only pair.request may be sent without a session.
+      void created.startListening().catch((error) => logger.warn(`Worlds CLI socket unavailable: ${error instanceof Error ? error.message : String(error)}`))
+    } catch (error) { logger.warn(`Worlds CLI disabled: ${error instanceof Error ? error.message : String(error)}`) }
+  }
+  editorBroker.onLeave(() => {
+    directEditBroker.cancelActive('editor_left')
+    readinessBroker.editorLeft()
+    worldsCliTransport?.revokeSession()
+  })
+  const worldsCliControls = registerWorldsCliIpcHandlers(ipcMain, {
+    getStatus() { return worldsCliTransport?.getStatus() ?? { running: false, paired: false, expired: false, pairingPending: false, pairingId: null, sessionExpiresAt: null } },
+    async revoke() {
+      directEditBroker.cancelActive('revoke')
+      readinessBroker.editorLeft()
+      worldsCliTransport?.revokeSession()
+    },
+    async listPending() { return worldsCliTransport?.listPending() ?? { ok: false, code: 'UNAVAILABLE' } },
+    async getReview(request) { return worldsCliTransport?.getReview(request) ?? { ok: false, code: 'UNAVAILABLE' } },
+    async reject(request) { return worldsCliTransport?.reject(request) ?? { ok: false, code: 'UNAVAILABLE' } },
+    async apply(request, confirm, assertIntentLive) { return worldsCliTransport?.apply(request, confirm, assertIntentLive) ?? { ok: false, code: 'UNAVAILABLE' } },
+  }, {
+    getWindow,
+    trustedRendererUrl,
+    dialog: { showMessageBox: (window, options) => dialog.showMessageBox(window as BrowserWindow, options) },
+  })
+  const worldRenderOutputRepository = new WorldRenderOutputRepository({
+    getWorkspaceRoot: getWorldsWorkspaceRoot,
+  })
+  const worldRenderBrowserExecutor = new WorldRenderBrowserExecutor({
+    outputRepository: worldRenderOutputRepository,
+    assembleWithFfmpeg: createPackagedWorldFfmpegFallback({
+      resourcesPath: process.resourcesPath,
+      platform: process.platform,
+      arch: process.arch,
+      authority: worldRenderOutputRepository,
+      spawnProcess: spawn as unknown as WorldFfmpegSpawn,
+      environment: process.env,
+    }),
+  })
+  const worldRenderJobService = new WorldRenderJobService({
+    projectReader: worldProjectRepository,
+    outputRepository: worldRenderOutputRepository,
+    executor: worldRenderBrowserExecutor,
+    maxConcurrentJobs: 1,
+  })
+  const worldRenderSubsystem = await initializeWorldRenderSubsystem({
+    service: worldRenderJobService,
+    executor: worldRenderBrowserExecutor,
+  })
+  registerWorldRendersIpcHandlers(ipcMain, worldRenderSubsystem.api, {
+    isTrustedSender: isTrustedMainFrameSender,
+  })
   const rendererFilesystemAccess = new RendererFilesystemAccess({
     getConfiguredRoots: () => {
       const settings = getSettings(app.getPath('userData'))
@@ -484,14 +629,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     commitIfOriginSessionActive: (originSessionId, operation) => agentSessionStore.commitIfActive(originSessionId, operation),
   })
   registerAgentSkillContextsIpcHandlers(ipcMain, agentSkillContextAuthority, {
-    isTrustedSender: (value) => {
-      if (!value || typeof value !== 'object') return false
-      const event = value as IpcMainInvokeEvent
-      const window = getWindow()
-      return Boolean(window && !window.isDestroyed()
-        && event.sender === window.webContents
-        && event.senderFrame === window.webContents.mainFrame)
-    },
+    isTrustedSender: isTrustedMainFrameSender,
   })
   const processExecutor = createAgentProcessExecutor({
     getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir,
@@ -1097,23 +1235,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     },
   })
 
-  ipcMain.handle('workspace:worlds:writeSceneManifest', async (_event, request: WorldsSceneManifestWriteRequest): Promise<WorldsSceneManifestWriteResult> => {
-    try {
-      const workspaceDir = getSettings(app.getPath('userData')).workspaceDir
-      const workspaceRelativePath = resolveSafeWorkspaceJsonPath(workspaceDir, request.workspacePath)
-      if (!workspaceRelativePath) {
-        return { success: false, error: 'Worlds scene manifests must be saved as safe workspace-relative JSON files.' }
-      }
-      if (!isSceneManifestRecord(request.manifest)) {
-        return { success: false, error: 'Worlds scene manifest payload is invalid.' }
-      }
-
-      await mkdir(dirname(workspaceRelativePath.absolutePath), { recursive: true })
-      await writeFile(workspaceRelativePath.absolutePath, `${JSON.stringify(request.manifest, null, 2)}\n`, 'utf-8')
-      return { success: true, workspacePath: workspaceRelativePath.workspacePath }
-    } catch (err) {
-      return { success: false, error: String(err) }
+  ipcMain.handle('workspace:worlds:writeSceneManifest', async (event, request: WorldsSceneManifestWriteRequest): Promise<WorldsSceneManifestWriteResult> => {
+    if (!isTrustedMainFrameSender(event)) {
+      return { success: false, error: 'Worlds scene manifest request is unauthorized.' }
     }
+    const workspaceDir = getSettings(app.getPath('userData')).workspaceDir
+    return writeWorldsSceneManifest(workspaceDir, request)
   })
 
   ipcMain.handle('workspace:listCollections', async () => {
@@ -1614,9 +1741,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   return {
     shutdown: async () => {
       try {
-        await agentActionsService.shutdown()
+        try {
+          await directEditBroker.shutdown()
+          editorBroker.shutdown()
+          readinessBroker.shutdown()
+          await worldsCliControls.shutdown()
+          await worldsCliTransport?.revoke()
+        }
+        finally { await worldRenderSubsystem.shutdown() }
       } finally {
-        await agentModelAccess.shutdown()
+        try {
+          await agentActionsService.shutdown()
+        } finally {
+          await agentModelAccess.shutdown()
+        }
       }
     },
   }

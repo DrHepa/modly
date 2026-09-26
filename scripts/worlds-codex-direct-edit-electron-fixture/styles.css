@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { width: 100%; min-width: 960px; min-height: 100%; margin: 0; background: #111113; color: #f4f4f5; font-family: Inter, system-ui, sans-serif; }
+body { overflow: hidden; }
+.c3-fixture-shell { display: grid; grid-template-rows: 58px minmax(0, 1fr); width: 100vw; height: 100vh; }
+.c3-fixture-header { z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 16px; border-bottom: 1px solid #303038; background: #17171b; }
+.c3-fixture-header h1 { margin: 0; font-size: 15px; font-weight: 650; }
+.c3-fixture-header p { margin: 3px 0 0; color: #a1a1aa; font-size: 11px; }
+.c3-fixture-leave { min-height: 32px; border: 1px solid #45454f; border-radius: 7px; padding: 0 12px; background: #232329; color: inherit; }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #a78bfa !important; outline-offset: 2px; }

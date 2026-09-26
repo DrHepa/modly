@@ -57,6 +57,8 @@ export class PythonBridge {
         WORKSPACE_DIR:          this.resolveWorkspaceDir(),
         EXTENSIONS_DIR:         this.resolveExtensionsDir(),
         SELECTED_MODEL_ID:      process.env['SELECTED_MODEL_ID'] ?? '',
+        // Server-side only: renderer/settings/preload never receive the OpenAI key.
+        OPENAI_API_KEY:         process.env['OPENAI_API_KEY'] ?? '',
         HUGGING_FACE_HUB_TOKEN: this.resolveHfToken(),
         HF_TOKEN:               this.resolveHfToken(),
       },

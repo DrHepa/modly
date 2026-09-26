@@ -1,3 +1,4 @@
+import { classifyWorldAiRequestFailure, requestWorldAiChat, worldAiRequestFailureMessage, type WorldAiChatAdapter, type WorldAiChatTurn } from '../../worlds/editor/worldAiChatAdapter.ts'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useAgentStore } from '@shared/stores/agentStore'
@@ -19,9 +20,31 @@ import AgentSessionHistory from './AgentSessionHistory'
 
 export { parseOllamaModelNames }
 
+export function isConfiguredOpenAiModelId(value: string): boolean {
+  return /^(?!sk-)(?!https?:\/\/)[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/i.test(value)
+}
+
+/** Proposed edits become facts only after the host command bus reports its outcome. */
+export function worldAiVisibleReply(data: { message: string; worldProposals: readonly unknown[] }, host: { message: string }): string {
+  return data.worldProposals.length ? host.message || 'World edit outcome unavailable.'
+    : `${host.message || 'Scene unchanged.'}\n\nModel reply (not an edit): ${data.message}`
+}
+
+export async function loadOllamaModelInventory(fetchModels: () => Promise<Response>): Promise<{ status: 'ready' | 'unavailable'; models: string[] }> {
+  try {
+    const response = await fetchModels()
+    if (!response.ok) throw new Error('Ollama model discovery failed')
+    const payload: unknown = await response.json()
+    if (!payload || typeof payload !== 'object' || !('models' in payload) || !Array.isArray(payload.models)) throw new Error('Invalid Ollama inventory')
+    const models = parseOllamaModelNames(payload)
+    if (payload.models.length && !models.length) throw new Error('Invalid Ollama inventory')
+    return { status: 'ready', models }
+  } catch { return { status: 'unavailable', models: [] } }
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-import type { ThinkingMode } from '@shared/stores/agentStore'
+import type { ThinkingMode, WorldsAiProvider } from '@shared/stores/agentStore'
 import type {
   AgentAttachmentRef,
   AgentGovernedActionTerminalSummary,
@@ -1506,15 +1529,15 @@ function GovernedActionCard({
   )
 }
 
-function PersistedSummaries({ summaries }: { summaries: AgentSessionSummary[] }): JSX.Element {
+function PersistedSummaries({ summaries, worlds }: { summaries: AgentSessionSummary[]; worlds: boolean }): JSX.Element {
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-3 py-2 text-[11px] text-zinc-400">
       {summaries.map((summary, index) => summary.kind === 'governed-action' ? (
         <div key={`${summary.kind}-${index}`}>
           <p>{summary.label}</p>
-          <p className="text-zinc-500">Model: {summary.governedAction.model}</p>
+          <p className={worlds ? 'text-zinc-300' : 'text-zinc-500'}>Model: {summary.governedAction.model}</p>
           {summary.governedAction.outputs.map((output) => (
-            <p key={`${output.sha256}-${output.kind}`} className="font-mono text-[10px] text-zinc-500">
+            <p key={`${output.sha256}-${output.kind}`} className={`font-mono text-[10px] ${worlds ? 'text-zinc-300' : 'text-zinc-500'}`}>
               {output.kind} · {output.sha256.slice(0, 12)}… · {formatByteCount(output.sizeBytes)}
             </p>
           ))}
@@ -1530,8 +1553,9 @@ function PersistedSummaries({ summaries }: { summaries: AgentSessionSummary[] })
 
 // ─── Feedback row ─────────────────────────────────────────────────────────────
 
-function FeedbackRow({ content }: { content: string }): JSX.Element {
+function FeedbackRow({ content, worlds }: { content: string; worlds: boolean }): JSX.Element {
   const [copied, setCopied] = useState(false)
+  const iconClass = `transition-colors ${worlds ? 'text-zinc-400 hover:text-zinc-200' : 'text-zinc-600 hover:text-zinc-400'}`
 
   function handleCopy() {
     navigator.clipboard.writeText(content)
@@ -1544,7 +1568,7 @@ function FeedbackRow({ content }: { content: string }): JSX.Element {
       <button
         onClick={handleCopy}
         title="Copy"
-        className="text-zinc-600 hover:text-zinc-400 transition-colors"
+        className={iconClass}
       >
         {copied ? (
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1556,13 +1580,13 @@ function FeedbackRow({ content }: { content: string }): JSX.Element {
           </svg>
         )}
       </button>
-      <button title="Good response" className="text-zinc-600 hover:text-zinc-400 transition-colors">
+      <button title="Good response" className={iconClass}>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z" />
           <path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3" />
         </svg>
       </button>
-      <button title="Bad response" className="text-zinc-600 hover:text-zinc-400 transition-colors">
+      <button title="Bad response" className={iconClass}>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10z" />
           <path d="M17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17" />
@@ -1574,13 +1598,13 @@ function FeedbackRow({ content }: { content: string }): JSX.Element {
 
 // ─── Thinking block ───────────────────────────────────────────────────────────
 
-function ThinkingBlock({ content }: { content: string }): JSX.Element {
+function ThinkingBlock({ content, worlds }: { content: string; worlds: boolean }): JSX.Element {
   const [open, setOpen] = useState(false)
   return (
     <div className="text-[11px]">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 text-zinc-500 hover:text-zinc-400 transition-colors"
+        className={`flex items-center gap-1.5 transition-colors ${worlds ? 'text-zinc-300 hover:text-zinc-100' : 'text-zinc-500 hover:text-zinc-400'}`}
       >
         {/* brain icon */}
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -1595,7 +1619,7 @@ function ThinkingBlock({ content }: { content: string }): JSX.Element {
       </button>
       {open && (
         <div className="mt-2 pl-3 border-l-2 border-zinc-700">
-          <p className="text-zinc-500 italic leading-relaxed whitespace-pre-wrap">{content}</p>
+          <p className={`${worlds ? 'text-zinc-300' : 'text-zinc-500'} italic leading-relaxed whitespace-pre-wrap`}>{content}</p>
         </div>
       )}
     </div>
@@ -1604,8 +1628,8 @@ function ThinkingBlock({ content }: { content: string }): JSX.Element {
 
 // ─── Main component ──────────────────────────────────────────────────────────
 
-export default function ChatPanel(): JSX.Element {
-  const { ollamaUrl, defaultModel, defaultThinking } = useAgentStore()
+export default function ChatPanel({ worlds }: { worlds?: WorldAiChatAdapter } = {}): JSX.Element {
+  const { ollamaUrl, defaultModel, defaultThinking, worldsProvider, worldsOpenAiModel, setWorldsProvider, setWorldsOpenAiModel } = useAgentStore()
 
   const [messages, setMessages]               = useState<Message[]>([])
   const [input, setInput]                     = useState('')
@@ -1615,14 +1639,22 @@ export default function ChatPanel(): JSX.Element {
   const [model, setModel]                     = useState(defaultModel)
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [ollamaModels, setOllamaModels]       = useState<string[]>([])
+  const [ollamaInventoryStatus, setOllamaInventoryStatus] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle')
+  const localModelAvailability = ollamaInventoryStatus === 'ready'
+    ? ollamaModels.includes(model) ? '' : ' · Not installed'
+    : ollamaInventoryStatus === 'unavailable' ? ' · Unavailable' : ' · Not checked'
   const [attachments, setAttachments]         = useState<PendingAttachment[]>([])
   const [isDragging, setIsDragging]           = useState(false)
   const [thinkingMode, setThinkingMode]       = useState<ThinkingMode>(defaultThinking)
+  const [worldProvider, setWorldProvider]     = useState<WorldsAiProvider>(worldsProvider)
+  const [openAiModel, setOpenAiModel]         = useState(worldsOpenAiModel)
+  const [openAiModelDraft, setOpenAiModelDraft] = useState(worldsOpenAiModel)
   const [governedActions, setGovernedActions] = useState<SessionGovernedAction[]>([])
   const [hydratedSessionId, setHydratedSessionId] = useState<string | null>(null)
   const endRef                                = useRef<HTMLDivElement>(null)
   const textareaRef                           = useRef<HTMLTextAreaElement>(null)
   const modelPickerRef                        = useRef<HTMLDivElement>(null)
+  const modelPickerButtonRef                  = useRef<HTMLButtonElement>(null)
   const fileInputRef                          = useRef<HTMLInputElement>(null)
   const messagesRef                           = useRef<Message[]>([])
   const governedActionsRef                    = useRef<SessionGovernedAction[]>([])
@@ -1659,6 +1691,7 @@ export default function ChatPanel(): JSX.Element {
     if (transientSessionIdRef.current === nextSessionId) return
     const previousSessionId = transientSessionIdRef.current
     originUiGateRef.current.invalidate()
+    if (previousSessionId) worlds?.cancel()
     if (previousSessionId) proposalTrackerRef.current.invalidateOrigin(previousSessionId)
     const switchPlan = planGovernedSessionSwitch(governedActionsRef.current, previousSessionId, nextSessionId)
     if (previousSessionId) void cancelGovernedActionIds(previousSessionId, switchPlan.cancelActionIds)
@@ -1673,13 +1706,14 @@ export default function ChatPanel(): JSX.Element {
     setShowAll(false)
     setIsDragging(false)
     setIsLoading(false)
-  }, [activeSession?.id])
+  }, [activeSession?.id, worlds])
 
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
       originUiGateRef.current.invalidate()
+      worlds?.cancel()
       proposalTrackerRef.current.invalidateAll()
       const originSessionId = transientSessionIdRef.current
       if (!originSessionId) return
@@ -1725,6 +1759,15 @@ export default function ChatPanel(): JSX.Element {
     setThinkingMode(defaultThinking)
   }, [defaultThinking])
 
+  useEffect(() => {
+    setWorldProvider(worldsProvider)
+  }, [worldsProvider])
+
+  useEffect(() => {
+    setOpenAiModel(worldsOpenAiModel)
+    setOpenAiModelDraft(worldsOpenAiModel)
+  }, [worldsOpenAiModel])
+
   // Close model picker on outside click
   useEffect(() => {
     if (!showModelPicker) return
@@ -1735,6 +1778,19 @@ export default function ChatPanel(): JSX.Element {
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [showModelPicker])
+
+  const selectWorldModel = (provider: WorldsAiProvider, selectedModel: string) => {
+    setWorldProvider(provider)
+    setWorldsProvider(provider)
+    if (provider === 'ollama') setModel(selectedModel)
+    else {
+      setOpenAiModel(selectedModel)
+      setOpenAiModelDraft(selectedModel)
+      setWorldsOpenAiModel(selectedModel)
+    }
+    setShowModelPicker(false)
+    modelPickerButtonRef.current?.focus()
+  }
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -2022,11 +2078,13 @@ export default function ChatPanel(): JSX.Element {
     msgs: Message[],
     uiToken: OriginBoundUiToken,
     extraContext: Record<string, unknown> = {},
+    worldTurn?: WorldAiChatTurn,
+    worldSelection?: { provider: WorldsAiProvider; ollamaModel: string; openaiModel: string },
   ) {
     const selectedModel: AgentOllamaModelSelectionV1 = {
       provider: 'ollama',
       endpoint: ollamaUrl,
-      model,
+      model: worldSelection?.ollamaModel ?? model,
     }
     const selectedThinkingMode = thinkingMode
     let actionFailureCount = 0
@@ -2047,6 +2105,25 @@ export default function ChatPanel(): JSX.Element {
         }
         return entry
       })
+      if (worlds) {
+        if (!worldTurn) throw new Error('The Worlds request is no longer current.')
+        const message = [...apiMessages].reverse().find((entry) => entry.role === 'user')
+        if (!message) throw new Error('Enter a Worlds request first.')
+        const data = await requestWorldAiChat({ apiUrl, model: selectedModel.model, ollamaUrl: selectedModel.endpoint,
+          thinking: selectedThinkingMode, turn: worldTurn, message, signal: uiToken.signal, fetch,
+          provider: worldSelection?.provider ?? worldProvider, openaiModel: worldSelection?.openaiModel ?? openAiModel })
+        await worlds.accept(worldTurn, data)
+        if (!uiToken.isCurrent()) return
+        const visibleReply = worldAiVisibleReply(data, worlds.getState())
+        const assistantMessage: Message = { id: `a-${Date.now()}`, role: 'assistant', content: visibleReply }
+        await appendPersistedMessage(originatingSessionId, { id: assistantMessage.id, role: 'assistant', content: visibleReply })
+        uiToken.run(() => {
+          const next = appendOrReplaceMessage(messagesRef.current, assistantMessage)
+          messagesRef.current = next
+          setMessages(next)
+        })
+        return
+      }
       const latestUserText = [...apiMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
       const protectedContext = await resolveOptionalAgentProtectedContext({
         originSessionId: originatingSessionId,
@@ -2187,25 +2264,28 @@ export default function ChatPanel(): JSX.Element {
         },
       })
     } catch (e: unknown) {
-      uiToken.run(() => setError(agentTurnFailureMessage({
-        error: e,
-        actionFailureCount,
-        partialSummaryError,
-        proposalErrors,
-      })))
+      if (worldTurn) {
+        const failureReason = classifyWorldAiRequestFailure(e)
+        worlds?.fail(worldTurn, failureReason)
+        uiToken.run(() => setError(worldAiRequestFailureMessage(failureReason)))
+      } else {
+        uiToken.run(() => setError(agentTurnFailureMessage({
+          error: e,
+          actionFailureCount,
+          partialSummaryError,
+          proposalErrors,
+        })))
+      }
     } finally {
       uiToken.run(() => setIsLoading(false))
     }
   }
 
   async function fetchOllamaModels() {
-    try {
-      const res = await fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(ollamaUrl)}`)
-      const data = await res.json()
-      setOllamaModels(parseOllamaModelNames(data))
-    } catch {
-      setOllamaModels([])
-    }
+    setOllamaInventoryStatus('loading')
+    const inventory = await loadOllamaModelInventory(() => fetch(`${apiUrl}/agent/models?ollama_url=${encodeURIComponent(ollamaUrl)}`))
+    setOllamaModels(inventory.models)
+    setOllamaInventoryStatus(inventory.status)
   }
 
   function handleFiles(files: File[]) {
@@ -2252,15 +2332,20 @@ export default function ChatPanel(): JSX.Element {
       if (
         !text.trim()
         || isLoading
+        || Boolean(worlds && worldProvider === 'openai' && !isConfiguredOpenAiModelId(openAiModel))
         || !originatingSessionId
         || !isAgentSessionReady(initializedSessions, hydratedSessionIdRef.current, originatingSessionId)
       ) return
       const historySnapshot = captureAgentHistorySnapshot(messagesRef.current)
+      const worldSelection = worlds ? { provider: worldProvider, ollamaModel: model, openaiModel: openAiModel } : undefined
       const uiToken = originUiGateRef.current.begin(originatingSessionId)
 
       const attachmentIds: string[] = []
       let userPersisted = false
+      let worldTurn: WorldAiChatTurn | undefined
       try {
+        // Capture before attachment reads, persistence, provider discovery or network work.
+        worldTurn = worlds?.begin({ originSessionId: originatingSessionId, requestId: `tx:world-ai-${crypto.randomUUID()}`, isCurrent: uiToken.isCurrent })
         for (const attachment of attachments) {
           const updated = await addPersistedAttachment(originatingSessionId, {
             name: attachment.file.name,
@@ -2291,8 +2376,9 @@ export default function ChatPanel(): JSX.Element {
           setAttachments([])
           if (textareaRef.current) textareaRef.current.style.height = 'auto'
         })
-        await callAgent(originatingSessionId, nextMessages, uiToken)
+        await callAgent(originatingSessionId, nextMessages, uiToken, {}, worldTurn, worldSelection)
       } catch (failure) {
+        if (worldTurn) worlds?.fail(worldTurn)
         let visibleFailure = failure
         if (!userPersisted && attachmentIds.length > 0) {
           try {
@@ -2319,7 +2405,7 @@ export default function ChatPanel(): JSX.Element {
   const collapsed = !showAll && messages.length > COLLAPSE_AFTER
   const hidden    = collapsed ? messages.length - COLLAPSE_AFTER : 0
   const visible   = collapsed ? messages.slice(-COLLAPSE_AFTER) : messages
-  const visibleGovernedActions = governedActions.filter((entry) => entry.originSessionId === activeSession?.id)
+  const visibleGovernedActions = worlds ? [] : governedActions.filter((entry) => entry.originSessionId === activeSession?.id)
 
   return (
     <div
@@ -2328,7 +2414,7 @@ export default function ChatPanel(): JSX.Element {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <AgentSessionHistory />
+      <AgentSessionHistory worlds={Boolean(worlds)} />
       {/* Drag overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 flex items-center justify-center rounded-xl border-2 border-dashed border-accent/60 bg-accent/5 pointer-events-none">
@@ -2348,8 +2434,8 @@ export default function ChatPanel(): JSX.Element {
                 <circle cx="12" cy="5" r="2" /><path d="M12 7v4" />
               </svg>
             </div>
-            <p className="text-[11px] text-zinc-500 text-center leading-relaxed">
-              Ask me to inspect Modly<br />or propose a governed action.
+            <p className={`text-[11px] text-center leading-relaxed ${worlds ? 'text-zinc-300' : 'text-zinc-500'}`}>
+              {worlds ? <>Ask about this scene<br />or change it directly.</> : <>Ask me to inspect Modly<br />or propose a governed action.</>}
             </p>
           </div>
         )}
@@ -2358,7 +2444,7 @@ export default function ChatPanel(): JSX.Element {
         {collapsed && (
           <button
             onClick={() => setShowAll(true)}
-            className="mx-4 mt-4 mb-1 flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors self-start"
+            className={`mx-4 mt-4 mb-1 flex items-center gap-1 text-[11px] transition-colors self-start ${worlds ? 'text-zinc-300 hover:text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
           >
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <polyline points="6 9 12 15 18 9" />
@@ -2388,15 +2474,15 @@ export default function ChatPanel(): JSX.Element {
               ) : (
                 /* Assistant message */
                 <div className="flex flex-col gap-3">
-                  {msg.thinking && <ThinkingBlock content={msg.thinking} />}
+                  {msg.thinking && <ThinkingBlock content={msg.thinking} worlds={Boolean(worlds)} />}
                   <ProseMessage content={msg.content} />
-                  {msg.actions && msg.actions.length > 0 && (
+                  {!worlds && msg.actions && msg.actions.length > 0 && (
                     <ActionsCard actions={msg.actions} onUndo={undoMesh} />
                   )}
                   {!msg.actions?.length && msg.summaries && msg.summaries.length > 0 && (
-                    <PersistedSummaries summaries={msg.summaries} />
+                    <PersistedSummaries summaries={msg.summaries} worlds={Boolean(worlds)} />
                   )}
-                  <FeedbackRow content={msg.content} />
+                  <FeedbackRow content={msg.content} worlds={Boolean(worlds)} />
                 </div>
               )}
             </div>
@@ -2452,8 +2538,10 @@ export default function ChatPanel(): JSX.Element {
                 <div key={i} className="relative group">
                   <img src={attachment.dataUrl} alt="" className="h-14 w-14 object-cover rounded-lg border border-zinc-700/50" />
                   <button
+                    type="button"
+                    aria-label={`Remove ${attachment.file.name}`}
                     onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
-                    className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-zinc-700 border border-zinc-600 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute -top-1 -right-1 min-w-6 min-h-6 rounded-full bg-zinc-700 border border-zinc-600 flex items-center justify-center opacity-70 group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-accent transition-opacity"
                   >
                     <svg width="7" height="7" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
                       <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
@@ -2463,23 +2551,27 @@ export default function ChatPanel(): JSX.Element {
               ))}
             </div>
           )}
+          {worlds && isLoading ? <button type="button" aria-label="Cancel Worlds AI request" className="self-end text-xs text-zinc-400" onClick={() => { originUiGateRef.current.invalidate(); worlds.cancel(); setIsLoading(false) }}>Cancel</button> : null}
           <textarea
             ref={textareaRef}
             value={input}
             onChange={(e) => { setInput(e.target.value); adjustHeight() }}
             onKeyDown={handleKeyDown}
-            placeholder="Ask Modly…"
+            aria-label={worlds ? 'Ask Worlds AI' : 'Ask Modly'}
+            placeholder={worlds ? 'Ask about this scene…' : 'Ask Modly…'}
             rows={1}
             spellCheck={false}
-            className="w-full bg-transparent text-[12.5px] text-zinc-200 placeholder-zinc-600 focus:outline-none resize-none leading-relaxed overflow-hidden"
+            className={`w-full bg-transparent text-[12.5px] text-zinc-200 focus:outline-none resize-none leading-relaxed overflow-hidden ${worlds ? 'placeholder-zinc-300' : 'placeholder-zinc-600'}`}
           />
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
             {/* Attach image button */}
             <button
+              type="button"
+              aria-label="Attach image"
               onClick={() => fileInputRef.current?.click()}
               title="Attach image"
-              className="text-zinc-600 hover:text-zinc-400 transition-colors"
+              className="text-zinc-400 hover:text-zinc-200 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /><line x1="8" y1="12" x2="16" y2="12" />
@@ -2487,9 +2579,11 @@ export default function ChatPanel(): JSX.Element {
             </button>
             {/* Thinking toggle */}
             <button
+              type="button"
+              aria-label={`Thinking: ${thinkingMode}`}
               onClick={() => setThinkingMode((m) => m === 'auto' ? 'on' : m === 'on' ? 'off' : 'auto')}
               title={`Thinking: ${thinkingMode}`}
-              className={`transition-colors ${thinkingMode === 'on' ? 'text-accent' : thinkingMode === 'off' ? 'text-zinc-700' : 'text-zinc-600 hover:text-zinc-400'}`}
+              className={`transition-colors ${thinkingMode === 'on' ? 'text-accent' : thinkingMode === 'off' ? 'text-zinc-400' : 'text-zinc-400 hover:text-zinc-200'}`}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/>
@@ -2500,48 +2594,80 @@ export default function ChatPanel(): JSX.Element {
             {/* Model selector */}
             <div className="relative" ref={modelPickerRef}>
               <button
-                onClick={() => { setShowModelPicker((v) => !v); if (!showModelPicker) fetchOllamaModels() }}
-                className="flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
+                ref={modelPickerButtonRef}
+                type="button"
+                aria-label={`Select AI model, ${worlds ? worldProvider === 'openai' ? `OpenAI ${openAiModel} remote` : `Ollama ${model} local${localModelAvailability.replace(' · ', ', ')}` : model}`}
+                aria-expanded={showModelPicker}
+                aria-controls="agent-model-picker"
+                onClick={() => { setShowModelPicker((v) => !v); if (!showModelPicker) void fetchOllamaModels() }}
+                onKeyDown={(event) => { if (event.key === 'Escape') setShowModelPicker(false) }}
+                className="flex min-h-6 items-center gap-1 text-[10px] text-zinc-300 hover:text-zinc-100 transition-colors focus-visible:outline-2 focus-visible:outline-accent"
               >
-                {model}
+                {worlds ? worldProvider === 'openai' ? `OpenAI · ${openAiModel} · Remote` : `Ollama · ${model}${localModelAvailability}` : model}
                 <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                   <polyline points="6 9 12 15 18 9" />
                 </svg>
               </button>
 
               {showModelPicker && (
-                <div className="absolute bottom-full mb-2 left-0 z-50 bg-zinc-900 border border-zinc-700/60 rounded-xl shadow-xl overflow-hidden min-w-[180px]">
-                  {ollamaModels.length === 0 ? (
-                    <p className="px-3 py-2.5 text-[11px] text-zinc-500">No models found — is Ollama running?</p>
-                  ) : (
-                    ollamaModels.map((m) => (
+                <div id="agent-model-picker" className="absolute bottom-full mb-2 left-0 z-50 bg-zinc-900 border border-zinc-700/60 rounded-xl shadow-xl min-w-[210px] max-w-[min(300px,85vw)] max-h-[min(320px,calc(100dvh-96px))] overflow-y-auto overscroll-contain"
+                  onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); setShowModelPicker(false); modelPickerButtonRef.current?.focus() } }}>
+                  {ollamaInventoryStatus !== 'ready' ? (
+                    <p className="px-3 py-2.5 text-[11px] text-zinc-300" role="status">{ollamaInventoryStatus === 'unavailable' ? 'Ollama models unavailable' : 'Checking local models…'}</p>
+                  ) : ollamaModels.length === 0 ? (
+                    <p className="px-3 py-2.5 text-[11px] text-zinc-300">No Ollama models installed</p>
+                  ) : ollamaModels.map((m) => (
                       <button
                         key={m}
-                        onClick={() => { setModel(m); setShowModelPicker(false) }}
-                        className={`w-full px-3 py-2 text-left text-[11px] hover:bg-zinc-800 transition-colors flex items-center justify-between gap-3 ${m === model ? 'text-zinc-100' : 'text-zinc-400'}`}
+                        type="button"
+                        aria-pressed={worlds ? worldProvider === 'ollama' && m === model : m === model}
+                        onClick={() => {
+                          if (worlds) selectWorldModel('ollama', m)
+                          else { setModel(m); setShowModelPicker(false); modelPickerButtonRef.current?.focus() }
+                        }}
+                        className={`w-full min-h-7 px-3 py-2 text-left text-[11px] hover:bg-zinc-800 transition-colors flex items-center justify-between gap-3 ${m === model && (!worlds || worldProvider === 'ollama') ? 'text-zinc-100' : 'text-zinc-400'}`}
                       >
-                        <span className="truncate">{m}</span>
-                        {m === model && (
+                        <span className="truncate">{worlds ? `Ollama · ${m}` : m}</span>
+                        {m === model && (!worlds || worldProvider === 'ollama') && (
                           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="shrink-0 text-accent">
                             <polyline points="20 6 9 17 4 12" />
                           </svg>
                         )}
                       </button>
-                    ))
-                  )}
+                    ))}
+                  {worlds && isConfiguredOpenAiModelId(openAiModel) ? <button type="button" aria-pressed={worldProvider === 'openai'}
+                    onClick={() => selectWorldModel('openai', openAiModel)}
+                    className="w-full min-h-7 px-3 py-2 text-left text-[11px] text-zinc-300 hover:bg-zinc-800 focus-visible:outline-2 focus-visible:outline-accent">
+                    OpenAI · {openAiModel} · Remote
+                  </button> : null}
+                  {worlds ? <div className="border-t border-zinc-700/60 px-3 py-2">
+                    <label htmlFor="worlds-openai-model-config" className="block text-[10px] text-zinc-300">OpenAI model ID</label>
+                    <div className="mt-1 flex gap-1">
+                      <input id="worlds-openai-model-config" aria-label="Configure OpenAI model" value={openAiModelDraft} maxLength={128}
+                        onChange={(event) => setOpenAiModelDraft(event.target.value)} spellCheck={false}
+                        className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 text-[11px] text-zinc-200 focus-visible:outline-2 focus-visible:outline-accent" />
+                      <button type="button" disabled={!isConfiguredOpenAiModelId(openAiModelDraft)}
+                        onClick={() => selectWorldModel('openai', openAiModelDraft)}
+                        className="min-h-7 rounded px-2 text-[11px] text-zinc-300 hover:bg-zinc-800 disabled:opacity-40">Use</button>
+                    </div>
+                    <p className="mt-1 text-[10px] text-zinc-300">Remote · requires configured access</p>
+                  </div> : null}
                 </div>
               )}
             </div>
             </div>
 
             <button
+              type="button"
+              aria-label={worlds ? 'Send Worlds AI request' : 'Send message'}
               onClick={handleSend}
               disabled={
                 !input.trim()
                 || isLoading
+                || Boolean(worlds && worldProvider === 'openai' && !isConfiguredOpenAiModelId(openAiModel))
                 || !isAgentSessionReady(initializedSessions, hydratedSessionId, activeSession?.id ?? null)
               }
-              className="w-6 h-6 rounded-full bg-accent hover:bg-accent-dark disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors shrink-0"
+              className="w-7 h-7 rounded-full bg-accent hover:bg-accent-dark disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors shrink-0 focus-visible:outline-2 focus-visible:outline-accent"
             >
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
@@ -2549,7 +2675,7 @@ export default function ChatPanel(): JSX.Element {
             </button>
           </div>
         </div>
-        <p className="mt-1.5 text-[10px] text-zinc-700 text-center">Shift+Enter for new line</p>
+        <p className={`mt-1.5 text-[10px] text-center ${worlds ? 'text-zinc-300' : 'text-zinc-700'}`}>Shift+Enter for new line</p>
       </div>
 
     </div>

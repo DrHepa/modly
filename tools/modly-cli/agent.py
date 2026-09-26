@@ -8,9 +8,15 @@ optionally start only the FastAPI backend, and always receive parseable JSON.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import math
 import mimetypes
 import os
+import secrets
+import socket
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -43,6 +49,8 @@ DEFAULT_POLL_SECONDS = _float_env("MODLY_CLI_POLL_SECONDS", "MODLY_AGENT_POLL_SE
 EXPORT_FORMATS = ("glb", "stl", "obj", "ply")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 WORKFLOW_ASSET_SUFFIXES = {".glb", ".gltf", ".obj", ".stl", ".ply"}
+WORLD_PROJECT_KEY = __import__("re").compile(r"^world-[a-f0-9]{32}$")
+WORLD_SESSION_TOKEN = __import__("re").compile(r"^[a-f0-9]{64}$")
 
 
 class ModlyCliError(RuntimeError):
@@ -53,6 +61,297 @@ class ModlyCliError(RuntimeError):
         self.message = message
         self.code = code
         self.http_status = http_status
+
+
+def _world_runtime_dir() -> Path:
+    """Use only the private runtime directory shared with the Desktop owner."""
+    if sys.platform != "linux" or not os.environ.get("XDG_RUNTIME_DIR"):
+        raise ModlyCliError("Worlds CLI requires a private Linux runtime directory.", code="WORLD_CLI_UNAVAILABLE")
+    runtime_parent = Path(os.environ["XDG_RUNTIME_DIR"])
+    runtime = runtime_parent / "modly-worlds-cli"
+    for path in (runtime_parent, runtime):
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ModlyCliError("Worlds CLI is not enabled in Desktop.", code="WORLD_CLI_UNAVAILABLE") from exc
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ModlyCliError("Unsafe Worlds CLI runtime directory.", code="WORLD_CLI_UNAVAILABLE")
+    if runtime.lstat().st_mode & 0o777 != 0o700:
+        raise ModlyCliError("Unsafe Worlds CLI runtime directory.", code="WORLD_CLI_UNAVAILABLE")
+    return runtime
+
+
+def _world_project_key(value: str) -> str:
+    if not WORLD_PROJECT_KEY.fullmatch(value):
+        raise ModlyCliError("Invalid World project key.", code="INVALID_REQUEST")
+    return value
+
+
+def _world_page_size(value: int) -> int:
+    if not 1 <= value <= 50:
+        raise ModlyCliError("Page size must be from 1 to 50.", code="INVALID_REQUEST")
+    return value
+
+
+def _world_require_tty() -> None:
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+            if not os.isatty(tty.fileno()):
+                raise OSError("not a terminal")
+    except OSError as exc:
+        raise ModlyCliError("Pair in an interactive terminal.", code="PAIRING_REQUIRES_TTY") from exc
+
+
+def _world_pairing_code() -> str:
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+            if not os.isatty(tty.fileno()):
+                raise OSError("not a terminal")
+            code = getpass.getpass("Pairing code: ", stream=tty)
+    except (OSError, EOFError) as exc:
+        raise ModlyCliError("Pair in an interactive terminal.", code="PAIRING_REQUIRES_TTY") from exc
+    if not __import__("re").fullmatch(r"[a-f0-9]{32}", code):
+        raise ModlyCliError("Invalid pairing code.", code="INVALID_REQUEST")
+    return code
+
+
+def _world_read_exact(stream: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = stream.recv(size - len(data))
+        if not chunk:
+            raise ModlyCliError("Worlds CLI connection closed.", code="WORLD_CLI_UNAVAILABLE")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _world_wire(runtime: Path, request: dict[str, Any], *, timeout: float = 3) -> dict[str, Any]:
+    socket_path = runtime / "worlds.sock"
+    try:
+        info = socket_path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600:
+            raise OSError("unsafe socket")
+        body = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        if not 1 <= len(body) <= 8192:
+            raise ModlyCliError("Worlds CLI request exceeds safe bounds.", code="INVALID_REQUEST")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(timeout)
+            stream.connect(str(socket_path))
+            stream.sendall(struct.pack(">I", len(body)) + body)
+            length = struct.unpack(">I", _world_read_exact(stream, 4))[0]
+            if not 1 <= length <= 36 * 1024:
+                raise ModlyCliError("Invalid Worlds CLI response.", code="INVALID_RESPONSE")
+            result = json.loads(_world_read_exact(stream, length))
+            if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+                raise ModlyCliError("Invalid Worlds CLI response.", code="INVALID_RESPONSE")
+            return result
+    except ModlyCliError:
+        raise
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ModlyCliError("Worlds CLI transport unavailable.", code="WORLD_CLI_UNAVAILABLE") from exc
+
+
+def _world_store_session(runtime: Path, token: str, expires_at: int) -> None:
+    if not isinstance(token, str) or not WORLD_SESSION_TOKEN.fullmatch(token) or type(expires_at) is not int:
+        raise ModlyCliError("Invalid Worlds CLI pairing response.", code="INVALID_RESPONSE")
+    temporary = runtime / (".session-" + secrets.token_hex(12))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = None
+            json.dump({"session": token, "expiresAt": expires_at}, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, runtime / "session.json")
+        directory = os.open(runtime, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise ModlyCliError("Could not save Worlds CLI session.", code="WORLD_CLI_UNAVAILABLE") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _world_session(runtime: Path) -> str:
+    path = runtime / "session.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o600 or info.st_size > 256:
+                raise OSError("unsafe session")
+            data = json.loads(source.read(257))
+        token = data["session"]
+        if not isinstance(token, str) or not WORLD_SESSION_TOKEN.fullmatch(token):
+            raise ValueError("invalid session")
+        return token
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ModlyCliError("Pair Worlds CLI in a trusted terminal first.", code="WORLD_CLI_UNPAIRED") from exc
+
+
+def _world_public(value: Any, session: str) -> Any:
+    """Last-mile allowlist against accidental credential and path echoes."""
+    if isinstance(value, dict):
+        public = {}
+        for key, child in value.items():
+            if not isinstance(key, str) or any(word in key.lower() for word in
+                    ("path", "snapshot", "token", "secret", "credential", "auth", "document", "url", "uri", "session")):
+                continue
+            if key == "nextCursor" and isinstance(child, str) and len(child) <= 2048 and session not in child:
+                public[key] = child
+            else:
+                public[key] = _world_public(child, session)
+        return public
+    if isinstance(value, list):
+        return [_world_public(child, session) for child in value]
+    if isinstance(value, str) and (session in value or "/" in value or "\\" in value or value.lower().startswith(("file:", "http:", "https:", "data:"))):
+        return "[redacted]"
+    return value
+
+
+def _world_result(args: argparse.Namespace, request: dict[str, Any], *, shape: str) -> int:
+    result = _world_wire(_world_runtime_dir(), request)
+    if result.get("ok") is not True:
+        code = result.get("code")
+        safe_code = code if isinstance(code, str) and __import__("re").fullmatch(r"[A-Z_]{3,40}", code) else "WORLD_CLI_ERROR"
+        raise ModlyCliError("Worlds CLI request was rejected.", code=safe_code)
+    value = result.get(shape)
+    if not isinstance(value, (dict, list)):
+        raise ModlyCliError("Invalid Worlds CLI response.", code="INVALID_RESPONSE")
+    public = {"ok": True, shape: _world_public(value, request["session"])}
+    if shape == "projects" and type(result.get("total")) is int and type(result.get("truncated")) is bool:
+        public.update({"total": result["total"], "truncated": result["truncated"]})
+    _json_print(public, compact=args.compact)
+    return 0
+
+
+def _world_action_result(args: argparse.Namespace, request: dict[str, Any], *, fields: tuple[str, ...]) -> int:
+    result = _world_wire(_world_runtime_dir(), request)
+    if result.get("ok") is not True:
+        code = result.get("code")
+        safe_code = code if isinstance(code, str) and __import__("re").fullmatch(r"[A-Z_]{3,40}", code) else "WORLD_CLI_ERROR"
+        raise ModlyCliError("Worlds CLI request was rejected.", code=safe_code)
+    if any(field not in result for field in fields):
+        raise ModlyCliError("Invalid Worlds CLI response.", code="INVALID_RESPONSE")
+    public = {"ok": True, **{field: _world_public(result[field], request["session"]) for field in fields}}
+    _json_print(public, compact=args.compact)
+    return 0
+
+
+def _world_plan_id(value: str) -> str:
+    if not __import__("re").fullmatch(r"plan_[a-f0-9]{48}", value):
+        raise ModlyCliError("Invalid Worlds plan ID.", code="INVALID_REQUEST")
+    return value
+
+
+def _world_recipe_stdin() -> str:
+    data = sys.stdin.buffer.read(8193)
+    if not 2 <= len(data) <= 8192:
+        raise ModlyCliError("Worlds recipe exceeds the stdin byte limit.", code="INVALID_REQUEST")
+    try:
+        text = data.decode("utf-8", errors="strict")
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+        parsed = json.loads(text, object_pairs_hook=unique, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("nonfinite")))
+        pending: list[tuple[Any, int]] = [(parsed, 0)]
+        count = 0
+        while pending:
+            value, depth = pending.pop()
+            count += 1
+            if count > 1024 or depth > 16 or isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("invalid bounds")
+            if isinstance(value, dict):
+                pending.extend((child, depth + 1) for child in value.values())
+            elif isinstance(value, list):
+                pending.extend((child, depth + 1) for child in value)
+        if not isinstance(parsed, dict) or set(parsed) != {"commands"} or not isinstance(parsed["commands"], list):
+            raise ValueError("invalid recipe envelope")
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise ModlyCliError("Invalid Worlds recipe JSON.", code="INVALID_REQUEST") from exc
+    return text
+
+
+def cmd_world_pair(args: argparse.Namespace) -> int:
+    runtime = _world_runtime_dir()
+    _world_require_tty()
+    activation = _world_wire(runtime, {"operation": "pair.request"}, timeout=95)
+    if activation.get("ok") is not True:
+        raise ModlyCliError("Worlds pairing was not approved in the desktop app.", code="PAIRING_DECLINED")
+    code = _world_pairing_code()
+    result = _world_wire(runtime, {"operation": "pair", "code": code})
+    if (result.get("ok") is not True or result.get("scope") != "worlds:read"
+            or result.get("proposalScope") != "worlds:auto-apply"):
+        raise ModlyCliError("Worlds CLI pairing was rejected.", code="UNAUTHORIZED")
+    _world_store_session(runtime, result.get("session"), result.get("expiresAt"))
+    _json_print({"ok": True, "paired": True, "scope": "worlds:read",
+                 **({"proposalScope": "worlds:auto-apply"} if result.get("proposalScope") == "worlds:auto-apply" else {})}, compact=args.compact)
+    return 0
+
+
+def cmd_world_list(args: argparse.Namespace) -> int:
+    runtime = _world_runtime_dir()
+    return _world_result(args, {"operation": "list", "session": _world_session(runtime)}, shape="projects")
+
+
+def cmd_world_open(args: argparse.Namespace) -> int:
+    runtime = _world_runtime_dir()
+    return _world_result(args, {"operation": "open", "session": _world_session(runtime), "projectKey": _world_project_key(args.project_key)}, shape="project")
+
+
+def cmd_world_query(args: argparse.Namespace) -> int:
+    runtime = _world_runtime_dir()
+    request: dict[str, Any] = {"operation": "query", "session": _world_session(runtime), "projectKey": _world_project_key(args.project_key),
+                               "revision": args.revision, "kind": args.kind, "pageSize": _world_page_size(args.page_size)}
+    for option, key in (("scene_id", "sceneId"), ("entity_id", "entityId"), ("source", "source"), ("format", "format"), ("cursor", "cursor")):
+        value = getattr(args, option)
+        if value is not None:
+            request[key] = value
+    if args.plan is not None:
+        request["planId"] = _world_plan_id(args.plan)
+        result = _world_wire(runtime, request)
+        if result.get("ok") is not True:
+            code = result.get("code")
+            safe_code = code if isinstance(code, str) and __import__("re").fullmatch(r"[A-Z_]{3,40}", code) else "WORLD_CLI_ERROR"
+            raise ModlyCliError("Worlds CLI query was rejected.", code=safe_code)
+        delivery_id = result.get("deliveryId")
+        if not isinstance(result.get("page"), dict) or not isinstance(delivery_id, str) or not __import__("re").fullmatch(r"delivery_[a-f0-9]{48}", delivery_id):
+            raise ModlyCliError("Invalid Worlds CLI query response.", code="INVALID_RESPONSE")
+        _json_print({"ok": True, "page": _world_public(result["page"], request["session"])}, compact=args.compact)
+        sys.stdout.flush()
+        acknowledged = _world_wire(runtime, {"operation": "ack", "session": request["session"], "projectKey": request["projectKey"],
+                                             "planId": request["planId"], "deliveryId": delivery_id})
+        if acknowledged != {"ok": True}:
+            raise ModlyCliError("Worlds CLI query delivery was not acknowledged.", code="INVALID_RESPONSE")
+        return 0
+    return _world_result(args, request, shape="page")
+
+
+def cmd_world_plan(args: argparse.Namespace) -> int:
+    request = {"operation": "plan", "session": _world_session(_world_runtime_dir()),
+               "projectKey": _world_project_key(args.project_key), "sceneId": args.scene_id}
+    return _world_action_result(args, request, fields=("planId", "projectKey", "revision", "sceneId", "expiresAt"))
+
+
+def cmd_world_propose(args: argparse.Namespace) -> int:
+    request = {"operation": "propose", "session": _world_session(_world_runtime_dir()),
+               "projectKey": _world_project_key(args.project_key), "planId": _world_plan_id(args.plan),
+               "json": _world_recipe_stdin()}
+    return _world_action_result(args, request, fields=("proposalId", "projectKey", "revision", "digest", "expiresAt",
+                                                        "commandCount", "changeCount", "status"))
 
 
 def _json_print(data: dict[str, Any], *, compact: bool = False) -> None:
@@ -1189,11 +1488,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout", type=float, default=30, help="Per-request timeout in seconds (default: 30)")
     parser.add_argument("--compact", action="store_true", help="Print compact one-line JSON")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output; final JSON is still printed")
-    canonical_commands = "{health,model,workflow-run,capability,process-run,generate,dev,experimental,legacy}"
+    canonical_commands = "{health,model,workflow-run,capability,process-run,world,generate,dev,experimental,legacy}"
     sub = parser.add_subparsers(dest="command", required=True, metavar=canonical_commands)
 
     health = sub.add_parser("health", help="Check that Modly's local API is reachable")
     health.set_defaults(func=cmd_health)
+
+    world = sub.add_parser("world", help="Read Worlds and submit bounded proposals through Desktop-approved pairing",
+                           description="Valid proposals may auto-apply during the approved five-minute, eight-admission lease. direct-edit-dispatched is dispatch only; verify with a fresh read. Apply, Reject, Undo, edit, and status commands are unsupported.")
+    world_sub = world.add_subparsers(dest="world_command", required=True)
+    world_sub.add_parser("pair", help="Request native desktop consent, then enter the code shown in the native dialog").set_defaults(func=cmd_world_pair)
+    world_project = world_sub.add_parser("project", help="List or open World project summaries")
+    world_project_sub = world_project.add_subparsers(dest="world_project_command", required=True)
+    world_project_sub.add_parser("list", help="List bounded project summaries").set_defaults(func=cmd_world_list)
+    world_open = world_project_sub.add_parser("open", help="Open a redacted project summary")
+    world_open.add_argument("project_key")
+    world_open.set_defaults(func=cmd_world_open)
+    world_plan = world_sub.add_parser("plan", help="Capture a short-lived Main-owned authoring context")
+    world_plan.add_argument("project_key")
+    world_plan.add_argument("--scene-id", required=True)
+    world_plan.set_defaults(func=cmd_world_plan)
+    world_query = world_sub.add_parser("query", help="Read a canonical paginated World AI query page")
+    world_query.add_argument("project_key")
+    world_query.add_argument("--revision", type=int, required=True)
+    world_query.add_argument("--kind", choices=("project", "scenes", "entities", "components", "resources"), required=True)
+    world_query.add_argument("--scene-id")
+    world_query.add_argument("--entity-id")
+    world_query.add_argument("--source", choices=("project", "workflows", "exports"))
+    world_query.add_argument("--format")
+    world_query.add_argument("--cursor")
+    world_query.add_argument("--page-size", type=int, default=50)
+    world_query.add_argument("--plan", help="Use a Main-owned plan for coherent observations")
+    world_query.set_defaults(func=cmd_world_query)
+    world_propose = world_sub.add_parser("propose", help="Submit bounded typed recipe JSON for possible automatic scene editing")
+    world_propose.add_argument("project_key")
+    world_propose.add_argument("--plan", required=True)
+    world_propose.add_argument("--json", required=True, choices=("-",), help="Read recipe JSON only from stdin")
+    world_propose.set_defaults(func=cmd_world_propose)
 
     status = sub.add_parser("status", help=argparse.SUPPRESS)
     status.set_defaults(func=cmd_status)

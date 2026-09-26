@@ -16,7 +16,7 @@ import type { RigMetaNamingMap } from './rigMetaNaming.ts'
 import type { RigRenamePlan } from './rigRenamePlan.ts'
 import type { RigSkeletonSummary } from './rigSkeleton.ts'
 
-const rigSummary: RigSkeletonSummary = {
+const rigSummary: RigSkeletonSummary & { sourceWorkspacePath: string } = {
   hasRig: true,
   sourceWorkspacePath: 'Workflows/generated/hero.glb',
   skeletonContextId: 'rig:Hero|skeleton:0',
@@ -97,6 +97,9 @@ function createArtifact(overrides: Partial<KimodoMotionArtifact> = {}): KimodoMo
     diagnostics: {
       runtimeStatus: 'success',
       retargetStatus: 'success',
+      solverStatus: null,
+      basisStatus: null,
+      rootMotionStatus: null,
       animationMappingStatus: 'trusted_contract',
       stabilizationStatus: 'not_evaluated',
       visualQualityStatus: 'warning',

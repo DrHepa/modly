@@ -1,0 +1,10 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; color: #e9edf3; background: #17191d; }
+body { margin: 0; }
+.physics-fixture { display: flex; flex-direction: column; min-height: 100vh; }
+.physics-fixture__heading { padding: 14px 20px; }
+.physics-fixture h1 { font-size: 19px; margin: 0 0 6px; }
+.physics-fixture p { margin: 0; color: #aeb9c9; font-size: 13px; }
+.physics-fixture__viewport { position: relative; height: 650px; min-height: 300px; }
+.physics-fixture .world-runtime-viewport { height: 100%; }
+.physics-fixture__status { padding: 12px 20px; font-variant-numeric: tabular-nums; }
+[role="alert"] { color: #ffb4a9; }

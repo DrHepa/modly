@@ -8,6 +8,8 @@ import type { PlyKind } from '../ply/plyHeaderClassification.ts'
 import type { AgentSessionsApi } from './agentSessions.ts'
 import type { AgentActionsApi, AgentCapabilitiesApi, AgentCapabilityDeclarationV1 } from './agentActions.ts'
 import type { AgentWorkflowsApi } from './agentWorkflows.ts'
+import type { WorldProjectsApi, WorldsCliApi } from './worldProjects.ts'
+import type { WorldRendersApi } from './worldRenders.ts'
 
 export type {
   AgentActionApprovalV1,
@@ -45,6 +47,46 @@ export type {
   AgentWorkflowGraphV1,
   AgentWorkflowsApi,
 } from './agentWorkflows.ts'
+
+export type {
+  WorldProjectCommandRequest,
+  WorldProjectCommandResult,
+  WorldProjectCreateRequest,
+  WorldProjectCreateResult,
+  WorldProjectDeleteRequest,
+  WorldProjectDeleteResult,
+  WorldProjectDiscoveryIssue,
+  WorldProjectDiscoveryStatus,
+  WorldProjectKeyRequest,
+  WorldProjectListResult,
+  WorldProjectOpenResult,
+  WorldProjectPublicError,
+  WorldProjectPublicErrorCode,
+  WorldProjectSummary,
+  WorldProjectsApi,
+} from './worldProjects.ts'
+
+export type {
+  WorldRenderArtifact,
+  WorldRenderCancelRequest,
+  WorldRenderCancelResult,
+  WorldRenderCreateRequest,
+  WorldRenderCreateResult,
+  WorldRenderDeleteRequest,
+  WorldRenderDeleteResult,
+  WorldRenderGetResult,
+  WorldRenderJobDetail,
+  WorldRenderJobKeyRequest,
+  WorldRenderJobStatus,
+  WorldRenderJobSummary,
+  WorldRenderListResult,
+  WorldRenderOutputs,
+  WorldRenderPreset,
+  WorldRenderProgress,
+  WorldRenderPublicError,
+  WorldRenderPublicErrorCode,
+  WorldRendersApi,
+} from './worldRenders.ts'
 
 export type {
   ArtifactKind,
@@ -1215,6 +1257,9 @@ declare global {
         }
         worlds: {
           writeSceneManifest: (request: WorldsSceneManifestWriteRequest) => Promise<WorldsSceneManifestWriteResult>
+          cli: WorldsCliApi
+          projects: WorldProjectsApi
+          renders: WorldRendersApi
         }
         artifacts: {
           writeSidecar: (request: ArtifactRegistryWriteRequest) => Promise<ArtifactRegistryWriteResult>

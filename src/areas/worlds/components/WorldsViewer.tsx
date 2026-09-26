@@ -1,8 +1,9 @@
-import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
+import { Component, Suspense, createContext, lazy, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
 import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
-import { Bounds, Environment, GizmoHelper, GizmoViewport, Html, Lightformer, OrbitControls, TransformControls, useBounds, useGLTF } from '@react-three/drei'
-import { EffectComposer, Outline, Select, Selection } from '@react-three/postprocessing'
+import { Bounds, Environment, GizmoHelper, GizmoViewport, Html, Lightformer, OrbitControls, TransformControls, useGLTF } from '@react-three/drei'
+import { Select, Selection } from '@react-three/postprocessing'
 import * as THREE from 'three'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import { clone as cloneSkeletonScene } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh'
@@ -11,6 +12,8 @@ import type { SceneArtifactManifestInitialView } from '../../../shared/types/art
 
 import { classifyPlyGeometry } from '../plyClassification.ts'
 import { isWorldsGaussianPlyEnabled, type WorldSceneItem } from '../worldRenderableResolver.ts'
+import type { WorldProjectDocumentV1 } from '../core/worldModel.ts'
+import { WorldViewportGraphics } from './WorldViewportGraphics.tsx'
 import { createWorldSceneSelectionTransformUpdates, type WorldSceneItemTransformUpdate, type WorldSceneTransformSnapshot } from '../worldsScenePlacement.ts'
 import {
   applyWorldsPoseClipAtTime,
@@ -23,7 +26,9 @@ import { calculateWorldsObjectLocalBounds } from '../worldsObjectBounds.ts'
 import {
   normalizeWorldSceneCollisionSurfaces,
   WORLD_CAMERA_COLLISION_HALF_EXTENTS,
+  DEFAULT_WORLDS_VIEWPORT_CONTROL_MODE,
   createWorldsCameraState,
+  type WorldsViewportControlMode,
 } from '../worldCameraNavigation.ts'
 import type { WorldsResolvedCollisionSurface } from '../worldsSurfaceMath.ts'
 import { resolveWorldSurfaceProbeTranslation } from '../worldsSurfaceNavigation.ts'
@@ -33,20 +38,20 @@ import {
   resolveWorldsPendingSurfacePlacementDecision,
   WORLDS_DRAG_BASE_SUPPORT_MAX_CORRECTION,
 } from '../worldsBaseSceneSupport.ts'
-import { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
-import { WorldsKeyboardCameraControls, type WorldsOrbitControlsHandle } from './WorldsKeyboardCameraControls.tsx'
-import { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
-import WorldsTransformToolbar, { type WorldsTransformMode } from './WorldsTransformToolbar.tsx'
+import { WorldsViewportModeControl } from './WorldsViewportModeControl.tsx'
+import { WorldsViewportNavigationControls, type WorldsOrbitControlsHandle } from './WorldsViewportNavigationControls.tsx'
+import WorldsTransformToolbar, { type WorldsItemSelectionOptions, type WorldsTransformMode } from './WorldsTransformToolbar.tsx'
 import WorldCollisionSurfaceLayer from './WorldCollisionSurfaceLayer.tsx'
 import type { WorldCollisionSurface, WorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
+import type { WorldsTimelineViewportPreview, WorldsViewportCamera, WorldsViewportEnvironment, WorldsViewportLight } from '../worldsViewportTypes.ts'
+import { WorldCanvasLifecycle, type WorldViewportFailure } from './WorldViewportBoundary.tsx'
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree as any
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree as any
 THREE.Mesh.prototype.raycast = acceleratedRaycast
 
-export { WORLD_VIEWER_CAMERA_OVERLAY, WorldsCameraOverlay } from './WorldsCameraOverlay.tsx'
-export { WorldsKeyboardCameraControls } from './WorldsKeyboardCameraControls.tsx'
-export { WorldsMouseLookCameraControls } from './WorldsMouseLookCameraControls.tsx'
+export { WorldsViewportModeControl } from './WorldsViewportModeControl.tsx'
+export { WorldsViewportNavigationControls } from './WorldsViewportNavigationControls.tsx'
 
 const LazyWorldsGaussianPlyObject = lazy(async () => {
   const module = await import('./WorldsGaussianPlyObject.tsx')
@@ -59,8 +64,17 @@ export type WorldsViewerUnsupportedItem = {
 }
 
 export interface WorldsViewerProps {
+  project: WorldProjectDocumentV1
+  onGraphicsFailure?: (failure: WorldViewportFailure) => void
+  onGraphicsDiagnostic?: (message: string) => void
   items: WorldSceneItem[]
   initialView?: SceneArtifactManifestInitialView
+  environment?: WorldsViewportEnvironment
+  lights?: WorldsViewportLight[]
+  useStudioLights?: boolean
+  showPlaybackControls?: boolean
+  showAuthoringToolbar?: boolean
+  timelinePreview?: WorldsTimelineViewportPreview | null
   collisionSurfaces?: WorldCollisionSurface[]
   unsupportedItems?: WorldsViewerUnsupportedItem[]
   selectedItemId?: string | null
@@ -69,13 +83,17 @@ export interface WorldsViewerProps {
   collisionEditMode?: boolean
   selectedCollisionSurfaceId?: string | null
   transformMode?: WorldsTransformMode | null
-  onSelectItem?: (itemId: string | null, options?: { toggle?: boolean }) => void
+  onSelectItem?: (itemId: string | null, options?: WorldsItemSelectionOptions) => void
   onAddCollisionSurface?: (preset?: WorldCollisionSurfacePreset) => void
   onCollisionEditModeChange?: (enabled: boolean) => void
   onSelectCollisionSurface?: (surfaceId: string | null) => void
   onTransformModeChange?: (mode: WorldsTransformMode | null) => void
-  onTransformItem?: (itemId: string, transform: WorldSceneItem['transform']) => void
-  onTransformItems?: (updates: WorldSceneItemTransformUpdate[]) => void
+  transformPending?: boolean
+  transformStatus?: string | null
+  onTransformGestureBegin?: (itemIds: readonly string[]) => WorldsTransformGestureToken | null
+  onTransformGestureCancel?: (gesture: WorldsTransformGestureToken) => void
+  onTransformItem?: (itemId: string, transform: WorldSceneItem['transform'], meta?: WorldsTransformCommitMeta) => void
+  onTransformItems?: (updates: WorldSceneItemTransformUpdate[], meta?: WorldsTransformCommitMeta) => void
   onTransformCollisionSurface?: (surfaceId: string, transform: WorldCollisionSurface['transform']) => void
   onRemoveCollisionSurface?: (surfaceId: string | null) => void
   onRemoveItem?: (itemId: string | null) => void
@@ -84,6 +102,14 @@ export interface WorldsViewerProps {
   onCommitPendingSurfacePlacement?: (itemId: string, transform: WorldSceneItem['transform']) => void
   onClearPendingSurfacePlacement?: () => void
   onAnimationMetadata?: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
+}
+
+export interface WorldsTransformGestureToken {
+  readonly gestureId: string
+}
+
+export interface WorldsTransformCommitMeta {
+  readonly gesture: WorldsTransformGestureToken | null
 }
 
 type WorldsPlaybackRef = {
@@ -102,14 +128,16 @@ export type PlyRenderModel = {
 }
 
 export const WORLD_VIEWER_CAMERA_NAVIGATION = {
-  orbitControls: 'always-enabled',
-  keyboardMovement: 'focused-viewer-scope',
+  modes: ['inspect', 'fly', 'run'],
+  orbitControls: 'inspect-only',
+  pointerLock: 'explicit-fly-run',
+  keyboardMovement: 'viewer-scoped',
 } as const
 
 export const WORLD_VIEWER_ORBIT_CONTROLS = {
   enablePan: true,
   enableZoom: true,
-  enableRotate: false,
+  enableRotate: true,
   screenSpacePanning: true,
   minPolarAngle: 0,
   maxPolarAngle: Math.PI,
@@ -127,12 +155,6 @@ export const WORLD_VIEWER_TRANSFORM_CONTROLS = {
   backendBake: false,
 } as const
 
-const WORLD_SELECTION_OUTLINE_VISIBLE_COLOR = 0x8b5cf6
-const WORLD_SELECTION_OUTLINE_HIDDEN_COLOR = 0x5b21b6
-const WORLD_SELECTION_OUTLINE_EDGE_STRENGTH = 2.5
-const WORLD_SELECTION_OUTLINE_BLUR = false
-const WORLD_SELECTION_OUTLINE_MULTISAMPLING = 0
-const WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE = 0.5
 const WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR = 0x8b5cf6
 const WORLD_SELECTION_ACTIVE_SILHOUETTE_OPACITY = 0.8
 const WORLD_SELECTION_ACTIVE_SILHOUETTE_SCALE = 1.012
@@ -140,7 +162,6 @@ const WORLD_SELECTION_SECONDARY_SILHOUETTE_COLOR = 0x38bdf8
 const WORLD_SELECTION_SECONDARY_SILHOUETTE_OPACITY = 0.52
 const WORLD_SELECTION_SECONDARY_SILHOUETTE_SCALE = 1.008
 
-const WORLDS_CAMERA_HELP_TEXT = 'Left-drag look · Right-drag pan · Wheel zoom · WASD/Arrows move · Space up · Shift down · Q/E yaw'
 const WORLDS_DEFAULT_CAMERA_POSITION = new THREE.Vector3(2.4, 1.8, 2.8)
 const WORLDS_DEFAULT_CAMERA_TARGET = new THREE.Vector3(0, 0, 0)
 const WORLDS_DEFAULT_CAMERA_UP = new THREE.Vector3(0, 1, 0)
@@ -188,6 +209,35 @@ type WorldsMeasuredBounds = {
   size: THREE.Vector3
 }
 
+type WorldsRenderLoadStatus = 'pending' | 'loading' | 'ready' | 'failed' | 'removed'
+type WorldsRenderLoadState = { sourceKey: string; owner: object; attempt: object; status: WorldsRenderLoadStatus }
+type WorldsRenderLoadReporter = (item: WorldSceneItem, attempt: object, status: WorldsRenderLoadStatus, owner?: object) => void
+const WorldsRenderLoadContext = createContext<(status: WorldsRenderLoadStatus, attempt?: object) => void>(() => {})
+function worldsRenderSourceKey(item: WorldSceneItem): string {
+  return `${item.id}|${item.kind}|${item.workspacePath}|${item.url}`
+}
+function updateWorldsRenderLoadState(states: Map<string, WorldsRenderLoadState>, item: WorldSceneItem, attempt: object, status: WorldsRenderLoadStatus, boundaryOwner?: object): boolean {
+  const sourceKey = worldsRenderSourceKey(item), previous = states.get(item.id)
+  const owner = boundaryOwner ?? (status === 'pending' ? attempt : previous?.owner ?? attempt)
+  if (status === 'pending') {
+    if (attempt !== owner) return false
+  } else {
+    if (!previous || previous.owner !== owner || previous.sourceKey !== sourceKey) return false
+    if (status === 'removed') {
+      if (attempt === owner) return states.delete(item.id)
+      if (previous.attempt !== attempt) return false
+      // Child cleanup retires only its load; the still-mounted boundary keeps authority.
+      states.set(item.id, { sourceKey, owner, attempt: owner, status: 'pending' })
+      return true
+    }
+    if (previous.status === 'failed' && previous.attempt === owner && status !== 'failed') return false
+    if (status !== 'loading' && !(status === 'failed' && attempt === owner) && previous.attempt !== attempt) return false
+  }
+  if (previous?.attempt === attempt && previous.sourceKey === sourceKey && previous.status === status) return false
+  states.set(item.id, { sourceKey, owner, attempt, status })
+  return true
+}
+
 type WorldsDeferredTaskHandle = {
   cancel: () => void
 }
@@ -208,8 +258,17 @@ function isWorldsMeshObject(object: THREE.Object3D): object is THREE.Mesh {
 }
 
 export function WorldsViewer({
+  project,
+  onGraphicsFailure,
+  onGraphicsDiagnostic,
   items,
   initialView,
+  environment,
+  lights = [],
+  useStudioLights = shouldUseWorldsStudioLights(lights),
+  showPlaybackControls = true,
+  showAuthoringToolbar = true,
+  timelinePreview = null,
   collisionSurfaces = [],
   unsupportedItems = [],
   selectedItemId = null,
@@ -218,11 +277,15 @@ export function WorldsViewer({
   collisionEditMode = false,
   selectedCollisionSurfaceId = null,
   transformMode = null,
+  transformPending = false,
+  transformStatus = null,
   onSelectItem = () => undefined,
   onAddCollisionSurface = () => undefined,
   onCollisionEditModeChange = () => undefined,
   onSelectCollisionSurface = () => undefined,
   onTransformModeChange = () => undefined,
+  onTransformGestureBegin,
+  onTransformGestureCancel = () => undefined,
   onTransformItem = () => undefined,
   onTransformItems = () => undefined,
   onTransformCollisionSurface = () => undefined,
@@ -247,13 +310,17 @@ export function WorldsViewer({
     [normalizedCollisionSurfaces],
   )
   const inputScopeRef = useRef<HTMLElement>(null)
-  const orbitControlsRef = useRef<WorldsOrbitControlsHandle | null>(null)
+  const orbitControlsRef = useRef<OrbitControlsImpl | null>(null)
   const cameraFitSnapshotRef = useRef<WorldsCameraFitSnapshot | null>(null)
   const [cameraState, setCameraState] = useState(() => createWorldsCameraState())
+  const [controlMode, setControlMode] = useState<WorldsViewportControlMode>(DEFAULT_WORLDS_VIEWPORT_CONTROL_MODE)
+  const [pointerLocked, setPointerLocked] = useState(false)
+  const [navigationStatus, setNavigationStatus] = useState('Inspect mode. Orbit, pan, select, and edit.')
   const visibleItems = useMemo(() => items.filter((item) => item.visible), [items])
   const sceneFitKey = useMemo(() => createWorldsSceneFitKey(visibleItems), [visibleItems])
   const description = describeWorldsViewerScene(items, unsupportedItems, selectedItemId, normalizedSelectedItemIds)
   const sceneObjectsRef = useRef(new Map<string, THREE.Object3D>())
+  const renderLoadStatesRef = useRef(new Map<string, WorldsRenderLoadState>())
   const sceneItemLocalBoundsRef = useRef(new Map<string, WorldsCollisionBounds | null>())
   const transformDraggingRef = useRef(false)
   const suppressSelectionUntilRef = useRef(0)
@@ -271,6 +338,23 @@ export function WorldsViewer({
   const selectedItemIdSet = useMemo(() => new Set(normalizedSelectedItemIds), [normalizedSelectedItemIds])
   const selectedItems = useMemo(() => visibleItems.filter((item) => selectedItemIdSet.has(item.id)), [selectedItemIdSet, visibleItems])
   const selectedSceneObjects = useMemo(() => resolveWorldsSelectedSceneObjects(sceneObjectsRef.current, normalizedSelectedItemIds, selectedItemId), [sceneObjectVersion, normalizedSelectedItemIds, selectedItemId])
+  const isInspectMode = controlMode === 'inspect'
+  const editorControlsVisible = !timelinePreview
+  const inspectAuthoringEnabled = editorControlsVisible && isInspectMode
+  const handleControlModeChange = useCallback((nextMode: WorldsViewportControlMode) => {
+    setControlMode(nextMode)
+    if (nextMode !== 'inspect') setFocusRequest(null)
+  }, [])
+  const handleFrameScene = useCallback(() => {
+    setControlMode('inspect')
+    setNavigationStatus('Inspect mode. Framing scene.')
+    setCameraState((state) => ({ ...state, resetToken: state.resetToken + 1 }))
+  }, [])
+  useEffect(() => {
+    if (timelinePreview) {
+      setControlMode('inspect')
+    }
+  }, [timelinePreview])
   const selectSceneItemFromCanvas = useCallback((itemId: string | null, options?: { toggle?: boolean }) => {
     if (transformDraggingRef.current) return
     if (Date.now() < suppressSelectionUntilRef.current) return
@@ -305,6 +389,9 @@ export function WorldsViewer({
       sceneItemLocalBoundsRef.current.delete(itemId)
     }
     setSceneObjectVersion((version) => version + 1)
+  }, [])
+  const reportRenderLoadState = useCallback<WorldsRenderLoadReporter>((item, attempt, status, owner) => {
+    if (updateWorldsRenderLoadState(renderLoadStatesRef.current, item, attempt, status, owner)) setSceneLoadRevision((revision) => revision + 1)
   }, [])
 
   useEffect(() => {
@@ -342,17 +429,14 @@ export function WorldsViewer({
       tabIndex={0}
       onPointerDown={(event) => event.currentTarget.focus()}
     >
-      <WorldsCameraOverlay
-        speed={cameraState.speed}
-        onSpeedChange={(nextSpeed) => {
-          setCameraState((state) => ({ ...state, speed: nextSpeed }))
-        }}
-        onResetCamera={() => {
-          setCameraState((state) => ({ ...state, resetToken: state.resetToken + 1 }))
-        }}
-        helpText={WORLDS_CAMERA_HELP_TEXT}
-      />
-        <WorldsTransformToolbar
+      {editorControlsVisible ? <WorldsViewportModeControl
+        mode={controlMode}
+        status={navigationStatus}
+        pointerLocked={pointerLocked}
+        onModeChange={handleControlModeChange}
+        onFrameScene={handleFrameScene}
+      /> : null}
+                {inspectAuthoringEnabled && showAuthoringToolbar ? <WorldsTransformToolbar
           items={visibleItems}
           collisionSurfaces={normalizedCollisionSurfaces}
           selectedItemId={selectedItemId}
@@ -368,8 +452,9 @@ export function WorldsViewer({
           onRemoveItem={onRemoveItem}
           onRemoveCollisionSurface={onRemoveCollisionSurface}
           onToggleBaseSceneItem={onToggleBaseSceneItem}
-        />
-      <WorldsPlaybackControls
+                /> : null}
+                {transformPending || transformStatus ? <div className="worlds-empty-copy" role="status" aria-live="polite">{transformStatus ?? 'Saving transform…'}</div> : null}
+      {showPlaybackControls ? <WorldsPlaybackControls
         durationSeconds={playbackDuration}
         playing={playbackPlaying}
         controlTimeSeconds={playbackControlTime}
@@ -381,63 +466,50 @@ export function WorldsViewer({
           setPlaybackIsPlaying(false)
           setPlaybackTime(0)
         }}
-      />
+      /> : null}
       <Canvas
+        shadows
         camera={{ position: [2.4, 1.8, 2.8], fov: 45, near: 0.01, far: 500 }}
-        dpr={[1, 1]}
+        dpr={1}
         gl={{
-          antialias: true,
+          antialias: false,
           alpha: false,
           outputColorSpace: THREE.SRGBColorSpace,
-          toneMapping: THREE.NeutralToneMapping,
+          toneMapping: THREE.NoToneMapping,
           toneMappingExposure: 1.8,
         }}
         className="h-full w-full bg-[#18181b]"
-        onPointerMissed={handleCanvasPointerMissed}
+        onPointerMissed={inspectAuthoringEnabled ? handleCanvasPointerMissed : undefined}
       >
-        <color attach="background" args={['#18181b']} />
-        <ambientLight intensity={0.3} />
-        <Environment background={false}>
-          <Lightformer intensity={2} position={[0, 4, 4]} scale={8} />
-          <Lightformer intensity={0.5} position={[-4, 2, -4]} scale={6} />
-          <Lightformer intensity={0.3} position={[4, 1, -4]} scale={6} />
-        </Environment>
-        <directionalLight position={[5, 8, 5]} color="#ffffff" intensity={1.5} />
-        <directionalLight position={[-4, 2, -4]} color="#ffffff" intensity={0.6} />
+        <WorldCanvasLifecycle onFailure={onGraphicsFailure} />
+        <WorldsSceneLighting
+          environment={environment}
+          lights={lights}
+          useStudioLights={useStudioLights}
+        />
         <gridHelper args={[10, 20, '#3f3f46', '#27272a']} />
         <Bounds margin={1.25}>
           <Selection enabled={normalizedSelectedItemIds.length > 0}>
-            <EffectComposer
-              multisampling={WORLD_SELECTION_OUTLINE_MULTISAMPLING}
-              resolutionScale={WORLD_SELECTION_OUTLINE_RESOLUTION_SCALE}
-            >
-              <Outline
-                blur={WORLD_SELECTION_OUTLINE_BLUR}
-                edgeStrength={WORLD_SELECTION_OUTLINE_EDGE_STRENGTH}
-                visibleEdgeColor={WORLD_SELECTION_OUTLINE_VISIBLE_COLOR}
-                hiddenEdgeColor={WORLD_SELECTION_OUTLINE_HIDDEN_COLOR}
-                xRay={false}
-              />
-            </EffectComposer>
             {visibleItems.map((item) => (
-              <WorldSceneItemErrorBoundary key={item.id}>
+              <WorldSceneItemErrorBoundary key={worldsRenderSourceKey(item)} item={item} onRenderLoadStateChange={reportRenderLoadState}>
                 <Suspense fallback={null}>
                   <WorldSceneItemObject
                     item={item}
                     selected={selectedItemIdSet.has(item.id)}
                     boundsVersion={item.id === selectedItemId ? selectedBoundsVersion : 0}
                     playbackRef={playbackRef}
-                    onSelectItem={selectSceneItemFromCanvas}
-                    onFocusItem={focusSceneItemFromCanvas}
+                    onSelectItem={inspectAuthoringEnabled ? selectSceneItemFromCanvas : () => undefined}
+                    onFocusItem={inspectAuthoringEnabled ? focusSceneItemFromCanvas : () => undefined}
                     onRegisterObject={registerSceneObject}
                     onLocalBoundsChange={cacheSceneItemLocalBounds}
                     onSceneItemAnchorChange={onSceneItemAnchorChange}
                     onAnimationMetadata={onAnimationMetadata}
+                    timelineAnimationTimeSeconds={resolveWorldsTimelineAnimationTime(item.id, timelinePreview)}
                   />
                 </Suspense>
               </WorldSceneItemErrorBoundary>
             ))}
-            {collisionEditMode ? (
+            {inspectAuthoringEnabled && collisionEditMode ? (
               <WorldCollisionSurfaceLayer
                 editMode={collisionEditMode}
                 surfaces={normalizedCollisionSurfaces}
@@ -450,7 +522,7 @@ export function WorldsViewer({
               />
             ) : null}
           </Selection>
-          {selectedSceneObjects.secondaryObjects.map((object) => (
+          {inspectAuthoringEnabled ? selectedSceneObjects.secondaryObjects.map((object) => (
             <WorldsSelectionSilhouette
               key={object.uuid}
               target={object}
@@ -459,8 +531,8 @@ export function WorldsViewer({
               scaleMultiplier={WORLD_SELECTION_SECONDARY_SILHOUETTE_SCALE}
               renderOrder={1}
             />
-          ))}
-          {selectedSceneObjects.activeObject ? (
+          )) : null}
+          {inspectAuthoringEnabled && selectedSceneObjects.activeObject ? (
             <WorldsSelectionSilhouette
               target={selectedSceneObjects.activeObject}
               color={WORLD_SELECTION_ACTIVE_SILHOUETTE_COLOR}
@@ -469,7 +541,7 @@ export function WorldsViewer({
               renderOrder={2}
             />
           ) : null}
-          {selectedObject && transformMode && !selectedCollisionSurfaceId ? (
+          {selectedObject && transformMode && !selectedCollisionSurfaceId && inspectAuthoringEnabled ? (
             <WorldsTransformControls
               object={selectedObject}
               mode={transformMode}
@@ -484,23 +556,30 @@ export function WorldsViewer({
               onBoundsChange={invalidateSelectedBounds}
               onTransformItem={onTransformItem}
               onTransformItems={onTransformItems}
+              onTransformGestureBegin={onTransformGestureBegin}
+              onTransformGestureCancel={onTransformGestureCancel}
             />
           ) : null}
-            <SceneFitController
+            {editorControlsVisible ? <SceneFitController
+              enabled={inspectAuthoringEnabled}
               initialView={initialView}
               fitKey={sceneFitKey}
               loadRevision={sceneLoadRevision}
+              sceneItems={visibleItems}
+              sceneObjectsRef={sceneObjectsRef}
+              sceneObjectVersion={sceneObjectVersion}
+              renderLoadStatesRef={renderLoadStatesRef}
               resetToken={cameraState.resetToken}
               orbitControlsRef={orbitControlsRef}
               cameraFitSnapshotRef={cameraFitSnapshotRef}
               collisionSurfaces={resolvedCollisionSurfaces}
-            />
-            <SceneFocusController
+            /> : null}
+            {inspectAuthoringEnabled ? <SceneFocusController
               focusRequest={focusRequest}
               orbitControlsRef={orbitControlsRef}
               sceneObjectsRef={sceneObjectsRef}
               collisionSurfaces={resolvedCollisionSurfaces}
-            />
+            /> : null}
             <WorldsPendingSurfacePlacementController
               pendingItemId={pendingSurfacePlacementItemId}
               sceneItems={visibleItems}
@@ -511,6 +590,16 @@ export function WorldsViewer({
               sceneLoadRevision={sceneLoadRevision}
               onCommitPendingSurfacePlacement={onCommitPendingSurfacePlacement}
               onClearPendingSurfacePlacement={onClearPendingSurfacePlacement}
+            />
+            <WorldViewportGraphics
+              kind="editor"
+              project={project}
+              selectedObjects={[
+                ...(selectedSceneObjects.activeObject ? [selectedSceneObjects.activeObject] : []),
+                ...selectedSceneObjects.secondaryObjects,
+              ]}
+              onDiagnostic={onGraphicsDiagnostic}
+              onGraphicsFailure={onGraphicsFailure}
             />
         </Bounds>
         <OrbitControls
@@ -529,22 +618,23 @@ export function WorldsViewer({
           zoomSpeed={WORLD_VIEWER_ORBIT_CONTROLS.zoomSpeed}
           panSpeed={WORLD_VIEWER_ORBIT_CONTROLS.panSpeed}
           rotateSpeed={WORLD_VIEWER_ORBIT_CONTROLS.rotateSpeed}
+          enabled={inspectAuthoringEnabled}
         />
-        <WorldsKeyboardCameraControls
+        {editorControlsVisible ? <WorldsViewportNavigationControls
+          mode={controlMode}
           collisionSurfaces={resolvedCollisionSurfaces}
-          speed={cameraState.speed}
           inputScopeRef={inputScopeRef}
           orbitControlsRef={orbitControlsRef}
-        />
-        <WorldsMouseLookCameraControls
-          inputScopeRef={inputScopeRef}
-          orbitControlsRef={orbitControlsRef}
-          enabled={!transformMode && !transformDraggingRef.current}
-        />
+          frameSceneToken={cameraState.resetToken}
+          onModeChange={handleControlModeChange}
+          onPointerLockChange={setPointerLocked}
+          onStatusChange={setNavigationStatus}
+        /> : null}
+        {timelinePreview?.activeCamera ? <WorldsTimelinePreviewCameraController camera={timelinePreview.activeCamera} /> : null}
         <WorldsPlaybackFrameController playbackRef={playbackRef} scrubRef={playbackScrubRef} timeLabelRef={playbackTimeLabelRef} />
-        <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
+        {inspectAuthoringEnabled ? <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
           <GizmoViewport axisColors={['#ef4444', '#22c55e', '#3b82f6']} labelColor="#f4f4f5" />
-        </GizmoHelper>
+        </GizmoHelper> : null}
       </Canvas>
 
       {description.unsupported.length > 0 ? (
@@ -554,6 +644,178 @@ export function WorldsViewer({
       ) : null}
     </section>
   )
+}
+
+export function shouldUseWorldsStudioLights(lights: readonly WorldsViewportLight[]): boolean {
+  return lights.length === 0
+}
+
+export function resolveWorldsTimelineAnimationTime(
+  entityId: string,
+  preview: WorldsTimelineViewportPreview | null | undefined,
+): number | undefined {
+  if (!preview) return undefined
+  const state = preview.animationStates.find((candidate) => candidate.entityId === entityId)
+  return state?.playing ? Math.max(0, preview.timeSeconds) : 0
+}
+
+export function createWorldsPoseClipLoadKey(
+  workspacePath: string,
+  animation: WorldSceneItem['animation'],
+): string | null {
+  if (!animation || animation.kind !== 'pose-clip' || workspacePath !== animation.sourceWorkspacePath) return null
+  return JSON.stringify([
+    workspacePath,
+    animation.kind,
+    animation.sourceWorkspacePath,
+    animation.sidecarWorkspacePath,
+    animation.legacySidecarWorkspacePath ?? null,
+  ])
+}
+
+export function createWorldsTimelinePreviewCamera(
+  descriptor: WorldsViewportCamera,
+  viewportWidth: number,
+  viewportHeight: number,
+): THREE.PerspectiveCamera | THREE.OrthographicCamera {
+  const camera = descriptor.component.projection === 'orthographic'
+    ? new THREE.OrthographicCamera()
+    : new THREE.PerspectiveCamera()
+  applyWorldsTimelinePreviewCamera(camera, descriptor, viewportWidth, viewportHeight)
+  return camera
+}
+
+export function applyWorldsTimelinePreviewCamera(
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+  descriptor: WorldsViewportCamera,
+  viewportWidth: number,
+  viewportHeight: number,
+): void {
+  const component = descriptor.component
+  const aspect = Math.max(1, viewportWidth) / Math.max(1, viewportHeight)
+  camera.position.set(...descriptor.transform.position)
+  camera.quaternion.setFromEuler(new THREE.Euler(...descriptor.transform.rotation, 'XYZ'))
+  camera.up.set(0, 1, 0)
+  camera.near = component.near
+  camera.far = component.far
+  if (camera instanceof THREE.PerspectiveCamera) {
+    camera.fov = component.fieldOfView ?? 45
+    camera.aspect = aspect
+  } else {
+    const verticalSize = component.orthographicSize ?? 10
+    camera.top = verticalSize / 2
+    camera.bottom = -verticalSize / 2
+    camera.left = -verticalSize * aspect / 2
+    camera.right = verticalSize * aspect / 2
+  }
+  camera.updateProjectionMatrix()
+  camera.updateMatrixWorld(true)
+}
+
+function WorldsTimelinePreviewCameraController({ camera: descriptor }: { camera: WorldsViewportCamera }): null {
+  const { get, set, size } = useThree()
+  const camera = useMemo(
+    () => descriptor.component.projection === 'orthographic'
+      ? new THREE.OrthographicCamera()
+      : new THREE.PerspectiveCamera(),
+    [descriptor.component.projection],
+  )
+  useLayoutEffect(() => {
+    const editorCamera = get().camera
+    set({ camera })
+    return () => {
+      if (get().camera === camera) set({ camera: editorCamera })
+    }
+  }, [camera, get, set])
+  useLayoutEffect(() => {
+    applyWorldsTimelinePreviewCamera(camera, descriptor, size.width, size.height)
+  }, [camera, descriptor, size.height, size.width])
+  return null
+}
+
+export function WorldsSceneLighting({
+  environment,
+  lights,
+  useStudioLights,
+}: {
+  environment?: WorldsViewportEnvironment
+  lights: readonly WorldsViewportLight[]
+  useStudioLights: boolean
+}): JSX.Element {
+  const backgroundColor = environment?.backgroundColor ?? '#18181b'
+  const ambientIntensity = environment?.ambientIntensity ?? 0.3
+  return (
+    <>
+      <color attach="background" args={[backgroundColor]} />
+      {environment?.environmentResourceUrl ? (
+        <Environment files={environment.environmentResourceUrl} background={false} />
+      ) : null}
+      {useStudioLights ? (
+        <>
+          <ambientLight intensity={ambientIntensity} />
+          {!environment?.environmentResourceUrl ? (
+            <Environment background={false}>
+              <Lightformer intensity={2} position={[0, 4, 4]} scale={8} />
+              <Lightformer intensity={0.5} position={[-4, 2, -4]} scale={6} />
+              <Lightformer intensity={0.3} position={[4, 1, -4]} scale={6} />
+            </Environment>
+          ) : null}
+          <directionalLight position={[5, 8, 5]} color="#ffffff" intensity={1.5} />
+          <directionalLight position={[-4, 2, -4]} color="#ffffff" intensity={0.6} />
+        </>
+      ) : (
+        <>
+          {ambientIntensity > 0 ? <ambientLight intensity={ambientIntensity} /> : null}
+          {lights.map((light) => <WorldsAuthoredLight key={light.component.id} light={light} />)}
+        </>
+      )}
+    </>
+  )
+}
+
+function WorldsAuthoredLight({ light }: { light: WorldsViewportLight }): JSX.Element {
+  const { component, transform } = light
+  if (component.lightKind === 'ambient') {
+    return <ambientLight color={component.color} intensity={component.intensity} />
+  }
+  if (component.lightKind === 'directional') {
+    return <WorldsTargetedAuthoredLight light={light} />
+  }
+  if (component.lightKind === 'point') {
+    return <pointLight position={transform.position} color={component.color} intensity={component.intensity} distance={component.range} decay={2} castShadow={component.castShadow} />
+  }
+  return <WorldsTargetedAuthoredLight light={light} />
+}
+
+function WorldsTargetedAuthoredLight({ light }: { light: WorldsViewportLight }): JSX.Element {
+  const { component, transform } = light
+  const target = useMemo(() => new THREE.Object3D(), [])
+  target.position.set(...resolveWorldsLightTarget(transform))
+  if (component.lightKind === 'directional') {
+    return (
+      <>
+        <primitive object={target} />
+        <directionalLight position={transform.position} target={target} color={component.color} intensity={component.intensity} castShadow={component.castShadow} />
+      </>
+    )
+  }
+  if (component.lightKind !== 'spot') return <></>
+  return (
+    <>
+      <primitive object={target} />
+      <spotLight position={transform.position} target={target} color={component.color} intensity={component.intensity} distance={component.range} angle={component.angle} decay={2} castShadow={component.castShadow} />
+    </>
+  )
+}
+
+export function resolveWorldsLightTarget(transform: WorldsViewportLight['transform']): [number, number, number] {
+  const direction = new THREE.Vector3(0, 0, -1)
+    .applyEuler(new THREE.Euler(...transform.rotation, 'XYZ'))
+  return [
+    transform.position[0] + direction.x,
+    transform.position[1] + direction.y,
+    transform.position[2] + direction.z,
+  ]
 }
 
 function WorldsPlaybackControls({
@@ -785,6 +1047,7 @@ function WorldSceneItemObject({
   onLocalBoundsChange,
   onSceneItemAnchorChange,
   onAnimationMetadata,
+  timelineAnimationTimeSeconds,
 }: {
   item: WorldSceneItem
   selected: boolean
@@ -796,6 +1059,7 @@ function WorldSceneItemObject({
   onLocalBoundsChange: (itemId: string, bounds: WorldsCollisionBounds | null) => void
   onSceneItemAnchorChange: (itemId: string, anchor: [number, number, number] | null) => void
   onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void
+  timelineAnimationTimeSeconds?: number
 }): JSX.Element | null {
   const groupRef = useRef<THREE.Group>(null)
   const boundsRef = useRef(new THREE.Box3())
@@ -900,7 +1164,7 @@ function WorldSceneItemObject({
           onClick={handleClick}
           onDoubleClick={handleDoubleClick}
         >
-          <WorldSceneItemGeometry item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} onBoundsChange={invalidateBounds} />
+          <WorldSceneItemGeometry item={item} playbackRef={playbackRef} timelineAnimationTimeSeconds={timelineAnimationTimeSeconds} onAnimationMetadata={onAnimationMetadata} onBoundsChange={invalidateBounds} />
         </group>
       </Select>
       <WorldsSelectionHitbox itemId={item.id} targetRef={groupRef} boundsVersion={boundsVersion + contentVersion} onSelectItem={onSelectItem} onFocusItem={onFocusItem} />
@@ -936,7 +1200,7 @@ export function isWorldsMultiSelectToggleGesture(event: Pick<MouseEvent, 'button
 export function shouldWorldsPointerMissClearSelection(
   event: Pick<MouseEvent, 'ctrlKey'> | { ctrlKey?: boolean; nativeEvent?: Pick<MouseEvent, 'ctrlKey'> } | null | undefined,
 ): boolean {
-  const ctrlKey = 'nativeEvent' in (event ?? {}) ? event?.nativeEvent?.ctrlKey : event?.ctrlKey
+  const ctrlKey = event && 'nativeEvent' in event ? event.nativeEvent?.ctrlKey : event?.ctrlKey
   return ctrlKey !== true
 }
 
@@ -1034,7 +1298,7 @@ export function resolveWorldsTransformPreview({
   }))
 
   if (collisionSurfaces.length === 0) {
-    const preview = {
+    const preview: WorldsTransformPreviewResolution = {
       correctionDelta: [0, 0, 0],
       reason: 'free',
       snappedPreset: null,
@@ -1090,7 +1354,7 @@ export function resolveWorldsTransformPreview({
     surfaces: collisionSurfaces,
   })
 
-  const preview = {
+  const preview: WorldsTransformPreviewResolution = {
     correctionDelta: resolved.acceptedTranslationDelta ?? [0, 0, 0],
     reason: resolved.reason,
     snappedPreset: null,
@@ -1255,7 +1519,7 @@ function WorldsSelectionHitbox({
   )
 }
 
-function WorldSceneItemGeometry({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element | null {
+function WorldSceneItemGeometry({ item, playbackRef, timelineAnimationTimeSeconds, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; timelineAnimationTimeSeconds?: number; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element | null {
   if (item.kind === 'gaussian-ply') {
     if (!isWorldsGaussianPlyEnabled()) return null
     return <LazyWorldsGaussianPlyObject itemId={item.id} url={item.url} onBoundsChange={onBoundsChange} />
@@ -1263,15 +1527,22 @@ function WorldSceneItemGeometry({ item, playbackRef, onAnimationMetadata, onBoun
   if (item.kind === 'ply-mesh' || item.kind === 'ply-points') {
     return <PlySceneObject item={item} onBoundsChange={onBoundsChange} />
   }
-  return <GltfSceneObject item={item} playbackRef={playbackRef} onAnimationMetadata={onAnimationMetadata} onBoundsChange={onBoundsChange} />
+  return <GltfSceneObject item={item} playbackRef={playbackRef} timelineAnimationTimeSeconds={timelineAnimationTimeSeconds} onAnimationMetadata={onAnimationMetadata} onBoundsChange={onBoundsChange} />
 }
 
 function PlySceneObject({ item, onBoundsChange }: { item: WorldSceneItem; onBoundsChange: () => void }): JSX.Element | null {
   const [model, setModel] = useState<PlyRenderModel | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const reportLoadState = useContext(WorldsRenderLoadContext)
+  const activeAttemptRef = useRef<object | null>(null)
+  const modelAttemptRef = useRef<object | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
+    const attempt = {}
+    activeAttemptRef.current = attempt
+    modelAttemptRef.current = null
+    reportLoadState('loading', attempt)
     setModel(null)
     setError(null)
 
@@ -1281,20 +1552,31 @@ function PlySceneObject({ item, onBoundsChange }: { item: WorldSceneItem; onBoun
         return response.arrayBuffer()
       })
       .then((buffer) => {
-        if (!controller.signal.aborted) setModel(createPlyRenderModel(buffer, item))
+        if (!controller.signal.aborted) {
+          const nextModel = createPlyRenderModel(buffer, item)
+          modelAttemptRef.current = attempt
+          setModel(nextModel)
+        }
       })
       .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : 'Unable to load PLY')
+        if (!controller.signal.aborted) {
+          setError(reason instanceof Error ? reason.message : 'Unable to load PLY')
+          reportLoadState('failed', attempt)
+        }
       })
 
     return () => {
       controller.abort()
+      reportLoadState('removed', attempt)
     }
-  }, [item])
+  }, [item, reportLoadState])
 
   useEffect(() => {
-    if (model) onBoundsChange()
-  }, [model, onBoundsChange])
+    if (model && modelAttemptRef.current === activeAttemptRef.current) {
+      onBoundsChange()
+      if (activeAttemptRef.current) reportLoadState('ready', activeAttemptRef.current)
+    }
+  }, [model, onBoundsChange, reportLoadState])
 
   useEffect(() => {
     return () => {
@@ -1308,23 +1590,68 @@ function PlySceneObject({ item, onBoundsChange }: { item: WorldSceneItem; onBoun
 
   if (model.primitive === 'points') {
     return (
-      <points geometry={model.geometry} userData={{ worldsSceneItemId: item.id }}>
-        <pointsMaterial size={model.pointSize} sizeAttenuation vertexColors={model.hasVertexColors} color={model.hasVertexColors ? undefined : '#a1a1aa'} />
+      <points geometry={model.geometry} userData={{ worldsSceneItemId: item.id }} castShadow={item.castShadow} receiveShadow={item.receiveShadow}>
+        <pointsMaterial
+          size={model.pointSize}
+          sizeAttenuation
+          vertexColors={model.hasVertexColors}
+          color={item.material?.baseColor ?? (model.hasVertexColors ? undefined : '#a1a1aa')}
+          opacity={item.material?.opacity ?? 1}
+          transparent={(item.material?.opacity ?? 1) < 1}
+        />
       </points>
     )
   }
 
   return (
-      <mesh geometry={model.geometry} userData={{ worldsSceneItemId: item.id }}>
-      <meshStandardMaterial vertexColors={model.hasVertexColors} color={model.hasVertexColors ? undefined : '#d4d4d8'} roughness={0.8} metalness={0.05} />
+      <mesh geometry={model.geometry} userData={{ worldsSceneItemId: item.id }} castShadow={item.castShadow} receiveShadow={item.receiveShadow}>
+      <meshStandardMaterial
+        vertexColors={model.hasVertexColors}
+        color={item.material?.baseColor ?? (model.hasVertexColors ? undefined : '#d4d4d8')}
+        roughness={item.material?.roughness ?? 0.8}
+        metalness={item.material?.metallic ?? 0.05}
+        opacity={item.material?.opacity ?? 1}
+        transparent={(item.material?.opacity ?? 1) < 1}
+      />
     </mesh>
   )
 }
 
-function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element {
+function GltfSceneObject({ item, playbackRef, timelineAnimationTimeSeconds, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; playbackRef: MutableRefObject<WorldsPlaybackRef>; timelineAnimationTimeSeconds?: number; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element {
   const gltf = useGLTF(item.url)
-  const instance = useMemo(() => createWorldsGltfSceneInstance(gltf.scene), [gltf.scene])
+  const instance = useWorldsGltfSceneInstance(gltf.scene)
+  if (!instance) return <group />
+  return <GltfSceneInstanceObject item={item} instance={instance} playbackRef={playbackRef} timelineAnimationTimeSeconds={timelineAnimationTimeSeconds} onAnimationMetadata={onAnimationMetadata} onBoundsChange={onBoundsChange} />
+}
+
+function useWorldsGltfSceneInstance(sourceScene: THREE.Object3D): WorldsGltfSceneInstance | null {
+  const resourceRef = useRef<{ sourceScene: THREE.Object3D; instance: WorldsGltfSceneInstance } | null>(null)
+  const [activeResource, setActiveResource] = useState<{ sourceScene: THREE.Object3D; instance: WorldsGltfSceneInstance } | null>(null)
+
+  useEffect(() => {
+    let resource = resourceRef.current
+    if (!resource || resource.sourceScene !== sourceScene || isWorldsGltfSceneInstanceDisposed(resource.instance)) {
+      resource = { sourceScene, instance: createWorldsGltfSceneInstance(sourceScene) }
+      resourceRef.current = resource
+    }
+    const release = retainWorldsGltfSceneInstance(resource.instance)
+    setActiveResource(resource)
+    return release
+  }, [sourceScene])
+
+  if (activeResource?.sourceScene !== sourceScene || isWorldsGltfSceneInstanceDisposed(activeResource.instance)) return null
+  return activeResource.instance
+}
+
+function GltfSceneInstanceObject({ item, instance, playbackRef, timelineAnimationTimeSeconds, onAnimationMetadata, onBoundsChange }: { item: WorldSceneItem; instance: WorldsGltfSceneInstance; playbackRef: MutableRefObject<WorldsPlaybackRef>; timelineAnimationTimeSeconds?: number; onAnimationMetadata: (itemId: string, animation: NonNullable<WorldSceneItem['animation']>) => void; onBoundsChange: () => void }): JSX.Element {
   const scene = instance.scene
+  const reportLoadState = useContext(WorldsRenderLoadContext)
+  useEffect(() => { reportLoadState('ready') }, [reportLoadState, scene])
+  const animationRef = useRef(item.animation)
+  const onAnimationMetadataRef = useRef(onAnimationMetadata)
+  animationRef.current = item.animation
+  onAnimationMetadataRef.current = onAnimationMetadata
+  const poseClipLoadKey = createWorldsPoseClipLoadKey(item.workspacePath, item.animation)
   const poseClipRef = useRef<{
     sidecar: PoseClipSidecarV1
     bonesById: Map<string, THREE.Bone>
@@ -1334,16 +1661,15 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChang
     scene.traverse((child) => {
       child.userData.worldsSceneItemId = item.id
     })
-    onBoundsChange()
-    return () => {
-      instance.dispose()
-    }
-  }, [instance, item.id, onBoundsChange, scene])
+  }, [item.id, scene])
   useEffect(() => {
-    const animation = item.animation
+    applyWorldsRenderableProjection(scene, item.material, item.castShadow, item.receiveShadow)
+    onBoundsChange()
+  }, [item.castShadow, item.material, item.receiveShadow, onBoundsChange, scene])
+  useEffect(() => {
+    const animation = animationRef.current
     poseClipRef.current = null
-    if (!animation || animation.kind !== 'pose-clip') return
-    if (item.workspacePath !== animation.sourceWorkspacePath) return
+    if (!animation || poseClipLoadKey === null) return
 
     let cancelled = false
     window.electron.workspace.artifacts.readPoseClipSidecar({
@@ -1362,7 +1688,7 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChang
         durationSeconds: result.sidecar.clip.durationSeconds,
       }
       if (animation.clipId !== nextAnimation.clipId || animation.clipName !== nextAnimation.clipName || animation.durationSeconds !== nextAnimation.durationSeconds) {
-        onAnimationMetadata(item.id, nextAnimation)
+        onAnimationMetadataRef.current(item.id, nextAnimation)
       }
     }).catch(() => undefined)
 
@@ -1370,7 +1696,7 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChang
       cancelled = true
       poseClipRef.current = null
     }
-  }, [item.animation, item.id, item.workspacePath, onAnimationMetadata, scene])
+  }, [item.id, poseClipLoadKey, scene])
   useFrame(() => {
     const poseClip = poseClipRef.current
     if (!poseClip) return
@@ -1378,7 +1704,7 @@ function GltfSceneObject({ item, playbackRef, onAnimationMetadata, onBoundsChang
       sidecar: poseClip.sidecar,
       bonesById: poseClip.bonesById,
       snapshot: poseClip.snapshot,
-      timeSeconds: playbackRef.current?.timeSeconds ?? 0,
+      timeSeconds: timelineAnimationTimeSeconds ?? playbackRef.current?.timeSeconds ?? 0,
     })
   })
   return <primitive object={scene} />
@@ -1490,6 +1816,8 @@ function WorldsTransformControls({
   onBoundsChange,
   onTransformItem,
   onTransformItems,
+  onTransformGestureBegin,
+  onTransformGestureCancel,
 }: {
   object: THREE.Object3D
   mode: WorldsTransformMode
@@ -1497,20 +1825,32 @@ function WorldsTransformControls({
   selectedItems: WorldSceneItem[]
   sceneItems: readonly WorldSceneItem[]
   collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
-  draggingRef: RefObject<boolean>
+  draggingRef: MutableRefObject<boolean>
   sceneObjectsRef: MutableRefObject<Map<string, THREE.Object3D>>
   localBoundsRef: MutableRefObject<Map<string, WorldsCollisionBounds | null>>
   onDragEndSelectionBlock: () => void
   onBoundsChange: () => void
-  onTransformItem: (itemId: string, transform: WorldSceneItem['transform']) => void
-  onTransformItems: (updates: WorldSceneItemTransformUpdate[]) => void
+  onTransformItem: (itemId: string, transform: WorldSceneItem['transform'], meta?: WorldsTransformCommitMeta) => void
+  onTransformItems: (updates: WorldSceneItemTransformUpdate[], meta?: WorldsTransformCommitMeta) => void
+  onTransformGestureBegin?: (itemIds: readonly string[]) => WorldsTransformGestureToken | null
+  onTransformGestureCancel: (gesture: WorldsTransformGestureToken) => void
 }): JSX.Element | null {
   const dragSessionRef = useRef<{
     collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
+    denied: boolean
+    gesture: WorldsTransformGestureToken | null
     lastValidTransforms: WorldSceneItemTransformUpdate[]
     localBoundsByItemId: Map<string, WorldsCollisionBounds | null>
     snapshot: WorldSceneTransformSnapshot[]
   } | null>(null)
+  const latestDragLifecycleRef = useRef({
+    sceneItems,
+    onTransformGestureCancel,
+  })
+  latestDragLifecycleRef.current = {
+    sceneItems,
+    onTransformGestureCancel,
+  }
 
   const createActiveTransform = useCallback((): WorldSceneItem['transform'] => ({
     position: object.position.toArray() as [number, number, number],
@@ -1540,22 +1880,46 @@ function WorldsTransformControls({
       if (measuredBounds) localBoundsRef.current.set(entry.itemId, cloneCollisionBounds(measuredBounds))
     }
 
+    const gesture = onTransformGestureBegin ? onTransformGestureBegin(snapshot.map((entry) => entry.itemId)) : null
     dragSessionRef.current = {
       collisionSurfaces: [...collisionSurfaces],
+      denied: !!onTransformGestureBegin && !gesture,
+      gesture,
       lastValidTransforms: snapshot.map((entry) => ({ itemId: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })),
       localBoundsByItemId,
       snapshot,
     }
-  }, [collisionSurfaces, localBoundsRef, sceneObjectsRef, selectedItems])
-
-  useEffect(() => {
-    if (!shouldResetWorldsTransformSnapshot(draggingRef.current)) return
-    dragSessionRef.current = null
-  }, [draggingRef, mode, object, selectedItemId, selectedItems])
+  }, [collisionSurfaces, localBoundsRef, onTransformGestureBegin, sceneObjectsRef, selectedItems])
 
   const restorePreviewTransforms = useCallback((updates: readonly WorldSceneItemTransformUpdate[]) => {
     applyWorldSceneTransformUpdatesToObjects(sceneObjectsRef.current, updates)
   }, [sceneObjectsRef])
+
+  const cancelActiveDragSession = useCallback(() => {
+    const session = dragSessionRef.current
+    if (!session) return
+
+    dragSessionRef.current = null
+    draggingRef.current = false
+
+    const currentTransformsByItemId = new Map(
+      latestDragLifecycleRef.current.sceneItems.map((item) => [item.id, item.transform] as const),
+    )
+    restorePreviewTransforms(session.snapshot.map((entry) => ({
+      itemId: entry.itemId,
+      transform: cloneWorldSceneTransform(currentTransformsByItemId.get(entry.itemId) ?? entry.transform),
+    })))
+
+    if (session.gesture) latestDragLifecycleRef.current.onTransformGestureCancel(session.gesture)
+  }, [draggingRef, restorePreviewTransforms])
+
+  const selectedItemLifecycleKey = selectedItems.map((item) => item.id).join('\u001f')
+
+  useEffect(() => {
+    return () => {
+      cancelActiveDragSession()
+    }
+  }, [cancelActiveDragSession, mode, object, selectedItemId, selectedItemLifecycleKey])
 
   const resolvePreview = useCallback((): WorldsTransformPreviewResolution | null => {
     if (!selectedItemId) return null
@@ -1579,6 +1943,10 @@ function WorldsTransformControls({
     const preview = resolvePreview()
     const session = dragSessionRef.current
     if (!preview || !session) return
+    if (session.denied) {
+      restorePreviewTransforms(session.snapshot.map((entry) => ({ itemId: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })))
+      return
+    }
     if (!preview.valid) {
       restorePreviewTransforms(session.lastValidTransforms)
       return
@@ -1592,6 +1960,10 @@ function WorldsTransformControls({
     if (!selectedItemId) return
     const session = dragSessionRef.current
     if (!session) return
+    if (session.denied) {
+      restorePreviewTransforms(session.snapshot.map((entry) => ({ itemId: entry.itemId, transform: cloneWorldSceneTransform(entry.transform) })))
+      return
+    }
     const preview = resolvePreview()
     const committedUpdates = preview?.valid
       ? preview.updates
@@ -1601,11 +1973,11 @@ function WorldsTransformControls({
     restorePreviewTransforms(committedUpdates)
 
     if (committedUpdates.length <= 1) {
-      onTransformItem(selectedItemId, cloneWorldSceneTransform(committedUpdates[0]?.transform ?? createActiveTransform()))
+      onTransformItem(selectedItemId, cloneWorldSceneTransform(committedUpdates[0]?.transform ?? createActiveTransform()), { gesture: session.gesture })
       return
     }
 
-    onTransformItems(committedUpdates.map(cloneTransformUpdate))
+    onTransformItems(committedUpdates.map(cloneTransformUpdate), { gesture: session.gesture })
   }, [createActiveTransform, onTransformItem, onTransformItems, resolvePreview, restorePreviewTransforms, selectedItemId])
 
   if (!selectedItemId) return null
@@ -1696,10 +2068,16 @@ export function createWorldsInitialViewCameraFitSnapshot(
 export function createWorldsBoundsCameraFitSnapshot(
   bounds: WorldsCameraBounds,
   cameraUp: THREE.Vector3 = WORLDS_DEFAULT_CAMERA_UP,
+  camera?: THREE.Camera,
 ): WorldsCameraFitSnapshot {
-  const safeDistance = Number.isFinite(bounds.distance) && bounds.distance > 0
-    ? bounds.distance
-    : WORLDS_DEFAULT_CAMERA_POSITION.length()
+  const perspective = camera as THREE.PerspectiveCamera | undefined
+  const verticalHalfFov = THREE.MathUtils.degToRad(perspective?.getEffectiveFOV?.() ?? 45) * 0.5
+  const aspect = Number.isFinite(perspective?.aspect) && perspective!.aspect > 0 ? perspective!.aspect : 1
+  const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * aspect)
+  const limitingHalfFov = Math.max(.001, Math.min(verticalHalfFov, horizontalHalfFov))
+  // The enclosing sphere contains every transformed AABB corner, including corner depth.
+  const radius = Math.max(bounds.size.length() * .5, WORLD_VIEWER_ORBIT_CONTROLS.minDistance)
+  const safeDistance = radius / Math.sin(limitingHalfFov) * 1.25
   worldsFitDirection.copy(WORLDS_DEFAULT_CAMERA_POSITION).sub(WORLDS_DEFAULT_CAMERA_TARGET).normalize()
   const target = bounds.center.clone()
   const position = worldsFitPosition.copy(target).addScaledVector(worldsFitDirection, safeDistance).clone()
@@ -1710,6 +2088,70 @@ export function createWorldsBoundsCameraFitSnapshot(
     up: cameraUp.clone(),
     ...deriveWorldsCameraLimitsFromBounds(bounds, position, target),
   }
+}
+
+export function measureWorldsSceneCameraBounds(
+  sceneItems: readonly WorldSceneItem[],
+  sceneObjects: ReadonlyMap<string, THREE.Object3D>,
+  loadStates: ReadonlyMap<string, WorldsRenderLoadState> = new Map(),
+): WorldsCameraBounds | null {
+  const union = new THREE.Box3(), objectBounds = new THREE.Box3(), childBounds = new THREE.Box3()
+  const center = new THREE.Vector3(), size = new THREE.Vector3()
+  let visibleCount = 0
+  for (const item of sceneItems) {
+    if (!item.visible) continue
+    if (item.kind === 'gaussian-ply' && !isWorldsGaussianPlyEnabled()) continue
+    const state = loadStates.get(item.id)
+    const currentState = state?.sourceKey === worldsRenderSourceKey(item) ? state : undefined
+    if (currentState?.status === 'failed') continue
+    if (currentState?.status === 'loading') return null
+    visibleCount++
+    const root = sceneObjects.get(item.id)
+    if (!root) return null
+    const measured = measureWorldsCameraRenderRoot(root, objectBounds, childBounds)
+    if (!measured.hasBounds) {
+      if (measured.nonrendering || currentState?.status === 'ready') continue
+      return null
+    }
+    union.union(objectBounds)
+  }
+  if (!visibleCount || union.isEmpty()) return null
+  union.getCenter(center); union.getSize(size)
+  if (![...center.toArray(), ...size.toArray()].every(Number.isFinite)) return null
+  return { center, size, distance: Math.max(size.length(), WORLD_VIEWER_ORBIT_CONTROLS.minDistance) }
+}
+
+function measureWorldsCameraRenderRoot(root: THREE.Object3D, bounds: THREE.Box3, childBounds: THREE.Box3): { hasBounds: boolean; nonrendering: boolean } {
+  bounds.makeEmpty()
+  for (let ancestor: THREE.Object3D | null = root; ancestor; ancestor = ancestor.parent) {
+    if (!ancestor.visible) return { hasBounds: false, nonrendering: true }
+    if (ancestor.userData.worldsSelectionHitbox || ancestor.userData.worldsSelectionSilhouette || ancestor.userData.worldsCollisionSurface) return { hasBounds: false, nonrendering: false }
+  }
+  root.updateWorldMatrix(true, true)
+  // Native dispatch refreshes attached SkinnedMesh bind inverses before vertex bounds.
+  root.updateMatrixWorld(true)
+  let nonrendering = false
+  const visit = (object: THREE.Object3D) => {
+    if (object.userData.worldsSelectionHitbox || object.userData.worldsSelectionSilhouette || object.userData.worldsCollisionSurface) return
+    if (!object.visible) { nonrendering = true; return }
+    const custom = object.userData.worldsObjectBounds as THREE.Box3 | undefined
+    if (custom?.isBox3 && !custom.isEmpty()) bounds.union(childBounds.copy(custom).applyMatrix4(object.matrixWorld))
+    const rendered = object as THREE.Object3D & { geometry?: THREE.BufferGeometry; boundingBox?: THREE.Box3 | null; computeBoundingBox?: () => void }
+    if (rendered.geometry) {
+      // Three's GLTF GPU instances and skinned meshes bound rendered vertices at object level.
+      if (rendered.boundingBox !== undefined) rendered.computeBoundingBox?.()
+      else if (!rendered.geometry.boundingBox) rendered.geometry.computeBoundingBox()
+      const local = rendered.boundingBox !== undefined ? rendered.boundingBox : rendered.geometry.boundingBox
+      if (local && !local.isEmpty()) bounds.union(childBounds.copy(local).applyMatrix4(object.matrixWorld))
+    }
+    object.children.forEach(visit)
+  }
+  visit(root)
+  return { hasBounds: !bounds.isEmpty(), nonrendering }
+}
+
+function createWorldsInitialViewKey(initialView?: SceneArtifactManifestInitialView): string {
+  return initialView ? [...initialView.position, ...initialView.target, ...(initialView.up ?? [0, 1, 0])].join('|') : ''
 }
 
 export function hasWorldsCameraBoundsGeometry(bounds: WorldsCameraBounds): boolean {
@@ -1865,6 +2307,46 @@ export function cloneWorldsSceneMaterialsForInstance(target: THREE.Object3D): Se
   return ownedMaterials
 }
 
+export function applyWorldsRenderableProjection(
+  target: THREE.Object3D,
+  materialOverride?: WorldSceneItem['material'],
+  castShadow?: boolean,
+  receiveShadow?: boolean,
+): void {
+  target.traverse((child) => {
+    if ((child as THREE.Object3D & { isMesh?: boolean }).isMesh === true) {
+      const mesh = child as THREE.Mesh
+      if (castShadow !== undefined) mesh.castShadow = castShadow
+      if (receiveShadow !== undefined) mesh.receiveShadow = receiveShadow
+      if (!materialOverride) return
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+      for (const material of materials) applyWorldsPbrMaterialOverride(material, materialOverride)
+    } else if ((child as THREE.Object3D & { isPoints?: boolean }).isPoints === true && materialOverride) {
+      const pointsMaterial = (child as THREE.Points).material as THREE.PointsMaterial
+      if ((pointsMaterial as THREE.PointsMaterial & { isPointsMaterial?: boolean }).isPointsMaterial !== true) return
+      pointsMaterial.color.set(materialOverride.baseColor)
+      pointsMaterial.opacity = materialOverride.opacity
+      pointsMaterial.transparent = materialOverride.opacity < 1
+      pointsMaterial.needsUpdate = true
+    }
+  })
+}
+
+function applyWorldsPbrMaterialOverride(
+  material: THREE.Material,
+  override: NonNullable<WorldSceneItem['material']>,
+): void {
+  if ((material as THREE.MeshStandardMaterial & { isMeshStandardMaterial?: boolean }).isMeshStandardMaterial === true) {
+    const standard = material as THREE.MeshStandardMaterial
+    standard.color.set(override.baseColor)
+    standard.metalness = override.metallic
+    standard.roughness = override.roughness
+  }
+  if ('opacity' in material) material.opacity = override.opacity
+  material.transparent = override.opacity < 1
+  material.needsUpdate = true
+}
+
 export function acquireWorldsManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
   const existingCount = worldsManagedBoundsTreeRefCounts.get(geometry)
   if (existingCount) {
@@ -1946,50 +2428,90 @@ export function createWorldsGltfSceneInstance(
   }
 }
 
+const pendingWorldsGltfInstanceDisposals = new WeakMap<object, { cancelled: boolean }>()
+const disposedWorldsGltfSceneInstances = new WeakSet<object>()
+
+function isWorldsGltfSceneInstanceDisposed(instance: object): boolean {
+  return disposedWorldsGltfSceneInstances.has(instance)
+}
+
+export function retainWorldsGltfSceneInstance(instance: { dispose(): void }): () => void {
+  const pending = pendingWorldsGltfInstanceDisposals.get(instance)
+  if (pending) {
+    pending.cancelled = true
+    pendingWorldsGltfInstanceDisposals.delete(instance)
+  }
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const scheduled = { cancelled: false }
+    pendingWorldsGltfInstanceDisposals.set(instance, scheduled)
+    queueMicrotask(() => {
+      if (scheduled.cancelled || pendingWorldsGltfInstanceDisposals.get(instance) !== scheduled) return
+      pendingWorldsGltfInstanceDisposals.delete(instance)
+      disposedWorldsGltfSceneInstances.add(instance)
+      instance.dispose()
+    })
+  }
+}
+
 function SceneFitController({
+  enabled = true,
   initialView,
   fitKey,
   loadRevision,
+  sceneItems,
+  sceneObjectsRef,
+  sceneObjectVersion,
+  renderLoadStatesRef,
   resetToken,
   orbitControlsRef,
   cameraFitSnapshotRef,
   collisionSurfaces,
 }: {
+  enabled?: boolean
   initialView?: SceneArtifactManifestInitialView
   fitKey: string
   loadRevision: number
+  sceneItems: readonly WorldSceneItem[]
+  sceneObjectsRef: RefObject<ReadonlyMap<string, THREE.Object3D>>
+  sceneObjectVersion: number
+  renderLoadStatesRef?: RefObject<ReadonlyMap<string, WorldsRenderLoadState>>
   resetToken: number
   orbitControlsRef: RefObject<WorldsOrbitControlsHandle | null>
   cameraFitSnapshotRef: MutableRefObject<WorldsCameraFitSnapshot | null>
   collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
 }): null {
-  const bounds = useBounds()
   const { camera } = useThree()
-  const previousInitialViewRef = useRef<SceneArtifactManifestInitialView | undefined>(undefined)
+  const initialViewKey = createWorldsInitialViewKey(initialView)
+  const previousInitialViewKeyRef = useRef(initialViewKey)
   const previousFitKeyRef = useRef<string | null>(null)
   const previousLoadRevisionRef = useRef(loadRevision)
   const boundsFitKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
+    if (!enabled) return
     const fitKeyChanged = previousFitKeyRef.current !== fitKey
-    const initialViewChanged = previousInitialViewRef.current !== undefined
-      && previousInitialViewRef.current !== initialView
+    const initialViewChanged = previousInitialViewKeyRef.current !== initialViewKey
     const loadRevisionChanged = previousLoadRevisionRef.current !== loadRevision
 
-    bounds.refresh()
-    const measuredBounds = bounds.getSize()
+    const needsBounds = fitKeyChanged || initialViewChanged || !cameraFitSnapshotRef.current
+      || (!!initialView && loadRevisionChanged) || (!initialView && boundsFitKeyRef.current !== fitKey)
+    const measuredBounds = needsBounds ? measureWorldsSceneCameraBounds(sceneItems, sceneObjectsRef.current ?? new Map(), renderLoadStatesRef?.current ?? new Map()) : null
+    const effectiveBounds = measuredBounds ?? { center: WORLDS_DEFAULT_CAMERA_TARGET, size: new THREE.Vector3(), distance: 0 }
     const action = resolveWorldsSceneFitAction({
       fitKeyChanged,
       initialViewChanged,
       hasInitialView: !!initialView,
-      hasMeasuredBounds: hasWorldsCameraBoundsGeometry(measuredBounds),
+      hasMeasuredBounds: measuredBounds !== null,
       hasSnapshot: cameraFitSnapshotRef.current !== null,
       hasAppliedBoundsFitForCurrentFitKey: boundsFitKeyRef.current === fitKey,
       loadRevisionChanged,
     })
 
     if (action === 'apply-initial-view' && initialView) {
-      const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
+      const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, effectiveBounds)
       cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
         camera,
         orbitControlsRef.current,
@@ -1997,8 +2519,8 @@ function SceneFitController({
         collisionSurfaces,
       )
       boundsFitKeyRef.current = null
-    } else if (action === 'apply-bounds-fit') {
-      const desiredSnapshot = createWorldsBoundsCameraFitSnapshot(measuredBounds, camera.up)
+    } else if (action === 'apply-bounds-fit' && measuredBounds) {
+      const desiredSnapshot = createWorldsBoundsCameraFitSnapshot(measuredBounds, camera.up, camera)
       cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot(
         camera,
         orbitControlsRef.current,
@@ -2013,10 +2535,10 @@ function SceneFitController({
           camera,
           orbitControlsRef.current,
           snapshot,
-          measuredBounds,
+          effectiveBounds,
         )
       } else if (initialView) {
-        const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, measuredBounds)
+        const desiredSnapshot = createWorldsInitialViewCameraFitSnapshot(initialView, effectiveBounds)
         const collisionOrigin = camera.position
         const resolvedSnapshot = createCollisionSafeWorldsCameraFitSnapshot(
           desiredSnapshot,
@@ -2029,16 +2551,16 @@ function SceneFitController({
     }
 
     previousFitKeyRef.current = fitKey
-    previousInitialViewRef.current = initialView
+    previousInitialViewKeyRef.current = initialViewKey
     previousLoadRevisionRef.current = loadRevision
-  }, [bounds, camera, cameraFitSnapshotRef, collisionSurfaces, fitKey, initialView, loadRevision, orbitControlsRef])
+  }, [camera, cameraFitSnapshotRef, collisionSurfaces, enabled, fitKey, initialView, initialViewKey, loadRevision, orbitControlsRef, sceneItems, sceneObjectsRef, sceneObjectVersion, renderLoadStatesRef])
 
   useEffect(() => {
-    if (resetToken === 0) return
+    if (!enabled || resetToken === 0) return
     const snapshot = cameraFitSnapshotRef.current
     if (!snapshot) return
     applyWorldsCameraFitSnapshot(camera, orbitControlsRef.current, snapshot)
-  }, [camera, cameraFitSnapshotRef, orbitControlsRef, resetToken])
+  }, [camera, cameraFitSnapshotRef, enabled, orbitControlsRef, resetToken])
 
   return null
 }
@@ -2191,8 +2713,16 @@ function setThreeFromSurfaceVector(target: THREE.Vector3, vector: WorldsResolved
   return target.set(vector.x, vector.y, vector.z)
 }
 
-class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element }, { message: string | null }> {
+class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element; item?: WorldSceneItem; onRenderLoadStateChange?: WorldsRenderLoadReporter }, { message: string | null }> {
   state = { message: null }
+  private readonly attempt = {}
+  private mounted = false
+  private reportLoadState = (status: WorldsRenderLoadStatus, attempt = this.attempt) => {
+    if (this.mounted && this.props.item) this.props.onRenderLoadStateChange?.(this.props.item, attempt, status, this.attempt)
+  }
+  componentDidMount(): void { this.mounted = true; this.reportLoadState('pending'); if (this.state.message) this.reportLoadState('failed') }
+  componentDidCatch(): void { this.reportLoadState('failed') }
+  componentWillUnmount(): void { this.reportLoadState('removed'); this.mounted = false }
 
   static getDerivedStateFromError(error: unknown): { message: string } {
     return { message: error instanceof Error ? error.message : 'Unable to load world asset' }
@@ -2200,7 +2730,7 @@ class WorldSceneItemErrorBoundary extends Component<{ children: JSX.Element }, {
 
   render(): JSX.Element {
     if (this.state.message) return <HtmlStatus message={this.state.message} />
-    return this.props.children
+    return <WorldsRenderLoadContext.Provider value={this.reportLoadState}>{this.props.children}</WorldsRenderLoadContext.Provider>
   }
 }
 

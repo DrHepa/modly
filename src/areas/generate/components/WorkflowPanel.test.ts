@@ -47,13 +47,13 @@ async function loadWorkflowPanelModule() {
     return {
       module,
       async cleanup() {
-        if (previousLocalStorage === undefined) delete globalThis.localStorage
+        if (previousLocalStorage === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
         else globalThis.localStorage = previousLocalStorage
         await rm(tempDir, { recursive: true, force: true })
       },
     }
   } catch (error) {
-    if (previousLocalStorage === undefined) delete globalThis.localStorage
+    if (previousLocalStorage === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
     else globalThis.localStorage = previousLocalStorage
     await rm(tempDir, { recursive: true, force: true })
     throw error

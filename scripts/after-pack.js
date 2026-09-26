@@ -1,41 +1,74 @@
 // @ts-check
-// Signature ad-hoc du bundle macOS.
-//
-// Sans licence Apple Developer (99 $/an) on ne peut ni signer avec un Developer
-// ID ni notariser. Mais sur Apple Silicon, un binaire SANS AUCUNE signature
-// refuse de se lancer (ce n'est pas un simple avertissement Gatekeeper).
-// La signature ad-hoc (`--sign -`) est gratuite et lève ce blocage.
-//
-// Ce hook tourne APRÈS le packaging et AVANT la fabrication du DMG, donc la
-// signature est bien embarquée dans l'app distribuée. Comme `identity: null`
-// désactive la signature interne d'electron-builder, rien ne l'écrase ensuite.
-//
-// L'utilisateur verra quand même Gatekeeper au premier lancement
-// ("développeur non vérifié") : clic droit > Ouvrir, ou `xattr -cr` sur l'app.
 
-const path = require('path')
-const { execFileSync } = require('child_process')
+const path = require('node:path')
+const { execFileSync } = require('node:child_process')
+const {
+  electronBuilderTargetFor,
+  verifyPackagedRuntime,
+} = require('./world-ffmpeg-before-pack.cjs')
+const { verifyWorldsCodexCliBundle } = require('./worlds-codex-cli-package.cjs')
+const REPOSITORY_ROOT = path.resolve(__dirname, '..')
 
-exports.default = async function afterPack(context) {
-  if (context.electronPlatformName !== 'darwin') return
-
-  const appPath = path.join(
-    context.appOutDir,
-    `${context.packager.appInfo.productFilename}.app`
-  )
-
-  // --deep est déprécié par Apple pour la signature réelle, mais reste la façon
-  // standard d'ad-hoc signer récursivement les binaires imbriqués (Electron
-  // Framework, helpers). Échouer ici doit casser le build : un DMG arm64 non
-  // signé ne se lance pas, autant le savoir en CI plutôt que chez l'utilisateur.
-  execFileSync('codesign', ['--force', '--deep', '--sign', '-', appPath], {
-    stdio: 'inherit'
-  })
-
-  // Vérifie que la signature est bien posée et que l'app est jugée valide.
-  execFileSync('codesign', ['--verify', '--verbose=2', appPath], {
-    stdio: 'inherit'
-  })
-
-  console.log(`[after-pack] Signature ad-hoc appliquée : ${appPath}`)
+async function verifyWorldsCodexCliPackage(resourcesPath) {
+  const source = await verifyWorldsCodexCliBundle(REPOSITORY_ROOT, 'source')
+  if (!source.ok) return source
+  return verifyWorldsCodexCliBundle(resourcesPath, 'packaged')
 }
+
+/**
+ * Verify the copied package resources before any distributable artifact is
+ * produced. macOS ad-hoc signing happens only after that verification so the
+ * exact native closure is included in the signature.
+ */
+async function afterPackWith(context, dependencies) {
+  const target = electronBuilderTargetFor(context?.electronPlatformName, context?.arch)
+  if (!target) throw new Error('Unsupported FFmpeg package target.')
+  const productFilename = context?.packager?.appInfo?.productFilename
+  if (typeof productFilename !== 'string' || !productFilename
+    || path.basename(productFilename) !== productFilename) {
+    throw new Error('Packaged application identity is invalid.')
+  }
+  if (typeof context?.appOutDir !== 'string' || !path.isAbsolute(context.appOutDir)) {
+    throw new Error('Packaged application output path is invalid.')
+  }
+  const arch = target.slice(target.indexOf('-') + 1)
+  const appPath = context.electronPlatformName === 'darwin'
+    ? path.join(context.appOutDir, `${productFilename}.app`)
+    : null
+  const resourcesPath = appPath
+    ? path.join(appPath, 'Contents', 'Resources')
+    : path.join(context.appOutDir, 'resources')
+  const cliResult = await (dependencies.verifyCli ?? verifyWorldsCodexCliPackage)(resourcesPath)
+  if (!cliResult || cliResult.ok !== true) {
+    throw new Error(`Packaged Worlds CLI verification failed: ${cliResult?.code ?? 'verification-error'}`)
+  }
+  const result = await dependencies.verify({
+    platform: context.electronPlatformName,
+    arch,
+    resourcesPath,
+  })
+  if (!result || result.ok !== true) {
+    throw new Error(`Packaged FFmpeg verification failed: ${result?.code ?? 'verification-error'}`)
+  }
+  if (appPath) await dependencies.codesign(appPath)
+}
+
+async function codesignApp(appPath) {
+  execFileSync('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', appPath], {
+    stdio: 'inherit',
+  })
+  execFileSync('/usr/bin/codesign', ['--verify', '--verbose=2', appPath], {
+    stdio: 'inherit',
+  })
+  console.log(`[after-pack] Ad-hoc signature applied: ${appPath}`)
+}
+
+async function afterPack(context) {
+  return afterPackWith(context, {
+    verify: verifyPackagedRuntime,
+    codesign: codesignApp,
+  })
+}
+
+exports.default = afterPack
+exports.afterPackWith = afterPackWith

@@ -56,6 +56,9 @@ const compatibleArtifact: KimodoMotionArtifact = {
   diagnostics: {
     runtimeStatus: 'completed',
     retargetStatus: 'completed',
+    solverStatus: null,
+    basisStatus: null,
+    rootMotionStatus: null,
     animationMappingStatus: 'completed',
     stabilizationStatus: 'completed',
     visualQualityStatus: 'preview-only',
@@ -199,12 +202,12 @@ test('resolveMotionRetargetPreviewClip applies manual source-role mappings to pr
     summary: rigSummary,
     artifact: remappedArtifact,
     sourceBones: [
-      { sourceBoneId: 'src:hips', label: 'Source Hips', rawLabel: 'Source Hips', role: 'hips', path: ['Source Hips'] },
-      { sourceBoneId: 'src:spine', label: 'Source Spine', rawLabel: 'Source Spine', role: 'spine', path: ['Source Hips', 'Source Spine'], parentSourceBoneId: 'src:hips' },
+      { sourceBoneId: 'src:hips', role: 'hips' },
+      { sourceBoneId: 'src:spine', role: 'spine' },
     ],
     mappings: {
-      'src:hips': { sourceBoneId: 'src:hips', targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0' },
-      'src:spine': { sourceBoneId: 'src:spine', targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
+      'src:hips': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0/spine#0' },
+      'src:spine': { targetBoneId: 'rig:hero|skeleton:0|bone:hips#0' },
     },
   })
 

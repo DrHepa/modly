@@ -15,11 +15,25 @@ from typing import Annotated, Literal, NoReturn
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from routers import world_ai
+from services.agent_providers.openai import OpenAIBoundaryError, build_openai_request, stream_openai_round
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 MODLY_API = "http://localhost:8765"
-AUTOMATION_BRIDGE = "http://127.0.0.1:8766"
+
+
+def _parse_automation_bridge_origin(value: str | None) -> str:
+    """Bind host startup transport only; no model, chat or mutable UI authority."""
+    if value is None:
+        return "http://127.0.0.1:8766"
+    match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", value)
+    if match is None or int(match[1]) > 65535:
+        raise ValueError("Invalid automation bridge origin")
+    return value
+
+
+AUTOMATION_BRIDGE = _parse_automation_bridge_origin(os.environ.get("MODLY_AUTOMATION_BRIDGE_ORIGIN"))
 
 # Each timeout is an individual network-operation timeout. In particular, read
 # is an inter-chunk inactivity limit; it is not a total response deadline.
@@ -56,6 +70,7 @@ UNSAFE_JSON_KEYS = {"__proto__", "prototype", "constructor"}
 CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CAPABILITY_HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 MODEL_LEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+OPENAI_MODEL_ID_PATTERN = re.compile(r"^(?!sk-)(?!https?://)[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.IGNORECASE)
 ARTIFACT_MEDIA_TYPE_PATTERN = re.compile(
     r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
 )
@@ -1634,11 +1649,36 @@ class AgentChatRequest(StrictModel):
     resolutionHash: str | None = None
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5:3b"
+    provider: Literal["ollama", "openai"] = "ollama"
+    openaiModel: str | None = None
+    OPENAI_API_KEY: str | None = None
+    apiKey: str | None = None
+    authorization: str | None = None
+    openaiApiKey: str | None = None
     context: dict = Field(default_factory=dict)
+    worldContext: world_ai.WorldAiContext | None = None
     thinking: str = "auto"  # "auto" | "on" | "off"
     capabilities: list[AgentCapabilityPromptView] = Field(default_factory=list, max_length=MAX_CAPABILITIES)
     completedArtifacts: list[AgentCompletedArtifact] = Field(default_factory=list, max_length=MAX_COMPLETED_ARTIFACTS)
     skillContexts: list[AgentSkillContext] = Field(default_factory=list, max_length=MAX_SKILL_CONTEXTS)
+
+
+    @field_validator("openaiModel")
+    @classmethod
+    def validate_openai_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or value != value.strip()
+            or len(value.encode("utf-8")) > 128
+            or any(ord(character) < 32 for character in value)
+            or "/" in value
+            or "\\" in value
+            or not OPENAI_MODEL_ID_PATTERN.fullmatch(value)
+        ):
+            raise ValueError("OpenAI model id is invalid")
+        return value
 
     @field_validator("modelLeaseId")
     @classmethod
@@ -1724,6 +1764,15 @@ class AgentChatRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_skill_context_capabilities(self):
+        if self.provider == "openai":
+            if self.worldContext is None:
+                return self
+            if self.openaiModel is None:
+                raise ValueError("OpenAI Worlds chat requires an OpenAI model id")
+        if self.worldContext is not None:
+            if (self.worldContext.originSessionId != self.originSessionId or self.context or self.capabilities
+                    or self.completedArtifacts or self.skillContexts or self.modelLeaseId is not None or self.resolutionHash is not None):
+                raise ValueError("Worlds chat cannot include broader context or action authority")
         if self.resolutionHash is None:
             if self.modelLeaseId is not None or self.capabilities or self.completedArtifacts or self.skillContexts:
                 raise ValueError("Absent Agent skill resolution is valid only without protected context or authority")
@@ -1801,6 +1850,7 @@ class ActionProposal(StrictModel):
 
 
 class AgentChatResponse(BaseModel):
+    worldProposals: list[world_ai.WorldProposal] | None = None
     message: str
     actions: list[ActionDone] = Field(default_factory=list)
     proposals: list[ActionProposal] = Field(default_factory=list)
@@ -1924,7 +1974,7 @@ def _normalize_stream_tool_calls(value: object) -> list[dict]:
         try:
             is_create_workflow = name == "create_workflow"
             argument_limit = MAX_DIRECT_TOOL_ARGUMENT_BYTES if is_create_workflow else MAX_TOOL_ARGUMENT_BYTES
-            argument_depth = MAX_DIRECT_TOOL_JSON_DEPTH if is_create_workflow else MAX_JSON_DEPTH
+            argument_depth = 6 if name == "propose_world_commands" else (MAX_DIRECT_TOOL_JSON_DEPTH if is_create_workflow else MAX_JSON_DEPTH)
             normalized_arguments = _normalize_bounded_json_object(
                 arguments,
                 argument_limit,
@@ -2230,6 +2280,84 @@ def _raise_ollama_boundary_error(
     ) from error
 
 
+def _raise_openai_boundary_error(error: OpenAIBoundaryError, round_number: int) -> NoReturn:
+    logger.warning(
+        "OpenAI agent round failed: round=%s code=%s retryable=%s",
+        round_number,
+        error.code,
+        error.retryable,
+    )
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={
+            "code": error.code,
+            "message": error.safe_message,
+            "retryable": error.retryable,
+            "provider": "openai",
+            "round": round_number,
+            "actions": [],
+            "proposals": [],
+        },
+    ) from error
+
+
+def _normalize_openai_world_arguments(value: object) -> dict:
+    return _normalize_bounded_json_object(value, MAX_TOOL_ARGUMENT_BYTES_PER_ROUND, max_depth=6)
+
+
+async def _run_openai_worlds_chat(request: AgentChatRequest, world_turn: world_ai.WorldAiTurn) -> AgentChatResponse:
+    latest_user_text = next((message.content for message in reversed(request.messages) if message.role == "user"), "")
+    transcript_items: list[dict] = []
+    tools = world_ai.openai_tools()
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+        for round_number in range(1, 11):
+            payload = build_openai_request(
+                request.openaiModel or "",
+                world_ai.SYSTEM_PROMPT,
+                latest_user_text,
+                tools,
+                transcript_items,
+                [],
+            )
+            try:
+                provider_round = await stream_openai_round(client, payload, _normalize_openai_world_arguments)
+            except OpenAIBoundaryError as error:
+                _raise_openai_boundary_error(error, round_number)
+            logger.info("OpenAI agent round completed: %s", {**provider_round.safe_metrics, "round": round_number})
+            tool_calls = provider_round.assistant_message.get("tool_calls") or []
+            if provider_round.refused:
+                return AgentChatResponse(
+                    message=provider_round.assistant_message.get("content") or "OpenAI refused this request. No changes were proposed.",
+                    actions=[],
+                    proposals=[],
+                    worldProposals=[],
+                    thinking=None,
+                )
+            if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
+                _raise_openai_boundary_error(OpenAIBoundaryError(
+                    502, "openai_tool_limit_exceeded", "OpenAI returned too many tool calls in one round. No changes were proposed.", False,
+                ), round_number)
+            transcript_items.extend(provider_round.provider_state_items)
+            if not tool_calls:
+                return AgentChatResponse(
+                    message=provider_round.assistant_message.get("content") or "",
+                    actions=[],
+                    proposals=[],
+                    worldProposals=world_turn.proposals,
+                    thinking=None,
+                )
+            for tc in tool_calls:
+                function = tc["function"]
+                call_id = function.get("call_id")
+                if not isinstance(call_id, str):
+                    _raise_openai_boundary_error(OpenAIBoundaryError(502, "openai_malformed_stream", "OpenAI returned malformed streaming data. No changes were proposed.", True), round_number)
+                result_text = await world_turn.execute(function["name"], function.get("arguments") or {}, client, AUTOMATION_BRIDGE)
+                transcript_items.append({"type": "function_call_output", "call_id": call_id, "output": result_text})
+    _raise_openai_boundary_error(OpenAIBoundaryError(
+        502, "openai_round_limit_exceeded", "OpenAI did not finish within the allowed agent rounds. No changes were proposed.", False,
+    ), 10)
+
+
 @router.get("/models")
 async def list_ollama_models(ollama_url: str = "http://localhost:11434"):
     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -2258,6 +2386,30 @@ async def list_ollama_models(ollama_url: str = "http://localhost:11434"):
 
 @router.post("/chat", response_model=AgentChatResponse, response_model_exclude_none=True)
 async def agent_chat(request: AgentChatRequest):
+    if request.provider == "openai":
+        if any(value is not None for value in (request.OPENAI_API_KEY, request.apiKey, request.authorization, request.openaiApiKey)):
+            raise HTTPException(status_code=400, detail={
+                "code": "openai_key_fields_unsupported",
+                "message": "OpenAI credentials must be configured on the server, not sent in chat requests.",
+                "retryable": False,
+                "provider": "openai",
+            })
+        if request.worldContext is None:
+            raise HTTPException(status_code=400, detail={
+                "code": "openai_worlds_only",
+                "message": "OpenAI is only available for Worlds AI turns in this version.",
+                "retryable": False,
+                "provider": "openai",
+            })
+        if any(message.images for message in request.messages):
+            raise HTTPException(status_code=400, detail={
+                "code": "openai_images_unsupported",
+                "message": "OpenAI Worlds chat does not support image attachments in this version.",
+                "retryable": False,
+                "provider": "openai",
+            })
+        return await _run_openai_worlds_chat(request, world_ai.WorldAiTurn(request.worldContext))
+
     if not _is_valid_ollama_base_url(request.ollama_url):
         _raise_ollama_boundary_error(
             OllamaBoundaryError(
@@ -2271,9 +2423,10 @@ async def agent_chat(request: AgentChatRequest):
             [],
         )
 
+    world_turn = world_ai.WorldAiTurn(request.worldContext) if request.worldContext is not None else None
     messages: list[dict] = [{
         "role": "system",
-        "content": SYSTEM_PROMPT if request.modelLeaseId is not None else SYSTEM_PROMPT_WITHOUT_PROPOSAL_AUTHORITY,
+        "content": world_ai.SYSTEM_PROMPT if world_turn else (SYSTEM_PROMPT if request.modelLeaseId is not None else SYSTEM_PROMPT_WITHOUT_PROPOSAL_AUTHORITY),
     }]
 
     # Inject scene context so the LLM knows current state
@@ -2351,7 +2504,7 @@ async def agent_chat(request: AgentChatRequest):
     direct_action_batch_rejected = False
     all_thinking:  list[str]       = []
     capabilities_by_id = {capability.id: capability for capability in request.capabilities}
-    tools = _build_tools(request.capabilities, request.modelLeaseId is not None)
+    tools = world_ai.tools() if world_turn else _build_tools(request.capabilities, request.modelLeaseId is not None)
 
     # Build Ollama think param
     ollama_extra: dict = {}
@@ -2390,6 +2543,7 @@ async def agent_chat(request: AgentChatRequest):
                     message=clean_content,
                     actions=[] if direct_action_batch_rejected else _finalize_actions(actions_done),
                     proposals=proposals,
+                    worldProposals=world_turn.proposals if world_turn else None,
                     thinking=combined_thinking,
                 )
 
@@ -2398,7 +2552,9 @@ async def agent_chat(request: AgentChatRequest):
                 fn = tc["function"]
                 name = fn["name"]
                 arguments = fn.get("arguments") or {}
-                if name == "propose_capability_action":
+                if world_turn is not None:
+                    result_text = await world_turn.execute(name, arguments, client, AUTOMATION_BRIDGE)
+                elif name == "propose_capability_action":
                     if request.modelLeaseId is None:
                         proposal_authority_violation = True
                         result_text = _compact_json({
@@ -2462,6 +2618,7 @@ async def agent_chat(request: AgentChatRequest):
                     message=clean_content or "Protected proposal authority is unavailable in this chat turn.",
                     actions=[] if direct_action_batch_rejected else _finalize_actions(actions_done),
                     proposals=proposals,
+                    worldProposals=world_turn.proposals if world_turn else None,
                     thinking="\n\n---\n\n".join(all_thinking) if all_thinking else None,
                 )
 
@@ -2470,5 +2627,6 @@ async def agent_chat(request: AgentChatRequest):
         message="Reached maximum tool iterations.",
         actions=[] if direct_action_batch_rejected else _finalize_actions(actions_done),
         proposals=proposals,
+        worldProposals=world_turn.proposals if world_turn else None,
         thinking=combined_thinking,
     )

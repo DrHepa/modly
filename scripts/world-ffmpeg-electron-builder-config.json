@@ -1,0 +1,121 @@
+{
+  "extends": null,
+  "appId": "com.modly.app",
+  "productName": "Modly",
+  "directories": {
+    "output": "dist"
+  },
+  "afterPack": "scripts/after-pack.js",
+  "files": [
+    "out/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "THIRD_PARTY_NOTICES.md",
+      "to": "THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "from": "resources/licenses/mediabunny-1.55.4",
+      "to": "licenses/mediabunny-1.55.4"
+    },
+    {
+      "from": "api",
+      "to": "api",
+      "filter": [
+        "**/*",
+        "!.venv/**/*",
+        "!__pycache__/**/*",
+        "!**/build/**/*",
+        "!**/*.pyd",
+        "!**/*.egg-info/**/*"
+      ]
+    },
+    {
+      "from": "out/builtin-extensions",
+      "to": "builtin-extensions"
+    },
+    {
+      "from": "resources/licenses/world-ffmpeg-7.1.1",
+      "to": "licenses/world-ffmpeg-7.1.1"
+    },
+    {
+      "from": "tools/modly-cli/agent.py",
+      "to": "modly-cli/agent.py"
+    },
+    {
+      "from": "tools/modly-cli/SKILL.md",
+      "to": "modly-cli/SKILL.md"
+    }
+  ],
+  "publish": {
+    "provider": "github",
+    "owner": "lightningpixel",
+    "repo": "modly"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true
+  },
+  "win": {
+    "target": "dir",
+    "artifactName": "${productName}-${version}-win32-x64.${ext}",
+    "icon": "resources/icons/icon.ico",
+    "extraResources": [
+      {
+        "from": "resources/python-embed",
+        "to": "python-embed"
+      },
+      {
+        "from": "resources/ffmpeg/win32-x64",
+        "to": "ffmpeg/win32-x64"
+      },
+      {
+        "from": "resources/world-ffmpeg-build-reports/win32-x64.json",
+        "to": "world-ffmpeg-build-reports/win32-x64.json"
+      }
+    ]
+  },
+  "mac": {
+    "target": "dmg",
+    "icon": "resources/icons/icon.icns",
+    "artifactName": "${productName}-${version}-arm64.${ext}",
+    "identity": null,
+    "category": "public.app-category.graphics-design",
+    "extraResources": [
+      {
+        "from": "resources/python-embed",
+        "to": "python-embed"
+      },
+      {
+        "from": "resources/ffmpeg/darwin-arm64",
+        "to": "ffmpeg/darwin-arm64"
+      },
+      {
+        "from": "resources/world-ffmpeg-build-reports/darwin-arm64.json",
+        "to": "world-ffmpeg-build-reports/darwin-arm64.json"
+      }
+    ]
+  },
+  "linux": {
+    "target": "AppImage",
+    "icon": "resources/icons/icon.png",
+    "extraResources": [
+      {
+        "from": "resources/python-embed",
+        "to": "python-embed"
+      },
+      {
+        "from": "resources/ffmpeg/linux-${arch}",
+        "to": "ffmpeg/linux-${arch}"
+      },
+      {
+        "from": "resources/world-ffmpeg-build-reports/linux-${arch}.json",
+        "to": "world-ffmpeg-build-reports/linux-${arch}.json"
+      }
+    ]
+  },
+  "beforePack": "scripts/world-ffmpeg-before-pack.cjs",
+  "electronDist": "node_modules/electron/dist",
+  "downloadAlternateFFmpeg": false,
+  "npmRebuild": false
+}

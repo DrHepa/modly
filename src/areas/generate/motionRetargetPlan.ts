@@ -230,9 +230,8 @@ export function hydrateMotionRetargetSessionSnapshotFromSidecar(input: {
 export function resolveMotionRetargetCorrectionState(input: MotionRetargetCorrectionStateInput): MotionRetargetCorrectionState {
   if (input.status === 'idle') return { status: 'idle', dirty: false, message: 'No saved correction sidecar loaded.' }
   if (input.status === 'dirty') return { status: 'dirty', dirty: true, message: 'Unsaved Motion Retarget corrections for this artifact.' }
-  if (input.status === 'saved') return { status: 'saved', dirty: false, message: `Saved Motion Retarget corrections: ${input.sidecarWorkspacePath}` }
-  if (input.status === 'loaded') return { status: 'loaded', dirty: false, message: `Loaded Motion Retarget corrections: ${input.sidecarWorkspacePath}` }
-  return { status: 'error', dirty: false, message: input.message }
+  if (input.status === 'error') return { status: 'error', dirty: false, message: input.message }
+  return { status: input.status, dirty: false, message: `${input.status === 'saved' ? 'Saved' : 'Loaded'} Motion Retarget corrections: ${input.sidecarWorkspacePath}` }
 }
 
 export type MotionRetargetSessionAction =
@@ -707,7 +706,7 @@ function resolveCoherentExportReadinessWarnings(artifact: KimodoMotionArtifact):
 function resolveLocalPreviewSafetyWarnings(artifact: KimodoMotionArtifact): string[] {
   const omittedChannels = artifact.motionRetarget?.status === 'parsed' ? artifact.motionRetarget.omittedChannels ?? [] : []
   const warnings: string[] = []
-  if (omittedChannels.some((omitted) => /basis[_\/-]?rest[_\/-]?pose/i.test(omitted.channel))) {
+  if (omittedChannels.some((omitted) => /basis[_/-]?rest[_/-]?pose/i.test(omitted.channel))) {
     warnings.push(BASIS_REST_POSE_PREVIEW_DISABLED_WARNING)
   }
   if (hasInvalidKimodoBasisContract(artifact)) warnings.push(INVALID_BASIS_PREVIEW_DISABLED_WARNING)

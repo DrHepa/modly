@@ -1,3 +1,5 @@
+import { parseWorldAiQueryRequest, WorldAiContractError, WORLD_AI_QUERY_BYTES, WORLD_AI_PAGE_BYTES, type WorldAiQueryRequest, type WorldAiQueryPage } from '../../src/areas/worlds/core/worldAiContract.ts'
+import type { WorldProjectResult } from '../../src/shared/types/worldProjects.ts'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AutomationCapabilitiesResponse } from './automation-capabilities.ts'
 import {
@@ -16,12 +18,14 @@ export const AUTOMATION_HTTP_BRIDGE_HOST = '127.0.0.1'
 export const AUTOMATION_HTTP_BRIDGE_PORT = 8766
 export const AUTOMATION_HTTP_BRIDGE_PATH = '/automation/capabilities'
 export const PROCESS_RUNS_HTTP_BRIDGE_PATH = '/process-runs'
+export const WORLD_AI_QUERY_HTTP_BRIDGE_PATH = '/automation/worlds/query'
 export const SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH = '/scene/import-mesh'
 
 let defaultProcessRunsServicePromise: Promise<import('./process-runs-service.ts').ProcessRunsService> | null = null
 
 type AutomationHttpBridgeDeps = {
   createServer: typeof createServer
+  queryWorld: (request: WorldAiQueryRequest) => Promise<WorldProjectResult<WorldAiQueryPage>>
   getAutomationCapabilities: () => Promise<AutomationCapabilitiesResponse>
   createProcessRun: (request: CreateProcessRunRequest) => Promise<ProcessRunSnapshot>
   getProcessRun: (runId: string) => Promise<ProcessRunSnapshot> | ProcessRunSnapshot
@@ -41,6 +45,13 @@ type AutomationHttpBridgeOptions = Partial<AutomationHttpBridgeDeps> & {
 
 const defaultAutomationHttpBridgeDeps: AutomationHttpBridgeDeps = {
   createServer,
+  queryWorld: async (request) => {
+    const [{ app }, { getSettings }, { WorldProjectRepository }] = await Promise.all([
+      import('electron'), import('./settings-store.ts'), import('./world-project-repository.ts'),
+    ])
+    const repository = new WorldProjectRepository({ getWorkspaceRoot: () => getSettings(app.getPath('userData')).workspaceDir })
+    return repository.queryAi(request)
+  },
   getAutomationCapabilities: async () => {
     const { getAutomationCapabilities } = await import('./automation-capabilities-service.ts')
     return getAutomationCapabilities()
@@ -110,11 +121,47 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
+function createInvalidJsonBodyError(): ProcessRunServiceError {
+  return new ProcessRunServiceError(400, {
+    code: 'INVALID_JSON',
+    message: 'Request body must be valid JSON.',
+    retryable: false,
+  })
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
+  let onAbort: (() => void) | null = null
+  let rejectAbort!: (error: ProcessRunServiceError) => void
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject
+    onAbort = () => {
+      rejectAbort(createInvalidJsonBodyError())
+      request.destroy(new Error('Request aborted before JSON body completed.'))
+    }
+    request.once('aborted', onAbort)
+  })
+  const aborted = request as IncomingMessage & { aborted?: boolean }
 
-  for await (const chunk of request) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+  if (aborted.aborted) {
+    if (onAbort) request.off('aborted', onAbort)
+    throw createInvalidJsonBodyError()
+  }
+
+  const readPromise = (async () => {
+    for await (const chunk of request) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+    }
+  })()
+
+  try {
+    await Promise.race([readPromise, abortPromise])
+  } catch (error) {
+    if (error instanceof ProcessRunServiceError) throw error
+    throw createInvalidJsonBodyError()
+  } finally {
+    if (onAbort) request.off('aborted', onAbort)
+    readPromise.catch(() => undefined)
   }
 
   const raw = Buffer.concat(chunks).toString('utf8').trim()
@@ -123,11 +170,7 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   try {
     return JSON.parse(raw) as unknown
   } catch {
-    throw new ProcessRunServiceError(400, {
-      code: 'INVALID_JSON',
-      message: 'Request body must be valid JSON.',
-      retryable: false,
-    })
+    throw createInvalidJsonBodyError()
   }
 }
 
@@ -190,6 +233,7 @@ export class AutomationHttpBridge {
     this.port = options.port ?? AUTOMATION_HTTP_BRIDGE_PORT
     this.deps = {
       createServer: options.createServer ?? defaultAutomationHttpBridgeDeps.createServer,
+      queryWorld: options.queryWorld ?? defaultAutomationHttpBridgeDeps.queryWorld,
       getAutomationCapabilities: options.getAutomationCapabilities ?? defaultAutomationHttpBridgeDeps.getAutomationCapabilities,
       createProcessRun: options.createProcessRun ?? defaultAutomationHttpBridgeDeps.createProcessRun,
       getProcessRun: options.getProcessRun ?? defaultAutomationHttpBridgeDeps.getProcessRun,
@@ -269,6 +313,26 @@ export class AutomationHttpBridge {
     try {
       const method = request.method ?? 'GET'
       const url = new URL(request.url ?? '/', `http://${this.host}:${this.port}`)
+
+      if (url.pathname === WORLD_AI_QUERY_HTTP_BRIDGE_PATH) {
+        if (method !== 'POST') { response.setHeader('Allow', 'POST'); writeJson(response, 405, { error: 'Method Not Allowed' }); return }
+        try {
+          if (url.search) throw new WorldAiContractError('invalid_query', 'Query-string parameters are not supported.')
+          const query = parseWorldAiQueryRequest(await readWorldQueryBody(request))
+          const queried = await this.deps.queryWorld(query)
+          const result = queried.ok ? queried : { ok: false as const, error: {
+            code: queried.error.code === 'revision_conflict' ? 'revision_conflict' : queried.error.code === 'project_busy' ? 'project_busy' : 'invalid_request',
+            message: 'The World query is stale, invalid, or unavailable.', retryable: false,
+          } }
+          if (Buffer.byteLength(JSON.stringify(result)) > WORLD_AI_PAGE_BYTES) throw new WorldAiContractError('invalid_query', 'The query response exceeds its byte limit.')
+          writeJson(response, result.ok ? 200 : result.error.code === 'revision_conflict' || result.error.code === 'project_busy' ? 409 : 400, result)
+        } catch (error) {
+          response.setHeader('Connection', 'close')
+          const status = error instanceof WorldQueryBodyError ? error.status : 400
+          writeJson(response, status, { ok: false, error: { code: 'invalid_request', message: error instanceof WorldAiContractError || error instanceof WorldQueryBodyError ? error.message : 'The Worlds query could not be completed.', retryable: false } })
+        }
+        return
+      }
 
       if (url.pathname === AUTOMATION_HTTP_BRIDGE_PATH) {
         if (method !== 'GET') {
@@ -374,4 +438,39 @@ export class AutomationHttpBridge {
       response.end()
     }
   }
+}
+
+class WorldQueryBodyError extends Error {
+  readonly status: number
+  constructor(status: number, message: string) { super(message); this.status = status }
+}
+
+/** No repository work until the complete bounded body has arrived. */
+function readWorldQueryBody(request: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let bytes = 0
+    let settled = false
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      request.off('data', onData); request.off('end', onEnd); request.off('aborted', onAbort)
+      if (error) { request.pause(); reject(error); return }
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
+      catch { reject(new WorldQueryBodyError(400, 'The Worlds query must be valid JSON.')) }
+    }
+    const onData = (chunk: Buffer | string) => {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      bytes += data.length
+      if (bytes > WORLD_AI_QUERY_BYTES) { finish(new WorldQueryBodyError(413, 'The Worlds query exceeds 8 KiB.')); return }
+      chunks.push(data)
+    }
+    const onEnd = () => finish()
+    // IncomingMessage can emit error after aborted; keep the settled error sink attached.
+    const onError = () => finish(new WorldQueryBodyError(400, 'The Worlds query body could not be read.'))
+    const onAbort = () => finish(new WorldQueryBodyError(400, 'The Worlds query was cancelled.'))
+    const timer = setTimeout(() => finish(new WorldQueryBodyError(408, 'The Worlds query body timed out.')), 10_000)
+    request.on('data', onData); request.once('end', onEnd); request.on('error', onError); request.once('aborted', onAbort)
+  })
 }

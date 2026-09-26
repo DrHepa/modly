@@ -45,6 +45,9 @@ export function WorldsGaussianPlyObject({
 
     const load = nextViewer.addSplatScene(url, {
       ...WORLDS_GAUSSIAN_PLY_SCENE_OPTIONS,
+      position: [...WORLDS_GAUSSIAN_PLY_SCENE_OPTIONS.position],
+      rotation: [...WORLDS_GAUSSIAN_PLY_SCENE_OPTIONS.rotation],
+      scale: [...WORLDS_GAUSSIAN_PLY_SCENE_OPTIONS.scale],
       onProgress: () => {
         if (!mountedRef.current) return
         applyGaussianViewerMetadata(nextViewer, itemId)

@@ -5,24 +5,44 @@
   "main": "./out/main/index.js",
   "author": "Modly",
   "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
+    "electron:install": "install-electron --no",
+    "predev": "npm run electron:install",
     "dev": "node scripts/build-builtins.mjs && electron-vite dev",
     "build": "node scripts/build-builtins.mjs && electron-vite build",
+    "prepreview": "npm run electron:install",
     "preview": "electron-vite preview",
     "prepare": "node scripts/setup-hooks.mjs",
     "prepare-resources": "node scripts/download-python-embed.js",
     "test": "npm run test:py && npm run test:node",
     "test:py": "node scripts/run-pytests.mjs",
     "test:node": "node scripts/run-node-tests.mjs",
-    "package": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && npm run prepare-resources && electron-builder",
+    "package": "npm run build && npm run package:from-build",
     "lint": "eslint .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "verify": "npm run typecheck && npm run lint"
+    "typecheck:worlds-integration": "tsc --noEmit -p tsconfig.worlds-integration.json",
+    "typecheck": "node scripts/run-typechecks.mjs",
+    "verify": "npm run typecheck && npm run lint",
+    "fetch:world-ffmpeg-sources": "node scripts/fetch-world-ffmpeg-sources.mjs",
+    "verify:world-ffmpeg-sources": "node scripts/verify-world-ffmpeg-sources.mjs",
+    "assemble:world-ffmpeg-runtime": "node scripts/assemble-world-ffmpeg-runtime.mjs",
+    "verify:world-ffmpeg-package": "node --no-warnings --experimental-strip-types scripts/verify-world-ffmpeg-package.ts",
+    "test:world-ffmpeg-native": "node --no-warnings --experimental-strip-types scripts/world-ffmpeg-native-e2e.ts",
+    "prepare:world-ffmpeg-build-trust": "node scripts/world-ffmpeg-build-trust.mjs",
+    "install:world-ffmpeg-runtime": "node --no-warnings --experimental-strip-types scripts/install-world-ffmpeg-build.mjs",
+    "prepare:package-tool-cache": "node scripts/prepare-electron-builder-tool-cache.mjs",
+    "stage:world-ffmpeg-runtime": "node scripts/stage-world-ffmpeg-runtime.mjs",
+    "build:world-ffmpeg-runtime": "bash scripts/build-world-ffmpeg-runtime.sh",
+    "create:world-ffmpeg-sources": "bash scripts/create-world-ffmpeg-source-archive.sh",
+    "package:from-build": "scripts/world-ffmpeg-clean-package"
   },
   "dependencies": {
-    "@electron-toolkit/utils": "^4.0.0",
+    "@dimforge/rapier3d": "0.20.0",
+    "@electron-toolkit/utils": "4.0.0",
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@react-three/drei": "^9.120.0",
@@ -31,8 +51,9 @@
     "@xyflow/react": "^12.10.2",
     "ajv": "8.20.0",
     "axios": "^1.7.9",
-    "electron-updater": "^6.8.3",
+    "electron-updater": "6.8.9",
     "esbuild": "^0.28.0",
+    "mediabunny": "1.55.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tar": "^7.5.9",
@@ -43,24 +64,24 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@types/node": "^22.10.1",
+    "@types/node": "24.13.3",
     "@types/react": "^18.3.17",
     "@types/react-dom": "^18.3.5",
     "@types/tar": "^7.0.87",
     "@types/three": "^0.171.0",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "5.2.0",
     "autoprefixer": "^10.4.20",
     "cross-env": "^10.1.0",
-    "electron": "^33.3.0",
-    "electron-builder": "^24.13.3",
-    "electron-vite": "^2.3.0",
+    "electron": "44.1.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
     "eslint": "^9.17.0",
     "globals": "^16.5.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
-    "typescript": "^5.7.2",
+    "typescript": "5.9.3",
     "typescript-eslint": "^8.58.1",
-    "vite": "^5.4.0"
+    "vite": "7.3.6"
   },
   "build": {
     "appId": "com.modly.app",
@@ -73,6 +94,14 @@
       "out/**/*"
     ],
     "extraResources": [
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "resources/licenses/mediabunny-1.55.4",
+        "to": "licenses/mediabunny-1.55.4"
+      },
       {
         "from": "api",
         "to": "api",
@@ -88,6 +117,18 @@
       {
         "from": "out/builtin-extensions",
         "to": "builtin-extensions"
+      },
+      {
+        "from": "resources/licenses/world-ffmpeg-7.1.1",
+        "to": "licenses/world-ffmpeg-7.1.1"
+      },
+      {
+        "from": "tools/modly-cli/agent.py",
+        "to": "modly-cli/agent.py"
+      },
+      {
+        "from": "tools/modly-cli/SKILL.md",
+        "to": "modly-cli/SKILL.md"
       }
     ],
     "publish": {
@@ -100,13 +141,21 @@
       "allowToChangeInstallationDirectory": true
     },
     "win": {
-      "target": "nsis",
-      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "target": "dir",
+      "artifactName": "${productName}-${version}-win32-x64.${ext}",
       "icon": "resources/icons/icon.ico",
       "extraResources": [
         {
           "from": "resources/python-embed",
           "to": "python-embed"
+        },
+        {
+          "from": "resources/ffmpeg/win32-x64",
+          "to": "ffmpeg/win32-x64"
+        },
+        {
+          "from": "resources/world-ffmpeg-build-reports/win32-x64.json",
+          "to": "world-ffmpeg-build-reports/win32-x64.json"
         }
       ]
     },
@@ -120,6 +169,14 @@
         {
           "from": "resources/python-embed",
           "to": "python-embed"
+        },
+        {
+          "from": "resources/ffmpeg/darwin-arm64",
+          "to": "ffmpeg/darwin-arm64"
+        },
+        {
+          "from": "resources/world-ffmpeg-build-reports/darwin-arm64.json",
+          "to": "world-ffmpeg-build-reports/darwin-arm64.json"
         }
       ]
     },
@@ -130,8 +187,20 @@
         {
           "from": "resources/python-embed",
           "to": "python-embed"
+        },
+        {
+          "from": "resources/ffmpeg/linux-${arch}",
+          "to": "ffmpeg/linux-${arch}"
+        },
+        {
+          "from": "resources/world-ffmpeg-build-reports/linux-${arch}.json",
+          "to": "world-ffmpeg-build-reports/linux-${arch}.json"
         }
       ]
-    }
+    },
+    "beforePack": "scripts/world-ffmpeg-before-pack.cjs",
+    "electronDist": "node_modules/electron/dist",
+    "downloadAlternateFFmpeg": false,
+    "npmRebuild": false
   }
 }

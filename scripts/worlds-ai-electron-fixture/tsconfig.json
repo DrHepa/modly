@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.web.json",
+  "compilerOptions": { "composite": false, "types": ["node"], "noEmit": true },
+  "include": ["*.ts", "*.tsx", "../../src/vite-env.d.ts", "../../src/shared/types/**/*.d.ts"]
+}

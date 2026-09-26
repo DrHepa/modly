@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, statSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -9,6 +10,7 @@ import ts from 'typescript'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const chatPanelEntry = path.join(projectRoot, 'src/areas/generate/components/ChatPanel.tsx')
+const require = createRequire(import.meta.url)
 
 function aliasPlugin(): Plugin {
   const resolvePath = (basePath: string): string => {
@@ -45,15 +47,20 @@ function localStorageMock(): Storage {
   }
 }
 
-async function loadChatPanelModule() {
+async function loadChatPanelModule(options: { agentSettings?: Record<string, unknown> } = {}) {
   const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-chat-panel-'))
+  const entry = path.join(tempDir, 'entry.ts')
   const outfile = path.join(tempDir, 'ChatPanel.bundle.mjs')
   const previousLocalStorage = globalThis.localStorage
   globalThis.localStorage = localStorageMock()
+  if (options.agentSettings) {
+    globalThis.localStorage.setItem('modly-agent-settings', JSON.stringify({ state: options.agentSettings, version: 0 }))
+  }
 
   try {
+    await writeFile(entry, `export { default } from ${JSON.stringify(chatPanelEntry)}\nexport * from ${JSON.stringify(chatPanelEntry)}\nexport { useAgentStore } from '@shared/stores/agentStore'\nexport { useAgentSessionsStore } from '@shared/stores/agentSessionsStore'\n`)
     await build({
-      entryPoints: [chatPanelEntry],
+      entryPoints: [entry],
       outfile,
       bundle: true,
       format: 'esm',
@@ -1383,5 +1390,260 @@ test('failed-send attachment rollback surfaces cleanup failure as recoverable', 
     assert.equal(rollbackAttempts, 1)
   } finally {
     await cleanup()
+  }
+})
+
+test('worlds_openai_selector_is_remote_labeled_and_generic_chat_stays_ollama_only', async () => {
+  const [{ createElement }, { renderToStaticMarkup }] = await Promise.all([
+    import('react'),
+    import('react-dom/server'),
+  ])
+  const { module: worldsModule, cleanup: cleanupWorlds } = await loadChatPanelModule({
+    agentSettings: { worldsProvider: 'openai', worldsOpenAiModel: 'gpt-5.1' },
+  })
+  try {
+    worldsModule.useAgentStore.setState({ worldsProvider: 'openai', worldsOpenAiModel: 'gpt-5.1' })
+    const noop = () => undefined
+    const worlds = {
+      begin: () => { throw new Error('server render must not begin a request') },
+      accept: async () => undefined,
+      fail: noop,
+      apply: async () => undefined,
+      reject: noop,
+      undo: async () => undefined,
+      cancel: noop,
+      getState: () => ({ status: 'idle', message: '' }),
+      subscribe: () => noop,
+      dispose: noop,
+    }
+    const html = renderToStaticMarkup(createElement(worldsModule.default, { worlds }))
+    assert.match(html, /aria-label="Select AI model, Ollama/)
+    assert.match(html, /placeholder="Ask about this scene…"[^>]*placeholder-zinc-300|placeholder-zinc-300[^>]*placeholder="Ask about this scene…"/)
+    assert.match(html, /text-zinc-300[^>]*>Ask about this scene<br\/>or change it directly/)
+    assert.match(html, /text-zinc-300[^>]*>Shift\+Enter for new line/)
+    assert.doesNotMatch(html, /aria-label="Worlds AI provider"/)
+  } finally {
+    await cleanupWorlds()
+  }
+
+  const { module: genericModule, cleanup: cleanupGeneric } = await loadChatPanelModule()
+  try {
+    const html = renderToStaticMarkup(createElement(genericModule.default))
+    assert.doesNotMatch(html, /OpenAI ·/)
+    assert.doesNotMatch(html, /OpenAI sends this scene request to a remote provider/)
+    assert.doesNotMatch(html, /Ask OpenAI \(remote\)/)
+    assert.match(html, /placeholder-zinc-600/)
+  } finally {
+    await cleanupGeneric()
+  }
+})
+
+test('Worlds uses only the existing compact model picker, not a separate provider box', async () => {
+  const source = await readFile(chatPanelEntry, 'utf8')
+  assert.doesNotMatch(source, /aria-label="Worlds AI provider"/)
+  assert.doesNotMatch(source, /OpenAI sends this scene request to a remote provider/)
+  assert.match(source, /Select AI model,/)
+  assert.match(source, /Ollama ·/)
+  assert.match(source, /OpenAI ·/)
+  assert.match(source, /max-h-\[min\(320px,calc\(100dvh-96px\)\)\]/)
+  assert.match(source, /overflow-y-auto overscroll-contain/)
+  assert.match(source, /aria-label=\{worlds \? 'Send Worlds AI request' : 'Send message'\}/)
+  assert.match(source, /aria-label=\{`Remove \$\{attachment\.file\.name\}`\}/)
+  assert.match(source, /focus-visible:opacity-100/)
+  for (const contrast of [contrastRatio('#d4d4d8', '#18181b'), contrastRatio('#a1a1aa', '#18181b')]) assert.ok(contrast >= 4.5)
+  assert.match(source, /min-h-6[^"`]*text-zinc-300/)
+  assert.match(source, /className="px-3 py-2\.5 text-\[11px\] text-zinc-300" role="status">\{ollamaInventoryStatus === 'unavailable'/)
+  assert.match(source, /className="px-3 py-2\.5 text-\[11px\] text-zinc-300">No Ollama models installed/)
+  assert.match(source, /className="block text-\[10px\] text-zinc-300">OpenAI model ID/)
+  assert.match(source, /aria-label="Attach image"[\s\S]*?className="text-zinc-400/)
+  assert.match(source, /Thinking: \$\{thinkingMode\}[\s\S]*?text-zinc-400/)
+})
+
+test('Worlds chat text and controls use AA contrast without changing generic Generate palette', async () => {
+  const chat = await readFile(chatPanelEntry, 'utf8')
+  const history = await readFile(path.join(projectRoot, 'src/areas/generate/components/AgentSessionHistory.tsx'), 'utf8')
+  const normalTextRatio = contrastRatio('#d4d4d8', '#18181b')
+  const controlRatio = contrastRatio('#a1a1aa', '#18181b')
+  const accentTextRatio = contrastRatio('#a78bfa', '#18181b')
+  assert.ok(normalTextRatio >= 4.5)
+  assert.ok(controlRatio >= 3)
+  assert.ok(Math.abs(accentTextRatio - 6.510) < 0.01 && accentTextRatio >= 4.5)
+  assert.ok(contrastRatio('#7c3aed', '#18181b') < 4.5)
+  assert.match(chat, /<AgentSessionHistory worlds=\{Boolean\(worlds\)\} \/>/)
+  assert.match(chat, /<FeedbackRow content=\{msg\.content\} worlds=\{Boolean\(worlds\)\} \/>/)
+  assert.match(chat, /<ThinkingBlock content=\{msg\.thinking\} worlds=\{Boolean\(worlds\)\} \/>/)
+  assert.match(chat, /<PersistedSummaries summaries=\{msg\.summaries\} worlds=\{Boolean\(worlds\)\} \/>/)
+  assert.match(chat, /worlds \? 'text-zinc-300' : 'text-zinc-500'/)
+  assert.match(chat, /worlds \? 'text-zinc-300 hover:text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'/)
+  assert.match(chat, /worlds \? 'text-zinc-300' : 'text-zinc-700'/)
+  assert.match(chat, /worlds \? 'placeholder-zinc-300' : 'placeholder-zinc-600'/)
+  assert.match(chat, /worlds \? 'text-zinc-400 hover:text-zinc-200' : 'text-zinc-600 hover:text-zinc-400'/)
+  for (const label of ['Copy', 'Good response', 'Bad response']) {
+    assert.match(chat, new RegExp(`title="${label}"[\\s\\S]*?className=\\{iconClass\\}`))
+  }
+  assert.match(history, /worlds \? 'text-zinc-300 hover:text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'/)
+  assert.match(history, /worlds \? 'text-zinc-300 hover:text-zinc-100' : 'text-zinc-600 hover:text-zinc-300'/)
+  assert.match(history, /worlds \? 'text-zinc-300 hover:text-red-300' : 'text-zinc-600 hover:text-red-400'/)
+  assert.match(history, /worlds \? 'text-zinc-300' : 'text-zinc-500'/)
+  assert.match(history, /worlds \? 'text-accent-light' : 'text-accent'/)
+})
+
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (hex: string) => {
+    const channels = hex.slice(1).match(/../g)!.map((value) => parseInt(value, 16) / 255)
+      .map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+  }
+  const a = luminance(foreground), b = luminance(background)
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)
+}
+
+test('Worlds proposed edits display host outcome, never an unverified model success claim', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    assert.equal(module.worldAiVisibleReply({ message: 'I changed it.', worldProposals: [{}] },
+      { status: 'stale', message: 'This request is stale.' }), 'This request is stale.')
+    assert.equal(module.worldAiVisibleReply({ message: 'I changed it.', worldProposals: [{}] },
+      { status: 'applied', message: 'Changes applied. Undo is available.' }), 'Changes applied. Undo is available.')
+    assert.equal(module.worldAiVisibleReply({ message: 'The scene has two lights.', worldProposals: [] },
+      { status: 'idle', message: 'Scene unchanged.' }), 'Scene unchanged.\n\nModel reply (not an edit): The scene has two lights.')
+    assert.equal(module.worldAiVisibleReply({ message: 'Done, renamed Hero.', worldProposals: [] },
+      { status: 'idle', message: 'Scene unchanged.' }), 'Scene unchanged.\n\nModel reply (not an edit): Done, renamed Hero.')
+  } finally { await cleanup() }
+})
+
+test('Ollama discovery distinguishes loading, successful-empty, HTTP failure and transport failure', async () => {
+  const { module, cleanup } = await loadChatPanelModule()
+  try {
+    const digest = `sha256:${'a'.repeat(64)}`
+    assert.deepEqual(await module.loadOllamaModelInventory(async () => new Response(JSON.stringify({ models: [{ name: 'gemma4:e4b', digest }] }), { status: 200 })),
+      { status: 'ready', models: ['gemma4:e4b'] })
+    assert.deepEqual(await module.loadOllamaModelInventory(async () => new Response(JSON.stringify({ models: [] }), { status: 200 })),
+      { status: 'ready', models: [] })
+    assert.deepEqual(await module.loadOllamaModelInventory(async () => new Response('unavailable', { status: 503 })),
+      { status: 'unavailable', models: [] })
+    assert.deepEqual(await module.loadOllamaModelInventory(async () => new Response(JSON.stringify({ error: 'bad schema' }), { status: 200 })),
+      { status: 'unavailable', models: [] })
+    assert.deepEqual(await module.loadOllamaModelInventory(async () => { throw new Error('offline') }),
+      { status: 'unavailable', models: [] })
+  } finally { await cleanup() }
+})
+
+test('mounted Worlds compact picker lists discovered Ollama models and configured OpenAI within one menu', async () => {
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const previousFetch = globalThis.fetch
+  const listeners = new Map<string, (event: unknown) => void>()
+  globalThis.window = globalThis as Window & typeof globalThis
+  globalThis.document = { addEventListener: (type: string, listener: (event: unknown) => void) => listeners.set(type, listener),
+    removeEventListener: (type: string) => listeners.delete(type) } as unknown as Document
+  globalThis.fetch = (async () => new Response(JSON.stringify({ models: [
+    { name: 'gemma4:e4b', digest: `sha256:${'a'.repeat(64)}` },
+    { name: 'qwen3:8b', digest: `sha256:${'b'.repeat(64)}` },
+  ] }), { status: 200 })) as typeof fetch
+  const { module, cleanup } = await loadChatPanelModule()
+  const React = require('react') as typeof import('react')
+  const Reconciler = require('react-reconciler')
+  type Host = { type: string; props: Record<string, any>; children: Host[]; focus(): void; scrollIntoView(): void; contains(node: Host): boolean }
+  const append = (parent: Host, child: Host) => { parent.children.push(child) }
+  const remove = (parent: Host, child: Host) => { parent.children.splice(parent.children.indexOf(child), 1) }
+  const createHost = (type: string, props: Host['props']): Host => ({ type, props, children: [], focus() {}, scrollIntoView() {},
+    contains(node: Host) { return this === node || this.children.some((child) => child.contains(node)) } })
+  const reconciler = Reconciler({ now: performance.now.bind(performance), supportsMutation: true, isPrimaryRenderer: true,
+    getRootHostContext: () => null, getChildHostContext: () => null, getPublicInstance: (node: Host) => node,
+    prepareForCommit: () => null, resetAfterCommit() {}, shouldSetTextContent: () => false,
+    createInstance: createHost, createTextInstance: (value: string) => createHost('#text', { value }),
+    appendInitialChild: append, appendChild: append, appendChildToContainer: append,
+    removeChild: remove, removeChildFromContainer: remove, clearContainer: (node: Host) => { node.children = [] },
+    insertBefore: append, insertInContainerBefore: append, finalizeInitialChildren: () => false,
+    prepareUpdate: () => true, commitUpdate: (node: Host, _payload: unknown, _type: unknown, _old: unknown, props: Host['props']) => { node.props = props },
+    commitTextUpdate: (node: Host, _old: unknown, value: string) => { node.props.value = value },
+    hideInstance: () => {}, unhideInstance: () => {}, hideTextInstance: () => {}, unhideTextInstance: () => {},
+    scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1, getCurrentEventPriority: () => 1,
+    detachDeletedInstance() {}, supportsMicrotasks: true, scheduleMicrotask: queueMicrotask,
+  })
+  const rootHost = createHost('root', {})
+  const root = reconciler.createContainer(rootHost, 0, null, false, null, '', () => {}, null)
+  const render = (element: React.ReactNode) => { reconciler.flushSync(() => reconciler.updateContainer(element, root, null, null)); reconciler.flushPassiveEffects() }
+  const find = (node: Host, predicate: (item: Host) => boolean): Host | undefined => {
+    if (predicate(node)) return node
+    for (const child of node.children) { const result = find(child, predicate); if (result) return result }
+  }
+  const nodeText = (node: Host): string => node.type === '#text' ? node.props.value : node.children.map(nodeText).join('')
+  const worlds = { begin() { throw new Error('not sent') }, accept: async () => undefined, fail() {}, apply: async () => undefined,
+    reject() {}, undo: async () => undefined, cancel() {}, getState: () => ({ status: 'idle', message: '' }), subscribe: () => () => {}, dispose() {} }
+  try {
+    module.useAgentSessionsStore.setState({ initialized: true, activeSession: null, sessions: [], initialize: async () => undefined })
+    render(React.createElement(module.default, { worlds }))
+    assert.match(String(find(rootHost, (node) => node.type === 'p' && nodeText(node).includes('Ask about this scene'))?.props.className), /text-zinc-300/)
+    assert.match(String(find(rootHost, (node) => node.type === 'p' && nodeText(node).includes('Shift+Enter for new line'))?.props.className), /text-zinc-300/)
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'New chat')?.props.className), /text-accent-light/)
+    const picker = find(rootHost, (node) => node.type === 'button' && String(node.props['aria-label']).startsWith('Select AI model'))!
+    assert.ok(picker)
+    assert.match(String(picker.props.className), /text-zinc-300/)
+    assert.match(String(find(rootHost, (node) => node.props['aria-label'] === 'Attach image')?.props.className), /text-zinc-400/)
+    assert.match(String(find(rootHost, (node) => String(node.props['aria-label']).startsWith('Thinking:'))?.props.className), /text-zinc-400/)
+    assert.match(String(picker.props['aria-label']), /Not checked/)
+    assert.ok(find(rootHost, (node) => node.type === 'button' && node.props['aria-label'] === 'Send Worlds AI request'))
+    assert.equal(picker.props['aria-expanded'], false)
+    picker.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    for (let tick = 0; tick < 4; tick++) { await new Promise((resolve) => setTimeout(resolve, 0)); render(React.createElement(module.default, { worlds })) }
+    assert.equal(picker.props['aria-expanded'], true)
+    assert.match(String(find(rootHost, (node) => node.props.id === 'agent-model-picker')?.props.className), /overflow-y-auto/)
+    assert.equal(find(rootHost, (node) => node.type === 'select' && node.props['aria-label'] === 'Worlds AI provider'), undefined)
+    const ollama = find(rootHost, (node) => node.type === 'button' && nodeText(node).includes('Ollama · qwen3:8b'))!
+    const openai = find(rootHost, (node) => node.type === 'button' && nodeText(node).includes('OpenAI · gpt-5.1 · Remote'))!
+    assert.ok(ollama)
+    assert.ok(openai)
+    ollama.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    assert.match(String(picker.props['aria-label']), /Ollama qwen3:8b local/)
+    picker.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    const remote = find(rootHost, (node) => node.type === 'button' && nodeText(node).includes('OpenAI · gpt-5.1 · Remote'))!
+    remote.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    assert.match(String(picker.props['aria-label']), /OpenAI gpt-5.1 remote/)
+    assert.equal(module.useAgentStore.getState().worldsProvider, 'openai')
+    assert.equal(module.useAgentStore.getState().worldsOpenAiModel, 'gpt-5.1')
+    picker.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    const config = find(rootHost, (node) => node.type === 'input' && node.props['aria-label'] === 'Configure OpenAI model')!
+    config.props.onChange({ target: { value: 'sk-secret' } })
+    render(React.createElement(module.default, { worlds }))
+    const use = find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Use')!
+    assert.equal(use.props.disabled, true)
+    const menu = find(rootHost, (node) => node.props.id === 'agent-model-picker')!
+    menu.props.onKeyDown({ key: 'Escape', stopPropagation() {} })
+    render(React.createElement(module.default, { worlds }))
+    assert.equal(picker.props['aria-expanded'], false)
+    module.useAgentSessionsStore.setState({ activeSession: { id: 'session:active', title: 'Scene chat', revision: 1, messages: [], attachments: [] },
+      sessions: [{ id: 'session:active', title: 'Scene chat' }, { id: 'session:earlier', title: 'Earlier chat' }] } as any)
+    render(React.createElement(module.default, { worlds }))
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Earlier chat')?.props.className), /text-zinc-300/)
+    const rename = find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Rename')!
+    assert.match(String(rename.props.className), /text-zinc-300/)
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Delete')?.props.className), /text-zinc-300/)
+    rename.props.onClick()
+    render(React.createElement(module.default, { worlds }))
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Save')?.props.className), /text-accent-light/)
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node) === 'Cancel')?.props.className), /text-zinc-300/)
+    module.useAgentSessionsStore.setState({ activeSession: { id: 'session:active', title: 'Scene chat', revision: 2, attachments: [],
+      messages: Array.from({ length: 5 }, (_, index) => ({ id: `message:${index}`, role: index % 2 ? 'assistant' : 'user',
+        content: `Message ${index}`, attachmentIds: [], summaries: [] })) } } as any)
+    for (let tick = 0; tick < 4; tick++) { await new Promise((resolve) => setTimeout(resolve, 0)); render(React.createElement(module.default, { worlds })) }
+    assert.match(String(find(rootHost, (node) => node.type === 'button' && nodeText(node).includes('previous message'))?.props.className), /text-zinc-300/)
+    for (const label of ['Copy', 'Good response', 'Bad response']) {
+      assert.match(String(find(rootHost, (node) => node.type === 'button' && node.props.title === label)?.props.className), /text-zinc-400/)
+    }
+  } finally {
+    render(null)
+    await cleanup()
+    if (previousWindow === undefined) Reflect.deleteProperty(globalThis, 'window')
+    else globalThis.window = previousWindow
+    if (previousDocument === undefined) Reflect.deleteProperty(globalThis, 'document')
+    else globalThis.document = previousDocument
+    globalThis.fetch = previousFetch
   }
 })

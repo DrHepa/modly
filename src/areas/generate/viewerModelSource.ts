@@ -30,6 +30,15 @@ export function resolveViewerModelSource(
     }
   }
 
+  if (target.kind === 'final') {
+    return {
+      kind: target.kind,
+      modelUrl: target.modelUrl,
+      isCheckpointPreview: target.isCheckpointPreview,
+      label: target.label,
+    }
+  }
+
   return {
     kind: target.kind,
     modelUrl: target.modelUrl,

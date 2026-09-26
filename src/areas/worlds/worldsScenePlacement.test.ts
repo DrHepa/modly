@@ -46,8 +46,8 @@ test('attachWorldSceneItemAnimation attaches serializable pose-clip binding with
 })
 
 test('appendWorldSceneItem prefers the selected item anchor before base-scene averages', () => {
-  const selected = { ...item('selected', 'Workflows/selected.glb'), transform: { position: [10, 0, 10], rotation: [0, 0, 0], scale: [1, 1, 1] } }
-  const base = { ...item('base', 'Workflows/base.glb'), role: 'base-scene' as const, transform: { position: [50, 1, -20], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const selected: WorldSceneItem = { ...item('selected', 'Workflows/selected.glb'), transform: { position: [10, 0, 10], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const base: WorldSceneItem = { ...item('base', 'Workflows/base.glb'), role: 'base-scene', transform: { position: [50, 1, -20], rotation: [0, 0, 0], scale: [1, 1, 1] } }
   const prop = item('prop', 'Workflows/prop.glb')
 
   const appended = appendWorldSceneItem([selected, base], prop, {
@@ -62,9 +62,9 @@ test('appendWorldSceneItem prefers the selected item anchor before base-scene av
 })
 
 test('appendWorldSceneItem falls back to selected item transform, then base-scene average, then origin', () => {
-  const selected = { ...item('selected', 'Workflows/selected.glb'), transform: { position: [6, 4, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
-  const baseA = { ...item('base-a', 'Workflows/base-a.glb'), role: 'base-scene' as const, transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
-  const baseB = { ...item('base-b', 'Workflows/base-b.glb'), role: 'base-scene' as const, transform: { position: [14, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const selected: WorldSceneItem = { ...item('selected', 'Workflows/selected.glb'), transform: { position: [6, 4, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const baseA: WorldSceneItem = { ...item('base-a', 'Workflows/base-a.glb'), role: 'base-scene', transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const baseB: WorldSceneItem = { ...item('base-b', 'Workflows/base-b.glb'), role: 'base-scene', transform: { position: [14, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } }
   const prop = item('prop', 'Workflows/prop.glb')
 
   assert.deepEqual(appendWorldSceneItem([selected], prop, { selectedSceneItemId: selected.id }).sceneItems[1]?.transform.position, [7.75, 4, -2])
@@ -162,8 +162,8 @@ test('updateWorldSceneItemTransforms applies batched updates without mutating un
 })
 
 test('legacy collision zone helpers remain deterministic while active UI migrates to collision surfaces', () => {
-  const hero = { ...item('hero'), transform: { position: [4, 1, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
-  const base = { ...item('base', 'Workflows/base.glb'), role: 'base-scene' as const, transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const hero: WorldSceneItem = { ...item('hero'), transform: { position: [4, 1, -2], rotation: [0, 0, 0], scale: [1, 1, 1] } }
+  const base: WorldSceneItem = { ...item('base', 'Workflows/base.glb'), role: 'base-scene', transform: { position: [10, 0, -4], rotation: [0, 0, 0], scale: [1, 1, 1] } }
 
   assert.deepEqual(resolveWorldCollisionZonePlacementAnchor([], [hero], { selectedSceneItemId: hero.id }), [4, 1, -2])
   assert.deepEqual(resolveWorldCollisionZonePlacementAnchor([], [base], { sceneItemAnchors: { [base.id]: [12, 2, -8] } }), [12, 2, -8])

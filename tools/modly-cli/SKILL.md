@@ -1,12 +1,12 @@
 ---
 name: modly-cli
-description: Use when an agent needs to call a running Modly desktop instance from the terminal to generate/export image-to-3D assets through canonical JSON-first automation commands.
-version: 1.2.0
+description: Use when an agent needs to call a running Modly desktop instance from the terminal for canonical asset automation or private Worlds read-and-propose commands.
+version: 1.3.0
 author: Modly
 license: MIT
 metadata:
   hermes:
-    tags: [modly, image-to-3d, cli, automation, agents]
+    tags: [modly, image-to-3d, worlds, cli, automation, agents]
     related_skills: []
 ---
 
@@ -23,6 +23,62 @@ Modly exposes a local API at `http://127.0.0.1:8765` while the official desktop 
 - `process-run`
 
 Final machine-readable JSON is printed to stdout. Progress JSON lines, when requested, are printed to stderr.
+
+## Worlds from an installed Modly app
+
+The packaged CLI and this skill are copied to the stable resource-relative paths
+`resourcesPath/modly-cli/agent.py` and `resourcesPath/modly-cli/SKILL.md`.
+Here, `resourcesPath` means Electron's `process.resourcesPath` for the running
+Modly installation, **not** a Worlds workspace path or a source checkout. Ask
+the user for the installed app's resources directory if it is not already known;
+do not search private app data, credentials, or the user's filesystem for it.
+The mounted path of a Linux AppImage may change on restart, so resolve it for
+the current running installation. Set `MODLY_RESOURCES_PATH` to that directory
+in a trusted terminal, then invoke:
+
+```bash
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world pair
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world project list
+```
+
+Worlds CLI is currently Linux-only. Start Modly, open a World project and its
+scene in Edit mode, then run `world pair` in a trusted terminal. The CLI asks
+Modly to show a native, cancel-default consent dialog, followed by a separate
+native one-time-code dialog; there is no Worlds CLI panel. Enter the code only
+at the interactive terminal prompt; never place it in command arguments, a
+prompt, a file, or a transcript. The terminal and Modly must run as the same
+OS user with the same private `XDG_RUNTIME_DIR`. Pairing uses a private Unix
+socket and a five-minute active-scene scoped session with at most eight admitted
+automatic edits; it does not use a ChatGPT Pro OAuth
+token, an OpenAI API key, or the localhost asset API.
+
+Use returned opaque project keys, scene IDs, revisions, plan IDs, and cursors.
+Do not invent identifiers or pass absolute workspace paths to Worlds:
+
+During this pairing-only stage, `world query` is limited to `entities` and
+`components` in the currently open scene. Project-wide scene and resource
+catalogues are intentionally unavailable even when their identifiers are known.
+
+```bash
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world project open <project_key>
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world plan <project_key> --scene-id <scene_id>
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world query <project_key> --revision <revision> --kind entities --scene-id <scene_id> --plan <plan_id>
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world query <project_key> --revision <revision> --kind entities --scene-id <scene_id> --cursor <nextCursor> --plan <plan_id>
+python3 "$MODLY_RESOURCES_PATH/modly-cli/agent.py" world propose <project_key> --plan <plan_id> --json - < recipe.json
+```
+
+The proposal input is a bounded, typed `{"commands":[...]}` recipe on stdin;
+derive commands only from the current plan and query observations. During the
+approved lease, a valid proposal may apply automatically and consumes one of
+the eight admissions even if dispatch or editing later fails. A
+`direct-edit-dispatched` receipt proves dispatch only, never completion: verify
+the result with a fresh `world project open` or `world query`. Apply, Reject,
+Undo, edit, and status commands are not available through the CLI.
+Never try to bypass pairing, invoke
+internal IPC, or write Worlds project documents directly. A stale plan or
+revision must be queried again rather than retried with guessed data. This
+packaged skill is guidance for Codex, not evidence that the user has installed
+it into Codex or that an external Codex task has passed native E2E.
 
 ## Prerequisites
 

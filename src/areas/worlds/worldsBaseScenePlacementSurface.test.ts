@@ -13,6 +13,21 @@ import type { WorldsSurfacePlacementItemDescriptor, WorldsSurfacePlacementTransf
 
 const EPSILON = 1e-6
 
+test('placement hit fixture preserves overrides without aliasing point or normal inputs', () => {
+  const point: WorldsPlacementSurfaceHit['point'] = [1, 2, 3]
+  const normal: WorldsPlacementSurfaceHit['normal'] = [0, 1, 0]
+  const hit = placementHit({ point, normal, sourceId: 'custom-surface', distance: 7 })
+
+  assert.notEqual(hit.point, point)
+  assert.notEqual(hit.normal, normal)
+  point[0] = 99
+  normal[1] = -1
+  assert.deepEqual(hit.point, [1, 2, 3])
+  assert.deepEqual(hit.normal, [0, 1, 0])
+  assert.equal(hit.sourceId, 'custom-surface')
+  assert.equal(hit.distance, 7)
+})
+
 test('single asset bottom aligns to horizontal surface with skin', () => {
   const hit = placementHit({ point: [0, 0, 0], normal: [0, 1, 0] })
   const result = resolveWorldsPlacementSurfaceSupport({
@@ -165,11 +180,11 @@ function placementHit(overrides: Partial<WorldsPlacementSurfaceHit> & Pick<World
   return {
     source: 'base-scene',
     sourceId: 'base',
-    point: [...overrides.point],
-    normal: [...overrides.normal],
     distance: 1,
     polygon: [[0, 0, 0], [1, 0, 0], [0, 0, 1]],
     ...overrides,
+    point: [...overrides.point],
+    normal: [...overrides.normal],
   }
 }
 

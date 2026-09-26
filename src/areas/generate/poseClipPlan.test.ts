@@ -578,6 +578,9 @@ function createKimodoArtifactForCompanion(raw: Record<string, unknown>): KimodoM
     diagnostics: {
       runtimeStatus: 'success',
       retargetStatus: 'success',
+      solverStatus: null,
+      basisStatus: null,
+      rootMotionStatus: null,
       animationMappingStatus: 'trusted_contract',
       stabilizationStatus: 'not_evaluated',
       visualQualityStatus: 'warning',

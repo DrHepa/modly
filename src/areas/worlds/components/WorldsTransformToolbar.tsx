@@ -2,8 +2,14 @@ import { useState, type ReactNode } from 'react'
 
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
 import type { WorldCollisionSurface, WorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
+import { Tooltip } from '../../../shared/components/ui/Tooltip.tsx'
 
 export type WorldsTransformMode = 'translate' | 'rotate' | 'scale'
+
+export interface WorldsItemSelectionOptions {
+  toggle?: boolean
+  preserveSelection?: boolean
+}
 
 interface WorldsTransformToolbarProps {
   items?: WorldSceneItem[]
@@ -13,7 +19,7 @@ interface WorldsTransformToolbarProps {
   collisionEditMode?: boolean
   selectedCollisionSurfaceId?: string | null
   mode: WorldsTransformMode | null
-  onSelectItem?: (itemId: string | null, options?: { preserveSelection?: boolean }) => void
+  onSelectItem?: (itemId: string | null, options?: WorldsItemSelectionOptions) => void
   onModeChange: (mode: WorldsTransformMode | null) => void
   onRemoveItem?: (itemId: string | null) => void
   onRemoveCollisionSurface?: (surfaceId: string | null) => void
@@ -125,7 +131,6 @@ export function WorldsTransformToolbar({
 
       <button
         type="button"
-        title={selectedItem ? (selectedItem.role === 'base-scene' ? 'Unset selected asset as a base world' : 'Set selected asset as a base world') : 'Select an asset to mark as a base world'}
         aria-label={selectedItem?.role === 'base-scene' ? 'Unset selected asset as base world' : 'Set selected asset as base world'}
         aria-pressed={selectedItem?.role === 'base-scene'}
         disabled={!selectedItem}
@@ -155,7 +160,6 @@ export function WorldsTransformToolbar({
         </select>
         <button
           type="button"
-          title="Add a world collision surface"
           aria-label="Add collision surface"
           onClick={() => onAddCollisionSurface(collisionPreset)}
           className="rounded-lg border border-zinc-700/70 px-2 py-1.5 text-[10px] font-semibold text-zinc-200 transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40"
@@ -164,7 +168,6 @@ export function WorldsTransformToolbar({
         </button>
         <button
           type="button"
-          title={hasCollisionSurfaces ? 'Show world collision surfaces' : 'Add a collision surface to edit collisions'}
           aria-label="Edit collision surfaces"
           aria-pressed={collisionEditMode}
           disabled={!hasCollisionSurfaces}
@@ -207,29 +210,24 @@ export function WorldsTransformToolbar({
               ? entry.label
               : 'Select an asset or collision surface to transform'
           return (
-            <button
-              key={entry.mode}
-              type="button"
-              title={title}
-              aria-label={entry.label}
-              aria-pressed={mode === entry.mode}
-              disabled={!hasTransformTarget}
-              onClick={() => onModeChange(mode === entry.mode ? null : entry.mode)}
-              className={`relative flex h-8 w-8 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 ${
-                mode === entry.mode ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:bg-zinc-700/60 hover:text-zinc-200 disabled:hover:bg-transparent disabled:hover:text-zinc-400'
-              }`}
-            >
-              {entry.icon}
-            </button>
+            <Tooltip key={entry.mode} content={title}>
+              <button
+                type="button"
+                aria-label={entry.label}
+                aria-pressed={mode === entry.mode}
+                disabled={!hasTransformTarget}
+                onClick={() => onModeChange(mode === entry.mode ? null : entry.mode)}
+                className={`relative flex h-8 w-8 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  mode === entry.mode ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:bg-zinc-700/60 hover:text-zinc-200 disabled:hover:bg-transparent disabled:hover:text-zinc-400'
+                }`}
+              >
+                {entry.icon}
+              </button>
+            </Tooltip>
           )
         })}
         <button
           type="button"
-          title={activeTarget === 'collision-surface'
-            ? 'Remove selected collision surface'
-            : activeTarget === 'asset'
-              ? 'Remove selected asset from scene'
-              : 'Select an asset or collision surface to remove'}
           aria-label={activeTarget === 'collision-surface' ? 'Remove selected collision surface' : 'Remove selected asset'}
           disabled={activeTarget === 'none'}
           onClick={() => {

@@ -39,7 +39,7 @@ test('owned process reports an early non-zero exit and retains bounded internal 
   const executable = await openPinnedAgentExecutable(await realpath(process.execPath), 'test executable')
   const owned = await startAgentOwnedProcess({
     executable,
-    args: ['-e', "console.error('private-alias-value'); process.exit(7)"],
+    args: ['-e', "require('node:fs').writeSync(2, 'private-alias-value'); process.exit(7)"],
     env: {},
     cwd: '/',
   })

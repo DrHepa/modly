@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -40,12 +41,18 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local")
 _CHUNK_BYTES = 1024 * 1024
 _MAX_REDIRECTS = 3
+_READ_CONTROL_POLL_SECONDS = 0.5
+_MAX_STALL_SECONDS = 30.0
 _VERIFIED_FILE_CACHE: dict[tuple[str, int, int, str], bool] = {}
 _VERIFIED_FILE_CACHE_LOCK = threading.Lock()
 
 
 class HttpsDownloadManifestError(ValueError):
     """Raised when a node-level HTTPS asset plan is unsafe or ambiguous."""
+
+
+class HttpsDownloadControlSignal(Exception):
+    """Raised by router-owned download controls for neutral settlement."""
 
 
 def _assert_exact_fields(
@@ -328,7 +335,14 @@ def https_download_assets_ready(
     try:
         canonical_model_id = _validate_model_id(model_id)
         normalized = validate_https_downloads(plan)
-        owner_root = owner_dir.resolve()
+        if owner_dir.is_symlink():
+            return False
+        owner_root = owner_dir
+        marker_ancestor = owner_root
+        for part in MARKER_RELATIVE_PATH.parts:
+            marker_ancestor = marker_ancestor / part
+            if marker_ancestor.is_symlink():
+                return False
         marker = _load_ready_marker(
             owner_root / MARKER_RELATIVE_PATH
         )
@@ -664,6 +678,8 @@ async def stream_https_asset_downloads(
     *,
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
     resolve_host: Callable[[str, int], Any] | None = None,
+    check_download_control: Callable[[], None] | None = None,
+    control_exceptions: tuple[type[BaseException], ...] = (),
 ) -> AsyncIterator[dict[str, Any]]:
     """Download one exact HTTPS plan and yield aggregate SSE-ready events."""
     try:
@@ -702,7 +718,15 @@ async def stream_https_asset_downloads(
         )
         return
 
-    owner_root = owner_dir.resolve()
+    if owner_dir.is_symlink():
+        yield _download_error(
+            code="unsafe_target",
+            stage="validate",
+            message="Canonical model owner must not be a symbolic link",
+            retryable=False,
+        )
+        return
+    owner_root = owner_dir
     owner_root.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -728,7 +752,12 @@ async def stream_https_asset_downloads(
         "status": "preparing",
         "fileIndex": 0,
         "totalFiles": total_files,
+        "bytesDownloaded": 0,
+        "totalBytes": total_bytes,
+        "stalledSeconds": 0,
     }
+    if check_download_control is not None:
+        check_download_control()
 
     factory = client_factory or _default_client_factory
 
@@ -738,6 +767,8 @@ async def stream_https_asset_downloads(
                 normalized,
                 start=1,
             ):
+                if check_download_control is not None:
+                    check_download_control()
                 filename = asset["filename"]
                 target_path = owner_root / filename
 
@@ -775,6 +806,9 @@ async def stream_https_asset_downloads(
                         "file": filename,
                         "fileIndex": file_index,
                         "totalFiles": total_files,
+                        "bytesDownloaded": completed_bytes,
+                        "totalBytes": total_bytes,
+                        "stalledSeconds": 0,
                     }
                     continue
 
@@ -791,6 +825,8 @@ async def stream_https_asset_downloads(
                     redirect_count = 0
 
                     while True:
+                        if check_download_control is not None:
+                            check_download_control()
                         request, _, _ = await _build_pinned_https_request(
                             logical_url,
                             resolve_host or _default_resolve_host,
@@ -863,8 +899,8 @@ async def stream_https_asset_downloads(
                                 ),
                                 filename=filename,
                                 retryable=(
-                                    response.status_code >= 500
-                                    or response.status_code == 429
+                                    response.status_code in {408, 425, 429}
+                                    or response.status_code >= 500
                                 ),
                             )
                             return
@@ -916,54 +952,111 @@ async def stream_https_asset_downloads(
                                 return
 
                         with temp_path.open("xb") as output:
-                            async for chunk in response.aiter_bytes(
-                                _CHUNK_BYTES
-                            ):
-                                if not chunk:
-                                    continue
+                            chunks = response.aiter_bytes(_CHUNK_BYTES).__aiter__()
+                            pending_chunk = None
+                            try:
+                                while True:
+                                    if check_download_control is not None:
+                                        check_download_control()
 
-                                received += len(chunk)
-                                if received > asset["size_bytes"]:
-                                    yield _download_error(
-                                        code="size_mismatch",
-                                        stage="verify",
-                                        message=(
-                                            "HTTPS asset exceeded "
-                                            "its declared byte size"
-                                        ),
-                                        filename=filename,
-                                        retryable=True,
-                                    )
-                                    return
-
-                                output.write(chunk)
-                                digest.update(chunk)
-
-                                percent = min(
-                                    99,
-                                    round(
-                                        (
-                                            completed_bytes
-                                            + received
+                                    if pending_chunk is None:
+                                        pending_chunk = asyncio.create_task(
+                                            chunks.__anext__()
                                         )
-                                        / total_bytes
-                                        * 99
-                                    ),
-                                )
-                                if percent != last_percent:
-                                    last_percent = percent
-                                    yield {
-                                        "percent": percent,
-                                        "status": "downloading",
-                                        "file": filename,
-                                        "fileIndex": file_index,
-                                        "totalFiles": total_files,
-                                    }
+                                        stall_deadline = (
+                                            time.monotonic()
+                                            + _MAX_STALL_SECONDS
+                                        )
+
+                                    remaining = stall_deadline - time.monotonic()
+                                    if remaining <= 0:
+                                        raise httpx.ReadTimeout(
+                                            f"HTTPS asset read stalled for {int(_MAX_STALL_SECONDS)} seconds",
+                                            request=response.request,
+                                        )
+
+                                    done, _ = await asyncio.wait(
+                                        {pending_chunk},
+                                        timeout=min(
+                                            _READ_CONTROL_POLL_SECONDS,
+                                            remaining,
+                                        ),
+                                    )
+                                    if not done:
+                                        if check_download_control is not None:
+                                            check_download_control()
+                                        if time.monotonic() >= stall_deadline:
+                                            raise httpx.ReadTimeout(
+                                                f"HTTPS asset read stalled for {int(_MAX_STALL_SECONDS)} seconds",
+                                                request=response.request,
+                                            )
+                                        continue
+
+                                    completed_chunk = pending_chunk
+                                    pending_chunk = None
+                                    try:
+                                        chunk = completed_chunk.result()
+                                    except StopAsyncIteration:
+                                        break
+                                    if not chunk:
+                                        continue
+
+                                    received += len(chunk)
+                                    if received > asset["size_bytes"]:
+                                        yield _download_error(
+                                            code="size_mismatch",
+                                            stage="verify",
+                                            message=(
+                                                "HTTPS asset exceeded "
+                                                "its declared byte size"
+                                            ),
+                                            filename=filename,
+                                            retryable=True,
+                                        )
+                                        return
+
+                                    output.write(chunk)
+                                    digest.update(chunk)
+
+                                    percent = min(
+                                        99,
+                                        round(
+                                            (
+                                                completed_bytes
+                                                + received
+                                            )
+                                            / total_bytes
+                                            * 99
+                                        ),
+                                    )
+                                    if percent != last_percent:
+                                        last_percent = percent
+                                        yield {
+                                            "percent": percent,
+                                            "status": "downloading",
+                                            "file": filename,
+                                            "fileIndex": file_index,
+                                            "totalFiles": total_files,
+                                            "bytesDownloaded": completed_bytes + received,
+                                            "totalBytes": total_bytes,
+                                            "stalledSeconds": 0,
+                                        }
+                            finally:
+                                if pending_chunk is not None:
+                                    if not pending_chunk.done():
+                                        pending_chunk.cancel()
+                                    await asyncio.gather(
+                                        pending_chunk,
+                                        return_exceptions=True,
+                                    )
 
                             output.flush()
                             os.fsync(output.fileno())
                     finally:
                         await response.aclose()
+
+                    if check_download_control is not None:
+                        check_download_control()
 
                     if received != asset["size_bytes"]:
                         yield _download_error(
@@ -1014,9 +1107,14 @@ async def stream_https_asset_downloads(
                         "file": filename,
                         "fileIndex": file_index,
                         "totalFiles": total_files,
+                        "bytesDownloaded": completed_bytes,
+                        "totalBytes": total_bytes,
+                        "stalledSeconds": 0,
                     }
                 finally:
                     temp_path.unlink(missing_ok=True)
+    except control_exceptions:
+        raise
     except HttpsDownloadManifestError as error:
         yield _download_error(
             code="unsafe_host",
@@ -1033,6 +1131,9 @@ async def stream_https_asset_downloads(
             retryable=True,
         )
         return
+
+    if check_download_control is not None:
+        check_download_control()
 
     try:
         _write_ready_marker(
@@ -1054,4 +1155,7 @@ async def stream_https_asset_downloads(
         "status": "done",
         "fileIndex": total_files,
         "totalFiles": total_files,
+        "bytesDownloaded": completed_bytes,
+        "totalBytes": total_bytes,
+        "stalledSeconds": 0,
     }

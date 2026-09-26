@@ -6,6 +6,7 @@ import { useAppStore } from '@shared/stores/appStore'
 import { resolveWorkflowDispatch } from './workflowDispatch'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { resolveSceneSourceManifest } from './workflowSceneSource'
+import { resolveCaptureSourceManifest } from './workflowCaptureSource'
 import { routeWorkflowOutputToWorlds } from './workflowWorldsOutput.ts'
 import { showCompletionNotification, showErrorNotification } from '@shared/utils/notification'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
@@ -59,6 +60,7 @@ export interface WorkflowCheckpoint {
   landmarkSidecar?: LandmarkSidecarLineageMetadata
 }
 import { deriveActiveWorkflowGraph, topoSortWorkflowNodes } from './workflowActiveGraph.ts'
+import { normalizeWorkflowEdges } from './workflowEdgeNormalization.ts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -482,6 +484,11 @@ type ModelGenerationRequest =
       scenePath: string
       params: Record<string, unknown>
     }
+  | {
+      kind: 'capture'
+      capturePath: string
+      params: Record<string, unknown>
+    }
 
 type ModelGenerationStatus = {
   status: string
@@ -516,6 +523,7 @@ function isArtifactKind(value: string | undefined): value is ArtifactRef['kind']
     || value === 'text'
     || value === 'mesh'
     || value === 'scene'
+    || value === 'capture'
     || value === 'audio'
 }
 
@@ -528,6 +536,7 @@ export function buildModelGenerationRequest(args: {
   nodeInputMeshPath?: string
   routedMeshParams?: Record<string, string>
   routedSideParams?: Record<string, string>
+  routedExtraImagePaths?: Array<string | undefined>
   selectedImagePath?: string
   selectedImageData?: string
   workspaceDir: string
@@ -550,6 +559,24 @@ export function buildModelGenerationRequest(args: {
         texture_resolution: 1024,
         params: nodeParams,
       },
+    }
+  }
+
+  if (input === 'scene') {
+    if (!args.nodeInputPath) throw new Error(`Missing required scene input for extension ${ext.id}`)
+    const scenePath = normalizeWorkflowPath(args.nodeInputPath, args.workspaceDir)
+    return { kind: 'scene', scenePath, params: { ...nodeParams, scene_path: scenePath, input_scene_path: scenePath } }
+  }
+
+  if (input === 'capture') {
+    const activeCapturePath = args.nodeInputPath
+    if (!activeCapturePath) {
+      throw new Error(`Missing required capture input for extension ${ext.id}`)
+    }
+    return {
+      kind: 'capture',
+      capturePath: normalizeWorkflowPath(activeCapturePath, args.workspaceDir),
+      params: nodeParams,
     }
   }
 
@@ -800,7 +827,7 @@ async function executeExtensionNode(
   const nodeInputTexts: (string | undefined)[] = []
   // Every image beyond the first resolved slot, for extensions that take several
   // (e.g. a texture node taking a mesh plus multiple reference images).
-  const extraImagePaths: string[] = []
+  const extraImagePaths: Array<string | undefined> = []
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
   const isInputless = mode === 'model' && ext.input === 'none'
@@ -810,11 +837,15 @@ async function executeExtensionNode(
     && (ext.input === 'scene' || positionalInputs?.includes('scene'))
   // Legacy front/side descriptors keep the single-image transport adapter.
   const namedModelImagePorts = mode === 'model' && ext.input === 'image' && hasNamedProcessInputs(ext.inputs)
-    ? new Set(ext.inputs.filter((port) => port.type === 'image' && ['front', 'left', 'back', 'right'].includes(port.name)).map((port) => port.name))
+    ? new Set(ext.inputs.filter((port) => port.type === 'image').map((port) => port.name))
     : new Set<string>()
   const routedSideParams: Record<string, string> = {}
 
   if (namedModelImagePorts.size > 0) {
+    const imagePortNames = [...namedModelImagePorts]
+    const hasViewLayout = imagePortNames.some((name) => ['front', 'left', 'back', 'right'].includes(name))
+    const primaryName = hasViewLayout && namedModelImagePorts.has('front') ? 'front' : imagePortNames[0]
+    const routedImages = new Map<string, string>()
     let legacyImagePath: string | undefined
     for (const edge of incomingEdges) {
       const src = resolveSource(edge)
@@ -822,15 +853,21 @@ async function executeExtensionNode(
       const handle = edge.targetHandle
       if (src?.outputType !== 'image' || !src.filePath) continue
       if (handle == null) {
-        legacyImagePath = src.filePath
+        legacyImagePath ??= src.filePath
         continue
       }
-      if (!namedModelImagePorts.has(handle)) continue
-      if (handle === 'front') nodeInputPath = src.filePath
-      else routedSideParams[`${handle}_image_path`] = src.filePath
+      if (namedModelImagePorts.has(handle)) routedImages.set(handle, src.filePath)
     }
-    // Named front wins regardless of edge order; sides never replace primary.
-    nodeInputPath ??= legacyImagePath
+    // Named primary wins regardless of edge order; physical secondary gaps stay reserved.
+    nodeInputPath = routedImages.get(primaryName) ?? legacyImagePath
+    if (hasViewLayout) {
+      for (const side of ['left', 'back', 'right']) {
+        const path = routedImages.get(side)
+        if (path) routedSideParams[`${side}_image_path`] = path
+      }
+    } else {
+      extraImagePaths.push(...imagePortNames.slice(1).map((name) => routedImages.get(name)))
+    }
   } else if (positionalInputs && positionalInputs.length > 1) {
     // MODEL shape is checked above; PROCESS retains the physical slot indices.
     const inputTypes = positionalInputs as SlotInputType[]
@@ -854,10 +891,10 @@ async function executeExtensionNode(
     nodeInputPath     = slots.nodeInputPath
     nodeInputMeshPath = slots.nodeInputMeshPath
     extraImagePaths.push(...slots.extraImagePaths)
-  } else if (mode === 'model' && ext.input === 'video') {
+  } else if (mode === 'model' && (ext.input === 'video' || ext.input === 'capture')) {
     for (const edge of incomingEdges) {
       const src = resolveSource(edge)
-      if (src?.outputType === 'video' && src.filePath !== undefined) nodeInputPath = src.filePath
+      if (src?.outputType === ext.input && src.filePath !== undefined) nodeInputPath = src.filePath
     }
   } else if (shouldUsePreviousNodeFallback(ext.input)) {
     for (const edge of incomingEdges) {
@@ -873,6 +910,7 @@ async function executeExtensionNode(
     if (!ext.input && !positionalInputs?.length) throw new Error(`Missing workflow capability input metadata for extension: ${ext.id}`)
     const isSceneInput = positionalInputs ? positionalInputs.includes('scene') : ext?.input === 'scene'
     const isVideoInput = ext.input === 'video'
+    const isCaptureInput = ext.input === 'capture'
     const isTextInput = positionalInputs ? positionalInputs.every((i) => i === 'text') : ext?.input === 'text'
     if (isSceneInput && !nodeInputScenePath) throw new Error(`${ext?.name ?? 'Model'} needs an incoming scene connection`)
     const namedModelInputs = !isInputless && hasNamedProcessInputs(ext.inputs) ? ext.inputs : []
@@ -894,17 +932,17 @@ async function executeExtensionNode(
         if (src?.text !== undefined && (!src.outputType || src.outputType === 'text')) nodeInputText = src.text
       }
     }
-    const activeImagePath = (isInputless || isTextInput || isSceneInput || isVideoInput) ? undefined : (nodeInputPath ?? selectedImagePath)
-    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
+    const activeImagePath = (isInputless || isTextInput || isSceneInput || isVideoInput || isCaptureInput) ? undefined : (nodeInputPath ?? selectedImagePath)
+    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && !isCaptureInput && !selectedImageData && (!activeImagePath || activeImagePath.trim().length === 0)) {
       throw new Error('No input image selected for model node')
     }
 
     let blob: Blob | undefined
     let fname = 'image.png'
-    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && selectedImageData && nodeInputPath === undefined) {
+    if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && !isCaptureInput && selectedImageData && nodeInputPath === undefined) {
       fname = 'placeholder.png'
       blob = new Blob([Uint8Array.from(atob(selectedImageData), (c) => c.charCodeAt(0))], { type: 'image/png' })
-    } else if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput) {
+    } else if (!isInputless && !isTextInput && !isSceneInput && !isVideoInput && !isCaptureInput) {
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
@@ -952,6 +990,14 @@ async function executeExtensionNode(
         input_kind: 'scene', input_path: inputPath,
         model_id: node.data.extensionId ?? '', collection: 'Workflows',
         params: { ...effectiveParams, ...extraParams },
+      })
+    } else if (isCaptureInput) {
+      const request = buildModelGenerationRequest({ ext, node, nodeParams: { ...effectiveParams, ...extraParams }, nodeInputPath, workspaceDir })
+      if (request.kind !== 'capture') throw new Error('Expected capture model request')
+      submission = await client.post('/generate/from-artifact', {
+        input_kind: 'capture', input_path: request.capturePath,
+        model_id: node.data.extensionId ?? '', collection: 'Workflows',
+        remesh: 'none', enable_texture: false, texture_resolution: 1024, params: request.params,
       })
     } else if (isVideoInput) {
       const request = buildModelGenerationRequest({
@@ -1426,7 +1472,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     pausedGroup:      [],
 
     async run(workflow, allExtensions, overrideImageData?) {
-      const activeGraph = deriveActiveWorkflowGraph(workflow.nodes, workflow.edges)
+      const normalizedEdges = normalizeWorkflowEdges({ nodes: workflow.nodes, edges: workflow.edges, allExtensions })
+      const activeGraph = deriveActiveWorkflowGraph(workflow.nodes, normalizedEdges.edges)
       workflow = { ...workflow, ...activeGraph }
       // Snapshot a legitimate Current Mesh before clearing the previous job.
       // A disposable checkpoint preview is not an input to the next workflow.
@@ -1614,6 +1661,15 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
               const fp = node.data.params?.filePath as string | undefined
               if (fp) nodeOutputs.set(node.id, { filePath: fp, outputType: 'mesh' })
             }
+          }
+          if (node.type === 'captureNode') {
+            const resolution = await resolveCaptureSourceManifest({
+              capturePath: typeof node.data.params?.path === 'string' ? node.data.params.path : '',
+              workspaceDir, readFileBase64: window.electron.fs.readFileBase64,
+            })
+            if (epoch !== executionEpoch || _cancel.current) return
+            if (!resolution.ok) throw new Error(`Load Capture: ${resolution.error}`)
+            nodeOutputs.set(node.id, { filePath: resolution.manifestAbsolutePath, outputType: 'capture' })
           }
           if (node.type === 'sceneNode') {
             // Revalidate the live source, never trust a persisted UI validation cache.

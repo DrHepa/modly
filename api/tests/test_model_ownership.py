@@ -86,6 +86,24 @@ def test_initialize_registers_owner_aware_model_paths_and_metadata(monkeypatch: 
     assert registry.get_generator("image-bundle/flux-schnell").model_dir == models_dir / "image-bundle/flux-schnell"
 
 
+def test_node_manifest_projects_ordered_inputs_instead_of_extension_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    registry, _, _, extensions_dir = _build_registry(monkeypatch, tmp_path)
+    ext_dir = _write_extension_bundle(extensions_dir)
+    manifest_path = ext_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["inputs"] = [{"name": "image", "type": "image", "required": True}]
+    manifest["nodes"][0]["inputs"] = ["image", "image", "image", "image"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    registry.initialize()
+
+    assert registry.get_manifest("image-bundle/sd15")["inputs"] == ["image"] * 4
+    assert registry.get_manifest("image-bundle/sdxl-base")["inputs"] is None
+
+
 def test_readiness_uses_owner_path_with_legacy_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     registry, models_dir, _, extensions_dir = _build_registry(monkeypatch, tmp_path)
     _write_extension_bundle(extensions_dir)

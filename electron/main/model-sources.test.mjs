@@ -259,3 +259,78 @@ test('reports installed variants and lists only the files of the variant being r
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('rejects same-source portable filename collisions before download', () => {
+  const { normalizeModelSources, validateModelSourceFilePlan } = loadModule()
+  const sources = normalizeModelSources(validNode())
+  assert.throws(
+    () => validateModelSourceFilePlan(sources, {
+      primary: ['pipeline.json', 'Pipeline.JSON'],
+      encoder: ['config.json', 'model.safetensors'],
+    }),
+    /portable filename collision/i,
+  )
+})
+
+
+test('rejects same-source ancestor and descendant targets before download', () => {
+  const { normalizeModelSources, validateModelSourceFilePlan } = loadModule()
+  const source = normalizeModelSources(validNode())[0]
+  assert.throws(
+    () => validateModelSourceFilePlan(source ? [source] : [], {
+      primary: ['pipeline.json', 'weights', 'weights/model.safetensors'],
+    }),
+    /portable target collision/i,
+  )
+})
+
+
+test('rejects broken symlink roots during local readiness preflight', (t) => {
+  const { areModelSourcesDownloaded, normalizeModelSources } = loadModule()
+  const root = mkdtempSync(join(tmpdir(), 'modly-broken-model-root-'))
+  const models = join(root, 'models')
+  const missing = join(root, 'missing')
+  try {
+    mkdirSync(models, { recursive: true })
+    try {
+      symlinkSync(missing, join(models, 'pixal3d'), 'dir')
+    } catch (error) {
+      t.skip(`Symlinks unavailable: ${error}`)
+      return
+    }
+    assert.equal(areModelSourcesDownloaded(models, 'pixal3d/generate', normalizeModelSources(validNode())), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+
+test('allows a configured MODELS_DIR symlink while rejecting child symlink traversal', (t) => {
+  const { areModelSourcesDownloaded, normalizeModelSources } = loadModule()
+  const root = mkdtempSync(join(tmpdir(), 'modly-model-root-link-'))
+  const realModels = join(root, 'real-models')
+  const linkedModels = join(root, 'linked-models')
+  const modelRoot = join(realModels, 'pixal3d', 'generate')
+  const encoder = join(modelRoot, 'auxiliary', 'encoder')
+  const sources = normalizeModelSources(validNode())
+
+  try {
+    mkdirSync(encoder, { recursive: true })
+    writeFileSync(join(modelRoot, 'pipeline.json'), '{}')
+    writeFileSync(join(encoder, 'config.json'), '{}')
+    writeFileSync(join(encoder, 'model.safetensors'), 'x')
+    try {
+      symlinkSync(realModels, linkedModels, 'dir')
+    } catch (error) {
+      t.skip(`Symlinks unavailable: ${error}`)
+      return
+    }
+
+    assert.equal(areModelSourcesDownloaded(linkedModels, 'pixal3d/generate', sources), true)
+    rmSync(join(encoder, 'model.safetensors'))
+    symlinkSync(join(root, 'outside.safetensors'), join(encoder, 'model.safetensors'))
+    assert.equal(areModelSourcesDownloaded(linkedModels, 'pixal3d/generate', sources), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

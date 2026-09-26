@@ -64,7 +64,7 @@ export function resolveMotionRetargetPreviewClip(args: {
 function resolveMotionRetargetPreviewSafetyWarnings(artifact: KimodoMotionArtifact): string[] {
   const omittedChannels = artifact.motionRetarget?.status === 'parsed' ? artifact.motionRetarget.omittedChannels ?? [] : []
   const warnings: string[] = []
-  if (omittedChannels.some((omitted) => /basis[_\/-]?rest[_\/-]?pose/i.test(omitted.channel))) {
+  if (omittedChannels.some((omitted) => /basis[_/-]?rest[_/-]?pose/i.test(omitted.channel))) {
     warnings.push(BASIS_REST_POSE_PREVIEW_DISABLED_WARNING)
   }
   if (hasInvalidKimodoBasisContract(artifact)) warnings.push(INVALID_BASIS_PREVIEW_DISABLED_WARNING)

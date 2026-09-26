@@ -1,4 +1,4 @@
-import type { AnyExtension, ExtensionNode, ProcessPort } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, ModelDownloadFailure, ProcessPort } from '@shared/types/electron.d'
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -19,6 +19,24 @@ export interface DownloadInfo {
 }
 
 export type DownloadMap = Record<string, DownloadInfo>
+
+export function isValidModelDownloadFailure(value: unknown): value is ModelDownloadFailure {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const failure = value as Record<string, unknown>
+  const optionalFieldsAreValid = ['repoId', 'sourceId', 'file'].every((field) => (
+    failure[field] === undefined
+      || (typeof failure[field] === 'string' && failure[field].trim().length > 0)
+  ))
+  return typeof failure.code === 'string' && failure.code.trim().length > 0
+    && typeof failure.stage === 'string' && failure.stage.trim().length > 0
+    && typeof failure.message === 'string' && failure.message.trim().length > 0
+    && typeof failure.retryable === 'boolean'
+    && optionalFieldsAreValid
+}
+
+export function isRetryableModelDownloadFailure(value: unknown): value is ModelDownloadFailure {
+  return isValidModelDownloadFailure(value) && value.retryable === true
+}
 
 export type NodeUiState =
   | { kind: 'ready' }                          // no weights required
@@ -99,7 +117,8 @@ export function IOBadge({ node }: { node: ExtensionNode }): JSX.Element {
   )
 }
 
-function formatInputBadgeLabel(port: ProcessPort): string {
+function formatInputBadgeLabel(port: string | ProcessPort): string {
+  if (typeof port === 'string') return port
   const portName = port.label ?? port.name
   return portName === port.type ? portName : `${portName}:${port.type}`
 }

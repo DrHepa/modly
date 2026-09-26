@@ -103,6 +103,17 @@ test('WorkflowsPage source never disables Run because of semantic process valida
   assert.match(source, /title="Run workflow"/)
 })
 
+test('WorkflowsPage blocks run on preflight issues before save and dispatch', async () => {
+  const source = await readFile(sourcePath, 'utf8')
+  const handler = source.match(/const handleRun = useCallback\(\(\) => \{([\s\S]*?)\n  \}, \[workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel\]\)/)?.[1]
+
+  assert.ok(handler)
+  assert.match(source, /preflightToastTimer\.current = setTimeout\(\(\) => \{\s*showToast\(preflightIssues\[0\]\.message\)\s*\}, 250\)/s)
+  assert.match(handler, /saveAndClaim\(wf\)\s*\n\s*runWorkflow\(wf, allExtensions\)/)
+  assert.doesNotMatch(handler, /\bpreflightIssues\b/)
+  assert.doesNotMatch(source, /if \(preflightIssues\.length > 0\) \{\s*showToast\(preflightIssues\[0\]\.message\)\s*return/s)
+})
+
 test('WorkflowsPage warns on preflight issues without blocking save and run', async () => {
   const source = await readFile(sourcePath, 'utf8')
   const handler = source.match(/const handleRun = useCallback\(\(\) => \{([\s\S]*?)\n  \}, \[workflow, nodes, edges, saveAndClaim, allExtensions, isRunning, runWorkflow, cancel\]\)/)?.[1]

@@ -252,6 +252,7 @@ export function createElectronApi(
       listDownloaded: () => ipcRenderer.invoke('model:listDownloaded'),
       isDownloaded:   (modelId: string) => ipcRenderer.invoke('model:isDownloaded', modelId),
       hasLocalData:    (modelId: string) => ipcRenderer.invoke('model:hasLocalData', modelId),
+      downloadSources: (modelId: string) => ipcRenderer.invoke('model:downloadSources', { modelId }),
       sharedGroups:    (extensionId: string) => ipcRenderer.invoke('model:sharedGroups', extensionId),
       download:       (modelId: string, variantId?: string) => (variantId === undefined
         ? ipcRenderer.invoke('model:download', modelId)

@@ -10,7 +10,7 @@ import { resolveDataSource } from './nodeBehaviors.ts'
 type ArtifactType = string
 
 type ProcessRulePhase = 'connect' | 'run'
-type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target' | 'min-items' | 'max-items'
+type ProcessRuleCode = 'type-mismatch' | 'duplicate-port' | 'missing-required-port' | 'inputless-target' | 'min-items' | 'max-items' | 'unsupported-video-process'
 
 export type ProcessConnectionRuleIssue = {
   phase: ProcessRulePhase
@@ -58,6 +58,7 @@ function resolveNodeOutputType(
   if (node.type === 'videoNode') return 'video'
   if (node.type === 'textNode') return 'text'
   if (node.type === 'sceneNode') return 'scene'
+  if (node.type === 'captureNode') return 'capture'
   if (node.type === 'forEachNode') return String(node.data.params?.mode ?? 'image')
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
 
@@ -102,6 +103,13 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
     }
   }
 
+  if (issue.code === 'unsupported-video-process') {
+    return {
+      ...issue,
+      message: 'Process extensions do not support video inputs or outputs.',
+    }
+  }
+
   if (issue.code === 'missing-required-port') {
     return {
       ...issue,
@@ -132,6 +140,7 @@ function createIssue(issue: Omit<ProcessConnectionRuleIssue, 'message'>): Proces
 }
 
 export function validateProcessConnection({ connection, nodes, edges, allExtensions }: ConnectionValidationContext): ProcessConnectionRuleIssue | null {
+  // Ordinary graph connections remain permissive; Run reports concrete port issues.
   void connection
   void nodes
   void edges

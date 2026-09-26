@@ -2,14 +2,21 @@ import { isAbsolute, relative, resolve as resolvePath } from 'node:path'
 
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/
 const OWNERSHIP_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x1f || code === 0x7f) return true
+  }
+  return false
+}
 
 function assertSafeSingleSegment(value: unknown, label: string, pattern: RegExp): string {
   if (typeof value !== 'string') {
     throw new Error(`${label} must be a string`)
   }
 
-  if (CONTROL_CHARACTER_PATTERN.test(value)) {
+  if (hasControlCharacter(value)) {
     throw new Error(`${label} must not contain control characters`)
   }
 

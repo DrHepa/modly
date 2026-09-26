@@ -182,7 +182,7 @@ export function validateModelNodeIds(nodes: Array<{ id?: unknown }>): void {
       throw new Error('model node id "_shared" is reserved')
     }
     const id = safeModelSourceId(node?.id, 'model node id')
-    const alias = id.toLowerCase()
+    const alias = id.normalize('NFC').toLowerCase()
     if (seen.has(alias)) throw new Error(`model node id "${id}" is not portable-unique`)
     seen.add(alias)
   }
@@ -351,16 +351,21 @@ export function normalizeWeightVariants(
   return { param, default: defaultId as string, options }
 }
 
-function pathHasSymlink(root: string, candidate: string): boolean {
+function pathHasSymlink(root: string, candidate: string, allowConfiguredRootSymlink = false): boolean {
   const rootPath = resolve(root)
   const rel = relative(rootPath, resolve(candidate))
   if (rel === '..' || rel.startsWith('../') || rel.startsWith('..\\') || isAbsolute(rel)) return true
   let current = rootPath
   try {
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) return true
+    try { if (!allowConfiguredRootSymlink && lstatSync(current).isSymbolicLink()) return true }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true }
     for (const part of rel.split(/[/\\]/).filter(Boolean)) {
       current = resolve(current, part)
-      if (existsSync(current) && lstatSync(current).isSymbolicLink()) return true
+      try {
+        if (lstatSync(current).isSymbolicLink()) return true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true
+      }
     }
   } catch {
     return true
@@ -378,7 +383,7 @@ export function resolveModelRoot(modelsDir: string, modelId: string): string {
   const root = resolve(modelsDir)
   const extensionRoot = resolveExtensionModelRoot(modelsDir, extensionId)
   const modelRoot = resolve(extensionRoot, nodeId)
-  if (pathHasSymlink(root, modelRoot)) throw new Error('Model path resolves through a symlink')
+  if (pathHasSymlink(root, modelRoot, true)) throw new Error('Model path resolves through a symlink')
   return modelRoot
 }
 
@@ -386,7 +391,7 @@ export function resolveExtensionModelRoot(modelsDir: string, extensionId: string
   const safeExtensionId = safeModelSourceId(extensionId, 'extension id')
   const root = resolve(modelsDir)
   const extensionRoot = resolve(root, safeExtensionId)
-  if (pathHasSymlink(root, extensionRoot)) throw new Error('Extension model path resolves through a symlink')
+  if (pathHasSymlink(root, extensionRoot, true)) throw new Error('Extension model path resolves through a symlink')
   return extensionRoot
 }
 
@@ -399,7 +404,7 @@ export function resolveWeightGroupRoot(modelsDir: string, extensionId: string, g
   const root = resolve(modelsDir)
   const extensionRoot = resolveExtensionModelRoot(modelsDir, safeExtensionId)
   const groupRoot = resolve(extensionRoot, '_shared', safeGroupId)
-  if (pathHasSymlink(root, groupRoot)) throw new Error('Weight group path resolves through a symlink')
+  if (pathHasSymlink(root, groupRoot, true)) throw new Error('Weight group path resolves through a symlink')
   return groupRoot
 }
 
@@ -464,6 +469,51 @@ export function areWeightGroupSourcesDownloaded(
     )
   } catch {
     return false
+  }
+}
+
+export function validateModelSourceFilePlan(
+  sources: ModelSource[],
+  filesBySource: Record<string, string[]>,
+): void {
+  const aliases = new Map<string, { sourceId: string; target: string }>()
+  for (const source of sources) {
+    const sourceAliases = new Map<string, string>()
+    const sourceFiles = new Set<string>()
+    for (const filename of filesBySource[source.id] ?? []) {
+      const safeFilename = safeModelRelativePath(filename, `model source "${source.id}" file`)
+      const sourceAlias = safeFilename.normalize('NFC').toLowerCase()
+      const previousFilename = sourceAliases.get(sourceAlias)
+      if (previousFilename) {
+        throw new Error(`Model source "${source.id}" has portable filename collision: ${previousFilename} and ${safeFilename}`)
+      }
+      sourceAliases.set(sourceAlias, safeFilename)
+      sourceFiles.add(safeFilename)
+    }
+
+    const missingChecks = source.checks.filter((check) => !sourceFiles.has(check))
+    if (missingChecks.length > 0) {
+      throw new Error(`Model source "${source.id}" checks files excluded from its download plan: ${missingChecks.join(', ')}`)
+    }
+
+    for (const safeFilename of sourceFiles) {
+      const target = source.destination === '.' ? safeFilename : `${source.destination}/${safeFilename}`
+      for (const value of [target, `${target}.part`]) {
+        const alias = value.normalize('NFC').toLowerCase()
+        const valueParts = alias.split('/')
+        for (const previous of aliases.values()) {
+          const previousParts = previous.target.normalize('NFC').toLowerCase().split('/')
+          const isAncestor = (ancestor: string[], descendant: string[]) => (
+            ancestor.length <= descendant.length
+            && ancestor.every((part, index) => part === descendant[index])
+          )
+          if (isAncestor(previousParts, valueParts) || isAncestor(valueParts, previousParts)) {
+            throw new Error(`Model sources "${previous.sourceId}" and "${source.id}" have portable target collision: ${previous.target} and ${value}`)
+          }
+        }
+        aliases.set(alias, { sourceId: source.id, target: value })
+      }
+    }
   }
 }
 

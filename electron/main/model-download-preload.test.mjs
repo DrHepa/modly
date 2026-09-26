@@ -84,3 +84,82 @@ test('owner progress preserves capability, variant and cancellation metadata thr
     ['model:download', 'bundle/a', 'Q4'], ['model:pauseDownload', 'bundle/a'], ['model:cancelDownload', 'bundle/a'],
   ])
 })
+
+test('renderer exposes legacy, structured, and multi-source model download actions', async () => {
+  const { createElectronApi } = loadModule()
+  const calls = []
+  const ipcRenderer = {
+    invoke: async (...args) => { calls.push(args); return { success: true } },
+    send: () => {},
+    on: () => {},
+    removeAllListeners: () => {},
+  }
+  const api = createElectronApi(ipcRenderer, { setZoomFactor: () => {} }, { getPathForFile: () => '' })
+
+  await api.model.isDownloaded('pixal3d/generate')
+  await api.model.hasLocalData('pixal3d/generate')
+  await api.model.download('pixal3d/generate')
+  await api.model.downloadAssets('pixal3d/generate')
+  await api.model.downloadSources('pixal3d/generate')
+  await api.model.downloadHttpsAssets('pixal3d/generate')
+  await api.model.pauseDownload('pixal3d/generate')
+  await api.model.cancelDownload('pixal3d/generate')
+
+  assert.deepEqual(calls, [
+    ['model:isDownloaded', 'pixal3d/generate'],
+    ['model:hasLocalData', 'pixal3d/generate'],
+    ['model:download', 'pixal3d/generate'],
+    ['model:downloadAssets', { modelId: 'pixal3d/generate' }],
+    ['model:downloadSources', { modelId: 'pixal3d/generate' }],
+    ['model:downloadHttpsAssets', { modelId: 'pixal3d/generate' }],
+    ['model:pauseDownload', 'pixal3d/generate'],
+    ['model:cancelDownload', 'pixal3d/generate'],
+  ])
+})
+
+
+test('the CURRENT canonical preload identifier forms the manifest-owned main-process payload', async () => {
+  const contractFile = join(mkdtempSync(join(tmpdir(), 'modly-download-contract-')), 'contract.cjs')
+  const built = buildSync({
+    entryPoints: [resolve('electron/main/model-download-ipc-contract.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    write: false,
+  })
+  writeFileSync(contractFile, built.outputFiles[0].text, 'utf8')
+  const require = createRequire(import.meta.url)
+  const { parseLegacyModelDownloadPayload } = require(contractFile)
+  const calls = []
+  const api = loadModule().createElectronApi(
+    { invoke: async (...args) => { calls.push(args); return { success: true } }, send: () => {}, on: () => {}, removeAllListeners: () => {} },
+    { setZoomFactor: () => {} }, { getPathForFile: () => '' },
+  )
+  await api.model.download('pixal3d/generate')
+  assert.deepEqual(parseLegacyModelDownloadPayload({ modelId: calls[0][1] }), {
+    modelId: 'pixal3d/generate', skipPrefixes: undefined, includePrefixes: undefined,
+  })
+})
+
+
+test('multi-source cancellation preserves completed files by removing only partial artifacts', () => {
+  const main = readFileSync(resolve('electron/main/ipc-handlers.ts'), 'utf8')
+  const page = readFileSync(resolve('src/areas/models/ModelsPage.tsx'), 'utf8')
+  const shared = readFileSync(resolve('src/areas/models/components/extensionShared.tsx'), 'utf8')
+
+  assert.match(main, /model:cancelDownload[\s\S]*active\.done[\s\S]*removePartialDownloadArtifacts/)
+  assert.doesNotMatch(main, /model:cancelDownload[\s\S]*rmAsync\(modelDir[\s\S]*model:export/)
+  assert.match(main, /plan\.sharedGroups[\s\S]*downloadModelSourcesFromHF\(modelId,\s*target\.targetId[\s\S]*model:downloadSources/)
+  assert.match(main, /downloadModelFromHF\([\s\S]*plan\.repoId[\s\S]*step\.skipPrefixes,\s*step\.includePrefixes[\s\S]*model:download'/)
+  assert.match(main, /parseLegacyModelDownloadPayloadContract[\s\S]*modelId[\s\S]*resolveModelPlan/)
+  assert.match(page, /nodeHasManagedWeights\(node\)[\s\S]*modelApi\.download\(fullId, variantId\)/)
+  assert.match(shared, /nodeHasManagedWeights[\s\S]*node\.hasModelSources/)
+})
+
+
+test('extension uninstall deletes owned models before removing the extension directory', () => {
+  const main = readFileSync(resolve('electron/main/ipc-handlers.ts'), 'utf8')
+  const uninstallBlock = main.match(/ipcMain\.handle\('extensions:uninstall'[\s\S]*?ipcMain\.handle\('extensions:repair'/)?.[0] ?? ''
+
+  assert.match(uninstallBlock, /weightOperations\.remove[\s\S]*unloadExtensionForRemoval[\s\S]*rmWithRetry\(extensionRoot[\s\S]*removeExtensionWithBackups/)
+})

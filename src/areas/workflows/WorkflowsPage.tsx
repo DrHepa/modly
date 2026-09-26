@@ -524,7 +524,6 @@ function NodePalette({
     }
 
     return { groups, totalItems: flatIdx }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- isExpanded only reads `collapsed`, already a dep
   }, [q, allExtensions, nonBuiltinMap, collapsed])
 
   useEffect(() => { setActiveIndex(0) }, [query])
@@ -888,7 +887,6 @@ function WorkflowCanvasInner({
     histIdxRef.current = 0
     setHistIdx(0)
     skipPushRef.current = true
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-sync only when the workflow switches; adding nodes/edges would reset the editor on every change
   }, [workflow.id])
 
   useEffect(() => {
@@ -1547,6 +1545,7 @@ const MINI_NODE_TINTS: Record<string, { fill: string; stroke: string }> = {
   textNode:      { fill: 'rgba(52,211,153,0.22)',  stroke: '#34d399' },
   meshNode:      { fill: 'rgba(52,211,153,0.22)',  stroke: '#34d399' },
   sceneNode:     { fill: 'rgba(244,114,182,0.22)', stroke: '#f472b6' },
+  captureNode:   { fill: 'rgba(34,211,238,0.22)',  stroke: '#22d3ee' },
   extensionNode: { fill: 'rgba(167,139,250,0.24)', stroke: '#a78bfa' },
   outputNode:    { fill: 'rgba(56,189,248,0.22)',  stroke: '#38bdf8' },
   previewNode:   { fill: 'rgba(56,189,248,0.22)',  stroke: '#38bdf8' },
@@ -1747,7 +1746,6 @@ export default function WorkflowsPage(): JSX.Element {
     [modelExtensions, processExtensions],
   )
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
   useEffect(() => { load(); loadExtensions() }, [])
 
   // Auto-select the first open tab when none is active or the active id is gone
@@ -1756,7 +1754,6 @@ export default function WorkflowsPage(): JSX.Element {
     if (openIds.length === 0) return
     if (activeId && openIds.includes(activeId) && workflows.find((w) => w.id === activeId)) return
     setActive(openIds[0])
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- setActive is a stable store setter
   }, [workflows, loading, activeId, openIds])
 
   const openWorkflows  = useMemo(() => resolveOpenWorkflows(workflows, openIds), [workflows, openIds])

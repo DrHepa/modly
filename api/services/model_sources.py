@@ -40,6 +40,18 @@ def safe_source_id(value: Any, field: str = "model source id") -> str:
     return _portable_segment(value, field)
 
 
+def safe_owner_model_id(value: Any, field: str = "weight_owner_id") -> str:
+    """Validate a canonical model owner before path construction.
+
+    Legacy manifests may supply the owner node without its extension prefix;
+    callers normalize that form before invoking this helper.
+    """
+    if not isinstance(value, str) or value.count("/") != 1:
+        raise ValueError(f"{field} must identify one extension owner")
+    extension_id, owner_id = value.split("/")
+    return f"{safe_source_id(extension_id, f'{field} extension')}/{safe_source_id(owner_id, f'{field} owner')}"
+
+
 def safe_relative_path(value: Any, field: str, *, allow_dot: bool = False) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{field} must be a non-empty relative path")
@@ -168,7 +180,7 @@ def validate_model_node_ids(nodes: list[dict[str, Any]]) -> None:
         if isinstance(node.get("id"), str) and node["id"].casefold() == "_shared":
             raise ValueError('model node id "_shared" is reserved')
         node_id = safe_source_id(node.get("id"), "model node id")
-        alias = node_id.casefold()
+        alias = unicodedata.normalize("NFC", node_id).casefold()
         if alias in seen:
             raise ValueError(f'model node id "{node_id}" is not portable-unique')
         seen.add(alias)
@@ -242,7 +254,7 @@ def normalize_weight_group_references(
     return refs
 
 
-def _path_has_symlink(root: Path, candidate: Path) -> bool:
+def _path_has_symlink(root: Path, candidate: Path, *, allow_configured_root_symlink: bool = False) -> bool:
     root = root.absolute()
     candidate = candidate.absolute()
     try:
@@ -250,13 +262,22 @@ def _path_has_symlink(root: Path, candidate: Path) -> bool:
     except ValueError:
         return True
     current = root
-    if current.exists() and current.is_symlink():
+    if not allow_configured_root_symlink and current.is_symlink():
         return True
     for part in relative.parts:
         current /= part
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             return True
     return False
+
+
+def _reject_existing_non_directories(path: Path) -> None:
+    """Reject file path components before download code creates descendants."""
+    current = path.anchor and Path(path.anchor) or Path()
+    for part in path.parts[1:] if path.anchor else path.parts:
+        current /= part
+        if current.exists() and not current.is_dir():
+            raise ValueError(f"Model path component is not a directory: {current}")
 
 
 def resolve_model_root(models_dir: Path, model_id: str) -> Path:
@@ -271,12 +292,13 @@ def resolve_model_root(models_dir: Path, model_id: str) -> Path:
     node_id = safe_source_id(parts[1], "model node id")
     root = models_dir.absolute()
     candidate = root / extension_id / node_id
-    if _path_has_symlink(root, candidate):
+    if _path_has_symlink(root, candidate, allow_configured_root_symlink=True):
         raise ValueError("Model path resolves through a symlink")
     try:
         candidate.resolve().relative_to(root.resolve())
     except ValueError as exc:
         raise ValueError("Model path escapes the models directory") from exc
+    _reject_existing_non_directories(candidate)
     return candidate
 
 
@@ -287,12 +309,13 @@ def resolve_weight_group_root(models_dir: Path, extension_id: str, group_id: str
     safe_group_id = safe_source_id(group_id, "weight group id")
     root = models_dir.absolute()
     candidate = root / safe_extension_id / "_shared" / safe_group_id
-    if _path_has_symlink(root, candidate):
+    if _path_has_symlink(root, candidate, allow_configured_root_symlink=True):
         raise ValueError("Weight group path resolves through a symlink")
     try:
         candidate.resolve().relative_to(root.resolve())
     except ValueError as exc:
         raise ValueError("Weight group path escapes the models directory") from exc
+    _reject_existing_non_directories(candidate)
     return candidate
 
 
@@ -327,14 +350,20 @@ def resolve_source_destination_at_root(model_root: Path, destination: str) -> Pa
     )
     if _path_has_symlink(model_root, candidate):
         raise ValueError("Source destination resolves through a symlink")
+    _reject_existing_non_directories(candidate)
     return candidate
 
 
 def resolve_download_path(destination: Path, filename: str) -> Path:
+    if destination.is_symlink():
+        raise ValueError("Download destination resolves through a symlink")
     safe_filename = safe_relative_path(filename, "Hugging Face repository file")
     candidate = destination.joinpath(*safe_filename.split("/"))
-    if _path_has_symlink(destination, candidate):
-        raise ValueError("Download target resolves through a symlink")
+    temporary = candidate.with_suffix(candidate.suffix + ".part")
+    for path in (candidate, temporary):
+        if _path_has_symlink(destination, path):
+            raise ValueError("Download target resolves through a symlink")
+        _reject_existing_non_directories(path.parent)
     return candidate
 
 
@@ -393,10 +422,18 @@ def validate_source_file_plan(
     for source in sources:
         source_id = source["id"]
         destination = source["destination"]
-        source_files = {
-            safe_relative_path(filename, f'model source "{source_id}" file')
-            for filename in files_by_source[source_id]
-        }
+        source_files: set[str] = set()
+        source_aliases: dict[str, str] = {}
+        for filename in files_by_source[source_id]:
+            safe_filename = safe_relative_path(filename, f'model source "{source_id}" file')
+            source_alias = unicodedata.normalize("NFC", safe_filename).casefold()
+            if source_alias in source_aliases:
+                raise ValueError(
+                    f'Model source "{source_id}" has portable filename collision: '
+                    f'{source_aliases[source_alias]} and {safe_filename}'
+                )
+            source_aliases[source_alias] = safe_filename
+            source_files.add(safe_filename)
         missing_checks = [check for check in source["checks"] if check not in source_files]
         if missing_checks:
             raise ValueError(
@@ -408,8 +445,6 @@ def validate_source_file_plan(
             for value in (target, f"{target}.part"):
                 alias = unicodedata.normalize("NFC", value).casefold()
                 for previous_alias, (previous_source, previous_target) in aliases.items():
-                    if previous_source == source_id:
-                        continue
                     if (
                         alias == previous_alias
                         or alias.startswith(f"{previous_alias}/")

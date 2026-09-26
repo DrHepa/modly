@@ -868,7 +868,7 @@ export function buildExtensionPythonSandboxLaunch(input: {
     if (!isAbsolute(path)) throw new AgentProcessPythonRuntimeError('runtime_unavailable', 'Python sandbox system path is invalid')
     args.push('--ro-bind', path, path)
   }
-  args.push('--ro-bind-fd', String(input.entryFd), '/app/process.pyz')
+  args.push('--ro-bind-fd', String(input.entryFd), '/app/processor.py')
   input.resourceFds.forEach((fd, index) => args.push('--ro-bind-fd', String(fd), `/resources/${index}`))
   input.inputFds.forEach((fd, index) => args.push('--ro-bind-fd', String(fd), `/input/${index}`))
   if (input.modelAccessDirectoryFd !== undefined) {
@@ -889,7 +889,7 @@ export function buildExtensionPythonSandboxLaunch(input: {
     '--setenv', 'PYTHONNOUSERSITE', '1',
     '--setenv', 'PYTHONDONTWRITEBYTECODE', '1',
     '--setenv', 'VIRTUAL_ENV', '/runtime',
-    '--', `/runtime/${interpreter}`, '/app/process.pyz',
+    '--', `/runtime/${interpreter}`, '-I', '-B', '/app/processor.py',
   )
   return { command: `/proc/self/fd/${input.bwrapFd}`, args, env: { ...FIXED_HOST_ENV }, cwd: '/', shell: false }
 }

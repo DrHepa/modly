@@ -116,7 +116,7 @@ test('scene PROCESS ports are supported while MODEL remains single-input', () =>
     { id: 'duplicate', input: 'scene', inputs: ['scene', 'scene'], output: 'mesh' },
     { id: 'hidden', input: 'image', inputs: ['scene'], output: 'mesh' },
   ]) {
-    assert.throws(() => mod.validateInstallManifest({ id: 'bad', generator_class: 'Generator', nodes: [node] }, modelFiles, 'repository'), /scene.*single|single.*scene/i)
+    assert.throws(() => mod.validateInstallManifest({ id: 'bad', generator_class: 'Generator', nodes: [{ ...node, agent: {} }] }, modelFiles, 'repository'), /scene.*single|single.*scene/i)
   }
   for (const node of [
     { id: 'input', input: 'scene', output: 'mesh' },
@@ -507,4 +507,31 @@ test('validateInstallManifest validates weight variants and keeps them off proce
     id: 'proc', type: 'process', entry: 'processor.js',
     nodes: [{ id: 'run', hf_repo: 'org/model', weight_variants: weightVariants }],
   }, files, 'repository'), /weight_variants is supported only for model nodes/)
+})
+
+test('validateInstallManifest allows scalar private Agent model video input and output only', () => {
+  const mod = loadModule()
+  const modelFiles = { hasEntryFile: () => false, hasGeneratorFile: () => true }
+  const processFiles = { hasEntryFile: () => true, hasGeneratorFile: () => false }
+  assert.doesNotThrow(() => mod.validateInstallManifest({
+    id: 'video-model', generator_class: 'Generator',
+    nodes: [{ id: 'generate', input: 'video', output: 'mesh' }],
+  }, modelFiles, 'repository'))
+  assert.doesNotThrow(() => mod.validateInstallManifest({
+    id: 'image-to-video-model', generator_class: 'Generator',
+    nodes: [{ id: 'image-to-video', input: 'image', output: 'video' }],
+  }, modelFiles, 'repository'))
+  for (const node of [
+    { id: 'array', input: 'video', inputs: ['video'], output: 'mesh' },
+    { id: 'mixed', input: 'video', inputs: ['video', 'text'], output: 'mesh' },
+    { id: 'object-array', input: 'video', inputs: [{ name: 'clip', type: 'video', required: true }], output: 'mesh' },
+  ]) {
+    assert.throws(() => mod.validateInstallManifest({ id: 'bad', generator_class: 'Generator', nodes: [{ ...node, agent: {} }] }, modelFiles, 'repository'), /video/i)
+  }
+  assert.throws(() => mod.validateInstallManifest({
+    id: 'process', type: 'process', entry: 'processor.js', nodes: [{ agent: {}, id: 'run', input: 'video', output: 'mesh' }],
+  }, processFiles, 'repository'), /video/i)
+  assert.throws(() => mod.validateInstallManifest({
+    id: 'process-output', type: 'process', entry: 'processor.js', nodes: [{ agent: {}, id: 'run', input: 'image', output: 'video' }],
+  }, processFiles, 'repository'), /video/i)
 })

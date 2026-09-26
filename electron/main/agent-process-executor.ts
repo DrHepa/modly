@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { constants, type BigIntStats } from 'node:fs'
 import {
-  access,
   chmod,
   lstat,
   mkdtemp,
@@ -515,7 +514,6 @@ async function revalidateInputs(inputs: readonly OpenInput[]): Promise<void> {
 async function resolveLaunch(
   target: GovernedAgentProcessTarget,
   entryFdPath: string,
-  options: AgentProcessExecutorOptions,
 ): Promise<{ command: string, args: string[], extraEnv: Record<string, string> }> {
   const entry = normalizeAgentProcessRelativePath(target.entry, 'Agent process entry')
   if (/\.(?:js|mjs)$/i.test(entry)) {
@@ -523,24 +521,6 @@ async function resolveLaunch(
       command: process.execPath,
       args: ['--input-type=module', '--eval', ESM_FD_LAUNCHER, '--', entryFdPath],
       extraEnv: { ELECTRON_RUN_AS_NODE: '1' },
-    }
-  }
-  if (/\.pyz$/i.test(entry)) {
-    if (target.capability.execution?.kind === 'process' && target.capability.execution.runtime) {
-      // A declared extension venv must never fall back to Modly's host Python.
-      // The sandboxed snapshot launch path is a separate, mandatory readiness boundary.
-      throw new AgentProcessExecutorError('runtime_unavailable')
-    }
-    const configured = await options.resolvePythonExecutable?.(target.extensionDir)
-    if (!configured || !isAbsolute(configured)) throw new AgentProcessExecutorError('runtime_unavailable')
-    try {
-      const executable = await realpath(configured)
-      const info = await stat(executable)
-      if (!info.isFile()) throw new Error('not a file')
-      await access(executable, constants.X_OK)
-      return { command: executable, args: [entryFdPath], extraEnv: { PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' } }
-    } catch (error) {
-      throw new AgentProcessExecutorError('runtime_unavailable', error)
     }
   }
   throw new AgentProcessExecutorError('runtime_unavailable')
@@ -553,7 +533,7 @@ async function preparePythonSandbox(
   options: AgentProcessExecutorOptions,
 ): Promise<PreparedPythonSandbox | undefined> {
   if (!execution.runtime) return undefined
-  if (!/\.pyz$/i.test(target.entry) || !options.getRuntimeSnapshotRoot || !options.pythonSandboxReadiness) {
+  if (target.entry !== 'processor.py' || !options.getRuntimeSnapshotRoot || !options.pythonSandboxReadiness) {
     throw new AgentProcessExecutorError('runtime_unavailable')
   }
   let ready = false
@@ -1081,7 +1061,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
         await revalidateOpenAgentProcessRuntime(runtime)
         await revalidatePythonSandbox(target, pythonSandbox, options)
       } else {
-        await resolveLaunch(target, '/proc/self/fd/3', options)
+        await resolveLaunch(target, '/proc/self/fd/3')
       }
     } finally {
       await Promise.all(runtime.map(({ handle }) => handle.close().catch(() => undefined)))
@@ -1210,7 +1190,7 @@ export function createAgentProcessExecutor(options: AgentProcessExecutorOptions)
         }
       } else {
         launch = {
-          ...await resolveLaunch(target, `/proc/self/fd/${entryFd}`, options),
+          ...await resolveLaunch(target, `/proc/self/fd/${entryFd}`),
           inheritedFds: [bundles[0].handle.fd, ...resources.map((file) => file.handle.fd), ...inputs.map((input) => input.handle.fd)],
         }
       }

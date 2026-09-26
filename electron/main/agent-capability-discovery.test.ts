@@ -64,7 +64,7 @@ test('manifest Agent process declarations are strict opt-in and legacy processes
   const withModelAccess = declaration({
     process: {
       ...declaration().process,
-      runtimeFiles: ['processor.pyz'],
+      runtimeFiles: ['processor.py'],
       runtime: { kind: 'extension-python-venv-v1', interpreter: 'bin/python' },
       modelAccess: {
         schema: 'modly.agent-model-access.v1',
@@ -73,7 +73,7 @@ test('manifest Agent process declarations are strict opt-in and legacy processes
     },
   })
   assert.deepEqual(
-    parseExtensionManifest({ ...processManifest(withModelAccess), entry: 'processor.pyz' }, 'fallback', new Set()).nodes[0].agent,
+    parseExtensionManifest({ ...processManifest(withModelAccess), entry: 'processor.py' }, 'fallback', new Set()).nodes[0].agent,
     withModelAccess,
   )
 
@@ -245,7 +245,7 @@ test('PROCESS Agent discovery preserves governed CAD artifact ports and derives 
     const rawManifest = JSON.parse(await readFile(join(extensionDir, 'manifest.json'), 'utf8'))
     assert.throws(
       () => parseExtensionManifest(rawManifest, 'cad-chain', new Set()),
-      /must be one of: image, text, mesh, scene, audio, video, none/i,
+      /must be one of: image, text, mesh, scene, capture, audio, video, none/i,
     )
     const parsed = parseExtensionManifest(rawManifest, 'cad-chain', new Set(), false, {
       governedAgentKinds: true,
@@ -364,7 +364,7 @@ test('Agent inventory denies duplicate capability IDs across roots and duplicate
   try {
     const ordinary = await listVisibleExtensions({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
     assert.equal(ordinary.filter((extension) => extension.id === 'cad-tools').length, 2)
-    assert.equal(ordinary.find((extension) => extension.id === 'duplicate-nodes')?.nodes.length, 2)
+    assert.deepEqual(ordinary.find((extension) => extension.id === 'duplicate-nodes')?.nodes, [])
 
     const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
     assert.deepEqual(inventory.capabilities, [])

@@ -42,7 +42,34 @@ class DownloadCancelled(Exception):
     pass
 
 
+def _is_retryable_download_error(error: Exception) -> bool:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is None and isinstance(error, HTTPError):
+        status = error.code
+    if isinstance(status, int):
+        return status in {408, 425, 429} or status >= 500
+    return True
+
+
 _download_controls: dict[str, dict[str, threading.Event]] = {}
+
+
+def _source_plan_error_response(message: str) -> StreamingResponse:
+    async def stream():
+        yield f'data: {json.dumps({"error": {"code": "source_plan_invalid", "stage": "validate", "message": message, "retryable": False}})}\n\n'
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+def _source_plan_validation_detail(message: str) -> dict:
+    return {
+        "code": "source_plan_invalid",
+        "stage": "validate",
+        "message": message,
+        "retryable": False,
+    }
 
 
 def _download_control(model_id: str) -> dict[str, threading.Event]:
@@ -56,6 +83,19 @@ def _download_control(model_id: str) -> dict[str, threading.Event]:
 
 def _new_download_control(model_id: str) -> dict[str, threading.Event]:
     """Create a fresh control for a new download session."""
+    existing = _download_controls.get(model_id)
+    if existing is not None:
+        if existing["pause"].is_set() or existing["cancel"].is_set():
+            return existing
+        raise HTTPException(
+            409,
+            {
+                "code": "download_in_progress",
+                "stage": "request",
+                "message": f"Download already active for owner {model_id}",
+                "retryable": False,
+            },
+        )
     control: dict[str, threading.Event] = {"pause": threading.Event(), "cancel": threading.Event()}
     _download_controls[model_id] = control
     return control
@@ -66,6 +106,18 @@ def _check_download_control(control: dict[str, threading.Event]) -> None:
         raise DownloadCancelled()
     if control["pause"].is_set():
         raise DownloadPaused()
+
+
+def _target_owner_mismatch_detail(plan_kind: str, target_owner_id: str, owner_model_id: str) -> dict:
+    return {
+        "code": "target_owner_mismatch",
+        "stage": "request",
+        "message": (
+            f"Target owner {target_owner_id} does not match the registered "
+            f"{plan_kind} plan owner {owner_model_id}"
+        ),
+        "retryable": False,
+    }
 
 
 @router.get("/status")
@@ -96,6 +148,18 @@ def _is_safe_canonical_model_id(model_id: str) -> bool:
     parts = model_id.split("/")
     return len(parts) == 2 and all(
         _SAFE_MODEL_SEGMENT_RE.fullmatch(part) for part in parts
+    )
+
+
+def _is_safe_weight_target_id(target_id: str) -> bool:
+    if _is_safe_canonical_model_id(target_id):
+        return True
+    parts = target_id.split("/") if isinstance(target_id, str) else []
+    return (
+        len(parts) == 3
+        and parts[1] == "_shared"
+        and _SAFE_MODEL_SEGMENT_RE.fullmatch(parts[0]) is not None
+        and _SAFE_MODEL_SEGMENT_RE.fullmatch(parts[2]) is not None
     )
 
 
@@ -181,6 +245,7 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
 @router.get("/hf-download-assets")
 async def hf_download_assets(
     model_id: str,
+    target_owner_id: Optional[str] = None,
     authorization: Optional[str] = Header(default=None),
 ):
     """Stream a manifest-owned, pinned and allowlisted asset plan via SSE."""
@@ -198,7 +263,7 @@ async def hf_download_assets(
     except KeyError as error:
         raise HTTPException(404, f"Unknown model ID: {model_id}") from error
     except HfDownloadManifestError as error:
-        raise HTTPException(422, str(error)) from error
+        raise HTTPException(422, _source_plan_validation_detail(str(error))) from error
 
     token = (
         _bearer_token(authorization)
@@ -207,15 +272,45 @@ async def hf_download_assets(
         or None
     )
 
+    owner_model_id = str(owner_dir.relative_to(registry_module.MODELS_DIR)).replace(os.sep, "/")
+    if target_owner_id is not None:
+        if not _is_safe_canonical_model_id(target_owner_id):
+            raise HTTPException(400, f"Invalid target owner ID: {target_owner_id}")
+        if target_owner_id != owner_model_id:
+            raise HTTPException(
+                400,
+                _target_owner_mismatch_detail("hf_downloads", target_owner_id, owner_model_id),
+            )
+    control = _new_download_control(owner_model_id)
+
     async def stream():
-        async for event in stream_hf_asset_downloads(owner_dir, plan, token=token):
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            async for event in stream_hf_asset_downloads(
+                owner_dir,
+                plan,
+                token=token,
+                check_download_control=lambda: _check_download_control(control),
+                control_exceptions=(DownloadPaused, DownloadCancelled),
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except DownloadPaused:
+            yield f"data: {json.dumps({'paused': True, 'status': 'paused'})}\n\n"
+        except DownloadCancelled:
+            for part in owner_dir.rglob("*.part"):
+                part.unlink(missing_ok=True)
+            yield f"data: {json.dumps({'cancelled': True, 'status': 'cancelled'})}\n\n"
+        finally:
+            if _download_controls.get(owner_model_id) is control:
+                _download_controls.pop(owner_model_id, None)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @router.get("/https-download-assets")
-async def https_download_assets(model_id: str):
+async def https_download_assets(
+    model_id: str,
+    target_owner_id: Optional[str] = None,
+):
     """Stream a model node's exact manifest-owned HTTPS asset plan via SSE."""
     if not _is_safe_canonical_model_id(model_id):
         raise HTTPException(400, f"Invalid model ID: {model_id}")
@@ -240,15 +335,38 @@ async def https_download_assets(model_id: str):
         HttpsDownloadManifestError,
         HfDownloadManifestError,
     ) as error:
-        raise HTTPException(422, str(error)) from error
+        raise HTTPException(422, _source_plan_validation_detail(str(error))) from error
+
+    owner_model_id = str(owner_dir.relative_to(registry_module.MODELS_DIR)).replace(os.sep, "/")
+    if target_owner_id is not None:
+        if not _is_safe_canonical_model_id(target_owner_id):
+            raise HTTPException(400, f"Invalid target owner ID: {target_owner_id}")
+        if target_owner_id != owner_model_id:
+            raise HTTPException(
+                400,
+                _target_owner_mismatch_detail("https_downloads", target_owner_id, owner_model_id),
+            )
+    control = _new_download_control(owner_model_id)
 
     async def stream():
-        async for event in stream_https_asset_downloads(
-            owner_dir,
-            model_id,
-            plan,
-        ):
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            async for event in stream_https_asset_downloads(
+                owner_dir,
+                model_id,
+                plan,
+                check_download_control=lambda: _check_download_control(control),
+                control_exceptions=(DownloadPaused, DownloadCancelled),
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except DownloadPaused:
+            yield f"data: {json.dumps({'paused': True, 'status': 'paused'})}\n\n"
+        except DownloadCancelled:
+            for part in owner_dir.rglob("*.part"):
+                part.unlink(missing_ok=True)
+            yield f"data: {json.dumps({'cancelled': True, 'status': 'cancelled'})}\n\n"
+        finally:
+            if _download_controls.get(owner_model_id) is control:
+                _download_controls.pop(owner_model_id, None)
 
     return StreamingResponse(
         stream(),
@@ -257,23 +375,64 @@ async def https_download_assets(model_id: str):
 
 
 @router.post("/hf-download-sources")
-async def hf_download_sources(request: FastAPIRequest, model_id: str):
-    """Download sources into one validated node or extension-shared target."""
+async def hf_download_sources(
+    request: FastAPIRequest,
+    model_id: str,
+    target_owner_id: Optional[str] = None,
+):
+    """Download all Hugging Face sources declared for one model node."""
     try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise ValueError("Request body must be an object")
-        raw_sources = body.get("sources")
-        if raw_sources is None:
-            raise ValueError("sources are required")
-        sources = normalize_model_sources({"model_sources": raw_sources})
-        model_root = resolve_weight_storage_root(registry_module.MODELS_DIR, model_id)
-        destinations = {
-            source["id"]: resolve_source_destination_at_root(
-                model_root, source["destination"]
-            )
-            for source in sources
-        }
+        if not _is_safe_weight_target_id(model_id):
+            raise ValueError(f"Invalid model ID: {model_id}")
+        body = await request.body()
+        payload = json.loads(body) if body.strip() else {}
+        if not isinstance(payload, dict) or any(key != "sources" for key in payload):
+            raise ValueError("Request body must be empty or contain the installed source plan")
+        requested_sources = normalize_model_sources({"model_sources": payload["sources"]}) if "sources" in payload else None
+        if target_owner_id is None and "/_shared/" in model_id:
+            target_owner_id = model_id
+        try:
+            if target_owner_id is not None and "/_shared/" in target_owner_id:
+                if not _is_safe_weight_target_id(target_owner_id):
+                    raise ValueError(f"Invalid target owner ID: {target_owner_id}")
+                model_root, sources = generator_registry.get_weight_group_sources_plan(
+                    model_id, target_owner_id
+                )
+                owner_model_id = target_owner_id
+            else:
+                sources = generator_registry.get_model_sources_plan(model_id)
+                model_root = resolve_confined_owner_dir(
+                    registry_module.MODELS_DIR,
+                    generator_registry.canonical_model_dir(model_id),
+                )
+                owner_model_id = str(model_root.relative_to(registry_module.MODELS_DIR)).replace(os.sep, "/")
+        except (TypeError, ValueError) as exc:
+            return _source_plan_error_response(str(exc))
+        if requested_sources is not None and requested_sources != sources:
+            raise ValueError("Request sources do not match the installed manifest-owned plan")
+        if not sources:
+            raise HTTPException(409, "Model does not declare model_sources")
+        if target_owner_id is not None:
+            if not _is_safe_weight_target_id(target_owner_id):
+                raise ValueError(f"Invalid target owner ID: {target_owner_id}")
+            if target_owner_id != owner_model_id:
+                raise HTTPException(
+                    400,
+                    _target_owner_mismatch_detail("model_sources", target_owner_id, owner_model_id),
+                )
+        try:
+            destinations = {
+                source["id"]: resolve_source_destination_at_root(
+                    model_root, source["destination"]
+                )
+                for source in sources
+            }
+        except (TypeError, ValueError) as exc:
+            return _source_plan_error_response(str(exc))
+    except KeyError as exc:
+        raise HTTPException(404, f"Unknown model ID: {model_id}") from exc
+    except HTTPException:
+        raise
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -285,7 +444,7 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
         or os.environ.get("HF_TOKEN")
         or None
     )
-    control = _new_download_control(model_id)
+    control = _new_download_control(owner_model_id)
 
     async def stream():
         loop = asyncio.get_running_loop()
@@ -315,17 +474,60 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
                         if not any(filename.startswith(prefix) for prefix in skip)
                     ]
 
-                files = await loop.run_in_executor(None, _list_files)
+                try:
+                    files = await loop.run_in_executor(None, _list_files)
+                except Exception as exc:
+                    yield _fmt({
+                        "error": {
+                            "code": "source_list_failed",
+                            "stage": "list",
+                            "message": str(exc),
+                            "source_id": source["id"],
+                            "repo_id": source["repo_id"],
+                            "retryable": _is_retryable_download_error(exc),
+                        }
+                    })
+                    return
                 if not files:
-                    raise RuntimeError(
-                        f'No files found in Hugging Face repo: {source["repo_id"]}'
-                    )
+                    yield _fmt({
+                        "error": {
+                            "code": "source_plan_invalid",
+                            "stage": "validate",
+                            "message": f'No files remain in the download plan for source "{source["id"]}" ({source["repo_id"]})',
+                            "source_id": source["id"],
+                            "repo_id": source["repo_id"],
+                            "retryable": False,
+                        }
+                    })
+                    return
                 destination = destinations[source["id"]]
-                for filename in files:
-                    resolve_download_path(destination, filename)
+                try:
+                    for filename in files:
+                        resolve_download_path(destination, filename)
+                except (TypeError, ValueError) as exc:
+                    yield _fmt({
+                        "error": {
+                            "code": "source_plan_invalid",
+                            "stage": "validate",
+                            "message": str(exc),
+                            "retryable": False,
+                        }
+                    })
+                    return
                 files_by_source[source["id"]] = files
 
-            validate_source_file_plan(sources, files_by_source)
+            try:
+                validate_source_file_plan(sources, files_by_source)
+            except ValueError as exc:
+                yield _fmt({
+                    "error": {
+                        "code": "source_plan_invalid",
+                        "stage": "validate",
+                        "message": str(exc),
+                        "retryable": False,
+                    }
+                })
+                return
             planned_files = [
                 (source, filename)
                 for source in sources
@@ -382,7 +584,25 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
                         continue
                     yield _fmt(message)
 
-                final_size = await future
+                try:
+                    final_size = await future
+                except DownloadPaused:
+                    raise
+                except DownloadCancelled:
+                    raise
+                except Exception as exc:
+                    yield _fmt({
+                        "error": {
+                            "code": "source_file_failed",
+                            "stage": "download",
+                            "message": str(exc),
+                            "source_id": source["id"],
+                            "repo_id": source["repo_id"],
+                            "file": filename,
+                            "retryable": _is_retryable_download_error(exc),
+                        }
+                    })
+                    return
                 _check_download_control(control)
                 yield _fmt({
                     "percent": 1 + round((index + 1) / total * 94),
@@ -402,71 +622,73 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
                 part.unlink(missing_ok=True)
             yield _fmt({"cancelled": True, "status": "cancelled"})
         except Exception as exc:
-            yield _fmt({"error": str(exc)})
+            yield _fmt({"error": {
+                "code": "download_failed",
+                "stage": "download",
+                "message": str(exc),
+                "retryable": _is_retryable_download_error(exc),
+            }})
         finally:
-            if _download_controls.get(model_id) is control:
-                _download_controls.pop(model_id, None)
+            if _download_controls.get(owner_model_id) is control:
+                _download_controls.pop(owner_model_id, None)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @router.get("/hf-download")
 async def hf_download(
-    repo_id: str,
     model_id: str,
+    repo_id: Optional[str] = None,
     skip_prefixes: Optional[str] = None,
     include_prefixes: Optional[str] = None,
     x_hf_token: Optional[str] = Header(default=None),
 ):
-    """
-    Streams a HuggingFace Hub model download via SSE.
-    Downloads into MODELS_DIR / model_id applying the filtering
-    declared in the extension manifest (hf_skip_prefixes / hf_include_prefixes).
-
-    skip_prefixes:    JSON-encoded list of path prefixes to exclude.
-    include_prefixes: JSON-encoded list of path prefixes to include (whitelist).
-    X-HF-Token:       HuggingFace access token for gated repos (from Electron settings).
-                      A HEADER, not a query param: uvicorn logs the full request
-                      line to stdout, python-bridge.ts pipes that into runtime.log,
-                      and `log:readAll` hands that file to the user for bug
-                      reports — the token used to travel all the way there.
-    All fall back to the extension's manifest / environment when not supplied.
-
-    SSE format: data: {"percent": 0-100, "file": "...", "status": "..."}
-    """
-    token = x_hf_token
+    """Stream the legacy manifest-owned Hugging Face plan via SSE."""
     import json as _json
     import os
     try:
-        dest_dir = str(generator_registry.canonical_model_dir(model_id))
-    except KeyError:
-        dest_dir = str(registry_module.MODELS_DIR / model_id)
-    # Prefer skip_prefixes passed directly from the client (authoritative, no registry dep)
-    if skip_prefixes:
-        try:
-            skip_list = _json.loads(skip_prefixes)
-        except Exception:
-            skip_list = []
-    else:
-        try:
-            skip_list = generator_registry.get_manifest(model_id).get("hf_skip_prefixes", [])
-        except KeyError:
-            skip_list = []
+        if not _is_safe_canonical_model_id(model_id):
+            raise ValueError(f"Invalid model ID: {model_id}")
+        plan = generator_registry.get_legacy_hf_download_plan(model_id)
+        if not plan:
+            raise HTTPException(409, "Model does not declare a legacy hf_repo download")
+        if repo_id is not None and repo_id != plan["repo_id"]:
+            raise ValueError("Request repo_id does not match the installed manifest-owned legacy plan")
+        skip_list = plan.get("hf_skip_prefixes", [])
+        include_list = plan.get("hf_include_prefixes", [])
+        manifest = generator_registry.get_manifest(model_id)
+        variants = manifest.get("weight_variants")
+        allowed_steps = [(include_list, skip_list)]
+        if variants:
+            allowed_steps = [(include_list, [*skip_list, *[prefix for option in variants["options"] for prefix in option["include_prefixes"]]])]
+            allowed_steps.extend((option["include_prefixes"], skip_list) for option in variants["options"])
+        requested_include = _json.loads(include_prefixes) if include_prefixes is not None else include_list
+        requested_skip = _json.loads(skip_prefixes) if skip_prefixes is not None else skip_list
+        if (requested_include, requested_skip) not in allowed_steps:
+            raise ValueError("Request filters do not match an installed manifest-owned legacy variant step")
+        include_list, skip_list = requested_include, requested_skip
+        selected_variant = next((option for option in variants["options"]
+            if (include_list, skip_list) == (option["include_prefixes"], plan.get("hf_skip_prefixes", []))), None) if variants else None
+        step_checks = selected_variant["checks"] if selected_variant else [plan.get("download_check")]
+        canonical_dir = generator_registry.canonical_model_dir(model_id)
+        configured_models_dir = getattr(generator_registry, "models_dir", None)
+        if configured_models_dir is None:
+            # canonical_model_dir is the authority for the configured root;
+            # derive that root only for confinement validation so a separately
+            # monkeypatched router constant cannot reintroduce relative_to drift.
+            configured_models_dir = registry_module.MODELS_DIR
+        dest_dir = str(resolve_confined_owner_dir(configured_models_dir, canonical_dir))
+        repo_id = plan["repo_id"]
+    except HTTPException:
+        raise
+    except KeyError as exc:
+        raise HTTPException(404, f"Unknown model ID: {model_id}") from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, _source_plan_validation_detail(str(exc))) from exc
 
-    if include_prefixes:
-        try:
-            include_list = _json.loads(include_prefixes)
-        except Exception:
-            include_list = []
-    else:
-        try:
-            include_list = generator_registry.get_manifest(model_id).get("hf_include_prefixes", [])
-        except KeyError:
-            include_list = []
-
-    # Token: explicit query param > env var > None
-    hf_token = token or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or None
-    control = _new_download_control(model_id)
+    hf_token = x_hf_token or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or None
+    owner_model_id = f"{Path(dest_dir).parent.name}/{Path(dest_dir).name}"
+    control = _new_download_control(owner_model_id)
 
     async def stream():
         loop = asyncio.get_running_loop()
@@ -489,8 +711,27 @@ async def hf_download(
             files = await loop.run_in_executor(None, _list_files)
             total = len(files)
 
+            for download_check in step_checks:
+                # Extension-contained sibling checks are readiness evidence, not
+                # a file required in this node's repository/filter pass.
+                if not download_check or '..' in Path(download_check).parts:
+                    continue
+                if download_check not in files:
+                    yield _fmt({"error": {
+                        "code": "source_plan_invalid", "stage": "validate",
+                        "message": f"download_check {download_check!r} was excluded by the installed legacy include/skip filters",
+                        "retryable": False,
+                    }})
+                    return
+
             if total == 0:
-                yield _fmt({"error": f"No files found in HuggingFace repo: {repo_id}"})
+                yield _fmt({"error": {
+                    "code": "legacy_source_empty",
+                    "stage": "list",
+                    "message": f"No files found in HuggingFace repo: {repo_id}",
+                    "repo_id": repo_id,
+                    "retryable": False,
+                }})
                 return
 
             yield _fmt({"percent": 1, "status": f"Downloading {total} files..."})
@@ -539,10 +780,24 @@ async def hf_download(
                     else:
                         yield _fmt(msg)
 
-                final_size = await dl_future
+                try:
+                    final_size = await dl_future
+                except DownloadPaused:
+                    raise
+                except DownloadCancelled:
+                    raise
+                except Exception as exc:
+                    yield _fmt({"error": {
+                        "code": "legacy_file_failed",
+                        "stage": "download",
+                        "message": str(exc),
+                        "repo_id": repo_id,
+                        "file": filename,
+                        "retryable": _is_retryable_download_error(exc),
+                    }})
+                    return
                 _check_download_control(control)
 
-                # Reserve 1-95 for file downloads, leave 95-100 for finalisation
                 pct = 1 + round((i + 1) / total * 94)
                 yield _fmt({
                     "percent": pct,
@@ -559,20 +814,22 @@ async def hf_download(
         except DownloadPaused:
             yield _fmt({"paused": True, "status": "paused"})
         except DownloadCancelled:
-            # Remove only partial files; completed files are preserved so the
-            # next download can resume from where it left off.
             for part in Path(dest_dir).rglob("*.part"):
                 part.unlink(missing_ok=True)
             yield _fmt({"cancelled": True, "status": "cancelled"})
         except Exception as exc:
-            yield _fmt({"error": str(exc)})
+            yield _fmt({"error": {
+                "code": "legacy_download_failed",
+                "stage": "download",
+                "message": str(exc),
+                "repo_id": repo_id,
+                "retryable": _is_retryable_download_error(exc),
+            }})
         finally:
-            # Only remove the control if it still belongs to this session.
-            if _download_controls.get(model_id) is control:
-                _download_controls.pop(model_id, None)
+            if _download_controls.get(owner_model_id) is control:
+                _download_controls.pop(owner_model_id, None)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
 
 def _download_file_streamed(
     *,
@@ -586,7 +843,11 @@ def _download_file_streamed(
     control: dict[str, threading.Event],
     token: Optional[str] = None,
 ) -> int:
-    final_path = Path(dest_dir) / filename
+    destination = Path(dest_dir)
+    # Validate both the final target and its .part sibling before mkdir/open/
+    # replace. This prevents a pre-existing temporary symlink from redirecting
+    # bytes outside the manifest-owned model directory.
+    final_path = resolve_download_path(destination, filename)
     temp_path = final_path.with_suffix(final_path.suffix + ".part")
     final_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -679,6 +940,8 @@ def _download_file_streamed(
             return bytes_downloaded
 
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            if isinstance(exc, HTTPError) and not _is_retryable_download_error(exc):
+                raise
             last_error = exc
             preserved_bytes = temp_path.stat().st_size if temp_path.exists() else 0
             progress_cb({

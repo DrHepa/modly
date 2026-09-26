@@ -236,6 +236,10 @@ test('ModelsPage routes structured asset plans to their owned endpoints and pres
         calls.push(`assets:${modelId}`)
         return { success: true }
       },
+      downloadSources: async (modelId: string) => {
+        calls.push(`sources:${modelId}`)
+        return { success: true }
+      },
       downloadHttpsAssets: async (modelId: string) => {
         calls.push(`https-assets:${modelId}`)
         return { success: true }
@@ -281,10 +285,20 @@ test('ModelsPage routes structured asset plans to their owned endpoints and pres
       hfRepo: 'owner/legacy',
     }, 'legacy/generate', modelApi)
 
+    await module.requestModelNodeDownload({
+      id: 'generate',
+      name: 'Generate',
+      input: 'image',
+      output: 'mesh',
+      paramsSchema: [],
+      hasModelSources: true,
+    }, 'pixal3d/generate', modelApi)
+
     assert.deepEqual(calls, [
       'https-assets:gaussiangpt/generate',
       'assets:cube3d/generate',
       'legacy:legacy/generate:default',
+      'legacy:pixal3d/generate:default',
     ])
   } finally {
     await cleanup()
@@ -328,6 +342,32 @@ test('ModelsPage prunes persisted failures when the model is gone or no longer d
     assert.deepEqual(module.pruneStaleDownloadFailures(failures, extensions), {
       'keep/generate': failures['keep/generate'],
     })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('ModelsPage fails closed for malformed persisted failure metadata', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    assert.equal(module.isValidModelDownloadFailure({ retryable: true }), false)
+    assert.equal(module.isValidModelDownloadFailure({
+      code: 'download_failed', stage: 'download', message: 'failed', retryable: true, file: 7,
+    }), false)
+    assert.equal(module.isValidModelDownloadFailure({
+      code: 'download_failed', stage: 'download', message: 'failed', retryable: true, file: 'weights/model.bin',
+    }), true)
+    assert.equal(module.isRetryableModelDownloadFailure({
+      code: 'download_failed',
+      stage: 'request',
+      message: 'temporary failure',
+      retryable: true,
+    }), true)
+    assert.equal(module.isRetryableModelDownloadFailure({
+      code: 'download_failed',
+      stage: 'request',
+      message: 'missing retryability',
+    }), false)
   } finally {
     await cleanup()
   }
@@ -496,5 +536,80 @@ test('ModelsPage actual pause handler preserves later progress and Resume after 
         assert.doesNotMatch(html, /title="Pause download"/)
       }
     }
+  }
+})
+
+test('ModelsPage treats cancelled download progress as neutral cleanup', async () => {
+  const source = await readFile(modelsPageEntry, 'utf8')
+
+  assert.match(source, /if \(cancelled\)[\s\S]*?delete n\[id\]/)
+  assert.match(source, /percent: paused \? \(current\?\.percent \?\? percent\) : percent/)
+  assert.match(source, /stalledSeconds: stalledSeconds \?\? current\?\.stalledSeconds,[\s\S]*paused,/)
+})
+
+
+
+test('ModelsPage Install All de-duplicates shared owners without dropping distinct owner assets', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const queue = module.buildInstallAllQueue([
+      {
+        fullId: 'bundle/sd15',
+        weightOwnerId: 'bundle/shared-base',
+        node: { id: 'sd15', name: 'SD 1.5', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/sd15' },
+      },
+      {
+        fullId: 'bundle/sdxl-base',
+        weightOwnerId: 'bundle/shared-base',
+        node: { id: 'sdxl-base', name: 'SDXL Base', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/sdxl-base' },
+      },
+      {
+        fullId: 'bundle/flux',
+        weightOwnerId: 'bundle/flux',
+        node: { id: 'flux', name: 'Flux', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/flux' },
+      },
+      {
+        fullId: 'bundle/ready',
+        weightOwnerId: 'bundle/ready',
+        node: { id: 'ready', name: 'Ready', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/ready' },
+      },
+    ], ['bundle/ready'], { 'bundle/sdxl-base': { percent: 12 } })
+
+    assert.deepEqual(queue.map((entry: { fullId: string }) => entry.fullId), [
+      'bundle/flux',
+    ])
+  } finally {
+    await cleanup()
+  }
+})
+
+
+test('ModelsPage Install All queues distinct plans for the same owner sequentially', async () => {
+  const { module, cleanup } = await loadModelsPageModule()
+  try {
+    const queue = module.buildInstallAllQueue([
+      {
+        fullId: 'bundle/front',
+        weightOwnerId: 'bundle/shared-base',
+        node: { id: 'front', name: 'Front', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/front' },
+      },
+      {
+        fullId: 'bundle/back',
+        weightOwnerId: 'bundle/shared-base',
+        node: { id: 'back', name: 'Back', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/back' },
+      },
+      {
+        fullId: 'bundle/front-alias',
+        weightOwnerId: 'bundle/shared-base',
+        node: { id: 'front-alias', name: 'Front alias', input: 'image', output: 'mesh', paramsSchema: [], hfRepo: 'acme/front' },
+      },
+    ], [], {})
+
+    assert.deepEqual(queue.map((entry: { fullId: string }) => entry.fullId), [
+      'bundle/front',
+      'bundle/back',
+    ])
+  } finally {
+    await cleanup()
   }
 })

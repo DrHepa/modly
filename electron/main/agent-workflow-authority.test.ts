@@ -56,11 +56,33 @@ function extension(
   }
 }
 
+function modelExtension(
+  id: string,
+  nodeId: string,
+  options: { input?: string, output?: string, inputs?: Array<{ name: string, type: string, required?: boolean }> } = {},
+): ListedExtension {
+  return {
+    type: 'model',
+    id,
+    name: id,
+    trusted: true,
+    builtin: false,
+    nodes: [{
+      id: nodeId,
+      name: nodeId,
+      input: (options.input ?? 'image') as never,
+      output: (options.output ?? 'mesh') as never,
+      ...(options.inputs ? { inputs: options.inputs as never } : {}),
+      paramsSchema: [],
+    }],
+  }
+}
+
 const BASE_EXTENSIONS: ListedExtension[] = [
   extension('mesh-repair', 'repair'),
   extension('pymeshlab', 'pymeshlab'),
   extension('image-process', 'convert', { input: 'image', output: 'mesh' }),
-  extension('video-process', 'convert', { input: 'video', output: 'mesh' }),
+  modelExtension('video-model', 'convert', { input: 'video', output: 'mesh' }),
   extension('scene-process', 'convert', { input: 'scene', output: 'mesh' }),
   extension('text-process', 'convert', { input: 'text', output: 'mesh' }),
   extension('named-process', 'combine', {
@@ -348,6 +370,41 @@ test('Agent workflow authority rejects unknown, ambiguous, duplicate-key, and in
   })
 })
 
+test('Agent workflow authority rejects process video declarations while allowing model video', async (t) => {
+  const source = node('source', 'builtin', 'videoNode', { videoPath: 'Workflows/Inputs/Videos/turntable.mp4' })
+  const sink = node('sink', 'builtin', 'outputNode')
+
+  const allowed = createHarness({
+    extensions: [modelExtension('video-model-ok', 'convert', { input: 'video', output: 'mesh' })],
+    validateWorkspaceSource: async () => true,
+  })
+  assert.equal((await allowed.authority.create(request(graph([
+    source,
+    node('convert', 'extension', 'video-model-ok/convert'),
+    sink,
+  ], [edge('source', 'convert'), edge('convert', 'sink')]), 'video-model-ok'))).ok, true)
+
+  const cases = [
+    { name: 'process scalar video input', ext: extension('video-process-input', 'convert', { input: 'video', output: 'mesh' }) },
+    { name: 'process video output', ext: extension('video-process-output', 'convert', { input: 'image', output: 'video' }) },
+    { name: 'process video input array', ext: extension('video-process-array', 'convert', { inputs: [{ name: 'clip', type: 'video', required: true }], output: 'mesh' }) },
+    { name: 'model video input array', ext: modelExtension('video-model-array', 'convert', { input: 'video', output: 'mesh', inputs: [{ name: 'clip', type: 'video', required: true }] }) },
+  ]
+  for (const item of cases) await t.test(item.name, async () => {
+    const capabilityId = `${item.ext.id}/convert`
+    const harness = createHarness({ extensions: [item.ext], validateWorkspaceSource: async () => true })
+    assert.deepEqual(await harness.authority.create(request(graph([
+      source,
+      node('convert', 'extension', capabilityId),
+      sink,
+    ], [edge('source', 'convert'), edge('convert', 'sink')]), `reject-${item.name.replaceAll(' ', '-')}`)), {
+      ok: false,
+      error: { code: 'graph_invalid' },
+    })
+    assert.equal(harness.writes.length, 0)
+  })
+})
+
 test('Agent workflow authority excludes untrusted extensions from workflow creation inventory', async () => {
   const untrusted = extension('untrusted-process', 'convert')
   untrusted.trusted = false
@@ -369,7 +426,7 @@ test('Agent workflow authority excludes untrusted extensions from workflow creat
 test('Agent workflow authority enforces builtin required, conditional, and runtime-compatible source contracts', async (t) => {
   const videoGraph = (params: Record<string, boolean | number | string>) => graph([
     node('source', 'builtin', 'videoNode', params),
-    node('convert', 'extension', 'video-process/convert'),
+    node('convert', 'extension', 'video-model/convert'),
     node('sink', 'builtin', 'outputNode'),
   ], [edge('source', 'convert'), edge('convert', 'sink')])
 
@@ -452,7 +509,7 @@ test('Agent workflow authority rejects unsafe workspace source references before
     const harness = createHarness({ validateWorkspaceSource: async () => { validations += 1; return true } })
     const value = graph([
       node('source', 'builtin', 'videoNode', { videoPath }),
-      node('convert', 'extension', 'video-process/convert'),
+      node('convert', 'extension', 'video-model/convert'),
       node('sink', 'builtin', 'outputNode'),
     ], [edge('source', 'convert'), edge('convert', 'sink')])
     assert.deepEqual(await harness.authority.create(request(value, `unsafe-path-${index}`)), {

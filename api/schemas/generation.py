@@ -39,11 +39,14 @@ class GenerateFromTextRequest(BaseModel):
 
 
 class GenerateFromArtifactRequest(BaseModel):
-    """Generic typed-artifact request. Only scene is public in this release."""
-    input_kind: Literal["scene"]
+    """Generic validated scene, capture, or video request."""
+    input_kind: Literal["scene", "capture", "video"]
     input_path: str
     model_id: str
     collection: str = "Workflows"
+    remesh: str = "none"
+    enable_texture: bool = False
+    texture_resolution: int = 1024
     params: dict[str, Any] = Field(default_factory=dict)
 
 

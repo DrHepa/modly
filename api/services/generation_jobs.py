@@ -19,6 +19,7 @@ from schemas.generation import JobStatus, SceneCandidate
 from services.artifact_input import TypedArtifactInput
 from services.generator_registry import generator_registry
 from services.generators.base import GenerationCancelled, smooth_progress
+from services.capture_input import TypedModelInput, revalidate_typed_model_input
 
 
 # Shared by both image routes so the two endpoints can't drift apart on
@@ -151,7 +152,7 @@ def create_job() -> JobStatus:
 
 def create_generation_job(
     background_tasks: BackgroundTasks,
-    model_input: Union[bytes, Path, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput, TypedModelInput],
     params: dict,
     collection: str = "Default",
     output_kind: str = "mesh",
@@ -225,6 +226,17 @@ def create_from_none_job(
     return create_generation_job(
         background_tasks, b"", params, collection, output_kind, model_id,
     )
+
+
+def create_from_artifact_job(
+    background_tasks: BackgroundTasks, input_kind: str, artifact_path: Path,
+    params: dict, collection: str = "Default", *, artifact_snapshot: object | None = None,
+    model_id: Optional[str] = None,
+) -> JobStatus:
+    artifact = (TypedArtifactInput(input_kind, artifact_path) if input_kind == "scene"
+                else TypedModelInput(input_kind, artifact_path, artifact_snapshot))
+    output_kind = generator_registry.get_manifest(model_id).get("output", "mesh") if model_id is not None else "mesh"
+    return create_generation_job(background_tasks, artifact, params, collection, output_kind, model_id)
 
 
 def get_job(job_id: str) -> Optional[JobStatus]:
@@ -410,7 +422,7 @@ def detect_output_kind(output_path: Optional[Path]) -> Optional[str]:
 
 async def _run_generation(
     job_id: str,
-    model_input: Union[bytes, Path, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput, TypedModelInput],
     params: dict,
     collection: str = "Default",
     output_kind: str = "mesh",
@@ -462,7 +474,7 @@ async def _run_generation(
 
 def _run_generation_impl(
     job_id: str,
-    model_input: Union[bytes, Path, TypedArtifactInput],
+    model_input: Union[bytes, Path, TypedArtifactInput, TypedModelInput],
     params: dict,
     collection: str,
     output_kind: str,
@@ -543,7 +555,7 @@ def _run_generation_impl(
         gen.outputs_dir = coll_dir
 
         cancel_event = _cancel_events.get(job_id)
-        if isinstance(model_input, TypedArtifactInput):
+        if isinstance(model_input, TypedArtifactInput) and model_input.kind == "scene":
             # Revalidate just before crossing the inference boundary. The
             # subprocess runner repeats this check inside the worker.
             from services.artifact_input import revalidate_artifact_input
@@ -555,6 +567,13 @@ def _run_generation_impl(
                 else gen.generate_artifact(model_input.kind, model_input.path, params, progress_cb)
             )
         else:
+            if isinstance(model_input, TypedArtifactInput):
+                model_input = TypedModelInput(model_input.kind, model_input.path, model_input.snapshot)
+            if isinstance(model_input, TypedModelInput):
+                model_input = revalidate_typed_model_input(registry.WORKSPACE_DIR, model_input)
+                from services.extension_process import ExtensionProcess
+                if model_input.kind == "video" and not isinstance(gen, ExtensionProcess):
+                    model_input = model_input.path
             if isinstance(model_input, Path):
                 from services.generation_inputs import validate_video_input_path
                 model_input = validate_video_input_path(

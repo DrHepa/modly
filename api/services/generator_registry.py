@@ -43,6 +43,8 @@ from services.model_sources import (
 )
 from services.hf_download_assets import validate_hf_downloads, hf_download_assets_ready
 from services.https_download_assets import validate_https_downloads, https_download_assets_ready
+from services.model_sources import resolve_model_root, safe_owner_model_id
+from services.capture_input import _declared_input_type, _iter_declared_input_types
 
 # ------------------------------------------------------------------ #
 # Global paths
@@ -78,6 +80,16 @@ _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
 def normalize_model_input(value):
     return value
 
+
+
+def validate_model_node_video_shape(node: dict, *, context: str) -> None:
+    declared = node.get("inputs")
+    inputs = list(_iter_declared_input_types(node))
+    primary = _declared_input_type(node.get("input")) or "image"
+    if "video" in inputs and (declared is not None or primary != "video" or inputs != ["video"]):
+        raise ValueError(f'{context} must declare video as its single input field')
+    if primary == "video" and declared is not None:
+        raise ValueError(f'{context} must declare video as its single input field')
 
 def validate_model_input(value, context: str = "input") -> str:
     """Validate flexible primary-input metadata with legacy JSON compatibility."""
@@ -705,6 +717,8 @@ def _discover_extensions(
                         "output":           node.get("output", "mesh"),
                         "weight_groups":    [group_by_id[group_id] for group_id in group_ids],
                     }
+                    if model_sources is None:
+                        node_manifest.pop("model_sources", None)
                     if model_sources is not None:
                         node_manifest["model_sources"] = model_sources
                     if weight_variants is not None:
@@ -742,9 +756,27 @@ def _discover_extensions(
     return result, errors
 
 
+def _legacy_model_root(models_dir: Path, model_id: str) -> Path:
+    root = models_dir.resolve()
+    candidate = root / safe_source_id(model_id, "legacy model id")
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+        raise ValueError("Legacy model root must be a directory, not a symlink")
+    return candidate
+
+
 def canonical_model_dir(models_dir: Path, manifest: dict) -> Path:
     owner_id = manifest.get("weight_owner_id") or manifest.get("id")
-    return models_dir / owner_id
+    if isinstance(owner_id, str) and owner_id.count("/") == 0:
+        model_id = manifest.get("id")
+        extension_id = manifest.get("bundle_id")
+        if not extension_id and isinstance(model_id, str) and "/" in model_id:
+            extension_id = model_id.split("/", 1)[0]
+        if extension_id:
+            owner_id = f"{extension_id}/{owner_id}"
+    if isinstance(owner_id, str) and "/" not in owner_id:
+        # Legacy direct models have one validated root, not a fabricated None prefix.
+        return _legacy_model_root(models_dir, owner_id)
+    return resolve_model_root(models_dir, safe_owner_model_id(owner_id))
 
 
 def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
@@ -756,7 +788,9 @@ def resolve_active_model_dir(models_dir: Path, manifest: dict) -> Path:
     # first existing legacy alias in manifest order. We do NOT merge aliases or
     # move files automatically because that could delete valid shared weights.
     for legacy_path in manifest.get("legacy_paths", [manifest.get("id")]):
-        legacy_dir = models_dir / legacy_path
+        legacy_dir = (_legacy_model_root(models_dir, legacy_path)
+                      if isinstance(legacy_path, str) and "/" not in legacy_path
+                      else resolve_model_root(models_dir, safe_owner_model_id(legacy_path, "legacy model path")))
         if legacy_dir == canonical_dir:
             continue
         if legacy_dir.exists():
@@ -884,6 +918,7 @@ class GeneratorRegistry:
                     gen.hf_downloads      = manifest.get("hf_downloads", [])
                     gen.https_downloads   = manifest.get("https_downloads", [])
                     gen.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
+                    gen.hf_include_prefixes = manifest.get("hf_include_prefixes", [])
                     gen.download_check   = manifest.get("download_check", "")
                     gen._params_schema   = manifest.get("params_schema", [])
 
@@ -1109,6 +1144,80 @@ class GeneratorRegistry:
             plan,
             context=f"{model_id}.https_downloads",
         ) if plan else []
+
+    def get_model_sources_plan(self, model_id: str) -> list[dict]:
+        """Return the exact manifest-owned multi-source plan for a canonical model ID."""
+        manifest = self.get_manifest(model_id)
+        plan = manifest.get("model_sources", [])
+        return normalize_model_sources({"model_sources": plan}) if plan else []
+
+    def get_weight_group_sources_plan(
+        self, model_id: str, target_owner_id: str
+    ) -> tuple[Path, list[dict]]:
+        """Return a node-authorized shared group plan and its confined root."""
+        if model_id == target_owner_id and "/_shared/" in model_id:
+            candidates = [candidate_id for candidate_id, candidate in self._manifests.items()
+                          if candidate_id.startswith(model_id.split("/", 1)[0] + "/")
+                          and any(group.get("id") == model_id.split("/")[-1]
+                                  for group in candidate.get("weight_groups", []))]
+            if not candidates:
+                raise ValueError("No installed model references the requested weight group")
+            model_id = candidates[0]
+        manifest = self.get_manifest(model_id)
+        parts = target_owner_id.split("/")
+        if len(parts) != 3 or parts[1] != "_shared":
+            raise ValueError("Shared target must be extension/_shared/group")
+        extension_id = manifest.get("ext_id", model_id.split("/", 1)[0])
+        if parts[0] != extension_id:
+            raise ValueError("Shared target belongs to another extension")
+        group = next(
+            (candidate for candidate in manifest.get("weight_groups", []) if candidate.get("id") == parts[2]),
+            None,
+        )
+        if group is None:
+            raise ValueError("Model node does not reference the requested weight group")
+        sources = normalize_model_sources(
+            {"model_sources": group.get("model_sources")},
+            field_name=f"weight_groups[{parts[2]}].model_sources",
+        )
+        if not sources:
+            raise ValueError("Weight group does not declare model sources")
+        return resolve_weight_group_root(MODELS_DIR, extension_id, parts[2]), sources
+
+    def get_legacy_hf_download_plan(self, model_id: str) -> dict:
+        """Return the exact manifest-owned legacy Hugging Face plan."""
+        manifest = self.get_manifest(model_id)
+        repo_id = manifest.get("hf_repo", "")
+        if repo_id in (None, ""):
+            return {}
+        if not isinstance(repo_id, str) or re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$", repo_id) is None:
+            raise ValueError(f"{model_id}.hf_repo must be a safe owner/repository ID")
+        if manifest.get("model_sources") or manifest.get("hf_downloads"):
+            return {}
+        skip = manifest.get("hf_skip_prefixes", [])
+        include = manifest.get("hf_include_prefixes", [])
+        for field, prefixes in (("hf_skip_prefixes", skip), ("hf_include_prefixes", include)):
+            if not isinstance(prefixes, list) or any(not isinstance(prefix, str) or not prefix.strip() or prefix != prefix.strip() for prefix in prefixes):
+                raise ValueError(f"{model_id}.{field} must be an array of non-empty strings")
+        download_check = manifest.get("download_check", "")
+        if download_check:
+            if (not isinstance(download_check, str) or not download_check
+                    or "\\" in download_check or Path(download_check).is_absolute()):
+                raise ValueError(f"{model_id}.download_check must be a safe relative path")
+            owner = self.canonical_model_dir(model_id)
+            extension_root = MODELS_DIR / manifest.get("ext_id", model_id.split("/", 1)[0])
+            try:
+                (owner / download_check).resolve().relative_to(extension_root.resolve())
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"{model_id}.download_check escapes its extension root") from exc
+        elif download_check not in ("", None):
+            raise ValueError(f"{model_id}.download_check must be a safe relative path")
+        return {
+            "repo_id": repo_id,
+            "download_check": download_check,
+            "hf_skip_prefixes": skip,
+            "hf_include_prefixes": include,
+        }
 
     def get_model_input(self, model_id: str) -> str:
         """Return the validated invocation input for a canonical model ID."""

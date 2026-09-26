@@ -31,12 +31,14 @@ async function withTemporaryRoot(run) {
   }
 }
 
-test('imports an external video into a collision-safe durable workspace path', async () => {
+const MP4 = Buffer.from('\x00\x00\x00\x18ftypisom')
+
+test('imports an external video into Workflows/Imported Videos', async () => {
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
     const sourcePath = join(root, 'My unsafe (clip).MP4')
-    await writeFile(sourcePath, 'video-bytes')
+    await writeFile(sourcePath, MP4)
 
     const result = await importVideoInputToWorkspace({
       sourcePath,
@@ -45,46 +47,41 @@ test('imports an external video into a collision-safe durable workspace path', a
     })
 
     assert.deepEqual(result, {
-      workspacePath: 'Workflows/Inputs/Videos/00000000-0000-4000-8000-000000000123-My-unsafe-clip.mp4',
+      workspacePath: 'Workflows/Imported Videos/00000000-0000-4000-8000-000000000123-My-unsafe-clip.mp4',
       displayName: 'My unsafe (clip).MP4',
     })
-    assert.equal(
-      await readFile(join(workspaceDir, ...result.workspacePath.split('/')), 'utf8'),
-      'video-bytes',
-    )
+    assert.deepEqual(await readFile(join(workspaceDir, ...result.workspacePath.split('/'))), MP4)
   })
 })
 
-test('reuses a canonical video already inside the configured workspace', async () => {
+test('reuses a canonical video already inside a durable workspace root', async () => {
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
-    const sourcePath = join(workspaceDir, 'Workflows', 'Inputs', 'existing.webm')
-    await mkdir(join(workspaceDir, 'Workflows', 'Inputs'), { recursive: true })
-    await writeFile(sourcePath, 'video-bytes')
+    const sourcePath = join(workspaceDir, 'Workflows', 'Imported Videos', 'existing.mp4')
+    await mkdir(join(workspaceDir, 'Workflows', 'Imported Videos'), { recursive: true })
+    await writeFile(sourcePath, MP4)
 
     const result = await importVideoInputToWorkspace({
       sourcePath,
       workspaceDir,
-      randomUUID: () => {
-        throw new Error('UUID should not be needed for workspace-owned input')
-      },
+      randomUUID: () => { throw new Error('UUID should not be needed for workspace-owned input') },
     })
 
     assert.deepEqual(result, {
-      workspacePath: 'Workflows/Inputs/existing.webm',
-      displayName: 'existing.webm',
+      workspacePath: 'Workflows/Imported Videos/existing.mp4',
+      displayName: 'existing.mp4',
     })
   })
 })
 
-test('copies a video from transient workspace tmp into durable workflow inputs', async () => {
+test('copies a video from transient workspace tmp into durable imported videos', async () => {
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
     const sourcePath = join(workspaceDir, 'tmp', 'selected.mp4')
     await mkdir(join(workspaceDir, 'tmp'), { recursive: true })
-    await writeFile(sourcePath, 'transient-video')
+    await writeFile(sourcePath, MP4)
 
     const result = await importVideoInputToWorkspace({
       sourcePath,
@@ -93,39 +90,26 @@ test('copies a video from transient workspace tmp into durable workflow inputs',
     })
 
     assert.deepEqual(result, {
-      workspacePath: 'Workflows/Inputs/Videos/00000000-0000-4000-8000-000000000321-selected.mp4',
+      workspacePath: 'Workflows/Imported Videos/00000000-0000-4000-8000-000000000321-selected.mp4',
       displayName: 'selected.mp4',
     })
-    assert.equal(
-      await readFile(join(workspaceDir, ...result.workspacePath.split('/')), 'utf8'),
-      'transient-video',
-    )
+    assert.deepEqual(await readFile(join(workspaceDir, ...result.workspacePath.split('/'))), MP4)
   })
 })
 
-test('copies an in-workspace symlink whose canonical target escapes the workspace', async () => {
+test('rejects an in-workspace symlink source instead of importing through it', async () => {
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
     const outsidePath = join(root, 'outside.mp4')
     const linkedPath = join(workspaceDir, 'linked.mp4')
     await mkdir(workspaceDir, { recursive: true })
-    await writeFile(outsidePath, 'outside-video')
+    await writeFile(outsidePath, MP4)
     await symlink(outsidePath, linkedPath)
 
-    const result = await importVideoInputToWorkspace({
-      sourcePath: linkedPath,
-      workspaceDir,
-      randomUUID: () => '00000000-0000-4000-8000-000000000456',
-    })
-
-    assert.deepEqual(result, {
-      workspacePath: 'Workflows/Inputs/Videos/00000000-0000-4000-8000-000000000456-linked.mp4',
-      displayName: 'linked.mp4',
-    })
-    assert.equal(
-      await readFile(join(workspaceDir, ...result.workspacePath.split('/')), 'utf8'),
-      'outside-video',
+    await assert.rejects(
+      importVideoInputToWorkspace({ sourcePath: linkedPath, workspaceDir }),
+      /symbolic link/i,
     )
   })
 })
@@ -134,14 +118,14 @@ test('rejects a destination directory symlink that escapes the workspace', async
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
-    const inputsDir = join(workspaceDir, 'Workflows', 'Inputs')
+    const workflowsDir = join(workspaceDir, 'Workflows')
     const outsideDirectory = join(root, 'outside-destination')
     const sourcePath = join(root, 'source.mp4')
-    await mkdir(inputsDir, { recursive: true })
+    await mkdir(workflowsDir, { recursive: true })
     await mkdir(outsideDirectory, { recursive: true })
-    await writeFile(sourcePath, 'video-bytes')
+    await writeFile(sourcePath, MP4)
     try {
-      await symlink(outsideDirectory, join(inputsDir, 'Videos'), 'dir')
+      await symlink(outsideDirectory, join(workflowsDir, 'Imported Videos'), 'dir')
     } catch (error) {
       if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes(error?.code)) {
         t.skip('directory symlink creation requires additional privileges on this platform')
@@ -166,7 +150,7 @@ test('rejects an escaping Workflows symlink before creating destination parents 
     const sourcePath = join(root, 'source.mp4')
     await mkdir(workspaceDir, { recursive: true })
     await mkdir(outsideDirectory, { recursive: true })
-    await writeFile(sourcePath, 'video-bytes')
+    await writeFile(sourcePath, MP4)
     try {
       await symlink(outsideDirectory, join(workspaceDir, 'Workflows'), 'dir')
     } catch (error) {
@@ -185,50 +169,17 @@ test('rejects an escaping Workflows symlink before creating destination parents 
   })
 })
 
-test('rejects an escaping Inputs symlink before creating destination parents outside the workspace', async (t) => {
-  await withTemporaryRoot(async (root) => {
-    const { importVideoInputToWorkspace } = await loadVideoInputModule()
-    const workspaceDir = join(root, 'workspace')
-    const workflowsDir = join(workspaceDir, 'Workflows')
-    const outsideDirectory = join(root, 'outside-inputs')
-    const sourcePath = join(root, 'source.mp4')
-    await mkdir(workflowsDir, { recursive: true })
-    await mkdir(outsideDirectory, { recursive: true })
-    await writeFile(sourcePath, 'video-bytes')
-    try {
-      await symlink(outsideDirectory, join(workflowsDir, 'Inputs'), 'dir')
-    } catch (error) {
-      if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes(error?.code)) {
-        t.skip('directory symlink creation requires additional privileges on this platform')
-        return
-      }
-      throw error
-    }
-
-    await assert.rejects(
-      importVideoInputToWorkspace({ sourcePath, workspaceDir }),
-      /destination must remain inside the configured workspace/i,
-    )
-    assert.deepEqual(await readdir(outsideDirectory), [])
-  })
-})
-
-test('imports a regular file without enforcing a hard suffix allowlist', async () => {
+test('rejects unsupported video suffixes before import', async () => {
   await withTemporaryRoot(async (root) => {
     const { importVideoInputToWorkspace } = await loadVideoInputModule()
     const workspaceDir = join(root, 'workspace')
     const sourcePath = join(root, 'notes.CAPTURE')
-    await writeFile(sourcePath, 'video-bytes')
+    await writeFile(sourcePath, MP4)
 
-    const result = await importVideoInputToWorkspace({
-      sourcePath,
-      workspaceDir,
-      randomUUID: () => '00000000-0000-4000-8000-000000000789',
-    })
-
-    assert.equal(result.workspacePath, 'Workflows/Inputs/Videos/00000000-0000-4000-8000-000000000789-notes.capture')
-    assert.equal(result.displayName, 'notes.CAPTURE')
-    assert.equal(await readFile(join(workspaceDir, ...result.workspacePath.split('/')), 'utf8'), 'video-bytes')
+    await assert.rejects(
+      importVideoInputToWorkspace({ sourcePath, workspaceDir }),
+      /unsupported extension/i,
+    )
   })
 })
 
@@ -237,6 +188,7 @@ test('fs:selectVideo uses the native video picker and workspace import helper', 
 
   assert.match(source, /ipcMain\.handle\('fs:selectVideo', async \(\) =>/)
   assert.match(source, /title:\s*'Select a video'/)
+  assert.match(source, /extensions:\s*\['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'\]/)
   assert.match(source, /getSettings\(app\.getPath\('userData'\)\)\.workspaceDir/)
   assert.match(source, /await importVideoInputToWorkspace\(\{\s*sourcePath,\s*workspaceDir\s*\}\)/)
   assert.doesNotMatch(source, /fs:selectVideo[\s\S]{0,800}readFileBase64/)

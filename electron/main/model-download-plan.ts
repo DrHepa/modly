@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve, relative, isAbsolute } from 'node:path'
 import { describeModelOwnership, type ModelOwnershipDescriptor } from './model-ownership'
 
 import {
@@ -9,6 +9,9 @@ import {
   assertSafeExtensionId,
   resolveExtensionPathWithinRoot,
 } from './extension-path-guard'
+import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest'
+import { normalizeHttpsDownloads, type HttpsDownloadAsset } from './https-download-manifest'
+import { ModelAssetDownloadError } from './model-download-events'
 import {
   normalizeModelSources,
   normalizeWeightGroupReferences,
@@ -34,6 +37,8 @@ interface InstalledNode {
   weight_groups?: unknown
   weight_variants?: unknown
   params_schema?: unknown
+  hf_downloads?: unknown
+  https_downloads?: unknown
 }
 
 interface InstalledManifest {
@@ -60,6 +65,18 @@ export type InstalledModelDownloadPlan = { ownership?: ModelOwnershipDescriptor 
   skipPrefixes?: string[]
   includePrefixes?: string[]
   weightVariants?: WeightVariants
+} | {
+  kind: 'hf-assets'
+  modelId: string
+  extensionId: string
+  nodeId: string
+  hfDownloads: HfDownloadDescriptor[]
+} | {
+  kind: 'https-assets'
+  modelId: string
+  extensionId: string
+  nodeId: string
+  httpsDownloads: HttpsDownloadAsset[]
 } | {
   kind: 'multi-source'
   modelId: string
@@ -169,6 +186,12 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
   const sharedGroups = refs.map((groupId) => (
     allSharedGroups.find((candidate) => candidate.id === groupId)!
   ))
+  if (!sources && sharedGroups.length === 0) {
+    const httpsDownloads = normalizeHttpsDownloads(node.https_downloads, 'https_downloads')
+    if (httpsDownloads) return { ...(ownership ? { ownership } : {}), kind: 'https-assets', modelId, extensionId, nodeId, httpsDownloads }
+    const hfDownloads = normalizeHfDownloads(node.hf_downloads, 'hf_downloads')
+    if (hfDownloads) return { ...(ownership ? { ownership } : {}), kind: 'hf-assets', modelId, extensionId, nodeId, hfDownloads }
+  }
   if (sources || sharedGroups.length > 0) {
     if (sharedGroups.length > 0 && node.hf_repo !== undefined) {
       throw new Error(`Model node "${modelId}" must use model_sources for private weights when weight_groups are declared`)
@@ -184,6 +207,20 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
     }
   }
 
+  const malformedLegacy = (message: string): never => { throw new Error(`Model node "${modelId}" ${message}`) }
+  if (typeof node.hf_repo !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(node.hf_repo)) {
+    malformedLegacy('has no safe Hugging Face repository')
+  }
+  for (const field of ['hf_skip_prefixes', 'hf_include_prefixes'] as const) {
+    const value = node[field]
+    if (value !== undefined && (!Array.isArray(value) || value.some((prefix) => typeof prefix !== 'string' || !prefix.trim() || prefix !== prefix.trim()))) malformedLegacy(`${field} must be an array of non-empty strings`)
+  }
+  if (node.download_check !== undefined) {
+    const check = node.download_check
+    if (typeof check !== 'string' || !check || check !== check.trim() || check.includes('\\') || isAbsolute(check)) malformedLegacy('download_check must be a safe relative path')
+    const rel = relative(resolve('/models', extensionId), resolve('/models', extensionId, nodeId, check as string))
+    if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) malformedLegacy('download_check escapes its extension root')
+  }
   if (typeof node.hf_repo !== 'string' || !node.hf_repo) {
     throw new Error(`Model node "${modelId}" has no Hugging Face download source`)
   }
@@ -290,7 +327,8 @@ export async function resolveInstalledModelDownloadPlan(args: {
   builtinExtensionsDir: string
   blockedExtensionIds?: ReadonlySet<string>
 }): Promise<InstalledModelDownloadPlan> {
-  if (typeof args.modelId !== 'string') throw new Error('Model id must be a string')
+  try {
+    if (typeof args.modelId !== 'string') throw new Error('Model id must be a string')
   const parts = args.modelId.split('/')
   if (parts.length !== 2) throw new Error('Model id must identify one extension node')
   const extensionId = assertSafeExtensionId(parts[0])
@@ -315,5 +353,12 @@ export async function resolveInstalledModelDownloadPlan(args: {
 
   const manifestPath = join(extensionPath, 'manifest.json')
   if (!existsSync(manifestPath)) throw new Error(`Extension "${extensionId}" has no manifest.json`)
-  return parseManifest(await readFile(manifestPath, 'utf-8'), extensionId, nodeId)
+    return parseManifest(await readFile(manifestPath, 'utf-8'), extensionId, nodeId)
+  } catch (error) {
+    if (error instanceof ModelAssetDownloadError) throw error
+    throw new ModelAssetDownloadError({
+      code: 'source_plan_invalid', stage: 'validate',
+      message: error instanceof Error ? error.message : String(error), retryable: false,
+    })
+  }
 }

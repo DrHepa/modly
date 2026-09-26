@@ -6,6 +6,11 @@ export interface DownloadProgress {
   repoIndex?: number
   totalRepos?: number
   status?: string
+  paused?: boolean
+  cancelled?: boolean
+  bytesDownloaded?: number
+  totalBytes?: number
+  stalledSeconds?: number
 }
 
 export interface ModelDownloadFailure {
@@ -13,6 +18,7 @@ export interface ModelDownloadFailure {
   stage: string
   message: string
   repoId?: string
+  sourceId?: string
   file?: string
   retryable: boolean
 }
@@ -53,6 +59,7 @@ export function normalizeDownloadEvent(value: unknown): NormalizedDownloadEvent 
           stage: optionalString(failure.stage) ?? 'download',
           message: safeMessage(failure.message),
           ...(optionalString(failure.repo_id) ? { repoId: optionalString(failure.repo_id) } : {}),
+          ...(optionalString(failure.source_id) ? { sourceId: optionalString(failure.source_id) } : {}),
           ...(optionalString(failure.file) ? { file: optionalString(failure.file) } : {}),
           retryable: failure.retryable !== false,
         },
@@ -69,7 +76,9 @@ export function normalizeDownloadEvent(value: unknown): NormalizedDownloadEvent 
     }
   }
 
-  if (typeof event.percent !== 'number' || !Number.isFinite(event.percent)) return {}
+  const hasTerminalControl = event.paused === true || event.cancelled === true
+  const hasPercent = typeof event.percent === 'number' && Number.isFinite(event.percent)
+  if (!hasPercent && !hasTerminalControl) return {}
 
   const file = optionalString(event.file)
   const status = optionalString(event.status)
@@ -77,16 +86,24 @@ export function normalizeDownloadEvent(value: unknown): NormalizedDownloadEvent 
   const totalFiles = optionalCount(event.totalFiles)
   const repoIndex = optionalCount(event.repoIndex)
   const totalRepos = optionalCount(event.totalRepos)
+  const bytesDownloaded = optionalCount(event.bytesDownloaded)
+  const totalBytes = optionalCount(event.totalBytes)
+  const stalledSeconds = optionalCount(event.stalledSeconds)
 
   return {
     progress: {
-      percent: Math.max(0, Math.min(100, Math.round(event.percent))),
+      percent: hasPercent ? Math.max(0, Math.min(100, Math.round(event.percent as number))) : 0,
       ...(file ? { file } : {}),
       ...(fileIndex !== undefined ? { fileIndex } : {}),
       ...(totalFiles !== undefined ? { totalFiles } : {}),
       ...(repoIndex !== undefined ? { repoIndex } : {}),
       ...(totalRepos !== undefined ? { totalRepos } : {}),
       ...(status ? { status } : {}),
+      ...(event.paused === true ? { paused: true } : {}),
+      ...(event.cancelled === true ? { cancelled: true } : {}),
+      ...(bytesDownloaded !== undefined ? { bytesDownloaded } : {}),
+      ...(totalBytes !== undefined ? { totalBytes } : {}),
+      ...(stalledSeconds !== undefined ? { stalledSeconds } : {}),
     },
   }
 }
@@ -94,10 +111,12 @@ export function normalizeDownloadEvent(value: unknown): NormalizedDownloadEvent 
 export function buildManifestAssetDownloadRequest(
   apiUrl: string,
   modelId: string,
+  targetOwnerId?: string,
   token?: string,
 ): { url: string; headers: Record<string, string> } {
+  const targetOwnerQuery = targetOwnerId ? `&target_owner_id=${encodeURIComponent(targetOwnerId)}` : ''
   return {
-    url: `${apiUrl}/model/hf-download-assets?model_id=${encodeURIComponent(modelId)}`,
+    url: `${apiUrl}/model/hf-download-assets?model_id=${encodeURIComponent(modelId)}${targetOwnerQuery}`,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   }
 }
@@ -105,9 +124,11 @@ export function buildManifestAssetDownloadRequest(
 export function buildHttpsDownloadAssetsRequest(
   apiUrl: string,
   modelId: string,
+  targetOwnerId?: string,
 ): { url: string; headers: Record<string, string> } {
+  const targetOwnerQuery = targetOwnerId ? `&target_owner_id=${encodeURIComponent(targetOwnerId)}` : ''
   return {
-    url: `${apiUrl}/model/https-download-assets?model_id=${encodeURIComponent(modelId)}`,
+    url: `${apiUrl}/model/https-download-assets?model_id=${encodeURIComponent(modelId)}${targetOwnerQuery}`,
     headers: {},
   }
 }
@@ -116,7 +137,7 @@ export class ModelAssetDownloadError extends Error {
   readonly failure: ModelDownloadFailure
 
   constructor(failure: ModelDownloadFailure) {
-    const location = [failure.repoId, failure.file].filter(Boolean).join(' / ')
+    const location = [failure.repoId, failure.sourceId, failure.file].filter(Boolean).join(' / ')
     super(`[${failure.code}/${failure.stage}] ${failure.message}${location ? ` (${location})` : ''}`)
     this.name = 'ModelAssetDownloadError'
     this.failure = failure

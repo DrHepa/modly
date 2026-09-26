@@ -6,6 +6,7 @@ import type { ListedExtension } from './automation-capabilities.ts'
 import { safeModelSourceId } from './model-sources'
 import { assertSafeOwnershipSegment } from './extension-path-guard.ts'
 import type { HfDownloadDescriptor } from './hf-download-manifest.ts'
+import { areModelSourcesDownloaded, type ModelSource } from './model-sources.ts'
 import {
   expectedHttpsMarkerAssets,
   httpsPlanSha256,
@@ -20,6 +21,9 @@ export interface ModelOwnershipDescriptor {
   legacyPaths: string[]
   hfDownloads?: HfDownloadDescriptor[]
   httpsDownloads?: HttpsDownloadAsset[]
+  hasModelSources?: boolean
+  modelSources?: ModelSource[]
+  downloadCheck?: string
 }
 
 /** Private payload aliases only; extension weight_groups keep their own roots. */
@@ -90,6 +94,11 @@ type DownloadProgressLike = {
   repoIndex?: number
   totalRepos?: number
   status?: string
+  paused?: boolean
+  cancelled?: boolean
+  bytesDownloaded?: number
+  totalBytes?: number
+  stalledSeconds?: number
 }
 
 type DirEntriesReader = (dirPath: string) => string[]
@@ -396,6 +405,35 @@ function isHttpsDownloadReady(
   return true
 }
 
+
+function isLegacyDownloadCheckReady(
+  rootPath: string,
+  ownerPath: string,
+  downloadCheck: string,
+): boolean {
+  const normalized = downloadCheck.trim()
+  if (!normalized || normalized.startsWith('/') || normalized.includes('\\')) return false
+  const segments = normalized.split('/')
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return false
+  const checkPath = resolvePath(ownerPath, ...segments)
+  assertPathContained(rootPath, checkPath, 'Legacy download check path')
+  assertNoAliasedExistingComponents(rootPath, checkPath, 'Legacy download check path')
+  const resolvedCheckPath = resolveContainedExistingPath(rootPath, checkPath, 'Legacy download check path', ownerPath)
+  const entry = lstatSync(resolvedCheckPath)
+  if (entry.isSymbolicLink()) return false
+  if (entry.isFile()) return entry.size > 0
+  if (entry.isDirectory()) return readDirNonEmpty(resolvedCheckPath)
+  return false
+}
+
+function readDirNonEmpty(dirPath: string): boolean {
+  try {
+    return readdirSync(dirPath).length > 0
+  } catch {
+    return false
+  }
+}
+
 function assertSafeDeleteTarget(modelsDir: string, target: string): string {
   const rootPath = canonicalModelsRoot(modelsDir)
   const candidatePath = resolvePath(target)
@@ -477,6 +515,9 @@ export function resolveModelOwnership(
         legacyPaths: [...(node.legacyPaths ?? [nodeCapabilityId])],
         ...(node.hfDownloads ? { hfDownloads: node.hfDownloads } : {}),
         ...(node.httpsDownloads ? { httpsDownloads: node.httpsDownloads } : {}),
+        ...(node.hasModelSources ? { hasModelSources: true } : {}),
+        ...(node.modelSources ? { modelSources: node.modelSources } : {}),
+        ...(node.downloadCheck ? { downloadCheck: node.downloadCheck } : {}),
       }
     }
   }
@@ -508,6 +549,12 @@ export function isOwnedModelDownloaded(
       'Model owner path',
     )
 
+    if (ownership.hasModelSources) {
+      return ownership.modelSources?.length
+        ? areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, ownership.modelSources)
+        : false
+    }
+
     if (ownership.httpsDownloads?.length) {
       return isHttpsDownloadReady(
         rootPath,
@@ -530,6 +577,11 @@ export function isOwnedModelDownloaded(
         )
       }))
     }
+
+    if (ownership.downloadCheck?.trim()) {
+      return isLegacyDownloadCheckReady(rootPath, ownerPath, ownership.downloadCheck)
+    }
+
     return readDir(ownerPath).length > 0
   } catch {
     return false

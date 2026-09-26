@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import { createAgentModelAccessRuntime, resolveAgentOllamaConfiguration } from './agent-model-access-runtime.ts'
+import { assertAgentCapabilitySnapshotV1, sha256Canonical } from './agent-trust-contracts.ts'
 import type { AgentPrivateOllamaDaemon } from './agent-ollama-private-daemon.ts'
 import type { OpenAgentOllamaGpuDeviceAuthority } from './agent-ollama-gpu-device-authority.ts'
 import type { AgentProcessModelAccessDeclarationV1, AgentCapabilitySnapshotV1 } from '../../src/shared/types/agentActions.ts'
@@ -17,6 +19,34 @@ const declaration: AgentProcessModelAccessDeclarationV1 = {
 }
 
 const hash = (value: Buffer | string) => `sha256:${createHash('sha256').update(value).digest('hex')}` as const
+const unixSocketSupport = process.platform === 'linux' ? probeUnixSocketSupport() : Promise.resolve(false)
+
+async function probeUnixSocketSupport(): Promise<boolean> {
+  const root = await mkdtemp(join(tmpdir(), 'modly-model-runtime-socket-probe-'))
+  const socketPath = join(root, 'probe.sock')
+  const server = createNetServer()
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const cleanup = () => {
+        server.off('listening', onListening)
+        server.off('error', onError)
+      }
+      const onListening = () => { cleanup(); resolveListen() }
+      const onError = (error: Error) => { cleanup(); rejectListen(error) }
+      server.once('listening', onListening)
+      server.once('error', onError)
+      server.listen(socketPath)
+    })
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EPERM' || code === 'EACCES') return false
+    throw error
+  } finally {
+    await new Promise<void>((resolveClose) => server.listening ? server.close(() => resolveClose()) : resolveClose())
+    await rm(root, { recursive: true, force: true })
+  }
+}
 
 function fakeAccelerator(counters?: { opened: number, closed: number, revalidated: number }): OpenAgentOllamaGpuDeviceAuthority {
   if (counters) counters.opened += 1
@@ -64,19 +94,54 @@ async function fixture() {
 }
 
 function capability(): AgentCapabilitySnapshotV1 {
-  return {
+  const runtimeFiles = [{
+    path: 'processor.py', device: '1', inode: '2', uid: 1000, gid: 1000,
+    mode: 0o600, size: 128, mtimeNs: '3', sha256: '3'.repeat(64),
+  }]
+  const resourceFiles: never[] = []
+  const runtimeUnsigned = {
+    kind: 'extension-python-venv-v1' as const,
+    interpreter: 'bin/python' as const,
+    baseInterpreter: {
+      device: '9', inode: '10', uid: 0, gid: 0, mode: 0o755, size: 1024, nlink: 1,
+      mtimeNs: '11', ctimeNs: '12', sha256: 'f'.repeat(64),
+    },
+    treeDigest: '1'.repeat(64), sourceIdentityHash: '2'.repeat(64), entryCount: 8, logicalBytes: 4096,
+  }
+  const runtime = {
+    ...runtimeUnsigned,
+    bindingHash: sha256Canonical({ schema: 'modly.extension-python-runtime-binding.v1', ...runtimeUnsigned }),
+  }
+  const modelAccess = declaration
+  const runtimeHash = sha256Canonical({ runtimeFiles, resourceFiles, runtime, modelAccess })
+  const artifacts = {
+    maxCount: 1,
+    maxTotalBytes: 1024,
+    allowed: [{ kind: 'plan' as const, mediaTypes: ['application/json'], maxBytes: 1024 }],
+  }
+  const execution = {
+    kind: 'process' as const,
+    schema: 'modly.agent-process-execution.v1' as const,
+    entry: 'processor.py',
+    runtimeFiles,
+    resourceFiles,
+    runtime,
+    modelAccess,
+    runtimeHash,
+    artifacts,
+    bindingHash: sha256Canonical({
+      schema: 'modly.agent-process-execution.v1', entry: 'processor.py', runtimeHash, artifacts,
+    }),
+  }
+  const unsigned = {
     schema: 'modly.agent-capability.v1', version: 1, id: 'text-to-cad/plan',
     displayName: 'Plan', description: 'Plan CAD',
     extension: { id: 'text-to-cad', name: 'Text to CAD', version: '1.0.0' },
     node: { id: 'plan', input: 'text', output: 'plan', paramsSchema: [] },
-    execution: {
-      kind: 'process', schema: 'modly.agent-process-execution.v1', entry: 'processor.pyz',
-      runtimeFiles: [], resourceFiles: [], modelAccess: declaration, runtimeHash: 'c'.repeat(64),
-      artifacts: { maxCount: 1, maxTotalBytes: 1024, allowed: [{ kind: 'plan', mediaTypes: ['application/json'], maxBytes: 1024 }] },
-      bindingHash: 'd'.repeat(64),
-    },
-    approval: { required: true, scope: 'single_action' }, hash: 'b'.repeat(64),
+    execution,
+    approval: { required: true, scope: 'single_action' },
   }
+  return assertAgentCapabilitySnapshotV1({ ...unsigned, hash: sha256Canonical(unsigned) })
 }
 
 function unixRequest(socketPath: string, token: string, body: unknown): Promise<{ status: number, body: unknown }> {
@@ -166,6 +231,7 @@ test('Ollama configuration is explicit, canonical, and never resolves mutable PA
 
 test('model access runtime keeps readiness/acquisition aligned and binds a one-shot exact-model lease', async (t) => {
   if (process.platform !== 'linux') return t.skip('production provider is Linux-only')
+  if (!await unixSocketSupport) return t.skip('pathname AF_UNIX sockets are unavailable in this test environment')
   const fixtureRoot = await fixture()
   const binary = await realpath(process.execPath)
   const calls: unknown[] = []

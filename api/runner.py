@@ -91,7 +91,7 @@ def _resolve_generation_input(
     msg: dict,
     *,
     declared_input: str,
-) -> bytes | Path:
+) -> bytes | Path | object:
     """Decode one legacy or typed generation input from the NDJSON request."""
     if "input" not in msg:
         return base64.b64decode(msg["image_b64"])
@@ -107,17 +107,28 @@ def _resolve_generation_input(
         raise ValueError(
             f"Typed input kind '{kind}' does not match generator input '{declared_input}'."
         )
-    if kind != "video":
-        raise ValueError(f"Unsupported typed generation input kind: {kind!r}.")
+    if kind in ("scene", "capture", "video"):
+        raw_path = envelope.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("Typed artifact input path must be a non-empty string.")
+        from services.capture_input import TypedModelInput, revalidate_typed_model_input
+        snapshot = None
+        if kind == "video":
+            if set(envelope) == {"kind", "path"}:
+                return validate_video_input_path(Path(raw_path), workspace_dir=MODLY_WORKSPACE_DIR)
+            from services.video_input import video_snapshot_from_dict
 
-    raw_path = envelope.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ValueError("Typed video input path must be a non-empty string.")
-
-    return validate_video_input_path(
-        Path(raw_path),
-        workspace_dir=MODLY_WORKSPACE_DIR,
-    )
+            if set(envelope) != {"kind", "path", "snapshot"}:
+                raise ValueError("Video artifact input requires a well-formed snapshot")
+            snapshot = video_snapshot_from_dict(envelope["snapshot"])
+        elif set(envelope) != {"kind", "path"}:
+            raise ValueError("Typed artifact input must contain exactly kind and path")
+        validated = revalidate_typed_model_input(
+            MODLY_WORKSPACE_DIR,
+            TypedModelInput(kind, Path(raw_path), snapshot),
+        )
+        return validated.path if kind == "scene" else validated
+    raise ValueError(f"Unsupported typed generation input kind: {kind!r}.")
 
 
 # ------------------------------------------------------------------ #
@@ -214,6 +225,7 @@ def _ensure_model_loaded(gen) -> bool:
 def _apply_manifest_metadata(gen, manifest: dict, node: dict) -> None:
     gen.hf_repo = node.get("hf_repo") or manifest.get("hf_repo", "")
     gen.hf_skip_prefixes = node.get("hf_skip_prefixes") or manifest.get("hf_skip_prefixes", [])
+    gen.hf_include_prefixes = node.get("hf_include_prefixes") or manifest.get("hf_include_prefixes", [])
     gen.download_check = node.get("download_check") or manifest.get("download_check", "")
     gen._params_schema = node.get("params_schema") or manifest.get("params_schema", [])
 
@@ -321,7 +333,7 @@ def main() -> None:
                 envelope = msg.get("input")
                 model_input = (
                     _resolve_generation_input(msg, declared_input=gen.input)
-                    if isinstance(envelope, dict) and envelope.get("kind") == "video"
+                    if isinstance(envelope, dict) and envelope.get("kind") in ("capture", "video")
                     else decode_model_input(msg)
                 )
                 params       = msg.get("params", {})
@@ -331,7 +343,8 @@ def main() -> None:
                     from services.artifact_input import RESERVED_ARTIFACT_PARAMS
                     params = {key: value for key, value in params.items()
                               if key not in RESERVED_ARTIFACT_PARAMS}
-                    params["scene_manifest_path"] = str(model_input.path)
+                    if model_input.kind in ("scene", "capture"):
+                        params[f"{model_input.kind}_manifest_path"] = str(model_input.path)
                 if msg.get("outputs_dir"):
                     gen.outputs_dir = Path(msg["outputs_dir"])
                     gen.outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +357,7 @@ def main() -> None:
                         send({"type": "log", "level": "warning",
                               "message": ("Model was not loaded (earlier setup failure?); "
                                           "reloaded before generating.")})
-                    if hasattr(model_input, "kind"):
+                    if hasattr(model_input, "kind") and model_input.kind == "scene":
                         output_path = gen.generate_artifact(
                             model_input.kind, model_input.path, params, progress_cb, cancel_evt
                         )

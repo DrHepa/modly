@@ -64,6 +64,8 @@ type ParamContract =
   | (ParamRules & { type: 'string', hasDefault: boolean, default?: string })
   | (ParamRules & { type: 'select', hasDefault: boolean, default?: string | number, options: ReadonlySet<string | number> })
 
+type IndexedExtensionNode = ListedExtensionNode & { extensionType: ListedExtension['type'] }
+
 type NodeContract = {
   storedType: string
   extensionId?: string
@@ -110,7 +112,7 @@ type ActionRecord = {
 }
 
 export type AgentWorkflowWorkspaceSource = {
-  kind: 'video' | 'scene'
+  kind: 'video' | 'scene' | 'capture'
   workspacePath: string
 }
 
@@ -405,8 +407,16 @@ function inputPorts(node: ListedExtensionNode): InputPort[] {
   return [{ name: null, type: node.input, required: true }]
 }
 
-function extensionContract(node: ListedExtensionNode, capabilityId: string): NodeContract {
+function assertSupportedVideoExtensionShape(node: IndexedExtensionNode): void {
+  const hasVideoArrayInput = Array.isArray(node.inputs) && node.inputs.some((port) => port?.type === 'video')
+  if (node.extensionType === 'process' && node.output === 'video') throw new GraphInvalidError()
+  if (hasVideoArrayInput) throw new GraphInvalidError()
+  if (node.extensionType === 'process' && node.input === 'video') throw new GraphInvalidError()
+}
+
+function extensionContract(node: IndexedExtensionNode, capabilityId: string): NodeContract {
   if (!boundedString(node.output, 80)) throw new InventoryUnavailableError()
+  assertSupportedVideoExtensionShape(node)
   const params = new Map<string, ParamContract>()
   if (!Array.isArray(node.paramsSchema) || node.paramsSchema.length > 64) throw new InventoryUnavailableError()
   for (const rawParam of node.paramsSchema) {
@@ -432,8 +442,8 @@ function builtinContract(type: string): NodeContract | undefined {
   }
 }
 
-function extensionIndex(extensions: readonly ListedExtension[]): Map<string, ListedExtensionNode> {
-  const index = new Map<string, ListedExtensionNode>()
+function extensionIndex(extensions: readonly ListedExtension[]): Map<string, IndexedExtensionNode> {
+  const index = new Map<string, IndexedExtensionNode>()
   const ambiguous = new Set<string>()
   for (const extension of extensions) {
     if (extension.trusted !== true) continue
@@ -442,7 +452,7 @@ function extensionIndex(extensions: readonly ListedExtension[]): Map<string, Lis
       const id = `${extension.id}/${node.id}`
       if (!SAFE_CAPABILITY_ID.test(id)) throw new InventoryUnavailableError()
       if (index.has(id)) ambiguous.add(id)
-      else index.set(id, node)
+      else index.set(id, { ...node, extensionType: extension.type })
     }
   }
   if (ambiguous.size > 0) throw new InventoryUnavailableError()
@@ -497,7 +507,7 @@ function hydrateParams(contract: NodeContract, supplied: Record<string, AgentWor
   return result
 }
 
-function resolveContracts(graph: AgentWorkflowGraphV1, index: Map<string, ListedExtensionNode>): Map<string, NodeContract> {
+function resolveContracts(graph: AgentWorkflowGraphV1, index: Map<string, IndexedExtensionNode>): Map<string, NodeContract> {
   const result = new Map<string, NodeContract>()
   for (const node of graph.nodes) {
     if (result.has(node.key)) throw new GraphInvalidError()
@@ -573,11 +583,12 @@ export async function validateAgentWorkspaceSource(
     if (!pathIsWithin(path.resolve(workspaceDir), requested)) return false
 
     let target = requested
-    if (source.kind === 'scene') {
+    if (source.kind === 'scene' || source.kind === 'capture') {
       const requestedInfo = await lstat(requested)
       if (requestedInfo.isSymbolicLink()) return false
-      if (requestedInfo.isDirectory()) target = path.join(requested, 'scene-manifest.json')
-      else if (path.basename(requested) !== 'scene-manifest.json') return false
+      const manifestName = source.kind === 'scene' ? 'scene-manifest.json' : 'capture-manifest.json'
+      if (requestedInfo.isDirectory()) target = path.join(requested, manifestName)
+      else if (path.basename(requested) !== manifestName) return false
     }
     const targetInfo = await lstat(target)
     if (!targetInfo.isFile() || targetInfo.isSymbolicLink() || targetInfo.size <= 0) return false
@@ -589,6 +600,13 @@ export async function validateAgentWorkspaceSource(
       if (!isPlainOwnRecord(manifest) || manifest.schema !== 'modly.scene-manifest.v1'
         || !Array.isArray(manifest.assets)) return false
       if (manifest.sceneRoot !== '.' && !isSafeWorkflowWorkspacePath(manifest.sceneRoot)) return false
+    }
+    if (source.kind === 'capture') {
+      if (targetInfo.size > MAX_SCENE_MANIFEST_BYTES) return false
+      const manifest = JSON.parse(await readFile(canonicalTarget, 'utf8')) as unknown
+      if (!isPlainOwnRecord(manifest) || manifest.schema !== 'modly.capture-manifest.v1'
+        || (manifest.kind !== 'frames' && manifest.kind !== 'video')) return false
+      if (manifest.captureRoot !== '.' && !isSafeWorkflowWorkspacePath(manifest.captureRoot)) return false
     }
     return true
   } catch {

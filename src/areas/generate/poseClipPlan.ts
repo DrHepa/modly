@@ -806,7 +806,7 @@ function normalizeSafePoseClipSourceWorkspacePath(sourceWorkspacePath: string): 
   const trimmed = sourceWorkspacePath.trim()
   if (!trimmed || trimmed.includes('\0') || /%2e|%2f|%5c/i.test(trimmed)) return null
   if (trimmed.includes('\\')) return null
-  if (trimmed.startsWith('/') || /^[a-zA-Z]:[\/]/.test(trimmed)) return null
+  if (trimmed.startsWith('/') || /^[a-zA-Z]:[/]/.test(trimmed)) return null
 
   const segments = trimmed.split('/').filter((segment) => segment.length > 0 && segment !== '.')
   if (segments.length === 0 || segments.includes('..')) return null

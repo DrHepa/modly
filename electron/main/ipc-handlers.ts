@@ -11,8 +11,8 @@ import * as os from 'os'
 import { promisify } from 'util'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
 import {
-  isModelDownloaded,
   listDownloadedModels,
+  isModelDownloaded,
   downloadModelFromHF,
   downloadModelSourcesFromHF,
   type DownloadProgress,
@@ -41,6 +41,7 @@ import {
   weightStorageHasLocalData,
 } from './model-sources'
 import { getCanonicalModelPath, isOwnedModelDownloaded, listDownloadedModelCapabilities, mapDownloadProgressToCapability, resolveModelOwnership, type ModelOwnershipDescriptor } from './model-ownership'
+import { parseLegacyModelDownloadPayload as parseLegacyModelDownloadPayloadContract } from './model-download-ipc-contract'
 import { getSettings, setSettings } from './settings-store'
 import { checkSetupNeeded, markSetupDone, runFullSetup, getVenvPythonExe, ensureSslPatch } from './python-setup'
 import { logger } from './logger'
@@ -51,6 +52,7 @@ import { getAutomationCapabilities } from './automation-capabilities-service'
 import { importWorkflowAvoidingIdCollision, listStoredWorkflows, saveWorkflowWithBackup } from './workflow-files.ts'
 import { fetchTrustedRepos } from './trusted-repos'
 import type { WorldsSceneManifestWriteRequest, WorldsSceneManifestWriteResult } from '../../src/shared/types/electron.d'
+import { parseManifestForInstall } from './github-extension-install'
 import { createRuntimeReadinessActionHandler, fetchRuntimeReadinessWithHealthGate } from './model-runtime-readiness'
 import { spawn, execFile } from 'child_process'
 import {
@@ -212,37 +214,6 @@ function runExtensionSetup(
     })
     proc.on('error', reject)
   })
-}
-
-function parseCanonicalModelDownloadPayload(payload: unknown): string {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('Model asset download payload must be an object containing only modelId')
-  }
-
-  const fields = Object.keys(payload)
-  if (fields.length !== 1 || fields[0] !== 'modelId') {
-    throw new Error('Model asset download payload must contain only modelId')
-  }
-
-  const modelId = (payload as Record<string, unknown>).modelId
-  if (typeof modelId !== 'string') {
-    throw new Error('Model asset download modelId must be a string')
-  }
-
-  const segments = modelId.split('/')
-  if (segments.length !== 2) {
-    throw new Error('Model asset download modelId must contain exactly two segments')
-  }
-
-  const extensionId = assertSafeOwnershipSegment(
-    segments[0],
-    'Model asset download extension segment',
-  )
-  const nodeId = assertSafeOwnershipSegment(
-    segments[1],
-    'Model asset download node segment',
-  )
-  return `${extensionId}/${nodeId}`
 }
 
 function modelAssetDownloadResult(error: unknown) {
@@ -551,6 +522,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       const privateReady = plan.sources.length === 0 || areModelSourcesDownloaded(modelsDir, storageId, plan.sources)
       return privateReady && plan.sharedGroups.every((group) => areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group))
     }
+    if (plan.kind === 'hf-assets' || plan.kind === 'https-assets') {
+      return plan.ownership ? isOwnedModelDownloaded(modelsDir, plan.ownership) : false
+    }
     return isModelDownloaded(modelsDir, storageId, plan.downloadCheck)
       && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
   }
@@ -697,11 +671,11 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
   const handleStructuredModelAssetDownload = async (
     event: IpcMainInvokeEvent,
     payload: unknown,
-    downloader: typeof downloadModelAssetsFromHF,
+    downloader: typeof downloadModelAssetsFromHF | typeof downloadModelAssetsFromHttps,
   ) => {
     let modelId: string
     try {
-      modelId = parseCanonicalModelDownloadPayload(payload)
+      modelId = parseLegacyModelDownloadPayloadContract(payload).modelId
     } catch (error) {
       return modelAssetDownloadResult(new ModelAssetDownloadError({
         code: 'invalid_model_id',
@@ -721,6 +695,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     }
 
     let targetRoots: string[]
+    let targetOwnerId: string
     let release: () => void
     try {
       const extensionId = modelId.split('/')[0]
@@ -728,6 +703,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         throw new Error(`Extension "${extensionId}" is being installed or repaired`)
       }
       const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      targetOwnerId = ownership.weightOwnerId
       const modelsDir = getSettings(app.getPath('userData')).modelsDir
       targetRoots = [...new Set([ownership.weightOwnerId, ...ownership.legacyPaths])]
         .map((id) => resolveModelRoot(modelsDir, id))
@@ -752,13 +728,18 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     activeDownloads.set(modelId, active)
     interruptedTargets.set(modelId, targetRoots)
     try {
-      await downloader(modelId, (progress) => {
+      active.currentTargetId = targetOwnerId!
+      await downloader(modelId, targetOwnerId!, (progress) => {
+        if (progress.paused) active.stopRequested = 'pause'
+        if (progress.cancelled) active.stopRequested = 'cancel'
+
         active.progress = progress
         event.sender.send(
           'model:downloadProgress',
           mapDownloadProgressToCapability(modelId, progress),
         )
       })
+      if (active.stopRequested) return { success: false, paused: active.stopRequested === 'pause', cancelled: active.stopRequested === 'cancel' }
       interruptedTargets.delete(modelId)
       return { success: true }
     } catch (error) {
@@ -912,6 +893,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
 
     const result = await dialog.showOpenDialog(win, {
       title: 'Select a video',
+      filters: [{ name: 'Videos', extensions: ['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'] }],
       properties: ['openFile']
     })
 
@@ -1282,8 +1264,8 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     )
   ))
 
-  ipcMain.handle('model:download', async (
-    event,
+  const downloadInstalledModel = async (
+    event: IpcMainInvokeEvent,
     modelId: string,
     requestedVariantId?: string | null,
   ) => {
@@ -1297,9 +1279,12 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       plan = await resolveModelPlan(modelId)
       if (plan.kind === 'multi-source') {
         if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
-      } else {
+      } else if (plan.kind === 'legacy') {
         // Shared files first (every variant excluded), then the requested variant.
         legacySteps = legacyDownloadSteps(plan, variantId)
+      } else {
+        if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
+        return handleStructuredModelAssetDownload(event, { modelId }, plan.kind === 'hf-assets' ? downloadModelAssetsFromHF : downloadModelAssetsFromHttps)
       }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -1354,7 +1339,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         for (const [index, target] of managedTargets.entries()) {
           if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
           active.currentTargetId = target.targetId
-          await downloadModelSourcesFromHF(target.targetId, target.sources, (progress) => {
+          await downloadModelSourcesFromHF(modelId, target.targetId, (progress) => {
+            if (progress.paused) active.stopRequested = 'pause'
+            if (progress.cancelled) active.stopRequested = 'cancel' 
             const aggregatePercent = Math.min(
               99,
               Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
@@ -1369,20 +1356,25 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         }
         if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
         if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
-      } else {
+      } else if (plan.kind === 'legacy') {
         active.currentTargetId = privateTargetId
         // Shared files and the variant are separate passes sharing one 0-100 bar.
         for (const [index, step] of legacySteps.entries()) {
           if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
           await downloadModelFromHF(
             plan.repoId,
-            privateTargetId,
-            (progress) => onProgress({ ...progress, percent: Math.round((index * 100 + progress.percent) / legacySteps.length) }),
+            modelId,
+            (progress) => {
+              if (progress.paused) active.stopRequested = 'pause'
+              if (progress.cancelled) active.stopRequested = 'cancel'
+              onProgress({ ...progress, percent: Math.round((index * 100 + progress.percent) / legacySteps.length) })
+            },
             step.skipPrefixes,
             step.includePrefixes,
           )
         }
       }
+      if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
       interruptedTargets.delete(modelId)
       return { success: true }
     } catch (err: any) {
@@ -1402,6 +1394,15 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       active.finish()
       notifyWeightChange()
     }
+  }
+  ipcMain.handle('model:download', downloadInstalledModel)
+  ipcMain.handle('model:downloadSources', async (event, payload: unknown) => {
+    try {
+      const { modelId } = parseLegacyModelDownloadPayloadContract(payload)
+      const plan = await resolveModelPlan(modelId)
+      if (plan.kind !== 'multi-source') throw new Error(`Model node "${modelId}" does not declare model_sources`)
+      return downloadInstalledModel(event, modelId)
+    } catch (error) { return modelAssetDownloadResult(error) }
   })
 
   ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
@@ -1969,12 +1970,25 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       // name can never be a built-in.
       const extensionsDir = getSettings(app.getPath('userData')).extensionsDir
 
+      let safeExtensionId: string | undefined
       try {
-        const safeExtensionId = assertSafeExtensionId(extensionId)
+        safeExtensionId = assertSafeExtensionId(extensionId)
         if (existsSync(resolveExtensionPathWithinRoot(getBuiltinExtensionsDir(), safeExtensionId))) {
           return { success: false, error: `"${safeExtensionId}" is a built-in extension and cannot be uninstalled.` }
         }
       } catch { /* non-conforming folder name → not a built-in */ }
+
+      if (safeExtensionId) {
+        const extensionRoot = resolveExtensionModelRoot(getSettings(app.getPath('userData')).modelsDir, safeExtensionId)
+        const ownerId = safeExtensionId
+        const weightsRemoved = await weightOperations.remove(
+          [extensionRoot],
+          () => unloadExtensionForRemoval(ownerId),
+          () => rmWithRetry(extensionRoot, 'extension-model-delete'),
+        )
+        if (!weightsRemoved.ok) return { success: false, error: String(weightsRemoved.error) }
+        notifyWeightChange()
+      }
 
       // Terminate process runner if it's a process extension
       terminateProcessRunner(extensionId)
@@ -2095,6 +2109,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         'local folder',
       )
       const extensionId = assertSafeExtensionId(rawManifestId)
+      const trustedRepos = await fetchTrustedRepos()
+      const annotatedManifest = { ...manifest, source: `local://${localPath}` }
+      const ext = parseManifestForInstall(annotatedManifest, extensionId, trustedRepos)
 
       // 3. Create symlink / junction in extensionsDir
       const userData      = app.getPath('userData')
@@ -2130,11 +2147,6 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         }
         backupDir = buildExtensionBackupPath(extensionsDir, extensionId, installSuffix)
       }
-
-      const trustedRepos = await fetchTrustedRepos()
-      // Build manifest with localPath marker so the UI can identify local extensions
-      const annotatedManifest = { ...manifest, source: `local://${localPath}` }
-      const ext = parseExtensionManifest(annotatedManifest, extensionId, trustedRepos)
 
       try {
         await runExtensionRegistrationValidationTransaction(

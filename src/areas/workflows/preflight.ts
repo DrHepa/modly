@@ -2,7 +2,7 @@ import { getPositionalInputTypes, hasNamedProcessInputs } from './processPorts'
 import { hydrateWorkflowNodeParams, resolveWorkflowPrompt } from './workflowNodeParams'
 import { validateWorkflowProcessRun } from './processConnectionRules'
 import type { Workflow, WFNode } from '@shared/types/electron.d'
-import { WORKFLOW_BUILTIN_NODE_CONTRACTS, workflowBuiltinParamIsRequired } from '../../shared/workflowBuiltinContracts.ts'
+import { WORKFLOW_BUILTIN_NODE_CONTRACTS, isSafeWorkflowWorkspacePath, workflowBuiltinParamIsRequired } from '../../shared/workflowBuiltinContracts.ts'
 import { getWorkflowExtension, type WorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
 import { isPassthrough, isBranchConsumer, resolveDataSource, nearestUpstreamWaits } from './nodeBehaviors'
@@ -57,6 +57,7 @@ function getNodeOutputType(node: WFNode, allExtensions: WorkflowExtension[]): Da
   if (node.type === 'imageNode') return 'image'
   if (node.type === 'videoNode') return 'video'
   if (node.type === 'textNode') return 'text'
+  if (node.type === 'captureNode') return 'capture'
   if (node.type === 'meshNode' || node.type === 'outputNode' || node.type === 'addToWorldsNode') return 'mesh'
   if (node.type === 'sceneNode') return 'scene'
   if (node.type === 'imagePreviewNode') return 'image'
@@ -124,6 +125,15 @@ export function validateWorkflowPreflight(
           nodeId: node.id,
           message: `${nodeLabel(node, allExtensions)} needs a selected video.`,
         })
+      } else if (typeof videoPath === 'string') {
+        const extension = videoPath.split('.').pop()?.toLowerCase()
+        if (!isSafeWorkflowWorkspacePath(videoPath) || !extension || !['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'].includes(extension)) {
+          pushIssue(issues, {
+            key: `${node.id}:invalid:videoPath`,
+            nodeId: node.id,
+            message: `${nodeLabel(node, allExtensions)} needs a safe workspace video file.`,
+          })
+        }
       }
     }
 

@@ -143,19 +143,20 @@ export function normalizeAgentProcessDeclaration(value: unknown, entryValue: unk
   exactKeys(process, ['schema', 'runtimeFiles', 'resourceFiles', 'runtime', 'modelAccess', 'artifacts'], 'Agent process metadata')
   if (process.schema !== PROCESS_SCHEMA) throw new AgentProcessManifestError('invalid_metadata', 'Agent process schema is invalid')
   const entry = normalizeAgentProcessRelativePath(entryValue, 'Process entry')
-  if (!/\.(?:js|mjs|pyz)$/i.test(entry)) {
-    throw new AgentProcessManifestError('invalid_metadata', 'Agent process entry must be a self-contained JavaScript bundle or Python zipapp')
+  const pythonEntry = entry === 'processor.py'
+  if (!/\.(?:js|mjs)$/i.test(entry) && !pythonEntry) {
+    throw new AgentProcessManifestError('invalid_metadata', 'Agent process entry must be a JavaScript bundle or root processor.py')
   }
   if (!Array.isArray(process.runtimeFiles) || process.runtimeFiles.length !== 1) {
-    throw new AgentProcessManifestError('invalid_metadata', 'Agent process runtimeFiles must contain exactly one self-contained entry bundle')
+    throw new AgentProcessManifestError('invalid_metadata', 'Agent process runtimeFiles must contain exactly one entry file')
   }
   const runtimeFiles = [normalizeAgentProcessRelativePath(process.runtimeFiles[0], 'Agent process runtimeFiles[0]')]
   if (runtimeFiles[0] !== entry) {
     throw new AgentProcessManifestError('invalid_metadata', 'Agent process runtimeFiles must contain only entry')
   }
   const runtime = process.runtime === undefined ? undefined : normalizePythonRuntime(process.runtime)
-  if (runtime !== undefined && !/\.pyz$/i.test(entry)) {
-    throw new AgentProcessManifestError('invalid_metadata', 'Extension Python runtime may execute only a Python zipapp')
+  if (pythonEntry !== (runtime !== undefined)) {
+    throw new AgentProcessManifestError('invalid_metadata', 'Root processor.py requires the extension Python venv runtime')
   }
   const modelAccess = process.modelAccess === undefined ? undefined : normalizeModelAccess(process.modelAccess)
   if (modelAccess !== undefined && runtime === undefined) {
@@ -281,6 +282,9 @@ export async function bindAgentProcessExecution(
     for (const path of [...declaration.runtimeFiles].sort()) {
       const bound = await openRuntimeFile(extensionDir, path, 'bundle')
       opened.push(bound.handle)
+      if (declaration.runtime && (bound.identity.mode & 0o111) !== 0) {
+        throw new AgentProcessManifestError('unsafe_runtime', 'Agent process Python source must not be executable')
+      }
       runtimeFiles.push(bound.identity)
     }
     const resourceFiles: AgentProcessRuntimeFileIdentityV1[] = []

@@ -10,15 +10,13 @@ const { CallToolRequestSchema, ListToolsRequestSchema } = await import(sdk('type
 
 const pidFile = process.argv[2]
 const server = new Server({ name: 'process-tree-fixture', version: '1.0.0' }, { capabilities: { tools: {} } })
+const child = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"], { stdio: 'ignore' })
+await writeFile(pidFile, JSON.stringify({ parent: process.pid, child: child.pid }))
 setInterval(() => undefined, 1_000)
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [{ name: 'hang', inputSchema: { type: 'object', additionalProperties: false } }],
 }))
-server.setRequestHandler(CallToolRequestSchema, async () => {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' })
-  await writeFile(pidFile, JSON.stringify({ parent: process.pid, child: child.pid }))
-  return new Promise(() => undefined)
-})
+server.setRequestHandler(CallToolRequestSchema, async () => new Promise(() => undefined))
 
 await server.connect(new StdioServerTransport())

@@ -13,6 +13,19 @@ MAX_REFERENCED_FILE_BYTES = 16 * 1024**3
 MAX_REFERENCED_TOTAL_BYTES = 64 * 1024**3
 
 
+def validate_scene_model_inputs(node: dict) -> None:
+    """Backward-compatible scene-only entry point for manifest discovery tests."""
+    from services.capture_input import validate_typed_model_node_inputs
+
+    try:
+        validate_typed_model_node_inputs(node)
+    except ValueError as exc:
+        raise ValueError(
+            f'model node "{node.get("id", "unknown")}" scene input supports only '
+            "one scene and an optional text prompt; image and mesh inputs are not supported"
+        ) from exc
+
+
 def _relative(value: str, *, allow_dot: bool = False) -> Path:
     if not isinstance(value, str) or not value or value != value.strip() or "\x00" in value:
         raise ValueError("Scene path must be a nonempty workspace-relative path")

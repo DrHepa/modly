@@ -53,8 +53,13 @@ def test_hf_download_route_streams_progress_and_done(monkeypatch, tmp_path: Path
     )
     monkeypatch.setattr(
         model_router.generator_registry,
-        "get_manifest",
-        lambda resolved_model_id: {},
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/model",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": [],
+            "hf_include_prefixes": [],
+        },
     )
 
     def fake_download_file_streamed(**kwargs):
@@ -94,6 +99,39 @@ def test_hf_download_route_streams_progress_and_done(monkeypatch, tmp_path: Path
     assert (dest_dir / "weights.bin").read_bytes() == b"mesh"
 
 
+def test_hf_download_rejects_filters_that_exclude_manifest_download_check(monkeypatch, tmp_path: Path):
+    model_router = _load_model_router_module()
+    model_id = "demo/generate"
+
+    _install_fake_huggingface_hub(monkeypatch, files=["weights.bin", "config.json"])
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda resolved_model_id: tmp_path / resolved_model_id,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/model",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": ["weights"],
+            "hf_include_prefixes": ["config"],
+        },
+    )
+
+    async def run_test() -> list[dict]:
+        response = await model_router.hf_download(model_id=model_id)
+        return await _collect_stream_events(response)
+
+    events = asyncio.run(run_test())
+
+    assert events[-1]["error"]["code"] == "source_plan_invalid"
+    assert events[-1]["error"]["retryable"] is False
+    assert events[-1]["error"]["stage"] == "validate"
+    assert model_id not in model_router._download_controls
+
+
 def test_hf_download_cancel_cleans_partial_files_and_preserves_completed_files(
     monkeypatch,
     tmp_path: Path,
@@ -115,8 +153,13 @@ def test_hf_download_cancel_cleans_partial_files_and_preserves_completed_files(
     )
     monkeypatch.setattr(
         model_router.generator_registry,
-        "get_manifest",
-        lambda resolved_model_id: {},
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/model",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": [],
+            "hf_include_prefixes": [],
+        },
     )
 
     def fake_download_file_streamed(**kwargs):
@@ -158,6 +201,66 @@ def test_hf_download_cancel_cleans_partial_files_and_preserves_completed_files(
     assert model_id not in model_router._download_controls
 
 
+def test_hf_download_immediate_cancel_before_stream_prevents_backend_fetch(
+    monkeypatch,
+    tmp_path: Path,
+):
+    model_router = _load_model_router_module()
+    model_id = "demo/generate"
+    calls: list[str] = []
+
+    _install_fake_huggingface_hub(monkeypatch, files=["weights.bin"])
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda resolved_model_id: tmp_path / resolved_model_id,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/model",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": [],
+            "hf_include_prefixes": [],
+        },
+    )
+
+    def fake_download_file_streamed(**_kwargs):
+        calls.append("download")
+        raise AssertionError("download must not start after immediate cancellation")
+
+    monkeypatch.setattr(model_router, "_download_file_streamed", fake_download_file_streamed)
+
+    async def run_test() -> list[dict]:
+        await model_router.cancel_hf_download(model_id)
+        response = await model_router.hf_download(
+            repo_id="owner/model",
+            model_id=model_id,
+        )
+        return await _collect_stream_events(response)
+
+    events = asyncio.run(run_test())
+
+    assert calls == []
+    assert events[-1] == {"cancelled": True, "status": "cancelled"}
+    assert model_id not in model_router._download_controls
+
+
+def test_backend_control_registration_preserves_pending_cancel_before_new_download():
+    model_router = _load_model_router_module()
+    model_id = "demo/generate"
+
+    asyncio.run(model_router.cancel_hf_download(model_id))
+    control = model_router._new_download_control(model_id)
+
+    assert control["cancel"].is_set()
+    with pytest.raises(model_router.DownloadCancelled):
+        model_router._check_download_control(control)
+    if model_router._download_controls.get(model_id) is control:
+        model_router._download_controls.pop(model_id, None)
+
+
 def test_hf_download_pause_preserves_partial_file_and_next_session_starts_fresh(
     monkeypatch,
     tmp_path: Path,
@@ -177,8 +280,13 @@ def test_hf_download_pause_preserves_partial_file_and_next_session_starts_fresh(
     )
     monkeypatch.setattr(
         model_router.generator_registry,
-        "get_manifest",
-        lambda resolved_model_id: {},
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/model",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": [],
+            "hf_include_prefixes": [],
+        },
     )
 
     def fake_download_file_streamed(**kwargs):
@@ -249,3 +357,47 @@ def test_hf_download_pause_preserves_partial_file_and_next_session_starts_fresh(
     assert any(event.get("status") == "Resuming... 100%" for event in second_events)
     assert (dest_dir / "weights.bin").read_bytes() == b"partial-done"
     assert model_id not in model_router._download_controls
+
+
+def test_hf_download_rejects_renderer_supplied_repo_or_filter_mismatch(monkeypatch, tmp_path: Path):
+    model_router = _load_model_router_module()
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "canonical_model_dir",
+        lambda resolved_model_id: tmp_path / resolved_model_id,
+    )
+    monkeypatch.setattr(
+        model_router.generator_registry,
+        "get_legacy_hf_download_plan",
+        lambda resolved_model_id: {
+            "repo_id": "owner/manifest",
+            "download_check": "weights.bin",
+            "hf_skip_prefixes": ["skip/"],
+            "hf_include_prefixes": ["weights/"],
+        },
+    )
+
+    async def run_repo():
+        with pytest.raises(model_router.HTTPException) as raised:
+            await model_router.hf_download(
+                repo_id="attacker/repo",
+                model_id="demo/generate",
+            )
+        return raised.value
+
+    async def run_filters():
+        with pytest.raises(model_router.HTTPException) as raised:
+            await model_router.hf_download(
+                repo_id="owner/manifest",
+                model_id="demo/generate",
+                skip_prefixes=json.dumps(["other/"]),
+                include_prefixes=json.dumps(["weights/"]),
+            )
+        return raised.value
+
+    repo_exc = asyncio.run(run_repo())
+    filter_exc = asyncio.run(run_filters())
+    assert repo_exc.status_code == 422
+    assert "manifest-owned legacy plan" in repo_exc.detail["message"]
+    assert filter_exc.status_code == 422
+    assert "manifest-owned legacy plan" in filter_exc.detail["message"]

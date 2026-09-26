@@ -3,6 +3,12 @@ import io
 import json
 import queue
 import threading
+import time
+from pathlib import Path
+
+from services.capture_input import TypedModelInput
+from services.video_input import validate_video_input, video_snapshot_to_dict
+from services.extension_process import _RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS
 
 import pytest
 
@@ -905,6 +911,60 @@ def test_extension_process_preserves_legacy_image_message(monkeypatch, tmp_path)
     assert "input" not in message
 
 
+def test_extension_process_sends_typed_video_snapshot_outside_params(monkeypatch, tmp_path):
+    import services.generator_registry as registry_module
+
+    workspace = tmp_path / "workspace"
+    video_path = workspace / "Workflows" / "Imported Videos" / "clip.mp4"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2")
+    path, snapshot = validate_video_input(workspace, "Workflows/Imported Videos/clip.mp4")
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace)
+    process = ExtensionProcess(tmp_path, {"id": "demo/video", "input": "video"})
+    sent: list[dict] = []
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    def reply_on_send(message):
+        sent.append(message)
+        if message["action"] == "generate":
+            process._queue.put({
+                "type": "done",
+                "id": message["id"],
+                "output_path": str(tmp_path / "mesh.glb"),
+            })
+            # A missing terminal reply must fail, never hang this fixture.
+            process._queue.put(None)
+
+    monkeypatch.setattr(process, "_send", reply_on_send)
+
+    process.generate(TypedModelInput("video", path, snapshot), {"quality": "draft"})
+
+    message = sent[0]
+    assert set(message) == {"action", "id", "model_id", "input", "params", "outputs_dir"}
+    assert message["model_id"] == "demo/video"
+    assert message["input"] == {"kind": "video", "path": str(path), "snapshot": video_snapshot_to_dict(snapshot)}
+    assert message["params"] == {"quality": "draft"}
+    assert "path" not in message["params"]
+    assert "image_b64" not in message
+
+
+def test_extension_process_exports_workspace_generation_input_root(monkeypatch, tmp_path):
+    import services.generator_registry as registry_module
+    from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
+
+    workspace_dir = tmp_path / "workspace"
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace_dir)
+
+    process = ExtensionProcess(tmp_path / "extension", {"id": "demo/video", "input": "video"})
+    env = process._build_env()
+
+    assert env[MODLY_WORKSPACE_DIR_ENV] == str(workspace_dir.resolve())
+
 def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tmp_path):
     process = ExtensionProcess(tmp_path, {"id": "demo/video", "input": "video"})
     sent: list[dict] = []
@@ -940,14 +1000,142 @@ def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tm
     assert "image_b64" not in message
 
 
-def test_extension_process_exports_workspace_generation_input_root(monkeypatch, tmp_path):
-    import services.generator_registry as registry_module
-    from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
+def test_extension_process_stop_graceful_path_and_kill_fallback_do_not_leak(monkeypatch, tmp_path):
+    sent: list[dict] = []
 
-    workspace_dir = tmp_path / "workspace"
-    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace_dir)
+    class GracefulProc:
+        def __init__(self):
+            self.wait_calls: list[float] = []
+            self.dead = False
+            self.kill_calls = 0
 
-    process = ExtensionProcess(tmp_path / "extension", {"id": "demo/video", "input": "video"})
-    env = process._build_env()
+        def poll(self):
+            return 0 if self.dead else None
 
-    assert env[MODLY_WORKSPACE_DIR_ENV] == str(workspace_dir.resolve())
+        def kill(self):
+            self.kill_calls += 1
+            self.dead = True
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            return 0
+
+    graceful = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    graceful._proc = graceful_worker = GracefulProc()
+    graceful._loaded = True
+    graceful._queue.put({"type": "ready"})
+    monkeypatch.setattr(graceful, "_send", sent.append)
+
+    graceful.stop()
+
+    assert sent == []
+    assert graceful_worker.kill_calls == 1
+    assert graceful_worker.wait_calls == [5]
+    assert graceful._proc is None
+    assert graceful._loaded is False
+    assert graceful._queue.get_nowait() is None
+    assert graceful._queue.empty()
+
+    class KillProc:
+        def __init__(self):
+            self.kill_calls = 0
+            self.dead = False
+            self.wait_calls: list[float] = []
+
+        def poll(self):
+            return 0 if self.dead else None
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            assert self.dead
+            return 0
+
+        def kill(self):
+            self.kill_calls += 1
+            self.dead = True
+
+    kill_sent: list[dict] = []
+    fallback = ExtensionProcess(tmp_path, {"id": "runtime-ext/mesh"})
+    fallback._proc = fallback_worker = KillProc()
+    fallback._loaded = True
+    fallback._queue.put({"type": "ready"})
+    monkeypatch.setattr(fallback, "_send", kill_sent.append)
+
+    fallback.stop()
+
+    assert kill_sent == []
+    assert fallback_worker.kill_calls == 1
+    assert fallback_worker.wait_calls == [5]
+    assert fallback._proc is None
+    assert fallback._loaded is False
+    assert fallback._queue.get_nowait() is None
+    assert fallback._queue.empty()
+
+
+def test_extension_process_concurrent_readiness_and_load_start_one_pid(monkeypatch, tmp_path):
+    from services.extension_process import RuntimeReadinessUnavailable
+
+    process = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    start_calls = 0
+    start_entered = threading.Event()
+    ready_release = threading.Event()
+    sent: list[dict] = []
+    errors: list[BaseException] = []
+
+    class RunningProc:
+        pid = 999
+        def poll(self):
+            return None
+
+    worker = RunningProc()
+    def fake_start() -> None:
+        nonlocal start_calls
+        start_calls += 1
+        start_entered.set()
+        assert ready_release.wait(timeout=1)
+        process._proc = worker
+
+    def send(message):
+        sent.append(message)
+        if message["action"] == "load":
+            process._queue.put({"type": "loaded"})
+        else:
+            assert message["action"] == "runtime_readiness"
+            process._route_readiness_reply(worker, {
+                "type": "runtime_readiness", "id": message["id"],
+                "status": {"ok": True, "machine_code": "ready"},
+            })
+    monkeypatch.setattr(process, "_start", fake_start)
+    monkeypatch.setattr(process, "_send", send)
+    with pytest.raises(RuntimeReadinessUnavailable, match="diagnostics do not start"):
+        process.readiness_status()
+    assert start_calls == 0
+    assert sent == []
+    readiness_result = {}
+    def run_readiness() -> None:
+        try:
+            readiness_result.update(process.readiness_status())
+        except BaseException as exc:
+            errors.append(exc)
+    def run_load() -> None:
+        try:
+            process.load()
+        except BaseException as exc:
+            errors.append(exc)
+    readiness_thread = threading.Thread(target=run_readiness)
+    load_thread = threading.Thread(target=run_load)
+    load_thread.start()
+    try:
+        assert start_entered.wait(timeout=1)
+        readiness_thread.start()
+    finally:
+        ready_release.set()
+        load_thread.join(timeout=1)
+        readiness_thread.join(timeout=1)
+    assert not load_thread.is_alive() and not readiness_thread.is_alive()
+    assert errors == []
+    assert start_calls == 1
+    assert readiness_result == {"ok": True, "machine_code": "ready"}
+    assert [message["action"] for message in sent] == ["load", "runtime_readiness"]
+    assert sent[1]["id"].startswith("readiness:")
+

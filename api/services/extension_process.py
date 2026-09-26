@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from services.generation_inputs import MODLY_WORKSPACE_DIR_ENV
 from services.hf_download_assets import hf_download_assets_ready
 from services.https_download_assets import https_download_assets_ready
+from services.download_check import safe_download_check_exists
 
 _RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 _MISSING_MODULE_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
@@ -82,6 +83,7 @@ class ExtensionProcess:
         self.hf_downloads      = manifest.get("hf_downloads", [])
         self.https_downloads   = manifest.get("https_downloads", [])
         self.hf_skip_prefixes = manifest.get("hf_skip_prefixes", [])
+        self.hf_include_prefixes = manifest.get("hf_include_prefixes", [])
         self.download_check   = manifest.get("download_check", "")
         self._params_schema   = manifest.get("params_schema", [])
 
@@ -348,7 +350,29 @@ class ExtensionProcess:
         if self.hf_downloads:
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
-            return (self.model_dir / self.download_check).exists()
+            import os
+            if self.model_dir.is_symlink() or not isinstance(self.download_check, str) or Path(self.download_check).is_absolute() or "\\" in self.download_check:
+                return False
+            # Inspect raw descendants before normalization can erase a symlink
+            # with '..'; parent traversal remains confined to the extension root.
+            check_root = self.model_dir.parent if "/" in self.model_id else self.model_dir
+            current = self.model_dir
+            try:
+                for part in Path(self.download_check).parts:
+                    if part == "..":
+                        if current == check_root:
+                            return False
+                        current = current.parent
+                    else:
+                        current = current / part
+                        if current.is_symlink():
+                            return False
+            except (OSError, RuntimeError):
+                return False
+            if "/" in self.model_id:
+                check = os.path.normpath(f"{self.model_dir.name}/{self.download_check}").replace(os.sep, "/")
+                return safe_download_check_exists(self.model_dir.parent, check)
+            return safe_download_check_exists(self.model_dir, self.download_check)
         return self.model_dir.exists() and any(self.model_dir.iterdir())
 
     def is_loaded(self) -> bool:
@@ -389,12 +413,21 @@ class ExtensionProcess:
 
     def generate(
         self,
-        image_bytes: bytes | Path,
+        image_bytes,
         params: dict,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
-        if isinstance(image_bytes, bytes):
+        from services.capture_input import TypedModelInput, revalidate_typed_model_input
+        if isinstance(image_bytes, TypedModelInput):
+            from services.generator_registry import WORKSPACE_DIR
+            typed = revalidate_typed_model_input(WORKSPACE_DIR, image_bytes)
+            envelope = {"kind": typed.kind, "path": str(typed.path)}
+            if typed.kind == "video":
+                from services.video_input import video_snapshot_to_dict
+                envelope["snapshot"] = video_snapshot_to_dict(typed.snapshot)
+            input_payload = {"input": envelope}
+        elif isinstance(image_bytes, bytes):
             input_payload = {"image_b64": base64.b64encode(image_bytes).decode()}
         elif isinstance(image_bytes, Path):
             if self.input != "video":

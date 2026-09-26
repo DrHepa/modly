@@ -2,6 +2,7 @@ import { existsSync, realpathSync, statSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { cp, mkdir, mkdtemp, readFile, readdir, lstat, realpath, rm, writeFile } from 'node:fs/promises'
 import { join, isAbsolute, relative, resolve, win32 } from 'node:path'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import axios from 'axios'
 import { buildSync } from 'esbuild'
@@ -11,6 +12,8 @@ import { activeExtensionInstalls } from './automation-capabilities'
 import { validateInstallManifest, validateExistingExtensionReplacement, expectedModelIds, validateExtensionReloadPayload, validateExtensionQuarantinePayload } from './extension-install-utils'
 import { assertSafeExtensionId, resolveExtensionPathWithinRoot, buildExtensionBackupPath, buildExtensionStagingPath, EXT_INCOMPLETE_MARKER, EXT_REGISTRATION_PENDING_MARKER, EXT_VALIDATED_MARKER } from './extension-path-guard'
 import { beginExtensionRegistrationTransaction, cleanupValidatedExtensionBackups, clearExtensionRegistrationTransaction, restoreExtensionBackup, renameWithRetry, rmWithRetry, validateExtensionDestinationRegistration, type ExtensionRegistrationValidationCapability } from './extension-install-recovery'
+import { projectAgentOnlyNodesForLegacy } from './automation-capabilities'
+import { sha256Canonical } from './agent-trust-contracts'
 
 export type InstallCandidateType = 'model' | 'process'
 
@@ -190,6 +193,100 @@ async function readManifest(path: string): Promise<ParsedManifest> {
   return manifest as ParsedManifest
 }
 
+export function parseManifestForInstall(
+  manifest: ParsedManifest,
+  fallbackId: string,
+  trustedRepos: Set<string>,
+): ListedExtension {
+  const rawAgentNodes = getRawAgentNodes(manifest)
+  if (rawAgentNodes.length === 0) return parseExtensionManifest(manifest, fallbackId, trustedRepos)
+  if (manifest.type !== 'process') {
+    throw new Error(`${fallbackId}: Agent declarations require a process manifest`)
+  }
+  assertUniqueManifestNodeIds(manifest, fallbackId)
+
+  const governed = parseExtensionManifest(
+    manifest, fallbackId, trustedRepos, false, { governedAgentKinds: true },
+  )
+  for (const { index, node: rawNode } of rawAgentNodes) {
+    const normalizedNode = governed.nodes[index]
+    if (!normalizedNode || normalizedNode.id !== rawNode.id || normalizedNode.agent === undefined) {
+      throw new Error(`${fallbackId}/${String(rawNode.id)}: Agent declaration is invalid`)
+    }
+  }
+  return parseExtensionManifest(projectAgentOnlyNodesForLegacy(manifest), fallbackId, trustedRepos)
+}
+
+function getRawAgentNodes(manifest: ParsedManifest): Array<{
+  index: number
+  node: NonNullable<ParsedManifest['nodes']>[number]
+}> {
+  if (!Array.isArray(manifest.nodes)) return []
+  return manifest.nodes.flatMap((node, index) => (
+    node && typeof node === 'object' && Object.hasOwn(node, 'agent') ? [{ index, node }] : []
+  ))
+}
+
+function assertUniqueManifestNodeIds(manifest: ParsedManifest, fallbackId: string): void {
+  const seen = new Set<string>()
+  for (const node of manifest.nodes ?? []) {
+    if (seen.has(node.id)) throw new Error(`${fallbackId}: duplicate node id "${node.id}"`)
+    seen.add(node.id)
+  }
+}
+
+function installManifestAuthorityHash(manifest: ParsedManifest): string {
+  return sha256Canonical({
+    schema: 'modly.github-governed-install-surface.v1',
+    id: manifest.id,
+    type: manifest.type,
+    source: manifest.source,
+    entry: manifest.entry ?? null,
+    nodes: manifest.nodes,
+  })
+}
+
+async function validateCommittedCandidateStructure(
+  destinationDir: string,
+  relativePath: string,
+  manifest: ParsedManifest,
+): Promise<InstallCandidate> {
+  const committedCandidate = createCandidate(destinationDir, relativePath, manifest)
+  validateCandidate(committedCandidate)
+  const entryFile = committedCandidate.type === 'process' ? committedCandidate.entryFile : 'generator.py'
+  const info = await lstat(join(destinationDir, entryFile))
+  if (!info.isFile()) {
+    throw new Error(`${committedCandidate.id}: entry file "${entryFile}" must be a regular file`)
+  }
+  return committedCandidate
+}
+
+async function governedEntryIdentityHash(destinationDir: string, manifest: ParsedManifest): Promise<string> {
+  if (manifest.type !== 'process') throw new Error('Governed Agent process entry is invalid')
+  const entry = manifest.entry ?? 'processor.js'
+  const entryPath = join(destinationDir, entry)
+  const info = await lstat(entryPath, { bigint: true })
+  if (!info.isFile()) throw new Error('Governed Agent process entry must be a regular file')
+  const mode = Number(info.mode & 0o7777n)
+  if (entry === 'processor.py' && (mode & 0o111) !== 0) {
+    throw new Error('Governed Agent processor.py must not be executable')
+  }
+  const content = await readFile(entryPath)
+  return sha256Canonical({
+    schema: 'modly.github-governed-entry-identity.v1',
+    entry,
+    device: info.dev.toString(),
+    inode: info.ino.toString(),
+    uid: info.uid.toString(),
+    gid: info.gid.toString(),
+    mode,
+    size: info.size.toString(),
+    mtimeNs: info.mtimeNs.toString(),
+    ctimeNs: info.ctimeNs.toString(),
+    sha256: createHash('sha256').update(content).digest('hex'),
+  })
+}
+
 function createCandidate(sourceDir: string, relativePath: string, manifest: ParsedManifest): InstallCandidate {
   return {
     id: manifest.id ?? '', type: manifest.type === 'process' ? 'process' : 'model',
@@ -252,7 +349,7 @@ export async function validateInstallCandidates({ repoDir, sourceRepo, discovery
     roots.push(root)
     await validateSourceTree(candidate.sourceDir)
     const manifest = { ...candidate.manifest, id, source: canonicalizeGitHubRepoUrl(sourceRepo) }
-    parseExtensionManifest(manifest, id, new Set(), false)
+    parseManifestForInstall(manifest, id, new Set())
     candidates.push({ ...candidate, id, manifest })
   }
   return { mode: discovery.mode, candidates, sourceRepo: canonicalizeGitHubRepoUrl(sourceRepo), reloadCount: 1 }
@@ -405,11 +502,23 @@ export async function installGitHubExtensionRepo({ githubUrl, extensionsDir, bui
           beforeActivate: ops.terminateProcessRunner,
           async postCopyStep({ destinationDir }) {
             const log = (message: string) => emit('setting_up', { extensionId: candidate.id, message })
+            let manifest = await readManifest(join(destinationDir, 'manifest.json'))
+            if (installManifestAuthorityHash(manifest) !== installManifestAuthorityHash(candidate.manifest)) {
+              throw new Error('Install manifest authority changed before setup')
+            }
+            parseManifestForInstall(manifest, candidate.id, trustedRepos)
+            await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
             if (candidate.type === 'process' && candidate.entryFile.endsWith('.ts')) {
               const entry = await ops.compileTypeScriptEntry({ candidate, destinationDir, entryFile: candidate.entryFile })
               candidate.manifest.entry = entry
               await ops.writeTextFile(join(destinationDir, 'manifest.json'), JSON.stringify(candidate.manifest, null, 2))
             }
+            manifest = await readManifest(join(destinationDir, 'manifest.json'))
+            parseManifestForInstall(manifest, candidate.id, trustedRepos)
+            await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+            const expectedAuthorityHash = installManifestAuthorityHash(manifest)
+            const expectedEntryIdentityHash = getRawAgentNodes(manifest).length > 0
+              ? await governedEntryIdentityHash(destinationDir, manifest) : undefined
             const python = candidate.type === 'model' || candidate.entryFile.endsWith('.py')
             if (python && existsSync(join(destinationDir, 'setup.py'))) {
               childStage = 'setup'
@@ -418,6 +527,16 @@ export async function installGitHubExtensionRepo({ githubUrl, extensionsDir, bui
               childStage = 'npm'
               await ops.runNpmInstall({ candidate, candidateId: candidate.id, destinationDir, onLog: log })
             }
+            manifest = await readManifest(join(destinationDir, 'manifest.json'))
+            await validateCommittedCandidateStructure(destinationDir, candidate.relativePath, manifest)
+            if (installManifestAuthorityHash(manifest) !== expectedAuthorityHash) {
+              throw new Error('Install manifest authority changed during setup')
+            }
+            parseManifestForInstall(manifest, candidate.id, trustedRepos)
+            if (expectedEntryIdentityHash !== undefined && await governedEntryIdentityHash(destinationDir, manifest) !== expectedEntryIdentityHash) {
+              throw new Error('Governed Agent process entry changed during setup')
+            }
+            candidate.manifest = manifest
           },
         })
         prepared.push(...transactions)
@@ -441,7 +560,7 @@ export async function installGitHubExtensionRepo({ githubUrl, extensionsDir, bui
           if (reloadError) throw reloadError
           validateExtensionReloadPayload(payload, candidate.id, expectedModelIds(candidate.manifest))
         }
-        const extension = parseExtensionManifest(candidate.manifest, candidate.id, trustedRepos)
+        const extension = parseManifestForInstall(candidate.manifest, candidate.id, trustedRepos)
         assertMutation(await cleanupValidatedExtensionBackups(extensionsDir, candidate.id), 'Could not commit validated registration cleanup')
         installed.push({ extensionId: candidate.id, extension, status: 'success' })
         emit('child_result', { extensionId: candidate.id, status: 'success' })
@@ -593,7 +712,7 @@ function resolveGitHubInstallOperations(overrides?: Partial<InstallGitHubExtensi
 async function defaultRunNpmInstall({ destinationDir, onLog }: RunNpmInstallInput): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    const child = spawn(npm, ['install', '--omit=dev', '--no-audit', '--no-fund', '--ignore-scripts=false'], {
+    const child = spawn(npm, [existsSync(join(destinationDir, 'package-lock.json')) ? 'ci' : 'install', '--omit=dev', '--no-audit', '--no-fund', '--ignore-scripts=false'], {
       cwd: destinationDir,
       stdio: 'pipe',
     })

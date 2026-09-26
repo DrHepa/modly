@@ -20,6 +20,7 @@ export type NormalizeWorkflowEdgesResult = {
 
 const LEGACY_TARGET_ALIAS = 'input-0'
 const LEGACY_SOURCE_ALIAS = 'output'
+const POSITIONAL_TARGET_ALIAS_RE = /^input-(\d+)$/
 
 function getExtensionForNode(node: WFNode | undefined, allExtensions: WorkflowExtension[]): WorkflowExtension | undefined {
   if (!node || node.type !== 'extensionNode') return undefined
@@ -33,6 +34,14 @@ function normalizeLegacyHandle(handle: string | null | undefined): NormalizeHand
 
 function getDeclaredTargetPorts(extension: WorkflowExtension) {
   return getProcessTargetPorts(extension).filter((port): port is typeof port & { name: string } => !port.isLegacy && typeof port.name === 'string')
+}
+
+function getPositionalTargetPortName(handle: string, namedPorts: Array<{ name: string }>): string | undefined {
+  const match = POSITIONAL_TARGET_ALIAS_RE.exec(handle)
+  if (!match) return undefined
+  const index = Number(match[1])
+  if (!Number.isSafeInteger(index)) return undefined
+  return namedPorts[index]?.name
 }
 
 function normalizeTargetHandle(node: WFNode | undefined, allExtensions: WorkflowExtension[], handle: string | null | undefined): NormalizeHandleResult {
@@ -52,6 +61,11 @@ function normalizeTargetHandle(node: WFNode | undefined, allExtensions: Workflow
 
   const primaryPort = namedPorts[0]?.name
   if (!primaryPort) return normalizeLegacyHandle(handle)
+
+  if (typeof handle === 'string') {
+    const positionalPortName = getPositionalTargetPortName(handle, namedPorts)
+    if (positionalPortName) return { handle: positionalPortName, changed: positionalPortName !== handle }
+  }
 
   if (handle == null || handle === LEGACY_TARGET_ALIAS) {
     return { handle: primaryPort, changed: primaryPort !== handle }

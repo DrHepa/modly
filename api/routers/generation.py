@@ -28,6 +28,8 @@ from services.generation_jobs import (
     require_model_id,
     require_model_input,
 )
+from services.capture_input import validate_capture_input
+from services.scene_input import validate_scene_input
 
 router = APIRouter(tags=["generation"])
 
@@ -134,7 +136,8 @@ async def generate_from_artifact(
 ):
     """Queue a validated typed artifact without serializing it as image bytes."""
     manifest = validate_model_id(request.model_id)
-    declared = manifest.get("inputs") or [manifest.get("input", "image")]
+    from services.capture_input import _iter_declared_input_types
+    declared = list(_iter_declared_input_types(manifest))
     if request.input_kind not in declared:
         raise HTTPException(400, f"Model {request.model_id} does not accept {request.input_kind} input")
     try:
@@ -148,7 +151,10 @@ async def generate_from_artifact(
         k: v for k, v in request.params.items()
         if k not in RESERVED_ARTIFACT_PARAMS and k != "input_scene_path"
     }
-    params["scene_manifest_path"] = str(artifact.path)
+    params = {"remesh": request.remesh, "enable_texture": request.enable_texture,
+              "texture_resolution": request.texture_resolution, **params}
+    if artifact.kind in ("scene", "capture"):
+        params[f"{artifact.kind}_manifest_path"] = str(artifact.path)
     job = create_generation_job(
         background_tasks, artifact, params, request.collection,
         manifest.get("output", "mesh"), request.model_id,

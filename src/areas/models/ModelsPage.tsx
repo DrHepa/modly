@@ -3,14 +3,16 @@ import { createPortal } from 'react-dom'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { collectModelOwnershipMetadata, collectReadyOwnerIds, deriveModelOwnershipState } from './modelOwnershipState'
 import { useNavStore } from '@shared/stores/navStore'
-import type { AnyExtension, ModelExtension, SharedWeightGroupState, ModelDownloadFailure, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
+import type { AnyExtension, ModelExtension, SharedWeightGroupState, ModelDownloadFailure, ModelDownloadProgress, ModelDownloadResult, RuntimeReadinessAction } from '@shared/types/electron.d'
 import { deleteModelsThenUninstallExtension, formatModelName, installModelAndRefresh, installModelQueue } from './utils'
 import { ExtensionCard } from './components/ExtensionCard'
 import type { ExtensionNode } from './components/ExtensionCard'
 import { ExtensionDrawer } from './components/ExtensionDrawer'
-import { ICONS, nodeHasManagedWeights, type DownloadMap } from './components/extensionShared'
+import { ICONS, isRetryableModelDownloadFailure, isValidModelDownloadFailure, nodeHasManagedWeights, type DownloadMap } from './components/extensionShared'
 
 // ─── Filters & sorts ──────────────────────────────────────────────────────────
+
+export { isRetryableModelDownloadFailure, isValidModelDownloadFailure }
 
 type FilterId = 'all' | 'process' | 'model' | 'official'
 type SortId   = 'name' | 'type'
@@ -32,6 +34,11 @@ const MODEL_DOWNLOAD_FAILURES_STORAGE_KEY = 'modly:model-download-failures:v1'
 type ExtensionsApiWithLocalInstall = Pick<typeof window.electron.extensions, 'installFromLocal'>
 type ModelApiWithDownloadControls = Pick<typeof window.electron.model, 'pauseDownload' | 'cancelDownload'>
 
+type DownloadingState = Omit<ModelDownloadProgress, 'capabilityId' | 'modelId'> & {
+  paused?: boolean
+  cancelled?: boolean
+}
+
 function hasLocalInstall(api: unknown): api is ExtensionsApiWithLocalInstall {
   return typeof api === 'object' && api !== null && 'installFromLocal' in api && typeof api.installFromLocal === 'function'
 }
@@ -45,7 +52,50 @@ function hasDownloadControls(api: unknown): api is ModelApiWithDownloadControls 
 type ModelDownloadApi = {
   download: (modelId: string, variantId?: string) => Promise<ModelDownloadResult & { paused?: boolean; cancelled?: boolean }>
   downloadAssets: (modelId: string) => Promise<ModelDownloadResult>
+  downloadSources: (modelId: string) => Promise<ModelDownloadResult>
   downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
+}
+
+
+export type InstallAllCandidate = {
+  node: ExtensionNode
+  fullId: string
+  weightOwnerId: string
+}
+
+function downloadPlanIdentity(node: ExtensionNode): string {
+  if (node.httpsDownloads?.length) return `https:${JSON.stringify(node.httpsDownloads)}`
+  if (node.hfDownloads?.length) return `hf-assets:${JSON.stringify(node.hfDownloads)}`
+  if (node.hasModelSources) return `sources:${JSON.stringify(node.modelSources ?? [])}`
+  if (node.hfRepo) return `legacy:${node.hfRepo}:${JSON.stringify(node.hfSkipPrefixes ?? [])}:${JSON.stringify(node.hfIncludePrefixes ?? [])}`
+  return 'none'
+}
+
+export function buildInstallAllQueue(
+  candidates: readonly InstallAllCandidate[],
+  installedIds: readonly string[],
+  downloadingById: Record<string, unknown>,
+): InstallAllCandidate[] {
+  const installed = new Set(installedIds)
+  const activeCapabilityIds = new Set(Object.keys(downloadingById))
+  const activeOwnerIds = new Set(
+    candidates
+      .filter((candidate) => activeCapabilityIds.has(candidate.fullId))
+      .map((candidate) => candidate.weightOwnerId),
+  )
+  const queuedPlanIds = new Set<string>()
+  const queue: InstallAllCandidate[] = []
+
+  for (const candidate of candidates) {
+    if (installed.has(candidate.fullId) || activeCapabilityIds.has(candidate.fullId)) continue
+    if (activeOwnerIds.has(candidate.weightOwnerId)) continue
+    const planId = `${candidate.weightOwnerId}::${downloadPlanIdentity(candidate.node)}`
+    if (queuedPlanIds.has(planId)) continue
+    queuedPlanIds.add(planId)
+    queue.push(candidate)
+  }
+
+  return queue
 }
 
 export function requestModelNodeDownload(
@@ -73,9 +123,10 @@ function loadPersistedDownloadFailures(): Record<string, ModelDownloadFailure> {
   if (typeof window === 'undefined' || !window.localStorage) return {}
   try {
     const value = JSON.parse(window.localStorage.getItem(MODEL_DOWNLOAD_FAILURES_STORAGE_KEY) ?? '{}')
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, ModelDownloadFailure>
-      : {}
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(
+      Object.entries(value).filter(([, failure]) => isValidModelDownloadFailure(failure)),
+    ) as Record<string, ModelDownloadFailure>
   } catch {
     return {}
   }
@@ -475,7 +526,10 @@ export default function ModelsPage(): JSX.Element {
     if (ext.type !== 'model' || installQueues.current.has(ext.id)) return
     installQueues.current.add(ext.id)
     try {
-      const nodes = new Map(ext.nodes.filter(nodeHasManagedWeights).map((node) => [`${ext.id}/${node.id}`, node]))
+      const nodes = new Map(ext.nodes.filter((node) => {
+        const failure = downloadFailures[`${ext.id}/${node.id}`]
+        return nodeHasManagedWeights(node) && (!failure || isRetryableModelDownloadFailure(failure))
+      }).map((node) => [`${ext.id}/${node.id}`, node]))
       await installModelQueue(
         nodes.keys(),
         (id) => window.electron.model.isDownloaded(id),
@@ -976,6 +1030,7 @@ export default function ModelsPage(): JSX.Element {
           localDataIds={localDataIds}
           downloading={downloading}
           sharedGroups={sharedGroupStates[selectedExt.id] ?? []}
+          downloadFailures={downloadFailures}
           ownershipStateById={ownershipStateById}
           loadError={extLoadError(selectedExt)}
           disabled={isBusy}
@@ -1057,31 +1112,17 @@ export default function ModelsPage(): JSX.Element {
                 ) : installedModels.length > 0 && (
                   <div className="flex flex-col gap-2 px-1">
                     <p className="text-[11px] font-medium text-zinc-400">
-                      Also delete downloaded model weights:
+                      Downloaded model weights owned only by this extension will also be deleted.
                     </p>
                     {installedModels.map((v) => {
-                      const id      = `${uninstallTarget}/${v.id}`
-                      const checked = modelsToDelete.has(id)
+                      const id      = v.capabilityId ?? `${uninstallTarget}/${v.id}`
                       return (
-                        <label
+                        <div
                           key={v.id}
-                          className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-zinc-800/60 border border-zinc-700/40 cursor-pointer hover:border-zinc-600/60 transition-colors"
+                          className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-zinc-800/60 border border-zinc-700/40"
                         >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => {
-                              setModelsToDelete((prev) => {
-                                const next = new Set(prev)
-                                if (checked) next.delete(id)
-                                else next.add(id)
-                                return next
-                              })
-                            }}
-                            className="accent-accent w-3.5 h-3.5 rounded"
-                          />
                           <span className="text-xs text-zinc-200">{formatModelName(id)}</span>
-                        </label>
+                        </div>
                       )
                     })}
                   </div>

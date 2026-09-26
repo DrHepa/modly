@@ -1,5 +1,5 @@
 // Type declarations for the Electron API exposed via preload
-import type { ArtifactKind, ArtifactRef, ArtifactSidecar, SceneArtifactManifestV1 } from './artifacts'
+import type { ArtifactKind, ArtifactRef, ArtifactSidecar, CaptureArtifactManifestV1, SceneArtifactManifestV1 } from './artifacts'
 import type { AssetLibraryListResult, AssetLibraryOpenRequest, AssetLibraryOpenResult, AssetLibraryReadRequest, AssetLibraryReadResult } from './assetLibrary.ts'
 import type { LandmarkSidecarV1 } from '../../areas/workflows/landmarks.ts'
 import type { KimodoMotionArtifact } from '../../areas/generate/kimodoMotionAdapter.ts'
@@ -99,6 +99,7 @@ export type {
   ArtifactVersion,
   ArtifactVersionRole,
   LegacyArtifactPayload,
+  CaptureArtifactManifestV1,
   SceneArtifactManifestPreview,
   SceneArtifactManifestV1,
 } from './artifacts'
@@ -149,13 +150,42 @@ export interface HttpsDownloadAsset {
   sha256: string
 }
 
+export interface ModelSource {
+  id: string
+  provider: 'huggingface'
+  repo_id: string
+  revision?: string
+  destination: string
+  include_prefixes?: string[]
+  skip_prefixes?: string[]
+  checks: string[]
+}
+
 export interface ModelDownloadFailure {
   code: string
   stage: string
   message: string
   repoId?: string
+  sourceId?: string
   file?: string
   retryable: boolean
+}
+
+export interface ModelDownloadProgress {
+  capabilityId: string
+  modelId?: string
+  percent: number
+  file?: string
+  fileIndex?: number
+  totalFiles?: number
+  repoIndex?: number
+  totalRepos?: number
+  status?: string
+  paused?: boolean
+  cancelled?: boolean
+  bytesDownloaded?: number
+  totalBytes?: number
+  stalledSeconds?: number
 }
 
 export interface ModelDownloadResult {
@@ -178,16 +208,17 @@ export interface ExtensionNode<
   hfRepo?:          string
   hfDownloads?:     HfDownloadDescriptor[]
   httpsDownloads?:  HttpsDownloadAsset[]
+  hasModelSources?: boolean
+  modelSources?:    ModelSource[]
   downloadCheck?:   string
   hfSkipPrefixes?:  string[]
+  hfIncludePrefixes?: string[]
   capabilityId?:    string
   bundleId?:        string
   weightOwnerId?:   string
   processOwnerId?:  string
   sharedOwner?:     boolean
   legacyPaths?:     string[]
-  hfIncludePrefixes?: string[]
-  hasModelSources?: boolean
   weightGroups?:    string[]
   weightVariants?:  WeightVariantsInfo
   automation?:      CapabilityAutomationMetadata
@@ -232,6 +263,9 @@ export interface ModelOwnershipMetadata {
   legacyPaths: string[]
   hfDownloads?: HfDownloadDescriptor[]
   httpsDownloads?: HttpsDownloadAsset[]
+  hasModelSources?: boolean
+  modelSources?: ModelSource[]
+  downloadCheck?: string
 }
 
 export interface WeightVariantsInfo {
@@ -1269,6 +1303,7 @@ declare global {
         installedWeightVariants: (modelId: string) => Promise<string[] | null>
         deleteWeightVariant: (modelId: string, variantId: string) => Promise<{ success: boolean; error?: string }>
         downloadAssets:      (modelId: string) => Promise<ModelDownloadResult>
+        downloadSources:     (modelId: string) => Promise<ModelDownloadResult>
         downloadHttpsAssets: (modelId: string) => Promise<ModelDownloadResult>
         unloadAll:      () => Promise<{ success: boolean; error?: string }>
         showInFolder:   (modelId: string) => Promise<void>

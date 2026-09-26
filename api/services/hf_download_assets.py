@@ -5,11 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import socket
+import stat
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -23,6 +29,61 @@ _VERIFIED_FILE_CACHE_LOCK = threading.Lock()
 
 class HfDownloadManifestError(ValueError):
     """Raised when an hf_downloads manifest plan is not safe and immutable."""
+
+
+class HfDownloadControlSignal(Exception):
+    """Raised by router-owned download controls for neutral settlement."""
+
+
+def _http_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("redirect URL must use HTTP or HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("redirect URL must not contain credentials")
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, parsed.hostname.rstrip(".").lower(), port
+
+
+class _HfOriginBoundRedirectHandler(HTTPRedirectHandler):
+    """Keep bearer credentials on-origin while allowing signed HTTPS redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            source_origin = _http_origin(req.full_url)
+            target_origin = _http_origin(newurl)
+        except ValueError as error:
+            raise HTTPError(
+                newurl,
+                code,
+                "Unsafe Hugging Face redirect destination",
+                headers,
+                fp,
+            ) from error
+
+        if source_origin[0] == "https" and target_origin[0] != "https":
+            raise HTTPError(
+                newurl,
+                code,
+                "Refusing Hugging Face HTTPS downgrade redirect",
+                headers,
+                fp,
+            )
+
+        redirected = super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            newurl,
+        )
+        if redirected is not None and source_origin != target_origin:
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 def _safe_relative_path(value: Any, context: str) -> str:
@@ -123,9 +184,53 @@ def validate_hf_downloads(value: Any, context: str = "hf_downloads") -> list[dic
 
 
 def resolve_confined_owner_dir(models_dir: Path, owner_dir: Path) -> Path:
-    """Resolve a canonical owner directory and prove it stays below MODELS_DIR."""
-    models_root = models_dir.resolve()
-    resolved_owner = owner_dir.resolve()
+    """Validate and return the logical owner directory below MODELS_DIR.
+
+    The configured MODELS_DIR may itself be a symlink, but existing child
+    components below it must not be symlinks/aliases. Returning the logical
+    path keeps owner control keyed by manifest/capability identity rather than
+    by a resolved victim alias.
+    """
+    configured_root = Path(models_dir)
+    models_root = configured_root.resolve()
+    candidate = Path(owner_dir)
+
+    try:
+        relative_owner = candidate.relative_to(configured_root)
+    except ValueError:
+        try:
+            relative_owner = candidate.resolve().relative_to(models_root)
+        except ValueError as error:
+            raise HfDownloadManifestError(
+                "Canonical model owner resolves outside the configured models directory"
+            ) from error
+
+    if (
+        not relative_owner.parts
+        or any(part in ("", ".", "..") for part in relative_owner.parts)
+    ):
+        raise HfDownloadManifestError(
+            "Canonical model owner must be below the configured models directory"
+        )
+
+    logical_owner = configured_root.joinpath(*relative_owner.parts)
+    current = configured_root
+    for index, segment in enumerate(relative_owner.parts):
+        current = current / segment
+        try:
+            entry = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(entry.st_mode):
+            raise HfDownloadManifestError(
+                "Canonical model owner contains a symbolic link or filesystem alias below the configured models directory"
+            )
+        if not stat.S_ISDIR(entry.st_mode):
+            raise HfDownloadManifestError(
+                "Canonical model owner contains a non-directory path component"
+            )
+
+    resolved_owner = logical_owner.resolve()
     try:
         resolved_owner.relative_to(models_root)
     except ValueError as error:
@@ -136,23 +241,35 @@ def resolve_confined_owner_dir(models_dir: Path, owner_dir: Path) -> Path:
         raise HfDownloadManifestError(
             "Canonical model owner must be below the configured models directory"
         )
-    return resolved_owner
+    return logical_owner
+
+
+def _assert_no_child_aliases(root: Path, relative_path: str, context: str) -> Path:
+    current = root
+    for segment in PurePosixPath(relative_path).parts:
+        current = current / segment
+        try:
+            entry = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(entry.st_mode):
+            raise HfDownloadManifestError(
+                f"{context} contains a symbolic link or filesystem alias below the canonical owner directory"
+            )
+        if current != root / relative_path and not stat.S_ISDIR(entry.st_mode):
+            raise HfDownloadManifestError(
+                f"{context} contains a non-directory path component"
+            )
+    return current
 
 
 def _asset_path(owner_dir: Path, descriptor: Mapping, file_record: Mapping) -> Path:
-    owner_root = owner_dir.resolve()
-    candidate = (
-        owner_root
-        / str(descriptor["target_subdir"])
-        / str(file_record["path"])
-    ).resolve()
-    try:
-        candidate.relative_to(owner_root)
-    except ValueError as error:
-        raise HfDownloadManifestError(
-            "Declared Hugging Face asset resolves outside its canonical owner directory"
-        ) from error
-    return candidate
+    relative_file = "{}/{}".format(descriptor["target_subdir"], file_record["path"])
+    return _assert_no_child_aliases(
+        Path(owner_dir),
+        relative_file,
+        "Declared Hugging Face asset",
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -206,6 +323,8 @@ def hf_download_assets_ready(owner_dir: Path, plan: Any) -> bool:
     """
     try:
         normalized = validate_hf_downloads(plan)
+        if owner_dir.is_symlink():
+            return False
         return all(
             _file_matches_optional_sha256(
                 _asset_path(owner_dir, descriptor, file_record),
@@ -235,6 +354,133 @@ def _default_download_file(**kwargs):
         return hf_hub_download(**kwargs)
 
 
+def _download_status(
+    downloaded: int,
+    total: int | None,
+    attempt: int,
+    retries: int,
+    resumed: bool = False,
+) -> str:
+    prefix = "Resuming..." if resumed and downloaded > 0 else "Downloading..."
+    if total and total > 0:
+        pct = min(100, round(downloaded / total * 100))
+        return f"{prefix} {pct}%"
+    if retries > 1 and attempt > 1:
+        return f"{prefix} retry {attempt}/{retries}"
+    return prefix
+
+
+def _parse_content_length(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _response_total_bytes(headers, already_downloaded: int) -> int | None:
+    content_range = headers.get("Content-Range")
+    if content_range and "/" in content_range:
+        total_raw = content_range.split("/")[-1].strip()
+        try:
+            return int(total_raw)
+        except (TypeError, ValueError):
+            pass
+
+    content_length = _parse_content_length(headers.get("Content-Length"))
+    if content_length is None:
+        return None
+    return already_downloaded + content_length
+
+
+def _download_hf_file_streamed(
+    *,
+    repo_id: str,
+    revision: str,
+    filename: str,
+    target_file: Path,
+    owner_root: Path,
+    token: str | None,
+    force_download: bool,
+    progress_cb: Callable[[dict], None],
+    progress_base: Mapping[str, Any],
+    check_download_control: Callable[[], None] | None,
+) -> int:
+    from huggingface_hub import hf_hub_url
+
+    if check_download_control is not None:
+        check_download_control()
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_file.with_suffix(target_file.suffix + ".part")
+    _assert_no_child_aliases(
+        owner_root,
+        str(temp_path.relative_to(owner_root)),
+        "Hugging Face temporary asset",
+    )
+    if force_download:
+        temp_path.unlink(missing_ok=True)
+    existing_bytes = temp_path.stat().st_size if temp_path.exists() else 0
+    headers = {"User-Agent": "modly/0.3.1"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if existing_bytes > 0:
+        headers["Range"] = f"bytes={existing_bytes}-"
+
+    request = Request(
+        hf_hub_url(repo_id=repo_id, filename=filename, revision=revision),
+        headers=headers,
+    )
+    opener = build_opener(_HfOriginBoundRedirectHandler())
+    with opener.open(request, timeout=30) as response:
+        resumed = existing_bytes > 0 and getattr(response, "status", None) == 206
+        if existing_bytes > 0 and not resumed:
+            temp_path.unlink(missing_ok=True)
+            existing_bytes = 0
+
+        total_bytes = _response_total_bytes(
+            response.headers,
+            existing_bytes if resumed else 0,
+        )
+        bytes_downloaded = existing_bytes
+        progress_cb({
+            **progress_base,
+            "status": _download_status(bytes_downloaded, total_bytes, 1, 1, resumed),
+            "bytesDownloaded": bytes_downloaded,
+            "totalBytes": total_bytes,
+            "stalledSeconds": 0,
+        })
+
+        mode = "ab" if resumed else "wb"
+        last_emit = 0.0
+        with temp_path.open(mode) as output:
+            while True:
+                if check_download_control is not None:
+                    check_download_control()
+                try:
+                    chunk = response.read(_CHUNK_BYTES)
+                except socket.timeout as error:
+                    raise TimeoutError(f"Timed out while downloading {filename}") from error
+                if not chunk:
+                    break
+                output.write(chunk)
+                bytes_downloaded += len(chunk)
+
+                now = time.monotonic()
+                if now - last_emit >= 0.5:
+                    progress_cb({
+                        **progress_base,
+                        "status": _download_status(bytes_downloaded, total_bytes, 1, 1, resumed),
+                        "bytesDownloaded": bytes_downloaded,
+                        "totalBytes": total_bytes,
+                        "stalledSeconds": 0,
+                    })
+                    last_emit = now
+
+    temp_path.replace(target_file)
+    return bytes_downloaded
+
 def _safe_exception_message(error: Exception) -> str:
     message = str(error).replace("\n", " ").strip()
     message = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[redacted]", message)
@@ -247,11 +493,24 @@ def _safe_exception_message(error: Exception) -> str:
     return message[:500] or error.__class__.__name__
 
 
+def _is_retryable_download_error(error: Exception) -> bool:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is None and isinstance(error, HTTPError):
+        status = error.code
+    if isinstance(status, int):
+        return status in {408, 425, 429} or status >= 500
+    return True
+
+
 async def stream_hf_asset_downloads(
     owner_dir: Path,
     plan: Any,
     token: str | None = None,
     download_file: Callable[..., Any] | None = None,
+    check_download_control: Callable[[], None] | None = None,
+    control_exceptions: tuple[type[BaseException], ...] = (),
 ) -> AsyncIterator[dict]:
     """Download an exact manifest plan and yield aggregate SSE-ready events."""
     try:
@@ -267,7 +526,10 @@ async def stream_hf_asset_downloads(
         }
         return
 
-    owner_root = owner_dir.resolve()
+    if Path(owner_dir).is_symlink():
+        yield {"error": {"code": "unsafe_target", "stage": "validate", "message": "Canonical model owner must not be a symbolic link", "retryable": False}}
+        return
+    owner_root = Path(owner_dir)
     owner_root.mkdir(parents=True, exist_ok=True)
     downloader = download_file or _default_download_file
     total_files = sum(len(descriptor["files"]) for descriptor in normalized)
@@ -281,17 +543,24 @@ async def stream_hf_asset_downloads(
         "repoIndex": 0,
         "totalRepos": total_repos,
     }
+    if check_download_control is not None:
+        check_download_control()
 
     for repo_index, descriptor in enumerate(normalized, start=1):
-        target_dir = (owner_root / descriptor["target_subdir"]).resolve()
+        if check_download_control is not None:
+            check_download_control()
         try:
-            target_dir.relative_to(owner_root)
-        except ValueError:
+            target_dir = _assert_no_child_aliases(
+                owner_root,
+                descriptor["target_subdir"],
+                "Declared Hugging Face target",
+            )
+        except HfDownloadManifestError as error:
             yield {
                 "error": {
                     "code": "unsafe_target",
                     "stage": "validate",
-                    "message": "Download target escapes the canonical model owner directory",
+                    "message": str(error),
                     "repo_id": descriptor["repo_id"],
                     "retryable": False,
                 }
@@ -300,6 +569,8 @@ async def stream_hf_asset_downloads(
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for file_record in descriptor["files"]:
+            if check_download_control is not None:
+                check_download_control()
             completed += 1
             relative_file = "{}/{}".format(
                 descriptor["target_subdir"], file_record["path"]
@@ -323,21 +594,61 @@ async def stream_hf_asset_downloads(
 
             target_file.parent.mkdir(parents=True, exist_ok=True)
             force_download = target_file.exists()
+            if check_download_control is not None:
+                check_download_control()
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    partial(
-                        downloader,
-                        repo_id=descriptor["repo_id"],
-                        revision=descriptor["revision"],
-                        filename=file_record["path"],
-                        local_dir=str(target_dir),
-                        local_dir_use_symlinks=False,
-                        token=token,
-                        force_download=force_download,
-                    ),
-                )
+                if download_file is None:
+                    loop = asyncio.get_running_loop()
+                    queue: asyncio.Queue[dict] = asyncio.Queue()
+
+                    def _progress(message: dict) -> None:
+                        loop.call_soon_threadsafe(queue.put_nowait, message)
+
+                    future = loop.run_in_executor(
+                        None,
+                        partial(
+                            _download_hf_file_streamed,
+                            repo_id=descriptor["repo_id"],
+                            revision=descriptor["revision"],
+                            filename=file_record["path"],
+                            target_file=target_file,
+                            owner_root=owner_root,
+                            token=token,
+                            force_download=force_download,
+                            progress_cb=_progress,
+                            progress_base={
+                                **progress,
+                                "percent": min(99, round((completed - 1) / total_files * 99)),
+                            },
+                            check_download_control=check_download_control,
+                        ),
+                    )
+                    while not future.done():
+                        try:
+                            message = await asyncio.wait_for(queue.get(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            if check_download_control is not None:
+                                check_download_control()
+                            continue
+                        yield message
+                    await future
+                else:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        partial(
+                            downloader,
+                            repo_id=descriptor["repo_id"],
+                            revision=descriptor["revision"],
+                            filename=file_record["path"],
+                            local_dir=str(target_dir),
+                            local_dir_use_symlinks=False,
+                            token=token,
+                            force_download=force_download,
+                        ),
+                    )
+            except control_exceptions:
+                raise
             except Exception as error:
                 yield {
                     "error": {
@@ -346,10 +657,13 @@ async def stream_hf_asset_downloads(
                         "message": _safe_exception_message(error),
                         "repo_id": descriptor["repo_id"],
                         "file": relative_file,
-                        "retryable": True,
+                        "retryable": _is_retryable_download_error(error),
                     }
                 }
                 return
+
+            if check_download_control is not None:
+                check_download_control()
 
             if not _file_is_verified(target_file, file_record):
                 try:

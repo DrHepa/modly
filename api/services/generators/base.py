@@ -92,6 +92,7 @@ class BaseGenerator(ABC):
         self.hf_downloads:      list = []
         self.https_downloads:   list = []
         self.hf_skip_prefixes: list = []
+        self.hf_include_prefixes: list = []
         self.download_check:   str  = ""   # relative path to check in model_dir
         self._params_schema:   list = []   # params declared in the manifest
         # Host-resolved extension-scoped shared weight roots, keyed by group id.
@@ -122,7 +123,31 @@ class BaseGenerator(ABC):
 
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
         if self.download_check:
-            return (self.model_dir / self.download_check).exists()
+            from services.download_check import safe_download_check_exists
+
+            import os
+            if self.model_dir.is_symlink() or not isinstance(self.download_check, str) or Path(self.download_check).is_absolute() or "\\" in self.download_check:
+                return False
+            # Inspect raw descendants before normalization can erase a symlink
+            # with '..'; parent traversal remains confined to the extension root.
+            check_root = self.model_dir.parent if "/" in self.model_id else self.model_dir
+            current = self.model_dir
+            try:
+                for part in Path(self.download_check).parts:
+                    if part == "..":
+                        if current == check_root:
+                            return False
+                        current = current.parent
+                    else:
+                        current = current / part
+                        if current.is_symlink():
+                            return False
+            except (OSError, RuntimeError):
+                return False
+            if "/" in self.model_id:
+                check = os.path.normpath(f"{self.model_dir.name}/{self.download_check}").replace(os.sep, "/")
+                return safe_download_check_exists(self.model_dir.parent, check)
+            return safe_download_check_exists(self.model_dir, self.download_check)
         return self.model_dir.exists() and any(self.model_dir.iterdir())
 
     @abstractmethod
@@ -253,6 +278,7 @@ class BaseGenerator(ABC):
         snapshot_download(
             repo_id=self.hf_repo,
             local_dir=str(self.model_dir),
+            allow_patterns=list(self.hf_include_prefixes) or None,
             ignore_patterns=ignore,
         )
         print(f"[{self.__class__.__name__}] Download complete.")

@@ -29,6 +29,33 @@ export interface InstallManifest {
   } & ModelWeightNode & WeightVariantNode>
 }
 
+function declaredInputKind(input: unknown): unknown {
+  if (typeof input === 'string') return input
+  if (input && typeof input === 'object' && 'type' in input) return (input as { type?: unknown }).type
+  return undefined
+}
+
+export function assertSupportedVideoNodeShape(
+  kind: 'model' | 'process',
+  node: { id?: string; input?: unknown; inputs?: unknown; output?: unknown; agent?: unknown },
+): void {
+  // Private declarations opt in to governed shape checks; ordinary ports remain open.
+  if (node.agent === undefined) return
+  const scalarVideoInput = node.input === 'video'
+  const declaredInputs = node.inputs === undefined ? [node.input ?? 'image'] : node.inputs
+  const declaredInputKinds = Array.isArray(declaredInputs) ? declaredInputs.map(declaredInputKind) : []
+  const usesVideoInput = scalarVideoInput || declaredInputKinds.includes('video')
+  if (kind === 'process' && node.output === 'video') {
+    throw new Error('manifest.json: video outputs are supported only for model nodes')
+  }
+  if (kind === 'process' && usesVideoInput) {
+    throw new Error('manifest.json: video input is supported only for model nodes')
+  }
+  if (kind === 'model' && usesVideoInput && (node.inputs !== undefined || node.input !== 'video')) {
+    throw new Error(`manifest.json: ${node.id ?? 'node'} must declare video as its single input field`)
+  }
+}
+
 export interface ValidatedInstallManifest {
   id: string
   isProcess: boolean
@@ -88,6 +115,7 @@ export function validateInstallManifest(
     const declaredInputs = Array.isArray(node.inputs) ? node.inputs : [node.input ?? 'image']
     const output = node.output ?? 'mesh'
     assertSupportedSceneNodeShape(isProcess ? 'process' : 'model', node, declaredInputs, output)
+    assertSupportedVideoNodeShape(isProcess ? 'process' : 'model', node)
     const usesSharedWeights = weightGroups !== undefined || node.weight_groups !== undefined
     if (usesSharedWeights && typeof node.id === 'string' && node.id.toLowerCase() === '_shared') {
       throw new Error('manifest.json: model node id "_shared" is reserved')

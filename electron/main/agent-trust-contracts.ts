@@ -346,7 +346,10 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
     .map((raw, index) => normalizeIdentity(raw, `Agent capability process resourceFiles[${index}]`))
     .sort((left, right) => left.path.localeCompare(right.path))
   const paths = [...runtimeFiles, ...resourceFiles].map((file) => file.path)
-  if (!/\.(?:js|mjs|pyz)$/i.test(entry) || new Set(paths).size !== paths.length || runtimeFiles[0]?.path !== entry
+  const pythonEntry = entry === 'processor.py'
+  if ((!/\.(?:js|mjs)$/i.test(entry) && !pythonEntry)
+    || new Set(paths).size !== paths.length || runtimeFiles[0]?.path !== entry
+    || (pythonEntry && ((runtimeFiles[0]?.mode ?? 0) & 0o111) !== 0)
     || resourceFiles.some((file) => EXECUTABLE_RESOURCE_EXTENSION.test(file.path) || (file.mode & 0o111) !== 0)) {
     throw new TypeError('Agent capability process file identities are duplicated or do not bind entry')
   }
@@ -357,7 +360,7 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
       'kind', 'interpreter', 'baseInterpreter', 'treeDigest', 'sourceIdentityHash', 'entryCount', 'logicalBytes', 'bindingHash',
     ], 'Agent capability process Python runtime')
     if (value.runtime.kind !== 'extension-python-venv-v1' || value.runtime.interpreter !== 'bin/python'
-      || !/\.pyz$/i.test(entry)) {
+      || !pythonEntry) {
       throw new TypeError('Agent capability process Python runtime is invalid')
     }
     const treeDigest = normalizeSha256(value.runtime.treeDigest, 'Agent capability process Python runtime treeDigest')
@@ -413,6 +416,9 @@ function normalizeProcessExecution(value: Record<string, unknown>): AgentCapabil
       throw new TypeError('Agent capability process Python runtime binding hash does not match')
     }
     runtime = { ...unsignedRuntime, bindingHash }
+  }
+  if (pythonEntry && runtime === undefined) {
+    throw new TypeError('Agent capability process Python runtime is required for processor.py')
   }
   let modelAccess: AgentProcessModelAccessDeclarationV1 | undefined
   if (value.modelAccess !== undefined) {

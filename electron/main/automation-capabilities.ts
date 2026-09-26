@@ -17,6 +17,7 @@ import { parseExtensionRegistrationPendingName } from './extension-install-recov
 // Shared with the installer so every discovery surface hides in-flight replacements.
 export const activeExtensionInstalls = new Set<string>()
 import { normalizeHfDownloads, type HfDownloadDescriptor } from './hf-download-manifest.ts'
+import type { ModelSource } from './model-sources.ts'
 import {
   normalizeHttpsDownloads,
   type HttpsDownloadAsset,
@@ -237,7 +238,7 @@ const UI_ONLY_NODE_ALLOWLIST: AutomationUiOnlyCapability[] = [
       boundary: 'ui_only',
       headless: false,
       pause: { supported: true, checkpoint: 'interactive' },
-      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'audio', 'video'], boundary: 'ui_only', headless: false },
+      substitution: { supported: true, artifactKinds: ['image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video'], boundary: 'ui_only', headless: false },
     },
   },
 ]
@@ -358,10 +359,13 @@ type PartialCapabilityAutomationMetadata = {
 }
 
 const LEGACY_PROCESS_ARTIFACT_KINDS = [
-  'image', 'text', 'mesh', 'scene', 'audio', 'video',
+  'image', 'text', 'mesh', 'scene', 'capture', 'audio', 'video',
 ] as const satisfies readonly ArtifactKind[]
 const CAPABILITY_ARTIFACT_KINDS = new Set<ArtifactKind>(LEGACY_PROCESS_ARTIFACT_KINDS)
 const GOVERNED_AGENT_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
+const AGENT_ONLY_ARTIFACT_KINDS = new Set<ArtifactKind>(
+  ARTIFACT_KINDS.filter((kind) => !CAPABILITY_ARTIFACT_KINDS.has(kind)),
+)
 const WORKFLOW_NODE_COMPONENTS = new Set<WorkflowNodeComponent>(['video-preview'])
 const AGENT_DECLARATION_KEYS = new Set(['schema', 'capability_id', 'display_name', 'description', 'approval', 'process', 'skills'])
 const AGENT_APPROVAL_KEYS = new Set(['required', 'scope'])
@@ -374,6 +378,16 @@ function isPlainOwnRecord(value: unknown): value is Record<string, unknown> {
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => allowed.has(key))
+}
+
+export function projectAgentOnlyNodesForLegacy(manifest: ParsedManifest): ParsedManifest {
+  if (!Array.isArray(manifest.nodes)) return manifest
+  const nodes = manifest.nodes.filter((node) => {
+    if (!isPlainOwnRecord(node) || !Object.hasOwn(node, 'agent')) return true
+    return !AGENT_ONLY_ARTIFACT_KINDS.has(node.input as ArtifactKind)
+      && !AGENT_ONLY_ARTIFACT_KINDS.has(node.output as ArtifactKind)
+  })
+  return nodes.length === manifest.nodes.length ? manifest : { ...manifest, nodes }
 }
 
 function isSafeDisplayText(value: unknown, maxLength: number): value is string {
@@ -679,6 +693,10 @@ export function parseExtensionManifest(
   }
   const ownership = describeModelOwnership(common.id, parsed.nodes ?? [])
   const nodes = (parsed.nodes ?? []).map((n, index) => {
+    if (options.governedAgentKinds && n.agent !== undefined && n.input !== undefined && n.input !== 'none'
+      && !GOVERNED_AGENT_ARTIFACT_KINDS.has(n.input as ArtifactKind)) {
+      throw new Error(`${extensionId}/${n.id}.input must be one of: image, text, mesh, scene, capture, audio, video, none`)
+    }
     const normalizedInputs = normalizeProcessPorts(n.inputs, n.input_contract)
     const processOwnerId = n.process_owner_id ? `${extensionId}/${n.process_owner_id}` : undefined
     const declaredInputs = Array.isArray(n.inputs) ? n.inputs : [n.input ?? 'image']
@@ -717,7 +735,7 @@ export function parseExtensionManifest(
         capabilityId + '.https_downloads requires a dedicated weight owner; structured HTTPS plans cannot share an owner',
       )
     }
-    const hasModelAssets = Boolean(httpsDownloads || hfDownloads || n.hf_repo || n.download_check || n.weight_owner_id)
+    const hasModelAssets = Boolean(modelSources || groupRefs?.length || httpsDownloads || hfDownloads || n.hf_repo || n.download_check || n.weight_owner_id)
     const agentResult = extensionType === 'process'
       && isProcessPortType(n.input, options.governedAgentKinds === true)
       && isProcessPortType(n.output, options.governedAgentKinds === true)
@@ -744,7 +762,8 @@ export function parseExtensionManifest(
       downloadCheck:  n.download_check,
       hfSkipPrefixes: n.hf_skip_prefixes,
       hfIncludePrefixes: n.hf_include_prefixes,
-      hasModelSources: modelSources !== undefined,
+      hasModelSources: modelSources !== undefined || Boolean(groupRefs?.length),
+      ...(modelSources ? { modelSources } : {}),
       weightGroups: groupRefs,
       weightVariants: weightVariants && {
         param:   weightVariants.param,
@@ -897,7 +916,8 @@ export async function readResolvedExtensionsFromDirDetailed(
             }
           }
           if (localSourcePath) manifest.source = `local://${localSourcePath}`
-          const extension = parseExtensionManifest(manifest, entry.name, trustedRepos, isBuiltin, {
+          const listingManifest = validateAgentJson ? manifest : projectAgentOnlyNodesForLegacy(manifest)
+          const extension = parseExtensionManifest(listingManifest, entry.name, trustedRepos, isBuiltin, {
             governedAgentKinds: validateAgentJson,
           })
           return {

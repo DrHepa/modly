@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ModelOwnershipCapabilityState } from '../modelOwnershipState'
-import type { AnyExtension, ExtensionNode, SharedWeightGroupState } from '@shared/types/electron.d'
+import type { AnyExtension, ExtensionNode, SharedWeightGroupState, ModelDownloadFailure } from '@shared/types/electron.d'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useNavStore } from '@shared/stores/navStore'
 import {
@@ -13,6 +13,7 @@ import {
   extInstallSummary,
   formatBytes,
   getNodeState,
+  isRetryableModelDownloadFailure,
 } from './extensionShared'
 import { finishExtensionRepair, isExtensionRepairable } from '../utils'
 
@@ -22,6 +23,7 @@ interface Props {
   localDataIds:     string[]
   downloading:      DownloadMap
   sharedGroups:     SharedWeightGroupState[]
+  downloadFailures?: Record<string, ModelDownloadFailure>
   ownershipStateById?: Record<string, ModelOwnershipCapabilityState>
   loadError?:       string
   disabled?:        boolean
@@ -39,7 +41,7 @@ interface Props {
 }
 
 export function ExtensionDrawer({
-  ext, installedIds, localDataIds, downloading, sharedGroups, ownershipStateById, loadError, disabled,
+  ext, installedIds, localDataIds, downloading, sharedGroups, downloadFailures, ownershipStateById, loadError, disabled,
   onInstall, onInstallAll, onPauseDownload, onCancelDownload,
   onUninstallNode, onDeleteSharedGroup, onDeleteWeightVariant, onUninstall, onRepaired, onSynced, onClose,
 }: Props): JSX.Element {
@@ -65,6 +67,11 @@ export function ExtensionDrawer({
   const isLocal = typeof ext.source === 'string' && ext.source.startsWith('local://')
   const localPath = isLocal ? ext.source!.replace('local://', '') : null
   const { total, done, installing, hasAvailable } = extInstallSummary(ext, installedIds, downloading)
+  const hasRetryableAvailable = hasAvailable && ext.nodes.some((node) => {
+    const fullId = `${ext.id}/${node.id}`
+    return getNodeState(ext.id, node, installedIds, downloading).kind === 'available'
+      && (!downloadFailures?.[fullId] || isRetryableModelDownloadFailure(downloadFailures[fullId]))
+  })
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -244,6 +251,9 @@ export function ExtensionDrawer({
                 const fullId = `${ext.id}/${node.id}`
                 const ownership = ownershipStateById?.[fullId]
                 const state = getNodeState(ext.id, node, installedIds, downloading)
+                const ownershipState = ownershipStateById?.[node.capabilityId ?? fullId]
+                const permanentlyFailed = Boolean(downloadFailures?.[fullId] && !isRetryableModelDownloadFailure(downloadFailures[fullId]))
+                const failure = downloadFailures?.[fullId]
                 const dl = state.kind === 'downloading' ? state.dl : null
                 const variants = isModel ? node.weightVariants : undefined
                 // A download started without a variant (Install all) fetches the default one.
@@ -358,6 +368,18 @@ export function ExtensionDrawer({
                       </div>
                     )}
 
+                    {variantError && (
+                      <div className="mt-3 rounded-md border border-red-900/60 bg-red-950/30 px-2.5 py-2 text-[10px] text-red-300" role="alert">
+                        {variantError}
+                      </div>
+                    )}
+
+                    {failure && permanentlyFailed && (
+                      <div className="mt-3 rounded-md border border-red-900/60 bg-red-950/30 px-2.5 py-2 text-[10px] text-red-300" role="alert">
+                        <div className="font-mono">{failure.code} · {failure.stage}</div>
+                        <div className="mt-1 break-words text-red-200/80">{failure.message}</div>
+                      </div>
+                    )}
                     {/* Download detail */}
                     {dl && (
                       <div className="mt-3 flex flex-col gap-1">
@@ -418,7 +440,7 @@ export function ExtensionDrawer({
               </svg>
               Delete broken folder
             </button>
-          ) : isModel && hasAvailable ? (
+          ) : isModel && hasRetryableAvailable ? (
             <button
               onClick={() => onInstallAll(ext)}
               disabled={disabled || installing}

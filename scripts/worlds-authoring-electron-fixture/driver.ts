@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import type { BrowserWindow, WebContents } from 'electron'
+import type { BrowserWindow, MouseInputEvent, WebContents } from 'electron'
 import type { WorldProjectSnapshotV1, WorldTransform } from '../../src/areas/worlds/core/worldModel.ts'
 import type { WorldProjectCommandRequest, WorldProjectCommandResult } from '../../src/shared/types/worldProjects.ts'
 import { NAMES, PROJECT_KEY, SCENE_ID, type AuthoringView, type CheckName, type HandleCandidate, type ModelObservation, type Point, type Rect, type SeedEvidence } from './shared.ts'
@@ -31,10 +31,35 @@ export interface UiAuthoredBaseline {
   names: { a: string; b: string }; seed: SeedEvidence
 }
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
-export function sendNativeInput(contents: WebContents, ports: CommonDriverPorts, event: Parameters<WebContents['sendInputEvent']>[0]): void {
+export interface NativeLookOwner { bootId: string; canvasUuid: string; lockChanges: number }
+const nativeScreenCursor = new WeakMap<WebContents, { owner: string | null; globalX: number; globalY: number }>()
+export function sendNativeInput(contents: WebContents, ports: CommonDriverPorts, event: Parameters<WebContents['sendInputEvent']>[0], relative?: {
+  owner: NativeLookOwner; beforeSend?(payload: Readonly<MouseInputEvent>): void
+}): void {
+  let nextCursor: { owner: string | null; globalX: number; globalY: number } | undefined
+  if (relative) {
+    assert.equal(event.type, 'mouseMove')
+    const mouse = event as MouseInputEvent, { owner } = relative
+    assert.ok(owner.bootId && owner.canvasUuid && Number.isSafeInteger(owner.lockChanges) && owner.lockChanges > 0)
+    assert.ok([mouse.x, mouse.y, mouse.movementX, mouse.movementY].every(Number.isSafeInteger))
+    assert.ok(Math.abs(mouse.movementX!) <= 300 && Math.abs(mouse.movementY!) <= 300)
+    const identity = JSON.stringify([owner.bootId, owner.canvasUuid, owner.lockChanges]), previous = nativeScreenCursor.get(contents)
+    const sameOwner = previous?.owner === identity
+    assert.ok(sameOwner || (mouse.movementX === 0 && mouse.movementY === 0), 'Fresh relative input owner requires observed zero-delta priming')
+    const base = sameOwner || previous?.owner === null ? previous! : { globalX: 0, globalY: 0 }
+    nextCursor = { owner: identity, globalX: base.globalX + mouse.movementX!, globalY: base.globalY + mouse.movementY! }
+    assert.ok(Number.isSafeInteger(nextCursor.globalX) && Number.isSafeInteger(nextCursor.globalY))
+    event = { ...mouse, globalX: nextCursor.globalX, globalY: nextCursor.globalY }
+    relative.beforeSend?.(Object.freeze({ ...event }))
+  } else if ('x' in event && 'y' in event) {
+    // Preserve ordinary absolute payloads exactly, including Electron's omitted-global default of zero.
+    nextCursor = { owner: null, globalX: event.globalX ?? 0, globalY: event.globalY ?? 0 }
+  }
   // Every event, including releases, rechecks the exact focused owner synchronously.
   ports.inputGuard(contents)
   contents.sendInputEvent(event)
+  // Rejected ownership or a throwing transport must never advance outgoing screen history.
+  if (nextCursor) nativeScreenCursor.set(contents, nextCursor)
 }
 export function waitForOwnedWindowFocus(window: Pick<BrowserWindow, 'on' | 'removeListener' | 'isDestroyed' | 'isFocused'>, options: {
   deadline: number; signal: AbortSignal; assertOwned(): void
@@ -125,6 +150,8 @@ export async function paint(contents: WebContents, ports: CommonDriverPorts, den
 }
 interface NativeClickPointObservation {
   point: Point; matchCount: number; enabled: boolean; visible: boolean; hitMatches: boolean
+  rect: Rect | null
+  inspector: { rect: Rect; scrollTop: number; scrollLeft: number } | null
   hit: { tagName: string; ariaLabel: string | null; text: string | null } | null
 }
 export function assertNativeClickPointStable(point: Point, observation: NativeClickPointObservation, name: string): void {
@@ -158,7 +185,11 @@ export async function observeNativeClickPoint(contents: WebContents, kind: Nativ
       if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) visible = false;
     }
     const hit = document.elementFromPoint(point.x, point.y);
-    return {point, matchCount: matches.length, enabled: !!e && !e.matches(':disabled'), visible,
+    const rect = (value) => value ? {x: value.x, y: value.y, width: value.width, height: value.height} : null;
+    const scrollOwners = [...document.querySelectorAll('[aria-label="Entity inspector"] > .worlds-inspector-scroll')];
+    const scroll = scrollOwners.length === 1 && e && scrollOwners[0].contains(e) ? scrollOwners[0] : null;
+    return {point, rect: rect(r), inspector: scroll ? {rect: rect(scroll.getBoundingClientRect()), scrollTop: scroll.scrollTop, scrollLeft: scroll.scrollLeft} : null,
+      matchCount: matches.length, enabled: !!e && !e.matches(':disabled'), visible,
       hitMatches: !!e && (hit === e || e.contains(hit)),
       hit: hit ? {tagName: hit.tagName, ariaLabel: hit.getAttribute('aria-label'), text: hit.textContent} : null};
   })()`, false)
@@ -425,7 +456,7 @@ export function isNativeNumericCommitSettled(view: AuthoringView, expectedRevisi
     && !view.statuses.includes('Saving transform…')
 }
 
-async function numeric(contents: WebContents, ports: CommonDriverPorts, sceneId: string, id: string, field: keyof WorldTransform, axis: 0 | 1 | 2, input: number): Promise<AuthoringView> {
+export async function numeric(contents: WebContents, ports: CommonDriverPorts, sceneId: string, id: string, field: keyof WorldTransform, axis: 0 | 1 | 2, input: number): Promise<AuthoringView> {
   let view = await readView(contents)
   assert.equal(view.selection.active, id)
   const before = snapshot(view), value = field === 'rotation' ? input * Math.PI / 180 : input

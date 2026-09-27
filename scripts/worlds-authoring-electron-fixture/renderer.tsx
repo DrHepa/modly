@@ -37,7 +37,7 @@ document.addEventListener('pointerlockerror', (event) => {
   if (!event.isTrusted) untrustedInputs += 1
   pointerLockErrors += 1; lastPointerLockErrorAt = new Date().toISOString()
 }, true)
-for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click', 'dblclick', 'keydown', 'keyup', 'input', 'change']) {
+for (const type of ['pointerdown', 'pointermove', 'mousemove', 'pointerup', 'click', 'dblclick', 'keydown', 'keyup', 'input', 'change']) {
   document.addEventListener(type, (event) => {
     if (!event.isTrusted) untrustedInputs += 1
     const target = event.target instanceof Element ? event.target : null
@@ -50,6 +50,7 @@ for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click', 'dblclic
       target: targetCanvas, sequence: trace.length + 1, frame, type, buttons: mouse.buttons, point: { x: mouse.clientX, y: mouse.clientY },
     }
     trace.push({ sequence: trace.length + 1, at: new Date().toISOString(), type, trusted: event.isTrusted,
+      screenX: mouse?.screenX ?? null, screenY: mouse?.screenY ?? null,
       x: mouse?.clientX ?? null, y: mouse?.clientY ?? null, buttons: mouse?.buttons ?? null,
       movementX: mouse?.movementX ?? null, movementY: mouse?.movementY ?? null, code: keyboard?.code ?? null,
       canvasUuid: targetCanvas ? canvasId(targetCanvas) : null, frame,

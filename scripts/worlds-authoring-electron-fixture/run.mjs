@@ -8,7 +8,7 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { captureOwnedDisplayResources, waitForDisplayResourcesAbsent } from './display-resources.mjs'
 
-const reviewedRepositoryHead = '416fcfa079aa3e569e8dd460c64c7462fac7850b'
+const reviewedRepositoryHead = 'bdcbd778e28358c1d582503e3202c7d9b649dd1a'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 
 export function validateRunnerRepositoryAdmission(build) {
@@ -266,6 +266,244 @@ export function assertActualWorldSculptNavigationTerminal(result) {
   assert.deepEqual(evidence.isolation, { canonicalUnchangedDuringNavigation: true, applyCountUnchanged: true, historyUnchanged: true, freshReopenMatched: true, observationCapabilityImmutable: true })
   assert.deepEqual(evidence.run, { groundOnlyFallback: true, colliderBacked: false, yPinned: true, horizontalMoved: true, rollZero: true })
   assert.deepEqual(evidence.screenshots, ['12-worldsculpt-inspect-framed.png', '13-worldsculpt-inspect-orbit.png', '14-worldsculpt-fly-locked.png', '15-worldsculpt-run-ground-only.png', '16-worldsculpt-restored-inspect.png'])
+  assertActualColliderRunTerminal(result.evidence?.colliderRun)
+  for (const name of ['native-collider-authoring', 'native-collider-ground-wall-slide', 'native-collider-jump-handoff', 'native-collider-reopen']) assert.equal(result.checks?.filter((check) => check?.name === name && check.status === 'PASS').length, 1, `Collider Run check missing: ${name}`)
+}
+
+
+export function assertActualColliderRunTerminal(evidence) {
+  assert.equal(evidence?.schema, 'modly.collider-run-acceptance.v1', 'Collider Run evidence is required')
+  assert.deepEqual(Object.keys(evidence).sort(), ['schema', 'grounding', 'sceneId', 'floorId', 'wallId', 'authoring', 'beforeAuthoring', 'baseline', 'canonicalSha256', 'geometry', 'observed', 'samples', 'inputTrace', 'reservedEscape', 'screenshots', 'reopened'].sort())
+  assert.equal(evidence.grounding, 'geometric-native-observation')
+  const finite = (value, size) => Array.isArray(value) && value.length === size && value.every(Number.isFinite)
+  const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+  const { baseline, sceneId, floorId, wallId, geometry, observed, samples, inputTrace, reopened } = evidence
+  assert.notEqual(floorId, wallId); assert.equal(typeof sceneId, 'string')
+  assert.equal(evidence.canonicalSha256, digest(baseline), 'Canonical baseline digest mismatch')
+  assert.ok(Number.isSafeInteger(baseline.applyCount) && baseline.applyCount > 0)
+  assert.ok(Array.isArray(baseline.undoStack) && Array.isArray(baseline.redoStack) && Array.isArray(baseline.receipts))
+  assert.ok(Array.isArray(evidence.authoring) && evidence.authoring.length >= 7 && evidence.authoring.length <= 20)
+  let prior = structuredClone(evidence.beforeAuthoring)
+  const authoredCommands = []
+  for (const entry of evidence.authoring) {
+    assert.ok(entry.forwardedAt && entry.settledAt && entry.result?.ok)
+    const batch = entry.request.batch, result = entry.result.value
+    assert.equal(batch.origin, 'ui'); assert.equal(batch.projectId, prior.project.projectId); assert.equal(batch.baseRevision, prior.project.revision)
+    assert.deepEqual(result.inverse, { kind: 'world-snapshot', snapshot: prior }); assert.equal(result.idempotent, false); assert.deepEqual(result.warnings, [])
+    assert.equal(batch.commands.length, 1)
+    const command = batch.commands[0]; authoredCommands.push(command)
+    if (command.type === 'add-scene') {
+      assert.equal(authoredCommands.length, 1); assert.equal(command.scene.sceneId, sceneId); assert.equal(command.reference.id, sceneId)
+      assert.deepEqual(command.scene.entities, []); prior.scenes.push(structuredClone(command.scene)); prior.project.scenes.push(structuredClone(command.reference))
+    } else {
+      assert.equal(command.sceneId, sceneId)
+      const scene = prior.scenes.find((scene) => scene.sceneId === sceneId); assert.ok(scene)
+      if (command.type === 'add-entity') { assert.ok([floorId, wallId].includes(command.entity.id)); scene.entities.push(structuredClone(command.entity)) }
+      else {
+        const entity = scene.entities.find((entity) => entity.id === command.entityId); assert.ok(entity)
+        if (command.type === 'add-component') entity.components.push(structuredClone(command.component))
+        else { assert.equal(command.type, 'patch-entity'); assert.deepEqual(Object.keys(command.patch), ['transform']); entity.transform = structuredClone(command.patch.transform) }
+      }
+    }
+    prior.project.revision++; assert.equal(result.newRevision, prior.project.revision); assert.deepEqual(result.snapshot, prior)
+  }
+  assert.deepEqual(prior, baseline.snapshot, 'Authoring receipts do not produce navigation baseline')
+  const scene = baseline.snapshot.scenes.find((scene) => scene.sceneId === sceneId)
+  assert.ok(scene && scene.entities.length === 2)
+  assert.equal(geometry.length, 2); assert.equal(observed.length, 2)
+  for (const id of [floorId, wallId]) {
+    const entity = scene.entities.find((entity) => entity.id === id), mesh = geometry.filter((item) => item.entityId === id), visible = observed.filter((item) => item.entityId === id)
+    assert.ok(entity?.enabled && !entity.parentId); assert.equal(mesh.length, 1); assert.equal(visible.length, 1)
+    const body = entity.components.filter((item) => item.type === 'rigid-body'), colliders = entity.components.filter((item) => item.type === 'collider'), renderables = entity.components.filter((item) => item.type === 'renderable')
+    assert.equal(body.length, 1); assert.equal(body[0].bodyType, 'fixed'); assert.equal(body[0].enabled, true)
+    assert.equal(colliders.length, 1); assert.equal(colliders[0].shape, 'mesh'); assert.equal(colliders[0].enabled, true); assert.equal(colliders[0].sensor, false); assert.equal(colliders[0].purpose, 'simulation')
+    assert.equal(renderables.length, 1); assert.equal(renderables[0].visible, true); assert.equal(renderables[0].enabled, true)
+    assert.equal(colliders[0].resourceId, renderables[0].resourceId); assert.equal(mesh[0].resourceId, colliders[0].resourceId); assert.equal(mesh[0].componentId, colliders[0].id)
+    const resource = baseline.snapshot.project.resources.find((item) => item.id === colliders[0].resourceId)
+    assert.equal(resource?.workspacePath, 'Exports/AuthoringFixtures/red-cube.glb'); assert.equal(resource.format, 'glb')
+    assert.deepEqual(entity.transform, id === floorId ? { position: [0, 0, 0], rotation: [0, 0, 0], scale: [30, 0.5, 30] } : { position: [0, 0.35, -2], rotation: [0, 0, 0], scale: [16, 8, 1] })
+    assert.deepEqual(visible[0].transform, entity.transform); assert.equal(mesh[0].vertices, 36); assert.equal(mesh[0].triangles, 12)
+    for (const key of ['min', 'max']) {
+      assert.ok(finite(mesh[0][key], 3) && finite(visible[0][key], 3))
+      const local = key === 'min' ? [-0.35, 0, -0.35] : [0.35, 0.7, 0.35]
+      for (let axis = 0; axis < 3; axis++) {
+        assert.ok(Math.abs(mesh[0][key][axis] - visible[0][key][axis]) < 1e-5, 'Visible/collider bounds mismatch')
+        assert.ok(Math.abs(mesh[0][key][axis] - (entity.transform.position[axis] + local[axis] * entity.transform.scale[axis])) < 1e-5, 'Geometry/transform mismatch')
+      }
+    }
+    const components = authoredCommands.filter((command) => command.type === 'add-component' && command.entityId === id)
+    assert.deepEqual(components.map((command) => command.component.type), ['collider', 'rigid-body'])
+  }
+  assert.ok(Array.isArray(inputTrace) && inputTrace.length > 0 && inputTrace.length <= 4096)
+  for (const [index, event] of inputTrace.entries()) {
+    assert.equal(event.trusted, true); assert.ok(Number.isSafeInteger(event.sequence) && event.sequence > 0 && Number.isFinite(Date.parse(event.at)))
+    if (index) { assert.ok(event.sequence === inputTrace[index - 1].sequence + 1); assert.ok(Date.parse(event.at) >= Date.parse(inputTrace[index - 1].at)) }
+  }
+  assert.ok(inputTrace.some((event) => event.type === 'pointermove' && Number.isFinite(event.movementX) && Number.isFinite(event.movementY) && Math.hypot(event.movementX, event.movementY) > 0))
+  const phases = ['staging', 'descent', 'ground', 'approach', 'contact', 'slide', 'jump', 'runExit', 'flyEnter', 'flyMove', 'inspect']
+  assert.ok(Array.isArray(samples) && samples.length >= 25 && samples.length <= 260)
+  for (const [index, sample] of samples.entries()) {
+    assert.deepEqual(Object.keys(sample).sort(), ['phase', 'at', 'bootId', 'frame', 'traceSequence', 'position', 'quaternion', 'status', 'groundOnly', 'locked', 'lockChanges', 'lockErrors', 'orbit', 'canonicalSha256', 'applyCount'].sort())
+    assert.ok(phases.includes(sample.phase) && finite(sample.position, 3) && finite(sample.quaternion, 4)); assert.ok(Math.abs(Math.hypot(...sample.quaternion) - 1) < 1e-5)
+    assert.ok(Number.isSafeInteger(sample.frame) && sample.frame > 0 && Number.isFinite(Date.parse(sample.at)) && typeof sample.bootId === 'string' && sample.bootId.length > 0)
+    assert.equal(sample.canonicalSha256, evidence.canonicalSha256); assert.equal(sample.applyCount, baseline.applyCount)
+    assert.equal(sample.groundOnly, false); assert.equal(sample.lockErrors, 0)
+    assert.ok(Number.isSafeInteger(sample.traceSequence) && inputTrace.some((event) => event.sequence === sample.traceSequence && Date.parse(event.at) <= Date.parse(sample.at)))
+    assert.ok(Number.isSafeInteger(sample.lockChanges) && sample.lockChanges > 0)
+    const inspect = sample.phase === 'inspect', fly = ['staging', 'flyEnter', 'flyMove'].includes(sample.phase)
+    assert.equal(sample.status, inspect ? 'Inspect mode. Orbit, pan, select, and edit.' : fly ? 'Fly mode. Pointer locked.' : 'Run mode. Collider-backed.')
+    assert.equal(sample.locked, !inspect); assert.equal(sample.orbit, inspect)
+    if (index) {
+      const previous = samples[index - 1]
+      assert.equal(sample.bootId, previous.bootId); assert.ok(sample.frame > previous.frame && Date.parse(sample.at) > Date.parse(previous.at)); assert.ok(sample.traceSequence >= previous.traceSequence)
+      assert.ok(phases.indexOf(sample.phase) >= phases.indexOf(previous.phase))
+      assert.equal(sample.lockChanges, previous.lockChanges + (inspect ? 1 : 0), 'Navigation lost/reacquired authoritative lock')
+    }
+  }
+  const phase = (name, minimum = 1) => { const values = samples.filter((sample) => sample.phase === name); assert.ok(values.length >= minimum, `Missing ${name} poses`); return values }
+  const eventsDuring = (name) => {
+    const values = phase(name), first = samples.indexOf(values[0]), start = first ? samples[first - 1].traceSequence : 0
+    return inputTrace.filter((event) => event.sequence > start && event.sequence <= values.at(-1).traceSequence)
+  }
+  for (const [name, codes] of [['descent', ['Digit3']], ['contact', ['KeyW']], ['slide', ['KeyW', 'KeyD']], ['jump', ['Space']], ['flyEnter', ['Digit2']], ['flyMove', ['KeyW']]]) {
+    const events = eventsDuring(name)
+    for (const code of codes) for (const type of ['keydown', 'keyup']) assert.ok(events.some((event) => event.type === type && event.code === code), `Missing native ${name} ${code} ${type}`)
+  }
+  // Reserved Escape is consumed before DOM delivery in the pinned browser. DISPATCH is not ingress.
+  const escape = evidence.reservedEscape, flyBeforeEscape = phase('flyMove').at(-1), inspectAfterEscape = phase('inspect')[0]
+  const exact = (value, keys) => { assert.ok(value && typeof value === 'object'); assert.deepEqual(Object.keys(value).sort(), keys.split(' ').sort()) }
+  const instant = (value) => { const time = Date.parse(value); assert.ok(typeof value === 'string' && Number.isFinite(time)); return time }
+  exact(escape, 'schema attemptId generation webContentsId keyboardLock before dispatches browserKeyUps mouseObservation browserMouse domEvents unlocked interference listenersRemoved')
+  assert.equal(escape.schema, 'modly.browser-reserved-escape.v1')
+  assert.ok(Number.isSafeInteger(escape.generation) && escape.generation > 0 && Number.isSafeInteger(escape.webContentsId) && escape.webContentsId > 0)
+  assert.equal(escape.attemptId, `reserved-escape:${escape.generation}:${escape.webContentsId}`)
+  assert.equal(escape.keyboardLock, 'denied-by-owned-session-policy'); assert.deepEqual(escape.interference, []); assert.equal(escape.listenersRemoved, true)
+  for (const state of [escape.before, escape.unlocked]) {
+    exact(state, 'at bootId canvasUuid frame traceSequence position quaternion locked lockChanges lockErrors focused fullscreen heldKeys canonicalSha256 applyCount')
+    instant(state.at); assert.equal(state.bootId, flyBeforeEscape.bootId); assert.ok(typeof state.canvasUuid === 'string' && state.canvasUuid.length > 0)
+    assert.ok(Number.isSafeInteger(state.frame) && state.frame >= flyBeforeEscape.frame && Number.isSafeInteger(state.traceSequence))
+    assert.ok(finite(state.position, 3) && finite(state.quaternion, 4)); assert.ok(Math.abs(Math.hypot(...state.quaternion) - 1) < 1e-5)
+    assert.equal(state.focused, true); assert.equal(state.fullscreen, false); assert.deepEqual(state.heldKeys, [])
+    assert.equal(state.canonicalSha256, evidence.canonicalSha256); assert.equal(state.applyCount, baseline.applyCount)
+    assert.equal(state.lockErrors, flyBeforeEscape.lockErrors)
+  }
+  const {before, unlocked} = escape
+  assert.equal(before.traceSequence, flyBeforeEscape.traceSequence)
+  const lastMouseBefore = [...inputTrace].reverse().find((event) => event.sequence <= before.traceSequence && typeof event.buttons === 'number')
+  if (lastMouseBefore) assert.equal(lastMouseBefore.buttons, 0)
+  assert.equal(before.locked, true); assert.equal(unlocked.locked, false); assert.equal(before.lockChanges, flyBeforeEscape.lockChanges)
+  assert.equal(unlocked.lockChanges, before.lockChanges + 1); assert.equal(unlocked.canvasUuid, before.canvasUuid); assert.ok(unlocked.frame > before.frame)
+  assert.ok(instant(before.at) >= instant(flyBeforeEscape.at) && instant(unlocked.at) > instant(before.at) && instant(unlocked.at) - instant(before.at) <= 4000)
+  assert.ok(Array.isArray(escape.dispatches) && escape.dispatches.length === 2)
+  for (const [index, dispatch] of escape.dispatches.entries()) {
+    exact(dispatch, 'kind startedAt returnedAt payload'); assert.equal(dispatch.kind, 'DISPATCH')
+    assert.deepEqual(dispatch.payload, {type: index ? 'keyUp' : 'keyDown', keyCode: 'Escape', modifiers: []})
+    assert.ok(instant(dispatch.startedAt) >= instant(index ? escape.dispatches[0].returnedAt : before.at))
+    assert.ok(instant(dispatch.returnedAt) >= instant(dispatch.startedAt) && instant(dispatch.returnedAt) <= instant(unlocked.at))
+  }
+  assert.ok(Array.isArray(escape.browserKeyUps) && escape.browserKeyUps.length === 1, 'Exactly one browser Escape KeyUp ingress is required')
+  const ingress = escape.browserKeyUps[0]
+  exact(ingress, 'at attemptId generation webContentsId input')
+  for (const field of ['attemptId', 'generation', 'webContentsId']) assert.equal(ingress[field], escape[field])
+  assert.deepEqual(ingress.input, {type: 'keyUp', key: 'Escape', code: 'Escape', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, modifiers: []})
+  assert.ok(instant(ingress.at) >= instant(escape.dispatches[1].startedAt) && instant(ingress.at) <= instant(unlocked.at))
+  // Bounded public-field correlation, not synthetic/physical provenance. Restore can precede KeyUp.
+  assert.equal(escape.mouseObservation, 'bounded-restoration-compatible-not-origin-proof')
+  assert.ok(Array.isArray(escape.browserMouse) && escape.browserMouse.length <= 2 && Array.isArray(escape.domEvents))
+  assert.equal(escape.domEvents.length, escape.browserMouse.length * 2)
+  assert.equal(unlocked.traceSequence, before.traceSequence + escape.domEvents.length)
+  assert.deepEqual(escape.domEvents, inputTrace.filter((event) => event.sequence > before.traceSequence && event.sequence <= unlocked.traceSequence), 'Full observed unlock slice must be retained')
+  const downAt = instant(escape.dispatches[0].startedAt)
+  for (const [index, mouse] of escape.browserMouse.entries()) {
+    exact(mouse, 'at sequence phase attemptId generation webContentsId input')
+    assert.equal(mouse.sequence, index + 1)
+    for (const field of ['attemptId','generation','webContentsId']) assert.equal(mouse[field], escape[field])
+    assert.ok(['keyDown','keyUp','await-release'].includes(mouse.phase))
+    const at = instant(mouse.at)
+    assert.ok(at >= downAt && at - downAt <= 250 && at <= instant(unlocked.at))
+    if (mouse.phase === 'keyDown') assert.ok(at <= instant(escape.dispatches[0].returnedAt))
+    if (mouse.phase === 'keyUp') assert.ok(at >= instant(escape.dispatches[1].startedAt) && at <= instant(escape.dispatches[1].returnedAt))
+    if (mouse.phase === 'await-release') assert.ok(at >= instant(escape.dispatches[1].returnedAt))
+    if (index) assert.ok(at >= instant(escape.browserMouse[index - 1].at))
+    exact(mouse.input, 'type clickCount movementX movementY button globalX globalY x y')
+    assert.equal(mouse.input.type, 'mouseMove'); assert.equal(mouse.input.button, 'none'); assert.equal(mouse.input.clickCount, 0)
+    assert.equal(mouse.input.movementX, 0); assert.equal(mouse.input.movementY, 0)
+    for (const field of ['globalX','globalY','x','y']) assert.ok(Number.isFinite(mouse.input[field]))
+    assert.deepEqual(mouse.input, escape.browserMouse[0].input)
+    for (let offset = 0; offset < 2; offset++) {
+      const event = escape.domEvents[index * 2 + offset]
+      exact(event, 'sequence at type trusted screenX screenY x y buttons movementX movementY code canvasUuid frame target')
+      assert.equal(event.sequence, before.traceSequence + index * 2 + offset + 1); assert.equal(event.type, offset ? 'mousemove' : 'pointermove')
+      assert.equal(event.trusted, true); assert.equal(event.buttons, 0); assert.equal(event.code, null)
+      assert.equal(event.movementX, 0); assert.equal(event.movementY, 0)
+      assert.equal(event.canvasUuid, before.canvasUuid); assert.ok(event.target.startsWith('CANVAS:'))
+      assert.ok(Number.isSafeInteger(event.frame) && event.frame >= before.frame && event.frame <= unlocked.frame)
+      assert.ok(instant(event.at) >= at && instant(event.at) - downAt <= 250 && instant(event.at) <= instant(unlocked.at))
+      assert.deepEqual([event.screenX,event.screenY,event.x,event.y], [mouse.input.globalX,mouse.input.globalY,mouse.input.x,mouse.input.y])
+    }
+  }
+  const frameClicks = eventsDuring('inspect').filter((event) => event.type === 'click' && event.target === 'BUTTON:Frame scene')
+  assert.equal(frameClicks.length, 1, 'Trusted Frame scene click must follow the independently observed unlock')
+  assert.ok(frameClicks[0].sequence > unlocked.traceSequence && instant(frameClicks[0].at) >= instant(unlocked.at))
+  for (const event of inputTrace.filter((event) => event.sequence > unlocked.traceSequence && event.sequence <= inspectAfterEscape.traceSequence)) {
+    assert.ok(instant(event.at) >= instant(unlocked.at), 'No pre-unlock Frame scene input')
+    assert.equal(event.target, 'BUTTON:Frame scene', 'No unclassified post-unlock input')
+    assert.ok(['pointermove','mousemove','pointerdown','pointerup','click'].includes(event.type))
+  }
+  assert.ok(inspectAfterEscape.frame > unlocked.frame && instant(inspectAfterEscape.at) >= instant(frameClicks[0].at))
+  assert.equal(inspectAfterEscape.lockChanges, unlocked.lockChanges)
+  const held = new Set(); let diagonal = false
+  for (const event of eventsDuring('slide')) {
+    if (event.type === 'keydown') held.add(event.code)
+    if (event.type === 'keyup') held.delete(event.code)
+    if (held.has('KeyW') && held.has('KeyD')) diagonal = true
+  }
+  assert.ok(diagonal && held.size === 0, 'Slide requires overlapping native forward/right input and complete releases')
+  const floor = geometry.find((item) => item.entityId === floorId), wall = geometry.find((item) => item.entityId === wallId), eyeY = floor.max[1] + 1.65
+  const grounded = (sample) => assert.ok(Math.abs(sample.position[1] - eyeY) <= 0.04, 'Geometric grounding is outside contact tolerance')
+  const separated = (sample) => { assert.ok(sample.position[2] >= wall.max[2] + 0.29 && sample.position[2] <= wall.max[2] + 0.36, 'Wall stop separation invalid'); assert.ok(Math.abs(sample.position[0]) < wall.max[0] - 0.4, 'Not beside the visible wall') }
+  const staging = phase('staging').at(-1), descent = phase('descent', 2), ground = phase('ground', 4), approach = phase('approach', 2), contact = phase('contact', 3), slide = phase('slide', 3), jump = phase('jump', 8)
+  assert.ok(staging.position[1] > eyeY + 1 && descent[0].position[1] > eyeY + 0.2 && descent.some((sample, index) => index > 0 && sample.position[1] < descent[index - 1].position[1] - 0.02), 'Actual descent is absent')
+  for (const sample of [...ground, ...approach, ...contact, ...slide]) grounded(sample)
+  for (const sample of samples.filter((sample) => !['staging', 'flyEnter', 'flyMove', 'inspect'].includes(sample.phase))) {
+    assert.ok(sample.position[0] > floor.min[0] + 0.3 && sample.position[0] < floor.max[0] - 0.3 && sample.position[2] > floor.min[2] + 0.3 && sample.position[2] < floor.max[2] - 0.3)
+    assert.ok(sample.position[2] >= wall.max[2] + 0.29, 'Run penetrated the visible wall')
+  }
+  assert.ok(ground.at(-1).position[2] - contact[0].position[2] > 1 && approach[0].position[2] - approach.at(-1).position[2] > 0.2, 'No wall approach')
+  for (const sample of [...contact, ...slide, ...jump]) separated(sample)
+  assert.ok(Math.max(...contact.map((sample) => sample.position[2])) - Math.min(...contact.map((sample) => sample.position[2])) < 0.03, 'Wall contact never stabilized')
+  assert.ok(slide.at(-1).position[0] - contact.at(-1).position[0] > 0.5, 'No tangential wall slide')
+  grounded(jump[0]); const peak = jump.reduce((best, sample, index) => sample.position[1] > jump[best].position[1] ? index : best, 0)
+  assert.ok(peak > 0 && peak < jump.length - 3 && jump[peak].position[1] > eyeY + 0.45, 'Jump rise/apex absent')
+  assert.ok(jump.slice(peak + 1).some((sample, index) => sample.position[1] < jump[peak + index].position[1] - 0.02), 'Jump descent absent')
+  jump.slice(-3).forEach(grounded)
+  const exit = phase('runExit')[0], enter = phase('flyEnter')[0], moved = phase('flyMove')[0]
+  assert.ok(Math.hypot(...exit.position.map((value, axis) => value - enter.position[axis])) <= 0.02 && Math.hypot(...exit.quaternion.map((value, axis) => value - enter.quaternion[axis])) <= 0.01, 'Run/Fly pose discontinuity')
+  assert.ok(moved.position[2] < wall.min[2] - 0.1 && enter.position[2] - moved.position[2] > 0.8, 'Fly did not freely cross the stopped wall')
+  phase('inspect'); assert.ok(typeof reopened.bootId === 'string' && reopened.bootId.length > 0 && reopened.bootId !== samples[0].bootId)
+  assert.deepEqual(reopened.snapshot, baseline.snapshot); assert.equal(reopened.applyCount, baseline.applyCount); assert.deepEqual(reopened.geometry, geometry)
+  assert.deepEqual(reopened.observed, observed.map(({ entityId, transform }) => ({ entityId, transform })))
+  assert.deepEqual(evidence.screenshots.map((shot) => shot.filename), ['17-collider-authored-inspect.png', '18-collider-wall-contact.png', '19-collider-jump-landed.png', '20-collider-restored-inspect.png'])
+  for (const shot of evidence.screenshots) { assert.ok(Number.isSafeInteger(shot.bytes) && shot.bytes > 32); assert.match(shot.sha256, /^[a-f0-9]{64}$/) }
+}
+
+export async function verifyActualColliderScreenshots(evidence, directory) {
+  for (const shot of evidence.screenshots) {
+    assert.match(shot.filename, /^(?:17-collider-authored-inspect|18-collider-wall-contact|19-collider-jump-landed|20-collider-restored-inspect)\.png$/)
+    const file = path.join(directory, shot.filename), info = await lstat(file)
+    assert.ok(info.isFile() && !info.isSymbolicLink()); assert.equal(await realpath(file), file)
+    const bytes = await readFile(file)
+    assert.equal(bytes.length, shot.bytes); assert.equal(createHash('sha256').update(bytes).digest('hex'), shot.sha256)
+    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
+    const checkpoint = JSON.parse(await readFile(file.replace(/\.png$/, '.json'), 'utf8'))
+    assert.equal(checkpoint.screenshot.sha256, shot.sha256); assert.equal(checkpoint.screenshot.bytes, shot.bytes)
+    assert.equal(checkpoint.screenshot.width, bytes.readUInt32BE(16)); assert.equal(checkpoint.screenshot.height, bytes.readUInt32BE(20))
+    assert.ok(checkpoint.screenshot.width > 0 && checkpoint.screenshot.height > 0)
+    assert.deepEqual(checkpoint.view.editor.session.snapshot, evidence.baseline.snapshot)
+    assert.deepEqual(checkpoint.freshRepository.value.snapshot, evidence.baseline.snapshot)
+    assert.equal(checkpoint.commandEnvelopes.length, evidence.baseline.applyCount)
+    assert.equal(checkpoint.view.bootId, shot.filename.startsWith('20-') ? evidence.reopened.bootId : evidence.samples[0].bootId)
+  }
 }
 
 export function installOwnedFatalGate(entry, interrupt, limit) {
@@ -467,6 +705,7 @@ async function execute() {
     const outcome = await electron.done
     assert.equal(outcome.code, 0, `Native fixture failed; preserve ${runDirectory}`)
     const result = JSON.parse(await readFile(path.join(runDirectory, 'fixture-report.json'), 'utf8'))
+    if (worldSculptInput && result.status === 'PASS') await verifyActualColliderScreenshots(result.evidence.colliderRun, runDirectory)
     assert.equal(result.status, 'PASS', 'Native process exit without an evidence PASS is not success')
     assert.ok(result.checks.every((entry) => entry.status === 'PASS'))
     if (localAi) assertActualAiTerminal(result)

@@ -223,6 +223,9 @@ test('WSNAV4 native navigation terminal rejects untrusted input pointer lock GPU
     screenshots: ['12-worldsculpt-inspect-framed.png', '13-worldsculpt-inspect-orbit.png', '14-worldsculpt-fly-locked.png', '15-worldsculpt-run-ground-only.png', '16-worldsculpt-restored-inspect.png'],
   }
   const result = { status: 'PASS', checks, errors: [], evidence: { worldSculptNavigation: navigation } }
+  assert.throws(() => runner.assertActualWorldSculptNavigationTerminal(result), /collider/i, 'Fallback proof alone must not accept collider-backed Run')
+  result.evidence.colliderRun = syntheticColliderRunEvidence()
+  result.checks.push(...['native-collider-authoring', 'native-collider-ground-wall-slide', 'native-collider-jump-handoff', 'native-collider-reopen'].map((name) => ({ name, status: 'PASS' })))
   assert.doesNotThrow(() => runner.assertActualWorldSculptNavigationTerminal(result))
   for (const [label, mutate] of [
     ['untrusted', (value) => { value.evidence.worldSculptNavigation.inputTrace[0].trusted = false }],
@@ -1221,7 +1224,7 @@ test('AI2 runner admission forwards exactly the reviewed runtime mode and reserv
 })
 
 test('P1 repository admissions bind relocated main and runner consumers before source reads or spawning', async () => {
-  const head = '416fcfa079aa3e569e8dd460c64c7462fac7850b', branch = 'codex/worlds-engine'
+  const head = 'bdcbd778e28358c1d582503e3202c7d9b649dd1a', branch = 'codex/worlds-engine'
   const admission = { schema: 'modly.worlds-authoring-repository-admission.v1', root: canonicalRoot, head, branch }
   assert.equal(aiPolicies.validateRepositoryAdmission(admission, canonicalRoot, head, branch), admission)
   for (const mutate of [
@@ -2367,6 +2370,7 @@ test('TH5 actual one-chat prompt rejects stale owned renderer before native send
 // Actual registered main callbacks and Promise.race teardown; all native/resource ports are inert.
 async function ownedLifecycleMain(terminalPorts = {}) {
   const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const escapePolicyState = oneSeam(source, /(const reservedEscapePolicies[^\n]+)/g, 'owned session policy state')
   const registration = oneSeam(source, /(app\.on\('window-all-closed',[\s\S]*?)(?=\nconst checks)/g, 'actual registered app lifecycle')
   const variables = oneSeam(source, /(let firstFailure:[\s\S]*?)(?=function fail)/g, 'actual lifecycle state declarations')
   const functions = oneSeam(source, /(function fail\([\s\S]*?)(?=function assertCurrentAiContents)/g, 'actual fail lifecycle and owner guard')
@@ -2401,7 +2405,7 @@ async function ownedLifecycleMain(terminalPorts = {}) {
   const params = ['app', 'BrowserWindow', 'ipcMain', 'session', 'assert', 'evidence', 'errors', 'report', 'checks', 'cleanup', 'network', 'now', 'writeFileSync', 'reportPath', 'path', 'bundle', 'build', 'assetPaths', 'runtimeMode', 'createWorldSculptPointerLockPermissionPolicy', 'localAi', 'isLocalAiRoute', 'waitForOwnedWindowFocus', 'execution', 'readView', 'writeFile', 'runDirectory', 'abortGate', 'bounded', 'stopLocalAi', 'diskManifest', 'workspace', 'persist', 'watchdog', 'onViolation', 'gate']
   // Bind the actual expression only to observe its exceptional completion; its body is unchanged.
   const observedPipeline = pipeline.replace(/^void /, 'const terminal = ')
-  const make = await inertFunction(`${variables}\n${functions}\n${registration}\n${windows}\n${observedPipeline}\nreturn {openWindow, fail, terminal, state: () => ({firstFailure, currentWindow, generation, stopping, terminalExitAuthorized, records: evidence.lifecycle ?? []}), setStage: name => {currentStage = name}, setStopping: value => {stopping = value}, setServer: value => {server = value}, addChannel: name => ownedChannels.push(name)}`, params)
+  const make = await inertFunction(`${variables}\n${escapePolicyState}\n${functions}\n${registration}\n${windows}\n${observedPipeline}\nreturn {openWindow, fail, terminal, state: () => ({firstFailure, currentWindow, generation, stopping, terminalExitAuthorized, records: evidence.lifecycle ?? []}), setStage: name => {currentStage = name}, setStopping: value => {stopping = value}, setServer: value => {server = value}, addChannel: name => ownedChannels.push(name)}`, params)
   const main = make(app, OwnedWindow, ipcMain, session, assert, evidence, errors, report, checks, cleanup, network, () => 'controlled:at', (_path, bytes) => {
     events.push('snapshot')
     if (terminalPorts.finalWriteError && events.includes('persist:complete')) { events.push('controlled:final-write'); throw terminalPorts.finalWriteError }
@@ -2543,4 +2547,704 @@ test('DB3 legacy twenty-second round1 HTTP504 never establishes actual AI accept
   Object.assign(failed.evidence.actualAi.turn.responseReceipt, { status: 504, responseBytes: bytes.length, responseSha256: createHash('sha256').update(bytes).digest('hex'), rawResponseBase64: bytes.toString('base64'), validation: 'rejected', response: JSON.parse(bytes.toString('utf8')) })
   assert.equal(failed.evidence.actualAi.turn.responseReceipt.response.detail.round, 1)
   assert.throws(() => runnerPolicy.assertActualAiTerminal(failed), { code: 'ERR_ASSERTION', actual: 504, expected: 200, message: /Actual AI HTTP success required/ }, 'A historical round timeout must fail specifically at real HTTP success validation, not at missing prior-stage evidence')
+})
+
+// Deliberately synthetic CPU validator fixtures, never native acceptance receipts.
+function syntheticColliderRunEvidence(restoration = false) {
+  const beforeAuthoring = createValidWorldSnapshot(), sceneId = 'scene:collider-test', floorId = 'entity:floor', wallId = 'entity:wall', resourceId = 'resource:native-cube'
+  beforeAuthoring.project.resources.push({ id: resourceId, type: 'model', format: 'glb', workspacePath: 'Exports/AuthoringFixtures/red-cube.glb' })
+  let current = structuredClone(beforeAuthoring)
+  const authoring = []
+  const apply = (command, change) => {
+    const previous = structuredClone(current); change(current); current.project.revision++
+    authoring.push({ forwardedAt: '2026-09-27T00:00:00Z', settledAt: '2026-09-27T00:00:00Z', request: { batch: { origin: 'ui', projectId: current.project.projectId, baseRevision: previous.project.revision, commands: [command] } },
+      result: { ok: true, value: { idempotent: false, newRevision: current.project.revision, warnings: [], snapshot: structuredClone(current), inverse: { kind: 'world-snapshot', snapshot: previous } } } })
+  }
+  const reference = { id: sceneId }, scene = { sceneId, entities: [] }
+  apply({ type: 'add-scene', reference, scene }, (snapshot) => { snapshot.project.scenes.push(structuredClone(reference)); snapshot.scenes.push(structuredClone(scene)) })
+  const geometry = [], observed = []
+  for (const id of [floorId, wallId]) {
+    const identity = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }
+    const entity = { id, enabled: true, parentId: null, transform: identity, components: [{ id: `render:${id}`, type: 'renderable', enabled: true, visible: true, resourceId }] }
+    const owner = (snapshot) => snapshot.scenes.find((scene) => scene.sceneId === sceneId).entities.find((entity) => entity.id === id)
+    apply({ type: 'add-entity', sceneId, entity: structuredClone(entity) }, (snapshot) => snapshot.scenes.find((scene) => scene.sceneId === sceneId).entities.push(structuredClone(entity)))
+    for (const component of [{ id: `collider:${id}`, type: 'collider', enabled: true, purpose: 'simulation', shape: 'mesh', sensor: false, resourceId }, { id: `body:${id}`, type: 'rigid-body', enabled: true, bodyType: 'fixed' }]) {
+      apply({ type: 'add-component', sceneId, entityId: id, component }, (snapshot) => owner(snapshot).components.push(component))
+    }
+    const transform = id === floorId ? { position: [0, 0, 0], rotation: [0, 0, 0], scale: [30, 0.5, 30] } : { position: [0, 0.35, -2], rotation: [0, 0, 0], scale: [16, 8, 1] }
+    apply({ type: 'patch-entity', sceneId, entityId: id, patch: { transform } }, (snapshot) => { owner(snapshot).transform = structuredClone(transform) })
+    const min = [-0.35, 0, -0.35].map((value, axis) => transform.position[axis] + value * transform.scale[axis]), max = [0.35, 0.7, 0.35].map((value, axis) => transform.position[axis] + value * transform.scale[axis])
+    geometry.push({ entityId: id, componentId: `collider:${id}`, resourceId, min, max, vertices: 36, triangles: 12 })
+    observed.push({ entityId: id, transform, min, max })
+  }
+  const baseline = { snapshot: current, undoStack: [], redoStack: [], receipts: [], applyCount: 20 }, canonicalSha256 = createHash('sha256').update(JSON.stringify(baseline)).digest('hex')
+  const inputTrace = [], samples = []
+  let clock = Date.parse('2026-09-27T00:00:00Z'), frame = 0
+  const event = (code, type = 'keydown') => inputTrace.push({ sequence: inputTrace.length + 1, at: new Date(++clock).toISOString(), type, code, trusted: true, movementX: type === 'pointermove' ? 4 : null, movementY: type === 'pointermove' ? 2 : null })
+  const press = (code) => { event(code); event(code, 'keyup') }
+  const sample = (phase, x, y, z) => {
+    clock += 100; frame += 6
+    const fly = ['staging', 'flyEnter', 'flyMove'].includes(phase), inspect = phase === 'inspect'
+    samples.push({ phase, at: new Date(clock).toISOString(), bootId: 'boot:old', frame, traceSequence: inputTrace.length,
+      position: [x, y, z], quaternion: [0, 0, 0, 1], status: inspect ? 'Inspect mode. Orbit, pan, select, and edit.' : fly ? 'Fly mode. Pointer locked.' : 'Run mode. Collider-backed.',
+      groundOnly: false, locked: !inspect, lockChanges: inspect ? 2 : 1, lockErrors: 0, orbit: inspect, canonicalSha256, applyCount: baseline.applyCount })
+  }
+  event(null, 'pointermove'); sample('staging', 0, 3.85, 3)
+  press('Digit3'); for (const y of [3.5, 2.8, 2.1, 2.01]) sample('descent', 0, y, 3)
+  for (let i = 0; i < 4; i++) sample('ground', 0, 2.01, 3)
+  for (const z of [2.3, 1.5, 0.5, -0.5, -1.34]) { press('KeyW'); sample('approach', 0, 2.01, z) }
+  for (let i = 0; i < 3; i++) { press('KeyW'); sample('contact', 0, 2.01, -1.34) }
+  for (const x of [0.6, 1.2, 1.8]) { event('KeyW'); event('KeyD'); event('KeyD', 'keyup'); event('KeyW', 'keyup'); sample('slide', x, 2.01, -1.34) }
+  sample('jump', 1.8, 2.01, -1.34); event('Space'); sample('jump', 1.8, 2.2, -1.34); event('Space', 'keyup')
+  for (const y of [2.6, 3, 2.8, 2.4, 2.01, 2.01, 2.01]) sample('jump', 1.8, y, -1.34)
+  sample('runExit', 1.8, 2.01, -1.34); press('Digit2'); sample('flyEnter', 1.8, 2.01, -1.34)
+  press('KeyW'); sample('flyMove', 1.8, 2.01, -2.94)
+  const before = { at: new Date(++clock).toISOString(), bootId: 'boot:old', canvasUuid: 'canvas:owned', frame: ++frame, traceSequence: inputTrace.length,
+    position: [1.8,2.01,-2.94], quaternion: [0,0,0,1], locked: true, lockChanges: 1, lockErrors: 0,
+    focused: true, fullscreen: false, heldKeys: [], canonicalSha256, applyCount: baseline.applyCount }
+  const reservedEscape = { schema: 'modly.browser-reserved-escape.v1', attemptId: 'reserved-escape:3:9', generation: 3, webContentsId: 9,
+    keyboardLock: 'denied-by-owned-session-policy', before, dispatches: ['keyDown','keyUp'].map((type) => ({kind: 'DISPATCH',
+      startedAt: new Date(++clock).toISOString(), returnedAt: new Date(++clock).toISOString(), payload: {type, keyCode: 'Escape', modifiers: []}})),
+    browserKeyUps: [{at: new Date(++clock).toISOString(), attemptId: 'reserved-escape:3:9', generation: 3, webContentsId: 9,
+      input: {type: 'keyUp', key: 'Escape', code: 'Escape', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, modifiers: []}}],
+    mouseObservation: 'bounded-restoration-compatible-not-origin-proof', browserMouse: [], domEvents: [],
+    unlocked: {...before, at: new Date(++clock).toISOString(), frame: ++frame, locked: false, lockChanges: 2}, interference: [], listenersRemoved: true }
+  if (restoration) {
+    // actual6-shaped repeated stationary Canvas pairs, BEFORE browser KeyUp, not origin proof.
+    for (let i = 0; i < 2; i++) {
+      const at = reservedEscape.dispatches[0].startedAt
+      reservedEscape.browserMouse.push({at, sequence: i + 1, phase: 'keyDown', attemptId: reservedEscape.attemptId, generation: 3, webContentsId: 9,
+        input: {type: 'mouseMove', clickCount: 0, movementX: 0, movementY: 0, button: 'none', globalX: 875, globalY: 462, x: 817, y: 364}})
+      for (const type of ['pointermove','mousemove']) inputTrace.push({sequence: inputTrace.length + 1, at, type, trusted: true,
+        screenX: 875, screenY: 462, x: 817, y: 364, buttons: 0, movementX: 0, movementY: 0, code: null,
+        canvasUuid: before.canvasUuid, frame: before.frame + 1, target: 'CANVAS:'})
+    }
+    reservedEscape.domEvents = structuredClone(inputTrace.slice(before.traceSequence))
+    reservedEscape.unlocked.traceSequence = inputTrace.length
+  }
+  event(null, 'click'); inputTrace.at(-1).target = 'BUTTON:Frame scene'; sample('inspect', 1.8, 4, 3)
+  return { schema: 'modly.collider-run-acceptance.v1', grounding: 'geometric-native-observation', sceneId, floorId, wallId, authoring, beforeAuthoring, baseline, canonicalSha256, geometry, observed, samples, inputTrace, reservedEscape,
+    screenshots: ['17-collider-authored-inspect.png', '18-collider-wall-contact.png', '19-collider-jump-landed.png', '20-collider-restored-inspect.png'].map((filename) => ({ filename, bytes: 100, sha256: 'a'.repeat(64) })),
+    reopened: { bootId: 'boot:new', snapshot: structuredClone(current), applyCount: baseline.applyCount, geometry: structuredClone(geometry), observed: observed.map(({ entityId, transform }) => ({ entityId, transform })) } }
+}
+
+test('WSNAV7 collider terminal recomputes authoring geometry and native behavior instead of trusting success flags', async () => {
+  const { assertActualColliderRunTerminal } = await import('./run.mjs')
+  assert.doesNotThrow(() => assertActualColliderRunTerminal(syntheticColliderRunEvidence()))
+  const mutatePhase = (evidence, phase, fn) => evidence.samples.filter((sample) => sample.phase === phase).forEach(fn)
+  for (const [label, mutate] of [
+    ['missing', (value) => { delete value.samples }],
+    ['boolean claim', (value) => { value.grounded = true }],
+    ['raw Worker claim', (value) => { value.grounding = 'worker-grounded' }],
+    ['forged baseline', (value) => { value.baseline.undoStack.push('forged') }],
+    ['non-UI authoring', (value) => { value.authoring[0].request.batch.origin = 'ai' }],
+    ['unapplied authoring', (value) => { value.authoring[1].result.ok = false }],
+    ['unrelated canonical edit', (value) => { value.authoring[2].result.value.snapshot.project.name = 'wrong' }],
+    ['source mismatch', (value) => { value.geometry[0].resourceId = 'other' }],
+    ['visible mismatch', (value) => { value.observed[1].max[2] += 1 }],
+    ['collider mismatch', (value) => { value.geometry[0].min[0] -= 1 }],
+    ['missing descent', (value) => mutatePhase(value, 'descent', (sample) => { sample.position[1] = 2.01 })],
+    ['wrong eye height', (value) => mutatePhase(value, 'ground', (sample) => { sample.position[1] = 0.7 })],
+    ['no approach', (value) => mutatePhase(value, 'approach', (sample) => { sample.position[2] = -1.34 })],
+    ['penetration', (value) => mutatePhase(value, 'contact', (sample) => { sample.position[2] = -2 })],
+    ['remote stop', (value) => mutatePhase(value, 'contact', (sample) => { sample.position[2] = 0 })],
+    ['no slide', (value) => mutatePhase(value, 'slide', (sample) => { sample.position[0] = 0 })],
+    ['no jump', (value) => mutatePhase(value, 'jump', (sample) => { sample.position[1] = 2.01 })],
+    ['no landing', (value) => mutatePhase(value, 'jump', (sample) => { sample.position[1] += 1 })],
+    ['fallback', (value) => { value.samples[3].groundOnly = true }],
+    ['recovered', (value) => { value.samples[3].status = 'Run mode. Returned to the last safe ground position.' }],
+    ['canonical navigation edit', (value) => { value.samples[3].canonicalSha256 = 'b'.repeat(64) }],
+    ['apply navigation edit', (value) => { value.samples[3].applyCount++ }],
+    ['untrusted', (value) => { value.inputTrace[0].trusted = false }],
+    ['no Space edge', (value) => { value.inputTrace.filter((event) => event.code === 'Space').forEach((event) => { event.code = 'KeyW' }) }],
+    ['no diagonal input', (value) => { value.inputTrace.filter((event) => event.code === 'KeyD').forEach((event) => { event.code = 'KeyA' }) }],
+    ['nonoverlapping diagonal', (value) => {
+      for (let index = 1; index < value.inputTrace.length; index++) if (value.inputTrace[index].code === 'KeyD' && value.inputTrace[index].type === 'keydown') {
+        value.inputTrace[index - 1].type = 'keyup'; value.inputTrace[index + 2].type = 'keydown'
+      }
+    }],
+    ['stale frames', (value) => { value.samples[3].frame = value.samples[2].frame }],
+    ['nonfinite pose', (value) => { value.samples[3].position[0] = NaN }],
+    ['lock reacquired', (value) => mutatePhase(value, 'flyEnter', (sample) => { sample.lockChanges += 2 })],
+    ['pose discontinuity', (value) => mutatePhase(value, 'flyEnter', (sample) => { sample.position[0] += 1 })],
+    ['blocked Fly', (value) => mutatePhase(value, 'flyMove', (sample) => { sample.position[2] = -1.34 })],
+    ['Inspect locked', (value) => mutatePhase(value, 'inspect', (sample) => { sample.locked = true })],
+    ['stale boot', (value) => { value.reopened.bootId = 'boot:old' }],
+    ['lost collider on reopen', (value) => { value.reopened.snapshot.scenes.at(-1).entities[0].components.pop() }],
+    ['lost transform on reopen', (value) => { value.reopened.observed[0].transform.position[0]++ }],
+    ['missing screenshot', (value) => { value.screenshots.pop() }],
+  ]) {
+    const value = syntheticColliderRunEvidence(); mutate(value)
+    assert.throws(() => assertActualColliderRunTerminal(value), undefined, label)
+  }
+})
+
+test('WSNAV8 native collider screenshots require actual hash-bound PNG and durable checkpoint files', async () => {
+  const { verifyActualColliderScreenshots } = await import('./run.mjs'), evidence = syntheticColliderRunEvidence()
+  const directory = await mkdtemp(path.join(evidenceRoot, 'collider-shots-'))
+  await assert.rejects(verifyActualColliderScreenshots(evidence, directory))
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWZkAAAAASUVORK5CYII=', 'base64')
+  for (const shot of evidence.screenshots) {
+    shot.bytes = png.length; shot.sha256 = createHash('sha256').update(png).digest('hex')
+    await writeFile(path.join(directory, shot.filename), png)
+    await writeFile(path.join(directory, shot.filename.replace(/\.png$/, '.json')), JSON.stringify({ screenshot: { ...shot, width: 1, height: 1 }, view: { bootId: shot.filename.startsWith('20-') ? 'boot:new' : 'boot:old', editor: { session: { snapshot: evidence.baseline.snapshot } } }, freshRepository: { value: { snapshot: evidence.baseline.snapshot } }, commandEnvelopes: Array.from({ length: evidence.baseline.applyCount }, () => ({})) }))
+  }
+  await assert.doesNotReject(verifyActualColliderScreenshots(evidence, directory))
+  await writeFile(path.join(directory, evidence.screenshots[0].filename), Buffer.from('forged screenshot'))
+  await assert.rejects(verifyActualColliderScreenshots(evidence, directory))
+})
+
+test('WSNAV9 actual locked look primes once then requires both native event types and independent later camera response', async () => {
+  const source = await readFile(new URL('./navigation-driver.ts', import.meta.url), 'utf8')
+  const helper = oneSeam(source, /(function captureNativeLook[\s\S]*?)(?=export async function runWorldSculptNavigationAcceptance)/g, 'bounded native look helper')
+  const changedBody = oneSeam(source, /(function changed\([\s\S]*?\n\})/g, 'actual camera change predicate')
+  const make = await inertFunction(`${changedBody}; ${helper}; return { captureNativeLook, hasNativeLookReceipt, nativeRelativeLook }`,
+    ['assert', 'sendNativeInput', 'waitFor', 'readView', 'FLY_LOCKED_STATUS'])
+  const { sendNativeInput } = await import('./driver.ts'), lockedStatus = 'Fly mode. Pointer locked.'
+  const before = { bootId: 'boot:owned', canvas: { canvasUuid: 'canvas:owned', frame: 41, cameraPose: { position: [0, 2, 3], quaternion: [0, 0, 0, 1] }, controls: { orbitEnabled: false } },
+    navigation: { status: lockedStatus, pointerLock: { canvasOwned: true, changes: 1, errors: 0 } }, trace: [{ sequence: 8 }] }
+  const primed = structuredClone(before); primed.canvas.frame = 43; primed.canvas.cameraPose.quaternion = [0.02, 0.03, 0, 0.999]
+  const receipt = (sequence, type, movementX, movementY, frame) => ({ sequence, type, trusted: true, canvasUuid: 'canvas:owned', frame, movementX, movementY, screenX: 100, screenY: 200 })
+  primed.trace.push(receipt(9, 'pointermove', 0, 0, 42), receipt(10, 'mousemove', 0, 0, 42))
+  const after = structuredClone(primed); after.canvas.frame = 46; after.canvas.cameraPose.quaternion = [...before.canvas.cameraPose.quaternion]
+  after.trace.push(receipt(11, 'pointermove', 37, -19, 45), receipt(12, 'mousemove', 37, -19, 45))
+  const exercise = async (failure) => {
+    const events = [], records = new Map(), budgets = []; let current = before
+    const contents = { sendInputEvent(event) { events.push(structuredClone(event)) } }
+    const ports = { guard(owner) { assert.equal(owner, contents) }, inputGuard(owner) { assert.equal(owner, contents) }, record(name, value) { records.set(name, structuredClone(value)) } }
+    const wait = async (owner, actualPorts, predicate, label, milliseconds) => {
+      assert.equal(owner, contents); assert.equal(actualPorts, ports); assert.ok(milliseconds > 0 && milliseconds <= 4000); budgets.push(milliseconds)
+      current = label.endsWith('-prime') ? primed : after
+      if (failure === 'prime' || (failure === 'measurement' && !label.endsWith('-prime'))) throw new Error(`Controlled ${failure} failure`)
+      assert.equal(predicate(current), true); return structuredClone(current)
+    }
+    const policy = make(assert, sendNativeInput, wait, async () => structuredClone(current), lockedStatus)
+    const task = policy.nativeRelativeLook(contents, ports, structuredClone(before), { x: 100, y: 200 }, { x: 37, y: -19 }, 'native-fly-look', true, Date.now() + 4000)
+    if (failure) await assert.rejects(task, /Controlled/); else await task
+    return { policy, events, records, budgets }
+  }
+  const { policy, events, records, budgets } = await exercise()
+  assert.deepEqual(events, [{ type: 'mouseMove', x: 100, y: 200, movementX: 0, movementY: 0, globalX: 0, globalY: 0 }, { type: 'mouseMove', x: 100, y: 200, movementX: 37, movementY: -19, globalX: 37, globalY: -19 }])
+  assert.equal(budgets.length, 2); assert.ok(budgets[1] <= budgets[0], 'Priming and measurement share one shrinking deadline')
+  assert.deepEqual(records.get('native-fly-look-before'), { observation: policy.captureNativeLook(primed), payload: events[1] }, 'Immediate baseline must follow priming, which may move the camera')
+  assert.deepEqual(records.get('native-fly-look-after'), policy.captureNativeLook(after))
+  const baseline = policy.captureNativeLook(primed), accepts = (view) => policy.hasNativeLookReceipt(view, baseline, { x: 37, y: -19 }, true)
+  assert.equal(accepts(after), true)
+  for (const type of ['pointermove', 'mousemove']) for (const [label, mutate] of [
+    ['missing', (view, index) => { view.trace.splice(index, 1) }],
+    ['zero', (view, index) => { view.trace[index].movementX = 0; view.trace[index].movementY = 0 }],
+    ['wrong delta', (view, index) => { view.trace[index].movementX = 36 }],
+    ['stale sequence', (view, index) => { view.trace[index].sequence = baseline.traceSequence }],
+    ['untrusted', (view, index) => { view.trace[index].trusted = false }],
+    ['wrong Canvas', (view, index) => { view.trace[index].canvasUuid = 'canvas:other' }],
+    ['stale frame', (view, index) => { view.trace[index].frame = baseline.frame - 1 }],
+  ]) {
+    const invalid = structuredClone(after), index = invalid.trace.findIndex((event) => event.type === type && event.sequence > baseline.traceSequence)
+    mutate(invalid, index); assert.equal(accepts(invalid), false, `${type}: ${label}`)
+  }
+  for (const [label, mutate] of [
+    ['lost lock', (view) => { view.navigation.pointerLock.canvasOwned = false }],
+    ['reacquired lock', (view) => { view.navigation.pointerLock.changes = 3 }],
+    ['lock error', (view) => { view.navigation.pointerLock.errors = 1 }],
+    ['new boot', (view) => { view.bootId = 'boot:other' }],
+    ['new Canvas', (view) => { view.canvas.canvasUuid = 'canvas:other' }],
+    ['no later render', (view) => { view.canvas.frame = 45 }],
+    ['Orbit active', (view) => { view.canvas.controls.orbitEnabled = true }],
+    ['not Fly', (view) => { view.navigation.status = 'Run mode. Pointer locked.' }],
+    ['unchanged camera', (view) => { view.canvas.cameraPose = structuredClone(primed.canvas.cameraPose) }],
+  ]) { const invalid = structuredClone(after); mutate(invalid); assert.equal(accepts(invalid), false, label) }
+  const failed = await exercise('measurement')
+  assert.deepEqual(failed.records.get('native-fly-look-error').observation, policy.captureNativeLook(after), 'Timeout must independently retain actual post/error pose and trace')
+  const primeFailed = await exercise('prime')
+  assert.equal(primeFailed.events.length, 1); assert.equal(primeFailed.records.has('native-fly-look-before'), false)
+  assert.equal(primeFailed.budgets.length, 1, 'No priming retry or second independent look deadline')
+  assert.match(source, /nativeRelativeLook\(contents, ports, view, canvasPoint, \{ x: 37, y: -19 \}, 'native-fly-look', true, Date\.now\(\) \+ 4000\)/)
+  assert.match(source, /`collider-look-\$\{step\}`, step === 0, colliderLookDeadline/)
+  const renderer = await readFile(new URL('./renderer.tsx', import.meta.url), 'utf8')
+  assert.match(renderer, /\['pointerdown', 'pointermove', 'mousemove', 'pointerup'/)
+  assert.match(renderer, /screenX: mouse\?\.screenX \?\? null, screenY: mouse\?\.screenY \?\? null/)
+})
+
+test('WSNAV10 locked look accumulates outgoing screen coordinates without advancing rejected sends', async () => {
+  const { sendNativeInput } = await import('./driver.ts'), events = [], records = [], order = []
+  let rejectOwner = false, rejectSend = false
+  const contents = { sendInputEvent(event) { order.push('send'); if (rejectSend) throw new Error('Controlled rejected send'); events.push(structuredClone(event)) } }
+  const ports = { inputGuard(owner) { assert.equal(owner, contents); order.push('guard'); if (rejectOwner) throw new Error('Controlled rejected owner') } }
+  const owner = { bootId: 'boot:1', canvasUuid: 'canvas:1', lockChanges: 1 }
+  const relative = (x, y, nextOwner = owner, target = contents) => sendNativeInput(target, ports, { type: 'mouseMove', x: 100, y: 200, movementX: x, movementY: y }, { owner: nextOwner, beforeSend(payload) { records.push(structuredClone(payload)) } })
+  const absolute = { type: 'mouseMove', x: 50, y: 60 }
+  sendNativeInput(contents, ports, absolute); assert.deepEqual(events[0], absolute)
+  relative(0, 0); relative(37, -19); relative(37, -19)
+  assert.deepEqual(events.slice(1).map(({ x, y, globalX, globalY }) => [x, y, globalX, globalY]), [[100, 200, 0, 0], [100, 200, 37, -19], [100, 200, 74, -38]])
+  assert.deepEqual(order, ['guard', 'send', 'guard', 'send', 'guard', 'send', 'guard', 'send'])
+  rejectOwner = true; assert.throws(() => relative(5, 6), /rejected owner/); rejectOwner = false
+  rejectSend = true; assert.throws(() => relative(5, 6), /rejected send/); rejectSend = false
+  relative(5, 6); assert.deepEqual([events.at(-1).globalX, events.at(-1).globalY], [79, -32])
+  for (const nextOwner of [{ ...owner, lockChanges: 3 }, { ...owner, bootId: 'boot:2' }, { ...owner, canvasUuid: 'canvas:2' }]) {
+    assert.throws(() => relative(1, 1, nextOwner), /prim/i)
+    relative(0, 0, nextOwner); assert.deepEqual([events.at(-1).globalX, events.at(-1).globalY], [0, 0])
+    relative(4, 5, nextOwner); assert.deepEqual([events.at(-1).globalX, events.at(-1).globalY], [4, 5])
+  }
+  const replacementEvents = [], replacement = { sendInputEvent(event) { replacementEvents.push(event) } }, replacementPorts = { inputGuard(target) { assert.equal(target, replacement) } }
+  assert.throws(() => sendNativeInput(replacement, replacementPorts, { type: 'mouseMove', x: 100, y: 200, movementX: 1, movementY: 1 }, { owner }), /prim/i)
+  sendNativeInput(replacement, replacementPorts, { type: 'mouseMove', x: 100, y: 200, movementX: 0, movementY: 0 }, { owner })
+  assert.deepEqual([replacementEvents[0].globalX, replacementEvents[0].globalY], [0, 0])
+  const globalAbsolute = { type: 'mouseMove', x: 8, y: 9, globalX: 10, globalY: 20 }
+  sendNativeInput(contents, ports, globalAbsolute); assert.deepEqual(events.at(-1), globalAbsolute)
+  relative(0, 0); relative(3, 4); assert.deepEqual([events.at(-1).globalX, events.at(-1).globalY], [13, 24])
+  assert.deepEqual(records.at(-1), events.at(-1), 'Intended outgoing payload is observable before send')
+})
+
+test('WSNAV11 actual focus waits for quiet distinct frames and preserves immediate before/after failure evidence', async () => {
+  const source = await readFile(new URL('./navigation-driver.ts', import.meta.url), 'utf8')
+  const seam = oneSeam(source, /(interface WorldSculptVisualProofEvidence[\s\S]*?)(?=async function nativeOrbitDrag)/g, 'native focus and clean-closeup')
+  const changedBody = oneSeam(source, /(function changed\([\s\S]*?\n\})/g, 'camera comparison')
+  const framedBody = oneSeam(source, /(function framed\([\s\S]*?\n\})/g, 'full-corner framing')
+  const make = await inertFunction(`${changedBody}; ${framedBody}; ${seam}; return prepareWorldSculptVisualProof`,
+    ['assert', 'model', 'nativeCanvasClick', 'nativeCanvasDoubleClick', 'waitFor', 'readView', 'assertCanonicalState', 'admitNativeCanvasFocusEvidence', 'INSPECT_STATUS'])
+  const entityId = 'entity:worldsculpt', status = 'Inspect mode. Orbit, pan, select, and edit.'
+  const observation = (frame, milliseconds, camera = 2) => ({
+    at: new Date(Date.UTC(2026, 8, 27) + milliseconds).toISOString(), bootId: 'boot:focus',
+    selection: { active: entityId, ids: [entityId], mode: 'translate' },
+    canvas: { canvasUuid: 'canvas:focus', cameraFraming: { uuid: 'camera:focus' }, frame, camera: Array.from({ length: 32 }, (_, index) => index === 12 ? camera : 0),
+      cameraPose: { position: [camera, 2, 3], quaternion: [0, 0, 0, 1], yawPitchRoll: [0, 0, 0] }, controls: { orbitEnabled: true }, gizmo: { entityId },
+      models: [{ entityId, bounds: { x: 20, y: 30, width: 100, height: 80 }, worldCorners: Array.from({ length: 8 }, () => ({ world: [0, 0, 0], ndc: [0.5, 0.5, 0], depth: 2 })) }] },
+    navigation: { status, pointerLock: { canvasOwned: false, changes: 0, errors: 0 } },
+    trace: [{ sequence: 11, type: 'dblclick', trusted: true, canvasUuid: 'canvas:focus', x: 60, y: 70, frame: 9 }],
+  })
+  const exercise = async ({ invalidOwner, failClean = false, neverSettles = false } = {}) => {
+    const records = new Map(), budgets = [], focused = observation(14, 240), after = observation(20, 400, failClean ? 2.1 : 2)
+    after.selection = { active: null, ids: [], mode: null }; after.canvas.gizmo = null
+    const focus = { point: { x: 60, y: 70 }, beforeCamera: observation(8, -40).canvas.camera, traceStart: 10,
+      bootId: 'boot:focus', canvasUuid: 'canvas:focus', cameraUuid: 'camera:focus' }
+    let clicks = 0, last
+    const contents = {}, ports = { guard() {}, record(name, value) { records.set(name, structuredClone(value)) } }
+    const prepare = make(assert, (view) => view.canvas.models[0], async () => {
+      if (++clicks === 2) {
+        const before = [...records].find(([name]) => name.endsWith('-before'))?.[1]
+        assert.ok(before, 'Focused baseline must be persisted before the second native empty click')
+        assert.deepEqual(before.view, focused); assert.deepEqual(before.focus, focus)
+      }
+      return { x: 10, y: 10 }
+    }, async () => focus, async (_contents, _ports, predicate, label, ms = 4000) => {
+      budgets.push([label, ms])
+      if (label === 'worldsculpt-native-deselect') return structuredClone(after)
+      if (label === 'worldsculpt-native-double-click-focus') {
+        assert.equal(predicate(observation(10, 0, 0)), false, 'Transient but framed camera must not be accepted')
+        assert.equal(predicate(observation(11, 60, 1)), false, 'Moving camera restarts quiet observation')
+        if (invalidOwner) {
+          const invalid = observation(12, 120); invalidOwner(invalid); predicate(invalid)
+          throw new Error('Owner drift incorrectly survived focus admission')
+        }
+        if (neverSettles) {
+          for (let frame = 12; frame < 100; frame++) {
+            const moving = observation(frame, frame * 80, frame)
+            assert.equal(predicate(moving), false)
+            const unframed = observation(frame + 1, frame * 80 + 40)
+            unframed.canvas.models[0].worldCorners[0].ndc[0] = 0.93
+            assert.equal(predicate(unframed), false, 'Unframed observations cannot count toward settlement')
+          }
+          throw new Error('Controlled original focus deadline')
+        }
+        assert.equal(predicate(observation(12, 120)), false)
+        assert.equal(predicate(observation(12, 160)), false, 'One stale rendered frame cannot establish quietness')
+        assert.equal(predicate(observation(13, 180)), false, 'At least three distinct frames and 120 ms quiet are required')
+        assert.equal(predicate(focused), true, 'Quiet distinct frames must be accepted without an arbitrary sleep')
+        return structuredClone(focused)
+      }
+      assert.equal(label, 'worldsculpt-native-clean-closeup')
+      last = structuredClone(after)
+      assert.equal(predicate(last), !failClean, 'Existing unchanged-camera requirement must not be weakened')
+      if (failClean) throw new Error('Controlled clean-closeup deadline')
+      return last
+    }, async () => structuredClone(after), () => {}, () => ({ dblclickSequence: 11 }), status)
+    const task = prepare(contents, ports, observation(1, -100), entityId, {})
+    if (invalidOwner) await assert.rejects(task, /owner changed/i)
+    else if (neverSettles) await assert.rejects(task, /original focus deadline/)
+    else if (failClean) await assert.rejects(task, /clean-closeup deadline/)
+    else await task
+    assert.equal(budgets.find(([label]) => label.endsWith('double-click-focus'))[1], 8000)
+    if (!invalidOwner && !neverSettles) {
+      assert.equal(budgets.find(([label]) => label.endsWith('clean-closeup'))[1], 4000)
+      const before = [...records].find(([name]) => name.endsWith('-before'))[1]
+      const post = [...records].find(([name]) => name.endsWith('-after'))[1]
+      assert.deepEqual(before.view, focused); assert.deepEqual(post.view, last)
+      assert.equal(post.predicates.cameraPreserved, !failClean); assert.equal(post.predicates.framed, true)
+      assert.equal(post.predicates.selectionEmpty, true); assert.equal(post.predicates.gizmoHidden, true); assert.equal(post.predicates.modelPresent, true)
+      assert.equal(post.cameraDelta[12], after.canvas.camera[12] - focused.canvas.camera[12])
+      if (failClean) {
+        const error = [...records].find(([name]) => name.endsWith('-error'))[1]
+        assert.deepEqual(error.observation.view, after, 'Independently read actual error pose must survive timeout')
+        assert.deepEqual(error.observation.cameraDelta, post.cameraDelta)
+      }
+    }
+  }
+  await exercise(); await exercise({ failClean: true }); await exercise({ neverSettles: true })
+  for (const invalidOwner of [
+    (view) => { view.bootId = 'boot:other' },
+    (view) => { view.canvas.canvasUuid = 'canvas:other' },
+    (view) => { view.canvas.cameraFraming.uuid = 'camera:other' },
+  ]) await exercise({ invalidOwner })
+})
+
+test('WSNAV12 actual Inspector reveal rejects moving-but-hittable layout and bounds native scroll settlement', async () => {
+  const source = await readFile(new URL('./navigation-driver.ts', import.meta.url), 'utf8')
+  const body = oneSeam(source, /(async function revealInspectorTarget[\s\S]*?)(?=async function runColliderNavigationAcceptance)/g, 'native Inspector reveal')
+  const make = await inertFunction(`${body}; return revealInspectorTarget`, ['assert', 'observeNativeClickPoint', 'sendNativeInput', 'paint', 'readView', 'waitFor', 'Date'])
+  const exercise = async (mode = 'settled') => {
+    let milliseconds = 0, frame = 1, observations = 0
+    const records = new Map(), events = [], budgets = []
+    const view = () => ({ at: new Date(milliseconds).toISOString(), bootId: mode === 'boot-drift' && observations > 0 ? 'boot:other' : 'boot:owned',
+      canvas: { canvasUuid: mode === 'canvas-drift' && observations > 0 ? 'canvas:other' : 'canvas:owned', frame },
+      editor: { activeSceneId: 'scene:owned' }, selection: { active: mode === 'entity-drift' && observations > 0 ? 'entity:other' : 'entity:owned', ids: ['entity:owned'] } })
+    const observe = async () => {
+      observations++
+      const y = mode === 'offscreen' ? 900 : mode === 'moving' ? 200 + observations : Math.min(300, 150 + observations * 50)
+      return { point: { x: 1073, y }, rect: { x: 1040, y: y - 15, width: 66, height: 30 },
+        inspector: { rect: { x: 1015, y: 80, width: 287, height: 520 }, scrollTop: mode === 'scroll-moving' ? observations : 300 - y, scrollLeft: 0 },
+        matchCount: mode === 'ambiguous' ? 2 : 1, enabled: mode !== 'disabled', visible: true,
+        hitMatches: !['occluded', 'offscreen'].includes(mode), hit: { tagName: 'INPUT', ariaLabel: null, text: '' } }
+    }
+    const contents = { async executeJavaScript() { return { x: 1159, y: 321 } } }
+    const ports = { guard() {}, record(name, value) { records.set(name, structuredClone(value)) } }
+    const wait = async (_contents, _ports, predicate, _label, budget) => {
+      assert.ok(budget > 0 && budget <= 2000, 'Settlement shares the existing two-second paint budget'); budgets.push(budget)
+      milliseconds += 60; frame++
+      const current = view(); assert.equal(predicate(current), true); return current
+    }
+    const reveal = make(assert, observe, (_contents, _ports, event) => { events.push(event) }, async () => { milliseconds += 60; frame++; return view() },
+      async () => view(), wait, { now: () => milliseconds, parse: Date.parse })
+    const task = reveal(contents, ports, 'number', 'Scale:X')
+    if (mode === 'settled') {
+      await task
+      assert.ok(observations >= 5, 'Moving but hittable target must not be returned before quiet distinct frames')
+      assert.equal(events.length, 0, 'Hittable moving target needs observation, not more wheels')
+      const evidence = [...records.values()].at(-1)
+      assert.equal(evidence.samples.at(-1).target.point.y, 300)
+      assert.equal(evidence.samples.at(-1).target.inspector.scrollTop, 0)
+      assert.ok(evidence.quiet.observations >= 3 && evidence.samples.at(-1).at - evidence.quiet.at >= 120)
+    } else {
+      await assert.rejects(task, mode.endsWith('-drift') ? /owner changed/i : mode === 'offscreen' ? /did not reveal/ : mode === 'occluded' ? /occluded/ : mode === 'disabled' ? /Disabled/ : mode === 'ambiguous' ? /Ambiguous/ : /settle/)
+      assert.ok([...records.values()].at(-1).samples.length <= 8, 'Failure evidence must remain bounded')
+      if (['moving', 'scroll-moving'].includes(mode)) assert.ok(milliseconds <= 2040, 'Nonsettlement fails inside the existing budget, without retry')
+    }
+    assert.ok(events.filter((event) => event.type === 'mouseWheel').length <= 14)
+    if (mode === 'offscreen') assert.equal(events.filter((event) => event.type === 'mouseWheel').length, 14)
+    else assert.equal(events.length, 0, 'Denied/settling targets must not receive wheel or click input')
+  }
+  await exercise()
+  for (const mode of ['moving', 'scroll-moving', 'boot-drift', 'canvas-drift', 'entity-drift', 'occluded', 'disabled', 'ambiguous', 'offscreen']) await exercise(mode)
+
+  // The original click guard still rejects a fresh post-hover drift, before mouseDown.
+  const driver = await readFile(new URL('./driver.ts', import.meta.url), 'utf8')
+  const clickBody = oneSeam(driver, /(async function target[\s\S]*?)(?=function stableTransform)/g, 'unchanged native target and click').replace(/^export /gm, '')
+  const events = [], point = { x: 1073, y: 335 }; let observations = 0
+  const click = (await inertFunction(`${clickBody}; return click`, ['observeNativeClickPoint', 'assertNativeClickPointStable', 'sendNativeInput']))(
+    async () => ({ point, matchCount: 1, enabled: true, visible: true, hitMatches: ++observations === 1, hit: { tagName: 'INPUT', ariaLabel: null, text: '' } }),
+    assertNativeClickPointStable, (_contents, _ports, event) => events.push(event))
+  await assert.rejects(click({ async executeJavaScript() {} }, { guard() {}, record() {} }, 'number', 'Scale:X'), /drifted or was occluded/)
+  assert.deepEqual(events.map((event) => event.type), ['mouseMove'])
+
+  // Exercise the actual passive rect/scroll observer without writable DOM capabilities.
+  const { observeNativeClickPoint } = await import('./driver.ts')
+  let top = 100
+  const element = { isConnected: true, parentElement: null, tagName: 'BUTTON', textContent: '', matches: () => false,
+    getAttribute: () => 'Add Fixed Body', getBoundingClientRect: () => ({ x: 1040, y: 420 - top, width: 66, height: 30 }), contains: () => false }
+  const scroll = { get scrollTop() { return top }, get scrollLeft() { return 0 }, contains: (candidate) => candidate === element,
+    getBoundingClientRect: () => ({ x: 1015, y: 80, width: 287, height: 520 }) }
+  const document = { querySelectorAll: (selector) => selector === 'button' ? [element] : selector === '[aria-label="Entity inspector"] > .worlds-inspector-scroll' ? [scroll] : [],
+    elementFromPoint: () => element }
+  const contents = { async executeJavaScript(expression) { return new Function('document', 'getComputedStyle', `return ${expression}`)(document, () => ({ display: 'block', visibility: 'visible', opacity: '1' })) } }
+  const first = await observeNativeClickPoint(contents, 'button', 'Add Fixed Body')
+  assert.deepEqual(first.rect, { x: 1040, y: 320, width: 66, height: 30 }); assert.equal(first.inspector.scrollTop, 100)
+  top = 0
+  const later = await observeNativeClickPoint(contents, 'button', 'Add Fixed Body', first.point)
+  assert.deepEqual(later.point, first.point, 'Observation must not retarget an original click point')
+  assert.equal(later.rect.y, 420); assert.equal(later.inspector.scrollTop, 0)
+})
+
+for (const [index, generation] of [3, 4].entries()) test(`WSNAV13.${generation} actual navigation reopen retires its own Canvas admission watchdog`, async () => {
+  const source = await readFile(new URL('./navigation-driver.ts', import.meta.url), 'utf8')
+  const blocks = [...source.matchAll(/(contents = await ports.reopen\(\)\n  view = await waitFor[\s\S]*?)(?=  assert.deepEqual\(snapshot\(view\))/g)]
+  assert.equal(blocks.length, 2, 'Both real navigation and collider reopen seams must be exercised')
+  const before = `boot:${generation - 1}`, contents = { id: generation }
+  const view = { bootId: `boot:${generation}`, editor: { lifecycle: 'ready', projectKey: 'owned', activeSceneId: 'scene:owned' },
+    canvas: { frame: 12, contextLost: false } }
+  let armed = false, admitted = 0
+  const execute = await inertFunction(`return async (ports) => { let contents, view; const previousBoot = '${before}', bootId = '${before}', authored = {projectKey: 'owned'}; ${blocks[index][1]} }`, ['waitFor'])
+  const task = execute(async (actualContents, _ports, predicate, _label, timeout) => {
+    assert.equal(actualContents, contents); assert.equal(timeout, 8000); assert.equal(predicate(view), true); return view
+  })({ async reopen() { armed = true; return contents }, async admitReopened(actualContents, actualView, previousBoot) {
+    assert.equal(actualContents, contents); assert.equal(actualView, view); assert.equal(previousBoot, before); armed = false; admitted++
+  } })
+  await task
+  assert.equal(armed, false, `Generation ${generation} real Canvas admission must retire its watchdog before later work`)
+  assert.equal(admitted, 1)
+})
+
+test('WSNAV14 actual main admission requires current owned Canvas evidence and preserves unadmitted timeout', async () => {
+  const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const helper = oneSeam(source, /(async function admitReopenedCanvas[\s\S]*?)(?=async function openWindow)/g, 'owned Canvas admission')
+  const guard = oneSeam(source, /(function guard\([\s\S]*?)(?=function inputGuard)/g, 'actual owned observation guard')
+  const arm = oneSeam(source, /(  if \(admissionDeadline\) clearTimeout\(admissionDeadline\)\n  const rendererAdmissionEndsAt[^\n]*\n  admissionDeadline = setTimeout[^\n]*)/g, 'unchanged eight-second admission watchdog')
+  const make = await inertFunction(`let generation = 0, currentWindow = null, firstFailure = null, stopping = false, admissionDeadline = null, admissionEndsAt = 0;
+    const fail = (error) => { firstFailure = error }; ${guard}; ${helper};
+    return { admitReopenedCanvas, arm(window, nextGeneration) { currentWindow = window; generation = nextGeneration; const windowGeneration = generation; ${arm} },
+      state: () => ({ firstFailure, admissionDeadline }) }`, ['assert', 'BrowserWindow', 'readView', 'evidence', 'now', 'Date', 'setTimeout', 'clearTimeout'])
+  const observed = (generation) => ({ at: 'observed:at', bootId: `boot:${generation}`, environment: { sandboxed: true, contextIsolated: true },
+    nodeGlobals: { require: 'undefined', process: 'undefined' }, diagnostics: [], untrustedInputs: 0, hostSetupComplete: true,
+    editor: { lifecycle: 'ready', session: {} }, canvasCount: 1,
+    canvas: { canvasUuid: `canvas:${generation}`, contextLost: false, frame: 12, drawingBuffer: [800, 600] } })
+  const exercise = async (mutate, fault) => {
+    const timers = new Set(), evidence = {}, windows = []; let milliseconds = 0, current = observed(3), duringRead
+    const clock = { now: () => milliseconds }, tick = () => { milliseconds += 8000; for (const timer of [...timers]) { timers.delete(timer); timer.callback() } }
+    const policy = make(assert, { getAllWindows: () => windows.slice(-1) }, async () => { duringRead?.(); return structuredClone(current) }, evidence, () => 'admitted:at', clock,
+      (callback, delay) => { assert.equal(delay, 8000); const timer = { callback }; timers.add(timer); return timer }, (timer) => timers.delete(timer))
+    const window = { isDestroyed: () => false, webContents: { id: 3, isDestroyed: () => false } }; windows.push(window); policy.arm(window, 3)
+    const view = observed(3); mutate?.(view)
+    if (fault === 'current-context-lost') current.canvas.contextLost = true
+    if (fault === 'stale-boot') current.bootId = 'boot:other'
+    if (fault === 'stale-canvas') current.canvas.canvasUuid = 'canvas:other'
+    if (fault === 'owner-replaced') duringRead = () => { const replacement = { ...window, webContents: { id: 4, isDestroyed: () => false } }; windows.push(replacement); policy.arm(replacement, 4) }
+    if (fault === 'expired') milliseconds = 8000
+    if (mutate || fault) {
+      if (fault !== 'never-admitted') await assert.rejects(policy.admitReopenedCanvas(fault === 'stale-owner' ? { id: 2 } : window.webContents, view, 'boot:2'))
+      assert.equal(timers.size, 1, 'Invalid/missing evidence cannot retire the current watchdog')
+      assert.deepEqual(evidence, {}); tick(); assert.match(policy.state().firstFailure.message, /failed positive Canvas admission within 8 seconds/)
+    } else {
+      await policy.admitReopenedCanvas(window.webContents, view, 'boot:2'); assert.equal(timers.size, 0)
+      assert.deepEqual(evidence['renderer-canvas-admission-3'], { at: 'admitted:at', generation: 3, webContentsId: 3, previousBoot: 'boot:2', bootId: 'boot:3',
+        canvasUuid: 'canvas:3', observedAt: 'observed:at', frame: 12, drawingBuffer: [800, 600], environment: view.environment, nodeGlobals: view.nodeGlobals, admissionDeadlineRetired: true })
+      tick(); assert.equal(policy.state().firstFailure, null)
+      const replacement = { ...window, webContents: { id: 4, isDestroyed: () => false } }; windows.push(replacement); policy.arm(replacement, 4); current = observed(4)
+      await assert.rejects(policy.admitReopenedCanvas(replacement.webContents, view, 'boot:2'), /Stale renderer boot/)
+      assert.equal(timers.size, 1, 'Generation 3 evidence cannot retire generation 4 timer')
+      await policy.admitReopenedCanvas(replacement.webContents, observed(4), 'boot:3'); tick()
+      assert.equal(policy.state().firstFailure, null); assert.equal(evidence['renderer-canvas-admission-4'].generation, 4)
+    }
+  }
+  await exercise()
+  for (const mutate of [(view) => { view.canvas = null }, (view) => { view.canvas.contextLost = true }, (view) => { view.canvas.frame = 1 },
+    (view) => { view.canvas.drawingBuffer[0] = 0 }, (view) => { view.canvasCount = 2 }, (view) => { view.environment.sandboxed = false },
+    (view) => { view.nodeGlobals.require = 'function' }, (view) => { view.bootId = 'boot:2' }]) await exercise(mutate)
+  for (const fault of ['current-context-lost', 'stale-boot', 'stale-canvas', 'stale-owner', 'owner-replaced', 'expired', 'never-admitted']) await exercise(undefined, fault)
+  assert.match(source, /admitReopened: admitReopenedCanvas/)
+})
+
+test('WSNAV15 reserved Escape requires guarded dispatch, browser KeyUp and owned release; always removes passive listeners', async () => {
+  const source = await readFile(new URL('./main.ts', import.meta.url), 'utf8')
+  const helper = oneSeam(source, /(const reservedEscapeAttempts[\s\S]*?)(?=async function admitReopenedCanvas)/g, 'one-shot reserved Escape observer')
+  const guard = oneSeam(source, /(function guard\([\s\S]*?)(?=async function)/g, 'owned input guards')
+  const { sendNativeInput } = await import('./driver.ts')
+  const make = await inertFunction(`let currentWindow, generation = 3, firstFailure = null, stopping = false;
+    ${guard}; ${helper}; return { releaseReservedEscape, setup(window, keyboardAllowed = false) { currentWindow = window; reservedEscapePolicies.set(window.webContents, () => !keyboardAllowed) }, replace() { generation++ } }`,
+    ['assert', 'BrowserWindow', 'readView', 'waitFor', 'sendNativeInput', 'applies', 'hash', 'Buffer', 'now', 'Date'])
+  const exercise = async (fault, restoration = false) => {
+    let time = Date.parse('2026-09-27T00:00:00Z'), focused = true, reads = 0
+    const clock = class extends Date { static now() { return time } }, now = () => new Date(time).toISOString()
+    const trace = ['keydown','keyup'].map((type, index) => ({sequence: index + 1, at: now(), type, code: 'KeyW', trusted: true,
+      screenX: null, screenY: null, x: null, y: null, buttons: null, movementX: null, movementY: null, canvasUuid: null, frame: null, target: 'SECTION:Worlds 3D canvas'}))
+    const window = new EventEmitter(), contents = new EventEmitter(), sent = [], records = {}
+    Object.assign(window, { webContents: contents, isDestroyed: () => false, isFocused: () => focused, isFullScreen: () => fault === 'fullscreen', isSimpleFullScreen: () => false })
+    Object.assign(contents, { id: 9, isDestroyed: () => false, executeJavaScript: async () => ({ focused, fullscreen: false }) })
+    const view = () => ({ at: now(), bootId: 'boot:3', canvasCount: 1, diagnostics: [], untrustedInputs: 0,
+      editor: { session: {snapshot: {}, undoStack: [], redoStack: [], receipts: []} }, trace: structuredClone(trace),
+      canvas: { canvasUuid: 'canvas:3', frame: 10 + reads, contextLost: false, cameraPose: {position: [1,2,3], quaternion: [0,0,0,1]}, controls: {orbitEnabled: false} },
+      navigation: { status: 'Fly mode. Pointer locked.', pointerLock: {canvasOwned: reads < 2 || fault === 'timeout', changes: reads < 2 ? 1 : 2, errors: 0} } })
+    let policy
+    const read = async () => { time += 10; reads++; const result = view();
+      if (reads > 1) {
+        if (fault === 'boot') result.bootId = 'other'
+        if (fault === 'canvas') result.canvas.canvasUuid = 'other'
+        if (fault === 'relock') result.navigation.pointerLock.changes = 3
+        if (fault === 'errors') result.navigation.pointerLock.errors++
+        if (fault === 'context') result.canvas.contextLost = true
+        if (fault === 'stale-owner') policy.replace()
+        if (fault === 'dom-interference') result.trace.push({sequence: 3, type: 'keydown', code: 'KeyW'})
+        if (fault === 'canonical') result.editor.session.snapshot = {changed: true}
+        if (fault === 'dom-dropped' && reads > 2) result.trace.pop()
+        if (fault === 'dom-forged' && reads > 2) result.trace[2].x++
+        if (fault === 'dom-rewritten-time' && reads > 2) result.trace[2].at = new Date(Date.parse(result.trace[2].at) + 1).toISOString()
+      } else {
+        if (fault === 'held') result.trace.push({sequence: 3, type: 'keydown', code: 'KeyW', trusted: true})
+        if (fault === 'held-button') result.trace.push({sequence: 3, type: 'pointerdown', buttons: 1, trusted: true})
+        if (fault === 'mouse-pre-attempt') contents.emit('before-mouse-event', {}, {type: 'mouseMove', clickCount: 0, movementX: 0, movementY: 0, button: 'none', globalX: 875, globalY: 462, x: 817, y: 364})
+      }
+      return result
+    }
+    const input = {type: 'keyUp', key: 'Escape', code: 'Escape', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, modifiers: []}
+    const emit = (value) => contents.emit('before-input-event', {preventDefault() { throw new Error('Passive observer called preventDefault') }}, value)
+    contents.sendInputEvent = (event) => {
+      if (fault === `send-${event.type}`) throw new Error('send failed')
+      sent.push(structuredClone(event))
+      if (event.type === 'keyDown') {
+        if (fault === 'guard-up') focused = false
+        if (fault === 'early') emit(input)
+        if (fault === 'mouse') contents.emit('before-mouse-event', {}, {type: 'mouseDown'})
+        if (restoration) {
+          const restore = () => {
+            if (fault === 'mouse-late') time += 251
+            if (fault === 'mouse-outside') time -= 1
+            for (let i = 0; i < (fault === 'mouse-budget' ? 3 : 2); i++) {
+              const raw = {type: 'mouseMove', clickCount: 0, movementX: 0, movementY: 0, button: 'none', globalX: 875, globalY: 462, x: 817, y: 364}
+              if (fault === 'mouse-nonzero') raw.movementX = 1
+              if (fault === 'mouse-point' && i) raw.x++
+              if (fault === 'mouse-button') raw.button = 'left'
+              if (fault === 'mouse-click') raw.clickCount = 1
+              if (fault === 'mouse-down') raw.type = 'mouseDown'
+              if (fault === 'mouse-up') raw.type = 'mouseUp'
+              if (fault === 'mouse-wheel') raw.type = 'mouseWheel'
+              contents.emit('before-mouse-event', {preventDefault() { throw new Error('Passive mouse observer') }}, raw)
+              for (const type of ['pointermove','mousemove']) trace.push({sequence: trace.length + 1, at: now(), type, trusted: true,
+                screenX: 875, screenY: 462, x: 817, y: 364, buttons: 0, movementX: 0, movementY: 0, code: null,
+                canvasUuid: 'canvas:3', frame: 12, target: 'CANVAS:'})
+            }
+            const last = trace.at(-1)
+            if (fault === 'dom-nonzero') last.movementY = 1
+            if (fault === 'dom-point') last.x++
+            if (fault === 'dom-canvas') last.canvasUuid = 'other'
+            if (fault === 'dom-target') last.target = 'BUTTON:Frame scene'
+            if (fault === 'dom-button') last.buttons = 1
+            if (fault === 'dom-click') last.type = 'click'
+            if (fault === 'dom-wheel') last.type = 'wheel'
+            if (fault === 'dom-key') {last.type = 'keyup'; last.code = 'KeyW'}
+            if (fault === 'dom-late') last.at = new Date(time + 251).toISOString()
+            if (fault === 'dom-outside') last.at = new Date(time - 1).toISOString()
+            if (fault === 'dom-budget') trace.push({...last, sequence: last.sequence + 1})
+          }
+          // Realistic asynchronous ordering: queued restoration before queued browser KeyUp.
+          if (restoration === 'async') queueMicrotask(() => {time++; restore()})
+          else restore()
+        }
+        return // Chromium consumes RawKeyDown, neither DOM event is emitted.
+      }
+      if (fault === 'missing' || fault === 'timeout') return
+      const actual = {...input, modifiers: []}
+      if (fault === 'wrong') actual.code = 'KeyW'
+      if (fault === 'repeat') actual.isAutoRepeat = true
+      if (fault === 'modifier') actual.modifiers = ['shift']
+      if (fault === 'down') actual.type = 'keyDown'
+      if (restoration === 'async') queueMicrotask(() => {time++; emit(actual)})
+      else emit(actual)
+      if (fault === 'send-after-keyUp') throw new Error('send failed after observer')
+      if (fault === 'duplicate') emit(actual)
+      if (fault === 'blur') { window.emit('blur'); focused = false }
+      if (fault === 'destroyed') contents.emit('destroyed')
+      if (fault === 'fullscreen-event') window.emit('enter-full-screen')
+      if (fault === 'extra-key') emit({...input, key: 'w', code: 'KeyW'})
+    }
+    policy = make(assert, {getAllWindows: () => [window]}, read,
+      async (actual, ports, predicate, label, budget) => { assert.equal(actual, contents); assert.equal(label, 'collider-escape-release'); assert.ok(budget > 0 && budget <= 4000)
+        for (let i = 0; i < 3; i++) { const result = await read(); if (predicate(result)) return result }
+        time += budget; throw new Error('release timeout') }, sendNativeInput, [], (bytes) => createHash('sha256').update(bytes).digest('hex'), Buffer, now, clock)
+    policy.setup(window, fault === 'keyboard-lock')
+    if (fault === 'guard-down') focused = false
+    const ports = { guard: () => {}, inputGuard: (actual) => { assert.equal(actual, contents); assert.ok(focused) }, record: (name, value) => { records[name] = structuredClone(value) } }
+    if (fault) await assert.rejects(policy.releaseReservedEscape(contents, ports), undefined, fault)
+    else {
+      const result = await policy.releaseReservedEscape(contents, ports)
+      assert.equal(result.receipt.browserKeyUps.length, 1); assert.equal(result.receipt.dispatches.length, 2)
+      assert.equal(result.receipt.before.locked, true); assert.equal(result.receipt.unlocked.locked, false)
+      assert.ok(result.receipt.unlocked.frame > result.receipt.before.frame); assert.equal(result.receipt.listenersRemoved, true)
+      assert.ok(records['collider-reserved-escape'].unlocked); assert.deepEqual(result.view.trace, trace)
+      assert.deepEqual(result.receipt.domEvents, trace.slice(2)); assert.equal(result.receipt.browserMouse.length, restoration ? 2 : 0)
+      if (restoration) assert.ok(result.receipt.browserMouse.every((event) => Date.parse(event.at) <= Date.parse(result.receipt.browserKeyUps[0].at)))
+      await assert.rejects(policy.releaseReservedEscape(contents, ports), /one-shot/)
+    }
+    if (fault?.startsWith('mouse-')) assert.ok(records['collider-reserved-escape'].browserMouse.length > 0, 'Rejected raw payloads retained')
+    if (fault?.startsWith('dom-') && restoration) assert.ok(records['collider-reserved-escape'].domEvents.length > 0, 'Rejected DOM suffix retained')
+    if (['dom-dropped','dom-forged','dom-rewritten-time'].includes(fault)) {
+      assert.deepEqual(records['collider-reserved-escape'].domEvents, trace.slice(2), 'Earlier real events cannot be overwritten by an inconsistent snapshot')
+      assert.ok(records['collider-reserved-escape-view'], 'Latest inconsistent raw view retained as failure evidence')
+    }
+    assert.equal(contents.listenerCount('before-input-event'), 0); assert.equal(contents.listenerCount('before-mouse-event'), 0)
+    assert.equal(window.listenerCount('blur'), 0); assert.equal(window.listenerCount('enter-full-screen'), 0); assert.equal(window.listenerCount('enter-html-full-screen'), 0)
+    assert.equal(contents.listenerCount('destroyed'), 0)
+    assert.ok(sent.length <= 2)
+    if (fault === 'send-keyDown' || fault === 'guard-down') assert.equal(records['collider-reserved-escape']?.dispatches.length ?? 0, 0)
+    if (fault === 'send-keyUp' || fault === 'guard-up') assert.equal(records['collider-reserved-escape'].dispatches.length, 1)
+  }
+  await exercise(undefined, true)
+  await exercise(undefined, 'async')
+  await exercise()
+  for (const fault of ['missing','duplicate','wrong','repeat','modifier','down','early','guard-down','guard-up','send-keyDown','send-keyUp','send-after-keyUp','blur','mouse','dom-interference','stale-owner','boot','canvas','relock','errors','context','fullscreen','keyboard-lock','held','held-button','timeout','destroyed','fullscreen-event','extra-key','canonical','mouse-pre-attempt']) await exercise(fault)
+  for (const fault of ['mouse-nonzero','mouse-point','mouse-button','mouse-click','mouse-down','mouse-up','mouse-wheel','mouse-late','mouse-outside','mouse-budget',
+    'dom-nonzero','dom-point','dom-canvas','dom-target','dom-button','dom-click','dom-wheel','dom-key','dom-late','dom-outside','dom-budget','dom-dropped','dom-forged','dom-rewritten-time']) await exercise(fault, true)
+})
+
+
+test('WSNAV16 terminal accepts consumed DOM Escape only with the complete reserved browser exit evidence', async () => {
+  const { assertActualColliderRunTerminal } = await import('./run.mjs')
+  const valid = syntheticColliderRunEvidence()
+  assert.equal(valid.inputTrace.some((event) => event.code === 'Escape'), false)
+  assert.doesNotThrow(() => assertActualColliderRunTerminal(valid))
+  assert.doesNotThrow(() => assertActualColliderRunTerminal(syntheticColliderRunEvidence(true)))
+  const restored = syntheticColliderRunEvidence(true)
+  const both = (e, mutation) => { mutation(e.reservedEscape.domEvents[0]); mutation(e.inputTrace.find((event) => event.sequence === e.reservedEscape.domEvents[0].sequence)) }
+  for (const [name, mutate] of [
+    ['nonzero raw', (e) => {e.reservedEscape.browserMouse[0].input.movementX = 1}],
+    ['wrong raw point', (e) => {e.reservedEscape.browserMouse[1].input.x++}],
+    ['button', (e) => {e.reservedEscape.browserMouse[0].input.button = 'left'}],
+    ['click count', (e) => {e.reservedEscape.browserMouse[0].input.clickCount = 1}],
+    ['mouseDown', (e) => {e.reservedEscape.browserMouse[0].input.type = 'mouseDown'}],
+    ['mouseUp', (e) => {e.reservedEscape.browserMouse[0].input.type = 'mouseUp'}],
+    ['mouseWheel', (e) => {e.reservedEscape.browserMouse[0].input.type = 'mouseWheel'}],
+    ['invented browser field', (e) => {e.reservedEscape.browserMouse[0].input.isTrusted = true}],
+    ['raw outside', (e) => {e.reservedEscape.browserMouse[0].at = e.reservedEscape.before.at}],
+    ['raw over time', (e) => {e.reservedEscape.browserMouse[0].at = new Date(Date.parse(e.reservedEscape.dispatches[0].startedAt) + 251).toISOString()}],
+    ['raw after unlock', (e) => {e.reservedEscape.browserMouse[0].at = new Date(Date.parse(e.reservedEscape.unlocked.at) + 1).toISOString()}],
+    ['raw stale owner', (e) => {e.reservedEscape.browserMouse[0].webContentsId++}],
+    ['raw stale generation', (e) => {e.reservedEscape.browserMouse[0].generation++}],
+    ['raw stale attempt', (e) => {e.reservedEscape.browserMouse[0].attemptId = 'old'}],
+    ['raw stale phase', (e) => {e.reservedEscape.browserMouse[0].phase = 'before'}],
+    ['raw false phase', (e) => {e.reservedEscape.browserMouse[0].phase = 'await-release'}],
+    ['raw dropped', (e) => {e.reservedEscape.browserMouse.pop()}],
+    ['raw budget', (e) => {e.reservedEscape.browserMouse.push(e.reservedEscape.browserMouse[0])}],
+    ['DOM dropped', (e) => {e.reservedEscape.domEvents.pop()}],
+    ['full trace dropped', (e) => {e.inputTrace.splice(e.inputTrace.findIndex((event) => event.sequence === e.reservedEscape.domEvents[0].sequence), 1)}],
+    ['DOM forged', (e) => {e.reservedEscape.domEvents[0].target = 'CANVAS:forged'}],
+    ['DOM nonzero', (e) => both(e, (event) => {event.movementY = 1})],
+    ['DOM point', (e) => both(e, (event) => {event.screenX++})],
+    ['DOM Canvas', (e) => both(e, (event) => {event.canvasUuid = 'other'})],
+    ['DOM target', (e) => both(e, (event) => {event.target = 'BUTTON:Frame scene'})],
+    ['DOM button', (e) => both(e, (event) => {event.buttons = 1})],
+    ['DOM click', (e) => both(e, (event) => {event.type = 'click'})],
+    ['DOM key', (e) => both(e, (event) => {event.code = 'KeyW'})],
+    ['DOM stale frame', (e) => both(e, (event) => {event.frame = e.reservedEscape.before.frame - 1})],
+    ['DOM stale time', (e) => both(e, (event) => {event.at = e.reservedEscape.before.at})],
+    ['DOM after unlock', (e) => both(e, (event) => {event.at = e.samples.at(-1).at})],
+    ['unclassified outside', (e) => {e.inputTrace.splice(-1, 0, {...e.reservedEscape.domEvents.at(-1), sequence: e.inputTrace.at(-1).sequence}); e.inputTrace.at(-1).sequence++; e.samples.at(-1).traceSequence++}],
+  ]) { const value = structuredClone(restored); mutate(value); assert.throws(() => assertActualColliderRunTerminal(value), undefined, name) }
+  for (const [name, mutate] of [
+    ['missing receipt', (e) => {delete e.reservedEscape}],
+    ['dispatch alone', (e) => {e.reservedEscape.browserKeyUps = []}],
+    ['release alone', (e) => {e.reservedEscape.dispatches = []}],
+    ['duplicate', (e) => {e.reservedEscape.browserKeyUps.push(e.reservedEscape.browserKeyUps[0])}],
+    ['wrong', (e) => {e.reservedEscape.browserKeyUps[0].input.code = 'KeyW'}],
+    ['fake down', (e) => {e.reservedEscape.browserKeyUps[0].input.type = 'keyDown'}],
+    ['repeat', (e) => {e.reservedEscape.browserKeyUps[0].input.isAutoRepeat = true}],
+    ['modifier', (e) => {e.reservedEscape.browserKeyUps[0].input.modifiers = ['shift']}],
+    ['stale time', (e) => {e.reservedEscape.browserKeyUps[0].at = e.reservedEscape.before.at}],
+    ['stale attempt', (e) => {e.reservedEscape.browserKeyUps[0].attemptId = 'previous'}],
+    ['stale owner', (e) => {e.reservedEscape.browserKeyUps[0].webContentsId++}],
+    ['stale generation', (e) => {e.reservedEscape.browserKeyUps[0].generation++}],
+    ['stale Canvas', (e) => {e.reservedEscape.unlocked.canvasUuid = 'other'}],
+    ['stale boot', (e) => {e.reservedEscape.unlocked.bootId = 'other'}],
+    ['unchanged frame', (e) => {e.reservedEscape.unlocked.frame = e.reservedEscape.before.frame}],
+    ['wrong dispatch', (e) => {e.reservedEscape.dispatches[0].payload.keyCode = 'KeyW'}],
+    ['delivery claim', (e) => {e.reservedEscape.dispatches[0].kind = 'DELIVERY'}],
+    ['focus loss', (e) => {e.reservedEscape.unlocked.focused = false}],
+    ['fullscreen', (e) => {e.reservedEscape.before.fullscreen = true}],
+    ['keyboard lock', (e) => {e.reservedEscape.keyboardLock = 'unknown'}],
+    ['held key', (e) => {e.reservedEscape.before.heldKeys = ['KeyW']}],
+    ['interference', (e) => {e.reservedEscape.interference.push('blur')}],
+    ['listener leak', (e) => {e.reservedEscape.listenersRemoved = false}],
+    ['relock', (e) => {e.reservedEscape.unlocked.lockChanges += 2}],
+    ['error', (e) => {e.reservedEscape.unlocked.lockErrors++}],
+    ['timeout', (e) => {e.reservedEscape.unlocked.at = new Date(Date.parse(e.reservedEscape.before.at) + 4001).toISOString()}],
+    ['click before release', (e) => {e.inputTrace.at(-1).at = e.reservedEscape.before.at}],
+    ['wrong click', (e) => {e.inputTrace.at(-1).target = 'BUTTON:Other'}],
+    ['no click', (e) => {e.inputTrace.at(-1).type = 'mousemove'}],
+    ['canonical mutation', (e) => {e.reservedEscape.unlocked.canonicalSha256 = 'b'.repeat(64)}],
+  ]) { const value = structuredClone(valid); mutate(value); assert.throws(() => assertActualColliderRunTerminal(value), undefined, name) }
 })

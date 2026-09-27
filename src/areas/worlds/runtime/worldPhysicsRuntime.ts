@@ -6,6 +6,9 @@ import {
   type WorldPhysicsStepRequest,
   type WorldPhysicsStepTiming,
   type WorldPhysicsTriggerEvent,
+  type WorldPhysicsNavigationInit,
+  type WorldPhysicsNavigationStep,
+  type WorldPhysicsNavigationPose,
 } from './worldPhysicsProtocol.ts'
 
 export interface WorldPhysicsSnapshot {
@@ -21,6 +24,7 @@ export interface WorldPhysicsRuntimeHandlers {
   onSnapshot(snapshot: WorldPhysicsSnapshot): void
   onTriggerEvents(events: WorldPhysicsTriggerEvent[]): void
   onError?(issue: { code: string; message: string }): void
+  onNavigationPose?(pose: WorldPhysicsNavigationPose): void
 }
 
 export interface WorldPhysicsWorkerEventLike {
@@ -64,6 +68,10 @@ export class WorldPhysicsWorkerRuntime {
   private readonly pendingTimings = new Map<number, number>()
   private lastTimingSequence = -1
   private diagnosticPaused = false
+  private navigationMode = false
+  private pendingNavigationSequence: number | null = null
+  private lastNavigationSequence = -1
+  private cancelNavigationTimeout: (() => void) | null = null
 
   constructor(options: WorldPhysicsWorkerRuntimeOptions) {
     this.generationId = options.generationId
@@ -82,10 +90,11 @@ export class WorldPhysicsWorkerRuntime {
     this.worker.addEventListener('messageerror', this.handleWorkerMessageError)
   }
 
-  initialize(scene: WorldPhysicsSceneDto): Promise<void> {
+  initialize(scene: WorldPhysicsSceneDto, navigation?: WorldPhysicsNavigationInit): Promise<void> {
     if (this.disposed) return Promise.reject(new Error('Physics runtime is disposed.'))
     if (this.initializationStarted) return Promise.reject(new Error('Physics runtime initialization already started.'))
     this.initializationStarted = true
+    this.navigationMode = navigation !== undefined
     this.diagnosticPaused = false
     this.pendingTimings.clear()
     this.lastTimingSequence = -1
@@ -97,7 +106,7 @@ export class WorldPhysicsWorkerRuntime {
       this.fail({ code: 'worker-initialization-timeout', message: `Physics Worker initialization timed out after ${this.initializationTimeoutMs} ms.` })
     }, this.initializationTimeoutMs)
     try {
-      this.worker.postMessage({ version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'init', generationId: this.generationId, scene, ...(this.diagnostics ? { diagnostics: true } : {}) })
+      this.worker.postMessage({ version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'init', generationId: this.generationId, scene, ...(this.diagnostics ? { diagnostics: true } : {}), ...(navigation ? { navigation } : {}) })
     } catch (error) {
       this.fail({ code: 'worker-post-failed', message: error instanceof Error ? error.message : 'Physics Worker initialization could not be posted.' }, error)
     }
@@ -105,7 +114,7 @@ export class WorldPhysicsWorkerRuntime {
   }
 
   step(request: WorldPhysicsStepRequest): void {
-    if (this.disposed || !this.initialized || (this.diagnostics && this.diagnosticPaused)) return
+    if (this.disposed || !this.initialized || this.navigationMode || (this.diagnostics && this.diagnosticPaused)) return
     const message = { version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'step', generationId: this.generationId, ...request }
     if (this.diagnostics) {
       const parsed = parseWorldPhysicsMainMessage(message)
@@ -120,15 +129,29 @@ export class WorldPhysicsWorkerRuntime {
     this.postRuntimeMessage(message)
   }
 
+  stepNavigation(sequence: number, steps: WorldPhysicsNavigationStep[]): boolean {
+    if (this.disposed || !this.initialized || !this.navigationMode || this.diagnosticPaused || this.pendingNavigationSequence !== null) return false
+    const message = { version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'navigation-step', generationId: this.generationId, sequence, steps }
+    if (!parseWorldPhysicsMainMessage(message).success || sequence <= this.lastNavigationSequence) {
+      this.fail({ code: 'invalid-navigation-request', message: 'Run requires increasing sequences and one to four bounded navigation steps.' })
+      return false
+    }
+    this.pendingNavigationSequence = sequence
+    this.lastNavigationSequence = sequence
+    this.cancelNavigationTimeout = this.scheduleTimeout(() => this.fail({ code: 'navigation-step-timeout', message: 'Run collision query timed out.' }), 2_000)
+    this.postRuntimeMessage(message)
+    return !this.disposed
+  }
+
   pause(): void {
     if (this.disposed || (this.diagnostics && !this.initialized)) return
-    if (this.diagnostics) this.diagnosticPaused = true
+    if (this.diagnostics || this.navigationMode) this.diagnosticPaused = true
     this.postRuntimeMessage({ version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'pause', generationId: this.generationId })
   }
 
   resume(): void {
     if (this.disposed || (this.diagnostics && !this.initialized)) return
-    if (this.diagnostics) this.diagnosticPaused = false
+    if (this.diagnostics || this.navigationMode) this.diagnosticPaused = false
     this.postRuntimeMessage({ version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'resume', generationId: this.generationId })
   }
 
@@ -165,6 +188,21 @@ export class WorldPhysicsWorkerRuntime {
     }
     if (!this.initialized) {
       this.fail({ code: 'worker-message-before-ready', message: 'Physics Worker emitted a snapshot before initialization completed.' })
+      return
+    }
+    if (message.kind === 'navigation-pose') {
+      if (!this.navigationMode || message.sequence !== this.pendingNavigationSequence) {
+        this.fail({ code: 'invalid-navigation-pose', message: 'Run pose does not match the outstanding camera query.' })
+        return
+      }
+      this.pendingNavigationSequence = null
+      this.cancelNavigationTimeout?.()
+      this.cancelNavigationTimeout = null
+      this.handlers.onNavigationPose?.({ sequence: message.sequence, position: [...message.position], grounded: message.grounded, recovered: message.recovered })
+      return
+    }
+    if (this.navigationMode) {
+      this.fail({ code: 'invalid-navigation-snapshot', message: 'Run must only return camera poses, not authored body transforms.' })
       return
     }
     if (this.diagnostics ? !message.stepTimings || this.pendingTimings.keys().next().value !== message.sequence
@@ -218,6 +256,9 @@ export class WorldPhysicsWorkerRuntime {
     this.diagnosticPaused = false
     this.pendingTimings.clear()
     this.lastTimingSequence = -1
+    this.cancelNavigationTimeout?.()
+    this.cancelNavigationTimeout = null
+    this.pendingNavigationSequence = null
     this.cancelInitializationTimeout?.()
     this.cancelInitializationTimeout = null
     this.readyResolve = null

@@ -34,6 +34,38 @@ class FakeWorker implements WorldPhysicsWorkerLike {
   }
 }
 
+test('navigation transport bounds outstanding work, returns poses only and revokes late replies', async () => {
+  const worker = new FakeWorker()
+  const poses: unknown[] = []
+  const issues: string[] = []
+  const timeouts = new Set<() => void>()
+  const runtime = new WorldPhysicsWorkerRuntime({ generationId: 88, worker,
+    onSnapshot: () => assert.fail('Run must not apply authored transforms'), onTriggerEvents: () => assert.fail('Run must not dispatch triggers'),
+    onNavigationPose: pose => poses.push(pose), onError: issue => issues.push(issue.code),
+    scheduleTimeout: callback => { timeouts.add(callback); return () => timeouts.delete(callback) } })
+  const ready = runtime.initialize({ sceneId: 'scene:run', gravity: [0, -9.81, 0], bodies: [] }, { position: [0, 2, 3], frontSurfaces: [] })
+  const steps = [{ move: [0, -1] as [number, number], jumpPressed: false, boost: false }]
+  assert.equal(runtime.stepNavigation(1, steps), false)
+  worker.emit({ version: 1, kind: 'ready', generationId: 88, entityIds: [] }); await ready
+  assert.equal(runtime.stepNavigation(1, steps), true)
+  assert.equal(runtime.stepNavigation(2, steps), false)
+  const pose = { version: 1, kind: 'navigation-pose', generationId: 88, sequence: 1, position: [0, 2, 2.95], grounded: false, recovered: false }
+  worker.emit({ ...pose, generationId: 87 })
+  assert.equal(poses.length, 0)
+  worker.emit(pose)
+  assert.equal(poses.length, 1)
+  assert.equal(timeouts.size, 0)
+  runtime.pause(); assert.equal(runtime.stepNavigation(2, steps), false)
+  runtime.resume(); assert.equal(runtime.stepNavigation(2, steps), true)
+  for (const timeout of timeouts) timeout()
+  assert.deepEqual(issues, ['navigation-step-timeout'])
+  assert.equal(worker.terminated, true)
+  worker.emit({ ...pose, sequence: 2 })
+  assert.equal(poses.length, 1)
+  assert.equal(worker.listenerCount(), 0)
+  assert.equal(timeouts.size, 0)
+})
+
 async function timingRuntime(diagnostics = true, generationId = 7, beforeReady?: (runtime: WorldPhysicsWorkerRuntime) => void) {
   const fake = new FakeWorker()
   const snapshots: WorldPhysicsSnapshot[] = []

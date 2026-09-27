@@ -20,6 +20,8 @@ import {
   type WorldsViewportNavigationPose,
 } from '../worldCameraNavigation.ts'
 import type { WorldsResolvedCollisionSurface } from '../worldsSurfaceMath.ts'
+import type { WorldEditorRunCollisionInput } from '../editor/worldEditorRunCollision.ts'
+import { WorldEditorRunSession } from '../editor/worldEditorRunSession.ts'
 
 export type WorldsOrbitControlsHandle = {
   target: THREE.Vector3
@@ -29,6 +31,7 @@ export type WorldsOrbitControlsHandle = {
 }
 
 export interface WorldsViewportNavigationControlsProps {
+  runCollisionInput?: WorldEditorRunCollisionInput
   mode: WorldsViewportControlMode
   collisionSurfaces: readonly WorldsResolvedCollisionSurface[]
   inputScopeRef: RefObject<HTMLElement>
@@ -92,6 +95,7 @@ function updateLookFromCamera(camera: THREE.Camera, lookRef: { current: LookStat
 export function WorldsViewportNavigationControls({
   mode,
   collisionSurfaces,
+  runCollisionInput,
   inputScopeRef,
   orbitControlsRef,
   frameSceneToken,
@@ -111,6 +115,19 @@ export function WorldsViewportNavigationControls({
   const runFallbackActiveRef = useRef(false)
   const statusRef = useRef('')
   const surfacesRef = useRef<readonly WorldsResolvedCollisionSurface[]>(collisionSurfaces)
+  const runCollisionInputRef = useRef(runCollisionInput)
+  const runSessionRef = useRef<WorldEditorRunSession | null>(null)
+
+  const stopRunSession = useCallback(() => {
+    runSessionRef.current?.dispose()
+    runSessionRef.current = null
+  }, [])
+
+  useEffect(() => {
+    stopRunSession()
+    runCollisionInputRef.current = runCollisionInput
+    return stopRunSession
+  }, [runCollisionInput, stopRunSession])
 
   useEffect(() => { surfacesRef.current = collisionSurfaces }, [collisionSurfaces])
 
@@ -125,6 +142,7 @@ export function WorldsViewportNavigationControls({
   }, [onStatusChange])
 
   const releasePointerLock = useCallback(() => {
+    stopRunSession()
     const ownerDocument = gl.domElement.ownerDocument
     if (ownerDocument.pointerLockElement !== gl.domElement) return
     try {
@@ -133,7 +151,7 @@ export function WorldsViewportNavigationControls({
       pointerLockedRef.current = false
       onPointerLockChange(false)
     }
-  }, [gl.domElement, onPointerLockChange])
+  }, [gl.domElement, onPointerLockChange, stopRunSession])
 
   const requestPointerLock = useCallback(() => {
     if (modeRef.current === 'inspect') return
@@ -162,6 +180,7 @@ export function WorldsViewportNavigationControls({
   }, [clearKeys, gl.domElement, inputScopeRef, onPointerLockChange, publishStatus])
 
   useEffect(() => {
+    stopRunSession()
     const previousMode = modeRef.current
     const frameSceneRequested = frameSceneTokenRef.current !== frameSceneToken
     frameSceneTokenRef.current = frameSceneToken
@@ -197,7 +216,7 @@ export function WorldsViewportNavigationControls({
         ? `${mode === 'fly' ? 'Fly' : 'Run'} mode. Pointer locked.`
         : `${mode === 'fly' ? 'Fly' : 'Run'} mode. Click viewport to capture pointer.`)
     }
-  }, [camera, clearKeys, frameSceneToken, mode, onPointerLockChange, orbitControlsRef, publishStatus, releasePointerLock])
+  }, [camera, clearKeys, frameSceneToken, mode, onPointerLockChange, orbitControlsRef, publishStatus, releasePointerLock, stopRunSession])
 
   useEffect(() => {
     const ownerDocument = gl.domElement.ownerDocument
@@ -213,6 +232,7 @@ export function WorldsViewportNavigationControls({
       pointerLockedRef.current = locked
       onPointerLockChange(locked)
       if (!locked) {
+        stopRunSession()
         clearKeys()
         publishStatus(modeRef.current === 'inspect'
           ? 'Inspect mode. Orbit, pan, select, and edit.'
@@ -222,6 +242,7 @@ export function WorldsViewportNavigationControls({
       }
     }
     const handlePointerLockError = () => {
+      stopRunSession()
       pointerLockedRef.current = false
       onPointerLockChange(false)
       clearKeys()
@@ -237,7 +258,7 @@ export function WorldsViewportNavigationControls({
       onPointerLockChange(false)
       clearKeys()
     }
-  }, [clearKeys, gl.domElement, onPointerLockChange, publishStatus, releasePointerLock])
+  }, [clearKeys, gl.domElement, onPointerLockChange, publishStatus, releasePointerLock, stopRunSession])
 
   useEffect(() => {
     const element = gl.domElement
@@ -326,6 +347,28 @@ export function WorldsViewportNavigationControls({
       ...pose,
       forward: { x: forward.x, y: forward.y, z: forward.z },
       up: { x: up.x, y: up.y, z: up.z },
+    }
+    const collisionInput = runCollisionInputRef.current
+    if (modeRef.current === 'run' && collisionInput) {
+      // Run is upright even while geometry loads or the scene uses ground fallback.
+      nextPose.roll = 0
+      nextPose.up = { x: 0, y: 1, z: 0 }
+      // Revoke synchronously, even before a React unmount following Play or a revision change.
+      if (!collisionInput.isCurrent()) { stopRunSession(); return }
+      const session = runSessionRef.current ??= new WorldEditorRunSession(collisionInput, [pose.position.x, pose.position.y, pose.position.z])
+      const movement = session.advance(delta, lookRef.current.yaw, keysRef.current)
+      if (movement) nextPose.position = { x: movement.position[0], y: movement.position[1], z: movement.position[2] }
+      if (session.status === 'empty') {
+        const fallback = applyWorldsRunNavigation({ pose: nextPose, state: runStateRef.current ?? createWorldsRunNavigationState(nextPose.position), keys: keysRef.current, deltaSeconds: delta, collisionSurfaces: [] })
+        nextPose.position = fallback.pose.position
+        runStateRef.current = fallback.state ?? null
+        publishStatus(`Run mode. ${WORLD_RUN_GROUND_FALLBACK_LABEL}.`)
+      } else if (session.status === 'preparing') publishStatus('Run mode. Preparing collisions…')
+      else if (session.status === 'failed') publishStatus('Run mode. Collisions unavailable; movement paused.')
+      else publishStatus(movement?.recovered ? 'Run mode. Returned to the last safe ground position.' : 'Run mode. Collider-backed.')
+      poseRef.current = nextPose
+      applyPose(camera, nextPose, lookRef.current)
+      return
     }
     const result = modeRef.current === 'fly'
       ? applyWorldsFlyNavigation({ pose: nextPose, keys: keysRef.current, deltaSeconds: delta })

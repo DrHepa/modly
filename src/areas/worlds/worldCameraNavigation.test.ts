@@ -160,7 +160,7 @@ test('Run navigation is editor-only, ground-fallback labelled, jump-gated, and d
     collisionSurfaces: surfaces,
   })
   assert.equal(first.status, 'ground-only-fallback')
-  assert.equal(WORLD_RUN_GROUND_FALLBACK_LABEL, 'Ground-only fallback — no editor-navigation surfaces')
+  assert.equal(WORLD_RUN_GROUND_FALLBACK_LABEL, 'Ground-only fallback — no eligible colliders')
   assert.equal(first.pose.roll, 0)
   assert.equal(first.pose.position.y, pose.position.y)
   assert.equal(first.state?.grounded, true)

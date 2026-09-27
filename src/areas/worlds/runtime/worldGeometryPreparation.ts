@@ -39,16 +39,16 @@ export interface WorldPreparedMesh {
   instanced: boolean
 }
 
-export type PrepareWorldRuntimeGeometryResult =
-  | { success: true; projection: WorldRuntimeSceneProjection; transfer: Transferable[]; byteLength: number }
+export type PrepareWorldRuntimeGeometryResult<T = WorldRuntimeSceneProjection> =
+  | { success: true; projection: T; transfer: Transferable[]; byteLength: number }
   | { success: false; issues: WorldRuntimeProjectionIssue[] }
 
-export async function prepareWorldRuntimeGeometry(
-  plan: WorldRuntimeScenePlan,
+export async function prepareWorldRuntimeGeometry<T extends { physics: WorldRuntimeScenePlan['physics'] }>(
+  plan: T,
   deps: WorldGeometryPreparationDependencies,
   signal: AbortSignal,
   generationId = 0,
-): Promise<PrepareWorldRuntimeGeometryResult> {
+): Promise<PrepareWorldRuntimeGeometryResult<Omit<T, 'physics'> & { physics: WorldPhysicsSceneDto }>> {
   if (signal.aborted) return geometryFailure('runtime-load-cancelled', 'geometry', 'Runtime scene load was superseded.')
   const sourceCache = new Map<string, WorldPreparedGeometrySource>()
   const chargedSources = new Set<string>()

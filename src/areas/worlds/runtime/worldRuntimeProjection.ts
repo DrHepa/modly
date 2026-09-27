@@ -201,7 +201,7 @@ export function planWorldRuntimeScene(snapshotValue: WorldProjectSnapshotV1, sce
   }
 }
 
-function projectColliderShapePlan(
+export function projectColliderShapePlan(
   collider: WorldColliderComponent,
   scale: WorldTransform['scale'],
   bodyType: WorldRigidBodyComponent['bodyType'],

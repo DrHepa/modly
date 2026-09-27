@@ -149,6 +149,8 @@ const EXPECTED_WORLDS_TYPESCRIPT_TESTS = [
   'src/areas/worlds/editor/worldEditorController.test.ts',
   'src/areas/worlds/editor/worldEditorProjection.test.ts',
   'src/areas/worlds/editor/worldEditorRepositoryIntegration.test.ts',
+  'src/areas/worlds/editor/worldEditorRunCollision.test.ts',
+  'src/areas/worlds/editor/worldEditorRunSession.test.ts',
   'src/areas/worlds/editor/worldGraphicsProfileCommands.test.ts',
   'src/areas/worlds/editor/worldProjectPickerModel.test.ts',
   'src/areas/worlds/editor/worldRenderUiController.test.ts',
@@ -245,7 +247,7 @@ test('Worlds runner accepts the complete current canonical inventory within fini
   const { createNodeTestPlan, collectWorldsTypeScriptTests } = await import('./run-node-tests.mjs')
   const worlds = await collectWorldsTypeScriptTests()
   const plan = await createNodeTestPlan()
-  assert.equal(worlds.length, 91)
+  assert.equal(worlds.length, 93)
   assert.ok(plan.length <= 256)
   for (const file of worlds) assert.equal(plan.filter((entry) => entry.file === file).length, 1, file)
   t.diagnostic(`Canonical inventory: total=${plan.length}, typescript=${plan.filter(({ phase }) => phase === 'typescript').length}, mjs=${plan.filter(({ phase }) => phase === 'mjs').length}, worlds=${worlds.length}`)
@@ -354,7 +356,7 @@ test('canonical main requires an ordinary-Node full proof before per-file dispat
     events.push('mock-proof-end')
   } })
   const plan = await createNodeTestPlan()
-  assert.equal(plan.length, 220)
+  assert.equal(plan.length, 222)
   assert.deepEqual(events, ['mock-proof-start', 'mock-proof-end', ...plan.map(({ file }) => file)])
   assert.equal(starts, plan.length)
   assert.equal(output.length, plan.length)
@@ -509,13 +511,13 @@ test('Worlds script registration preserves canonical membership and includes Nod
   const aiFiles = ['src/areas/worlds/core/worldAiContract.test.ts', 'src/areas/worlds/editor/worldAiChatAdapter.test.ts',
     'src/areas/worlds/components/WorldsAiDrawer.test.ts', 'electron/main/automation-http-bridge.test.ts', 'scripts/worlds-ai-electron-fixture.test.mjs']
   for (const file of aiFiles) assert.equal(plan.filter((entry) => entry.file === file).length, 1, file)
-  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 215)
-  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 219)
-  assert.equal(plan.length, 220)
-  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 182)
+  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 217)
+  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 221)
+  assert.equal(plan.length, 222)
+  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 184)
   assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 38)
   assert.equal(new Set(plan.map(({ file }) => file)).size, plan.length)
-  assert.equal((await collectWorldsTypeScriptTests()).length, 91)
+  assert.equal((await collectWorldsTypeScriptTests()).length, 93)
 })
 
 test('Worlds MJS fixture entries receive TypeScript loader arguments without changing other entries or isolation', async () => {

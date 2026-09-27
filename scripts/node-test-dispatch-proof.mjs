@@ -37,7 +37,7 @@ export const REQUIRED_AUTHORING_GUARD_TEST_NAMES = Object.freeze([
   'AI1I Inspector number observation excludes nested units and uses the nearest production group heading',
   'P1 repository admissions bind relocated main and runner consumers before source reads or spawning',
 ])
-export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 304
+export const EXPECTED_AUTHORING_GUARD_TEST_COUNT = 315
 
 export function parseAuthoringGuardTapNames(stdout) {
   return [...stdout.matchAll(/^ok \d+ - (.+)$/gm)].map((match) => match[1])

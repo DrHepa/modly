@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import type { WebContents } from 'electron'
 import type { WorldProjectSnapshotV1 } from '../../src/areas/worlds/core/worldModel.ts'
 import { WORLD_RUN_GROUND_FALLBACK_LABEL } from '../../src/areas/worlds/worldCameraNavigation.ts'
@@ -7,6 +8,8 @@ import {
   click,
   key,
   paint,
+  numeric,
+  observeNativeClickPoint,
   readView,
   selectValue,
   sendNativeInput,
@@ -22,6 +25,10 @@ import {
   type AuthoringView,
   type CanvasInteractionPointObservation,
   type Point,
+  type ColliderRunSample,
+  type ColliderRunGeometry,
+  type ColliderRunScreenshot,
+  type ReservedEscapeReceipt,
 } from './shared.ts'
 
 const INSPECT_LABEL = 'Inspect (1) — Orbit, pan, select, and edit'
@@ -42,6 +49,10 @@ export interface WorldSculptNavigationSourceEvidence {
 
 export interface WorldSculptNavigationDriverPorts extends CommonDriverPorts {
   source: WorldSculptNavigationSourceEvidence
+  admitReopened(contents: WebContents, view: AuthoringView, previousBoot: string): Promise<void>
+  releaseReservedEscape(contents: WebContents): Promise<{view: AuthoringView; receipt: ReservedEscapeReceipt}>
+  collisionGeometry(view: AuthoringView): Promise<ColliderRunGeometry[]>
+  captureCollider(stage: string, view: AuthoringView, contents: WebContents): Promise<ColliderRunScreenshot>
 }
 
 function snapshot(view: AuthoringView): WorldProjectSnapshotV1 {
@@ -165,11 +176,12 @@ async function nativeCanvasClick(contents: WebContents, ports: CommonDriverPorts
 }
 
 async function nativeCanvasDoubleClick(contents: WebContents, ports: CommonDriverPorts, entityId: string): Promise<{
-  point: Point; beforeCamera: number[]; traceStart: number; canvasUuid: string
+  point: Point; beforeCamera: number[]; traceStart: number; bootId: string; canvasUuid: string; cameraUuid: string
 }> {
   const { point, view } = await settleNativePoint(contents, ports, entityId)
   assert.ok(view.canvas)
-  const result = { point: { ...point }, beforeCamera: [...view.canvas.camera], traceStart: view.trace.at(-1)?.sequence ?? 0, canvasUuid: view.canvas.canvasUuid }
+  const result = { point: { ...point }, beforeCamera: [...view.canvas.camera], traceStart: view.trace.at(-1)?.sequence ?? 0,
+    bootId: view.bootId, canvasUuid: view.canvas.canvasUuid, cameraUuid: view.canvas.cameraFraming.uuid }
   ports.guard()
   sendNativeInput(contents, ports, { type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
   sendNativeInput(contents, ports, { type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
@@ -184,6 +196,23 @@ interface WorldSculptVisualProofEvidence {
   focusPoint: Point
   emptyPoints: [Point, Point]
   dblclickSequence: number
+}
+
+function cleanCloseupObservation(before: AuthoringView, view: AuthoringView, entityId: string) {
+  const previous = before.canvas!, current = view.canvas
+  const beforeBounds = previous.models.find((candidate) => candidate.entityId === entityId)?.bounds
+  const afterBounds = current?.models.find((candidate) => candidate.entityId === entityId)?.bounds
+  const cameraDelta = current?.camera.length === previous.camera.length && current.camera.every(Number.isFinite)
+    ? current.camera.map((value, index) => value - previous.camera[index]) : null
+  return structuredClone({ view, cameraDelta, predicates: {
+    ownerUnchanged: view.bootId === before.bootId && current?.canvasUuid === previous.canvasUuid && current.cameraFraming.uuid === previous.cameraFraming.uuid,
+    selectionEmpty: view.selection.active === null && view.selection.ids.length === 0,
+    gizmoHidden: current?.gizmo === null,
+    modelPresent: current?.models.some((candidate) => candidate.entityId === entityId) ?? false,
+    cameraPreserved: cameraDelta !== null && !changed(previous.camera, current!.camera),
+    framed: framed(view, entityId),
+    projectedSizePreserved: !!beforeBounds && !!afterBounds && afterBounds.width >= beforeBounds.width * 0.99 && afterBounds.height >= beforeBounds.height * 0.99,
+  } })
 }
 
 async function prepareWorldSculptVisualProof(
@@ -202,11 +231,25 @@ async function prepareWorldSculptVisualProof(
   assertCanonicalState(view, ports, expectedCanonical)
 
   const focus = await nativeCanvasDoubleClick(contents, ports, entityId)
+  let quiet: { camera: number[]; at: number; firstFrame: number; lastFrame: number; observations: number } | undefined
   view = await waitFor(contents, ports, (current) => {
+    assert.ok(current.bootId === focus.bootId && current.canvas?.canvasUuid === focus.canvasUuid
+      && current.canvas.cameraFraming.uuid === focus.cameraUuid, 'Native focus owner changed during settlement')
     const exactFocusEvents = current.trace.filter((event) => event.sequence > focus.traceStart && event.type === 'dblclick'
       && event.trusted && event.canvasUuid === focus.canvasUuid && event.x === focus.point.x && event.y === focus.point.y)
-    return current.selection.active === entityId && !!current.canvas && current.canvas.controls.orbitEnabled === true
+    const eligible = current.selection.active === entityId && !!current.canvas && current.canvas.controls.orbitEnabled === true
       && current.navigation.status === INSPECT_STATUS && framed(current, entityId) && exactFocusEvents.length === 1
+    if (!eligible) { quiet = undefined; return false }
+    const { camera, frame } = current.canvas, at = Date.parse(current.at)
+    assert.ok(camera.length === 32 && camera.every(Number.isFinite) && Number.isFinite(at) && Number.isSafeInteger(frame))
+    // Framing can precede the final focus pose. Observe quietness; never delay blindly or extend the focus budget.
+    if (!quiet || changed(quiet.camera, camera)) {
+      quiet = { camera: [...camera], at, firstFrame: frame, lastFrame: frame, observations: 1 }
+      return false
+    }
+    if (frame <= quiet.lastFrame) return false
+    quiet.lastFrame = frame; quiet.observations++
+    return quiet.observations >= 3 && at - quiet.at >= 120
   }, 'worldsculpt-native-double-click-focus', 8000)
   assert.ok(view.canvas)
   const focused = model(view, entityId)
@@ -225,26 +268,41 @@ async function prepareWorldSculptVisualProof(
   const focusedBounds = { ...focused.bounds }
   const focusedCamera = [...view.canvas.camera]
   assertCanonicalState(view, ports, expectedCanonical)
-
-  const secondEmptyPoint = await nativeCanvasClick(contents, ports)
-  view = await waitFor(contents, ports, (current) => current.selection.active === null && current.selection.ids.length === 0
-    && current.canvas?.gizmo === null && current.canvas.models.some((candidate) => candidate.entityId === entityId)
-    && !changed(focusedCamera, current.canvas.camera) && framed(current, entityId), 'worldsculpt-native-clean-closeup')
-  assert.ok(view.canvas)
-  assert.equal(changed(focusedCamera, view.canvas.camera), false, 'Canvas deselection must preserve the focused camera')
-  const clean = model(view, entityId)
-  assert.ok(clean.bounds)
-  assert.ok(clean.bounds.width >= focusedBounds.width * 0.99 && clean.bounds.height >= focusedBounds.height * 0.99, 'Clean closeup lost the focused projected size')
-  assertCanonicalState(view, ports, expectedCanonical)
-  return {
-    view,
-    evidence: {
-      initialBounds,
-      focusedBounds,
-      focusPoint: { ...focus.point },
-      emptyPoints: [{ ...firstEmptyPoint }, { ...secondEmptyPoint }],
-      dblclickSequence: focusEvidence.dblclickSequence,
-    },
+  const before = structuredClone(view), label = `worldsculpt-focus-${view.bootId}-${focus.traceStart}`
+  ports.record(`${label}-before`, structuredClone({ view: before, focus, settlement: quiet }))
+  let lastCleanView: AuthoringView | undefined
+  try {
+    const secondEmptyPoint = await nativeCanvasClick(contents, ports)
+    view = await waitFor(contents, ports, (current) => {
+      lastCleanView = current
+      return current.selection.active === null && current.selection.ids.length === 0
+        && current.canvas?.gizmo === null && current.canvas.models.some((candidate) => candidate.entityId === entityId)
+        && !changed(focusedCamera, current.canvas.camera) && framed(current, entityId)
+    }, 'worldsculpt-native-clean-closeup')
+    ports.record(`${label}-after`, cleanCloseupObservation(before, view, entityId))
+    assert.ok(view.canvas)
+    assert.equal(changed(focusedCamera, view.canvas.camera), false, 'Canvas deselection must preserve the focused camera')
+    const clean = model(view, entityId)
+    assert.ok(clean.bounds)
+    assert.ok(clean.bounds.width >= focusedBounds.width * 0.99 && clean.bounds.height >= focusedBounds.height * 0.99, 'Clean closeup lost the focused projected size')
+    assertCanonicalState(view, ports, expectedCanonical)
+    return {
+      view,
+      evidence: {
+        initialBounds,
+        focusedBounds,
+        focusPoint: { ...focus.point },
+        emptyPoints: [{ ...firstEmptyPoint }, { ...secondEmptyPoint }],
+        dblclickSequence: focusEvidence.dblclickSequence,
+      },
+    }
+  } catch (error) {
+    if (lastCleanView) ports.record(`${label}-after`, cleanCloseupObservation(before, lastCleanView, entityId))
+    let observation: unknown
+    try { ports.guard(contents); observation = cleanCloseupObservation(before, await readView(contents), entityId); ports.guard(contents) }
+    catch (observationError) { observation = { unavailable: String(observationError) } }
+    ports.record(`${label}-error`, { error: String(error), observation })
+    throw error
   }
 }
 
@@ -264,7 +322,7 @@ async function nativeOrbitDrag(contents: WebContents, ports: CommonDriverPorts):
 }
 
 async function holdKeys(contents: WebContents, ports: CommonDriverPorts, keyCodes: readonly string[], milliseconds: number): Promise<void> {
-  assert.ok(milliseconds >= 250 && milliseconds <= 400)
+  assert.ok(milliseconds >= 25 && milliseconds <= 400)
   const held: string[] = []
   try {
     for (const keyCode of keyCodes) { ports.guard(); sendNativeInput(contents, ports, { type: 'keyDown', keyCode }); held.push(keyCode) }
@@ -272,6 +330,58 @@ async function holdKeys(contents: WebContents, ports: CommonDriverPorts, keyCode
     while (Date.now() < deadline) { ports.guard(); await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now()))) }
   } finally {
     if (!contents.isDestroyed()) for (const keyCode of [...held].reverse()) sendNativeInput(contents, ports, { type: 'keyUp', keyCode })
+  }
+}
+
+function captureNativeLook(view: AuthoringView) {
+  assert.ok(view.canvas)
+  return structuredClone({ at: view.at, bootId: view.bootId, canvasUuid: view.canvas.canvasUuid, frame: view.canvas.frame,
+    pose: view.canvas.cameraPose, lock: view.navigation.pointerLock, status: view.navigation.status,
+    orbit: view.canvas.controls.orbitEnabled, traceSequence: view.trace.at(-1)?.sequence ?? 0, trace: view.trace.slice(-4) })
+}
+
+function hasNativeLookReceipt(view: AuthoringView, before: ReturnType<typeof captureNativeLook>, delta: Point, cameraResponse: boolean): boolean {
+  if (!view.canvas || view.bootId !== before.bootId || view.canvas.canvasUuid !== before.canvasUuid
+    || !view.navigation.pointerLock.canvasOwned || view.navigation.pointerLock.changes !== before.lock.changes
+    || view.navigation.pointerLock.errors !== 0 || view.canvas.controls.orbitEnabled !== false || view.navigation.status !== FLY_LOCKED_STATUS) return false
+  const events = ['pointermove', 'mousemove'].map((type) => view.trace.find((event) => event.sequence > before.traceSequence && event.type === type
+    && event.trusted && event.canvasUuid === before.canvasUuid && event.movementX === delta.x && event.movementY === delta.y
+    && event.frame !== null && event.frame >= before.frame && view.canvas!.frame > event.frame))
+  return events.every(Boolean) && events[0]!.sequence < events[1]!.sequence && view.canvas.frame > before.frame
+    && (!cameraResponse || ((delta.x !== 0 || delta.y !== 0) && changed(before.pose.quaternion, view.canvas.cameraPose.quaternion)))
+}
+
+async function nativeRelativeLook(contents: WebContents, ports: CommonDriverPorts, view: AuthoringView, point: Point, delta: Point, label: string, prime: boolean, deadline: number): Promise<AuthoringView> {
+  const remaining = () => { const value = deadline - Date.now(); assert.ok(value > 0 && value <= 4000, 'Native look exceeded its original 4000-ms deadline'); return value }
+  const owner = { bootId: view.bootId, canvasUuid: view.canvas!.canvasUuid, lockChanges: view.navigation.pointerLock.changes }
+  try {
+    if (prime) {
+      const before = captureNativeLook(view)
+      remaining()
+      sendNativeInput(contents, ports, { type: 'mouseMove', ...point, movementX: 0, movementY: 0 }, {
+        owner, beforeSend(payload) { ports.record(`${label}-prime-before`, { observation: before, payload }) },
+      })
+      view = await waitFor(contents, ports, (current) => hasNativeLookReceipt(current, before, { x: 0, y: 0 }, false), `${label}-prime`, remaining())
+      ports.record(`${label}-prime-after`, captureNativeLook(view))
+    }
+    // Priming can change the camera. Capture the measurement baseline only after its observed receipt.
+    ports.guard(contents); view = await readView(contents); ports.guard(contents)
+    const before = captureNativeLook(view)
+    assert.equal(before.bootId, owner.bootId); assert.equal(before.canvasUuid, owner.canvasUuid)
+    assert.equal(before.lock.changes, owner.lockChanges); assert.equal(before.lock.canvasOwned, true); assert.equal(before.lock.errors, 0)
+    remaining()
+    sendNativeInput(contents, ports, { type: 'mouseMove', ...point, movementX: delta.x, movementY: delta.y }, {
+      owner, beforeSend(payload) { ports.record(`${label}-before`, { observation: before, payload }) },
+    })
+    view = await waitFor(contents, ports, (current) => hasNativeLookReceipt(current, before, delta, true), label, remaining())
+    ports.record(`${label}-after`, captureNativeLook(view))
+    return view
+  } catch (error) {
+    let observation: unknown
+    try { ports.guard(contents); observation = captureNativeLook(await readView(contents)); ports.guard(contents) }
+    catch (observationError) { observation = { unavailable: String(observationError) } }
+    ports.record(`${label}-error`, { error: String(error), observation })
+    throw error
   }
 }
 
@@ -386,9 +496,7 @@ export async function runWorldSculptNavigationAcceptance(
   const lockChangesBefore = view.navigation.pointerLock.changes
   const canvasPoint = await nativeCanvasClick(contents, ports)
   view = await waitFor(contents, ports, (current) => current.navigation.pointerLock.canvasOwned && current.navigation.pointerLock.changes > lockChangesBefore && current.navigation.pointerLock.errors === 0 && current.navigation.status === FLY_LOCKED_STATUS, 'native-fly-pointer-lock')
-  const flyBeforeLook = [...view.canvas!.cameraPose.quaternion]
-  sendNativeInput(contents, ports, { type: 'mouseMove', x: canvasPoint.x + 37, y: canvasPoint.y - 19 })
-  view = await waitFor(contents, ports, (current) => !!current.canvas && changed(flyBeforeLook, current.canvas.cameraPose.quaternion), 'native-fly-look')
+  view = await nativeRelativeLook(contents, ports, view, canvasPoint, { x: 37, y: -19 }, 'native-fly-look', true, Date.now() + 4000)
   const flyBeforeMove = [...view.canvas!.cameraPose.position]
   await holdKeys(contents, ports, ['W'], 300)
   view = await waitFor(contents, ports, (current) => !!current.canvas && changed(flyBeforeMove, current.canvas.cameraPose.position), 'native-fly-translation')
@@ -427,7 +535,9 @@ export async function runWorldSculptNavigationAcceptance(
   ports.stage('native-navigation-document-isolation')
   contents = await ports.reopen()
   view = await waitFor(contents, ports, (current) => current.bootId !== previousBoot && current.editor.lifecycle === 'ready'
-    && current.editor.projectKey === authored.projectKey && !!current.editor.activeSceneId, 'worldsculpt-fresh-reopen', 8000)
+    && current.editor.projectKey === authored.projectKey && !!current.editor.activeSceneId
+    && !!current.canvas && !current.canvas.contextLost && current.canvas.frame > 1, 'worldsculpt-fresh-reopen', 8000)
+  await ports.admitReopened(contents, view, previousBoot)
   assert.deepEqual(snapshot(view), navigationBaseline.snapshot, 'Fresh repository/renderer lost the WorldSculpt document')
   assert.equal(ports.applies().length, navigationBaseline.applyCount)
   if (view.editor.activeSceneId !== worldSculptSceneId) {
@@ -464,4 +574,253 @@ export async function runWorldSculptNavigationAcceptance(
     screenshots: ['12-worldsculpt-inspect-framed.png', '13-worldsculpt-inspect-orbit.png', '14-worldsculpt-fly-locked.png', '15-worldsculpt-run-ground-only.png', '16-worldsculpt-restored-inspect.png'],
   })
   await ports.pass('native-navigation-document-isolation')
+  await runColliderNavigationAcceptance(contents, ports)
+}
+
+async function revealInspectorTarget(contents: WebContents, ports: CommonDriverPorts, kind: 'button' | 'number', name: string): Promise<void> {
+  ports.guard(contents)
+  let view = await readView(contents)
+  const ownerOf = (current: AuthoringView) => ({ bootId: current.bootId, canvasUuid: current.canvas?.canvasUuid,
+    sceneId: current.editor.activeSceneId, selection: current.selection })
+  const owner = structuredClone(ownerOf(view)), label = `inspector-reveal-${view.bootId}-${view.selection.active}-${name}`
+  assert.ok(owner.canvasUuid && owner.sceneId && owner.selection.active)
+  const samples: { at: number; frame: number; owner: ReturnType<typeof ownerOf>; target: Awaited<ReturnType<typeof observeNativeClickPoint>> }[] = []
+  let quiet: { geometry: string; at: number; lastFrame: number; observations: number } | undefined
+  let step = 0
+  try {
+    for (; step < 14; step++) {
+      // Reuse each wheel step's existing 2000-ms paint budget for observed layout quietness.
+      const deadline = Date.now() + 2000
+      quiet = undefined
+      let observed: Awaited<ReturnType<typeof observeNativeClickPoint>>
+      for (;;) {
+        ports.guard(contents)
+        observed = await observeNativeClickPoint(contents, kind, name)
+        ports.guard(contents)
+        const sample = { at: Date.parse(view.at), frame: view.canvas?.frame ?? -1, owner: ownerOf(view), target: observed }
+        samples.push(sample); if (samples.length > 8) samples.shift()
+        assert.deepEqual(sample.owner, owner, 'Native Inspector owner changed during reveal')
+        assert.equal(observed.matchCount, 1, `Ambiguous Inspector target: ${name}`)
+        assert.equal(observed.enabled, true, `Disabled Inspector target: ${name}`)
+        assert.ok(observed.visible && observed.rect && observed.inspector, `Inspector target or scroll owner missing: ${name}`)
+        assert.ok([sample.at, sample.frame, ...Object.values(observed.rect), ...Object.values(observed.inspector.rect), observed.inspector.scrollTop, observed.inspector.scrollLeft].every(Number.isFinite))
+        assert.ok(Date.now() < deadline, `Native Inspector target did not settle within 2000 ms: ${name}`)
+        const geometry = JSON.stringify({ rect: observed.rect, inspector: observed.inspector })
+        if (!quiet || quiet.geometry !== geometry) quiet = { geometry, at: sample.at, lastFrame: sample.frame, observations: 1 }
+        else if (sample.frame > quiet.lastFrame) { quiet.lastFrame = sample.frame; quiet.observations++ }
+        if (quiet.observations >= 3 && sample.at - quiet.at >= 120) break
+        const frame = sample.frame
+        view = await waitFor(contents, ports, (current) => !!current.canvas && current.canvas.frame > frame,
+          'native-inspector-settlement', deadline - Date.now())
+      }
+      if (observed.hitMatches) { ports.record(label, structuredClone({ owner, step, quiet, samples })); return }
+      const rect = observed.inspector!.rect
+      assert.ok(observed.point.x < rect.x || observed.point.x >= rect.x + rect.width || observed.point.y < rect.y || observed.point.y >= rect.y + rect.height,
+        `Inspector target occluded inside its scroll viewport: ${name}`)
+      const point = await contents.executeJavaScript(`(() => {
+        const elements = [...document.querySelectorAll('[aria-label="Entity inspector"]')];
+        if (elements.length !== 1) throw new Error('Actual Inspector scroll owner missing');
+        const r = elements[0].getBoundingClientRect();
+        const point = { x: Math.round(r.x + r.width / 2), y: Math.round((Math.max(0, r.y) + Math.min(innerHeight, r.bottom)) / 2) };
+        if (!elements[0].contains(document.elementFromPoint(point.x, point.y))) throw new Error('Inspector wheel owner occluded');
+        return point;
+      })()`, false) as Point
+      sendNativeInput(contents, ports, { type: 'mouseMove', ...point })
+      sendNativeInput(contents, ports, { type: 'mouseWheel', ...point, deltaX: 0, deltaY: observed.point.y > point.y ? -360 : 360 })
+      view = await readView(contents)
+    }
+    throw new Error(`Native Inspector wheel did not reveal ${name}`)
+  } catch (error) {
+    ports.record(label, structuredClone({ owner, step, quiet, samples, error: String(error) }))
+    throw error
+  }
+}
+
+async function runColliderNavigationAcceptance(contents: WebContents, ports: WorldSculptNavigationDriverPorts): Promise<void> {
+  ports.stage('native-collider-authoring')
+  let view = await readView(contents)
+  const authoringStart = ports.applies().length, beforeAuthoring = snapshot(view)
+  const sceneOffset = ports.applies().length
+  await click(contents, ports, 'button', 'Add scene')
+  view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready' && snapshot(v).project.revision === beforeAuthoring.project.revision + 1, 'collider-add-scene')
+  assert.equal(ports.applies().length, sceneOffset + 1)
+  assertSuccessfulUiApply(beforeAuthoring, snapshot(view), ports.applies()[sceneOffset], ['add-scene'])
+  const sceneCommand = ports.applies()[sceneOffset].request.batch.commands[0]
+  assert.ok(sceneCommand.type === 'add-scene')
+  const sceneId = sceneCommand.scene.sceneId
+  assert.equal(view.editor.activeSceneId, sceneId)
+  const entityIds: string[] = []
+  for (const role of ['floor', 'wall'] as const) {
+    await click(contents, ports, 'button', 'Assets')
+    view = await readView(contents)
+    const before = snapshot(view), offset = ports.applies().length
+    await click(contents, ports, 'button', 'Add red-cube.glb to scene')
+    view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready' && snapshot(v).project.revision === before.project.revision + 1 && !!v.selection.active, `collider-${role}-asset`)
+    assert.equal(ports.applies().length, offset + 1)
+    const invocation = ports.applies()[offset]
+    // The Assets lane reuses the already registered cube resource on subsequent imports.
+    assertSuccessfulUiApply(before, snapshot(view), invocation, ['add-entity'])
+    const command = invocation.request.batch.commands[0]
+    assert.ok(command.type === 'add-entity' && command.sceneId === sceneId)
+    const id = command.entity.id; entityIds.push(id)
+    assert.equal(view.selection.active, id)
+    for (const label of ['Add Static Mesh', 'Add Fixed Body']) {
+      const beforeComponent = snapshot(view), componentOffset = ports.applies().length
+      await revealInspectorTarget(contents, ports, 'button', label)
+      await click(contents, ports, 'button', label)
+      view = await waitFor(contents, ports, (v) => v.editor.lifecycle === 'ready' && snapshot(v).project.revision === beforeComponent.project.revision + 1, `collider-${role}-${label}`)
+      assert.equal(ports.applies().length, componentOffset + 1)
+      assertSuccessfulUiApply(beforeComponent, snapshot(view), ports.applies()[componentOffset], ['add-component'])
+    }
+    const target = role === 'floor' ? { position: [0, 0, 0], scale: [30, 0.5, 30] } : { position: [0, 0.35, -2], scale: [16, 8, 1] }
+    for (const field of ['position', 'scale'] as const) for (const axis of [0, 1, 2] as const) {
+      const entity = snapshot(view).scenes.find((scene) => scene.sceneId === sceneId)!.entities.find((entity) => entity.id === id)!
+      if (entity.transform[field][axis] !== target[field][axis]) {
+        await revealInspectorTarget(contents, ports, 'number', `${field === 'position' ? 'Position' : 'Scale'}:${['X', 'Y', 'Z'][axis]}`)
+        view = await numeric(contents, ports, sceneId, id, field, axis, target[field][axis])
+      }
+    }
+  }
+  const [floorId, wallId] = entityIds
+  const baseline = canonicalState(view, ports.applies().length)
+  const canonicalSha256 = createHash('sha256').update(JSON.stringify(baseline)).digest('hex')
+  const geometry = await ports.collisionGeometry(view)
+  assert.equal(geometry.length, 2)
+  const observed = entityIds.map((id) => {
+    const rendered = view.canvas?.models.find((model) => model.entityId === id)
+    assert.ok(rendered?.visible && rendered.meshes === 1 && rendered.triangles === 12 && rendered.worldCorners.length === 8)
+    const prepared = geometry.find((item) => item.entityId === id)!
+    assert.ok(prepared && prepared.vertices === 36 && prepared.triangles === 12)
+    const min = [0, 1, 2].map((axis) => Math.min(...rendered.worldCorners.map((corner) => corner.world[axis])))
+    const max = [0, 1, 2].map((axis) => Math.max(...rendered.worldCorners.map((corner) => corner.world[axis])))
+    for (const axis of [0, 1, 2]) {
+      assert.ok(Number.isFinite(min[axis]) && Number.isFinite(max[axis]) && max[axis] > min[axis])
+      assert.ok(Math.abs(min[axis] - prepared.min[axis]) < 1e-5 && Math.abs(max[axis] - prepared.max[axis]) < 1e-5, 'Visible and prepared collider bounds differ')
+    }
+    return { entityId: id, transform: structuredClone(rendered.transform), min, max }
+  })
+  const floor = geometry.find((item) => item.entityId === floorId)!, wall = geometry.find((item) => item.entityId === wallId)!
+  const eyeY = floor.max[1] + 1.65
+  const samples: ColliderRunSample[] = []
+  const screenshots: ColliderRunScreenshot[] = []
+  const traceStart = view.trace.at(-1)?.sequence ?? 0
+  const take = async (phase: ColliderRunSample['phase']) => {
+    view = await paint(contents, ports)
+    assertCanonicalState(view, ports, baseline)
+    assert.ok(view.canvas && [...view.canvas.cameraPose.position, ...view.canvas.cameraPose.quaternion].every(Number.isFinite))
+    assert.equal(view.navigation.observationCapability.writable, false); assert.equal(view.navigation.observationCapability.configurable, false)
+    const sample: ColliderRunSample = { phase, at: view.at, bootId: view.bootId, frame: view.canvas.frame, traceSequence: view.trace.at(-1)?.sequence ?? 0,
+      position: [...view.canvas.cameraPose.position], quaternion: [...view.canvas.cameraPose.quaternion],
+      status: view.navigation.status, groundOnly: view.navigation.groundOnlyVisible, locked: view.navigation.pointerLock.canvasOwned,
+      lockChanges: view.navigation.pointerLock.changes, lockErrors: view.navigation.pointerLock.errors, orbit: view.canvas.controls.orbitEnabled,
+      canonicalSha256: createHash('sha256').update(JSON.stringify(canonicalState(view, ports.applies().length))).digest('hex'), applyCount: ports.applies().length }
+    samples.push(sample)
+    return sample
+  }
+  const capture = async (name: string) => { screenshots.push(await ports.captureCollider(name, view, contents)) }
+  await click(contents, ports, 'button', 'Frame scene')
+  view = await waitFor(contents, ports, (v) => entityIds.every((id) => framed(v, id)), 'collider-scene-framed', 8000)
+  await nativeCanvasClick(contents, ports)
+  view = await paint(contents, ports)
+  assert.equal(view.selection.active, null)
+  await capture('17-collider-authored-inspect')
+  await ports.pass('native-collider-authoring')
+
+  ports.stage('native-collider-ground-wall-slide')
+  await click(contents, ports, 'button', FLY_LABEL)
+  await nativeCanvasClick(contents, ports)
+  view = await waitFor(contents, ports, (v) => v.navigation.status === FLY_LOCKED_STATUS && v.navigation.pointerLock.canvasOwned, 'collider-fly-lock')
+  // Bounded feedback uses only observed pose and guarded native input, never camera/scene setters.
+  const colliderLookDeadline = Date.now() + 4000
+  for (let step = 0; step < 16; step++) {
+    const [yaw, pitch, roll] = view.canvas!.cameraPose.yawPitchRoll
+    assert.ok(Math.abs(roll) < 1e-6)
+    if (Math.abs(yaw) < 0.015 && Math.abs(pitch) < 0.015) break
+    const rect = view.canvas!.rect
+    view = await nativeRelativeLook(contents, ports, view, { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) },
+      { x: Math.max(-300, Math.min(300, Math.round(yaw / 0.002))), y: Math.max(-300, Math.min(300, Math.round(pitch / 0.002))) },
+      `collider-look-${step}`, step === 0, colliderLookDeadline)
+    await take('staging')
+  }
+  assert.ok(view.canvas!.cameraPose.yawPitchRoll.every((value) => Math.abs(value) < 0.015), 'Native look staging did not converge')
+  const target = [0, floor.max[1] + 3.5, 3]
+  for (let step = 0; step < 140; step++) {
+    const delta = target.map((value, axis) => value - view.canvas!.cameraPose.position[axis])
+    const axis = delta.map(Math.abs).indexOf(Math.max(...delta.map(Math.abs)))
+    if (Math.abs(delta[axis]) < 0.16) break
+    const code = axis === 0 ? (delta[axis] > 0 ? 'D' : 'A') : axis === 1 ? (delta[axis] > 0 ? 'Space' : 'Control') : (delta[axis] > 0 ? 'S' : 'W')
+    await holdKeys(contents, ports, [code], Math.max(25, Math.min(250, Math.round(Math.abs(delta[axis]) / 4 * 800))))
+    await take('staging')
+  }
+  const staged = await take('staging')
+  assert.ok(target.every((value, axis) => Math.abs(staged.position[axis] - value) < 0.2), 'Native Fly position staging did not converge')
+  key(contents, ports, '3')
+  view = await waitFor(contents, ports, (v) => v.navigation.status === 'Run mode. Collider-backed.' && v.navigation.pointerLock.canvasOwned, 'collider-run-ready', 8000)
+  // Sample the actual descent and several stable contacts; no Worker grounded flag is claimed.
+  for (let step = 0; step < 45; step++) {
+    const sample = await take('descent')
+    if (Math.abs(sample.position[1] - eyeY) <= 0.04) break
+    await new Promise((resolve) => setTimeout(resolve, 35))
+  }
+  for (let step = 0; step < 4; step++) { await new Promise((resolve) => setTimeout(resolve, 60)); await take('ground') }
+  for (let step = 0; step < 10; step++) {
+    await holdKeys(contents, ports, ['W'], 250)
+    const sample = await take('approach')
+    if (sample.position[2] <= wall.max[2] + 0.36) break
+  }
+  for (let step = 0; step < 3; step++) { await holdKeys(contents, ports, ['W'], 250); await take('contact') }
+  await capture('18-collider-wall-contact')
+  for (let step = 0; step < 3; step++) { await holdKeys(contents, ports, ['W', 'D'], 250); await take('slide') }
+  await ports.pass('native-collider-ground-wall-slide')
+
+  ports.stage('native-collider-jump-handoff')
+  await take('jump')
+  // Keep Space down across an actual rendered frame, then release, to expose a real jump edge to the Worker.
+  sendNativeInput(contents, ports, { type: 'keyDown', keyCode: 'Space' })
+  try { await take('jump') } finally { sendNativeInput(contents, ports, { type: 'keyUp', keyCode: 'Space' }) }
+  for (let step = 0; step < 35; step++) {
+    const sample = await take('jump')
+    if (step > 8 && Math.abs(sample.position[1] - eyeY) <= 0.04) break
+    await new Promise((resolve) => setTimeout(resolve, 30))
+  }
+  for (let step = 0; step < 3; step++) { await new Promise((resolve) => setTimeout(resolve, 50)); await take('jump') }
+  await capture('19-collider-jump-landed')
+  await take('runExit'); key(contents, ports, '2')
+  view = await waitFor(contents, ports, (v) => v.navigation.status === FLY_LOCKED_STATUS, 'collider-run-fly-handoff')
+  await take('flyEnter')
+  // Fly must cross the previously blocking wall at the same eye level.
+  await holdKeys(contents, ports, ['W'], 400); await take('flyMove')
+  const reservedExit = await ports.releaseReservedEscape(contents)
+  view = reservedExit.view
+  assertCanonicalState(view, ports, baseline)
+  const reservedEscape = reservedExit.receipt
+  assert.ok(reservedEscape.unlocked)
+  ports.record('collider-unlocked-before-frame-scene', view)
+  await click(contents, ports, 'button', 'Frame scene')
+  view = await waitFor(contents, ports, (v) => v.navigation.status === INSPECT_STATUS && v.canvas?.controls.orbitEnabled === true && v.canvas.frame > reservedEscape.unlocked!.frame && entityIds.every((id) => framed(v, id)), 'collider-inspect-handoff')
+  assert.equal(view.bootId, reservedEscape.unlocked.bootId); assert.equal(view.canvas!.canvasUuid, reservedEscape.unlocked.canvasUuid)
+  await take('inspect')
+  const inputTrace = view.trace.filter((event) => event.sequence > traceStart)
+  const bootId = view.bootId
+  await ports.pass('native-collider-jump-handoff')
+
+  ports.stage('native-collider-reopen')
+  contents = await ports.reopen()
+  view = await waitFor(contents, ports, (v) => v.bootId !== bootId && v.editor.lifecycle === 'ready' && !!v.editor.activeSceneId
+    && !!v.canvas && !v.canvas.contextLost && v.canvas.frame > 1, 'collider-fresh-reopen', 8000)
+  await ports.admitReopened(contents, view, bootId)
+  assert.deepEqual(snapshot(view), baseline.snapshot); assert.equal(ports.applies().length, baseline.applyCount)
+  if (view.editor.activeSceneId !== sceneId) await selectValue(contents, ports, 'Active scene', sceneId)
+  await click(contents, ports, 'button', 'Frame scene')
+  view = await waitFor(contents, ports, (v) => v.editor.activeSceneId === sceneId && v.canvas?.models.length === 2 && entityIds.every((id) => framed(v, id)), 'collider-reopened-frame', 8000)
+  assert.deepEqual(snapshot(view), baseline.snapshot); assert.equal(ports.applies().length, baseline.applyCount)
+  const reopenedGeometry = await ports.collisionGeometry(view)
+  assert.deepEqual(reopenedGeometry, geometry)
+  for (const item of observed) assert.deepEqual(view.canvas!.models.find((model) => model.entityId === item.entityId)!.transform, item.transform)
+  view = await paint(contents, ports)
+  await capture('20-collider-restored-inspect')
+  ports.record('colliderRun', { schema: 'modly.collider-run-acceptance.v1', grounding: 'geometric-native-observation', sceneId, floorId, wallId,
+    authoring: structuredClone(ports.applies().slice(authoringStart)), beforeAuthoring, baseline, canonicalSha256, geometry, observed, samples, inputTrace, reservedEscape, screenshots,
+    reopened: { bootId: view.bootId, snapshot: snapshot(view), applyCount: ports.applies().length, geometry: reopenedGeometry, observed: view.canvas!.models.map((model) => ({ entityId: model.entityId, transform: model.transform })) } })
+  await ports.pass('native-collider-reopen')
 }

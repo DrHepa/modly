@@ -22,9 +22,11 @@ import { runActualOllamaDriver, type AiDriverPorts, type AiQueryCapture, type Ai
 import { WORLD_PROJECT_CHANNELS, type WorldProjectCommandRequest, type WorldProjectCommandResult, type WorldProjectCommandSuccess } from '../../src/shared/types/worldProjects.ts'
 import type { AssetLibraryListResult } from '../../src/shared/types/assetLibrary.ts'
 import { ASSET_PATHS, UI_ASSET_PATHS, WORLD_SCULPT_ASSET_PATHS, provisionAuthoringInputs, seedAuthoring } from './scene.ts'
-import { runAuthoringInteractions, runUiAuthoredScenes, readView, waitForOwnedWindowFocus, type DriverPorts, type Invocation } from './driver.ts'
+import { runAuthoringInteractions, runUiAuthoredScenes, readView, waitFor, sendNativeInput, waitForOwnedWindowFocus, type CommonDriverPorts, type DriverPorts, type Invocation } from './driver.ts'
 import { runWorldSculptNavigationAcceptance } from './navigation-driver.ts'
-import { CHECK_NAMES, UI_CHECK_NAMES, NAVIGATION_CHECK_NAMES, PROJECT_KEY, SCENE_KEY, SCENE_ID, createWorldSculptPointerLockPermissionPolicy, parseWorldSculptInputContract, type AuthoringView, type Check, type CheckName, type SeedEvidence } from './shared.ts'
+import { planWorldEditorRunCollision } from '../../src/areas/worlds/editor/worldEditorRunCollision.ts'
+import { prepareWorldRuntimeGeometry, loadWorldGeometrySource } from '../../src/areas/worlds/runtime/worldGeometryPreparation.ts'
+import { CHECK_NAMES, UI_CHECK_NAMES, NAVIGATION_CHECK_NAMES, PROJECT_KEY, SCENE_KEY, SCENE_ID, createWorldSculptPointerLockPermissionPolicy, parseWorldSculptInputContract, type AuthoringView, type ReservedEscapeReceipt, type ReservedEscapeState, type Check, type CheckName, type SeedEvidence } from './shared.ts'
 import { AI_CHECK_NAMES, LOCAL_AI_PATH_ADMISSION, LOCAL_AI_SESSION_METHODS, createLocalAiConfig, validateLocalAiConfig, validateRepositoryAdmission, parseReviewedAiModel, localAiBridgeEnvironment, parseOwnedBridgeOrigin, localAiPythonArguments, parseUvicornAddress, isLocalAiRoute, isLocalAiHttpRequest, parseLocalAiModels, parseLocalAiChat } from './shared.ts'
 
 interface Digest { bytes: number; sha256: string }
@@ -42,7 +44,7 @@ interface BuildManifest {
 }
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 const now = () => new Date().toISOString()
-const reviewedRepositoryHead = '416fcfa079aa3e569e8dd460c64c7462fac7850b'
+const reviewedRepositoryHead = 'bdcbd778e28358c1d582503e3202c7d9b649dd1a'
 const reviewedRepositoryBranch = 'codex/worlds-engine'
 const sourceRepositoryRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
 const bundle = realpathSync(__dirname)
@@ -167,6 +169,7 @@ let firstFailure: Error | null = null, currentStage: CheckName | null = null, st
 let currentWindow: BrowserWindow | null = null, server: Server | null = null, isolatedSession: Session | null = null
 let origin = '', indexUrl = '', generation = 0
 let admissionDeadline: ReturnType<typeof setTimeout> | null = null
+let admissionEndsAt = 0
 const ownedChannels: string[] = []
 let rejectFatal!: (reason: Error) => void
 const focusAdmissionAbort = new AbortController()
@@ -737,6 +740,167 @@ async function checkpoint(stage: string, view: AuthoringView, contents: Electron
   return { ...size, pixels }
 }
 
+const reservedEscapeAttempts = new WeakSet<Electron.WebContents>()
+const reservedEscapePolicies = new WeakMap<Electron.WebContents, () => boolean>()
+async function releaseReservedEscape(contents: Electron.WebContents, ports: CommonDriverPorts): Promise<{ view: AuthoringView; receipt: ReservedEscapeReceipt }> {
+  inputGuard(contents)
+  assert.ok(!reservedEscapeAttempts.has(contents), 'Reserved Escape is a one-shot attempt')
+  reservedEscapeAttempts.add(contents)
+  const owner = currentWindow!, ownerGeneration = generation, deadline = Date.now() + 4000
+  const attemptId = `reserved-escape:${ownerGeneration}:${contents.id}`
+  let phase = 'before', downStartedAt = '', receipt: ReservedEscapeReceipt | undefined, before: ReservedEscapeState | undefined
+  let beforeTrace: AuthoringView['trace'] = []
+  const browserMouse: ReservedEscapeReceipt['browserMouse'] = [], domEvents: ReservedEscapeReceipt['domEvents'] = []
+  const dispatches: ReservedEscapeReceipt['dispatches'] = [], browserKeyUps: ReservedEscapeReceipt['browserKeyUps'] = [], interference: string[] = []
+  const disturb = (reason: string) => { if (interference.length < 8) interference.push(reason) }
+  const assertOwner = () => {
+    inputGuard(contents); assert.equal(currentWindow, owner); assert.equal(generation, ownerGeneration)
+    assert.deepEqual(interference, [], 'Competing input/focus/lifecycle event during reserved Escape')
+    assert.ok(Date.now() < deadline, 'Reserved Escape release exceeded 4000 ms')
+    assert.equal(owner.isFullScreen(), false); assert.equal(owner.isSimpleFullScreen(), false)
+    assert.equal(reservedEscapePolicies.get(contents)?.(), true, 'Owned session must deny keyboard lock')
+  }
+  const onKey = (_event: Electron.Event, input: Electron.Input) => {
+    // Exact-version Chromium consumes down before this observer. Never invent that receipt.
+    const {type, key, code, isAutoRepeat, isComposing, shift, control, alt, meta, modifiers} = input
+    const valid = (phase === 'keyUp' || phase === 'await-release') && type === 'keyUp' && key === 'Escape' && code === 'Escape'
+      && isAutoRepeat === false && isComposing === false && shift === false && control === false && alt === false && meta === false
+      && Array.isArray(modifiers) && modifiers.length === 0 && browserKeyUps.length === 0
+    if (!valid) { disturb('unexpected-browser-key'); return }
+    try { assertOwner() } catch { disturb('browser-key-owner-drift'); return }
+    browserKeyUps.push(Object.freeze({ at: now(), attemptId, generation: ownerGeneration, webContentsId: contents.id,
+      input: Object.freeze({type, key, code, isAutoRepeat, isComposing, shift, control, alt, meta, modifiers: Object.freeze([...modifiers])}) }))
+  }
+  const onMouse = (_event: Electron.Event, input: Electron.MouseInputEvent) => {
+    // Electron exposes ONLY these raw fields; observation time/owner/phase are ours, not OS provenance.
+    const raw: Readonly<Record<string, unknown>> = Object.freeze({...input}), at = now()
+    browserMouse.push(Object.freeze({at, sequence: browserMouse.length + 1, phase, attemptId, generation: ownerGeneration, webContentsId: contents.id, input: raw}))
+    try {
+      assertOwner()
+      assert.ok(['keyDown', 'keyUp', 'await-release'].includes(phase) && downStartedAt)
+      // Conservative fixture admission bounds, NOT a Chromium delivery guarantee.
+      assert.ok(browserMouse.length <= 2 && Date.parse(at) >= Date.parse(downStartedAt) && Date.parse(at) - Date.parse(downStartedAt) <= 250)
+      assert.deepEqual(Object.keys(raw).sort(), ['type','clickCount','movementX','movementY','button','globalX','globalY','x','y'].sort())
+      assert.equal(raw.type, 'mouseMove'); assert.equal(raw.button, 'none'); assert.equal(raw.clickCount, 0)
+      assert.equal(raw.movementX, 0); assert.equal(raw.movementY, 0)
+      for (const coordinate of ['globalX','globalY','x','y']) assert.ok(typeof raw[coordinate] === 'number' && Number.isFinite(raw[coordinate]))
+      assert.deepEqual(raw, browserMouse[0].input)
+    } catch { disturb('incompatible-browser-mouse') }
+  }
+  const onBlur = () => disturb('focus-loss')
+  const onDestroyed = () => disturb('renderer-destroyed'), onFullscreen = () => disturb('fullscreen-entered')
+  contents.on('before-input-event', onKey); contents.on('before-mouse-event', onMouse); contents.on('destroyed', onDestroyed)
+  owner.on('blur', onBlur); owner.on('enter-full-screen', onFullscreen); owner.on('enter-html-full-screen', onFullscreen)
+  const state = (view: AuthoringView, document: {focused: boolean; fullscreen: boolean}): ReservedEscapeState => {
+    assertOwner(); assert.ok(view.canvas && view.canvasCount === 1 && !view.canvas.contextLost)
+    assert.deepEqual(view.diagnostics, []); assert.equal(view.untrustedInputs, 0); assert.ok(view.editor.session)
+    assert.equal(document.focused, true); assert.equal(document.fullscreen, false)
+    const held = new Set<string>()
+    for (const event of view.trace) { assert.equal(event.trusted, true); if (event.code && event.type === 'keydown') held.add(event.code); if (event.code && event.type === 'keyup') held.delete(event.code) }
+    assert.equal(held.size, 0, 'Reserved Escape requires all ordinary keys released')
+    const lastMouse = [...view.trace].reverse().find((event) => typeof event.buttons === 'number')
+    if (lastMouse) assert.equal(lastMouse.buttons, 0, 'Reserved Escape requires all mouse buttons released')
+    const session = view.editor.session
+    return { at: view.at, bootId: view.bootId, canvasUuid: view.canvas.canvasUuid, frame: view.canvas.frame,
+      traceSequence: view.trace.at(-1)?.sequence ?? 0, position: [...view.canvas.cameraPose.position], quaternion: [...view.canvas.cameraPose.quaternion],
+      locked: view.navigation.pointerLock.canvasOwned, lockChanges: view.navigation.pointerLock.changes, lockErrors: view.navigation.pointerLock.errors,
+      focused: document.focused, fullscreen: document.fullscreen, heldKeys: [...held], applyCount: applies.length,
+      canonicalSha256: hash(Buffer.from(JSON.stringify({snapshot: session.snapshot, undoStack: session.undoStack, redoStack: session.redoStack, receipts: session.receipts, applyCount: applies.length}))) }
+  }
+  const documentState = async () => {
+    const observed: {focused: boolean; fullscreen: boolean} = await contents.executeJavaScript('({focused: document.hasFocus(), fullscreen: document.fullscreenElement !== null})', false)
+    assertOwner(); return observed
+  }
+  const matches = (view: AuthoringView): boolean => {
+    // Append every new event; retain both the earlier suffix and final raw view if it changes/drops.
+    const observedDom = structuredClone(view.trace.slice(beforeTrace.length)), retainedCount = domEvents.length
+    domEvents.push(...observedDom.slice(retainedCount))
+    ports.record('collider-reserved-escape-view', view)
+    assert.deepEqual(observedDom.slice(0, retainedCount), domEvents.slice(0, retainedCount), 'Previously observed unlock events changed/dropped')
+    assertOwner(); assert.ok(before && view.canvas && !view.canvas.contextLost && view.canvasCount === 1)
+    assert.deepEqual(view.trace.slice(0, beforeTrace.length), beforeTrace, 'Previously observed trace changed')
+    assert.equal(view.bootId, before.bootId); assert.equal(view.canvas.canvasUuid, before.canvasUuid)
+    assert.deepEqual(view.diagnostics, []); assert.equal(view.untrustedInputs, 0)
+    assert.ok(domEvents.length <= 4, 'Restoration DOM event budget exceeded')
+    for (const [index, event] of domEvents.entries()) {
+      assert.equal(event.sequence, before.traceSequence + index + 1); assert.equal(event.type, index % 2 ? 'mousemove' : 'pointermove')
+      assert.equal(event.trusted, true); assert.equal(event.buttons, 0); assert.equal(event.code, null)
+      assert.equal(event.movementX, 0); assert.equal(event.movementY, 0)
+      assert.equal(event.canvasUuid, before.canvasUuid); assert.ok(event.target.startsWith('CANVAS:'))
+      assert.ok(Number.isSafeInteger(event.frame) && event.frame! >= before.frame && event.frame! <= view.canvas.frame)
+      assert.ok(Date.parse(event.at) >= Date.parse(downStartedAt) && Date.parse(event.at) - Date.parse(downStartedAt) <= 250 && Date.parse(event.at) <= Date.parse(view.at))
+      const raw = browserMouse[Math.floor(index / 2)]
+      assert.ok(raw, 'DOM restoration lacks its retained browser observation')
+      assert.ok(Date.parse(event.at) >= Date.parse(raw.at))
+      assert.deepEqual([event.screenX, event.screenY, event.x, event.y], [raw.input.globalX, raw.input.globalY, raw.input.x, raw.input.y])
+      if (index) assert.ok(Date.parse(event.at) >= Date.parse(domEvents[index - 1].at))
+    }
+    const lock = view.navigation.pointerLock
+    assert.equal(lock.errors, before.lockErrors); assert.ok(lock.changes >= before.lockChanges && lock.changes <= before.lockChanges + 1)
+    if (lock.changes === before.lockChanges + 1) assert.equal(lock.canvasOwned, false, 'Lock reacquired during reserved Escape')
+    return domEvents.length === browserMouse.length * 2 && browserMouse.every((event) => Date.parse(event.at) <= Date.parse(view.at))
+      && browserKeyUps.length === 1 && !lock.canvasOwned && lock.changes === before.lockChanges + 1 && view.canvas.frame > before.frame
+  }
+  try {
+    const document = await documentState(), view = await readView(contents)
+    before = state(view, document); beforeTrace = structuredClone(view.trace)
+    assert.ok(before.locked && before.lockChanges > 0 && before.lockErrors === 0)
+    assert.equal(view.navigation.status, 'Fly mode. Pointer locked.'); assert.equal(view.canvas!.controls.orbitEnabled, false)
+    receipt = { schema: 'modly.browser-reserved-escape.v1', attemptId, generation: ownerGeneration, webContentsId: contents.id,
+      keyboardLock: 'denied-by-owned-session-policy', before, dispatches, browserKeyUps,
+      mouseObservation: 'bounded-restoration-compatible-not-origin-proof', browserMouse, domEvents, interference, listenersRemoved: false }
+    ports.record('collider-reserved-escape', structuredClone(receipt))
+    for (const type of ['keyDown', 'keyUp'] as const) {
+      assertOwner(); phase = type
+      const payload = Object.freeze({type, keyCode: 'Escape' as const, modifiers: Object.freeze([] as const)})
+      const startedAt = now(); if (type === 'keyDown') downStartedAt = startedAt
+      // The existing synchronous focused-owner guard still runs immediately before EACH send.
+      sendNativeInput(contents, ports, {...payload, modifiers: [...payload.modifiers]})
+      dispatches.push(Object.freeze({kind: 'DISPATCH', startedAt, returnedAt: now(), payload}))
+    }
+    phase = 'await-release'
+    let released = await waitFor(contents, ports, matches, 'collider-escape-release', Math.max(0, deadline - Date.now()))
+    const documentAfter = await documentState()
+    released = await readView(contents); assert.ok(matches(released), 'Fresh owned release observation required')
+    receipt.unlocked = state(released, documentAfter)
+    assert.equal(receipt.unlocked.canonicalSha256, before.canonicalSha256); assert.equal(receipt.unlocked.applyCount, before.applyCount)
+    return {view: released, receipt}
+  } finally {
+    phase = 'closed'
+    contents.removeListener('before-input-event', onKey); contents.removeListener('before-mouse-event', onMouse); contents.removeListener('destroyed', onDestroyed)
+    owner.removeListener('blur', onBlur); owner.removeListener('enter-full-screen', onFullscreen); owner.removeListener('enter-html-full-screen', onFullscreen)
+    if (receipt) receipt.listenersRemoved = true
+    ports.record('collider-reserved-escape', structuredClone(receipt ?? {attemptId, dispatches, browserKeyUps, browserMouse, domEvents, interference, listenersRemoved: true}))
+  }
+}
+
+async function admitReopenedCanvas(contents: Electron.WebContents, view: AuthoringView, previousBoot: string): Promise<void> {
+  guard(contents)
+  const admittedGeneration = generation
+  assert.ok(admissionDeadline && Date.now() < admissionEndsAt, 'Current Canvas admission is absent or expired')
+  const current = await readView(contents)
+  guard(contents)
+  assert.equal(generation, admittedGeneration, 'Canvas admission generation changed during observation')
+  assert.ok(previousBoot && view.bootId && view.bootId !== previousBoot, 'Canvas admission requires a fresh renderer boot')
+  assert.equal(current.bootId, view.bootId, 'Stale renderer boot cannot admit the current generation')
+  for (const observed of [view, current]) {
+    assert.deepEqual(observed.environment, { sandboxed: true, contextIsolated: true })
+    assert.deepEqual(observed.nodeGlobals, { require: 'undefined', process: 'undefined' })
+    assert.deepEqual(observed.diagnostics, []); assert.equal(observed.untrustedInputs, 0)
+    assert.ok(observed.hostSetupComplete && observed.editor.lifecycle === 'ready' && observed.editor.session)
+    assert.ok(observed.canvasCount === 1 && observed.canvas && observed.canvas.canvasUuid && observed.canvas.contextLost === false
+      && Number.isSafeInteger(observed.canvas.frame) && observed.canvas.frame > 1
+      && observed.canvas.drawingBuffer.length === 2 && observed.canvas.drawingBuffer.every((value) => Number.isFinite(value) && value > 0), 'Positive real rendered Canvas required')
+  }
+  assert.equal(current.canvas!.canvasUuid, view.canvas!.canvasUuid, 'Stale Canvas cannot admit the current generation')
+  assert.ok(current.canvas!.frame >= view.canvas!.frame && Date.now() < admissionEndsAt, 'Canvas admission is stale or expired')
+  clearTimeout(admissionDeadline!); admissionDeadline = null
+  evidence[`renderer-canvas-admission-${admittedGeneration}`] = { at: now(), generation: admittedGeneration,
+    webContentsId: contents.id, previousBoot, bootId: current.bootId, canvasUuid: current.canvas!.canvasUuid,
+    observedAt: current.at, frame: current.canvas!.frame, drawingBuffer: current.canvas!.drawingBuffer,
+    environment: current.environment, nodeGlobals: current.nodeGlobals, admissionDeadlineRetired: true }
+}
+
 async function openWindow(): Promise<Electron.WebContents> {
   if (currentWindow) {
     const previous = currentWindow, previousGeneration = generation; currentWindow = null
@@ -751,7 +915,7 @@ async function openWindow(): Promise<Electron.WebContents> {
   const windowGeneration = generation
   if (firstFailure || stopping) throw firstFailure ?? new Error('Stopped before renderer creation')
   if (admissionDeadline) clearTimeout(admissionDeadline)
-  const rendererAdmissionEndsAt = Date.now() + 8000
+  const rendererAdmissionEndsAt = admissionEndsAt = Date.now() + 8000
   admissionDeadline = setTimeout(() => fail(new Error(`Renderer ${windowGeneration} failed positive Canvas admission within 8 seconds of window creation`)), 8000)
   isolatedSession = session.fromPartition(`worlds-authoring-${path.basename(bundle)}-${generation}`)
   const allowed = new Set(Object.keys(build.outputs).filter((name) => name.startsWith('renderer/')).map((name) => `${origin}/${name.slice('renderer/'.length)}`))
@@ -777,6 +941,7 @@ async function openWindow(): Promise<Electron.WebContents> {
     webPreferences: { preload: path.join(bundle, 'preload.cjs'), session: isolatedSession, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
   })
   currentWindow = window
+  reservedEscapePolicies.set(window.webContents, () => !pointerLockPermissionPolicy.check(window.webContents, 'keyboardLock', origin, {isMainFrame: true, requestingUrl: indexUrl}))
   recordLifecycle('created', windowGeneration)
   window.webContents.setWindowOpenHandler(() => { fail(new Error('Unexpected window-open request')); return { action: 'deny' } })
   window.webContents.on('will-navigate', (event, url) => { if (url !== indexUrl) { event.preventDefault(); fail(new Error(`Unexpected navigation ${url}`)) } })
@@ -934,6 +1099,33 @@ async function run(): Promise<void> {
       assert.ok(servedEntry)
       await runWorldSculptNavigationAcceptance(currentWindow.webContents, {
         ...ports,
+        admitReopened: admitReopenedCanvas,
+        releaseReservedEscape: (contents) => releaseReservedEscape(contents, ports),
+        async collisionGeometry(view) {
+          guard()
+          assert.ok(view.editor.session && view.editor.activeSceneId)
+          const planned = planWorldEditorRunCollision(view.editor.session.snapshot, view.editor.activeSceneId)
+          assert.ok(planned.success, 'Actual canonical Run geometry plan failed')
+          const prepared = await prepareWorldRuntimeGeometry(planned.plan, { apiUrl: origin, loadModelGeometry: loadWorldGeometrySource }, AbortSignal.timeout(4000))
+          guard(); assert.ok(prepared.success, 'Actual source-backed collision geometry preparation failed')
+          return prepared.projection.physics.bodies.flatMap((body) => body.colliders.map((collider) => {
+            assert.equal(collider.shape.kind, 'trimesh')
+            if (collider.shape.kind !== 'trimesh') throw new Error('Native Run fixture requires source-backed mesh geometry')
+            assert.deepEqual(body.rotation, [0, 0, 0, 1], 'Fixture geometry must stay axis aligned')
+            const entity = view.editor.session!.snapshot.scenes.flatMap((scene) => scene.entities).find((entity) => entity.id === body.entityId)!
+            const component = entity.components.find((component) => component.id === collider.componentId)
+            assert.ok(component?.type === 'collider' && component.shape === 'mesh')
+            const axes = [0, 1, 2].map((axis) => Array.from(collider.shape.kind === 'trimesh' ? collider.shape.vertices : []).filter((_, index) => index % 3 === axis).map((value) => value + body.position[axis]))
+            return { entityId: body.entityId, componentId: collider.componentId, resourceId: component.resourceId,
+              min: axes.map((values) => Math.min(...values)), max: axes.map((values) => Math.max(...values)),
+              vertices: collider.shape.vertices.length / 3, triangles: collider.shape.indices.length / 3 }
+          }))
+        },
+        async captureCollider(stage, view, contents) {
+          await checkpoint(stage, view, contents)
+          const bytes = await readFile(path.join(runDirectory, `${stage}.png`))
+          return { filename: `${stage}.png`, bytes: bytes.length, sha256: hash(bytes) }
+        },
         source: {
           bytes: worldSculptInput.sourceIdentity.bytes,
           sourceSha256: worldSculptInput.sourceIdentity.sha256,

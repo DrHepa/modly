@@ -311,7 +311,7 @@ export const CHECK_NAMES = [
 ] as const
 export const UI_CHECK_NAMES = ['native-ui-project-and-both-scenes', 'native-numeric-authoring', 'native-both-scenes-reopen'] as const
 export const AI_CHECK_NAMES = ['actual-model-discovery', 'actual-ai-camera-auto-apply-and-history', 'actual-ai-camera-reopen'] as const
-export const NAVIGATION_CHECK_NAMES = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation'] as const
+export const NAVIGATION_CHECK_NAMES = ['native-worldsculpt-library-add', 'native-inspect-orbit', 'native-fly-pointer-lock', 'native-run-ground-only', 'native-navigation-document-isolation', 'native-collider-authoring', 'native-collider-ground-wall-slide', 'native-collider-jump-handoff', 'native-collider-reopen'] as const
 export type CheckName = typeof CHECK_NAMES[number] | typeof UI_CHECK_NAMES[number] | typeof AI_CHECK_NAMES[number] | typeof NAVIGATION_CHECK_NAMES[number]
 export interface Check { name: CheckName; status: 'UNREACHED' | 'PASS' | 'FAIL'; reason?: string }
 export interface Rect { x: number; y: number; width: number; height: number }
@@ -350,6 +350,7 @@ export interface CanvasObservation {
 }
 export interface NativeTrace {
   sequence: number; at: string; type: string; trusted: boolean; x: number | null; y: number | null
+  screenX: number | null; screenY: number | null
   buttons: number | null; movementX: number | null; movementY: number | null; code: string | null
   target: string; canvasUuid: string | null; frame: number | null
 }
@@ -448,4 +449,42 @@ declare global {
     readonly worldsAuthoringEnvironment: Readonly<{ sandboxed: boolean; contextIsolated: boolean }>
     readonly worldsAuthoringObserve: () => AuthoringView
   }
+}
+
+// Geometric observations only: the renderer does not expose Worker grounded state.
+export interface ColliderRunSample {
+  phase: 'staging' | 'descent' | 'ground' | 'approach' | 'contact' | 'slide' | 'jump' | 'runExit' | 'flyEnter' | 'flyMove' | 'inspect'
+  at: string; bootId: string; frame: number; traceSequence: number
+  position: [number, number, number]; quaternion: [number, number, number, number]
+  status: string | null; groundOnly: boolean; locked: boolean; lockChanges: number; lockErrors: number; orbit: boolean | null
+  canonicalSha256: string; applyCount: number
+}
+export interface ColliderRunGeometry {
+  entityId: string; componentId: string; resourceId: string
+  min: number[]; max: number[]; vertices: number; triangles: number
+}
+export interface ColliderRunScreenshot { filename: string; bytes: number; sha256: string }
+
+// Browser-reserved Escape proves dispatch + released-key ingress + owned lock transition,
+// not consumed-down ingress or a physical OS keystroke.
+export interface ReservedEscapeState {
+  at: string; bootId: string; canvasUuid: string; frame: number; traceSequence: number
+  position: number[]; quaternion: number[]; locked: boolean; lockChanges: number; lockErrors: number
+  focused: boolean; fullscreen: boolean; heldKeys: string[]; canonicalSha256: string; applyCount: number
+}
+export interface ReservedEscapeReceipt {
+  schema: 'modly.browser-reserved-escape.v1'; attemptId: string; generation: number; webContentsId: number
+  keyboardLock: 'denied-by-owned-session-policy'
+  before: ReservedEscapeState
+  dispatches: Readonly<{ kind: 'DISPATCH'; startedAt: string; returnedAt: string;
+    payload: Readonly<{ type: 'keyDown' | 'keyUp'; keyCode: 'Escape'; modifiers: readonly string[] }> }>[]
+  browserKeyUps: Readonly<{ at: string; attemptId: string; generation: number; webContentsId: number;
+    input: Readonly<{ type: string; key: string; code: string; isAutoRepeat: boolean; isComposing: boolean;
+      shift: boolean; control: boolean; alt: boolean; meta: boolean; modifiers: readonly string[] }> }>[]
+  // These fixture admission bounds classify matching public observations, never input origin.
+  mouseObservation: 'bounded-restoration-compatible-not-origin-proof'
+  browserMouse: Readonly<{ at: string; sequence: number; phase: string; attemptId: string; generation: number; webContentsId: number;
+    input: Readonly<Record<string, unknown>> }>[]
+  domEvents: NativeTrace[]
+  unlocked?: ReservedEscapeState; interference: string[]; listenersRemoved: boolean
 }

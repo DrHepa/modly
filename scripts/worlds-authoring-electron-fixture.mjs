@@ -200,7 +200,7 @@ export async function buildWorldsAuthoringFixture(nativeMode = 'owned-xvfb', loc
   }
   try {
     initialHead = git(['rev-parse', 'HEAD']).trim(); initialBranch = git(['branch', '--show-current']).trim()
-    if (initialHead !== '416fcfa079aa3e569e8dd460c64c7462fac7850b' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
+    if (initialHead !== 'bdcbd778e28358c1d582503e3202c7d9b649dd1a' || initialBranch !== 'codex/worlds-engine') throw new Error('This reviewed fixture is pinned to the canonical source lane; re-review before rebuilding elsewhere')
     const worldSculpt = worldSculptSource ? await readWorldSculptBuildInput(worldSculptSource.path, worldSculptSource.sha256) : null
     if (worldSculpt) {
       const bundledPath = path.join(outputDirectory, WORLD_SCULPT_BUNDLED_RELATIVE_PATH)

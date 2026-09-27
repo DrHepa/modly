@@ -12,7 +12,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import * as THREE from 'three'
 
 import type { WorldSceneItem } from '../worldRenderableResolver.ts'
-import { normalizeWorldSceneCollisionSurfaces } from '../worldCameraNavigation.ts'
+import { normalizeWorldSceneCollisionSurfaces, WORLD_RUN_GROUND_FALLBACK_LABEL } from '../worldCameraNavigation.ts'
 import { createWorldCollisionSurfacePreset } from '../worldsCollisionSurfaces.ts'
 import { createWorldEditorTransformAdmission } from '../editor/worldEditorTransformAdmission.ts'
 import { createWorldEditorController } from '../editor/worldEditorController.ts'
@@ -23,6 +23,8 @@ import type { WorldProjectSnapshotV1 } from '../core/worldModel.ts'
 import { applyWorldCommandBatch } from '../core/worldCommands.ts'
 import type { WorldProjectCommandRequest } from '../../../shared/types/worldProjects.ts'
 import type { WorldsCameraFitSnapshot } from './WorldsViewer.tsx'
+import { createRuntimeWorldSnapshot } from '../runtime/_testFixtures.ts'
+import type { WorldEditorRunCollisionInput } from '../editor/worldEditorRunCollision.ts'
 
 const require = createRequire(import.meta.url)
 const React = require('react') as typeof import('react')
@@ -126,6 +128,7 @@ async function loadModeControlModule() {
 
 type NavigationControlsTestModule = {
   WorldsViewportNavigationControls: ComponentType<{
+    runCollisionInput?: WorldEditorRunCollisionInput
     mode: 'inspect' | 'fly' | 'run'
     collisionSurfaces: readonly unknown[]
     inputScopeRef: { current: HTMLElement }
@@ -695,6 +698,26 @@ async function mountedAnchorBridge(options: { holdTransformApply?: boolean } = {
     },
   }
 }
+
+test('mounted canonical bridge gives Run a read-only revision and Play-intent lease', async () => {
+  const rig = await mountedAnchorBridge()
+  try {
+    const input = rig.bridge.viewerProps.runCollisionInput
+    assert.ok(input)
+    assert.equal(input.snapshot, rig.controller.getState().session?.snapshot)
+    assert.equal(input.sceneId, rig.controller.getState().activeSceneId)
+    assert.equal(input.isCurrent(), true)
+    const next = structuredClone(input.snapshot)
+    next.project.revision++
+    await rig.publish(next)
+    assert.equal(input.isCurrent(), false)
+    const current = rig.bridge.viewerProps.runCollisionInput!
+    assert.equal(current.isCurrent(), true)
+    rig.authority.revoke()
+    assert.equal(current.isCurrent(), false)
+    assert.equal(rig.requests.length, 0)
+  } finally { await rig.cleanup() }
+})
 
 test('mounted actual editor bridge keeps captured C pending without a false-stale alert until its held dispatch settles', async (t) => {
   const rig = await mountedAnchorBridge({ holdTransformApply: true })
@@ -1739,6 +1762,115 @@ test('mounted viewport key bubbling leaves native interactive controls in contro
     host.render(null)
     await cleanup()
   }
+})
+
+test('mounted canonical Run consumes only current Worker camera poses and terminates on pointer, mode, revision and Play boundaries', async () => {
+  const { module, cleanup } = await loadNavigationControlsModule()
+  const previousWorker = Object.getOwnPropertyDescriptor(globalThis, 'Worker')
+  const workers: NavigationWorker[] = []
+  // Transport/lifecycle proof only. Real KCC behavior is tested in worldRapierRuntime.test.ts.
+  class NavigationWorker {
+    messages: Record<string, any>[] = []
+    listeners = new Set<(event: { data: unknown }) => void>()
+    terminated = false
+    constructor() { workers.push(this) }
+    postMessage(message: Record<string, any>) { this.messages.push(message) }
+    addEventListener(type: string, callback: (event: { data: unknown }) => void) { if (type === 'message') this.listeners.add(callback) }
+    removeEventListener(type: string, callback: (event: { data: unknown }) => void) { if (type === 'message') this.listeners.delete(callback) }
+    terminate() { this.terminated = true }
+    emit(data: unknown) { for (const callback of this.listeners) callback({ data }) }
+  }
+  Object.defineProperty(globalThis, 'Worker', { configurable: true, value: NavigationWorker })
+  const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve() }
+  try {
+    for (const boundary of ['pointer', 'fly', 'inspect', 'revision', 'play', 'unmount']) {
+      const host = mounted()
+      const dom = createNavigationTestDom()
+      const camera = new THREE.PerspectiveCamera()
+      camera.position.set(0, 3, 6)
+      camera.quaternion.setFromEuler(new THREE.Euler(0.25, 0.6, 0.4, 'YXZ'))
+      const snapshot = createRuntimeWorldSnapshot()
+      const before = structuredClone(snapshot)
+      let current = true
+      const statuses: string[] = []
+      const runCollisionInput = { snapshot, sceneId: 'scene:one', apiUrl: '', isCurrent: () => current }
+      const props = { mode: 'run' as const, collisionSurfaces: [], runCollisionInput,
+        inputScopeRef: { current: dom.scope as unknown as HTMLElement }, orbitControlsRef: { current: null }, frameSceneToken: 0,
+        onModeChange: () => {}, onPointerLockChange: () => {}, onStatusChange: (status: string) => { statuses.push(status) } }
+      module.configureNavigationTestThree({ camera, gl: { domElement: dom.canvas } })
+      host.render(createElement(module.WorldsViewportNavigationControls, { ...props, mode: 'fly' }))
+      dom.canvas.emit('pointerdown', { button: 0 })
+      module.advanceNavigationTestFrame(1 / 60)
+      assert.ok(Math.abs(new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ').z - 0.4) < 1e-6, 'Fly must retain its roll')
+      host.render(createElement(module.WorldsViewportNavigationControls, props))
+      module.advanceNavigationTestFrame(1 / 60)
+      assert.deepEqual(camera.position.toArray(), [0, 3, 6])
+      assert.equal(statuses.at(-1), 'Run mode. Preparing collisions…')
+      const preparingLook = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ')
+      assert.ok(Math.abs(preparingLook.z) < 1e-6, 'Preparing Run must level Fly roll')
+      assert.ok(Math.abs(preparingLook.x - 0.25) < 1e-6 && Math.abs(preparingLook.y - 0.6) < 1e-6, 'Run must retain pitch and yaw')
+      await flush()
+      const worker = workers.at(-1)!
+      const generationId = worker.messages[0].generationId
+      assert.ok(worker.messages[0].navigation)
+      assert.ok(worker.messages[0].scene.bodies.every((body: any) => body.bodyType === 'fixed' && !body.controller))
+      worker.emit({ version: 1, kind: 'ready', generationId, entityIds: [] }); await flush()
+      module.advanceNavigationTestFrame(1 / 60)
+      worker.emit({ version: 1, kind: 'navigation-pose', generationId, sequence: 1, position: [0, 1.66, 5.95], grounded: true, recovered: false })
+      module.advanceNavigationTestFrame(1 / 60)
+      assert.deepEqual(camera.position.toArray(), [0, 1.66, 5.95])
+      assert.equal(statuses.at(-1), 'Run mode. Collider-backed.')
+      assert.ok(Math.abs(new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ').z) < 1e-6, 'Ready Run must remain level')
+      if (boundary === 'pointer') dom.ownerDocument.exitPointerLock()
+      else if (boundary === 'unmount') host.render(null)
+      else if (boundary === 'fly' || boundary === 'inspect') host.render(createElement(module.WorldsViewportNavigationControls, { ...props, mode: boundary }))
+      else { current = false; module.advanceNavigationTestFrame(1 / 60) }
+      assert.equal(worker.terminated, true, boundary)
+      const position = camera.position.toArray()
+      worker.emit({ version: 1, kind: 'navigation-pose', generationId, sequence: 2, position: [99, 99, 99], grounded: true, recovered: false })
+      assert.deepEqual(camera.position.toArray(), position)
+      assert.deepEqual(snapshot, before)
+      host.render(null)
+    }
+  } finally {
+    if (previousWorker) Object.defineProperty(globalThis, 'Worker', previousWorker)
+    else Reflect.deleteProperty(globalThis, 'Worker')
+    await cleanup()
+  }
+})
+
+test('mounted empty canonical Run levels Fly roll and delivers its visible Ground-only toolbar badge', async () => {
+  const controls = await loadNavigationControlsModule()
+  const toolbar = await loadModeControlModule()
+  const host = mounted()
+  const toolbarHost = mounted()
+  const dom = createNavigationTestDom()
+  const camera = new THREE.PerspectiveCamera()
+  camera.position.set(0, 3, 6)
+  camera.quaternion.setFromEuler(new THREE.Euler(0.25, 0.6, 0.4, 'YXZ'))
+  const statuses: string[] = []
+  const props = {
+    collisionSurfaces: [], inputScopeRef: { current: dom.scope as unknown as HTMLElement }, orbitControlsRef: { current: null }, frameSceneToken: 0,
+    runCollisionInput: { snapshot: createRuntimeWorldSnapshot(), sceneId: 'scene:two', apiUrl: '', isCurrent: () => true },
+    onModeChange: () => {}, onPointerLockChange: () => {}, onStatusChange: (status: string) => { statuses.push(status) },
+  }
+  controls.module.configureNavigationTestThree({ camera, gl: { domElement: dom.canvas } })
+  try {
+    host.render(createElement(controls.module.WorldsViewportNavigationControls, { ...props, mode: 'fly' }))
+    dom.canvas.emit('pointerdown', { button: 0 })
+    controls.module.advanceNavigationTestFrame(1 / 60)
+    assert.ok(Math.abs(new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ').z - 0.4) < 1e-6)
+    host.render(createElement(controls.module.WorldsViewportNavigationControls, { ...props, mode: 'run' }))
+    controls.module.advanceNavigationTestFrame(1 / 60)
+    const status = statuses.at(-1)!
+    toolbarHost.render(createElement(toolbar.module.WorldsViewportModeControl, { mode: 'run', status, pointerLocked: true, onModeChange: () => {}, onFrameScene: () => {} }))
+    assert.ok(findHost(toolbarHost.container, node => node.type === 'span' && node.props['aria-hidden'] === 'true'), 'Actual Run status must show the visible Ground-only badge')
+    assert.equal(status, `Run mode. ${WORLD_RUN_GROUND_FALLBACK_LABEL}.`)
+    assert.equal(WORLD_RUN_GROUND_FALLBACK_LABEL, 'Ground-only fallback — no eligible colliders')
+    const look = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ')
+    assert.ok(Math.abs(look.z) < 1e-6, 'Empty Run must level Fly roll')
+    assert.ok(Math.abs(look.x - 0.25) < 1e-6 && Math.abs(look.y - 0.6) < 1e-6, 'Empty Run must retain pitch/yaw')
+  } finally { host.render(null); toolbarHost.render(null); await controls.cleanup(); await toolbar.cleanup() }
 })
 
 test('WorldsViewer retires drag-look and enables Orbit rotation only for Inspect', async () => {
@@ -3491,7 +3623,7 @@ test('WorldsViewportModeControl renders radio modes with visible labels and fram
 
     const fallbackMarkup = renderToStaticMarkup(createElement(module.WorldsViewportModeControl, {
       mode: 'run',
-      status: 'Run mode. Ground-only fallback — no editor-navigation surfaces.',
+      status: `Run mode. ${WORLD_RUN_GROUND_FALLBACK_LABEL}.`,
       pointerLocked: true,
       onModeChange: () => undefined,
       onFrameScene: () => undefined,

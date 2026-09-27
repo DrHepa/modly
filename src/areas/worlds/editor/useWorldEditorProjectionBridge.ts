@@ -21,6 +21,7 @@ import { buildWorldTreeMutationCommands, isWorldEntityEffectivelyLocked } from '
 import { createWorldUiTransactionId } from './useWorldEditorController.ts'
 import type { WorldEditorTransformAdmission, WorldEditorTransformGesture } from './worldEditorTransformAdmission.ts'
 import { createWorldWorkspaceUrl } from '../worldWorkspaceUrl.ts'
+import type { WorldEditorRunCollisionInput } from './worldEditorRunCollision.ts'
 
 export { createWorldWorkspaceUrl } from '../worldWorkspaceUrl.ts'
 
@@ -320,6 +321,19 @@ export function useWorldEditorProjectionBridge({
     return projectWorldEditorViewport(state.session.snapshot, state.activeSceneId, apiUrl)
   }, [apiUrl, projectionEpoch, state.activeSceneId, state.session])
   const projection = projected?.success ? projected.value : null
+  const runCollisionInput = useMemo<WorldEditorRunCollisionInput | undefined>(() => {
+    if (!state.session || !state.activeSceneId) return undefined
+    const snapshot = state.session.snapshot
+    const sceneId = state.activeSceneId
+    const projectKey = state.projectKey
+    const editorEpoch = state.editorEpoch
+    return { snapshot, sceneId, apiUrl, isCurrent: () => {
+      const current = controller.getState()
+      return viewportCommitAuthority.isCurrent(viewportCommitLease) && current.lifecycle === 'ready'
+        && current.projectKey === projectKey && current.editorEpoch === editorEpoch && current.activeSceneId === sceneId
+        && current.session?.snapshot.project.revision === snapshot.project.revision
+    } }
+  }, [apiUrl, controller, state.activeSceneId, state.editorEpoch, state.projectKey, state.session, viewportCommitAuthority, viewportCommitLease])
   const issues = projected && !projected.success ? projected.issues.map((issue) => issue.message) : []
 
   const syncLegacyProjection = useCallback((value: WorldEditorViewportProjection | null) => {
@@ -471,6 +485,7 @@ export function useWorldEditorProjectionBridge({
       project: state.session?.snapshot.project ?? { schema: 'modly.world-project.v1', projectId: 'project:unavailable', name: 'Unavailable', revision: 0, resources: [], scenes: [], startSceneId: 'scene:unavailable', inputActions: [], graphicsProfiles: [{ id: 'graphics:unavailable', name: 'Unavailable', renderScale: 1, shadowQuality: 'off', antialiasing: 'off' }], activeGraphicsProfileId: 'graphics:unavailable' },
       items: projection?.items ?? [],
       collisionSurfaces: projection?.collisionSurfaces ?? [],
+      runCollisionInput,
       initialView: projection?.initialView ?? undefined,
       environment: projection?.environment,
       lights: projection?.lights ?? [],

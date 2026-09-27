@@ -64,6 +64,7 @@ export type WorldsViewerUnsupportedItem = {
 }
 
 export interface WorldsViewerProps {
+  runCollisionInput?: import('../editor/worldEditorRunCollision.ts').WorldEditorRunCollisionInput
   project: WorldProjectDocumentV1
   onGraphicsFailure?: (failure: WorldViewportFailure) => void
   onGraphicsDiagnostic?: (message: string) => void
@@ -270,6 +271,7 @@ export function WorldsViewer({
   showAuthoringToolbar = true,
   timelinePreview = null,
   collisionSurfaces = [],
+  runCollisionInput,
   unsupportedItems = [],
   selectedItemId = null,
   selectedItemIds = [],
@@ -620,6 +622,7 @@ export function WorldsViewer({
           enabled={inspectAuthoringEnabled}
         />
         {editorControlsVisible ? <WorldsViewportNavigationControls
+          runCollisionInput={runCollisionInput}
           mode={controlMode}
           collisionSurfaces={resolvedCollisionSurfaces}
           inputScopeRef={inputScopeRef}

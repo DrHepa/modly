@@ -8,6 +8,11 @@ import {
   parseWorldPhysicsMainMessage,
   WORLD_PHYSICS_PROTOCOL_VERSION,
   WORLD_PHYSICS_TRANSFORM_STRIDE,
+  WORLD_NAVIGATION_COLLISION_LAYER,
+  WORLD_NAVIGATION_COLLISION_MASK,
+  WORLD_NAVIGATION_EYE_OFFSET,
+  type WorldPhysicsNavigationInit,
+  type WorldPhysicsNavigationStep,
   type WorldPhysicsBodyDto,
   type WorldPhysicsCharacterInput,
   type WorldPhysicsColliderDto,
@@ -52,6 +57,17 @@ let colliderMetadata = new Map<number, RuntimeColliderMetadata>()
 let paused = false
 let timingEnabled = false
 let lastTimingSequence = -1
+let navigation: {
+  body: RAPIER_TYPES.RigidBody
+  collider: RAPIER_TYPES.Collider
+  controller: RAPIER_TYPES.KinematicCharacterController
+  frontSurfaces: Map<number, WorldPhysicsNavigationInit['frontSurfaces'][number]>
+  velocityY: number
+  grounded: boolean
+  lastSafe: RAPIER_TYPES.Vector
+  sequence: number
+} | null = null
+const NAVIGATION_GROUPS = ((WORLD_NAVIGATION_COLLISION_LAYER * 0x10000) + WORLD_NAVIGATION_COLLISION_MASK) >>> 0
 
 scope.addEventListener('message', (event: MessageEvent<unknown>) => {
   const parsed = parseWorldPhysicsMainMessage(event.data)
@@ -66,9 +82,9 @@ scope.addEventListener('message', (event: MessageEvent<unknown>) => {
       return
     }
     initializingGenerationId = message.generationId
-    void initialize(message.generationId, message.scene, message.diagnostics)
+    void initialize(message.generationId, message.scene, message.diagnostics, message.navigation)
       .catch((error) => {
-        disposeWorld()
+        try { disposeWorld() } catch { /* A failed WASM query can also reject cleanup; preserve its original error. */ }
         postError('physics-init-failed', error instanceof Error ? error.message : 'Rapier initialization failed.', message.generationId)
       })
       .finally(() => {
@@ -81,7 +97,12 @@ scope.addEventListener('message', (event: MessageEvent<unknown>) => {
     if (message.kind === 'pause') paused = true
     else if (message.kind === 'resume') paused = false
     else if (message.kind === 'dispose') disposeWorld()
+    else if (message.kind === 'navigation-step' && !paused) {
+      if (!navigation) throw new Error('Navigation requests require a navigation world.')
+      stepNavigation(message.sequence, message.steps)
+    }
     else if (message.kind === 'step' && !paused) {
+      if (navigation) throw new Error('Navigation worlds do not execute Play steps.')
       if (timingEnabled && message.sequence <= lastTimingSequence) throw new Error('Diagnostic step sequences must increase within a generation.')
       if (timingEnabled) lastTimingSequence = message.sequence
       stepWorld(message.sequence, message.steps)
@@ -91,19 +112,116 @@ scope.addEventListener('message', (event: MessageEvent<unknown>) => {
   }
 })
 
-async function initialize(nextGenerationId: number, scene: Parameters<typeof createWorld>[0], diagnostics?: true): Promise<void> {
+async function initialize(nextGenerationId: number, scene: Parameters<typeof createWorld>[0], diagnostics?: true, probe?: WorldPhysicsNavigationInit): Promise<void> {
   RAPIER = await loadRapier()
   disposeWorld()
   generationId = nextGenerationId
   timingEnabled = diagnostics === true
   paused = false
   createWorld(scene)
+  if (probe) createNavigation(probe)
   scope.postMessage({
     version: WORLD_PHYSICS_PROTOCOL_VERSION,
     kind: 'ready',
     generationId,
     entityIds: bodies.map((runtime) => runtime.dto.entityId),
   })
+}
+
+function createNavigation(probe: WorldPhysicsNavigationInit): void {
+  const body = world!.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(probe.position[0], probe.position[1] - WORLD_NAVIGATION_EYE_OFFSET, probe.position[2]))
+  const collider = world!.createCollider(RAPIER.ColliderDesc.capsule(0.6, 0.3).setCollisionGroups(NAVIGATION_GROUPS), body)
+  const controller = world!.createCharacterController(0.01)
+  controller.setMaxSlopeClimbAngle(Math.PI / 4)
+  controller.setMinSlopeSlideAngle(Math.PI / 4)
+  controller.enableSnapToGround(0.15)
+  controller.setApplyImpulsesToDynamicBodies(false)
+  const frontsById = new Map(probe.frontSurfaces.map(surface => [surface.componentId, surface]))
+  const frontSurfaces = new Map<number, WorldPhysicsNavigationInit['frontSurfaces'][number]>()
+  for (const runtime of bodies) for (let index = 0; index < runtime.body.numColliders(); index++) {
+    const obstacle = runtime.body.collider(index)
+    const front = frontsById.get(runtime.dto.colliders[index]?.componentId)
+    if (front) frontSurfaces.set(obstacle.handle, front)
+  }
+  navigation = { body, collider, controller, frontSurfaces, velocityY: 0, grounded: false, lastSafe: body.translation(), sequence: -1 }
+  // Populate Rapier's spatial queries; every authored body is fixed in this mode.
+  world!.step(eventQueue!)
+  eventQueue!.drainCollisionEvents(() => {})
+  depenetrateNavigation()
+  const position = body.translation()
+  const groundProbe = { x: 0, y: -0.02, z: 0 }
+  controller.computeColliderMovement(collider, groundProbe, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, NAVIGATION_GROUPS, obstacle => acceptsNavigationObstacle(obstacle, position, groundProbe))
+  navigation.grounded = controller.computedGrounded()
+  navigation.lastSafe = body.translation()
+}
+
+function acceptsNavigationObstacle(obstacle: RAPIER_TYPES.Collider, position: RAPIER_TYPES.Vector, movement?: RAPIER_TYPES.Vector): boolean {
+  const probe = navigation!
+  if (obstacle.handle === probe.collider.handle) return false
+  const front = probe.frontSurfaces.get(obstacle.handle)
+  if (!front) return true
+  const [x, y, z] = front.normal
+  // Back-to-front passage remains nonblocking until the entire crossing finishes.
+  return (position.x - front.point[0]) * x + (position.y - front.point[1]) * y + (position.z - front.point[2]) * z >= -1e-5
+    && (!movement || movement.x * x + movement.y * y + movement.z * z <= 1e-8)
+}
+
+function depenetrateNavigation(): void {
+  const probe = navigation!
+  for (let iteration = 0; iteration < 8; iteration++) {
+    let deepest: RAPIER_TYPES.ShapeContact | null = null
+    const overlaps: RAPIER_TYPES.Collider[] = []
+    const position = probe.body.translation()
+    world!.intersectionsWithShape(position, probe.body.rotation(), probe.collider.shape, obstacle => {
+      overlaps.push(obstacle)
+      return true
+    }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, NAVIGATION_GROUPS, probe.collider, probe.body, obstacle => acceptsNavigationObstacle(obstacle, position))
+    // Do not re-enter a WASM contact query from its spatial-query callback.
+    for (const obstacle of overlaps) {
+      const contact = obstacle.contactCollider(probe.collider, 0)
+      if (contact && contact.distance < -1e-5 && (!deepest || contact.distance < deepest.distance)) deepest = contact
+    }
+    const contact = deepest as RAPIER_TYPES.ShapeContact | null
+    if (!contact) return
+    if (contact.distance < -2) throw new Error('Run starts too deeply inside a collider.')
+    const current = probe.body.translation()
+    const distance = -contact.distance + 0.011
+    probe.body.setTranslation({ x: current.x + contact.normal1.x * distance, y: current.y + contact.normal1.y * distance, z: current.z + contact.normal1.z * distance }, true)
+    world!.propagateModifiedBodyPositionsToColliders()
+  }
+  throw new Error('Run could not find a non-overlapping camera position.')
+}
+
+function stepNavigation(sequence: number, steps: WorldPhysicsNavigationStep[]): void {
+  const probe = navigation!
+  if (sequence <= probe.sequence) throw new Error('Navigation sequences must increase.')
+  probe.sequence = sequence
+  let recovered = false
+  for (const input of steps) {
+    if (input.jumpPressed && probe.grounded) { probe.velocityY = 4.4; probe.grounded = false }
+    probe.velocityY = Math.max(-32, probe.velocityY - 9.81 * WORLD_FIXED_STEP_SECONDS)
+    const speed = input.boost ? 6 : 3
+    const desired = { x: input.move[0] * speed * WORLD_FIXED_STEP_SECONDS, y: probe.velocityY * WORLD_FIXED_STEP_SECONDS, z: input.move[1] * speed * WORLD_FIXED_STEP_SECONDS }
+    const position = probe.body.translation()
+    probe.controller.computeColliderMovement(probe.collider, desired, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, NAVIGATION_GROUPS, obstacle => acceptsNavigationObstacle(obstacle, position, desired))
+    const movement = probe.controller.computedMovement()
+    probe.velocityY = correctCharacterVerticalVelocity(probe.controller, probe.velocityY, desired.y, movement.y)
+    probe.body.setNextKinematicTranslation({ x: position.x + movement.x, y: position.y + movement.y, z: position.z + movement.z })
+    world!.step(eventQueue!)
+    eventQueue!.drainCollisionEvents(() => {})
+    probe.grounded = probe.controller.computedGrounded()
+    if (probe.grounded) probe.lastSafe = probe.body.translation()
+    if (probe.body.translation().y < -40) {
+      probe.body.setTranslation(probe.lastSafe, true)
+      probe.body.setNextKinematicTranslation(probe.lastSafe)
+      world!.propagateModifiedBodyPositionsToColliders()
+      probe.velocityY = 0
+      recovered = true
+    }
+  }
+  const position = probe.body.translation()
+  scope.postMessage({ version: WORLD_PHYSICS_PROTOCOL_VERSION, kind: 'navigation-pose', generationId, sequence,
+    position: [position.x, position.y + WORLD_NAVIGATION_EYE_OFFSET, position.z], grounded: probe.grounded, recovered })
 }
 
 function loadRapier(): Promise<RapierApi> {
@@ -253,7 +371,18 @@ function applyCharacterMovement(runtime: RuntimeBody, input: WorldPhysicsCharact
   const current = runtime.body.translation()
   runtime.body.setNextKinematicTranslation({ x: current.x + movement.x, y: current.y + movement.y, z: current.z + movement.z })
   character.grounded = character.controller.computedGrounded()
-  if (character.grounded && character.verticalVelocity < 0) character.verticalVelocity = 0
+  character.verticalVelocity = correctCharacterVerticalVelocity(character.controller, character.verticalVelocity, desired.y, movement.y)
+}
+
+function correctCharacterVerticalVelocity(controller: RAPIER_TYPES.KinematicCharacterController, velocityY: number, desiredY: number, movementY: number): number {
+  if (velocityY < 0 && controller.computedGrounded()) return 0
+  if (velocityY > 0 && movementY < desiredY - 1e-5) {
+    for (let index = 0; index < controller.numComputedCollisions(); index++) {
+      // A wall or slope must not cancel the jump: require an actual overhead contact.
+      if ((controller.computedCollision(index)?.normal1.y ?? 0) < -1e-3) return 0
+    }
+  }
+  return velocityY
 }
 
 function drainTriggerEvents(queue: RAPIER_TYPES.EventQueue, output: WorldPhysicsTriggerEvent[]): void {
@@ -287,8 +416,8 @@ function triggerEventKey(event: WorldPhysicsTriggerEvent): string {
 }
 
 function disposeWorld(): void {
-  world?.free()
-  eventQueue?.free()
+  const previousWorld = world
+  const previousQueue = eventQueue
   world = null
   eventQueue = null
   bodies = []
@@ -297,6 +426,8 @@ function disposeWorld(): void {
   paused = false
   timingEnabled = false
   lastTimingSequence = -1
+  navigation = null
+  try { previousWorld?.free() } finally { previousQueue?.free() }
 }
 
 function postError(code: string, message: string, targetGeneration: number): void {

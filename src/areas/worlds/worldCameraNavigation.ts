@@ -223,7 +223,7 @@ const RUN_STEP_SECONDS = 1 / 60
 const RUN_MAX_STEPS = 4
 const RUN_FALL_RECOVERY_Y = -40
 const RUN_GROUND_PROBE_DISTANCE = 1e-3
-export const WORLD_RUN_GROUND_FALLBACK_LABEL = 'Ground-only fallback — no editor-navigation surfaces'
+export const WORLD_RUN_GROUND_FALLBACK_LABEL = 'Ground-only fallback — no eligible colliders'
 export const WORLD_RUN_PROBE_HALF_EXTENTS = { x: 0.30, y: 0.90, z: 0.30 } as const
 
 export function createWorldsCameraState(overrides: Partial<WorldsCameraState> = {}): WorldsCameraState {

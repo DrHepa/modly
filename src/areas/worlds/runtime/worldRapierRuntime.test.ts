@@ -509,3 +509,119 @@ export async function run(invalidScene, validScene) {
     await rm(temporaryRoot, { recursive: true, force: true })
   }
 })
+
+test('production Worker navigation probe uses frozen mixed solids, sided surfaces, groups and overlap recovery', { timeout: 30_000 }, async (t) => {
+  const repositoryRoot = path.resolve(import.meta.dirname, '../../../..')
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), 'modly-world-navigation-'))
+  const outputDirectory = path.join(temporaryRoot, 'out')
+  const entryPath = path.join(temporaryRoot, 'entry.mjs')
+  const sourceUrl = (relative: string) => pathToFileURL(path.join(repositoryRoot, relative)).href
+  await writeFile(entryPath, `
+export async function run() {
+  const previousSelf = Object.getOwnPropertyDescriptor(globalThis, 'self')
+  let receive, resolveReady, rejectReady, last
+  let generationId = 0
+  globalThis.self = {
+    performance: globalThis.performance,
+    addEventListener(kind, listener) { if (kind === 'message') receive = listener },
+    postMessage(message) {
+      last = message
+      if (message.kind === 'ready') resolveReady(message)
+      if (message.kind === 'error') rejectReady(new Error('generation '+generationId+' '+message.code + ': ' + message.message))
+    },
+  }
+  const send = message => receive({ data: { version: 1, generationId, ...message } })
+  const solid = (id, position, shape, extra = {}) => ({ entityId: id, bodyType: 'fixed', position, rotation: [0,0,0,1], gravityScale: 0, linearDamping: 0, angularDamping: 0, canSleep: true, tags: [], colliders: [{componentId: id, shape, sensor: false, friction: .5, restitution: 0, collisionLayer: 1, collisionMask: 65535, triggerComponentIds: [], ...extra}] })
+  const floor = solid('floor', [0,-.5,0], {kind:'box',halfExtents:[20,.5,20]})
+  const plane = (id, double = false) => solid(id, [0,0,0], {kind:'trimesh', vertices:new Float32Array([-10,-10,0, 10,-10,0, 10,10,0, -10,10,0]), indices:new Uint32Array([0,1,2,0,2,3])})
+  async function scenario(bodies, position, steps, frontSurfaces = [], play = false) {
+    generationId++
+    const ready = new Promise((resolve,reject) => { resolveReady=resolve; rejectReady=reject })
+    const timer = setTimeout(() => rejectReady(new Error('Navigation Worker readiness timed out')), 3000)
+    if (play) {
+      const hero = solid('hero',position,{kind:'capsule',radius:.3,halfHeight:.6})
+      hero.bodyType='kinematic-position'
+      hero.controller={componentId:'controller',colliderComponentId:'hero',moveActionId:'move',jumpActionId:'jump',speed:3,jumpSpeed:4.4,maxSlopeRadians:Math.PI/4}
+      bodies=[...bodies,hero]
+    }
+    send({kind:'init',scene:{sceneId:'navigation',gravity:[0,-9.81,0],bodies},...(!play ? {navigation:{position,frontSurfaces}} : {})})
+    try { await ready } finally { clearTimeout(timer) }
+    await Promise.resolve()
+    const initialY = position[1] + (play ? .75 : 0)
+    let maxY = initialY, previousY = initialY, plateau = 0, maxAirbornePlateauTicks = 0, cameraPose
+    for (let i=0;i<steps.length;i++) {
+      if (play) {
+        send({kind:'step',sequence:i,steps:[{characters:[{entityId:'hero',move:[steps[i].move[0],-steps[i].move[1]],jumpPressed:steps[i].jumpPressed}],impulses:[]}]})
+        if(last.kind !== 'snapshot' || last.sequence !== i) throw new Error('Missing Play character snapshot')
+        const values = new Float32Array(last.transforms), offset=last.entityIds.indexOf('hero')*7
+        cameraPose={position:[values[offset],values[offset+1]+.75,values[offset+2]]}
+      } else {
+        send({kind:'navigation-step',sequence:i,steps:[steps[i]]})
+        if(last.kind !== 'navigation-pose' || last.sequence !== i) throw new Error('Missing camera-only pose: '+JSON.stringify(last))
+        cameraPose=last
+      }
+      const y=cameraPose.position[1]
+      maxY=Math.max(maxY,y)
+      plateau=y > initialY+.1 && Math.abs(y-previousY)<.0002 ? plateau+1 : 0
+      maxAirbornePlateauTicks=Math.max(maxAirbornePlateauTicks,plateau)
+      previousY=y
+    }
+    const result={...cameraPose,maxY,maxAirbornePlateauTicks}
+    send({kind:'dispose'})
+    return result
+  }
+  const input = (move=[0,0], jumpPressed=false, boost=false) => ({move,jumpPressed,boost})
+  try {
+    await import(${JSON.stringify(sourceUrl('src/areas/worlds/runtime/worldPhysics.worker.ts'))})
+    const results={}
+    results.wall=await scenario([floor, solid('wall',[0,2,0],{kind:'box',halfExtents:[4,2,.1]})], [0,2,3], Array.from({length:180},()=>input([0,-1])))
+    results.slide=await scenario([floor, solid('wall',[0,2,0],{kind:'box',halfExtents:[10,2,.1]})], [0,2,3], Array.from({length:180},()=>input([Math.SQRT1_2,-Math.SQRT1_2])))
+    results.filtered=await scenario([floor, solid('sensor',[0,2,1],{kind:'box',halfExtents:[4,2,.1]},{sensor:true}), solid('masked',[0,2,0],{kind:'box',halfExtents:[4,2,.1]},{collisionMask:2})], [0,2,3], Array.from({length:120},()=>input([0,-1])))
+    const front=[{componentId:'plane', point:[0,0,0], normal:[0,0,1]}]
+    results.front=await scenario([floor,plane('plane')], [0,2,3], Array.from({length:120},()=>input([0,-1])),front)
+    results.back=await scenario([floor,plane('plane')], [0,2,-3], Array.from({length:120},()=>input([0,1])),front)
+    results.double=await scenario([floor,plane('plane')], [0,2,-3], Array.from({length:120},()=>input([0,1])))
+    results.overlap=await scenario([floor,solid('wall',[0,2,0],{kind:'box',halfExtents:[4,2,.1]})],[0,.7,.2],Array.from({length:60},()=>input()))
+    results.jump=await scenario([floor],[0,2,3],Array.from({length:150},(_,i)=>input([0,0],i===90)))
+    results.initialJump=await scenario([floor],[0,1.66,3],Array.from({length:60},(_,i)=>input([0,0],i===0)))
+    const ceiling=solid('ceiling',[0,2.3,0],{kind:'box',halfExtents:[10,.1,10]})
+    results.lowCeiling=await scenario([floor,ceiling],[0,1.66,0],Array.from({length:100},(_,i)=>input([0,0],i===30)))
+    results.playLowCeiling=await scenario([floor,ceiling],[0,.91,0],Array.from({length:100},(_,i)=>input([0,0],i===30)),[],true)
+    results.boost=await scenario([floor],[0,2,3],Array.from({length:60},()=>input([1,0],false,true)))
+    const hull={kind:'convexHull',vertices:new Float32Array([-2,0,-.2,2,0,-.2,2,4,-.2,-2,4,-.2,-2,0,.2,2,0,.2,2,4,.2,-2,4,.2])}
+    const mesh={kind:'trimesh',vertices:new Float32Array([-10,0,-10,10,0,-10,10,0,10,-10,0,10]),indices:new Uint32Array([0,1,2,0,2,3])}
+    results.advanced=await scenario([solid('mesh',[0,0,0],mesh),solid('hull',[0,0,0],hull)], [0,2,3], Array.from({length:150},()=>input([0,-1])))
+    for(const [name,shape] of [['sphere',{kind:'sphere',radius:2}],['capsule',{kind:'capsule',radius:1,halfHeight:2}]]) results[name]=await scenario([floor,solid(name,[0,1,0],shape)],[0,2,4],Array.from({length:150},()=>input([0,-1])))
+    return results
+  } finally { send({kind:'dispose'}); if(previousSelf) Object.defineProperty(globalThis,'self',previousSelf); else delete globalThis.self }
+}
+`)
+  try {
+    const { default: productionConfig } = await import(sourceUrl('electron.vite.config.ts'))
+    await build({ configFile: false, envFile: false, root: temporaryRoot, publicDir: false, cacheDir: path.join(temporaryRoot, 'cache'), logLevel: 'warn', plugins: productionConfig.renderer.worker.plugins(), build: { target: 'node24', outDir: outputDirectory, emptyOutDir: false, minify: false, lib: { entry: entryPath, formats: ['es'] }, rollupOptions: { output: { entryFileNames: 'navigation.mjs' } } } })
+    const executed = await import(pathToFileURL(path.join(outputDirectory, 'navigation.mjs')).href)
+    const result = await executed.run()
+    t.diagnostic(JSON.stringify(result))
+    for (const name of ['wall', 'front', 'advanced']) {
+      assert.ok(result[name].position[2] > .29 && result[name].position[2] < .65, name)
+      assert.ok(result[name].position[1] > 1.64 && result[name].position[1] < 1.71, name)
+      assert.equal(result[name].grounded, true)
+      assert.equal(result[name].transforms, undefined)
+      assert.equal(result[name].triggerEvents, undefined)
+    }
+    assert.ok(result.slide.position[0] > 5 && result.slide.position[2] > .39)
+    assert.ok(result.filtered.position[2] < -2.5)
+    assert.ok(result.back.position[2] > 2.5)
+    assert.ok(result.double.position[2] < -.29 && result.double.position[2] > -.4)
+    assert.ok(result.overlap.position[1] > 1.64 && result.overlap.position[2] > .39)
+    assert.ok(result.jump.maxY > 2.4)
+    assert.ok(result.initialJump.maxY > 2.4, 'Space on the first grounded Run tick must not be lost during initialization')
+    for (const name of ['lowCeiling','playLowCeiling']) {
+      assert.ok(result[name].maxY > 1.9 && result[name].maxY < 2.06, name+' must jump and contact the low ceiling')
+      assert.ok(result[name].maxAirbornePlateauTicks <= 2, name+' must fall promptly after ceiling contact, not hang: '+result[name].maxAirbornePlateauTicks)
+    }
+    assert.ok(result.boost.position[0] > 5.85 && result.boost.position[0] < 6.1)
+    assert.ok(result.sphere.position[2] > 1.8)
+    assert.ok(result.capsule.position[2] > 1.2)
+  } finally { await rm(temporaryRoot, { recursive: true, force: true }) }
+})

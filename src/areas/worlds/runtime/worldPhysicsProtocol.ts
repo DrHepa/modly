@@ -3,6 +3,30 @@ import { WORLD_MAX_RECOVERY_STEPS } from './worldRuntimeClock.ts'
 
 export const WORLD_PHYSICS_PROTOCOL_VERSION = 1 as const
 export const WORLD_PHYSICS_TRANSFORM_STRIDE = 7
+/** Editor camera belongs to the default layer; obstacles must opt into that layer. */
+export const WORLD_NAVIGATION_COLLISION_LAYER = 1
+export const WORLD_NAVIGATION_COLLISION_MASK = 0xffff
+export const WORLD_NAVIGATION_MAX_COORDINATE = 1_000_000
+/** 1.8 m capsule, eye 1.65 m above its feet. Protocol positions are always eyes. */
+export const WORLD_NAVIGATION_EYE_OFFSET = 0.75
+
+export interface WorldPhysicsNavigationInit {
+  position: WorldVector3
+  /** Authored +Y side in world space. Double-sided triangles need no entry. */
+  frontSurfaces: { componentId: string; point: WorldVector3; normal: WorldVector3 }[]
+}
+export interface WorldPhysicsNavigationStep {
+  /** Normalized world-space X/Z direction, independent of camera pitch. */
+  move: WorldVector2
+  jumpPressed: boolean
+  boost: boolean
+}
+export interface WorldPhysicsNavigationPose {
+  sequence: number
+  position: WorldVector3
+  grounded: boolean
+  recovered: boolean
+}
 export const WORLD_PHYSICS_GEOMETRY_LIMITS = Object.freeze({
   maxVerticesPerCollider: 16_384,
   maxTrianglesPerCollider: 32_768,
@@ -99,11 +123,13 @@ export interface WorldPhysicsStepTiming {
 }
 
 export type WorldPhysicsMainMessage =
-  | { version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'init'; generationId: number; scene: WorldPhysicsSceneDto; diagnostics?: true }
+  | { version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'init'; generationId: number; scene: WorldPhysicsSceneDto; diagnostics?: true; navigation?: WorldPhysicsNavigationInit }
+  | { version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'navigation-step'; generationId: number; sequence: number; steps: WorldPhysicsNavigationStep[] }
   | ({ version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'step'; generationId: number } & WorldPhysicsStepRequest)
   | { version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'pause' | 'resume' | 'dispose'; generationId: number }
 
 export type WorldPhysicsWorkerMessage =
+  | ({ version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'navigation-pose'; generationId: number } & WorldPhysicsNavigationPose)
   | { version: typeof WORLD_PHYSICS_PROTOCOL_VERSION; kind: 'ready'; generationId: number; entityIds: string[] }
   | {
       version: typeof WORLD_PHYSICS_PROTOCOL_VERSION
@@ -124,8 +150,16 @@ export type ParseWorldPhysicsMessageResult<T> =
 export function parseWorldPhysicsMainMessage(value: unknown): ParseWorldPhysicsMessageResult<WorldPhysicsMainMessage> {
   if (!isRecord(value) || value.version !== WORLD_PHYSICS_PROTOCOL_VERSION || !isGeneration(value.generationId) || typeof value.kind !== 'string') return invalid('Physics message envelope is invalid.')
   if (value.kind === 'init') {
-    if (!hasOnlyKeys(value, ['version', 'kind', 'generationId', 'scene', ...('diagnostics' in value ? ['diagnostics'] : [])])
-      || ('diagnostics' in value && value.diagnostics !== true) || !isPhysicsScene(value.scene)) return invalid('Physics init message is invalid.')
+    if (!hasOnlyKeys(value, ['version', 'kind', 'generationId', 'scene', ...('diagnostics' in value ? ['diagnostics'] : []), ...('navigation' in value ? ['navigation'] : [])])
+      || ('diagnostics' in value && value.diagnostics !== true) || !isPhysicsScene(value.scene)
+      || ('navigation' in value && (!isNavigationInit(value.navigation, value.scene) || 'diagnostics' in value))) return invalid('Physics init message is invalid.')
+    return valid(value as unknown as WorldPhysicsMainMessage)
+  }
+  if (value.kind === 'navigation-step') {
+    if (!hasOnlyKeys(value, ['version', 'kind', 'generationId', 'sequence', 'steps']) || !isSequence(value.sequence)
+      || !Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > WORLD_MAX_RECOVERY_STEPS
+      || !value.steps.every(step => isRecord(step) && hasOnlyKeys(step, ['move', 'jumpPressed', 'boost']) && isVector2(step.move)
+        && Math.hypot(...step.move) <= 1.000001 && typeof step.jumpPressed === 'boolean' && typeof step.boost === 'boolean')) return invalid('Navigation step message is invalid.')
     return valid(value as unknown as WorldPhysicsMainMessage)
   }
   if (value.kind === 'step') {
@@ -148,6 +182,11 @@ function isFixedStep(value: unknown): value is WorldPhysicsFixedStep {
 
 export function parseWorldPhysicsWorkerMessage(value: unknown): ParseWorldPhysicsMessageResult<WorldPhysicsWorkerMessage> {
   if (!isRecord(value) || value.version !== WORLD_PHYSICS_PROTOCOL_VERSION || !isGeneration(value.generationId) || typeof value.kind !== 'string') return invalid('Physics worker envelope is invalid.')
+  if (value.kind === 'navigation-pose') {
+    if (!hasOnlyKeys(value, ['version', 'kind', 'generationId', 'sequence', 'position', 'grounded', 'recovered']) || !isSequence(value.sequence)
+      || !isNavigationPosition(value.position) || typeof value.grounded !== 'boolean' || typeof value.recovered !== 'boolean') return invalid('Navigation pose message is invalid.')
+    return valid(value as unknown as WorldPhysicsWorkerMessage)
+  }
   if (value.kind === 'ready') {
     if (!hasOnlyKeys(value, ['version', 'kind', 'generationId', 'entityIds']) || !isStringArray(value.entityIds)) return invalid('Physics ready message is invalid.')
     return valid(value as unknown as WorldPhysicsWorkerMessage)
@@ -182,6 +221,33 @@ function isPhysicsScene(value: unknown): value is WorldPhysicsSceneDto {
     || !isVector3(value.gravity) || !Array.isArray(value.bodies) || value.bodies.length > 65_536) return false
   const budget = { advancedGeometryBytes: 0 }
   return value.bodies.every((bodyValue) => isBody(bodyValue, budget))
+}
+
+function isNavigationPosition(value: unknown): value is WorldVector3 {
+  return isVector3(value) && value.every(coordinate => Math.abs(coordinate) <= WORLD_NAVIGATION_MAX_COORDINATE)
+}
+
+function isNavigationInit(value: unknown, scene: WorldPhysicsSceneDto): value is WorldPhysicsNavigationInit {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['position', 'frontSurfaces']) || !isNavigationPosition(value.position)
+    || !Array.isArray(value.frontSurfaces) || value.frontSurfaces.length > 65_536) return false
+  const colliderIds = new Set<string>()
+  const triangleIds = new Set<string>()
+  for (const body of scene.bodies) {
+    if (body.bodyType !== 'fixed' || body.controller) return false
+    for (const collider of body.colliders) {
+      if (colliderIds.has(collider.componentId) || collider.triggerComponentIds.length) return false
+      colliderIds.add(collider.componentId)
+      if (collider.shape.kind === 'trimesh') triangleIds.add(collider.componentId)
+    }
+  }
+  const seen = new Set<string>()
+  return value.frontSurfaces.every(surface => {
+    if (!isRecord(surface) || !hasOnlyKeys(surface, ['componentId', 'point', 'normal']) || !isNonEmptyString(surface.componentId)
+      || !triangleIds.has(surface.componentId) || seen.has(surface.componentId) || !isNavigationPosition(surface.point)
+      || !isVector3(surface.normal) || Math.abs(Math.hypot(...surface.normal) - 1) > 1e-5) return false
+    seen.add(surface.componentId)
+    return true
+  })
 }
 
 function isBody(value: unknown, budget: { advancedGeometryBytes: number }): value is WorldPhysicsBodyDto {

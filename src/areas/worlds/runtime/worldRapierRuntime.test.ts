@@ -534,7 +534,7 @@ export async function run() {
   const solid = (id, position, shape, extra = {}) => ({ entityId: id, bodyType: 'fixed', position, rotation: [0,0,0,1], gravityScale: 0, linearDamping: 0, angularDamping: 0, canSleep: true, tags: [], colliders: [{componentId: id, shape, sensor: false, friction: .5, restitution: 0, collisionLayer: 1, collisionMask: 65535, triggerComponentIds: [], ...extra}] })
   const floor = solid('floor', [0,-.5,0], {kind:'box',halfExtents:[20,.5,20]})
   const plane = (id, double = false) => solid(id, [0,0,0], {kind:'trimesh', vertices:new Float32Array([-10,-10,0, 10,-10,0, 10,10,0, -10,10,0]), indices:new Uint32Array([0,1,2,0,2,3])})
-  async function scenario(bodies, position, steps, frontSurfaces = [], play = false) {
+  async function scenario(bodies, position, steps, frontSurfaces = [], play = false, trace = false) {
     generationId++
     const ready = new Promise((resolve,reject) => { resolveReady=resolve; rejectReady=reject })
     const timer = setTimeout(() => rejectReady(new Error('Navigation Worker readiness timed out')), 3000)
@@ -548,6 +548,7 @@ export async function run() {
     try { await ready } finally { clearTimeout(timer) }
     await Promise.resolve()
     const initialY = position[1] + (play ? .75 : 0)
+    const poses = []
     let maxY = initialY, previousY = initialY, plateau = 0, maxAirbornePlateauTicks = 0, cameraPose
     for (let i=0;i<steps.length;i++) {
       if (play) {
@@ -560,13 +561,14 @@ export async function run() {
         if(last.kind !== 'navigation-pose' || last.sequence !== i) throw new Error('Missing camera-only pose: '+JSON.stringify(last))
         cameraPose=last
       }
+      if (trace) poses.push({position: [...cameraPose.position], grounded: cameraPose.grounded, recovered: cameraPose.recovered})
       const y=cameraPose.position[1]
       maxY=Math.max(maxY,y)
       plateau=y > initialY+.1 && Math.abs(y-previousY)<.0002 ? plateau+1 : 0
       maxAirbornePlateauTicks=Math.max(maxAirbornePlateauTicks,plateau)
       previousY=y
     }
-    const result={...cameraPose,maxY,maxAirbornePlateauTicks}
+    const result={...cameraPose,maxY,maxAirbornePlateauTicks,...(trace ? {poses} : {})}
     send({kind:'dispose'})
     return result
   }
@@ -581,6 +583,23 @@ export async function run() {
     results.front=await scenario([floor,plane('plane')], [0,2,3], Array.from({length:120},()=>input([0,-1])),front)
     results.back=await scenario([floor,plane('plane')], [0,2,-3], Array.from({length:120},()=>input([0,1])),front)
     results.double=await scenario([floor,plane('plane')], [0,2,-3], Array.from({length:120},()=>input([0,1])))
+    // Both footprints lie on y = z / 2, with the authored front facing upward.
+    const slopeNormal=[0, 2/Math.sqrt(5), -1/Math.sqrt(5)]
+    const slopeFront=[{componentId:'slope', point:[0,0,0], normal:slopeNormal}]
+    const slopeEyeHeight=z=>z/2+.75+.6+(.3+.01)/slopeNormal[1]
+    const underFloor=solid('under-floor',[0,-2.5,0],{kind:'box',halfExtents:[20,.5,20]})
+    results.underFloor=await scenario([underFloor],[0,-.34,3],Array.from({length:180},()=>input([0,-1])),[],false,true)
+    for (const [name,vertices,indices] of [
+      ['rect', [-10,-5,-10, -10,5,10, 10,5,10, 10,-5,-10], [0,1,2,0,2,3]],
+      ['tri', [-10,-5,-10, 0,5,10, 10,-5,-10], [0,1,2]],
+    ]) {
+      const slope=solid('slope',[0,0,0],{kind:'trimesh',vertices:new Float32Array(vertices),indices:new Uint32Array(indices)})
+      results[name+'Downhill']=await scenario([slope],[0,slopeEyeHeight(3),3],Array.from({length:100},(_,i)=>input([0,i<10?0:-1])),slopeFront,false,true)
+      results[name+'Uphill']=await scenario([slope],[0,slopeEyeHeight(-3),-3],Array.from({length:100},(_,i)=>input([0,i<10?0:1])),slopeFront,false,true)
+      results[name+'Stop']=await scenario([slope],[0,slopeEyeHeight(3),3],Array.from({length:160},(_,i)=>input([0,i>=10&&i<100?-1:0])),slopeFront,false,true)
+      results[name+'Jump']=await scenario([slope],[0,slopeEyeHeight(3),3],Array.from({length:180},(_,i)=>input([0,i<10||i>=120?0:-1],i===60)),slopeFront,false,true)
+      results[name+'Back']=await scenario([slope,underFloor],[0,-.34,3],Array.from({length:180},()=>input([0,-1])),slopeFront,false,true)
+    }
     results.overlap=await scenario([floor,solid('wall',[0,2,0],{kind:'box',halfExtents:[4,2,.1]})],[0,.7,.2],Array.from({length:60},()=>input()))
     results.jump=await scenario([floor],[0,2,3],Array.from({length:150},(_,i)=>input([0,0],i===90)))
     results.initialJump=await scenario([floor],[0,1.66,3],Array.from({length:60},(_,i)=>input([0,0],i===0)))
@@ -601,7 +620,7 @@ export async function run() {
     await build({ configFile: false, envFile: false, root: temporaryRoot, publicDir: false, cacheDir: path.join(temporaryRoot, 'cache'), logLevel: 'warn', plugins: productionConfig.renderer.worker.plugins(), build: { target: 'node24', outDir: outputDirectory, emptyOutDir: false, minify: false, lib: { entry: entryPath, formats: ['es'] }, rollupOptions: { output: { entryFileNames: 'navigation.mjs' } } } })
     const executed = await import(pathToFileURL(path.join(outputDirectory, 'navigation.mjs')).href)
     const result = await executed.run()
-    t.diagnostic(JSON.stringify(result))
+    t.diagnostic(JSON.stringify(result, (key, value) => key === 'poses' ? undefined : value))
     for (const name of ['wall', 'front', 'advanced']) {
       assert.ok(result[name].position[2] > .29 && result[name].position[2] < .65, name)
       assert.ok(result[name].position[1] > 1.64 && result[name].position[1] < 1.71, name)
@@ -623,5 +642,44 @@ export async function run() {
     assert.ok(result.boost.position[0] > 5.85 && result.boost.position[0] < 6.1)
     assert.ok(result.sphere.position[2] > 1.8)
     assert.ok(result.capsule.position[2] > 1.2)
+    const clearance = (position: number[]) => (position[1] - .75 - position[2] / 2) * 2 / Math.sqrt(5) - (.6 * 2 / Math.sqrt(5) + .3)
+    for (const shape of ['rect', 'tri']) {
+      for (const action of ['Downhill', 'Uphill', 'Stop']) {
+        const name = shape + action
+        const poses = result[name].poses as Array<{ position: number[]; grounded: boolean; recovered: boolean }>
+        const gaps = poses.map(pose => clearance(pose.position))
+        t.diagnostic(JSON.stringify({ name, airborneTicks: poses.filter(pose => !pose.grounded).length, minClearance: Math.min(...gaps), maxClearance: Math.max(...gaps) }))
+        for (const [tick, pose] of poses.entries()) {
+          assert.equal(pose.grounded, true, name + ' must retain support at tick ' + tick)
+          assert.equal(pose.recovered, false, name + ' must not fall back to last-safe')
+          assert.ok(gaps[tick] >= -.002 && gaps[tick] <= .025, name + ' capsule-to-plane clearance at tick ' + tick + ': ' + gaps[tick])
+        }
+        const z = poses.at(-1)!.position[2]
+        assert.ok(action === 'Uphill' ? z > .4 : z < -1.3, name + ' must travel along the ramp')
+        if (action === 'Stop') {
+          const stopped = poses.slice(100)
+          for (const pose of stopped) assert.ok(Math.hypot(...pose.position.map((value, axis) => value - stopped[0].position[axis])) < .01, name + ' must not drift after input stops')
+        }
+      }
+      const jump = result[shape + 'Jump'].poses as Array<{ position: number[]; grounded: boolean; recovered: boolean }>
+      t.diagnostic(JSON.stringify({ name: shape + 'Jump', groundedBeforeJump: jump[59].grounded, jumpRise: jump[60].position[1] - jump[59].position[1], maxClearance: Math.max(...jump.map(pose => clearance(pose.position))) }))
+      assert.equal(jump[59].grounded, true, shape + ' must support the downhill jump edge')
+      assert.equal(jump[60].grounded, false, shape + ' must leave the slope when jumping')
+      assert.ok(jump[60].position[1] > jump[59].position[1] + .05, shape + ' must apply the jump immediately')
+      assert.ok(Math.max(...jump.map(pose => clearance(pose.position))) > .8, shape + ' jump must clear the slope, not snap back')
+      assert.ok(jump.every(pose => !pose.recovered && clearance(pose.position) >= -.002), shape + ' jump must not penetrate or recover')
+      for (const pose of jump.slice(150)) {
+        assert.equal(pose.grounded, true, shape + ' must land and remain supported')
+        assert.ok(clearance(pose.position) <= .025, shape + ' landing must restore capsule clearance')
+      }
+      const back = result[shape + 'Back'].poses as Array<{ position: number[]; grounded: boolean; recovered: boolean }>
+      for (const [tick, pose] of back.entries()) {
+        assert.equal(pose.grounded, true, shape + ' back-to-front passage must retain the lower floor')
+        assert.equal(pose.recovered, false)
+        assert.ok(Math.abs(pose.position[1] + .34) < .025, shape + ' back-to-front passage must not lift onto the ramp')
+        assert.ok(Math.abs(pose.position[2] - result.underFloor.poses[tick].position[2]) < .01, shape + ' back-to-front passage must match the unobstructed floor at tick ' + tick)
+      }
+      assert.ok(clearance(back[0].position) < -.9 && clearance(back.at(-1)!.position) > .5, shape + ' must cross from behind until the whole capsule clears the front')
+    }
   } finally { await rm(temporaryRoot, { recursive: true, force: true }) }
 })

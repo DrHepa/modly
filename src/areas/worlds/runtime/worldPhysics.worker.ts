@@ -68,6 +68,8 @@ let navigation: {
   sequence: number
 } | null = null
 const NAVIGATION_GROUPS = ((WORLD_NAVIGATION_COLLISION_LAYER * 0x10000) + WORLD_NAVIGATION_COLLISION_MASK) >>> 0
+const NAVIGATION_CAPSULE_HALF_HEIGHT = 0.6
+const NAVIGATION_CAPSULE_RADIUS = 0.3
 
 scope.addEventListener('message', (event: MessageEvent<unknown>) => {
   const parsed = parseWorldPhysicsMainMessage(event.data)
@@ -130,7 +132,7 @@ async function initialize(nextGenerationId: number, scene: Parameters<typeof cre
 
 function createNavigation(probe: WorldPhysicsNavigationInit): void {
   const body = world!.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(probe.position[0], probe.position[1] - WORLD_NAVIGATION_EYE_OFFSET, probe.position[2]))
-  const collider = world!.createCollider(RAPIER.ColliderDesc.capsule(0.6, 0.3).setCollisionGroups(NAVIGATION_GROUPS), body)
+  const collider = world!.createCollider(RAPIER.ColliderDesc.capsule(NAVIGATION_CAPSULE_HALF_HEIGHT, NAVIGATION_CAPSULE_RADIUS).setCollisionGroups(NAVIGATION_GROUPS), body)
   const controller = world!.createCharacterController(0.01)
   controller.setMaxSlopeClimbAngle(Math.PI / 4)
   controller.setMinSlopeSlideAngle(Math.PI / 4)
@@ -161,9 +163,12 @@ function acceptsNavigationObstacle(obstacle: RAPIER_TYPES.Collider, position: RA
   const front = probe.frontSurfaces.get(obstacle.handle)
   if (!front) return true
   const [x, y, z] = front.normal
-  // Back-to-front passage remains nonblocking until the entire crossing finishes.
-  return (position.x - front.point[0]) * x + (position.y - front.point[1]) * y + (position.z - front.point[2]) * z >= -1e-5
-    && (!movement || movement.x * x + movement.y * y + movement.z * z <= 1e-8)
+  const distance = (position.x - front.point[0]) * x + (position.y - front.point[1]) * y + (position.z - front.point[2]) * z
+  const capsuleExtent = NAVIGATION_CAPSULE_HALF_HEIGHT * Math.abs(y) + NAVIGATION_CAPSULE_RADIUS
+  // Keep back-to-front passage nonblocking while the capsule still crosses the plane.
+  // Once entirely in front, retain the obstacle for KCC snap-to-ground on downhill motion.
+  return distance >= -1e-5
+    && (distance >= capsuleExtent || !movement || movement.x * x + movement.y * y + movement.z * z <= 1e-8)
 }
 
 function depenetrateNavigation(): void {

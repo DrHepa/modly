@@ -8,6 +8,7 @@ import { PICKER_LABELS, resolvePickerIntent } from '@shared/utils/paramPicker'
 import {
   isPromptLikeStringParam,
   resolveBooleanParamValue,
+  resolveSelectParamValue,
   resolveStringParamEditorState,
   selectWorkflowParamPath,
   stopControlDragPropagation,
@@ -110,7 +111,7 @@ export default function WorkflowParamControl({ param, value, onChange, resolvedP
 
   if (param.type === 'select') {
     return (
-      <select aria-label={param.label} value={String(value)} onChange={(event) => onChange(event.target.value)} className={INPUT_CLASS_NAME}
+      <select aria-label={param.label} value={String(value)} onChange={(event) => onChange(resolveSelectParamValue(param.options, event.target.value, value))} className={INPUT_CLASS_NAME}
         onPointerDown={stopControlDragPropagation} onMouseDown={stopControlDragPropagation}>
         {param.options?.map((option) => (
           <option key={String(option.value)} value={option.value}>{option.label ?? String(option.value)}</option>

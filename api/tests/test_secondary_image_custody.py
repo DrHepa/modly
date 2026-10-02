@@ -346,6 +346,8 @@ def test_primary_upload_enforces_byte_and_safe_dimension_limits(client, api_modu
         "reference_image_paths",
         "custom-role_image_path",
         "CUSTOM_ROLE_IMAGE_PATHS",
+        "image_2_path",
+        "image_2_paths",
         "input_images",
         "inputImages",
         "reference_images",
@@ -353,15 +355,16 @@ def test_primary_upload_enforces_byte_and_safe_dimension_limits(client, api_modu
         "referenceImagePaths",
         "Reference-Image-Paths",
         "REFERENCE.IMAGE.PATHS",
-        "arbitraryCamelCasePath",
-        "scene_manifest_path",
-        "video_path",
-        "capture_manifest_path",
+        "images_dir",
+        "imageFolder",
     ],
 )
-def test_undeclared_generation_parameters_are_forbidden(client, api_modules, alias):
+@pytest.mark.parametrize("route", ["/generate/from-image", "/workflow-runs/from-image"])
+def test_undeclared_known_image_transport_aliases_are_forbidden(
+    client, api_modules, route, alias
+):
     response = client.post(
-        "/generate/from-image",
+        route,
         files={"image": ("primary.png", PNG_BYTES, "image/png")},
         data={
             "model_id": api_modules["valid_model_id"],
@@ -369,21 +372,151 @@ def test_undeclared_generation_parameters_are_forbidden(client, api_modules, ali
         },
     )
     assert response.status_code == 400
-    assert "not declared" in response.text
+    assert "server-managed" in response.text
     assert api_modules["generation_jobs"]._jobs == {}
 
 
-def test_declared_scalar_generation_parameter_is_accepted(client, api_modules):
+@pytest.mark.parametrize("route, expected_status", [
+    ("/generate/from-image", 200),
+    ("/workflow-runs/from-image", 202),
+])
+def test_unknown_ordinary_scalar_parameters_pass_through_unchanged(
+    client, api_modules, monkeypatch, route, expected_status
+):
+    generator = api_modules["fake_generator"]
+    original_generate = generator.generate
+    captured = {}
+
+    def generate(image_bytes, params, progress_cb=None, cancel_event=None):
+        captured.update(params)
+        return original_generate(image_bytes, params, progress_cb, cancel_event)
+
+    monkeypatch.setattr(generator, "generate", generate)
     response = client.post(
-        "/generate/from-image",
+        route,
         files={"image": ("primary.png", PNG_BYTES, "image/png")},
         data={
             "model_id": api_modules["valid_model_id"],
-            "params": json.dumps({"quality": "draft"}),
+            "params": json.dumps({
+                "stale_strength": "0.75",
+                "legacy_low_vram": True,
+                "arbitraryCamelCasePath": "runtime-token",
+            }),
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == expected_status
+    assert captured["stale_strength"] == "0.75"
+    assert captured["legacy_low_vram"] is True
+    assert captured["arbitraryCamelCasePath"] == "runtime-token"
+
+
+def test_generation_param_compatibility_keeps_structural_and_transport_boundaries(api_modules):
+    jobs = api_modules["generation_jobs"]
+    model_id = api_modules["valid_model_id"]
+
+    with pytest.raises(Exception, match="params must be a JSON object"):
+        jobs.validate_client_generation_params(model_id, [])
+    with pytest.raises(Exception, match="parameter names must be strings"):
+        jobs.validate_client_generation_params(model_id, {1: "value"})
+    with pytest.raises(Exception, match="server-managed"):
+        jobs.validate_client_generation_params(
+            model_id,
+            {"extra_image_paths": ["/tmp/forged.png"]},
+        )
+
+
+@pytest.mark.parametrize("route, expected_status", [
+    ("/generate/from-image", 200),
+    ("/workflow-runs/from-image", 202),
+])
+def test_blank_image_transport_aliases_are_stripped_without_dropping_ordinary_blanks(
+    client, api_modules, monkeypatch, route, expected_status
+):
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["inputs"] = [
+        {"name": "front", "type": "image", "required": True},
+    ]
+    generator = api_modules["fake_generator"]
+    original_generate = generator.generate
+    captured = {}
+
+    def generate(image_bytes, params, progress_cb=None, cancel_event=None):
+        captured.update(params)
+        return original_generate(image_bytes, params, progress_cb, cancel_event)
+
+    monkeypatch.setattr(generator, "generate", generate)
+    response = client.post(
+        route,
+        files={"image": ("primary.png", PNG_BYTES, "image/png")},
+        data={
+            "model_id": api_modules["valid_model_id"],
+            "params": json.dumps({
+                "left_image_path": "   ",
+                "image_2_path": None,
+                "image_2_paths": [None, "", "  "],
+                "ordinary_blank": "",
+            }),
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert set(captured).isdisjoint({"left_image_path", "image_2_path", "image_2_paths"})
+    assert captured["ordinary_blank"] == ""
+
+
+@pytest.mark.parametrize("route", ["/generate/from-image", "/workflow-runs/from-image"])
+@pytest.mark.parametrize(
+    "alias, value",
+    [
+        ("image_2_path", "Refs/forged.png"),
+        ("image_2_paths", [None, "Refs/forged.png"]),
+    ],
+)
+def test_nonblank_ordinal_image_transport_aliases_are_rejected_without_declared_port(
+    client, api_modules, route, alias, value
+):
+    from services.generator_registry import generator_registry
+
+    generator_registry._manifests[api_modules["valid_model_id"]]["inputs"] = [
+        {"name": "front", "type": "image", "required": True},
+    ]
+    response = client.post(
+        route,
+        files={"image": ("primary.png", PNG_BYTES, "image/png")},
+        data={
+            "model_id": api_modules["valid_model_id"],
+            "params": json.dumps({alias: value}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "server-managed" in response.text
+    assert api_modules["generation_jobs"]._jobs == {}
+
+
+@pytest.mark.parametrize("route", ["/generate/from-image", "/workflow-runs/from-image"])
+@pytest.mark.parametrize(
+    "alias",
+    ["image_17_path", f"image{'9' * 5000}_path"],
+    ids=["out-of-range", "very-long"],
+)
+def test_untrusted_ordinal_image_aliases_fail_with_controlled_response(
+    client, api_modules, route, alias
+):
+    response = client.post(
+        route,
+        files={"image": ("primary.png", PNG_BYTES, "image/png")},
+        data={
+            "model_id": api_modules["valid_model_id"],
+            "params": json.dumps({alias: "Refs/forged.png"}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "server-managed" in response.text
+    assert api_modules["generation_jobs"]._jobs == {}
 
 
 def test_typed_transport_param_is_rejected_even_when_manifest_declares_it(
@@ -418,7 +551,6 @@ def test_image_routes_never_authorize_typed_transport_aliases_from_client_params
 
     manifest = generator_registry._manifests[api_modules["valid_model_id"]]
     manifest["name"] = "Pixal3D Scene Prep"
-    manifest["params_schema"].append({"id": alias, "type": "string"})
 
     response = client.post(
         route,
@@ -485,44 +617,58 @@ def test_pixal3d_worldsculpt_scene_aliases_are_injected_only_by_typed_route(
     ("/generate/from-image", 200),
     ("/workflow-runs/from-image", 202),
 ])
-def test_installed_style_boolean_select_values_match_by_exact_type(
-    client, api_modules, route, expected_status
+def test_legacy_declared_scalar_values_pass_through_unchanged(
+    client, api_modules, monkeypatch, route, expected_status
 ):
     from services.generator_registry import generator_registry
 
     manifest = generator_registry._manifests[api_modules["valid_model_id"]]
     manifest["params_schema"].append({
-        "id": "remove_bg",
+        "id": "resolution",
         "type": "select",
-        "default": True,
+        "default": 1024,
         "options": [
-            {"value": True, "label": "Yes"},
-            {"value": False, "label": "No"},
+            {"value": 1024, "label": "1024"},
+            {"value": 1536, "label": "1536"},
+            {"value": 2048, "label": "2048"},
         ],
     })
+    manifest["params_schema"].append({
+        "id": "low_vram",
+        "type": "select",
+        "default": "false",
+        "options": [
+            {"value": "false", "label": "Disabled"},
+            {"value": "true", "label": "Enabled"},
+        ],
+    })
+    generator = api_modules["fake_generator"]
+    original_generate = generator.generate
+    captured = {}
 
-    for value in (True, False):
-        response = client.post(
-            route,
-            files={"image": ("front.png", PNG_BYTES, "image/png")},
-            data={
-                "model_id": api_modules["valid_model_id"],
-                "params": json.dumps({"remove_bg": value}),
-            },
-        )
-        assert response.status_code == expected_status
+    def generate(image_bytes, params, progress_cb=None, cancel_event=None):
+        captured.update(params)
+        return original_generate(image_bytes, params, progress_cb, cancel_event)
 
-    for value in (0, 1, "true", "false"):
-        response = client.post(
-            route,
-            files={"image": ("front.png", PNG_BYTES, "image/png")},
-            data={
-                "model_id": api_modules["valid_model_id"],
-                "params": json.dumps({"remove_bg": value}),
-            },
-        )
-        assert response.status_code == 400
-        assert "valid select value" in response.text
+    monkeypatch.setattr(generator, "generate", generate)
+    response = client.post(
+        route,
+        files={"image": ("front.png", PNG_BYTES, "image/png")},
+        data={
+            "model_id": api_modules["valid_model_id"],
+            "params": json.dumps({
+                "resolution": "1536",
+                "low_vram": True,
+                "quality": "legacy-quality",
+            }),
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert captured["resolution"] == "1536"
+    assert type(captured["resolution"]) is str
+    assert captured["low_vram"] is True
+    assert captured["quality"] == "legacy-quality"
 
 
 @pytest.mark.parametrize("route, expected_status, id_key", [
@@ -785,7 +931,7 @@ def test_declared_hunyuan_style_image_path_params_are_server_managed(
         },
     )
     assert scalar_path_bypass.status_code == 400
-    assert "valid select value" in scalar_path_bypass.text
+    assert "server-managed" in scalar_path_bypass.text
     assert api_modules["generation_jobs"]._jobs == {}
 
     generator = api_modules["fake_generator"]
@@ -797,6 +943,7 @@ def test_declared_hunyuan_style_image_path_params_are_server_managed(
         consumed["right"] = Path(params["right_image_path"])
         consumed["right_camel"] = Path(params["rightImagePath"])
         consumed["generic"] = list(params["extra_image_paths"])
+        consumed["reference_raw"] = params["reference_images"]
         consumed["reference_count"] = int(params["reference_images"])
         consumed["input_images_label"] = params["input_images"]
         assert consumed["left"].is_file()
@@ -812,7 +959,7 @@ def test_declared_hunyuan_style_image_path_params_are_server_managed(
             model_id=api_modules["valid_model_id"],
             secondaries=[(2, "left"), (4, "right")],
         ), ("params", (None, json.dumps({
-            "reference_images": 3,
+            "reference_images": "3",
             "input_images": "three",
         })))],
     )
@@ -821,6 +968,7 @@ def test_declared_hunyuan_style_image_path_params_are_server_managed(
     assert consumed["generic"][0] == str(consumed["left"])
     assert consumed["generic"][1] is None
     assert consumed["generic"][2] == str(consumed["right"])
+    assert consumed["reference_raw"] == "3"
     assert consumed["reference_count"] == 3
     assert consumed["input_images_label"] == "three"
     assert consumed["generic"] != consumed["reference_count"]

@@ -62,3 +62,51 @@ def test_workspace_route_rejects_symlink_escape(api_modules, monkeypatch, tmp_pa
     response = client.get("/workspace/Workflows/generated/escape.txt")
 
     assert response.status_code == 404
+
+
+def test_workspace_route_denies_private_input_custody_tree(api_modules, monkeypatch):
+    private_file = (
+        api_modules["workspace_dir"]
+        / ".modly-private-inputs"
+        / "job-id"
+        / "slot-2.png"
+    )
+    private_file.parent.mkdir(parents=True)
+    private_file.write_bytes(b"private")
+
+    client = _create_client(monkeypatch)
+    response = client.get("/workspace/.modly-private-inputs/job-id/slot-2.png")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/workspace/.MODLY-PRIVATE-INPUTS/job-id/slot-2.png",
+        "/workspace/%2emodly-private-inputs/job-id/slot-2.png",
+        "/workspace/.modly-private-inputs%5cjob-id%5cslot-2.png",
+    ],
+)
+def test_workspace_route_denies_private_tree_spelling_variants(path, api_modules, monkeypatch):
+    client = _create_client(monkeypatch)
+    assert client.get(path).status_code == 404
+
+
+def test_workspace_route_denies_symlink_alias_to_private_tree(api_modules):
+    import main
+
+    workspace = api_modules["workspace_dir"]
+    private_file = workspace / ".modly-private-inputs" / "job" / "slot.png"
+    private_file.parent.mkdir(parents=True)
+    private_file.write_bytes(b"private")
+    alias = workspace / "Workflows" / "private-alias"
+    alias.parent.mkdir(parents=True)
+    try:
+        alias.symlink_to(private_file.parent, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    with pytest.raises(Exception) as error:
+        main.resolve_workspace_request_path(workspace, "Workflows/private-alias/slot.png")
+    assert getattr(error.value, "status_code", None) == 404

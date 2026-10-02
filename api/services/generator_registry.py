@@ -714,6 +714,7 @@ def _discover_extensions(
                         "params_schema":    node.get("params_schema", manifest.get("params_schema", [])),
                         "input":            normalize_model_input(node.get("input", "image")),
                         "inputs":           node.get("inputs"),
+                        "input_contract":   node.get("input_contract"),
                         "output":           node.get("output", "mesh"),
                         "weight_groups":    [group_by_id[group_id] for group_id in group_ids],
                     }

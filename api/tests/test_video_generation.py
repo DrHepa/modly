@@ -52,7 +52,7 @@ def test_generate_from_video_artifact_reaches_generator_and_returns_mesh(
             "input_path": "Workflows/Imported Videos/turntable.mp4",
             "model_id": api_modules["valid_model_id"],
             "collection": "VideoRuns",
-            "params": {"filename": "from-video.glb", "quality": "draft", "video_path": "/forged/outside.mp4"},
+            "params": {"filename": "from-video.glb", "quality": "draft"},
         },
     )
 
@@ -74,6 +74,30 @@ def test_generate_from_video_artifact_reaches_generator_and_returns_mesh(
         },
     }]
     assert video_path.exists()
+
+
+def test_generate_from_video_artifact_rejects_undeclared_transport_alias(
+    client,
+    api_modules,
+):
+    _select_video_model(api_modules)
+    video_path = api_modules["workspace_dir"] / "Workflows" / "turntable.mp4"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(MP4)
+
+    response = client.post(
+        "/generate/from-artifact",
+        json={
+            "input_kind": "video",
+            "input_path": "Workflows/turntable.mp4",
+            "model_id": api_modules["valid_model_id"],
+            "params": {"video_path": "/forged/outside.mp4"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "not declared" in response.text
+    assert api_modules["generation_jobs"]._jobs == {}
 
 
 def test_generate_from_video_artifact_rejects_traversal_and_symlink_escape(

@@ -27,7 +27,7 @@ const candidates = [
 
 function works(cmd, prefix) {
   try {
-    const r = spawnSync(cmd, [...prefix, '-c', 'import fastapi, pytest'], { stdio: 'ignore' })
+    const r = spawnSync(cmd, [...prefix, '-c', 'import fastapi, pytest, PIL'], { stdio: 'ignore' })
     return r.status === 0
   } catch {
     return false
@@ -82,7 +82,9 @@ const pytestResult = spawnSync(cmd, [
   'tests/test_generation_inputs.py',
   'tests/test_hf_download_assets.py',
   'tests/test_https_download_assets.py',
+  'tests/test_secondary_image_custody.py',
   'tests/test_video_generation.py',
+  'tests/test_workspace_route_security.py',
   '-q',
 ], {
   cwd: apiDir,

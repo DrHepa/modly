@@ -460,6 +460,8 @@ type ModelGenerationRequest =
       kind: 'image'
       imagePath: string
       imageData?: string
+      secondaryImages: Array<{ slot: number; handle: string; path: string }>
+      meshPath?: string
       params: Record<string, unknown>
     }
   | {
@@ -500,6 +502,25 @@ type ModelGenerationStatus = {
   error?: string
 }
 
+function imageMimeTypeFromBytes(bytes: Uint8Array, filePath: string): string {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 12
+    && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF'
+    && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp'
+  if (bytes.length >= 8
+    && bytes[0] === 0x89
+    && String.fromCharCode(...bytes.slice(1, 4)) === 'PNG') return 'image/png'
+  if (bytes.length >= 4 && ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00)
+    || (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a))) return 'image/tiff'
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) return 'image/bmp'
+  const normalized = filePath.toLowerCase()
+  if (normalized.endsWith('.jpg') || normalized.endsWith('.jpeg')) return 'image/jpeg'
+  if (normalized.endsWith('.webp')) return 'image/webp'
+  if (normalized.endsWith('.tif') || normalized.endsWith('.tiff')) return 'image/tiff'
+  if (normalized.endsWith('.bmp')) return 'image/bmp'
+  return 'image/png'
+}
+
 export function shouldUsePreviousNodeFallback(input: WorkflowExtension['input']): boolean {
   return input !== 'none'
 }
@@ -535,6 +556,7 @@ export function buildModelGenerationRequest(args: {
   nodeInputText?: string
   nodeInputMeshPath?: string
   routedMeshParams?: Record<string, string>
+  routedSecondaryImages?: Array<{ slot: number; handle: string; path: string }>
   routedSideParams?: Record<string, string>
   routedExtraImagePaths?: Array<string | undefined>
   selectedImagePath?: string
@@ -565,7 +587,7 @@ export function buildModelGenerationRequest(args: {
   if (input === 'scene') {
     if (!args.nodeInputPath) throw new Error(`Missing required scene input for extension ${ext.id}`)
     const scenePath = normalizeWorkflowPath(args.nodeInputPath, args.workspaceDir)
-    return { kind: 'scene', scenePath, params: { ...nodeParams, scene_path: scenePath, input_scene_path: scenePath } }
+    return { kind: 'scene', scenePath, params: nodeParams }
   }
 
   if (input === 'capture') {
@@ -828,6 +850,8 @@ async function executeExtensionNode(
   // Every image beyond the first resolved slot, for extensions that take several
   // (e.g. a texture node taking a mesh plus multiple reference images).
   const extraImagePaths: Array<string | undefined> = []
+  const secondaryImages: Array<{ slot: number; handle: string; path: string }> = []
+  let primaryImagePort: { slot: number; handle: string } | undefined
 
   const incomingEdges = workflow.edges.filter((e) => e.target === node.id)
   const isInputless = mode === 'model' && ext.input === 'none'
@@ -860,6 +884,15 @@ async function executeExtensionNode(
     }
     // Named primary wins regardless of edge order; physical secondary gaps stay reserved.
     nodeInputPath = routedImages.get(primaryName) ?? legacyImagePath
+    if (hasNamedProcessInputs(ext.inputs)) {
+      ext.inputs.forEach((port, index) => {
+        if (port.name === primaryName) primaryImagePort = { slot: index + 1, handle: port.name }
+        const path = routedImages.get(port.name)
+        if (port.type === 'image' && port.name !== primaryName && path) {
+          secondaryImages.push({ slot: index + 1, handle: port.name, path })
+        }
+      })
+    }
     if (hasViewLayout) {
       for (const side of ['left', 'back', 'right']) {
         const path = routedImages.get(side)
@@ -891,6 +924,22 @@ async function executeExtensionNode(
     nodeInputPath     = slots.nodeInputPath
     nodeInputMeshPath = slots.nodeInputMeshPath
     extraImagePaths.push(...slots.extraImagePaths)
+    if (mode === 'model') {
+      let primaryResolved = false
+      const counts = new Map<string, number>()
+      inputTypes.forEach((type, index) => {
+        const count = (counts.get(type) ?? 0) + 1
+        counts.set(type, count)
+        const path = inputPaths[index]
+        if (type !== 'image' || !path) return
+        if (!primaryResolved) {
+          primaryResolved = true
+          primaryImagePort = { slot: index + 1, handle: count === 1 ? type : `${type}_${count}` }
+          return
+        }
+        secondaryImages.push({ slot: index + 1, handle: count === 1 ? type : `${type}_${count}`, path })
+      })
+    }
   } else if (mode === 'model' && (ext.input === 'video' || ext.input === 'capture')) {
     for (const edge of incomingEdges) {
       const src = resolveSource(edge)
@@ -946,7 +995,7 @@ async function executeExtensionNode(
       const base64 = await window.electron.fs.readFileBase64(activeImagePath as string)
       assertCurrentContext(ctx)
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-      blob = new Blob([bytes], { type: 'image/png' })
+      blob = new Blob([bytes], { type: imageMimeTypeFromBytes(bytes, activeImagePath ?? '') })
       fname = activeImagePath?.split(/[\\/]/).pop() ?? 'image.png'
     }
 
@@ -972,7 +1021,8 @@ async function executeExtensionNode(
       for (const side of ['left', 'back', 'right']) {
         if (namedModelImagePorts.has(side)) delete effectiveParams[`${side}_image_path`]
       }
-      Object.assign(effectiveParams, routedSideParams)
+      // Connected declared ports travel as custody-owned multipart bytes, not
+      // raw path parameters; undeclared ordinary user params remain untouched.
     }
 
     setRunState((s) => ({ ...s, blockProgress: 5, blockStep: 'Submitting to model…' }))
@@ -1054,7 +1104,29 @@ async function executeExtensionNode(
       fd.append('remesh', 'none')
       fd.append('enable_texture', 'false')
       fd.append('texture_resolution', '1024')
-      fd.append('params', JSON.stringify({ ...effectiveParams, ...extraParams }))
+      const imageParams = { ...effectiveParams, ...extraParams }
+      if (primaryImagePort) {
+        fd.append('primary_image_slot', String(primaryImagePort.slot))
+        fd.append('primary_image_handle', primaryImagePort.handle)
+      }
+      if (secondaryImages.length > 0) delete imageParams.extra_image_paths
+      const transportMeshPath = nodeInputMeshPath ?? meshPaths.get('mesh')
+        ?? (meshPorts.length === 1 ? meshPaths.get(meshPorts[0].name) : undefined)
+      if (transportMeshPath) {
+        fd.append('mesh_path', normalizeWorkflowPath(transportMeshPath, workspaceDir))
+        delete imageParams.mesh_path
+      }
+      for (const secondary of secondaryImages) {
+        const base64 = await window.electron.fs.readFileBase64(secondary.path)
+        assertCurrentContext(ctx)
+        const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+        const name = secondary.path.split(/[\\/]/).pop() ?? `image-${secondary.slot}.png`
+        fd.append('secondary_image', new Blob([bytes], { type: imageMimeTypeFromBytes(bytes, secondary.path) }), name)
+        fd.append('secondary_image_slot', String(secondary.slot))
+        fd.append('secondary_image_handle', secondary.handle)
+      }
+      fd.append('params', JSON.stringify(imageParams))
+      assertCurrentContext(ctx)
       submission = await client.post('/generate/from-image', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
     }
     const { data } = submission

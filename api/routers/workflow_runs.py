@@ -6,17 +6,28 @@ from schemas.generation import GenerateFromSceneRequest, GenerateFromTextRequest
 from schemas.workflow_runs import WorkflowRunAccepted, WorkflowRunCancelResponse, WorkflowRunStatus
 from services.generation_jobs import (
     VALID_REMESH_MODES,
+    ImageRequestBudget,
     cancel_job,
     create_from_image_job,
     create_from_none_job,
     create_from_text_job,
     get_job_status,
+    extract_declared_legacy_image_transports,
+    extract_legacy_extra_image_paths,
+    inject_trusted_host_transport_params,
     parse_params_object,
     sanitize_collection,
     require_model_id,
     require_model_input,
     validate_model_id,
     validate_image_upload,
+    read_validated_image_upload,
+    snapshot_legacy_secondary_images,
+    snapshot_declared_legacy_image_transports,
+    validate_host_mesh_path,
+    validate_secondary_image_metadata,
+    validate_primary_image_metadata,
+    reject_host_image_transport_params,
 )
 
 router = APIRouter(tags=["workflow-runs"])
@@ -26,28 +37,83 @@ router = APIRouter(tags=["workflow-runs"])
 async def create_from_image_run(
     background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
+    secondary_image: list[UploadFile] | None = File(None),
+    secondary_image_slot: list[int] | None = Form(None),
+    secondary_image_handle: list[str] | None = Form(None),
+    primary_image_slot: int | None = Form(None),
+    primary_image_handle: str | None = Form(None),
+    mesh_path: str | None = Form(None),
     model_id: str = Form("sf3d"),
     collection: str = Form("Default"),
     params: Optional[str] = Form(None),
 ):
     validate_image_upload(image)
-    model_params = parse_params_object(params, strict=True)
+
+    model_id = require_model_id(model_id)
+    manifest = validate_model_id(model_id)
+    model_params, legacy_paths, legacy_paths_present = extract_legacy_extra_image_paths(
+        parse_params_object(params, strict=True)
+    )
+    validate_primary_image_metadata(model_id, primary_image_slot, primary_image_handle)
+    reject_host_image_transport_params(model_id, model_params)
+    model_params, raw_declared_image_transports = extract_declared_legacy_image_transports(
+        model_id, model_params
+    )
+    mesh_input_path = (
+        validate_host_mesh_path(model_id, mesh_path)
+        if mesh_path is not None
+        else None
+    )
+    secondary_uploads = secondary_image or []
+    secondary_slots = secondary_image_slot or []
+    secondary_handles = secondary_image_handle or []
+    if not (
+        len(secondary_uploads) == len(secondary_slots) == len(secondary_handles)
+    ):
+        raise HTTPException(
+            400,
+            "secondary_image, secondary_image_slot, and secondary_image_handle counts must match",
+        )
+    if legacy_paths_present and secondary_uploads:
+        raise HTTPException(
+            400,
+            "legacy extra_image_paths must not be combined with multipart secondary images",
+        )
+    validate_secondary_image_metadata(
+        model_id, secondary_slots, secondary_handles,
+        primary_image_slot=primary_image_slot, primary_image_handle=primary_image_handle,
+    )
+    image_budget = ImageRequestBudget()
+    image_bytes, _suffix = await read_validated_image_upload(image, image_budget)
+    secondary_images: list[tuple[int, str, bytes, str]] = []
+    for upload, slot, handle in zip(
+        secondary_uploads, secondary_slots, secondary_handles, strict=True
+    ):
+        data, suffix = await read_validated_image_upload(upload, image_budget)
+        secondary_images.append((slot, handle, data, suffix))
+    if legacy_paths_present:
+        secondary_images = snapshot_legacy_secondary_images(
+            model_id, legacy_paths, image_budget,
+            primary_image_slot=primary_image_slot, primary_image_handle=primary_image_handle,
+        )
+    legacy_image_transports = snapshot_declared_legacy_image_transports(
+        model_id, raw_declared_image_transports, image_budget
+    )
     full_params = {
-        "remesh": "quad",
-        "enable_texture": False,
-        "texture_resolution": 1024,
+        "remesh": "quad", "enable_texture": False, "texture_resolution": 1024,
         **model_params,
     }
     if full_params["remesh"] not in VALID_REMESH_MODES:
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
-
     collection = sanitize_collection(collection)
-    model_id = require_model_id(model_id)
-    manifest = validate_model_id(model_id)
-    image_bytes = await image.read()
     job = create_from_image_job(
         background_tasks, image_bytes, full_params, collection,
         manifest.get("output", "mesh"), model_id,
+        secondary_images=secondary_images,
+        legacy_image_transports=legacy_image_transports,
+        mesh_input_path=mesh_input_path,
+        primary_image_slot=primary_image_slot,
+        primary_image_handle=primary_image_handle,
     )
     return WorkflowRunAccepted.from_job(job)
 

@@ -925,7 +925,64 @@ test('workflowRunStore preserves legacy front routing for named image ports', as
 
   assert.equal(postCalls.length, 1)
   assert.equal((postCalls[0].data.get('image') as File).name, 'front-view.png')
-  assert.deepEqual(fsReadCalls, ['/tmp/front-view.png'])
+  assert.deepEqual(postCalls[0].data.getAll('secondary_image_slot'), ['2', '4'])
+  assert.deepEqual(postCalls[0].data.getAll('secondary_image_handle'), ['left', 'right'])
+  assert.deepEqual(
+    postCalls[0].data.getAll('secondary_image').map((file) => (file as File).name),
+    ['left-view.png', 'right-view.png'],
+  )
+  assert.deepEqual(fsReadCalls, ['/tmp/front-view.png', '/tmp/left-view.png', '/tmp/right-view.png'])
+})
+
+test('workflowRunStore preserves declared legacy image paths for API custody', async () => {
+  const ext = createNamedImageModelExtension({
+    inputs: [{ name: 'image', type: 'image', required: true }],
+    params: [
+      { id: 'prompt_image_path', label: 'Prompt', type: 'string', default: '', pickerIntent: 'image' },
+      { id: 'view_2_image_path', label: 'View 2', type: 'string', default: '', pickerIntent: 'image' },
+      { id: 'depthImagePath', label: 'Depth', type: 'string', default: '', pickerIntent: 'image' },
+      { id: 'image_paths', label: 'Views', type: 'string', default: '[]', tooltip: 'JSON list of image paths.' },
+      { id: 'images_dir', label: 'VGGT images', type: 'string', default: '' },
+      { id: 'image_folder', label: 'Hunyuan folder', type: 'string', default: '' },
+      { id: 'constraints_path', label: 'Constraints', type: 'string', default: '', pickerIntent: 'generic-file', tooltip: 'Path to constraints.' },
+    ],
+  })
+  const expected = {
+    prompt_image_path: 'Refs/prompt.png',
+    view_2_image_path: 'Refs/view-2.png',
+    depthImagePath: 'Refs/depth.png',
+    image_paths: '["Refs/a.png",null,"Refs/b.png"]',
+    images_dir: 'Views/VGGT',
+    image_folder: 'Views/Hunyuan',
+    constraints_path: '',
+  }
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: expected,
+    }),
+    imageSources: [{ id: 'primary-source', filePath: '/tmp/primary.png', targetHandle: 'image' }],
+  })
+  let posted: FormData | undefined
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      assert.equal(path, '/generate/from-image')
+      posted = data as FormData
+      return { data: { job_id: 'job-legacy-path-custody' } }
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/legacy.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(JSON.parse(String(posted?.get('params'))), expected)
 })
 
 test('workflowRunStore routes legacy positional image slots in order and preserves secondary gaps', async () => {
@@ -934,11 +991,11 @@ test('workflowRunStore routes legacy positional image slots in order and preserv
     node: createNode('model-node', 'extensionNode', {
       extensionId: ext.id,
       enabled: true,
-      params: {},
+      params: { extra_image_paths: ['/home/drhepa/Descargas/stale-raw-path.png'] },
     }),
     imageSources: [
-      { id: 'primary-source', filePath: '/tmp/primary.png', targetHandle: 'image' },
-      { id: 'third-source', filePath: '/tmp/third.png', targetHandle: 'image_3' },
+      { id: 'primary-source', filePath: '/tmp/primary.tiff', targetHandle: 'image' },
+      { id: 'third-source', filePath: '/home/drhepa/Descargas/third.bmp', targetHandle: 'image_3' },
     ],
   })
   const postCalls: FormData[] = []
@@ -964,12 +1021,159 @@ test('workflowRunStore routes legacy positional image slots in order and preserv
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
   assert.equal(postCalls.length, 1)
-  assert.equal((postCalls[0].get('image') as File).name, 'primary.png')
-  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
-    extra_image_paths: [null, '/tmp/third.png'],
-  })
-  assert.deepEqual(fsReadCalls, ['/tmp/primary.png'])
+  assert.equal((postCalls[0].get('image') as File).name, 'primary.tiff')
+  assert.equal((postCalls[0].get('image') as File).type, 'image/tiff')
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {})
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['3'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['image_3'])
+  assert.equal((postCalls[0].get('secondary_image') as File).name, 'third.bmp')
+  assert.equal((postCalls[0].get('secondary_image') as File).type, 'image/bmp')
+  assert.equal(String(postCalls[0].get('params')).includes('/home/drhepa/Descargas'), false)
+  assert.deepEqual(fsReadCalls, ['/tmp/primary.tiff', '/home/drhepa/Descargas/third.bmp'])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+})
+
+test('workflowRunStore snapshots custom declared secondary handles without raw path params', async () => {
+  const ext = createNamedImageModelExtension({
+    inputs: [
+      { name: 'hero', type: 'image', required: true },
+      { name: 'style-reference', type: 'image', required: false },
+      { name: 'occlusion', type: 'image', required: false },
+    ],
+  })
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model-node', 'extensionNode', {
+      extensionId: ext.id,
+      enabled: true,
+      params: {
+        reference_image_path: '/outside/stale-reference.png',
+        'style-reference_image_paths': ['/outside/stale-style.png'],
+        CUSTOM_ROLE_IMAGE_PATH: '/outside/stale-custom.png',
+        input_images: ['/outside/stale-input.png'],
+        inputImages: ['/outside/stale-input-camel.png'],
+        reference_images: ['/outside/stale-reference-images.png'],
+        referenceImages: ['/outside/stale-reference-images-camel.png'],
+        referenceImagePaths: ['/outside/stale-reference-paths-camel.png'],
+      },
+    }),
+    imageSources: [
+      { id: 'hero-source', filePath: '/tmp/hero.png', targetHandle: 'hero' },
+      { id: 'occlusion-source', filePath: '/outside/occlusion.webp', targetHandle: 'occlusion' },
+    ],
+  })
+  const postCalls: FormData[] = []
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-custom-handles' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/custom.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['3'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['occlusion'])
+  assert.equal((postCalls[0].get('secondary_image') as File).name, 'occlusion.webp')
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {})
+  assert.deepEqual(fsReadCalls, ['/tmp/hero.png', '/outside/occlusion.webp'])
+})
+
+test('workflowRunStore transports mixed mesh and image inputs without declared raw side paths', async () => {
+  const ext = createNamedImageModelExtension({
+    id: 'hunyuan3d2mv/texture-mesh',
+    extensionId: 'hunyuan3d2mv',
+    nodeId: 'texture-mesh',
+    inputs: [
+      { name: 'front', type: 'image', required: true },
+      { name: 'mesh', type: 'mesh', required: true },
+      { name: 'left', type: 'image', required: false },
+      { name: 'back', type: 'image', required: false },
+      { name: 'right', type: 'image', required: false },
+    ],
+    params: [
+      {
+        id: 'reference_images',
+        label: 'Reference image count',
+        type: 'select',
+        default: 4,
+        options: [1, 2, 3, 4].map((value) => ({ value, label: String(value) })),
+      },
+      { id: 'input_images', label: 'Reference preset', type: 'string', default: 'three' },
+      { id: 'left_image_path', label: 'Left', type: 'string', default: '' },
+      { id: 'back_image_path', label: 'Back', type: 'string', default: '' },
+      { id: 'right_image_path', label: 'Right', type: 'string', default: '' },
+    ],
+  })
+  const modelNode = createNode('model-node', 'extensionNode', {
+    extensionId: ext.id,
+    enabled: true,
+    params: {
+      reference_images: 3,
+      input_images: 'three',
+      left_image_path: '/outside/forged-left.png',
+      back_image_path: '/outside/forged-back.png',
+      right_image_path: '/outside/forged-right.png',
+    },
+  })
+  const workflow: Workflow = {
+    id: 'workflow-mixed-texture',
+    name: 'Mixed texture transport',
+    description: '',
+    nodes: [
+      createNode('front-source', 'imageNode', { enabled: true, params: { filePath: '/tmp/front.png' } }),
+      createNode('left-source', 'imageNode', { enabled: true, params: { filePath: '/tmp/left.png' } }),
+      createNode('mesh-source', 'meshNode', { enabled: true, params: { source: 'file', filePath: '/workspace/Meshes/source.glb' } }),
+      modelNode,
+      createNode('output-node', 'outputNode', { enabled: true, params: {} }),
+    ],
+    edges: [
+      { id: 'edge-front', source: 'front-source', target: modelNode.id, targetHandle: 'front' },
+      { id: 'edge-left', source: 'left-source', target: modelNode.id, targetHandle: 'left' },
+      { id: 'edge-mesh', source: 'mesh-source', target: modelNode.id, targetHandle: 'mesh' },
+      { id: 'edge-output', source: modelNode.id, target: 'output-node' },
+    ],
+    createdAt: '2026-10-02T00:00:00.000Z',
+    updatedAt: '2026-10-02T00:00:00.000Z',
+  }
+  const postCalls: FormData[] = []
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    if (typeof callback === 'function') callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  axiosClientMock = {
+    async post(path: string, data?: unknown) {
+      if (path === '/generate/from-image') {
+        postCalls.push(data as FormData)
+        return { data: { job_id: 'job-mixed-texture' } }
+      }
+      throw new Error(`Unexpected axios.post call: ${path}`)
+    },
+    async get() {
+      return { data: { status: 'done', output_url: '/workspace/output/textured.glb' } }
+    },
+  }
+
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+
+  assert.equal(postCalls.length, 1)
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
+    reference_images: 3,
+    input_images: 'three',
+  })
+  assert.equal(postCalls[0].get('mesh_path'), 'Meshes/source.glb')
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['3'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['left'])
+  assert.deepEqual(fsReadCalls, ['/tmp/front.png', '/tmp/left.png'])
 })
 
 test('workflowRunStore normalizes raw positional image handles at runtime before dispatch', async () => {
@@ -1009,10 +1213,11 @@ test('workflowRunStore normalizes raw positional image handles at runtime before
 
   assert.equal(postCalls.length, 1)
   assert.equal((postCalls[0].get('image') as File).name, 'primary.png')
-  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
-    extra_image_paths: [null, '/tmp/third.png'],
-  })
-  assert.deepEqual(fsReadCalls, ['/tmp/primary.png'])
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {})
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['3'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['image_3'])
+  assert.equal((postCalls[0].get('secondary_image') as File).name, 'third.png')
+  assert.deepEqual(fsReadCalls, ['/tmp/primary.png', '/tmp/third.png'])
   assert.equal(workflow.edges.find((edge) => edge.id === 'edge-primary-source')?.targetHandle, 'input-0')
   assert.equal(workflow.edges.find((edge) => edge.id === 'edge-third-source')?.targetHandle, 'input-2')
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
@@ -1061,7 +1266,7 @@ test('workflowRunStore keeps an untargeted legacy image edge as primary for name
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
 })
 
-test('workflowRunStore flattens only connected named side views into model params', async () => {
+test('workflowRunStore snapshots connected named side views with handles and physical slots', async () => {
   const ext = createNamedImageModelExtension({
     params: [
       { id: 'prompt', label: 'Prompt', type: 'string', default: 'fallback prompt' },
@@ -1107,10 +1312,14 @@ test('workflowRunStore flattens only connected named side views into model param
   assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
     prompt: 'refine',
     strength: 0.75,
-    left_image_path: '/tmp/left.png',
-    back_image_path: '/tmp/back.png',
-    right_image_path: '/tmp/right.png',
   })
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['2', '3', '4'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['left', 'back', 'right'])
+  assert.deepEqual(
+    postCalls[0].getAll('secondary_image').map((file) => (file as File).name),
+    ['left.png', 'back.png', 'right.png'],
+  )
+  assert.deepEqual(fsReadCalls, ['/tmp/front.png', '/tmp/left.png', '/tmp/back.png', '/tmp/right.png'])
 })
 
 test('workflowRunStore omits unconnected side views and removes stale reserved side params', async () => {
@@ -1188,8 +1397,11 @@ test('workflowRunStore falls back to selectedImagePath when front is missing but
 
   assert.equal(postCalls.length, 1)
   assert.equal((postCalls[0].get('image') as File).name, 'source.png')
-  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), { left_image_path: '/tmp/left-only.png' })
-  assert.deepEqual(fsReadCalls, [])
+  assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {})
+  assert.deepEqual(postCalls[0].getAll('secondary_image_slot'), ['2'])
+  assert.deepEqual(postCalls[0].getAll('secondary_image_handle'), ['left'])
+  assert.equal((postCalls[0].get('secondary_image') as File).name, 'left-only.png')
+  assert.deepEqual(fsReadCalls, ['/tmp/left-only.png'])
 })
 
 test('workflowRunStore preserves the legacy missing-primary-image failure when front and selected image are both absent', async () => {
@@ -1640,7 +1852,7 @@ test('workflowRunStore blocks model dispatch before backend requests when capabi
   }
 })
 
-test('buildModelGenerationRequest accepts scene model inputs as scene path params', () => {
+test('buildModelGenerationRequest keeps scene transport out of client params', () => {
   const ext = createWorkflowExtension({
     id: 'hy-world-2/worldstereo-2',
     extensionId: 'hy-world-2',
@@ -1665,11 +1877,7 @@ test('buildModelGenerationRequest accepts scene model inputs as scene path param
 
   assert.equal(request.kind, 'scene')
   assert.equal(request.scenePath, 'Default/worlds/scene.scene.json')
-  assert.deepEqual(request.params, {
-    steps: 12,
-    scene_path: 'Default/worlds/scene.scene.json',
-    input_scene_path: 'Default/worlds/scene.scene.json',
-  })
+  assert.deepEqual(request.params, { steps: 12 })
 })
 
 test('workflowRunStore dispatches scene-capability model nodes to /generate/from-artifact as JSON without reading image bytes', async () => {
@@ -1733,11 +1941,7 @@ test('workflowRunStore dispatches scene-capability model nodes to /generate/from
     remesh: 'none',
     enable_texture: false,
     texture_resolution: 1024,
-    params: {
-      steps: 12,
-      scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
-      input_scene_path: 'Default/worlds/hero-scene/scene-manifest.json',
-    },
+    params: { steps: 12 },
   })
   assert.equal(postCalls[0].config, undefined)
   assert.deepEqual(fsReadCalls, ['/workspace/Default/worlds/hero-scene/scene-manifest.json'])
@@ -3271,9 +3475,9 @@ test('workflowRunStore injects landmarks_sidecar_path into Rig Mesh params with 
   assert.equal(postCalls.length, 1)
   assert.deepEqual(JSON.parse(String(postCalls[0].get('params'))), {
     quality: 'draft',
-    mesh_path: 'meshes/original.glb',
     landmarks_sidecar_path: assertLandmarkCapturePath(landmarkSidecarWriteCalls[0]?.sidecarWorkspacePath, 'workflow-landmarks-rig-mesh'),
   })
+  assert.equal(postCalls[0].get('mesh_path'), 'meshes/original.glb')
 })
 
 test('workflowRunStore injects landmarks_sidecar_path into Unirig params with the original mesh path', async () => {

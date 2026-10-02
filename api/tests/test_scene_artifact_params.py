@@ -46,7 +46,11 @@ class SceneArtifactParamTests(unittest.TestCase):
 
             with mock.patch.object(registry_module, "WORKSPACE_DIR", workspace), \
                  mock.patch.object(generator_registry, "_generators", {"demo/scene": type("FakeGen", (), {"model_dir": Path("/")})()}, create=True), \
-                 mock.patch.object(generator_registry, "_manifests", {"demo/scene": {"id": "demo/scene", "input": "scene"}}, create=True), \
+                 mock.patch.object(generator_registry, "_manifests", {"demo/scene": {
+                     "id": "demo/scene",
+                     "input": "scene",
+                     "params_schema": [{"id": "quality", "type": "string"}],
+                 }}, create=True), \
                  mock.patch.object(generator_registry, "switch_model", lambda model_id: None), \
                  mock.patch.object(generation, "create_from_artifact_job", fake_create_job):
                 result = asyncio.run(generation.generate_from_artifact(GenerateFromArtifactRequest(
@@ -54,12 +58,7 @@ class SceneArtifactParamTests(unittest.TestCase):
                     input_path="Worlds/hero",
                     model_id="demo/scene",
                     collection="SceneRuns",
-                    params={
-                        "quality": "draft",
-                        "scene_manifest_path": "/forged/outside.json",
-                        "scene_path": "Forged/outside.json",
-                        "input_scene_path": "Forged/input.json",
-                    },
+                    params={"quality": "draft"},
                 ), BackgroundTasks()))
 
             self.assertEqual(result, {"job_id": "scene-job"})

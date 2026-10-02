@@ -252,7 +252,7 @@ def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_
     assert none_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'scene' but this endpoint received 'none'."
 
 
-def test_generate_from_artifact_routes_validated_capture_and_strips_reserved_params(
+def test_generate_from_artifact_routes_validated_capture_and_rejects_reserved_params(
     client,
     api_modules,
     monkeypatch,
@@ -296,7 +296,7 @@ def test_generate_from_artifact_routes_validated_capture_and_strips_reserved_par
         return output
 
     monkeypatch.setattr(api_modules["fake_generator"], "generate", generate)
-    response = client.post("/generate/from-artifact", json={
+    forged_response = client.post("/generate/from-artifact", json={
         "input_kind": "capture",
         "input_path": "Captures/chair/capture-manifest.json",
         "model_id": api_modules["valid_model_id"],
@@ -306,6 +306,18 @@ def test_generate_from_artifact_routes_validated_capture_and_strips_reserved_par
             "capture_manifest_path": "/forged/outside.json",
             "typed_input_path": "/forged/typed.json",
         },
+    })
+
+    assert forged_response.status_code == 400
+    assert "not declared" in forged_response.text
+    assert api_modules["generation_jobs"]._jobs == {}
+
+    response = client.post("/generate/from-artifact", json={
+        "input_kind": "capture",
+        "input_path": "Captures/chair/capture-manifest.json",
+        "model_id": api_modules["valid_model_id"],
+        "collection": "CaptureRuns",
+        "params": {"quality": "high"},
     })
 
     assert response.status_code == 200

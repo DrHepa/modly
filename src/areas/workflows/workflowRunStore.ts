@@ -583,6 +583,8 @@ type ModelGenerationRequest =
       kind: 'image'
       imagePath: string
       imageData?: string
+      secondaryImages: Array<{ slot: number; handle: string; path: string }>
+      meshPath?: string
       params: Record<string, unknown>
     }
   | {
@@ -623,8 +625,73 @@ type ModelGenerationStatus = {
   error?: string
 }
 
-const RESERVED_MODEL_SIDE_IMAGE_PARAMS = ['left_image_path', 'back_image_path', 'right_image_path'] as const
-const RESERVED_MODEL_IMAGE_VIEW_NAMES = new Set(['front', 'left', 'back', 'right'])
+function compactImageTransportId(value: string): string {
+  return value.trim().replace(/[._\-\s]/g, '').toLowerCase()
+}
+
+function isUndeclaredSecondaryImagePathAlias(key: string): boolean {
+  const compact = compactImageTransportId(key)
+  return compact === 'extraimagepaths'
+    || compact === 'imagepaths'
+    || compact === 'inputimages'
+    || compact === 'inputimagepaths'
+    || compact === 'referenceimages'
+    || compact === 'referenceimagepaths'
+    || compact.endsWith('imagepath')
+    || compact.endsWith('imagepaths')
+}
+
+function stringParamHasImagePathEvidence(param: WorkflowExtension['params'][number]): boolean {
+  if (param.type !== 'string') return false
+  const compact = compactImageTransportId(param.id)
+  if (compact.endsWith('imagepath') || compact.endsWith('imagepaths')) return true
+  if (param.pickerIntent === 'image') return true
+  if (param.filters?.some((filter) => filter.extensions.some((extension) => (
+    ['png', 'jpg', 'jpeg', 'webp'].includes(extension.toLowerCase().replace(/^\./, ''))
+  )))) return true
+  return false
+}
+
+function isReservedSecondaryImagePathParam(key: string, ext: WorkflowExtension): boolean {
+  const param = ext.params.find((candidate) => candidate.id === key)
+  if (!param) return isUndeclaredSecondaryImagePathAlias(key)
+  if (!stringParamHasImagePathEvidence(param)) return false
+
+  const imageHandles = (ext.inputs ?? [])
+    .filter((input) => input.type === 'image')
+    .map((input) => compactImageTransportId(input.name))
+  if (imageHandles.length <= 1) return false
+  const compact = compactImageTransportId(key)
+  if (new Set([
+    'extraimagepaths',
+    'imagepaths',
+    'inputimages',
+    'inputimagepaths',
+    'referenceimages',
+    'referenceimagepaths',
+  ]).has(compact)) return true
+  const numberedView = /^view(\d+)imagepath$/.exec(compact)
+  if (numberedView) {
+    const slot = Number(numberedView[1])
+    return slot >= 2 && slot <= imageHandles.length
+  }
+  return imageHandles.slice(1).some((handle) => (
+    compact === `${handle}path` || compact === `${handle}imagepath`
+  ))
+}
+
+const HOST_TRANSPORT_PARAM_IDS = new Set([
+  'scene_manifest_path', 'scene_path', 'input_scene_path',
+  'capture_manifest_path', 'capture_path', 'input_capture_path',
+  'video_path', 'input_video_path', 'typed_input_kind', 'typed_input_path',
+  'mesh_path',
+])
+
+function withoutHostTransportAliases(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(params).filter(([key]) => !HOST_TRANSPORT_PARAM_IDS.has(key)),
+  )
+}
 
 function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
   const norm = filePath.replace(/\\/g, '/')
@@ -633,6 +700,25 @@ function normalizeWorkflowPath(filePath: string, workspaceDir: string): string {
   return norm.startsWith(`${workspace}/`)
     ? norm.slice(workspace.length + 1)
     : norm
+}
+
+function imageMimeTypeFromBytes(bytes: Uint8Array, filePath: string): string {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 12
+    && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF'
+    && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp'
+  if (bytes.length >= 8
+    && bytes[0] === 0x89
+    && String.fromCharCode(...bytes.slice(1, 4)) === 'PNG') return 'image/png'
+  if (bytes.length >= 4 && ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00)
+    || (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a))) return 'image/tiff'
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) return 'image/bmp'
+  const normalized = filePath.toLowerCase()
+  if (normalized.endsWith('.jpg') || normalized.endsWith('.jpeg')) return 'image/jpeg'
+  if (normalized.endsWith('.webp')) return 'image/webp'
+  if (normalized.endsWith('.tif') || normalized.endsWith('.tiff')) return 'image/tiff'
+  if (normalized.endsWith('.bmp')) return 'image/bmp'
+  return 'image/png'
 }
 
 function resolveSafeWorkspaceUrl(filePath: string | undefined, workspaceDir: string): string | undefined {
@@ -691,15 +777,15 @@ function resolveModelImageRouting(args: {
 }): {
   applies: boolean
   primaryPath?: string
-  frontPath?: string
-  sideParams: Record<string, string>
-  extraImagePaths?: Array<string | undefined>
+  secondaryImages?: Array<{ slot: number; handle: string; path: string }>
 } {
-  const imagePorts = args.ext.inputs?.filter((port) => port.type === 'image') ?? []
+  const imagePorts = (args.ext.inputs ?? []).flatMap((port, index) => (
+    port.type === 'image' ? [{ ...port, physicalSlot: index + 1 }] : []
+  ))
   const namedImagePorts = new Set(imagePorts.map((port) => port.name))
 
   if (imagePorts.length === 0) {
-    return { applies: false, sideParams: {} }
+    return { applies: false }
   }
 
   const routed = new Map<string, string>()
@@ -721,20 +807,18 @@ function resolveModelImageRouting(args: {
   const primaryPath = primaryPort
     ? routed.get(primaryPort.name) ?? untargetedPrimaryPath
     : untargetedPrimaryPath
-  const hasNamedViewLayout = imagePorts.some((port) => RESERVED_MODEL_IMAGE_VIEW_NAMES.has(port.name))
 
   return {
     applies: true,
     primaryPath,
-    frontPath: routed.get('front'),
-    sideParams: {
-      ...(routed.get('left') ? { left_image_path: routed.get('left')! } : {}),
-      ...(routed.get('back') ? { back_image_path: routed.get('back')! } : {}),
-      ...(routed.get('right') ? { right_image_path: routed.get('right')! } : {}),
-    },
-    ...(hasNamedViewLayout || imagePorts.length < 2
+    ...(imagePorts.length < 2
       ? {}
-      : { extraImagePaths: imagePorts.slice(1).map((port) => routed.get(port.name)) }),
+      : {
+          secondaryImages: imagePorts.slice(1).flatMap((port) => {
+            const path = routed.get(port.name)
+            return path ? [{ slot: port.physicalSlot, handle: port.name, path }] : []
+          }),
+        }),
   }
 }
 
@@ -813,8 +897,7 @@ export function buildModelGenerationRequest(args: {
   nodeInputText?: string
   nodeInputMeshPath?: string
   routedMeshParams?: Record<string, string>
-  routedSideParams?: Record<string, string>
-  routedExtraImagePaths?: Array<string | undefined>
+  routedSecondaryImages?: Array<{ slot: number; handle: string; path: string }>
   selectedImagePath?: string
   selectedImageData?: string
   workspaceDir: string
@@ -827,8 +910,7 @@ export function buildModelGenerationRequest(args: {
     nodeInputText,
     nodeInputMeshPath,
     routedMeshParams = {},
-    routedSideParams = {},
-    routedExtraImagePaths,
+    routedSecondaryImages = [],
     selectedImagePath,
     selectedImageData,
     workspaceDir,
@@ -896,11 +978,7 @@ export function buildModelGenerationRequest(args: {
     return {
       kind: 'scene',
       scenePath,
-      params: {
-        ...nodeParams,
-        scene_path: scenePath,
-        input_scene_path: scenePath,
-      },
+      params: withoutHostTransportAliases(nodeParams),
     }
   }
 
@@ -912,7 +990,7 @@ export function buildModelGenerationRequest(args: {
     return {
       kind: 'capture',
       capturePath: normalizeWorkflowPath(activeCapturePath, workspaceDir),
-      params: nodeParams,
+      params: withoutHostTransportAliases(nodeParams),
     }
   }
 
@@ -924,7 +1002,7 @@ export function buildModelGenerationRequest(args: {
     return {
       kind: 'video',
       videoPath: normalizeWorkflowPath(activeVideoPath, workspaceDir),
-      params: nodeParams,
+      params: withoutHostTransportAliases(nodeParams),
     }
   }
 
@@ -933,18 +1011,19 @@ export function buildModelGenerationRequest(args: {
   }
 
   const sanitizedNodeParams = Object.fromEntries(
-    Object.entries(nodeParams).filter(([key]) => !RESERVED_MODEL_SIDE_IMAGE_PARAMS.includes(key as typeof RESERVED_MODEL_SIDE_IMAGE_PARAMS[number])),
+    Object.entries(withoutHostTransportAliases(nodeParams))
+      .filter(([key]) => !isReservedSecondaryImagePathParam(key, ext)),
   )
-  const extraParams: Record<string, unknown> = {}
-  if (nodeInputMeshPath) {
-    extraParams.mesh_path = normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
-  }
+  const routedMeshPath = typeof routedMeshParams.mesh_path === 'string'
+    ? routedMeshParams.mesh_path
+    : undefined
+  const { mesh_path: _meshPath, ...nonTransportMeshParams } = routedMeshParams
+  const meshPath = nodeInputMeshPath
+    ? normalizeWorkflowPath(nodeInputMeshPath, workspaceDir)
+    : routedMeshPath
   const params = {
     ...sanitizedNodeParams,
-    ...routedSideParams,
-    ...routedMeshParams,
-    ...extraParams,
-    ...(routedExtraImagePaths !== undefined ? { extra_image_paths: routedExtraImagePaths } : {}),
+    ...nonTransportMeshParams,
   }
 
   const activeImagePath = nodeInputPath ?? selectedImagePath
@@ -955,6 +1034,8 @@ export function buildModelGenerationRequest(args: {
     kind: 'image',
     imagePath: activeImagePath,
     imageData: selectedImageData && nodeInputPath === undefined ? selectedImageData : undefined,
+    secondaryImages: routedSecondaryImages,
+    ...(meshPath ? { meshPath } : {}),
     params,
   }
 }
@@ -1681,8 +1762,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
             nodeInputText,
             nodeInputMeshPath,
             routedMeshParams,
-            routedSideParams: modelImageRouting.sideParams,
-            routedExtraImagePaths: modelImageRouting.extraImagePaths,
+            routedSecondaryImages: modelImageRouting.secondaryImages,
             selectedImagePath,
             selectedImageData,
             workspaceDir,
@@ -1706,7 +1786,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
                 : request.kind === 'image'
                   ? (async () => {
                     const bytes = Uint8Array.from(atob(request.imageData ?? await window.electron.fs.readFileBase64(request.imagePath)), (c) => c.charCodeAt(0))
-                    const blob  = new Blob([bytes], { type: 'image/png' })
+                    const blob  = new Blob([bytes], { type: imageMimeTypeFromBytes(bytes, request.imagePath) })
                     const fname = request.imagePath.split(/[\\/]/).pop() ?? 'image.png'
                     const fd = new FormData()
                     fd.append('image', blob, fname)
@@ -1716,6 +1796,21 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set) => ({
                     fd.append('enable_texture', 'false')
                     fd.append('texture_resolution', '1024')
                     fd.append('params', JSON.stringify(request.params))
+                    if (request.meshPath) fd.append('mesh_path', request.meshPath)
+                    for (const secondary of request.secondaryImages) {
+                      const secondaryBytes = Uint8Array.from(
+                        atob(await window.electron.fs.readFileBase64(secondary.path)),
+                        (c) => c.charCodeAt(0),
+                      )
+                      const secondaryBlob = new Blob(
+                        [secondaryBytes],
+                        { type: imageMimeTypeFromBytes(secondaryBytes, secondary.path) },
+                      )
+                      const secondaryName = secondary.path.split(/[\\/]/).pop() ?? `image_${secondary.slot}.png`
+                      fd.append('secondary_image', secondaryBlob, secondaryName)
+                      fd.append('secondary_image_slot', String(secondary.slot))
+                      fd.append('secondary_image_handle', secondary.handle)
+                    }
                     return client.post<{ job_id: string }>(
                       '/generate/from-image', fd,
                       { headers: { 'Content-Type': 'multipart/form-data' } },

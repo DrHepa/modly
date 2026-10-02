@@ -14,8 +14,8 @@ PNG_BYTES = (
     b"\x00\x00\x00\rIHDR"
     b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
     b"\x90wS\xde"
-    b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x04\x00\x01"
-    b"\x0b\xe7\x02\x9d"
+    b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
+    b"\xf6\x178U"
     b"\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
@@ -77,7 +77,20 @@ def api_modules(monkeypatch, tmp_path):
     monkeypatch.setattr(
         generator_registry,
         "_manifests",
-        {VALID_MODEL_ID: {"id": VALID_MODEL_ID, "name": "Fake Generator", "input": "image"}},
+        {
+            VALID_MODEL_ID: {
+                "id": VALID_MODEL_ID,
+                "name": "Fake Generator",
+                "input": "image",
+                "inputs": ["image", "image", "image", "image"],
+                "params_schema": [
+                    {"id": "filename", "type": "string"},
+                    {"id": "quality", "type": "string"},
+                    {"id": "seed", "type": "int"},
+                    {"id": "steps", "type": "int"},
+                ],
+            }
+        },
         raising=False,
     )
     monkeypatch.setattr(generator_registry, "_errors", {}, raising=False)
@@ -105,9 +118,11 @@ def client(api_modules):
 
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+    from main import GenerationMultipartBodyLimitMiddleware
     from routers import generation, status, workflow_runs
 
     app = FastAPI()
+    app.add_middleware(GenerationMultipartBodyLimitMiddleware)
     app.include_router(status.router)
     app.include_router(generation.router, prefix="/generate")
     app.include_router(workflow_runs.router, prefix="/workflow-runs")

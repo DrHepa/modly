@@ -4,11 +4,35 @@ import test from 'node:test'
 import type { BooleanParamSchema, ParamSchema, StringParamSchema } from '../../../shared/types/electron.d.ts'
 import {
   isPromptLikeStringParam,
+  resolveSelectParamValue,
   resolveStringParamEditorState,
   selectWorkflowParamPath,
   stopControlDragPropagation,
   toggleBooleanParamValue,
 } from './workflowParamControlState.ts'
+
+test('resolves DOM select strings back to the exact declared option type', () => {
+  const options = [
+    { value: 1536 },
+    { value: 'balanced' },
+  ]
+
+  const numericValue = resolveSelectParamValue(options, '1536', 'fallback')
+  const stringValue = resolveSelectParamValue(options, 'balanced', 'fallback')
+
+  assert.equal(numericValue, 1536)
+  assert.equal(typeof numericValue, 'number')
+  assert.equal(stringValue, 'balanced')
+  assert.equal(typeof stringValue, 'string')
+})
+
+test('keeps the current select value when the DOM value is unmatched or ambiguous', () => {
+  assert.equal(resolveSelectParamValue([{ value: 1536 }], '01536', 1024), 1024)
+  assert.equal(resolveSelectParamValue([
+    { value: 1 },
+    { value: '1' },
+  ], '1', 'current'), 'current')
+})
 
 test('toggles boolean params as real booleans through the shared control seam', () => {
   const param: BooleanParamSchema = {

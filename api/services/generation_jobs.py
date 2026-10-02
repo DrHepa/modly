@@ -369,37 +369,61 @@ def _declared_legacy_image_transport_schema(model_id: str) -> dict[str, dict]:
     }
 
 
-def _validate_declared_client_param_value(param_id: str, schema: dict, value: object) -> None:
-    """Reject obvious schema/type bypasses before values reach an extension runtime."""
+def _is_known_image_transport_alias(model_id: str, param_id: str) -> bool:
+    """Recognize image transport names without treating every path-like id as reserved."""
 
-    param_type = schema.get("type")
-    if param_type == "select":
-        options = schema.get("options")
-        if isinstance(options, list) and options:
-            allowed: list[object] = []
-            for item in options:
-                option_value = item.get("value") if isinstance(item, dict) else item
-                if isinstance(option_value, (str, int, float, bool)):
-                    allowed.append(option_value)
-            if allowed and not any(
-                type(value) is type(option_value) and value == option_value
-                for option_value in allowed
-            ):
-                raise HTTPException(400, f"Parameter '{param_id}' must be a valid select value")
-        if not isinstance(value, (str, int, float, bool)):
-            raise HTTPException(400, f"Parameter '{param_id}' must be a valid select value")
-    elif param_type == "int":
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise HTTPException(400, f"Parameter '{param_id}' must be an integer")
-    elif param_type == "float":
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise HTTPException(400, f"Parameter '{param_id}' must be a number")
-    elif param_type == "string":
-        if not isinstance(value, str):
-            raise HTTPException(400, f"Parameter '{param_id}' must be a string")
-    elif param_type == "boolean":
-        if not isinstance(value, bool):
-            raise HTTPException(400, f"Parameter '{param_id}' must be a boolean")
+    compact = _compact_transport_id(param_id)
+    if compact in _LIST_IMAGE_TRANSPORT_IDS or compact in _DIRECTORY_IMAGE_TRANSPORT_IDS:
+        return True
+    if compact.endswith("imagepath") or compact.endswith("imagepaths"):
+        return True
+    if re.fullmatch(r"image\d+paths?", compact) is not None:
+        return True
+    for handle in _declared_image_handles(model_id):
+        handle_compact = _compact_transport_id(handle)
+        if compact in {
+            f"{handle_compact}path",
+            f"{handle_compact}paths",
+            f"{handle_compact}imagepath",
+            f"{handle_compact}imagepaths",
+        }:
+            return True
+    return False
+
+
+def _is_blank_image_transport_value(value: object) -> bool:
+    """Allow only bounded transports containing no client path material."""
+
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple)):
+        return len(value) <= MAX_IMAGE_PORTS and all(
+            item is None or (isinstance(item, str) and not item.strip())
+            for item in value
+        )
+    return False
+
+
+def _contains_path_shaped_value(value: object) -> bool:
+    """Detect path-shaped payloads only for otherwise ambiguous reserved aliases."""
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return False
+        normalized = candidate.replace("\\", "/")
+        return (
+            "\x00" in candidate
+            or "/" in normalized
+            or normalized in {".", ".."}
+            or Path(normalized).suffix.casefold()
+            in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_path_shaped_value(item) for item in value)
+    return False
 
 
 def _manifest_declares_input_type(model_id: str, expected_type: str) -> bool:
@@ -438,7 +462,7 @@ def validate_client_generation_params(
     *,
     extra_server_managed: frozenset[str] = frozenset(),
 ) -> dict:
-    """Allow only exact manifest-declared UI parameters from an API client."""
+    """Pass runtime parameters through while reserving host-owned transport names."""
 
     if not isinstance(params, dict):
         raise HTTPException(400, "params must be a JSON object")
@@ -449,35 +473,43 @@ def validate_client_generation_params(
         | list_aliases
         | set(_declared_legacy_image_transport_schema(model_id))
     )
-    undeclared: list[str] = []
     server_managed: list[str] = []
-    for key in params:
+    filtered_params = dict(params)
+    for key, value in params.items():
         if not isinstance(key, str):
             raise HTTPException(400, "generation parameter names must be strings")
-        if key not in declared:
-            undeclared.append(key)
-        elif (
-            key in _TYPED_SERVER_TRANSPORT_IDS
-            or key in extra_server_managed
-            or key in image_transport_ids
-        ):
+        schema = declared.get(key)
+        compact = _compact_transport_id(key)
+        known_image_alias = _is_known_image_transport_alias(model_id, key)
+        ambiguous_declared_alias = (
+            schema is not None
+            and key not in image_transport_ids
+            and compact in _LIST_IMAGE_TRANSPORT_IDS
+        )
+        reserved_image_alias = (
+            key in image_transport_ids
+            or (known_image_alias and not ambiguous_declared_alias)
+        )
+        if key in _TYPED_SERVER_TRANSPORT_IDS or key in extra_server_managed:
             server_managed.append(key)
-        else:
-            _validate_declared_client_param_value(key, declared[key], params[key])
+        elif reserved_image_alias:
+            if _is_blank_image_transport_value(value):
+                filtered_params.pop(key, None)
+            else:
+                server_managed.append(key)
+        elif ambiguous_declared_alias and _contains_path_shaped_value(value):
+            server_managed.append(key)
     if server_managed:
         rendered = ", ".join(repr(key) for key in sorted(server_managed))
         raise HTTPException(400, f"Image transport parameter(s) are server-managed: {rendered}")
-    if undeclared:
-        rendered = ", ".join(repr(key) for key in sorted(undeclared))
-        raise HTTPException(400, f"Generation parameter(s) not declared by requested model: {rendered}")
-    return dict(params)
+    return filtered_params
 
 
 def inject_trusted_host_transport_params(
     client_params: dict,
     trusted_params: dict[str, object],
 ) -> dict:
-    """Inject route-derived transport aliases only after client UI allowlisting."""
+    """Inject route-derived transport aliases only after client transport validation."""
 
     invalid = set(trusted_params) - _TYPED_SERVER_TRANSPORT_IDS
     if invalid:

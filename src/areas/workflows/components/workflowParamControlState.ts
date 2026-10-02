@@ -7,6 +7,10 @@ import type {
 
 export type WorkflowParamValue = boolean | number | string
 
+export type WorkflowSelectOption = {
+  value: number | string
+}
+
 export type StringParamEditorMode = 'compact' | 'multiline'
 
 export type StringParamEditorState = {
@@ -32,6 +36,15 @@ export function resolveBooleanParamValue(param: BooleanParamSchema, value: Workf
 
 export function toggleBooleanParamValue(param: BooleanParamSchema, value: WorkflowParamValue): boolean {
   return !resolveBooleanParamValue(param, value)
+}
+
+export function resolveSelectParamValue(
+  options: readonly WorkflowSelectOption[] | undefined,
+  serializedValue: string,
+  fallbackValue: WorkflowParamValue,
+): WorkflowParamValue {
+  const matches = options?.filter((option) => String(option.value) === serializedValue) ?? []
+  return matches.length === 1 ? matches[0].value : fallbackValue
 }
 
 export function isPickerEnabled(param: ParamSchema): param is StringParamSchema & { pickerIntent: WorkflowPickerIntent } {

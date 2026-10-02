@@ -6,6 +6,7 @@ import {
   isPickerEnabled,
   isPromptLikeStringParam,
   resolveBooleanParamValue,
+  resolveSelectParamValue,
   resolveStringParamEditorState,
   selectWorkflowParamPath,
   stopControlDragPropagation,
@@ -104,7 +105,7 @@ export default function WorkflowParamControl({ param, value, onChange }: Workflo
     return (
       <select
         value={String(value)}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => onChange(resolveSelectParamValue(param.options, event.target.value, value))}
         className={INPUT_CLASS_NAME}
         onPointerDown={stopControlDragPropagation}
         onMouseDown={stopControlDragPropagation}

@@ -501,7 +501,7 @@ def validate_client_generation_params(
             server_managed.append(key)
     if server_managed:
         rendered = ", ".join(repr(key) for key in sorted(server_managed))
-        raise HTTPException(400, f"Image transport parameter(s) are server-managed: {rendered}")
+        raise HTTPException(400, f"Generation transport parameter(s) are server-managed: {rendered}")
     return filtered_params
 
 

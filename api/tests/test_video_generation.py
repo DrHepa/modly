@@ -52,7 +52,11 @@ def test_generate_from_video_artifact_reaches_generator_and_returns_mesh(
             "input_path": "Workflows/Imported Videos/turntable.mp4",
             "model_id": api_modules["valid_model_id"],
             "collection": "VideoRuns",
-            "params": {"filename": "from-video.glb", "quality": "draft"},
+            "params": {
+                "filename": "from-video.glb",
+                "quality": "draft",
+                "extension_runtime_strength": 0.75,
+            },
         },
     )
 
@@ -71,16 +75,27 @@ def test_generate_from_video_artifact_reaches_generator_and_returns_mesh(
             "texture_resolution": 1024,
             "filename": "from-video.glb",
             "quality": "draft",
+            "extension_runtime_strength": 0.75,
         },
     }]
     assert video_path.exists()
 
 
-def test_generate_from_video_artifact_rejects_undeclared_transport_alias(
+@pytest.mark.parametrize("alias", ["video_path", "input_video_path"])
+@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "declared"])
+def test_generate_from_video_artifact_rejects_server_managed_transport_alias(
     client,
     api_modules,
+    alias,
+    declared,
 ):
     _select_video_model(api_modules)
+    if declared:
+        from services.generator_registry import generator_registry
+
+        generator_registry._manifests[api_modules["valid_model_id"]]["params_schema"].append(
+            {"id": alias, "type": "string"},
+        )
     video_path = api_modules["workspace_dir"] / "Workflows" / "turntable.mp4"
     video_path.parent.mkdir(parents=True)
     video_path.write_bytes(MP4)
@@ -91,12 +106,14 @@ def test_generate_from_video_artifact_rejects_undeclared_transport_alias(
             "input_kind": "video",
             "input_path": "Workflows/turntable.mp4",
             "model_id": api_modules["valid_model_id"],
-            "params": {"video_path": "/forged/outside.mp4"},
+            "params": {alias: "/forged/outside.mp4"},
         },
     )
 
     assert response.status_code == 400
-    assert "not declared" in response.text
+    assert response.json()["detail"] == (
+        f"Generation transport parameter(s) are server-managed: '{alias}'"
+    )
     assert api_modules["generation_jobs"]._jobs == {}
 
 

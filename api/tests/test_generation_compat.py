@@ -309,7 +309,10 @@ def test_generate_from_artifact_routes_validated_capture_and_rejects_reserved_pa
     })
 
     assert forged_response.status_code == 400
-    assert "not declared" in forged_response.text
+    assert forged_response.json()["detail"] == (
+        "Generation transport parameter(s) are server-managed: "
+        "'capture_manifest_path', 'typed_input_path'"
+    )
     assert api_modules["generation_jobs"]._jobs == {}
 
     response = client.post("/generate/from-artifact", json={

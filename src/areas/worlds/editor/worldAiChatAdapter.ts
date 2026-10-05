@@ -122,6 +122,11 @@ export function createWorldAiChatAdapter(port: WorldEditorCommandPort, isEditAva
     discard(); generation += 1; current = null; committedRevision = null
     publish({ status: 'stale', message: 'This request is stale. Ask again from the current scene.' })
   }
+  const retireCommittedHistory = () => {
+    // Later editor history changes retire a completed turn, not a pending request.
+    discard(); generation += 1; current = null; committedRevision = null
+    publish({ status: 'idle', message: '' })
+  }
   const keepCommittedHistory = (turn: WorldAiChatTurn) => {
     // The chat/request lifetime may end when its drawer closes. A committed command
     // belongs to the editor history, not to that transient request UI token.
@@ -136,7 +141,10 @@ export function createWorldAiChatAdapter(port: WorldEditorCommandPort, isEditAva
     if (!current || state.status === 'applying') return
     if (!scopeBound(current.context) || !current.guard.isCurrent()
       || (state.status === 'applied' && port.getActiveContext()?.baseRevision !== committedRevision)
-      || (['loading', 'previewing', 'ready'].includes(state.status) && !bound(current.context))) stale()
+      || (['loading', 'previewing', 'ready'].includes(state.status) && !bound(current.context))) {
+      if (state.status === 'applied') retireCommittedHistory()
+      else stale()
+    }
   }
   const adapter: WorldAiChatAdapter = {
     begin(input) {
@@ -221,10 +229,10 @@ export function createWorldAiChatAdapter(port: WorldEditorCommandPort, isEditAva
     },
     reject() { discard(); generation += 1; current = null; committedRevision = null; publish({ status: 'rejected', message: 'Proposal rejected. Nothing changed.' }) },
     async undo() {
-      if (!current || state.status !== 'applied' || !scopeBound(current.context) || !isEditAvailable()) return
+      if (!current || state.status !== 'applied') return
       const active = port.getActiveContext()
-      if (!active) return
-      if (active.baseRevision !== committedRevision) { stale(); return }
+      if (!active || !scopeBound(current.context) || !current.guard.isCurrent() || !isEditAvailable()
+        || active.baseRevision !== committedRevision) { retireCommittedHistory(); return }
       const turn = current
       const context = parseWorldAiContext({ ...turn.context, projectKey: active.projectKey, projectId: active.projectId,
         baseRevision: active.baseRevision, activeSceneId: active.activeSceneId, editorEpoch: port.getState().editorEpoch })

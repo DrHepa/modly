@@ -76,6 +76,55 @@ test('Worlds direct mode previews against the open scene, applies through the co
   f.adapter.dispose()
 })
 
+for (const subscribed of [true, false]) {
+  test(`editor Undo/Redo retires completed AI feedback without reviving its authority (subscribed: ${subscribed})`, async (t) => {
+    const f = await fixture({ autoApply: true })
+    const unsubscribe = subscribed ? f.adapter.subscribe(() => undefined) : () => undefined
+    t.after(() => { unsubscribe(); f.adapter.dispose() })
+    const turn = f.begin()
+    const response = proposal(turn.context)
+    await f.adapter.accept(turn, response)
+    assert.equal(f.adapter.getState().status, 'applied')
+    assert.equal((await f.controller.undo()).ok, true)
+    assert.equal(f.controller.getState().session?.snapshot.scenes[0].entities[0].name, 'Hero')
+    if (!subscribed) await f.adapter.undo() // A retained callback must check the revision even without UI listeners.
+    assert.deepEqual(f.adapter.getState(), { status: 'idle', message: '' })
+    assert.equal(turn.guard.isCurrent(), false)
+    assert.equal(turn.isRequestCurrent(), false)
+    assert.equal((await f.controller.redo()).ok, true)
+    assert.equal(f.controller.getState().session?.snapshot.scenes[0].entities[0].name, 'Renamed Hero')
+    await f.adapter.undo()
+    await f.adapter.apply()
+    await f.adapter.accept(turn, response)
+    f.adapter.fail(turn, 'transport')
+    assert.deepEqual(f.adapter.getState(), { status: 'idle', message: '' })
+    assert.equal(f.writes(), 3, 'Only canonical Apply, Undo and Redo may write')
+    const next = f.begin()
+    await f.adapter.accept(next, { message: 'Scene queried.', actions: [], proposals: [], worldProposals: [] })
+    assert.equal(f.adapter.getState().message, 'Scene unchanged.')
+  })
+}
+
+for (const pending of ['loading', 'ready'] as const) {
+  test(`editor Undo still invalidates a genuinely pending ${pending} AI turn`, async (t) => {
+    const f = await fixture()
+    const unsubscribe = f.adapter.subscribe(() => undefined)
+    t.after(() => { unsubscribe(); f.adapter.dispose() })
+    await f.controller.dispatchCommands({ transactionId: 'tx:before-pending', origin: 'ui',
+      commands: [{ type: 'rename-project', name: 'Human title' }] })
+    const turn = f.begin()
+    if (pending === 'ready') await f.adapter.accept(turn, proposal(turn.context))
+    assert.equal(f.adapter.getState().status, pending)
+    assert.equal((await f.controller.undo()).ok, true)
+    assert.deepEqual(f.adapter.getState(), { status: 'stale', message: 'This request is stale. Ask again from the current scene.' })
+    assert.equal(turn.guard.isCurrent(), false)
+    await f.adapter.accept(turn, proposal(turn.context))
+    await f.adapter.apply()
+    assert.equal(f.writes(), 2)
+    assert.equal(f.controller.getState().session?.snapshot.scenes[0].entities[0].name, 'Hero')
+  })
+}
+
 test('scene switch queued with assistant Undo leaves no stale Undo authority', async () => {
   const f = await fixture({ autoApply: true })
   const unsubscribe = f.adapter.subscribe(() => undefined)
@@ -158,22 +207,26 @@ test('proposal-less Worlds response retains query content but reports host-owned
   f.adapter.dispose()
 })
 
-test('AI-specific Undo never undoes a later human edit', async () => {
-  const f = await fixture({ autoApply: true })
-  const unsubscribe = f.adapter.subscribe(() => undefined)
-  const turn = f.begin()
-  await f.adapter.accept(turn, proposal(turn.context))
-  assert.equal(f.adapter.getState().status, 'applied')
-  const edited = await f.controller.dispatchCommands({ transactionId: 'tx:after-ai-human', origin: 'ui',
-    commands: [{ type: 'rename-project', name: 'Human title' }] })
-  assert.equal(edited.ok, true)
-  assert.equal(f.adapter.getState().status, 'stale')
-  await f.adapter.undo()
-  assert.equal(f.controller.getState().session?.snapshot.project.name, 'Human title')
-  assert.equal(f.controller.getState().session?.snapshot.scenes[0].entities[0].name, 'Renamed Hero')
-  unsubscribe()
-  f.adapter.dispose()
-})
+for (const subscribed of [true, false]) {
+  test(`AI-specific Undo never undoes a later human edit (subscribed: ${subscribed})`, async (t) => {
+    const f = await fixture({ autoApply: true })
+    const unsubscribe = subscribed ? f.adapter.subscribe(() => undefined) : () => undefined
+    t.after(() => { unsubscribe(); f.adapter.dispose() })
+    const turn = f.begin()
+    await f.adapter.accept(turn, proposal(turn.context))
+    assert.equal(f.adapter.getState().status, 'applied')
+    const edited = await f.controller.dispatchCommands({ transactionId: 'tx:after-ai-human', origin: 'ui',
+      commands: [{ type: 'rename-project', name: 'Human title' }] })
+    assert.equal(edited.ok, true)
+    if (!subscribed) await f.adapter.undo()
+    assert.deepEqual(f.adapter.getState(), { status: 'idle', message: '' })
+    assert.equal(turn.guard.isCurrent(), false)
+    await f.adapter.undo()
+    assert.equal(f.controller.getState().session?.snapshot.project.name, 'Human title')
+    assert.equal(f.controller.getState().session?.snapshot.scenes[0].entities[0].name, 'Renamed Hero')
+    assert.equal(f.writes(), 2)
+  })
+}
 
 test('adapter uses real preview, meaningful diff, explicit Apply, Reject and canonical Undo without model actions', async () => {
   const f = await fixture()
@@ -333,15 +386,22 @@ test('adapter failure reporting uses typed transport copy and stale isolation, n
   }
 })
 
-test('an applied request and its Undo control become stale when the editor scene scope changes', async () => {
-  const f = await fixture()
-  const unsubscribe = f.adapter.subscribe(() => undefined)
-  const turn = f.begin(); await f.adapter.accept(turn, proposal(turn.context)); await f.adapter.apply()
-  assert.equal(f.adapter.getState().status, 'applied')
-  await f.controller.setActiveScene('scene:two')
-  assert.equal(f.adapter.getState().status, 'stale')
-  unsubscribe(); f.adapter.dispose()
-})
+for (const subscribed of [true, false]) {
+  test(`completed AI feedback and its Undo control retire when the editor scene scope changes (subscribed: ${subscribed})`, async (t) => {
+    const f = await fixture()
+    const unsubscribe = subscribed ? f.adapter.subscribe(() => undefined) : () => undefined
+    t.after(() => { unsubscribe(); f.adapter.dispose() })
+    const turn = f.begin(); await f.adapter.accept(turn, proposal(turn.context)); await f.adapter.apply()
+    assert.equal(f.adapter.getState().status, 'applied')
+    await f.controller.setActiveScene('scene:two')
+    if (!subscribed) await f.adapter.undo()
+    assert.deepEqual(f.adapter.getState(), { status: 'idle', message: '' })
+    assert.equal(turn.guard.isCurrent(), false)
+    await f.controller.setActiveScene('scene:one')
+    await f.adapter.undo()
+    assert.equal(f.writes(), 1)
+  })
+}
 
 test('idle cleanup and Play transitions do not invent a stale request before the first prompt', async () => {
   const f = await fixture()

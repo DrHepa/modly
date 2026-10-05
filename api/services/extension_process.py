@@ -518,6 +518,8 @@ class ExtensionProcess:
                 # before the next run rather than reusing a broken worker.
                 if msg.get("loaded") is False:
                     self._loaded = False
+                if cancel_sent_at is not None:
+                    raise GenerationCancelled()
                 raise RuntimeError(msg.get("traceback") or msg.get("message", "Unknown error"))
 
             elif t == "cancelled":

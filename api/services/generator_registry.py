@@ -819,7 +819,7 @@ class GeneratorRegistry:
         # for lifecycle while holding it. Publication contains host writes only.
         self._path_publication_lock = threading.Lock()
         self._legacy_imports = _LegacyImportManager()
-        self._active_id:  str = os.environ.get("SELECTED_MODEL_ID", "sf3d")
+        self._active_id: Optional[str] = os.environ.get("SELECTED_MODEL_ID", "").strip() or None
         self._runtime_readiness_ttl_seconds = 30.0
         self._runtime_readiness_timeout_seconds = _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS
         self._runtime_readiness_epoch = 0
@@ -940,17 +940,16 @@ class GeneratorRegistry:
                 print(f"[Registry] ERROR: {msg}")
                 self._errors[model_id] = msg
 
+        if self._active_id is not None and self._active_id not in self._generators:
+            print(
+                f"[Registry] WARNING: SELECTED_MODEL_ID='{self._active_id}' is unknown. "
+                "No model selected."
+            )
+            self._active_id = None
+
         if not self._generators:
             print("[Registry] WARNING: No extensions found.")
             return
-
-        if self._active_id not in self._generators:
-            fallback = next(iter(self._generators))
-            print(
-                f"[Registry] WARNING: SELECTED_MODEL_ID='{self._active_id}' is unknown. "
-                f"Falling back to '{fallback}'."
-            )
-            self._active_id = fallback
 
         print(f"[Registry] Active model  : {self._active_id}")
         print(f"[Registry] All models    : {list(self._generators.keys())}")
@@ -1037,6 +1036,8 @@ class GeneratorRegistry:
     def get_active(self) -> BaseGenerator:
         """Returns the active generator. Downloads and loads if necessary."""
         with self._lifecycle_lock:
+            if self._active_id is None:
+                raise ValueError("No model selected; choose a model before generation")
             return self.get_ready_generator(self._active_id)
 
     def get_ready_generator(self, model_id: str) -> BaseGenerator:
@@ -1304,6 +1305,14 @@ class GeneratorRegistry:
         return gen.is_downloaded()
 
     def active_status(self) -> dict:
+        if self._active_id is None:
+            return {
+                "id": None,
+                "name": "No model selected",
+                "input": None,
+                "downloaded": False,
+                "loaded": False,
+            }
         return self.model_status(self._active_id)
 
     def all_status(self) -> list:
@@ -1449,6 +1458,8 @@ class GeneratorRegistry:
 
     def params_schema(self, model_id: Optional[str] = None) -> list:
         target_id = model_id or self._active_id
+        if target_id is None:
+            raise KeyError("No model selected")
         gen = self._generators.get(target_id)
         if gen is None:
             raise KeyError(target_id)

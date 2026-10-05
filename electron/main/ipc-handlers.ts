@@ -1268,140 +1268,159 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     event: IpcMainInvokeEvent,
     modelId: string,
     requestedVariantId?: string | null,
+    requireMultiSource = false,
   ) => {
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Download already in progress' }
     }
     const variantId = requestedVariantId ?? undefined
-    let plan: Awaited<ReturnType<typeof resolveInstalledModelDownloadPlan>>
-    let legacySteps: ReturnType<typeof legacyDownloadSteps> = []
-    try {
-      plan = await resolveModelPlan(modelId)
-      if (plan.kind === 'multi-source') {
-        if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
-      } else if (plan.kind === 'legacy') {
-        // Shared files first (every variant excluded), then the requested variant.
-        legacySteps = legacyDownloadSteps(plan, variantId)
-      } else {
-        if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
-        return handleStructuredModelAssetDownload(event, { modelId }, plan.kind === 'hf-assets' ? downloadModelAssetsFromHF : downloadModelAssetsFromHttps)
-      }
-    } catch (err) {
-      return { success: false, error: String(err) }
-    }
-    if (activeDownloads.has(modelId)) {
-      return { success: false, error: 'Download already in progress' }
-    }
-
-    const modelsDir = getSettings(app.getPath('userData')).modelsDir
-    const privateTargetId = plan.ownership?.weightOwnerId ?? modelId
-    const allTargets = plan.kind === 'multi-source'
-      ? [
-          ...plan.sharedGroups.map((group) => ({
-            targetId: group.targetId,
-            label: `Shared · ${group.id}`,
-            sources: group.sources,
-          })),
-          ...(plan.sources.length > 0 ? [{
-            targetId: privateTargetId,
-            label: 'Node-specific',
-            sources: plan.sources,
-          }] : []),
-        ]
-      : []
-    const targetRoots = plan.kind === 'multi-source'
-      ? allTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
-      : [resolveModelRoot(modelsDir, privateTargetId)]
-    let release: () => void
-    try {
-      release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
-    } catch (err) {
-      return { success: false, error: String(err) }
-    }
-    const managedTargets = allTargets.filter((target) => !areModelSourcesDownloadedAtRoot(
-      resolveWeightStorageRoot(modelsDir, target.targetId), target.sources,
-    ))
-
     let finish!: () => void
     const done = new Promise<void>((resolveDone) => { finish = resolveDone })
-    const active: ActiveDownload = { progress: { percent: 0, variantId }, done, finish, targetRoots }
+    const active: ActiveDownload = {
+      progress: { percent: 0, status: 'preparing', variantId }, done, finish, targetRoots: [],
+    }
+    // Reserve this capability synchronously before installed-plan I/O; a second
+    // request must not replace its pending progress, stop flag or settlement.
     activeDownloads.set(modelId, active)
-    interruptedTargets.set(modelId, targetRoots)
     try {
-      const onProgress = (progress: DownloadProgress) => {
-        active.progress = { ...progress, variantId }
-        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, ...progress })
-      }
-      if (plan.kind === 'multi-source') {
-        if (managedTargets.length === 0) {
-          onProgress({ percent: 100 })
+      let plan: Awaited<ReturnType<typeof resolveInstalledModelDownloadPlan>>
+      let legacySteps: ReturnType<typeof legacyDownloadSteps> = []
+      try {
+        plan = await resolveModelPlan(modelId)
+        if (requireMultiSource && plan.kind !== 'multi-source') {
+          throw new Error(`Model node "${modelId}" does not declare model_sources`)
         }
-        for (const [index, target] of managedTargets.entries()) {
-          if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
-          active.currentTargetId = target.targetId
-          await downloadModelSourcesFromHF(modelId, target.targetId, (progress) => {
-            if (progress.paused) active.stopRequested = 'pause'
-            if (progress.cancelled) active.stopRequested = 'cancel' 
-            const aggregatePercent = Math.min(
-              99,
-              Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
-            )
-            onProgress({
-              ...progress,
-              percent: aggregatePercent,
-              status: progress.status ? `${target.label} · ${progress.status}` : target.label,
+        if (active.stopRequested) {
+          return { success: false, paused: active.stopRequested === 'pause', cancelled: active.stopRequested === 'cancel' }
+        }
+        if (plan.kind === 'multi-source') {
+          if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
+        } else if (plan.kind === 'legacy') {
+          // Shared files first (every variant excluded), then the requested variant.
+          legacySteps = legacyDownloadSteps(plan, variantId)
+        } else {
+          if (variantId !== undefined) throw new Error(`Model node "${modelId}" does not declare weight variants`)
+          // The structured downloader takes over with its CURRENT rich owner.
+          if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
+          return await handleStructuredModelAssetDownload(event, { modelId }, plan.kind === 'hf-assets' ? downloadModelAssetsFromHF : downloadModelAssetsFromHttps)
+        }
+      } catch (err) {
+        return { success: false, error: String(err) }
+      }
+      if (activeDownloads.get(modelId) !== active) {
+        return { success: false, error: 'Download already in progress' }
+      }
+      if (active.stopRequested) {
+        return { success: false, paused: active.stopRequested === 'pause', cancelled: active.stopRequested === 'cancel' }
+      }
+
+      const modelsDir = getSettings(app.getPath('userData')).modelsDir
+      const privateTargetId = plan.ownership?.weightOwnerId ?? modelId
+      const allTargets = plan.kind === 'multi-source'
+        ? [
+            ...plan.sharedGroups.map((group) => ({
+              targetId: group.targetId,
+              label: `Shared · ${group.id}`,
+              sources: group.sources,
+            })),
+            ...(plan.sources.length > 0 ? [{
+              targetId: privateTargetId,
+              label: 'Node-specific',
+              sources: plan.sources,
+            }] : []),
+          ]
+        : []
+      const targetRoots = plan.kind === 'multi-source'
+        ? allTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
+        : [resolveModelRoot(modelsDir, privateTargetId)]
+      let release: () => void
+      try {
+        release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
+      } catch (err) {
+        return { success: false, error: String(err) }
+      }
+      const managedTargets = allTargets.filter((target) => !areModelSourcesDownloadedAtRoot(
+        resolveWeightStorageRoot(modelsDir, target.targetId), target.sources,
+      ))
+
+      active.targetRoots = targetRoots
+      interruptedTargets.set(modelId, targetRoots)
+      try {
+        const onProgress = (progress: DownloadProgress) => {
+          active.progress = { ...progress, variantId }
+          event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, ...progress })
+        }
+        if (plan.kind === 'multi-source') {
+          if (managedTargets.length === 0) {
+            onProgress({ percent: 100 })
+          }
+          for (const [index, target] of managedTargets.entries()) {
+            if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
+            active.currentTargetId = target.targetId
+            await downloadModelSourcesFromHF(modelId, target.targetId, (progress) => {
+              if (progress.paused) active.stopRequested = 'pause'
+              if (progress.cancelled) active.stopRequested = 'cancel' 
+              const aggregatePercent = Math.min(
+                99,
+                Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
+              )
+              onProgress({
+                ...progress,
+                percent: aggregatePercent,
+                status: progress.status ? `${target.label} · ${progress.status}` : target.label,
+              })
             })
-          })
-          notifyWeightChange()
+            notifyWeightChange()
+          }
+          if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
+          if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
+        } else if (plan.kind === 'legacy') {
+          active.currentTargetId = privateTargetId
+          // Shared files and the variant are separate passes sharing one 0-100 bar.
+          for (const [index, step] of legacySteps.entries()) {
+            if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
+            await downloadModelFromHF(
+              plan.repoId,
+              modelId,
+              (progress) => {
+                if (progress.paused) active.stopRequested = 'pause'
+                if (progress.cancelled) active.stopRequested = 'cancel'
+                onProgress({ ...progress, percent: Math.round((index * 100 + progress.percent) / legacySteps.length) })
+              },
+              step.skipPrefixes,
+              step.includePrefixes,
+            )
+          }
         }
         if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
-        if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
-      } else if (plan.kind === 'legacy') {
-        active.currentTargetId = privateTargetId
-        // Shared files and the variant are separate passes sharing one 0-100 bar.
-        for (const [index, step] of legacySteps.entries()) {
-          if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
-          await downloadModelFromHF(
-            plan.repoId,
-            modelId,
-            (progress) => {
-              if (progress.paused) active.stopRequested = 'pause'
-              if (progress.cancelled) active.stopRequested = 'cancel'
-              onProgress({ ...progress, percent: Math.round((index * 100 + progress.percent) / legacySteps.length) })
-            },
-            step.skipPrefixes,
-            step.includePrefixes,
-          )
+        interruptedTargets.delete(modelId)
+        return { success: true }
+      } catch (err: any) {
+        const message = err?.message ?? String(err)
+        if (message.includes('paused')) {
+          event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'paused', paused: true })
+          return { success: false, paused: true }
         }
+        if (message.includes('cancelled')) {
+          event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
+          return { success: false, cancelled: true }
+        }
+        return { success: false, error: String(err) }
+      } finally {
+        if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
+        release()
+        notifyWeightChange()
       }
-      if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
-      interruptedTargets.delete(modelId)
-      return { success: true }
-    } catch (err: any) {
-      const message = err?.message ?? String(err)
-      if (message.includes('paused')) {
-        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'paused', paused: true })
-        return { success: false, paused: true }
-      }
-      if (message.includes('cancelled')) {
-        event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
-        return { success: false, cancelled: true }
-      }
-      return { success: false, error: String(err) }
     } finally {
       if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
-      release()
       active.finish()
-      notifyWeightChange()
     }
   }
   ipcMain.handle('model:download', downloadInstalledModel)
   ipcMain.handle('model:downloadSources', async (event, payload: unknown) => {
     try {
       const { modelId } = parseLegacyModelDownloadPayloadContract(payload)
-      const plan = await resolveModelPlan(modelId)
-      if (plan.kind !== 'multi-source') throw new Error(`Model node "${modelId}" does not declare model_sources`)
-      return downloadInstalledModel(event, modelId)
+      return downloadInstalledModel(event, modelId, undefined, true)
     } catch (error) { return modelAssetDownloadResult(error) }
   })
 
@@ -1444,7 +1463,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           clearTimeout(timer)
         }
       }
-      const roots = active?.targetRoots ?? interruptedTargets.get(modelId) ?? [resolveModelRoot(
+      const roots = (active?.targetRoots.length ? active.targetRoots : interruptedTargets.get(modelId)) ?? [resolveModelRoot(
         getSettings(app.getPath('userData')).modelsDir, (await resolveModelPlan(modelId)).ownership?.weightOwnerId ?? modelId,
       )]
       // Another sibling may have resumed these targets after our session stopped.

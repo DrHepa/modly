@@ -169,6 +169,8 @@ async def model_params(model_id: Optional[str] = None):
     try:
         return await asyncio.to_thread(generator_registry.params_schema, model_id)
     except KeyError:
+        if model_id is None:
+            raise HTTPException(409, "No model selected")
         raise HTTPException(404, f"Unknown model ID: {model_id}")
 
 

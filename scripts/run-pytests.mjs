@@ -80,6 +80,7 @@ const pytestResult = spawnSync(cmd, [
   'tests/test_agent_worlds.py',
   'tests/test_collection_safety.py',
   'tests/test_extension_process_protocol.py',
+  'tests/test_generation_compat.py',
   'tests/test_generation_inputs.py',
   'tests/test_hf_download_assets.py',
   'tests/test_https_download_assets.py',

@@ -1105,14 +1105,17 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     const userData = app.getPath('userData')
     const modelsDir = getSettings(userData).modelsDir
     const extensions = await listModelExtensions(userData)
-    const downloaded = listDownloadedModelCapabilities(modelsDir, extensions)
-    const downloadedIds = new Set(downloaded.map((model) => model.id))
+    const downloadedById = new Map(
+      listDownloadedModelCapabilities(modelsDir, extensions).map((model) => [model.id, model]),
+    )
 
     for (const extension of extensions) {
       if (extension.type !== 'model') continue
       for (const node of extension.nodes) {
         const capabilityId = node.capabilityId ?? `${extension.id}/${node.id}`
-        if (downloadedIds.has(capabilityId)) continue
+        const collected = downloadedById.get(capabilityId)
+        // Private-only readiness is provisional for a source-managed capability.
+        if (node.hasModelSources) downloadedById.delete(capabilityId)
         try {
           const plan = await resolveInstalledModelDownloadPlan({
             modelId: capabilityId,
@@ -1120,6 +1123,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
             builtinExtensionsDir: getBuiltinExtensionsDir(),
           })
           if (plan.kind !== 'multi-source') continue
+          downloadedById.delete(capabilityId)
           const { ownership } = await resolveOwnershipContext(userData, capabilityId)
           const privateReady = plan.sources.length === 0
             || areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, plan.sources)
@@ -1127,15 +1131,14 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
             areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group)
           ))
           if (!privateReady || !sharedReady) continue
-          downloaded.push({ id: capabilityId, name: node.name, size_gb: 0 })
-          downloadedIds.add(capabilityId)
+          downloadedById.set(capabilityId, collected ?? { id: capabilityId, name: node.name, size_gb: 0 })
         } catch {
-          // Ignore invalid or non-model entries; extension listing still succeeds.
+          // Source-managed entries fail closed; legacy collector rows survive.
         }
       }
     }
 
-    return downloaded.length > 0 ? downloaded : listDownloadedModels(modelsDir)
+    return downloadedById.size > 0 ? [...downloadedById.values()] : listDownloadedModels(modelsDir)
   })
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
@@ -1206,15 +1209,16 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       }))
     }
 
+    // Reject before replacing this capability's pending reservation/control.
+    if (activeDownloads.has(modelId) || activeDownloadSettlements.has(modelId)) {
+      return downloadInProgressError(modelId, activeWeightTargets.get(modelId) ?? modelId, [modelId])
+    }
     const userData = app.getPath('userData')
     const control = localDownloadControl(modelId)
     activeDownloads.set(modelId, { percent: 0, status: 'preparing' })
     const releasePendingDownload = beginPendingDownloadSettlement(modelId)
-    let activeOwnerId: string | null = null
     try {
       const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(userData, modelId)
-      activeOwnerId = ownership.weightOwnerId
-      aliasLocalDownloadControl(activeOwnerId, control)
       activeDownloads.delete(modelId)
       if (control.cancel) return { success: true }
       if (control.pause) return { success: true }
@@ -1244,6 +1248,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       ]
       const activePlanDownloads = downloadPlans
         .map((item) => item.targetId)
+        .filter((targetId) => targetId !== modelId) // The current request owns this pending reservation.
         .filter((targetId) => activeDownloads.has(targetId) || activeDownloadSettlements.has(targetId))
       if (activePlanDownloads.length > 0) {
         return downloadInProgressError(modelId, ownership.weightOwnerId, activePlanDownloads)
@@ -1255,6 +1260,12 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           if (areWeightGroupSourcesDownloaded(getSettings(userData).modelsDir, plan.extensionId, group)) continue
         } else if (areModelSourcesDownloaded(getSettings(userData).modelsDir, ownership.weightOwnerId, plan.sources)) {
           continue
+        }
+        // Earlier transfers await I/O, so acquire each target again at its start.
+        // No await may separate this check from the reservation below.
+        if (downloadPlan.targetId !== modelId
+          && (activeDownloads.has(downloadPlan.targetId) || activeDownloadSettlements.has(downloadPlan.targetId))) {
+          return downloadInProgressError(modelId, ownership.weightOwnerId, [downloadPlan.targetId])
         }
         activeWeightTargets.set(modelId, downloadPlan.targetId)
         activeDownloads.set(downloadPlan.targetId, { percent: 0, status: 'preparing' })
@@ -1268,6 +1279,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           event.sender.send('model:downloadProgress', mapDownloadProgressToCapability(modelId, overall))
         }))
         activeDownloads.delete(downloadPlan.targetId)
+        clearLocalDownloadControlAliases([downloadPlan.targetId], control)
         activeWeightTargets.delete(modelId)
       }
       return { success: true }
@@ -1275,12 +1287,13 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       return modelAssetDownloadResult(error)
     } finally {
       const activeWeightTarget = activeWeightTargets.get(modelId)
-      if (activeWeightTarget) activeDownloads.delete(activeWeightTarget)
+      if (activeWeightTarget && localDownloadControls.get(activeWeightTarget) === control) {
+        activeDownloads.delete(activeWeightTarget)
+      }
       clearLocalDownloadControlAliases(activeWeightTarget ? [activeWeightTarget] : [], control)
       activeWeightTargets.delete(modelId)
-      activeDownloads.delete(modelId)
-      if (activeOwnerId) activeDownloads.delete(activeOwnerId)
-      clearLocalDownloadControlAliases(activeOwnerId ? [modelId, activeOwnerId] : [modelId], control)
+      if (localDownloadControls.get(modelId) === control) activeDownloads.delete(modelId)
+      clearLocalDownloadControlAliases([modelId], control)
       releasePendingDownload()
     }
   })

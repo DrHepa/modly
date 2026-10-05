@@ -2,12 +2,113 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from services.capture_input import TypedModelInput
 from services.video_input import validate_video_input, video_snapshot_to_dict
 from services.extension_process import (
     ExtensionProcess,
     _RUNTIME_READINESS_RESPONSE_TIMEOUT_SECONDS,
 )
+from services.generators.base import GenerationCancelled
+from services.generator_registry import GeneratorRegistry
+
+
+@pytest.mark.parametrize(
+    ("reported_loaded", "expect_reload"),
+    [(False, True), (True, False), (None, False)],
+)
+def test_generation_error_reconciles_loaded_state_and_registry_retry(
+    monkeypatch, tmp_path, reported_loaded, expect_reload
+):
+    model_id = "demo/generate"
+    process = ExtensionProcess(tmp_path, {"id": model_id, "input": "image"})
+    process._loaded = True
+    sent: list[dict] = []
+    reloads: list[str] = []
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+    process.model_dir = tmp_path / "models"
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+
+    def error_response(timeout=None):
+        response = {
+            "type": "error",
+            "id": sent[0]["id"],
+            "message": "short",
+            "traceback": "original failure traceback",
+        }
+        if reported_loaded is not None:
+            response["loaded"] = reported_loaded
+        return response
+
+    monkeypatch.setattr(process, "_recv", error_response)
+
+    with pytest.raises(RuntimeError, match="original failure traceback"):
+        process.generate(b"image", {})
+
+    assert process.is_loaded() is (not expect_reload)
+
+    registry = GeneratorRegistry()
+    registry._active_id = model_id
+    registry._generators = {model_id: process}
+    registry._manifests = {model_id: {"id": model_id, "input": "image"}}
+    monkeypatch.setattr(registry, "_sync_generator_model_dir", lambda _model_id: process)
+    monkeypatch.setattr(registry, "_is_downloaded", lambda _model_id, _gen: True)
+    assert registry.active_status()["loaded"] is (not expect_reload)
+
+    def record_load():
+        reloads.append(model_id)
+        process._loaded = True
+
+    monkeypatch.setattr(process, "load", record_load)
+
+    assert registry.get_loaded(model_id) is process
+    assert reloads == ([model_id] if expect_reload else [])
+    assert process.is_loaded() is True
+    assert registry.active_status()["loaded"] is True
+
+
+@pytest.mark.parametrize(
+    ("reported_loaded", "expected_loaded"),
+    [(False, False), (True, True), (None, True)],
+)
+def test_cancel_drain_reconciles_matching_error_before_cancelled(
+    monkeypatch, tmp_path, reported_loaded, expected_loaded
+):
+    process = ExtensionProcess(tmp_path, {"id": "demo/generate", "input": "image"})
+    process._loaded = True
+    sent: list[dict] = []
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    class RunningProc:
+        def poll(self):
+            return None
+
+    process._proc = RunningProc()
+    monkeypatch.setattr(process, "_ensure_started", lambda: None)
+    monkeypatch.setattr(process, "_send", sent.append)
+
+    def matching_error(timeout=None):
+        response = {"type": "error", "id": sent[0]["id"], "message": "worker failed"}
+        if reported_loaded is not None:
+            response["loaded"] = reported_loaded
+        return response
+
+    monkeypatch.setattr(process, "_recv", matching_error)
+
+    with pytest.raises(GenerationCancelled):
+        process.generate(b"image", {}, cancel_event=cancel_event)
+
+    assert [message["action"] for message in sent] == ["generate", "cancel"]
+    assert sent[1]["id"] == sent[0]["id"]
+    assert process.is_loaded() is expected_loaded
 
 
 def _start_extension_process_with_ready_schema(monkeypatch, tmp_path, manifest, ready_schema):

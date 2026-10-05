@@ -124,6 +124,48 @@ class ResolveReadySchemaTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_generate_error_reports_post_failure_loaded_state(self) -> None:
+        manifest = {
+            "id": "demo",
+            "generator_class": "FailingGenerator",
+            "nodes": [{"id": "generate", "input": "image"}],
+        }
+
+        for survives in (False, True, None):
+            with self.subTest(survives=survives):
+                sent: list[dict] = []
+
+                class FailingGenerator:
+                    def __init__(self, model_dir, outputs_dir):
+                        self._loaded = True
+
+                    def is_loaded(self):
+                        if self._loaded is None:
+                            raise RuntimeError("unreadable loaded state")
+                        return self._loaded
+
+                    def generate(self, image_bytes, params, progress_cb, cancel_event):
+                        self._loaded = survives
+                        raise RuntimeError("original generation failure")
+
+                messages = iter([{
+                    "action": "generate",
+                    "id": "failed-run",
+                    "image_b64": "",
+                    "params": {},
+                }])
+                with mock.patch.object(runner, "load_generator", return_value=FailingGenerator), \
+                     mock.patch.object(runner, "send", side_effect=sent.append), \
+                     mock.patch.object(runner, "recv", return_value=messages), \
+                     mock.patch.object(Path, "read_text", return_value=json.dumps(manifest)):
+                    runner.main()
+
+                error = next(message for message in sent if message.get("type") == "error")
+                self.assertEqual(error["id"], "failed-run")
+                self.assertIs(error["loaded"], bool(survives))
+                self.assertEqual(error["message"], "original generation failure")
+                self.assertIn("original generation failure", error["traceback"])
+
     def test_runner_emits_ready_without_host_third_party_packages(self) -> None:
         with tempfile.TemporaryDirectory(prefix="modly-isolated-runner-") as tmp:
             root = Path(tmp)

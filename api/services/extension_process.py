@@ -412,6 +412,8 @@ class ExtensionProcess:
                         if msg_type in ("runtime_readiness", "loaded", "unloaded"):
                             continue
                         if msg_type in ("cancelled", "done", "error") and msg_id == req_id:
+                            if msg_type == "error" and msg.get("loaded") is False:
+                                self._loaded = False
                             raise GenerationCancelled()
 
                 # Poll queue with short timeout so we can re-check cancel_event
@@ -434,6 +436,8 @@ class ExtensionProcess:
                     return Path(msg["output_path"])
 
                 elif t == "error" and msg_id == req_id:
+                    if msg.get("loaded") is False:
+                        self._loaded = False
                     raise RuntimeError(msg.get("traceback") or msg.get("message", "Unknown error"))
 
                 elif t == "cancelled" and msg_id == req_id:

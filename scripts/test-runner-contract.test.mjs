@@ -228,6 +228,8 @@ const REQUIRED_CANONICAL_CHANGED_TESTS = [
   { phase: 'typescript', file: 'electron/main/worlds-cli-reviewed-apply.test.ts' },
   { phase: 'typescript', file: 'src/areas/workflows/workflowWorldsOutput.worldsculpt.test.ts' },
   { phase: 'typescript', file: 'src/shared/stores/navStore.test.ts' },
+  { phase: 'mjs', file: 'electron/main/model-download-sources-ipc.test.mjs' },
+  { phase: 'mjs', file: 'electron/main/model-readiness-ipc.test.mjs' },
   { phase: 'mjs', file: 'scripts/platform-contract.test.mjs' },
   { phase: 'mjs', file: 'scripts/run-typechecks.test.mjs' },
   { phase: 'mjs', file: 'scripts/world-ffmpeg-linux-arm64.test.mjs' },
@@ -304,6 +306,30 @@ test('canonical Node test command delegates to the bounded deterministic runner'
   assert.equal(command, 'node scripts/run-node-tests.mjs')
 })
 
+test('canonical Python command explicitly registers the focused pytest function suites', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(packageJson.scripts?.['test:py'], 'node scripts/run-pytests.mjs')
+  const runner = await readFile(new URL('./run-pytests.mjs', import.meta.url), 'utf8')
+  const pytestArgs = runner.match(/const pytestResult = spawnSync\(cmd, \[([\s\S]*?)\], \{/)
+  assert.ok(pytestArgs, 'The focused pytest invocation must remain explicit')
+  assert.deepEqual([...pytestArgs[1].matchAll(/'([^']+)'/g)].map((match) => match[1]), [
+    '-m', 'pytest',
+    'tests/test_agent.py',
+    'tests/test_agent_direct_actions.py',
+    'tests/test_agent_worlds.py',
+    'tests/test_collection_safety.py',
+    'tests/test_extension_process_protocol.py',
+    'tests/test_generation_inputs.py',
+    'tests/test_hf_download_assets.py',
+    'tests/test_https_download_assets.py',
+    'tests/test_model_selection_startup.py',
+    'tests/test_secondary_image_custody.py',
+    'tests/test_video_generation.py',
+    'tests/test_workspace_route_security.py',
+    '-q',
+  ])
+})
+
 test('canonical runner includes every required changed test exactly once', async () => {
   const { createNodeTestPlan } = await import('./run-node-tests.mjs')
   const plan = await createNodeTestPlan()
@@ -356,7 +382,7 @@ test('canonical main requires an ordinary-Node full proof before per-file dispat
     events.push('mock-proof-end')
   } })
   const plan = await createNodeTestPlan()
-  assert.equal(plan.length, 222)
+  assert.equal(plan.length, 224)
   assert.deepEqual(events, ['mock-proof-start', 'mock-proof-end', ...plan.map(({ file }) => file)])
   assert.equal(starts, plan.length)
   assert.equal(output.length, plan.length)
@@ -511,11 +537,11 @@ test('Worlds script registration preserves canonical membership and includes Nod
   const aiFiles = ['src/areas/worlds/core/worldAiContract.test.ts', 'src/areas/worlds/editor/worldAiChatAdapter.test.ts',
     'src/areas/worlds/components/WorldsAiDrawer.test.ts', 'electron/main/automation-http-bridge.test.ts', 'scripts/worlds-ai-electron-fixture.test.mjs']
   for (const file of aiFiles) assert.equal(plan.filter((entry) => entry.file === file).length, 1, file)
-  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 217)
-  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 221)
-  assert.equal(plan.length, 222)
+  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 219)
+  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 223)
+  assert.equal(plan.length, 224)
   assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 184)
-  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 38)
+  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 40)
   assert.equal(new Set(plan.map(({ file }) => file)).size, plan.length)
   assert.equal((await collectWorldsTypeScriptTests()).length, 93)
 })

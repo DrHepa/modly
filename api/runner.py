@@ -205,6 +205,14 @@ def resolve_runtime_readiness(gen) -> dict:
     return status
 
 
+def _loaded_after_generation_error(gen) -> bool:
+    """Report the worker's actual post-failure state; uncertainty means reload."""
+    try:
+        return bool(gen.is_loaded())
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------------ #
 # Main loop
 # ------------------------------------------------------------------ #
@@ -293,7 +301,8 @@ def main() -> None:
                     else:
                         send({"type": "error", "id": rid,
                               "message": str(exc),
-                              "traceback": traceback.format_exc()})
+                              "traceback": traceback.format_exc(),
+                              "loaded": _loaded_after_generation_error(gen)})
                 finally:
                     _cancel.pop(rid, None)
 

@@ -13,6 +13,7 @@ from services.generation_jobs import (
     get_job_status,
     parse_params_object,
     sanitize_collection,
+    require_model_id,
     require_model_input,
     validate_model_id,
     validate_image_upload,
@@ -41,7 +42,7 @@ async def create_from_image_run(
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
 
     collection = sanitize_collection(collection)
-    model_id = require_model_input(model_id, "image")
+    model_id = require_model_id(model_id)
     manifest = validate_model_id(model_id)
     image_bytes = await image.read()
     job = create_from_image_job(
@@ -77,7 +78,7 @@ async def create_from_text_run(
         raise HTTPException(400, "prompt is required")
     if payload.remesh not in ("quad", "triangle", "none"):
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
-    model_id = require_model_input(payload.model_id, "text")
+    model_id = require_model_id(payload.model_id)
     manifest = validate_model_id(model_id)
 
     job = create_from_text_job(

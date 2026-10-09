@@ -757,3 +757,46 @@ def test_readiness_sanitizer_preserves_https_prose_in_guidance_and_details():
         })
         assert result['actions'] == [action]
         assert result['details'] == details
+
+
+def test_registry_registers_flexible_primary_input_metadata(monkeypatch, tmp_path):
+    import pytest
+    import services.generator_registry as registry_module
+    from services.generators.base import BaseGenerator
+
+    class DummyGenerator(BaseGenerator):
+        def load(self):
+            self._model = object()
+
+        def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):
+            return self.outputs_dir / "dummy.glb"
+
+    extension_dir = tmp_path / "extension"
+    extension_dir.mkdir()
+    models_dir = tmp_path / "models"
+    workspace_dir = tmp_path / "workspace"
+    models_dir.mkdir()
+    workspace_dir.mkdir()
+    manifests = {
+        "demo/capture": {"id": "capture", "input": "capture"},
+        "demo/custom": {"id": "custom", "input": "custom-input"},
+        "demo/legacy": {"id": "legacy"},
+    }
+    monkeypatch.setattr(registry_module, "MODELS_DIR", models_dir)
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", workspace_dir)
+    monkeypatch.setattr(registry_module, "_discover_extensions",
+                        lambda manager, _authorization: ({
+                            model_id: (DummyGenerator, manifest, extension_dir, manager.register(extension_dir))
+                            for model_id, manifest in manifests.items()
+                        }, {}))
+    registry = registry_module.GeneratorRegistry()
+    registry.initialize()
+    assert registry._errors == {}
+    for model_id, expected in [("demo/capture", "capture"), ("demo/custom", "custom-input"), ("demo/legacy", "image")]:
+        assert registry.get_model_input(model_id) == expected
+        assert registry.get_manifest(model_id)["input"] == expected
+        assert registry.get_generator(model_id).input == expected
+
+    for invalid in [None, 42, False, [], {}, "", "   "]:
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            registry_module.validate_model_input(invalid)

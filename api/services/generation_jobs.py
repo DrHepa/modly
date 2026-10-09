@@ -193,6 +193,8 @@ def create_from_none_job(
     output_kind: str = "mesh",
     model_id: Optional[str] = None,
 ) -> JobStatus:
+    if model_id is not None:
+        model_id = require_model_input(model_id, "none")
     return create_generation_job(
         background_tasks, b"", params, collection, output_kind, model_id,
     )

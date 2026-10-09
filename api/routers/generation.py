@@ -20,6 +20,7 @@ from services.generation_jobs import (
     sanitize_collection,
     validate_image_upload,
     validate_model_id,
+    require_model_id,
     require_model_input,
 )
 
@@ -43,7 +44,7 @@ async def generate_from_image(
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
 
     collection = sanitize_collection(collection)
-    model_id = require_model_input(model_id, "image")
+    model_id = require_model_id(model_id)
     manifest = validate_model_id(model_id)
     model_params = parse_params_object(params, strict=False)
     image_bytes = await image.read()
@@ -67,7 +68,7 @@ async def generate_from_text(payload: GenerateFromTextRequest, background_tasks:
         raise HTTPException(400, "prompt is required")
     if payload.remesh not in VALID_REMESH_MODES:
         raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
-    model_id = require_model_input(payload.model_id, "text")
+    model_id = require_model_id(payload.model_id)
     manifest = validate_model_id(model_id)
     full_params = {
         "remesh": payload.remesh,

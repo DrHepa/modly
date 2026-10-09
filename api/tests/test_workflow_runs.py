@@ -90,7 +90,7 @@ def test_create_workflow_run_from_none_rejects_non_none_model(
     assert api_modules["generation_jobs"]._jobs == {}
 
 
-def test_workflow_run_routes_enforce_declared_model_input_symmetrically(client, api_modules, image_upload, monkeypatch):
+def test_workflow_run_routes_preserve_existing_input_transport(client, api_modules, image_upload, monkeypatch):
     assert_backend_ready(client)
     from services.generator_registry import generator_registry
 
@@ -106,8 +106,7 @@ def test_workflow_run_routes_enforce_declared_model_input_symmetrically(client, 
         "/workflow-runs/from-text",
         json={"prompt": "hello", "model_id": api_modules["valid_model_id"]},
     )
-    assert text_mismatch.status_code == 400
-    assert text_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'image' but this endpoint received 'text'."
+    assert text_mismatch.status_code == 202
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "text"
     text_response = client.post(
@@ -136,8 +135,7 @@ def test_workflow_run_routes_enforce_declared_model_input_symmetrically(client, 
         files={"image": image_upload},
         data={"model_id": api_modules["valid_model_id"]},
     )
-    assert image_mismatch.status_code == 400
-    assert image_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'scene' but this endpoint received 'image'."
+    assert image_mismatch.status_code == 202
 
 
 def test_workflow_run_from_image_accepts_legacy_missing_input_metadata(client, api_modules, image_upload):

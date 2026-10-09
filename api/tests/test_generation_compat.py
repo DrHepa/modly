@@ -206,7 +206,7 @@ def test_generate_from_none_rejects_non_none_model_without_creating_job(
     assert api_modules["generation_jobs"]._jobs == {}
 
 
-def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_modules, image_upload, monkeypatch):
+def test_generate_routes_preserve_existing_input_transport_and_none_contract(client, api_modules, image_upload, monkeypatch):
     assert_backend_ready(client)
     from services.generator_registry import generator_registry
 
@@ -223,8 +223,7 @@ def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_
         "/generate/from-text",
         json={"prompt": "hello", "model_id": api_modules["valid_model_id"]},
     )
-    assert text_mismatch.status_code == 400
-    assert text_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'image' but this endpoint received 'text'."
+    assert text_mismatch.status_code == 200
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "text"
     text_response = client.post(
@@ -238,8 +237,7 @@ def test_generate_routes_enforce_declared_model_input_symmetrically(client, api_
         files={"image": image_upload},
         data={"model_id": api_modules["valid_model_id"]},
     )
-    assert image_mismatch.status_code == 400
-    assert image_mismatch.json()["detail"] == "Model 'demo/fake' expects input 'text' but this endpoint received 'image'."
+    assert image_mismatch.status_code == 200
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "scene"
     scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero" / "scene-manifest.json"
@@ -1124,3 +1122,36 @@ def test_late_worker_cannot_recreate_retired_job_state(api_modules, monkeypatch,
     assert jobs._jobs[fresh.job_id] is fresh
     messages = [record.getMessage() for record in caplog.records if record.name == "modly.generation.jobs"]
     assert sum(f"job_id={job.job_id} status=cancelled " in message for message in messages) == 1
+
+
+@pytest.mark.parametrize("input_kind", ["capture", "custom-input"])
+@pytest.mark.parametrize("route,accepted_status", [("/generate/from-image", 200), ("/workflow-runs/from-image", 202)])
+def test_existing_image_routes_consume_flexible_model_input_metadata(
+    client, api_modules, image_upload, monkeypatch, input_kind, route, accepted_status,
+):
+    from services.generator_registry import generator_registry
+
+    model_id = api_modules["valid_model_id"]
+    generator_registry._manifests[model_id]["input"] = input_kind
+    captured = []
+    original_generate = api_modules["fake_generator"].generate
+
+    def generate(image_bytes, params, progress_cb=None, cancel_event=None):
+        captured.append((image_bytes, dict(params)))
+        return original_generate(image_bytes, params, progress_cb, cancel_event)
+
+    monkeypatch.setattr(api_modules["fake_generator"], "generate", generate)
+    response = client.post(route, files={"image": image_upload}, data={
+        "model_id": model_id, "collection": "CaptureRuns",
+        "params": '{"filename":"capture-output.glb","seed":0,"enabled":false}',
+    })
+    assert response.status_code == accepted_status
+    body = response.json()
+    job_id = body.get("job_id", body.get("run_id"))
+    job = api_modules["generation_jobs"].get_job_status(job_id)
+    assert job.status == "done"
+    assert job.output_url == "/workspace/CaptureRuns/capture-output.glb"
+    assert captured[0][0] == image_upload[1]
+    assert captured[0][1]["seed"] == 0
+    assert captured[0][1]["enabled"] is False
+    assert generator_registry.get_manifest(model_id)["input"] == input_kind

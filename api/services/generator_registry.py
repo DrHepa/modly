@@ -73,22 +73,12 @@ print(f"[Registry] EXTENSIONS_DIR = {EXTENSIONS_DIR or '(not set)'}")
 
 # Optional read-only diagnostics have a bounded budget independent of model load.
 _DEFAULT_RUNTIME_READINESS_TIMEOUT_SECONDS = 30.0
-_MODEL_INPUT_KINDS = frozenset({
-    "image",
-    "text",
-    "mesh",
-    "scene",
-    "audio",
-    "video",
-    "none",
-})
 
 
 def validate_model_input(value, context: str = "input") -> str:
-    """Validate the invocation input declared by one model node."""
-    if not isinstance(value, str) or value not in _MODEL_INPUT_KINDS:
-        expected = ", ".join(sorted(_MODEL_INPUT_KINDS))
-        raise ValueError(f"{context} must be one of: {expected}")
+    """Validate flexible primary-input metadata without rewriting its modality."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} must be a non-empty string")
     return value
 
 

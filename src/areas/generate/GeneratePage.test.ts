@@ -301,7 +301,7 @@ test('GeneratePage library seam renders scope and capability sections with direc
     assert.match(markup, /Chair mesh/)
     assert.doesNotMatch(markup, /Workspace folder /)
     assert.doesNotMatch(markup, /Import mesh file/)
-    assert.match(markup, /Workflows\/Characters\/hero\.glb/)
+    assert.match(markup, /aria-label="Select library asset Hero mesh"/)
     assert.equal(countMatches(markup, /Ready to open this asset directly in Generate\./g), 1)
     assert.match(markup, /aria-expanded="true"/)
   } finally {

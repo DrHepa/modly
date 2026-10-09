@@ -5,7 +5,7 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { build } from 'esbuild'
-import { createElement } from 'react'
+import { Children, createElement, isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
@@ -96,6 +96,100 @@ test('WorkspaceAssetLibrary helpers provide default collapsed scope and capabili
       'capability:workflows:mesh',
       'capability:workflows:rigged-mesh',
     ])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorkspaceAssetLibraryPopover renders selectable unknown-metadata rows without enabling open', async () => {
+  const { module, cleanup } = await loadLibraryModule()
+
+  try {
+    const selections: string[] = []
+    const props = {
+      entries: [entry({
+        id: 'unknown', displayName: 'Unknown cloud', workspacePath: 'Workflows/Scans/cloud.ply',
+        capability: undefined, state: 'unknown-metadata', previewKind: 'binary',
+        openTarget: { kind: 'unavailable', reason: 'state-not-openable' },
+      })],
+      selectedEntryId: null,
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: '',
+      collapsedSectionKeys: [],
+      onSelectEntry: (id: string) => { selections.push(id) },
+      onSearchQueryChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }
+    const tree = module.WorkspaceAssetLibraryPopover(props)
+    const markup = renderToStaticMarkup(tree)
+    assert.match(markup, /aria-label="Capability category Unknown metadata"/)
+    assert.match(markup, /aria-label="Select library asset Unknown cloud"/)
+    assert.ok(module.getDefaultWorkspaceAssetLibraryCollapsedSectionKeys().includes('capability:workflows:undefined'))
+
+    type RowProps = { children?: ReactNode, 'aria-label'?: string, 'aria-pressed'?: boolean, disabled?: boolean, onClick?: () => void }
+    function findRow(node: ReactNode): ReactElement<RowProps> | undefined {
+      let row: ReactElement<RowProps> | undefined
+      Children.forEach(node, child => {
+        if (!isValidElement<RowProps>(child)) return
+        if (child.type === 'button' && child.props['aria-label'] === 'Select library asset Unknown cloud') row = child
+        else row ??= findRow(child.props.children)
+      })
+      return row
+    }
+    const row = findRow(tree)
+    assert.ok(row)
+    assert.notEqual(row.props.disabled, true)
+    const select = row.props.onClick
+    assert.ok(select)
+    select()
+    assert.deepEqual(selections, ['unknown'])
+
+    const selectedTree = module.WorkspaceAssetLibraryPopover({ ...props, selectedEntryId: selections[0] })
+    assert.equal(findRow(selectedTree)?.props['aria-pressed'], true)
+    const selectedMarkup = renderToStaticMarkup(selectedTree)
+    assert.match(selectedMarkup, /Missing metadata prevents a safe open/)
+    assert.match(selectedMarkup, /<button[^>]*disabled=""[^>]*aria-label="Open selected asset"/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('WorkspaceAssetLibraryPopover finds entries by warning-only query tokens', async () => {
+  const { module, cleanup } = await loadLibraryModule()
+
+  try {
+    const markup = renderToStaticMarkup(createElement(module.WorkspaceAssetLibraryPopover, {
+      entries: [
+        entry({
+          id: 'warning-only', displayName: 'Inspected asset', workspacePath: 'Workflows/Scenes/huge.json',
+          capability: 'scene-manifest', previewKind: 'text',
+          warnings: ['Skipped optional manifest inspection for Workflows/Scenes/huge.json: Library metadata exceeds inspection limit'],
+          openTarget: { kind: 'unavailable', reason: 'capability-not-viewable' },
+        }),
+        entry({ id: 'ordinary', displayName: 'Ordinary mesh', workspacePath: 'Workflows/Props/ordinary.glb' }),
+      ],
+      selectedEntryId: null,
+      loading: false,
+      opening: false,
+      error: null,
+      searchQuery: 'inspection limit',
+      collapsedSectionKeys: [],
+      onSelectEntry: () => undefined,
+      onSearchQueryChange: () => undefined,
+      onOpenSelected: () => undefined,
+      onRefresh: () => undefined,
+      onToggleSection: () => undefined,
+      onClose: () => undefined,
+    }))
+    assert.match(markup, /aria-label="Capability category Scene manifests"/)
+    assert.match(markup, /aria-label="Select library asset Inspected asset"/)
+    assert.doesNotMatch(markup, /aria-label="Select library asset Ordinary mesh"/)
+    assert.doesNotMatch(markup, /No workspace assets match/)
   } finally {
     await cleanup()
   }

@@ -70,7 +70,7 @@ export interface WorkspaceAssetLibraryPopoverProps<Entry extends WorkspaceAssetL
 }
 
 interface WorkspaceAssetLibraryEntryGroup<Entry extends WorkspaceAssetLibraryEntry> {
-  capability: NonNullable<Entry['capability']>
+  capability: Entry['capability']
   capabilityLabel: string
   sectionKey: string
   entries: Entry[]
@@ -92,7 +92,8 @@ const WORKSPACE_ASSET_LIBRARY_CAPABILITY_SECTIONS = [
   { capability: 'landmarks-sidecar', label: 'Landmarks sidecars' },
   { capability: 'generated-world', label: 'Generated worlds' },
   { capability: 'scene-manifest', label: 'Scene manifests' },
-] as const satisfies ReadonlyArray<{ capability: AssetCapability, label: string }>
+  { capability: undefined, label: 'Unknown metadata' },
+] as const satisfies ReadonlyArray<{ capability: AssetCapability | undefined, label: string }>
 
 const WORKSPACE_ASSET_LIBRARY_SOURCE_SCOPE_SECTIONS = [
   { sourceScope: 'workflows', label: 'Workflows' },
@@ -105,7 +106,7 @@ const WORKSPACE_ASSET_LIBRARY_SORT_OPTIONS = [
   { value: 'date', label: 'Date' },
 ] as const satisfies ReadonlyArray<{ value: WorkspaceAssetLibrarySortMode, label: string }>
 
-const WORKSPACE_ASSET_LIBRARY_CAPABILITY_ORDER = new Map(
+const WORKSPACE_ASSET_LIBRARY_CAPABILITY_ORDER = new Map<AssetCapability | undefined, number>(
   WORKSPACE_ASSET_LIBRARY_CAPABILITY_SECTIONS.map((section, index) => [section.capability, index]),
 )
 
@@ -534,6 +535,7 @@ function matchesWorkspaceAssetLibraryEntrySearch(entry: WorkspaceAssetLibraryEnt
     entry.sourceScope,
     entry.source?.workspacePath,
     entry.manifest?.workspacePath,
+    ...entry.warnings,
   ]
     .filter((value): value is string => typeof value === 'string' && value.length > 0)
     .some((value) => matchesWorkspaceAssetLibrarySearch(value, normalizedSearchQuery))

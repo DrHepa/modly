@@ -67,7 +67,7 @@ function createModelExtension(overrides: Partial<Extract<WorkflowExtension, { ty
 
 test('preflight accepts scene outputs for scene workflow consumers', () => {
   const workflow = createWorkflow([
-    createNode('scene-source', 'sceneNode', { enabled: true, params: { path: 'Scenes/castle' } }),
+    createNode('scene-source', 'sceneNode', { enabled: true, params: { path: 'Scenes/castle', manifestPath: 'Scenes/castle/scene-manifest.json' } }),
     createNode('scene-consumer', 'extensionNode', { extensionId: 'ext/scene-consumer', enabled: true, params: {} }),
   ])
 
@@ -107,3 +107,49 @@ test('preflight accepts video outputs for video workflow consumers', () => {
 
   assert.deepEqual(issues, [])
 })
+
+for (const type of ['model', 'process'] as const) {
+  for (const inputs of [undefined, ['none']]) {
+    test(`preflight keeps ${type}:none advisory with ${inputs ? "positional ['none']" : 'absent inputs'} and a retained incoming image edge`, () => {
+      const createExtension = type === 'model' ? createModelExtension : createProcessExtension
+      const extension = createExtension({
+        id: 'ext/inputless',
+        input: 'none',
+        ...(inputs ? { inputs } : {}),
+      })
+      const workflow = createWorkflow([
+        createNode('image-source', 'imageNode'),
+        createNode('inputless-target', 'extensionNode', { extensionId: extension.id, enabled: true, params: {} }),
+      ])
+
+      assert.equal(Object.hasOwn(extension, 'inputs'), inputs !== undefined)
+      assert.deepEqual(validateWorkflowPreflight(workflow, [extension]), [])
+    })
+  }
+}
+
+for (const structured of [false, true]) {
+  test(`preflight preserves custom kinds in ${structured ? 'structured' : 'string'} generic input declarations`, () => {
+    const kind = 'custom-artifact'
+    const producer = createModelExtension({ id: 'ext/custom-producer', output: kind })
+    const consumer = createModelExtension({
+      id: 'ext/custom-consumer',
+      name: 'Custom Consumer',
+      input: kind,
+      inputs: structured ? [{ name: 'artifact', type: kind }] : [kind],
+      ...(structured ? { ioContract: 'named-v1' as const } : {}),
+    })
+    const workflow = createWorkflow([
+      createNode('custom-source', 'extensionNode', { extensionId: producer.id, enabled: true, params: {} }),
+      createNode('custom-target', 'extensionNode', { extensionId: consumer.id, enabled: true, params: {} }),
+    ])
+    if (structured) workflow.edges[0].targetHandle = 'artifact'
+
+    assert.deepEqual(validateWorkflowPreflight(workflow, [producer, consumer]), [])
+    assert.deepEqual(validateWorkflowPreflight({ ...workflow, edges: [] }, [producer, consumer]), [{
+      key: 'custom-target:missing:custom-artifact',
+      nodeId: 'custom-target',
+      message: 'Custom Consumer needs an incoming custom-artifact connection.',
+    }])
+  })
+}

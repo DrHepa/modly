@@ -351,8 +351,10 @@ test('named-output model nodes keep an anonymous primary source alias for legacy
 
 test('extension node tag classes keep scene and audio styling on distinct keys', async () => {
   const source = await readWorkflowFile('nodes/ExtensionNode.tsx')
+  const tagClasses = source.match(/const TAG_CLS:\s*Record<string, string>\s*=\s*\{([\s\S]*?)\n\}/)?.[1]
+  assert.ok(tagClasses, 'The regression must inspect the actual TAG_CLS owner')
 
-  assert.match(source, /scene:\s*'border-emerald-500\/30 bg-emerald-500\/10 text-emerald-400'/)
-  assert.match(source, /audio:\s*'border-pink-500\/30 bg-pink-500\/10 text-pink-400'/)
-  assert.equal(source.match(/\baudio:\s*'/g)?.length, 1)
+  assert.match(tagClasses, /scene:\s*'border-emerald-500\/30 bg-emerald-500\/10 text-emerald-400'/)
+  assert.match(tagClasses, /audio:\s*'border-pink-500\/30 bg-pink-500\/10 text-pink-400'/)
+  assert.equal(tagClasses.match(/\baudio:\s*'/g)?.length, 1)
 })

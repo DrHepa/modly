@@ -1,6 +1,6 @@
 import type { HumanoidDraftSidecarReadResult, HumanoidDraftSidecarV1, HumanoidPromotionSidecarReadResult, HumanoidPromotionSidecarV1, RigMetaSidecarReadResult } from '../../shared/types/electron.d'
 import assert from 'node:assert/strict'
-import test, { beforeEach } from 'node:test'
+import test, { afterEach, beforeEach } from 'node:test'
 import type { GenerationJob } from '../../shared/stores/appStore.ts'
 import { resolveViewerAssetTarget } from '../generate/viewerAssetTarget.ts'
 import { build } from 'esbuild'
@@ -46,6 +46,8 @@ let useWorldsSceneStore: typeof import('../worlds/worldsSceneStore.ts').useWorld
 let useWorkflowRunStore: WorkflowRunStore
 let axiosClientMock: AxiosClientMock
 let runProcessCalls: RunProcessCall[]
+const originalSetTimeout = globalThis.setTimeout
+afterEach(() => { globalThis.setTimeout = originalSetTimeout })
 test('workflowRunStore ignores disabled siblings and still runs an active inputless model', async () => {
   const activeExt = createWorkflowExtension({
     id: 'sense/open-image',
@@ -1200,7 +1202,7 @@ test('workflowRunStore still dispatches animate-rigged-mesh when rigged mesh is 
 
   axiosClientMock = {
     async post(path: string, data?: unknown) {
-      postCalls.push({ path, data: data as Record<string, unknown> })
+      postCalls.push({ path, data: JSON.parse(JSON.stringify(data)) as Record<string, unknown> })
       assert.equal(path, '/generate/from-text')
       return { data: { job_id: 'job-animate-without-rigged-mesh' } }
     },
@@ -1223,6 +1225,8 @@ test('workflowRunStore still dispatches animate-rigged-mesh when rigged mesh is 
     enable_texture: false,
     texture_resolution: 1024,
     params: {
+      prompt: 'Walk forward',
+      text: 'Walk forward',
       motion_prompt: 'Walk forward',
     },
   })
@@ -3171,18 +3175,26 @@ test('motion MODEL recaptures raw explicit presence on While Retry and falls bac
 
 for (const type of ['model', 'process'] as const) {
   for (const targetHandle of [undefined, 'input-0', 'mesh']) {
-    test(`named rigged ${type} rejects non-declared mesh route without borrowing authority: ${targetHandle ?? 'no handle'}`, async () => {
+    test(`named rigged ${type} ${type === 'model' ? 'dispatches without non-declared mesh transport' : 'rejects non-declared mesh route'} without borrowing authority: ${targetHandle ?? 'no handle'}`, async () => {
       const ext = createKimodoAnimateExtension({ type })
       const workflow = createTextMeshWorkflow({ node: createNode('animate', 'extensionNode', { extensionId: ext.id, enabled: true, params: { prompt: 'Move' } }) })
       workflow.edges.find((edge) => edge.source === 'mesh-source')!.targetHandle = targetHandle
       const posts = captureTextRequests()
       humanoidPromotionReadResult = foundPromotion()
       await useWorkflowRunStore.getState().run(workflow, [ext])
-      assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-      assert.equal(posts.length, 0)
+      assert.equal(useWorkflowRunStore.getState().runState.status, type === 'model' ? 'done' : 'error')
+      assert.equal(posts.length, type === 'model' ? 1 : 0)
       assert.equal(runProcessCalls.length, 0)
       assert.deepEqual(humanoidPromotionReadCalls, [])
-      assert.equal(useWorkflowRunStore.getState().nodeArtifacts.animate, undefined)
+      if (type === 'model') {
+        const params = posts[0].params as Record<string, unknown>
+        for (const key of ['rigged_mesh_path', 'mesh_path', 'humanoid_input_status', 'humanoid_promotion_sidecar_path']) {
+          assert.equal(Object.hasOwn(params, key), false)
+        }
+        assert.equal(useWorkflowRunStore.getState().nodeArtifacts.animate?.provenance?.extensionId, ext.extensionId)
+      } else {
+        assert.equal(useWorkflowRunStore.getState().nodeArtifacts.animate, undefined)
+      }
     })
   }
 }

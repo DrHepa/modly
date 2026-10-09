@@ -177,7 +177,7 @@ test('a required named port cannot use an inherited dictionary member as missing
 // not rendered React Flow or Electron interaction coverage.
 import ts from 'typescript'
 import * as connectionRules from './processConnectionRules.ts'
-import { getProcessTargetPorts } from './processPorts.ts'
+import { getExtensionSourcePort, getExtensionSourcePorts, getProcessTargetPort, getProcessTargetPorts } from './processPorts.ts'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory.ts'
 import { NODE_TYPES_WITHOUT_SOURCE, NODE_TYPES_WITHOUT_TARGET } from '../../shared/stores/workflowsStore.ts'
 
@@ -197,7 +197,7 @@ const pageSource = await readWorkflowFile('WorkflowsPage.tsx')
 const pageAst = ts.createSourceFile('WorkflowsPage.tsx', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
 const paletteOwners = new Map<string, string>()
 function collectPaletteOwners(astNode: ts.Node): void {
-  if (ts.isFunctionDeclaration(astNode) && astNode.name?.text === 'getNodeOutputType') paletteOwners.set(astNode.name.text, astNode.getText(pageAst))
+  if (ts.isFunctionDeclaration(astNode) && astNode.name && ['getNodeOutputType', 'createWorkflowExtensionNode', 'withStableTargetItemIndex'].includes(astNode.name.text)) paletteOwners.set(astNode.name.text, astNode.getText(pageAst))
   if (ts.isVariableDeclaration(astNode) && ['addNodeFromPalette', 'appendValidatedEdge'].includes(astNode.name.getText(pageAst))) {
     assert.ok(astNode.initializer && ts.isCallExpression(astNode.initializer))
     const callback = astNode.initializer.arguments[0]
@@ -207,9 +207,11 @@ function collectPaletteOwners(astNode: ts.Node): void {
   ts.forEachChild(astNode, collectPaletteOwners)
 }
 collectPaletteOwners(pageAst)
-assert.equal(paletteOwners.size, 3, 'The regression must execute the current palette and append owners')
+assert.equal(paletteOwners.size, 5, 'The regression must execute the current palette, append and supporting owners')
 const paletteCode = ts.transpileModule(`
 ${paletteOwners.get('getNodeOutputType')}
+${paletteOwners.get('createWorkflowExtensionNode')}
+${paletteOwners.get('withStableTargetItemIndex')}
 const appendValidatedEdge = ${paletteOwners.get('appendValidatedEdge')};
 const callback = ${paletteOwners.get('addNodeFromPalette')};
 return callback;
@@ -236,7 +238,7 @@ function invokePalette(sourceKind: string, reversed: boolean, targetInputs: Work
     NODE_TYPES_WITHOUT_TARGET,
     NODE_TYPES_WITHOUT_SOURCE,
     allExtensions, getNode: (id: string) => nodes.find((candidate) => candidate.id === id),
-    getProcessTargetPorts, createHydratedExtensionWorkflowNode, createBuiltinWorkflowNode, ...connectionRules,
+    getExtensionSourcePort, getExtensionSourcePorts, getProcessTargetPort, getProcessTargetPorts, createHydratedExtensionWorkflowNode, createBuiltinWorkflowNode, ...connectionRules,
     setConnectionIssue: (value: connectionRules.ProcessConnectionRuleIssue | null) => { issue = value },
     addEdge: (connection: Omit<WFEdge, 'id'>, current: WFEdge[]) => [...current, { id: 'added', ...connection }],
     DEFAULT_EDGE_OPTS: {}, setPendingDropPos: () => {}, setPaletteOpen: () => {}, window: { innerWidth: 100, innerHeight: 100 },
@@ -294,7 +296,7 @@ test('actual palette retains current hydration, canonical identity and While geo
   assert.equal(container.parentId, undefined)
 })
 
-test('actual runner keeps image passthrough data and terminal sinks without leaking scene manifests', async () => {
+test('actual runner keeps image passthrough data and terminal sinks without reading disconnected scene manifests', async () => {
   const fsReadCalls: string[] = []
   const manifestBase64 = Buffer.from(JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] })).toString('base64')
   const { store, calls } = storeFixture(() => ({ filePath: '/workspace/generated.png' }), async (filePath) => {
@@ -305,7 +307,7 @@ test('actual runner keeps image passthrough data and terminal sinks without leak
   const nodes = [node('image', 'imageNode', { filePath: '/workspace/input.png' }), node('pass', 'imagePreviewNode'), node('run', 'extensionNode'), node('single', 'previewImageNode'), node('views', 'previewNode'), node('scene', 'sceneNode', { path: 'scene/scene-manifest.json', manifestPath: 'scene/manifest.json' })]
   await store.getState().run(workflow(nodes, [edge('image', 'pass'), edge('pass', 'run'), edge('run', 'single'), edge('run', 'views')]), [extension('run', undefined, 'image', 'image')])
   assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
-  assert.deepEqual(fsReadCalls, ['/workspace/scene/scene-manifest.json'])
+  assert.deepEqual(fsReadCalls, [])
   assert.equal(calls.length, 1)
   assert.equal(calls[0].input.filePath, '/workspace/input.png')
   assert.equal(store.getState().nodeImageOutputs.run, '/workspace/generated.png')

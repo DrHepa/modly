@@ -269,27 +269,10 @@ class ExtensionProcess:
                 self._readiness_pending = None
                 pending[2].put(None)
 
-    def _assert_no_readiness_pending(self) -> None:
-        with self._readiness_lock:
-            pending = self._readiness_pending
-            if pending and pending[0].poll() is None:
-                raise RuntimeReadinessUnavailable("runtime_busy", "Worker is busy checking runtime readiness.")
-            self._readiness_pending = None
-
     @contextmanager
-    def _model_invocation(self, *, release_readiness: bool = False):
-        # Hold ownership through send AND receive. A timed-out diagnostic still
-        # owns the worker until its correlated reply arrives or stop reaps it.
+    def _model_invocation(self):
+        # Serialize model RPCs through both send and receive.
         with self._invocation_lock:
-            if release_readiness:
-                with self._readiness_lock:
-                    pending = self._readiness_pending
-                # Explicit release may reap the reserved diagnostic worker.
-                # Invocation ownership prevents a new model RPC or restart
-                # between this exact-incarnation check and stop().
-                if pending and pending[0] is self._proc:
-                    self.stop()
-            self._assert_no_readiness_pending()
             self._runtime_revision += 1
             try:
                 yield
@@ -378,7 +361,7 @@ class ExtensionProcess:
                 raise RuntimeError(f"[{self.MODEL_ID}] Unexpected response to load: {msg}")
 
     def unload(self) -> None:
-        with self._model_invocation(release_readiness=True):
+        with self._model_invocation():
             if self._proc and self._proc.poll() is None:
                 try:
                     self._send({"action": "unload"})
@@ -526,11 +509,8 @@ class ExtensionProcess:
         return self._params_schema
 
     def readiness_status(self) -> dict:
-        """Probe an idle, already-running worker; never import/load/repair one."""
-        if not self._invocation_lock.acquire(blocking=False):
-            raise RuntimeReadinessUnavailable("runtime_busy", "Worker is busy.")
-        try:
-            self._assert_no_readiness_pending()
+        """Probe an already-running worker without preventing normal model use."""
+        with self._invocation_lock:
             proc = self._proc
             if proc is None or proc.poll() is not None:
                 raise RuntimeReadinessUnavailable("runtime_not_running", "Worker is not running; diagnostics do not start it.")
@@ -538,22 +518,16 @@ class ExtensionProcess:
             replies: queue.Queue = queue.Queue()
             with self._readiness_lock:
                 self._readiness_pending = (proc, request_id, replies)
-            # Even on timeout or a partial write, retain pending ownership:
-            # there is no safe assumption that the worker did not run the hook.
             self._send({"action": "runtime_readiness", "id": request_id})
-        finally:
-            self._invocation_lock.release()
-        # The pending reservation, not this waiting thread, owns the worker.
-        # New load/generate/probes reject it; explicit unload can stop it.
-        try:
-            msg = replies.get(timeout=self._readiness_timeout)
-        except queue.Empty as exc:
-            raise TimeoutError("Runtime readiness check timed out") from exc
-        if msg is None or self._proc is not proc or proc.poll() is not None:
-            raise RuntimeError("Runtime readiness worker changed")
-        if msg.get("type") == "runtime_readiness":
-            return msg.get("status") or {}
-        raise RuntimeError("Runtime readiness check failed")
+            try:
+                msg = replies.get(timeout=self._readiness_timeout)
+            except queue.Empty as exc:
+                raise TimeoutError("Runtime readiness check timed out") from exc
+            if msg is None or self._proc is not proc or proc.poll() is not None:
+                raise RuntimeError("Runtime readiness worker changed")
+            if msg.get("type") == "runtime_readiness":
+                return msg.get("status") or {}
+            raise RuntimeError("Runtime readiness check failed")
 
     def stop(self) -> None:
         """Hard-stop the subprocess.

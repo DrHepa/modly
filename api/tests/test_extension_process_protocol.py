@@ -542,21 +542,18 @@ def test_extension_process_generate_ignores_stale_runtime_readiness_before_done(
 
 
 def test_extension_process_serializes_readiness_and_load_requests(monkeypatch, load_process):
-    """Current owner rejects a pending diagnostic rather than waiting on it."""
+    """A timed-out optional probe does not reject normal model use."""
     process, sent = load_process
     process._readiness_timeout = 0.001
     with pytest.raises(TimeoutError):
         process.readiness_status()
-    pending = process._readiness_pending
-    with pytest.raises(RuntimeError, match="busy"):
-        process.load()
-    assert len(sent) == 1 and process._readiness_pending is pending
-    process._route_readiness_reply(process._proc, {
-        "type": "runtime_readiness", "id": sent[0]["id"], "status": {"ok": True},
-    })
     send_load_reply(monkeypatch, process, sent, {"type": "loaded"})
     process.load()
-    assert process.is_loaded() and process._readiness_pending is None
+    assert process.is_loaded()
+    assert process._route_readiness_reply(process._proc, {
+        "type": "runtime_readiness", "id": sent[0]["id"], "status": {"ok": True},
+    })
+    assert process._queue.empty()
     assert [request["action"] for request in sent] == ["runtime_readiness", "load"]
 
 

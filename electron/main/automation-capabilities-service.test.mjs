@@ -197,7 +197,6 @@ test('buildAutomationCapabilities returns full canonical payload when backend is
         source: 'backend-runtime',
         id: 'hf://acme/mesh-gen',
         name: 'Mesh Gen',
-        input: undefined,
         description: 'Canonical model id from backend',
         version: '2.0.0',
         hf_repo: 'acme/mesh-gen',

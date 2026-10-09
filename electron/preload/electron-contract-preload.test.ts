@@ -109,6 +109,6 @@ test('preload contract requires webFrame and production index wires it', async (
   }), /webFrame\.setZoomFactor/)
 
   const indexSource = await readFile(new URL('./index.ts', import.meta.url), 'utf-8')
-  assert.match(indexSource, /import\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*,\s*webFrame\s*\}\s*from\s*'electron'/)
-  assert.match(indexSource, /createElectronApi\(\{\s*ipcRenderer\s*,\s*webFrame\s*\}\)/)
+  assert.match(indexSource, /import\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*,\s*webFrame\s*,\s*webUtils\s*\}\s*from\s*'electron'/)
+  assert.match(indexSource, /createElectronApi\(\{\s*ipcRenderer\s*,\s*webFrame\s*,\s*webUtils\s*\}\)/)
 })

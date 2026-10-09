@@ -24,7 +24,7 @@ test('preload model runtimeReadiness invokes the model:runtimeReadiness IPC chan
       invocations.push({ channel, args })
       return { success: true, models: {} }
     },
-  }, { setZoomFactor() {} }, { getPathForFile() { return '/inert/file' } })
+  })
 
   const result = await api.model.runtimeReadiness(['modly-codex-image-extension/text-to-image'])
 
@@ -72,7 +72,7 @@ test('preload model runtimeReadinessAction invokes the model:runtimeReadinessAct
       invocations.push({ channel, args })
       return { success: true }
     },
-  }, { setZoomFactor() {} }, { getPathForFile() { return '/inert/file' } })
+  })
 
   const action = {
     id: 'codex.login.docs',

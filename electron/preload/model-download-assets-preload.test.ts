@@ -26,7 +26,7 @@ test('preload HTTPS asset download sends only the canonical modelId payload', as
       invocations.push({ channel, args })
       return { success: true }
     },
-  }, { setZoomFactor() {} }, { getPathForFile: () => '' })
+  })
 
   const result = await api.model.downloadHttpsAssets('gaussiangpt/vfront')
 

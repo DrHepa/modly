@@ -107,7 +107,7 @@ test('preload workspace artifact registry invokes minimal sidecar IPC channels',
         },
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const writeResult = await api.workspace.artifacts.writeSidecar({
     workspacePath: 'collection/model.glb',
@@ -160,7 +160,7 @@ test('preload workspace artifact registry invokes edited scene artifact IPC chan
         metadata: { kind: 'scene-edit' },
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const request = {
     glbWorkspacePath: 'Workflows/edited/source-edited.glb',
@@ -218,7 +218,7 @@ test('preload workspace artifact registry exposes landmark sidecar writer IPC ch
           : undefined,
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const sidecar = {
     schema: 'modly.landmarks',
@@ -265,7 +265,7 @@ test('preload workspace artifact registry exposes pose clip sidecar writer IPC c
           : undefined,
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const sidecar = {
     schema: 'modly.pose-clip',
@@ -351,7 +351,7 @@ test('preload workspace artifact registry exposes pose clip sidecar reader IPC c
       invocations.push({ channel, args })
       return results[invocations.length - 1]
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const foundRequest = {
     sidecarWorkspacePath: 'Workflows/pose-clips/source-walk.pose-clip.v1.json',
@@ -397,7 +397,7 @@ test('preload workspace artifact registry exposes motion retarget sidecar writer
           : undefined,
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const sidecar = {
     schema: 'modly.motion-retarget',
@@ -503,7 +503,7 @@ test('preload workspace artifact registry exposes motion retarget sidecar reader
       invocations.push({ channel, args })
       return results[invocations.length - 1]
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const foundRequest = {
     sidecarWorkspacePath: 'Workflows/motion-retarget/source.motion-retarget.v1.json',
@@ -559,7 +559,7 @@ test('preload workspace artifact registry exposes workspace artifact preview and
         targetPath: '/tmp/metadata.json',
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const previewRequest = { workspacePath: 'Workflows/kimodo/run-1/metadata.json' }
   const downloadRequest = { workspacePath: 'Workflows/kimodo/run-1/metadata.json', suggestedName: 'metadata.json' }
@@ -607,7 +607,7 @@ test('preload workspace artifact registry exposes dedicated rig rename sidecar w
           : undefined,
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const sidecar = {
     schema: 'modly.rig.rename-plan',
@@ -654,7 +654,7 @@ test('preload rig rename sidecar writer does not route through generic sidecar o
       invocations.push({ channel, args })
       return { success: true, sidecarWorkspacePath: 'Workflows/rig-edits/source-rig-aliases.rig.v1.json', sidecar: (args[0] as { sidecar?: unknown }).sidecar }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const request = {
     sidecarWorkspacePath: 'Workflows/rig-edits/source-rig-aliases.rig.v1.json',
@@ -729,7 +729,7 @@ test('preload workspace artifact registry exposes dedicated rig rename sidecar r
       invocations.push({ channel, args })
       return results[invocations.length - 1]
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const foundRequest = {
     sidecarWorkspacePath: 'Workflows/rig-edits/source-rig-aliases.rig.v1.json',
@@ -799,7 +799,7 @@ test('preload workspace artifact registry exposes read-only UniRig rigmeta sidec
       invocations.push({ channel, args })
       return results[invocations.length - 1]
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const foundRequest = { sourceWorkspacePath: 'Workflows/foo_unirig.glb' }
   const notFoundRequest = { sourceWorkspacePath: 'Workflows/missing_unirig.glb' }
@@ -912,7 +912,7 @@ test('preload workspace artifact registry exposes humanoid draft discovery and p
         sidecar: { schema: 'modly.humanoid-promotion.v1', version: 1 },
       }
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   const draftRequest = { meshWorkspacePath: 'Workflows/outputs/hero_unirig.glb' }
   const promotionWriteRequest: import('../../src/shared/types/electron.d').HumanoidPromotionSidecarWriteRequest = {
@@ -993,7 +993,7 @@ test('preload workspace asset library exposes list, read, and open IPC channels'
       if (channel === 'workspace:library:open') return openResult
       throw new Error(`Unexpected channel: ${channel}`)
     },
-  }, { setZoomFactor: () => undefined }, { getPathForFile: () => '' })
+  })
 
   assert.equal(typeof api.workspace.library.list, 'function')
   assert.equal(typeof api.workspace.library.read, 'function')

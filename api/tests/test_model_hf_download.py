@@ -80,7 +80,7 @@ def test_hf_download_route_streams_progress_and_done(monkeypatch, tmp_path: Path
         response = await model_router.hf_download(
             repo_id="owner/model",
             model_id=model_id,
-            token="private-token",
+            x_hf_token="private-token",
         )
         return await _collect_stream_events(response)
 

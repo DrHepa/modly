@@ -7,6 +7,7 @@ import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
+import type { DownloadMap } from './components/extensionShared'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const modelsPageEntry = path.join(projectRoot, 'src/areas/models/ModelsPage.tsx')
@@ -398,5 +399,102 @@ test('ModelsPage preserves model-owned source, shared group and variant download
     ])
   } finally {
     await cleanup()
+  }
+})
+
+test('ModelsPage actual pause handler preserves later progress and Resume after failed or rejected IPC', async () => {
+  const source = await readFile(modelsPageEntry, 'utf8')
+  const tree = ts.createSourceFile(modelsPageEntry, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const declarations = new Map<string, ts.FunctionDeclaration>()
+  const progressCallbacks: ts.ArrowFunction[] = []
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name) declarations.set(node.name.text, node)
+    if (ts.isCallExpression(node) && node.expression.getText(tree) === 'window.electron.model.onProgress') {
+      assert.equal(node.arguments.length, 1)
+      assert.ok(ts.isArrowFunction(node.arguments[0]), 'Use the actual registered progress callback')
+      progressCallbacks.push(node.arguments[0] as ts.ArrowFunction)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
+  assert.ok(declarations.has('handlePauseDownload'))
+  assert.ok(declarations.has('hasDownloadControls'))
+  assert.equal(progressCallbacks.length, 1)
+  const emit = (text: string) => ts.transpileModule(text, {
+    fileName: 'actual-owner.tsx',
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, jsx: ts.JsxEmit.React },
+  }).outputText
+  const makePause = new Function('window', 'downloading', 'setDownloading', 'setGhErr', emit(
+    `${declarations.get('hasDownloadControls')!.getText(tree)}\nreturn (${declarations.get('handlePauseDownload')!.getText(tree)});`,
+  ))
+  const makeProgress = new Function('setDownloading', 'setDownloadFailures', 'useExtensionsStore', 'refreshInstalledIds', emit(
+    `return (${progressCallbacks[0].getText(tree)});`,
+  ))
+
+  // Render the real consumer, not a duplicate paused-to-Resume predicate.
+  const controlsEntry = path.join(projectRoot, 'src/areas/models/components/extensionShared.tsx')
+  const controlsSource = await readFile(controlsEntry, 'utf8')
+  const controlsTree = ts.createSourceFile(controlsEntry, controlsSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const control = controlsTree.statements.find((node): node is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(node) && node.name?.text === 'NodeInstallControl')
+  assert.ok(control)
+  const NodeInstallControl = new Function('React', emit(
+    `return (${control.getText(controlsTree).replace(/^export\s+/, '')});`,
+  ))({ createElement })
+
+  const fullId = 'pause-owner/generate'
+  const events = [
+    undefined,
+    { percent: 0, status: 'paused', paused: true },
+    { percent: 41, status: 'downloading', paused: false },
+    { percent: 42, status: 'Pausing…', paused: true },
+    { percent: 100, status: 'done', paused: false },
+    { percent: 0, status: 'cancelled', cancelled: true },
+  ]
+  for (const event of events) for (const outcome of ['failure', 'throw'] as const) {
+    const original = { percent: 37, status: 'receiving', file: 'weights.bin', bytesDownloaded: 370, totalBytes: 1000, variantId: 'small' }
+    let downloading: DownloadMap = { [fullId]: original }
+    const errors: string[] = []
+    const requestedIds: string[] = []
+    let resolve!: (result: { success: boolean; error?: string }) => void
+    let reject!: (error: Error) => void
+    const response = new Promise<{ success: boolean; error?: string }>((done, fail) => { resolve = done; reject = fail })
+    const setDownloading = (update: (previous: DownloadMap) => DownloadMap) => { downloading = update(downloading) }
+    const pause = makePause({ electron: { model: {
+      pauseDownload: (id: string) => { requestedIds.push(id); return response },
+      cancelDownload: async () => ({ success: true }),
+    } } }, downloading, setDownloading, (error: string) => { errors.push(error) })
+    const progress = makeProgress(setDownloading, () => {}, { getState: () => ({ modelExtensions: [{
+      id: 'pause-owner', nodes: [{ id: 'generate', capabilityId: fullId, hfRepo: 'owner/repo' }],
+    }] }) }, async () => {})
+
+    const pending = pause(fullId)
+    assert.deepEqual(requestedIds, [fullId])
+    assert.equal(downloading[fullId].paused, true)
+    assert.equal(downloading[fullId].status, 'Pausing…')
+    if (event) progress({ capabilityId: fullId, modelId: fullId, variantId: 'small', ...event })
+    await Promise.resolve() // Let the actual completion callback remove its finished entry.
+    const physicalRecord = downloading[fullId]
+    if (outcome === 'throw') reject(new Error('pause IPC rejected'))
+    else resolve({ success: false, error: 'pause IPC failed' })
+    await pending
+
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /pause IPC/)
+    if (!event) {
+      assert.equal(downloading[fullId], original, 'No later event: restore the exact prior object and optional fields')
+      assert.equal(Object.hasOwn(downloading[fullId], 'paused'), false)
+    } else {
+      assert.equal(downloading[fullId], physicalRecord, 'A later progress record or removal must win over a late IPC failure')
+      if (event.percent === 100 || 'cancelled' in event) assert.equal(downloading[fullId], undefined)
+      if (event.paused) {
+        const html = renderToStaticMarkup(createElement(NodeInstallControl, {
+          state: { kind: 'downloading', dl: downloading[fullId] },
+          onInstall: () => {}, onPause: () => {}, onResume: () => {}, onCancel: () => {},
+        }))
+        assert.match(html, /title="Resume download"/)
+        assert.doesNotMatch(html, /title="Pause download"/)
+      }
+    }
   }
 })

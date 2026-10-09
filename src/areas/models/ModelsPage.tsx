@@ -492,15 +492,22 @@ export default function ModelsPage(): JSX.Element {
       return
     }
 
-    const previousStatus = downloading[fullId]?.status
-    setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: { ...prev[fullId], paused: true, status: 'Pausing…' } }) : prev)
-    const result = await window.electron.model.pauseDownload(fullId)
-    if (!result.success) {
-      setGhErr(result.error ?? 'Could not pause download.')
-      setDownloading((prev) => prev[fullId] ? ({ ...prev, [fullId]: {
-        ...prev[fullId], paused: false,
-        status: prev[fullId].status === 'Pausing…' ? previousStatus : prev[fullId].status,
-      } }) : prev)
+    const previousDownload = downloading[fullId]
+    const optimisticDownload = previousDownload ? { ...previousDownload, paused: true, status: 'Pausing…' } : undefined
+    setDownloading((prev) => optimisticDownload && prev[fullId] === previousDownload
+      ? { ...prev, [fullId]: optimisticDownload } : prev)
+    const rollbackPause = () => setDownloading((prev) => previousDownload && prev[fullId] === optimisticDownload
+      ? { ...prev, [fullId]: previousDownload } : prev)
+
+    try {
+      const result = await window.electron.model.pauseDownload(fullId)
+      if (!result.success) {
+        setGhErr(result.error ?? 'Could not pause download.')
+        rollbackPause()
+      }
+    } catch (error) {
+      setGhErr(String(error))
+      rollbackPause()
     }
   }
 

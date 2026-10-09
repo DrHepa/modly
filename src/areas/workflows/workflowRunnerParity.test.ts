@@ -51,7 +51,10 @@ const storeBundle = (await build({
   } }],
 })).outputFiles[0].text
 
-function storeFixture(resultFor: (nodeId: string) => { filePath?: string; text?: string } = () => ({ filePath: '/workspace/result.glb' })) {
+function storeFixture(
+  resultFor: (nodeId: string) => { filePath?: string; text?: string } = () => ({ filePath: '/workspace/result.glb' }),
+  readFileBase64: (filePath: string) => Promise<string> = async () => { throw new Error('No image reads in process fixture') },
+) {
   const calls: { id: string; input: any; params: any }[] = []
   const fixture = {
     app: { apiUrl: 'http://inert.invalid', selectedImagePath: undefined, currentJob: null as any,
@@ -60,14 +63,14 @@ function storeFixture(resultFor: (nodeId: string) => { filePath?: string; text?:
   }
   const window = { electron: {
     settings: { get: async () => ({ workspaceDir: '/workspace' }) },
-    fs: { deleteDirectory: async () => ({ success: true }), listFiles: async () => ['a.glb', 'b.glb'], readFileBase64: async () => { throw new Error('No image reads in process fixture') } },
+    fs: { deleteDirectory: async () => ({ success: true }), listFiles: async () => ['a.glb', 'b.glb'], readFileBase64 },
     extensions: { runProcess: async (id: string, input: any, params: any) => {
       calls.push(JSON.parse(JSON.stringify({ id, input, params })))
       return { success: true, result: resultFor(input.nodeId) }
     } },
   } }
   const module = { exports: {} as any }
-  vm.runInNewContext(storeBundle, { module, exports: module.exports, require: createRequire(import.meta.url), fixture, window, process, console, crypto, setTimeout, clearTimeout })
+  vm.runInNewContext(storeBundle, { module, exports: module.exports, require: createRequire(import.meta.url), fixture, window, process, console, crypto, setTimeout, clearTimeout, atob, TextDecoder })
   return { store: module.exports.useWorkflowRunStore, calls, fixture }
 }
 
@@ -135,9 +138,10 @@ test('actual store keeps Wait source traversal and audio routing for named and p
   ]), [extension('audio', undefined, 'text', 'audio'), extension('named', [{ name: 'sound', type: 'audio' }], 'audio', 'audio'), extension('legacy', ['audio', 'text'], 'audio')])
   assert.equal(calls.length, 1)
   assert.equal(store.getState().waitStates.wait, 'pending')
+  assert.equal(store.getState().checkpoints.wait.input.filePath, '/sound.wav')
   await store.getState().continueRun('wait')
   assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
-  assert.deepEqual(calls[1].input.inputs.sound, { type: 'audio', filePath: '/sound.wav', text: 'sound', sourceNodeId: 'audio' })
+  assert.deepEqual(calls[1].input.inputs.sound, { type: 'audio', filePath: '/sound.wav', text: 'sound', sourceNodeId: 'wait' })
   assert.equal(calls[2].input.filePath, '/workspace/result.glb')
 })
 
@@ -166,8 +170,19 @@ import ts from 'typescript'
 import * as connectionRules from './processConnectionRules.ts'
 import { getProcessTargetPorts } from './processPorts.ts'
 import { createHydratedExtensionWorkflowNode } from './workflowNodeFactory.ts'
-import { createBuiltinWorkflowNode } from './workflowBuiltinNodeCatalog.tsx'
 import { NODE_TYPES_WITHOUT_SOURCE, NODE_TYPES_WITHOUT_TARGET } from '../../shared/stores/workflowsStore.ts'
+
+const builtinCatalogBundle = (await build({
+  entryPoints: [path.join(__dirname, 'workflowBuiltinNodeCatalog.tsx')], bundle: true, platform: 'node', format: 'cjs', write: false,
+})).outputFiles[0].text
+const builtinCatalogModule = { exports: {} as typeof import('./workflowBuiltinNodeCatalog') }
+// Keep factory-created data in the test's realm for strict prototype comparisons.
+vm.runInThisContext(`(function(module, exports, require, crypto, process) {
+${builtinCatalogBundle}
+})`)(
+  builtinCatalogModule, builtinCatalogModule.exports, createRequire(import.meta.url), crypto, process,
+)
+const { createBuiltinWorkflowNode } = builtinCatalogModule.exports
 
 const pageSource = await readWorkflowFile('WorkflowsPage.tsx')
 const pageAst = ts.createSourceFile('WorkflowsPage.tsx', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
@@ -271,10 +286,17 @@ test('actual palette retains current hydration, canonical identity and While geo
 })
 
 test('actual runner keeps image passthrough data and terminal sinks without leaking scene manifests', async () => {
-  const { store, calls } = storeFixture(() => ({ filePath: '/workspace/generated.png' }))
-  const nodes = [node('image', 'imageNode', { filePath: '/workspace/input.png' }), node('pass', 'imagePreviewNode'), node('run', 'extensionNode'), node('single', 'previewImageNode'), node('views', 'previewNode'), node('scene', 'sceneNode', { manifestPath: 'scene/manifest.json' })]
+  const fsReadCalls: string[] = []
+  const manifestBase64 = Buffer.from(JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] })).toString('base64')
+  const { store, calls } = storeFixture(() => ({ filePath: '/workspace/generated.png' }), async (filePath) => {
+    fsReadCalls.push(filePath)
+    assert.equal(filePath, '/workspace/scene/scene-manifest.json')
+    return manifestBase64
+  })
+  const nodes = [node('image', 'imageNode', { filePath: '/workspace/input.png' }), node('pass', 'imagePreviewNode'), node('run', 'extensionNode'), node('single', 'previewImageNode'), node('views', 'previewNode'), node('scene', 'sceneNode', { path: 'scene/scene-manifest.json', manifestPath: 'scene/manifest.json' })]
   await store.getState().run(workflow(nodes, [edge('image', 'pass'), edge('pass', 'run'), edge('run', 'single'), edge('run', 'views')]), [extension('run', undefined, 'image', 'image')])
   assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
+  assert.deepEqual(fsReadCalls, ['/workspace/scene/scene-manifest.json'])
   assert.equal(calls.length, 1)
   assert.equal(calls[0].input.filePath, '/workspace/input.png')
   assert.equal(store.getState().nodeImageOutputs.run, '/workspace/generated.png')

@@ -1485,20 +1485,17 @@ test('workflowRunStore captures video process outputs for video preview nodes wi
     params: {},
   }))
 
-  window.electron.extensions.runProcess = async (extensionId: string, input: unknown, params: Record<string, unknown>) => {
-    runProcessCalls.push({ extensionId, input, params })
-    return { success: true, result: { filePath: '/workspace/video/generated.mp4' } }
-  }
+  processResult = async () => ({ success: true, result: { filePath: '/workspace/video/generated.mp4' } })
 
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/video/generated.mp4')
   assert.equal(useWorkflowRunStore.getState().runState.artifact?.kind, 'video')
-  assert.deepEqual(useWorkflowRunStore.getState().nodeVideoOutputs, {
+  assert.deepEqual(structuredClone(useWorkflowRunStore.getState().nodeVideoOutputs), {
     'video-node': '/workspace/video/generated.mp4',
   })
-  assert.equal(useAppStore.getState().currentJob?.outputUrl, undefined)
+  assert.equal(appState.currentJob?.outputUrl, undefined)
 })
 
 test('workflowRunStore hydrates missing defaults for legacy process nodes before runProcess', async () => {
@@ -2886,10 +2883,12 @@ test('mounted cancellation clears busy state and late rejection cannot clear a n
 // Original54: provenance is descriptive lineage, never a humanoid trust receipt.
 test('artifact adapter adds optional provenance without changing identity, legacy payload or absent behavior', () => {
   const provenance = { workflowId: 'workflow', workflowNodeId: 'node', extensionId: 'resolved', extensionNodeId: 'capability' }
-  for (const outputType of ['image', 'mesh', 'text', 'scene']) {
+  for (const outputType of ['image', 'mesh', 'text', 'scene', 'audio', 'video']) {
     const output = outputType === 'text' ? { text: '', outputType } : { filePath: `/workspace/result.${outputType}`, outputType }
     const original = legacyOutputToArtifactRef(output)!
     const described = legacyOutputToArtifactRef(output, { provenance })!
+    assert.equal(original.kind, outputType)
+    assert.deepEqual(artifactRefToLegacyOutput(original), output)
     assert.deepEqual(described, { ...original, provenance })
     assert.deepEqual(artifactRefToLegacyOutput(described), artifactRefToLegacyOutput(original))
     assert.equal(Object.hasOwn(original, 'provenance'), false)
@@ -2897,7 +2896,7 @@ test('artifact adapter adds optional provenance without changing identity, legac
       ...original, id: 'run:node', versionId: 'run:node:2', provenance,
     })
   }
-  for (const absent of [undefined, {}, { outputType: 'mesh' }, { outputType: 'scene' }, { filePath: '/unsupported', outputType: 'unknown' }, { filePath: '/result.wav', outputType: 'audio' }, { filePath: '/result.mp4', outputType: 'video' }]) {
+  for (const absent of [undefined, {}, { outputType: 'mesh' }, { outputType: 'scene' }, { filePath: '/unsupported', outputType: 'unknown' }]) {
     assert.equal(legacyOutputToArtifactRef(absent, { provenance }), undefined)
   }
   assert.equal(legacyOutputToArtifactRef({ text: 'legacy text', outputType: 'unknown' }, { provenance })?.kind, 'text')

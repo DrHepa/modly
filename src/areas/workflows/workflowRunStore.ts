@@ -1338,7 +1338,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         artifact,
       },
     }))
-    updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl, previewKind: undefined, step: undefined })
+    updateOwnedJob(ctx, { status: 'done', progress: 100, outputUrl: artifact?.kind === 'mesh' ? outputUrl : undefined, previewKind: undefined, step: undefined })
     void showCompletionNotification('Workflow run complete')
   }
 

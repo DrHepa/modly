@@ -39,6 +39,12 @@ function normalizeTargetHandle(node: WFNode | undefined, allExtensions: Workflow
   const extension = getExtensionForNode(node, allExtensions)
   if (!extension) return { handle, changed: false }
 
+  const ports = getProcessTargetPorts(extension)
+  const positionalPorts = ports.filter((port) => port.isLegacy && typeof port.name === 'string')
+  if (positionalPorts.length > 0) {
+    if (handle == null) return { handle: positionalPorts[0].name, changed: positionalPorts[0].name !== handle }
+    return { handle, changed: false }
+  }
   const namedPorts = getDeclaredTargetPorts(extension)
   if (namedPorts.length === 0) return normalizeLegacyHandle(handle)
 

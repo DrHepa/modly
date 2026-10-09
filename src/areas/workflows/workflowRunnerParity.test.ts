@@ -197,7 +197,7 @@ const pageSource = await readWorkflowFile('WorkflowsPage.tsx')
 const pageAst = ts.createSourceFile('WorkflowsPage.tsx', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
 const paletteOwners = new Map<string, string>()
 function collectPaletteOwners(astNode: ts.Node): void {
-  if (ts.isFunctionDeclaration(astNode) && astNode.name && ['getNodeOutputType', 'createWorkflowExtensionNode', 'withStableTargetItemIndex'].includes(astNode.name.text)) paletteOwners.set(astNode.name.text, astNode.getText(pageAst))
+  if (ts.isFunctionDeclaration(astNode) && astNode.name && ['getNodeOutputType', 'createWorkflowExtensionNode'].includes(astNode.name.text)) paletteOwners.set(astNode.name.text, astNode.getText(pageAst))
   if (ts.isVariableDeclaration(astNode) && ['addNodeFromPalette', 'appendValidatedEdge'].includes(astNode.name.getText(pageAst))) {
     assert.ok(astNode.initializer && ts.isCallExpression(astNode.initializer))
     const callback = astNode.initializer.arguments[0]
@@ -207,11 +207,10 @@ function collectPaletteOwners(astNode: ts.Node): void {
   ts.forEachChild(astNode, collectPaletteOwners)
 }
 collectPaletteOwners(pageAst)
-assert.equal(paletteOwners.size, 5, 'The regression must execute the current palette, append and supporting owners')
+assert.equal(paletteOwners.size, 4, 'The regression must execute the current palette, append and supporting owners')
 const paletteCode = ts.transpileModule(`
 ${paletteOwners.get('getNodeOutputType')}
 ${paletteOwners.get('createWorkflowExtensionNode')}
-${paletteOwners.get('withStableTargetItemIndex')}
 const appendValidatedEdge = ${paletteOwners.get('appendValidatedEdge')};
 const callback = ${paletteOwners.get('addNodeFromPalette')};
 return callback;
@@ -332,7 +331,7 @@ test('inputless model nodes expose no target socket and skip predecessor fallbac
   const extensionNodeSource = await readWorkflowFile('nodes/ExtensionNode.tsx')
   const runStoreSource = await readWorkflowFile('workflowRunStore.ts')
 
-  assert.match(extensionNodeSource, /const targetPorts = ext \? getProcessTargetPorts\(ext\) : \[\]/)
+  assert.match(extensionNodeSource, /const inputs = ext \? getProcessTargetPorts\(ext\) : \[\]/)
   assert.match(extensionNodeSource, /ext\?\.input !== 'none'/)
   assert.match(runStoreSource, /export function shouldUsePreviousNodeFallback[\s\S]*return input !== 'none'/)
   assert.match(runStoreSource, /else if \(shouldUsePreviousNodeFallback\(ext\.input\)\)/)
@@ -345,8 +344,10 @@ test('inputless model nodes expose no target socket and skip predecessor fallbac
 test('extension nodes keep a single anonymous primary source handle for legacy edges', async () => {
   const source = await readWorkflowFile('nodes/ExtensionNode.tsx')
   assert.match(source, /getExtensionSourcePorts\(\{ output: ext\?\.output \}\)/)
-  assert.match(source, /\{\.\.\.\(port\.name \? \{ id: port\.name \} : \{\}\)\}/)
-  assert.match(source, /sourcePorts\.map\(\(port, index\)/)
+  const sourceHandleOwner = source.match(/const sourceHandlesEl = sourcePorts\.length > 0 \? \(([\s\S]*?)\n  \) : null/)?.[1]
+  assert.ok(sourceHandleOwner, 'The regression must inspect the actual primary source Handle owner')
+  assert.match(sourceHandleOwner, /<Handle\s+type="source"/)
+  assert.doesNotMatch(sourceHandleOwner, /\bid=/)
   assert.doesNotMatch(source, /__primary-source-alias/)
 })
 

@@ -157,6 +157,7 @@ export default function ExtensionNode({ id, data, selected }: { id: string; data
     <>
       {inputs.length > 0 && (
       <Handle
+        id={inputs[0].name ?? undefined}
         type="target"
         position={Position.Left}
         style={{ background: HANDLE_COLOR[ext?.input ?? 'image'], width: 14, height: 14, border: '2.5px solid #18181b', top: handleTops[0] ?? '50%' }}

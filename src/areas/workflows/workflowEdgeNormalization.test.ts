@@ -4,6 +4,7 @@ import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions.ts'
 
 const { normalizeWorkflowEdges } = await import(new URL('./workflowEdgeNormalization.ts', import.meta.url).href)
+const { buildProcessExecutionInput } = await import(new URL('./processExecution.ts', import.meta.url).href)
 
 function createNode(id: string, type: WFNode['type'], data: WFNode['data'] = { enabled: true, params: {} }): WFNode {
   return {
@@ -271,3 +272,75 @@ test('normalizes each switched workflow independently', () => {
     id: 'edge-b', source: 'source-b', sourceHandle: null, target: 'target-b', targetHandle: 'reference_image',
   })
 })
+
+for (const type of ['model', 'process'] as const) {
+  function positionalExtension(inputs: string[]): WorkflowExtension {
+    return type === 'model' ? createModelExtension({ inputs }) : createProcessExtension(inputs)
+  }
+
+  test(`${type} normalization preserves input-2 mesh ownership across an empty physical slot into actual execution`, () => {
+    const extension = positionalExtension(['image', '', 'mesh'])
+    const source = createNode('mesh-source', 'meshNode')
+    const target = createNode('positional-target', 'extensionNode', { extensionId: extension.id, enabled: true, params: {} })
+    const edge: WFEdge = { id: 'mesh-edge', source: source.id, target: target.id, targetHandle: 'input-2' }
+    const args = { nodes: [source, target], edges: [edge], allExtensions: [extension] }
+    const normalized = normalizeWorkflowEdges(args)
+
+    assert.equal(normalized.changed, false)
+    assert.equal(normalized.edges[0], edge)
+    assert.equal(normalized.edges[0].targetHandle, 'input-2')
+    assert.equal(normalizeWorkflowEdges({ ...args, edges: normalized.edges }).changed, false)
+    assert.deepEqual(buildProcessExecutionInput({
+      ...args, node: target, edges: normalized.edges,
+      nodeOutputs: new Map([[source.id, { filePath: '/tmp/slot-two.glb', outputType: 'mesh' }]]),
+    }), { filePath: '/tmp/slot-two.glb', text: undefined, nodeId: extension.nodeId })
+  })
+
+  for (const handle of [null, undefined]) {
+    test(`${type} normalization maps a missing singleton positional handle (${String(handle)}) to its first physical port`, () => {
+      const extension = positionalExtension(['image'])
+      const source = createNode('image-source', 'imageNode')
+      const target = createNode('singleton-target', 'extensionNode', { extensionId: extension.id, enabled: true, params: {} })
+      const edge: WFEdge = { id: 'image-edge', source: source.id, target: target.id, targetHandle: handle }
+      const args = { nodes: [source, target], edges: [edge], allExtensions: [extension] }
+      const normalized = normalizeWorkflowEdges(args)
+
+      assert.equal(normalized.changed, true)
+      assert.deepEqual(normalized.edges, [{ ...edge, targetHandle: 'input-0' }])
+      assert.equal(edge.targetHandle, handle)
+      assert.equal(normalizeWorkflowEdges({ ...args, edges: normalized.edges }).changed, false)
+      assert.deepEqual(buildProcessExecutionInput({
+        ...args, node: target, edges: normalized.edges,
+        nodeOutputs: new Map([[source.id, { filePath: '/tmp/first-slot.png', outputType: 'image' }]]),
+      }), { filePath: '/tmp/first-slot.png', text: undefined, nodeId: extension.nodeId })
+    })
+  }
+
+  test(`${type} normalization retains indexed prompt and mesh descriptors without compacting slots`, () => {
+    const extension = positionalExtension(['image', 'text', 'mesh'])
+    const text = createNode('text-source', 'textNode')
+    const mesh = createNode('mesh-source', 'meshNode')
+    const target = createNode('mixed-target', 'extensionNode', { extensionId: extension.id, enabled: true, params: {} })
+    const args = { nodes: [text, mesh, target], allExtensions: [extension], edges: [
+      { id: 'text-edge', source: text.id, target: target.id, targetHandle: 'input-1' },
+      { id: 'mesh-edge', source: mesh.id, target: target.id, targetHandle: 'input-2' },
+    ] }
+    const normalized = normalizeWorkflowEdges(args)
+    assert.equal(normalized.changed, false)
+    assert.deepEqual(normalized.edges.map((edge) => edge.targetHandle), ['input-1', 'input-2'])
+    const result = buildProcessExecutionInput({
+      ...args, node: target, edges: normalized.edges, nodeOutputs: new Map([
+        [text.id, { text: 'Keep the physical prompt', outputType: 'text' }],
+        [mesh.id, { filePath: '/tmp/slot-two.glb', outputType: 'mesh' }],
+      ]),
+    })
+    const indexedTexts = new Array<string | undefined>(2)
+    indexedTexts[1] = 'Keep the physical prompt'
+    assert.deepEqual(result, {
+      filePath: '/tmp/slot-two.glb', text: 'Keep the physical prompt',
+      nodeId: extension.nodeId, texts: indexedTexts,
+    })
+    assert.equal(Object.hasOwn(result.texts!, 0), false)
+    assert.equal(result.texts![1], 'Keep the physical prompt')
+  })
+}

@@ -270,19 +270,18 @@ test('keeps legacy primary output routing for stale source handles', () => {
 })
 
 
-test('named outputs retain literal output handles, open types and materialized Wait ownership', () => {
+test('legacy primary outputs ignore stale named handles and retain open types and materialized Wait ownership', () => {
   const source = createNode('source', 'extensionNode', { extensionId: 'vision/named', enabled: true, params: {} })
   const wait = createNode('wait', 'waitNode')
   const preview = createNode('preview', 'imagePreviewNode')
   const target = createNode('target', 'extensionNode', { extensionId: 'ext/refiner', enabled: true, params: {} })
   const extension: WorkflowExtension = {
-    ...createProcessExtension(), id: 'vision/named', type: 'model', ioContract: 'named-v1',
-    outputs: [{ name: 'primary', type: 'image' }, { name: 'output', type: 'capture' }],
+    ...createProcessExtension(), id: 'vision/named', type: 'model', output: 'capture',
   }
-  const primary = { filePath: '/primary.png', outputType: 'image' }
+  const primary = { filePath: '/primary.capture', outputType: 'capture' }
   const secondary = { filePath: '/secondary.capture', outputType: 'capture' }
   const outputs = new Map([
-    ['source', primary], [getWorkflowNodeOutputKey('source', 'output'), secondary],
+    ['source', primary], ['source::output::output', secondary],
   ])
   const edges: WFEdge[] = [
     { id: 'source-wait', source: source.id, sourceHandle: 'output', target: wait.id },
@@ -292,10 +291,10 @@ test('named outputs retain literal output handles, open types and materialized W
   const args = { node: target, nodes: [source, wait, preview, target], edges,
     allExtensions: [extension, createProcessExtension([{ name: 'capture', type: 'capture' }])], nodeOutputs: outputs }
   const original = buildProcessExecutionInput(args)
-  assert.deepEqual(original.inputs?.capture, { type: 'capture', sourceNodeId: 'source', filePath: '/secondary.capture' })
+  assert.deepEqual(original.inputs?.capture, { type: 'capture', sourceNodeId: 'source', filePath: '/primary.capture' })
   outputs.set('wait', { filePath: '/edited.capture', outputType: 'capture' })
   const materialized = buildProcessExecutionInput(args)
   assert.deepEqual(materialized.inputs?.capture, { type: 'capture', sourceNodeId: 'wait', filePath: '/edited.capture' })
   assert.equal(outputs.get('source'), primary)
-  assert.equal(outputs.get(getWorkflowNodeOutputKey('source', 'output')), secondary)
+  assert.equal(outputs.get('source::output::output'), secondary)
 })

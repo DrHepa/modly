@@ -273,13 +273,17 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
         grid = new THREE.GridHelper(10, 20, 0x3f3f46, 0x27272a)
         viewer.threeScene.add(grid)
 
-        loadPromise = viewer.addSplatScene(url, {
+        const sceneLoad = viewer.addSplatScene(url, {
           format: module.SceneFormat.Splat,
           showLoadingUI: false,
           progressiveLoad: false,
           rotation: SPLAT_SCENE_ROTATION, // 180° about Z — 3DGS is Y-down; stands it upright while keeping the front toward the camera (X-mirror is invisible on a symmetric model)
         })
-        return loadPromise
+        loadPromise = sceneLoad
+        // The package wrapper ignores native thenable rejection callbacks.
+        return new Promise<void>((resolve, reject) => {
+          sceneLoad.then(resolve).catch(reject)
+        })
           .then(() => {
             if (disposed) return
             viewer?.start()

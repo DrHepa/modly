@@ -1349,3 +1349,147 @@ test('Viewer3D metadata captures the reader before awaiting and retires same-URL
   assert.equal(view.component('RigEditorPanel').effectiveNaming.byBoneId[rootId].label, 'Still Editable')
   assert.deepEqual(await readFile(path.join(bridge.workspaceDir, 'Workflows/rig.glb')), bridge.sourceBytes)
 })
+
+// Exercise the isolated SplatViewer itself: only Canvas and Viewer construction
+// are inert. Promise behavior comes from the installed public package export.
+async function mountActualSplat(t: any) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'modly-splat-promise-'))
+  const unhandled: unknown[] = []
+  const onUnhandled = (error: unknown) => unhandled.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  const errors: unknown[][] = []
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args) })
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected SplatViewer network request') })
+  let unmount = () => undefined as void
+  const advance = async () => {
+    await settle()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    await settle()
+  }
+  t.after(async () => {
+    try { unmount(); await advance() } finally {
+      process.off('unhandledRejection', onUnhandled)
+      await rm(directory, { recursive: true, force: true })
+    }
+    assert.deepEqual(unhandled, [], 'The installed wrapper must not leave a derived rejection unhandled')
+    assert.equal(fetch.mock.callCount(), 0, 'No network request may leave the splat CPU harness')
+  })
+  const packageModule = pathToFileURL(path.join(path.dirname(require.resolve('@mkkellogg/gaussian-splats-3d')), 'gaussian-splats-3d.module.js')).href
+  const outfile = path.join(directory, 'splat.mjs')
+  await build({
+    stdin: {
+      contents: `export { default as SplatViewer } from './src/areas/generate/components/SplatViewer.tsx'; export { harness, AbortablePromise, SceneFormat } from '@mkkellogg/gaussian-splats-3d'`,
+      resolveDir: projectRoot, loader: 'tsx',
+    },
+    outfile, bundle: true, format: 'esm', platform: 'node',
+    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+    plugins: [{
+      name: 'actual-splat-public-promise',
+      setup(builder) {
+        builder.onResolve({ filter: /^@react-three\/fiber$/ }, () => ({ path: 'canvas', namespace: 'splat-fixture' }))
+        builder.onLoad({ filter: /^canvas$/, namespace: 'splat-fixture' }, () => ({
+          contents: `import { createElement } from 'react'; export const Canvas = () => createElement('test-splat-ready'); export const useFrame = () => { throw new Error('Inert Canvas must not mount gizmo children') }`,
+          loader: 'js', resolveDir: projectRoot,
+        }))
+        builder.onResolve({ filter: /^@mkkellogg\/gaussian-splats-3d$/ }, () => ({ path: 'viewer', namespace: 'splat-fixture' }))
+        builder.onLoad({ filter: /^viewer$/, namespace: 'splat-fixture' }, () => ({
+          contents: `
+            import { AbortablePromise, SceneFormat } from ${JSON.stringify(packageModule)}
+            import * as THREE from 'three'
+            export { AbortablePromise, SceneFormat }
+            export const harness = { instances: [], loads: [], aborts: [] }
+            export class Viewer {
+              camera = new THREE.PerspectiveCamera()
+              threeScene = new THREE.Scene()
+              controls = { target: new THREE.Vector3(), update() {} }
+              starts = 0; stops = 0; disposals = 0
+              constructor(options) { this.options = options; harness.instances.push(this) }
+              addSplatScene(url, options) {
+                let finish, fail
+                const load = new AbortablePromise((resolve, reject) => { finish = resolve; fail = reject }, reason => {
+                  harness.aborts.push(reason); fail(new Error(String(reason)))
+                })
+                harness.loads.push({ url, options, load, resolve: () => finish(), reject: error => fail(error) })
+                return load
+              }
+              getSplatMesh() { return { getSplatCount: () => 0, getSplatCenter() {} } }
+              start() { this.starts++ }
+              stop() { this.stops++ }
+              dispose() { this.disposals++; return Promise.resolve() }
+            }
+          `,
+          loader: 'js', resolveDir: projectRoot,
+        }))
+        builder.onResolve({ filter: /^file:/ }, args => ({ path: args.path, external: true }))
+        builder.onResolve({ filter: /^(react(?:\/.*)?|three)$/ }, args => ({ path: require.resolve(args.path), external: true }))
+      },
+    }],
+  })
+  const { SplatViewer, harness, AbortablePromise, SceneFormat } = await import(pathToFileURL(outfile).href)
+  const host: Host = { type: 'root', props: {}, children: [] }
+  const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
+  let mounted = true
+  unmount = () => {
+    if (!mounted) return
+    mounted = false
+    flush(() => renderer.updateContainer(null, root, null))
+  }
+  flush(() => renderer.updateContainer(createElement(SplatViewer, { url: '/fixture.splat', autoRotate: false }), root, null))
+  assert.ok(find(host, node => node.type === 'p' && node.props.children === 'Loading splat…'))
+  await advance()
+  assert.equal(harness.instances.length, 1)
+  assert.equal(harness.loads.length, 1)
+  const viewer = harness.instances[0]
+  const load = harness.loads[0]
+  assert.ok(load.load instanceof AbortablePromise, 'Use the installed public wrapper, not a native Promise double')
+  assert.equal(load.load instanceof Promise, false)
+  assert.equal(load.url, '/fixture.splat')
+  assert.equal(load.options.format, SceneFormat.Splat)
+  assert.equal(viewer.starts, 0)
+  return { host, harness, viewer, load, errors, unhandled, advance, unmount }
+}
+
+test('SplatViewer publishes readiness and starts after the installed AbortablePromise resolves', async t => {
+  const view = await mountActualSplat(t)
+  view.load.resolve()
+  await view.advance()
+  assert.equal(view.viewer.starts, 1)
+  assert.ok(find(view.host, node => node.type === 'test-splat-ready'))
+  assert.equal(find(view.host, node => node.type === 'p' && node.props.children === 'Loading splat…'), undefined)
+  assert.equal(find(view.host, node => node.type === 'p' && node.props.children === 'Splat failed to load'), undefined)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.unhandled, [])
+})
+
+test('SplatViewer publishes installed AbortablePromise download failure without readiness or unhandled rejection', async t => {
+  const view = await mountActualSplat(t)
+  const error = new Error('Splat download failed')
+  view.load.reject(error)
+  await view.advance()
+  assert.equal(view.viewer.starts, 0)
+  assert.equal(find(view.host, node => node.type === 'test-splat-ready'), undefined)
+  assert.ok(find(view.host, node => node.type === 'p' && node.props.children === 'Splat failed to load'))
+  assert.ok(find(view.host, node => node.type === 'p' && node.props.children === error.message))
+  assert.equal(find(view.host, node => node.type === 'p' && node.props.children === 'Loading splat…'), undefined)
+  assert.deepEqual(view.errors, [['[SplatViewer] init failed:', error]])
+  assert.deepEqual(view.unhandled, [])
+})
+
+test('SplatViewer aborts a pending installed AbortablePromise and ignores rejection after unmount', async t => {
+  const view = await mountActualSplat(t)
+  const grid = view.viewer.threeScene.children[0]
+  assert.ok(grid instanceof THREE.GridHelper)
+  const resources = [grid.geometry, ...(Array.isArray(grid.material) ? grid.material : [grid.material])]
+  const disposals = disposeCounts(t, resources)
+  view.unmount()
+  await view.advance()
+  assert.deepEqual(view.harness.aborts, ['Generate SplatViewer unmounted.'])
+  assert.equal(view.viewer.starts, 0)
+  assert.equal(view.viewer.stops, 1)
+  assert.equal(view.viewer.disposals, 1)
+  assert.equal(view.viewer.threeScene.children.length, 0)
+  assert.deepEqual(disposals.map(dispose => dispose.mock.callCount()), resources.map(() => 1))
+  assert.deepEqual(view.host.children, [], 'Retired completion must not republish loading, error or ready UI')
+  assert.deepEqual(view.errors, [], 'Retired rejection must not enter the active error/status publication branch')
+  assert.deepEqual(view.unhandled, [])
+})

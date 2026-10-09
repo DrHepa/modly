@@ -74,6 +74,29 @@ test('registers a generated scene directory through its canonical manifest artif
   assert.equal(scene && scene.state, 'ready')
 }))
 
+test('optional manifest inspection skips oversized generic JSON without weakening sidecar budgets or path guards', () => withWorkspace(async (workspaceDir) => {
+  await mkdir(path.join(workspaceDir, 'Workflows'), { recursive: true })
+  const workspacePath = 'Workflows/source-geometry.json'
+  const oversized = '{}' + ' '.repeat(8 * 1024 * 1024)
+  await writeFile(path.join(workspaceDir, workspacePath), oversized)
+  await writeArtifactSidecar({ workspaceDir, workspacePath, artifactId: 'source-geometry', metadata: { artifactKind: 'mesh' } })
+  await writeFile(path.join(workspaceDir, 'Workflows/scene-manifest.json'), JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] }))
+
+  const listed = await listWorkspaceAssetLibrary({ workspaceDir })
+  assertSuccessfulAssetLibraryList(listed)
+  const entry = listed.entries.find((entry) => entry.workspacePath === workspacePath)
+  assert.ok(entry)
+  assert.equal(entry.manifest, undefined)
+  assert.ok(entry.warnings.some((warning) => /Skipped optional manifest inspection.*inspection limit/.test(warning)))
+  assert.equal(listed.entries.find((entry) => entry.workspacePath === 'Workflows/scene-manifest.json')?.capability, 'scene-manifest')
+  assert.equal((await readWorkspaceAssetLibraryEntry({ workspaceDir, workspacePath: '../outside.json' })).success, false)
+
+  await writeFile(path.join(workspaceDir, `${workspacePath}.artifact.json`), oversized)
+  const blocked = await listWorkspaceAssetLibrary({ workspaceDir })
+  assert.equal(blocked.success, false, 'required sidecar evidence keeps its bounded reader')
+  if (!blocked.success) assert.match(blocked.error, /Library metadata exceeds inspection limit/)
+}))
+
 test('reads and opens only safe GLB/GLTF workspace assets', () => withWorkspace(async (workspaceDir) => {
   await mkdir(path.join(workspaceDir, 'Workflows/checkpoints'), { recursive: true })
   await mkdir(path.join(workspaceDir, 'Exports'), { recursive: true })

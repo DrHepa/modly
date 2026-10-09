@@ -441,6 +441,10 @@ async function readJsonRecordIfPresent(workspaceDir: string, workspacePath: stri
 }
 
 const LIBRARY_METADATA_MAX_BYTES = 8 * 1024 * 1024
+class LibraryMetadataInspectionLimitError extends Error {
+  constructor() { super('Library metadata exceeds inspection limit') }
+}
+
 async function readLibraryBytes(workspaceDir: string, workspacePath: string, glb = false): Promise<Buffer> {
   const target = await physicalArtifactPath(workspaceDir, workspacePath)
   const file = await open(target.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -456,7 +460,7 @@ async function readLibraryBytes(workspaceDir: string, workspacePath: string, glb
       size = 20 + header.readUInt32LE(12)
       if (header.readUInt32LE(8) !== stats.size || size > stats.size) throw new Error('Invalid GLB declared length')
     }
-    if (size > LIBRARY_METADATA_MAX_BYTES) throw new Error('Library metadata exceeds inspection limit')
+    if (size > LIBRARY_METADATA_MAX_BYTES) throw new LibraryMetadataInspectionLimitError()
     const buffer = Buffer.alloc(size)
     let offset = 0
     while (offset < size) {
@@ -468,6 +472,17 @@ async function readLibraryBytes(workspaceDir: string, workspacePath: string, glb
     if (glb) buffer.writeUInt32LE(size, 8)
     return buffer
   } finally { await file.close() }
+}
+
+async function readOptionalManifestRecord(workspaceDir: string, workspacePath: string) {
+  try {
+    return await readJsonRecordIfPresent(workspaceDir, workspacePath)
+  } catch (error) {
+    if (error instanceof LibraryMetadataInspectionLimitError) {
+      return { status: 'skipped' as const, warning: `Skipped optional manifest inspection for ${workspacePath}: ${error.message}` }
+    }
+    throw error
+  }
 }
 
 interface IntrinsicAssetLibraryEvidence {
@@ -834,7 +849,7 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
   const metadata = extractAssetLibraryMetadataRecord(sidecar)
   const manifestFromMetadata = extractManifestRefFromMetadata(metadata, workspacePath)
   const manifestRecord = previewKind === 'text' && resolveWorkspaceArtifactExtension(workspacePath) === 'json'
-    ? await readJsonRecordIfPresent(workspaceDir, workspacePath)
+    ? await readOptionalManifestRecord(workspaceDir, workspacePath)
     : { status: 'not-found' as const }
   const manifestFromRecord = manifestRecord.status === 'found' ? extractManifestRefFromRecord(manifestRecord.value, workspacePath) : undefined
 
@@ -875,6 +890,7 @@ async function buildWorkspaceAssetLibraryEntry(workspaceDir: string, workspacePa
     ...extractAssetLibraryWarnings(metadata),
     ...sidecarWarnings,
     ...(manifestRecord.status === 'invalid' ? [`Invalid manifest JSON for ${workspacePath}: ${manifestRecord.error}`] : []),
+    ...(manifestRecord.status === 'skipped' ? [manifestRecord.warning] : []),
     ...motionState.warnings,
     ...poseClipState.warnings,
     ...landmarkState.warnings,

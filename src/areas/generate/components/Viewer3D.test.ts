@@ -6054,17 +6054,20 @@ test('Viewer3D metadata descriptor rejects contradictory artifact paths, foreign
   const { module, cleanup } = await loadViewer3DModule()
   try {
     const apiUrl = 'http://local.test'
-    const uri = '/workspace/Workflows/run/animated.glb'
+    const uri = '/workspace/Workflows/kimodo-run/animated.glb'
     const artifact = { id: 'run', kind: 'mesh', uri, versionId: 'v1', legacy: { filePath: uri, outputType: 'mesh' } }
     assert.ok(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, artifact, modelUrl: apiUrl + uri }))
-    for (const modelUrl of ['http://evil.test' + uri, apiUrl + '/workspace/Workflows/other/animated.glb', apiUrl + '/workspace/Workflows/./run/animated.glb', apiUrl + '/workspace/Workflows/%252e%252e/a.glb', apiUrl + '/workspace/bad%.glb']) {
+    const genericUri = '/workspace/Workflows/run/animated.glb'
+    const genericArtifact = { ...artifact, uri: genericUri, legacy: { ...artifact.legacy, filePath: genericUri } }
+    assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, artifact: genericArtifact, modelUrl: apiUrl + genericUri }), undefined, 'A consistent non-Kimodo path is not a Kimodo metadata candidate')
+    for (const modelUrl of ['http://evil.test' + uri, apiUrl + '/workspace/Workflows/other/animated.glb', apiUrl + '/workspace/Workflows/./kimodo-run/animated.glb', apiUrl + '/workspace/Workflows/%252e%252e/a.glb', apiUrl + '/workspace/bad%.glb']) {
       assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, artifact, modelUrl }), undefined, modelUrl)
     }
     assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, artifact: { ...artifact, legacy: { ...artifact.legacy, filePath: '/workspace/another.glb' } }, modelUrl: apiUrl + uri }), undefined)
-    const absolute = '/configured/workspace/Workflows/run/animated.glb'
+    const absolute = '/configured/workspace/Workflows/kimodo-run/animated.glb'
     const modelUrl = apiUrl + '/optimize/serve-file?path=' + encodeURIComponent(absolute)
     assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl }), undefined)
-    assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl, workspaceDir: '/configured/workspace' })?.artifactWorkspacePath, 'Workflows/run/animated.glb')
+    assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl, workspaceDir: '/configured/workspace' })?.artifactWorkspacePath, 'Workflows/kimodo-run/animated.glb')
     assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl: modelUrl.replace('configured', 'lookalike'), workspaceDir: '/configured/workspace' }), undefined)
     assert.equal(module.resolveViewer3DKimodoMetadataDescriptor({ apiUrl, modelUrl: modelUrl + '&path=' + encodeURIComponent(absolute), workspaceDir: '/configured/workspace' }), undefined)
   } finally { await cleanup() }

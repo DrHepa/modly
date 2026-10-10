@@ -38,7 +38,7 @@ test('workflow nodeTypes maps landmarksNode to the LandmarksNode component', asy
 
   try {
     assert.equal(module.WORKFLOW_NODE_TYPES.landmarksNode?.name, 'LandmarksNode')
-    assert.deepEqual(Object.keys(module.WORKFLOW_NODE_TYPES), ['extensionNode', 'imageNode', 'textNode', 'outputNode', 'meshNode', 'sceneNode', 'imagePreviewNode', 'previewImageNode', 'previewNode', 'landmarksNode', 'waitNode', 'whileNode', 'forEachNode'])
+    assert.deepEqual(Object.keys(module.WORKFLOW_NODE_TYPES), ['extensionNode', 'imageNode', 'videoNode', 'textNode', 'outputNode', 'addToWorldsNode', 'meshNode', 'sceneNode', 'imagePreviewNode', 'previewImageNode', 'previewNode', 'previewVideoNode', 'landmarksNode', 'waitNode', 'whileNode', 'forEachNode'])
   } finally {
     await cleanup()
   }

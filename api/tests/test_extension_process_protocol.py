@@ -882,16 +882,18 @@ def test_extension_process_preserves_legacy_image_message(monkeypatch, tmp_path)
 
     process._proc = RunningProc()
     monkeypatch.setattr(process, "_ensure_started", lambda: None)
-    monkeypatch.setattr(process, "_send", sent.append)
-    monkeypatch.setattr(
-        process,
-        "_recv",
-        lambda timeout=None: {
-            "type": "done",
-            "id": sent[0]["id"],
-            "output_path": str(tmp_path / "mesh.glb"),
-        },
-    )
+    def reply_on_send(message):
+        sent.append(message)
+        if message["action"] == "generate":
+            process._queue.put({
+                "type": "done",
+                "id": message["id"],
+                "output_path": str(tmp_path / "mesh.glb"),
+            })
+            # A missing terminal reply must fail, never hang this fixture.
+            process._queue.put(None)
+
+    monkeypatch.setattr(process, "_send", reply_on_send)
 
     process.generate(b"image-bytes", {"quality": "draft"})
 
@@ -914,16 +916,18 @@ def test_extension_process_sends_typed_video_path_outside_params(monkeypatch, tm
 
     process._proc = RunningProc()
     monkeypatch.setattr(process, "_ensure_started", lambda: None)
-    monkeypatch.setattr(process, "_send", sent.append)
-    monkeypatch.setattr(
-        process,
-        "_recv",
-        lambda timeout=None: {
-            "type": "done",
-            "id": sent[0]["id"],
-            "output_path": str(tmp_path / "mesh.glb"),
-        },
-    )
+    def reply_on_send(message):
+        sent.append(message)
+        if message["action"] == "generate":
+            process._queue.put({
+                "type": "done",
+                "id": message["id"],
+                "output_path": str(tmp_path / "mesh.glb"),
+            })
+            # A missing terminal reply must fail, never hang this fixture.
+            process._queue.put(None)
+
+    monkeypatch.setattr(process, "_send", reply_on_send)
 
     process.generate(video_path, {"quality": "draft"})
 

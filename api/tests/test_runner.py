@@ -265,6 +265,13 @@ class GenerationInputProtocolTests(unittest.TestCase):
             def __init__(self, model_dir, outputs_dir):
                 self.model_dir = model_dir
                 self.outputs_dir = outputs_dir
+                self._loaded = False
+
+            def is_loaded(self):
+                return self._loaded
+
+            def load(self):
+                self._loaded = True
 
             def params_schema(self):
                 return []

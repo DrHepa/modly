@@ -551,6 +551,11 @@ def _run_generation_impl(
                 else gen.generate_artifact(model_input.kind, model_input.path, params, progress_cb)
             )
         else:
+            if isinstance(model_input, Path):
+                from services.generation_inputs import validate_video_input_path
+                model_input = validate_video_input_path(
+                    model_input, workspace_dir=registry.WORKSPACE_DIR,
+                )
             supports_cancel = "cancel_event" in inspect.signature(gen.generate).parameters
             output_path = (
                 gen.generate(model_input, params, progress_cb, cancel_event)

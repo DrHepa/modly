@@ -3961,7 +3961,9 @@ test('buildModelGenerationRequest creates a workspace-relative video request and
     workspaceDir: '/workspace',
   })
 
-  assert.deepEqual(request, {
+  assert.deepEqual(new Set(Reflect.ownKeys(request)), new Set(['kind', 'videoPath', 'params']))
+  assert.deepEqual(new Set(Reflect.ownKeys(request.params as object)), new Set(['quality']))
+  assert.deepEqual(structuredClone(request), {
     kind: 'video',
     videoPath: 'Workflows/Inputs/Videos/turntable.mp4',
     params: { quality: 'draft' },
@@ -3975,7 +3977,9 @@ test('buildModelGenerationRequest creates a workspace-relative video request and
     workspaceDir: '/workspace',
   })
 
-  assert.deepEqual(collidingPrefixRequest, {
+  assert.deepEqual(new Set(Reflect.ownKeys(collidingPrefixRequest)), new Set(['kind', 'videoPath', 'params']))
+  assert.deepEqual(new Set(Reflect.ownKeys(collidingPrefixRequest.params as object)), new Set(['quality']))
+  assert.deepEqual(structuredClone(collidingPrefixRequest), {
     kind: 'video',
     videoPath: '/workspace2/Workflows/Inputs/Videos/turntable.mp4',
     params: { quality: 'draft' },
@@ -4045,7 +4049,9 @@ test('workflowRunStore dispatches video models as path-only JSON without multipa
   assert.equal(postCalls.length, 1)
   const call = postCalls[0]
   assert.equal(call.path, '/generate/from-video')
-  assert.deepEqual(call.data, {
+  assert.deepEqual(new Set(Reflect.ownKeys(call.data)), new Set(['video_path', 'model_id', 'collection', 'remesh', 'enable_texture', 'texture_resolution', 'params']))
+  assert.deepEqual(new Set(Reflect.ownKeys(call.data.params as object)), new Set(['quality']))
+  assert.deepEqual(structuredClone(call.data), {
     video_path: 'Workflows/Inputs/Videos/turntable.mp4',
     model_id: ext.id,
     collection: 'Workflows',
@@ -4064,4 +4070,64 @@ test('workflowRunStore dispatches video models as path-only JSON without multipa
   assert.equal(runProcessCalls.length, 0)
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().nodeArtifacts['video-model']?.kind, 'mesh')
+})
+
+function videoContextWorkflow(ext: WorkflowExtension, videoPath?: string): Workflow {
+  return {
+    ...checkpointWorkflow(), id: 'video-context-regression',
+    nodes: [
+      createNode('video-source', 'videoNode', { enabled: true, params: videoPath ? { videoPath } : {} }),
+      createNode('video-model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    ],
+    edges: [{ id: 'video-model-input', source: 'video-source', target: 'video-model' }],
+  }
+}
+
+test('video MODEL never substitutes selected image bytes for a missing connected video path', async () => {
+  const ext = createWorkflowExtension({ id: 'video/context', input: 'video' })
+  const posts: string[] = []
+  axiosClientMock = {
+    async post(path) { posts.push(path); assert.fail('Missing video input must not be submitted') },
+    async get() { assert.fail('Missing video input must not be polled') },
+  }
+  // The common fixture deliberately has both selected image path and base64 data.
+  assert.ok(appState.selectedImagePath)
+  assert.ok(appState.selectedImageData)
+  await useWorkflowRunStore.getState().run(videoContextWorkflow(ext), [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /Missing required video input/)
+  assert.deepEqual(posts, [])
+  assert.deepEqual(fsReadCalls, [])
+  assert.deepEqual(runProcessCalls, [])
+})
+
+test('late cancelled video JSON acknowledgement uses the shared owning-client cleanup boundary', async () => {
+  const ext = createWorkflowExtension({ id: 'video/context', input: 'video' })
+  const response = deferred<{ data: { job_id: string } }>()
+  const paths: string[] = []
+  axiosClientMock = {
+    async post(path, data, config) {
+      paths.push(path)
+      if (path === '/generate/from-video') {
+        assert.equal(config, undefined)
+        assert.equal(data instanceof FormData, false)
+        assert.equal((data as Record<string, unknown>).video_path, 'Inputs/queued.capture')
+        return response.promise
+      }
+      assert.equal(path, '/generate/cancel/late-video-owned-job')
+      return { data: {} }
+    },
+    async get() { assert.fail('A cancelled video acknowledgement must never be polled') },
+  }
+  const pending = useWorkflowRunStore.getState().run(videoContextWorkflow(ext, '/workspace/Inputs/queued.capture'), [ext])
+  await waitFor(() => paths.length === 1)
+  useWorkflowRunStore.getState().cancel()
+  const cancelled = JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob })
+  response.resolve({ data: { job_id: 'late-video-owned-job' } })
+  await pending
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(paths, ['/generate/from-video', '/generate/cancel/late-video-owned-job'])
+  assert.equal(JSON.stringify({ state: useWorkflowRunStore.getState(), job: appState.currentJob }), cancelled)
+  assert.deepEqual(fsReadCalls, [])
+  assert.deepEqual(runProcessCalls, [])
 })

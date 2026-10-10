@@ -153,3 +153,157 @@ def test_generate_from_video_rejects_multipart_form_transport(
 
     assert response.status_code == 422
     assert api_modules["generation_jobs"]._jobs == {}
+
+
+def test_video_route_pins_current_queue_abi_without_request_time_activation(api_modules, monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+    from routers.generation import generate_from_video
+    from schemas.generation import GenerateFromVideoRequest
+
+    _select_video_model(api_modules)
+    jobs = api_modules["generation_jobs"]
+    model_id = api_modules["valid_model_id"]
+    jobs.generator_registry._manifests[model_id]["output"] = "video"
+    video_path = api_modules["workspace_dir"] / "Inputs" / "queued.capture"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    activation_calls = []
+    monkeypatch.setattr(jobs.generator_registry, "switch_model", activation_calls.append)
+    background = BackgroundTasks()
+
+    response = asyncio.run(generate_from_video(
+        GenerateFromVideoRequest(
+            video_path="Inputs/queued.capture", model_id=model_id,
+            collection=" VideoRuns ", params={"quality": "draft"},
+        ),
+        background,
+    ))
+
+    assert activation_calls == []
+    assert not api_modules["fake_generator"].is_loaded()
+    assert jobs.get_job_status(response["job_id"]).status == "pending"
+    assert len(background.tasks) == 1
+    queued = background.tasks[0]
+    assert queued.func is jobs._run_generation
+    assert queued.args == (
+        response["job_id"], video_path.resolve(),
+        {"remesh": "quad", "enable_texture": False, "texture_resolution": 1024, "quality": "draft"},
+        "VideoRuns", "video", model_id,
+    )
+    assert queued.kwargs == {}
+
+    # Cancelling before execution must not activate or invoke this queued model.
+    cancelled = jobs.cancel_job(response["job_id"])
+    assert cancelled.status == "cancelled"
+    assert jobs._cancel_events[response["job_id"]].is_set()
+    assert activation_calls == []
+    assert video_path.read_bytes() == b"video"
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_error",
+    [
+        ("escape-file", "must stay within the workspace"),
+        ("escape-parent", "must stay within the workspace"),
+        ("deleted", "does not reference an existing file"),
+        ("directory", "must reference a regular file"),
+        ("workspace-relocated", "must stay within the workspace"),
+    ],
+)
+def test_queued_direct_video_revalidates_current_workspace_before_generate(
+    api_modules, monkeypatch, tmp_path, mutation, expected_error,
+):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+    from routers.generation import generate_from_video
+    from schemas.generation import GenerateFromVideoRequest
+    import services.generator_registry as registry_module
+
+    _select_video_model(api_modules)
+    captured = _capture_video_generation(api_modules, monkeypatch)
+    workspace = api_modules["workspace_dir"]
+    video_path = workspace / "Inputs" / "queued.capture"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"accepted-video")
+    background = BackgroundTasks()
+    response = asyncio.run(generate_from_video(
+        GenerateFromVideoRequest(
+            video_path="Inputs/queued.capture", model_id=api_modules["valid_model_id"],
+            collection="VideoRuns", params={"quality": "draft"},
+        ),
+        background,
+    ))
+    jobs = api_modules["generation_jobs"]
+    assert jobs.get_job_status(response["job_id"]).status == "pending"
+    assert background.tasks[0].args[1] == video_path.resolve()
+    assert captured == []
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "queued.capture"
+    outside_file.write_bytes(b"external-video")
+    if mutation == "escape-file":
+        video_path.unlink()
+        video_path.symlink_to(outside_file)
+    elif mutation == "escape-parent":
+        video_path.unlink()
+        video_path.parent.rmdir()
+        video_path.parent.symlink_to(outside, target_is_directory=True)
+    elif mutation == "deleted":
+        video_path.unlink()
+    elif mutation == "directory":
+        video_path.unlink()
+        video_path.mkdir()
+    else:
+        relocated = tmp_path / "relocated-workspace"
+        relocated.mkdir()
+        monkeypatch.setattr(registry_module, "WORKSPACE_DIR", relocated)
+
+    asyncio.run(background())
+
+    status = jobs.get_job_status(response["job_id"])
+    assert status.status == "error"
+    assert expected_error in status.error
+    assert captured == []
+    assert outside_file.read_bytes() == b"external-video"
+    assert status.output_url is None
+    assert status.scene_candidate is None
+
+
+def test_queued_direct_video_keeps_valid_capture_path_params_and_output_semantics(api_modules, monkeypatch):
+    import asyncio
+
+    from fastapi import BackgroundTasks
+    from routers.generation import generate_from_video
+    from schemas.generation import GenerateFromVideoRequest
+
+    _select_video_model(api_modules)
+    captured = _capture_video_generation(api_modules, monkeypatch)
+    video_path = api_modules["workspace_dir"] / "Inputs" / "valid.capture"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"accepted-video")
+    background = BackgroundTasks()
+    response = asyncio.run(generate_from_video(
+        GenerateFromVideoRequest(
+            video_path="Inputs/valid.capture", model_id=api_modules["valid_model_id"],
+            collection="VideoRuns", params={"quality": "draft", "filename": "valid.glb"},
+        ),
+        background,
+    ))
+    assert captured == []
+    asyncio.run(background())
+    status = api_modules["generation_jobs"].get_job_status(response["job_id"])
+    assert status.status == "done"
+    assert status.output_kind == "mesh"
+    assert status.output_url == "/workspace/VideoRuns/valid.glb"
+    assert len(captured) == 1
+    assert captured[0]["generation_input"] == video_path.resolve()
+    assert captured[0]["exists_during_generate"] is True
+    assert captured[0]["params"] == {
+        "remesh": "quad", "enable_texture": False, "texture_resolution": 1024,
+        "quality": "draft", "filename": "valid.glb",
+    }
+    assert video_path.read_bytes() == b"accepted-video"

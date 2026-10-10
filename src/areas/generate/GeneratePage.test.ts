@@ -14,6 +14,22 @@ const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const generatePageEntry = path.join(projectRoot, 'src/areas/generate/GeneratePage.tsx')
 const require = createRequire(import.meta.url)
 
+// Each unique ESM bundle owns its storage; window/document remain late-bound host globals.
+const browserStorageBanner = `
+const localStorage = (() => {
+  const values = new Map();
+  return {
+    get length() { return values.size; },
+    key(index) { return [...values.keys()][index >>> 0] ?? null; },
+    getItem(key) { return values.get(String(key)) ?? null; },
+    setItem(key, value) { values.set(String(key), String(value)); },
+    removeItem(key) { values.delete(String(key)); },
+    clear() { values.clear(); },
+  };
+})();
+export { localStorage as harnessBrowserStorage };
+`
+
 function aliasPlugin(): Plugin {
   const resolvePath = (basePath: string): string => {
     if (existsSync(basePath) && statSync(basePath).isFile()) return basePath
@@ -59,6 +75,7 @@ async function loadGeneratePageModule(mounted = false) {
     } } : { entryPoints: [generatePageEntry] }),
     outfile,
     bundle: true,
+    banner: { js: browserStorageBanner },
     format: 'esm',
     platform: 'node',
     tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
@@ -112,6 +129,7 @@ async function loadGeneratePageModule(mounted = false) {
   return {
     module,
     async cleanup() {
+      module.harnessBrowserStorage.clear()
       await rm(tempDir, { recursive: true, force: true })
     },
   }
@@ -142,6 +160,53 @@ function libraryEntry(patch: Record<string, unknown> = {}) {
 function countMatches(value: string, pattern: RegExp): number {
   return value.match(pattern)?.length ?? 0
 }
+
+test('GeneratePage bundles own isolated browser storage without changing host globals', async () => {
+  const hostGlobals = ['localStorage', 'window', 'document'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const)
+  const first = await loadGeneratePageModule()
+  let second: Awaited<ReturnType<typeof loadGeneratePageModule>> | undefined
+
+  try {
+    const storage = first.module.harnessBrowserStorage
+    assert.equal(storage.length, 0)
+    assert.equal(storage.getItem('missing'), null)
+    assert.equal(storage.key(0), null)
+    assert.equal(storage.setItem('first', 'one'), undefined)
+    assert.equal(storage.setItem('second', 'two'), undefined)
+    assert.equal(storage.setItem('first', 'updated'), undefined)
+    assert.equal(storage.length, 2)
+    assert.equal(storage.key(0), 'first', 'Updating a key preserves its position')
+    assert.equal(storage.key(1), 'second')
+    assert.equal(storage.key(2), null)
+    assert.equal(storage.key(-1), null)
+    assert.equal(storage.key(1.9), 'second', 'Storage indexes use unsigned integer conversion')
+    assert.equal(storage.getItem('first'), 'updated')
+    assert.equal(storage.setItem(7, null), undefined)
+    assert.equal(storage.getItem(7), 'null', 'Storage keys and values are strings')
+    assert.equal(storage.removeItem('second'), undefined)
+    assert.equal(storage.removeItem('missing'), undefined)
+    assert.equal(storage.length, 2)
+    assert.equal(storage.key(1), '7')
+
+    second = await loadGeneratePageModule()
+    const otherStorage = second.module.harnessBrowserStorage
+    assert.notEqual(otherStorage, storage)
+    assert.equal(otherStorage.length, 0, 'The next bundle cannot inherit another fixture session')
+    assert.equal(otherStorage.getItem('first'), null)
+    otherStorage.setItem('first', 'independent')
+    assert.equal(storage.getItem('first'), 'updated')
+    assert.equal(otherStorage.getItem('first'), 'independent')
+    assert.equal(storage.clear(), undefined)
+    assert.equal(storage.length, 0)
+    assert.equal(storage.key(0), null)
+    assert.equal(otherStorage.length, 1, 'Clearing one bundle cannot clear another')
+  } finally {
+    try { await first.cleanup() } finally { await second?.cleanup() }
+    for (const [name, descriptor] of hostGlobals) {
+      assert.deepEqual(Object.getOwnPropertyDescriptor(globalThis, name), descriptor, `Host ${name} is unchanged`)
+    }
+  }
+})
 
 test('GeneratePage library seam renders accessible named controls for selection and open actions', async () => {
   const { module, cleanup } = await loadGeneratePageModule()

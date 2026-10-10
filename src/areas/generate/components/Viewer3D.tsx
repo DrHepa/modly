@@ -56,6 +56,14 @@ export type GizmoMode = 'translate' | 'rotate' | 'scale'
 
 // Drei Hud with priority 1 renders the default scene first, then the gizmo HUD.
 export const VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY = 1
+export const VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY = 1
+
+export function resolveViewer3DViewportGizmoRenderPriority(hasPostProcessing: boolean): number {
+  // Hud priority 1 clears and redraws the base scene; an active composer owns it instead.
+  return hasPostProcessing
+    ? VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY + 1
+    : VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY
+}
 
 const SELECTION_OUTLINE_VISIBLE_COLOR = 0x8b5cf6
 const SELECTION_OUTLINE_HIDDEN_COLOR = 0x5b21b6
@@ -5001,6 +5009,8 @@ export default function Viewer3D({
   const [loadedSource, sourceRef, setLoadedSource] = useCurrentState<LoadedScene | null>(() => null)
   const liveSource = loadedSource?.url === modelUrl && !isSplat ? loadedSource : null
   const currentMeshObject = liveSource?.scene === meshObject ? meshObject : null
+  const hasPostProcessing = Boolean(modelUrl && currentJob)
+  const viewportGizmoRenderPriority = resolveViewer3DViewportGizmoRenderPriority(hasPostProcessing)
   const canRenderViewportGizmos = shouldRenderViewer3DViewportGizmos({ modelUrl, hasCurrentJob: Boolean(currentJob), object: currentMeshObject })
   const sceneFrameKey = modelUrl && currentMeshObject ? `${modelUrl}:${currentMeshObject.uuid}` : null
   const isLive = useCallback((source: LoadedScene | null): source is LoadedScene =>
@@ -5910,6 +5920,7 @@ export default function Viewer3D({
   // on render state.
   const postProcessing = useMemo(() => (
     <EffectComposer
+      renderPriority={VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY}
       autoClear={false}
       multisampling={SELECTION_OUTLINE_MULTISAMPLING}
       resolutionScale={SELECTION_OUTLINE_RESOLUTION_SCALE}
@@ -6043,7 +6054,7 @@ export default function Viewer3D({
           />
 
           {canRenderViewportGizmos ? (
-            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY}>
+            <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={viewportGizmoRenderPriority}>
               <GizmoBubbles />
             </GizmoHelper>
           ) : null}

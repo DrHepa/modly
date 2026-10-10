@@ -365,7 +365,7 @@ test('Viewer3D viewport gizmos render only when a real renderable object is load
   }
 })
 
-test('Viewer3D viewport gizmo locks Drei Hud render priority to 1 when a model is renderable', async () => {
+test('Viewer3D viewport gizmo retains base priority 1 and overlays an active selection composer', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
   try {
@@ -375,10 +375,160 @@ test('Viewer3D viewport gizmo locks Drei Hud render priority to 1 when a model i
 
     assert.equal(module.shouldRenderViewer3DViewportGizmos({ modelUrl: 'http://127.0.0.1:8000/workspace/mesh.glb', hasCurrentJob: true, object: meshGroup }), true)
     assert.equal(module.VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY, 1)
-    assert.match(source, /renderPriority=\{VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY\}/)
+    assert.equal(module.resolveViewer3DViewportGizmoRenderPriority(false), 1)
+    assert.equal(module.VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY, 1)
+    assert.equal(module.resolveViewer3DViewportGizmoRenderPriority(true), module.VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY + 1)
+    assert.match(source, /renderPriority=\{VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY\}/)
+    assert.match(source, /renderPriority=\{viewportGizmoRenderPriority\}/)
+    assert.match(source, /const hasPostProcessing = Boolean\(modelUrl && currentJob\)/)
+    assert.match(source, /\{modelUrl && currentJob \? \([\s\S]*?<Selection/)
     assert.doesNotMatch(source, /renderPriority=\{0\}/)
     assert.doesNotMatch(source, /renderPriority=\{2\}/)
   } finally {
+    await cleanup()
+  }
+})
+
+// CPU frame ownership only: installed Hud/composer callbacks and R3F subscribe/advance;
+// portal/host nodes and postprocessing GPU passes are adapters, not visual qualification.
+test('Viewer3D installed frame owners preserve the composed buffer before drawing the viewport HUD', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  const directory = await mkdtemp(path.join(tmpdir(), 'viewer-frame-owners-'))
+  const { createElement: h } = require('react')
+  type Host = { type: string; props: any; children: Host[] }
+  const host: Host = { type: 'root', props: {}, children: [] }
+  const context = {}
+  const remove = (parent: Host, child: Host) => { const i = parent.children.indexOf(child); if (i >= 0) parent.children.splice(i, 1) }
+  const append = (parent: Host, child: Host) => { remove(parent, child); parent.children.push(child) }
+  const insert = (parent: Host, child: Host, before: Host) => { remove(parent, child); parent.children.splice(parent.children.indexOf(before), 0, child) }
+  const renderer = require('react-reconciler')({
+    now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
+    getRootHostContext: () => context, getChildHostContext: () => context,
+    getPublicInstance: (instance: Host) => instance, prepareForCommit: () => null, resetAfterCommit: () => undefined,
+    createInstance: (type: string, props: any) => ({ type, props, children: [] }),
+    createTextInstance: (text: string) => ({ type: '#text', props: { text }, children: [] }),
+    appendInitialChild: append, appendChild: append, appendChildToContainer: append,
+    removeChild: remove, removeChildFromContainer: remove, insertBefore: insert, insertInContainerBefore: insert,
+    finalizeInitialChildren: () => false, shouldSetTextContent: () => false, prepareUpdate: () => true,
+    commitUpdate: (instance: Host, _payload: unknown, _type: string, _old: unknown, props: any) => { instance.props = props },
+    commitTextUpdate: (instance: Host, _old: string, text: string) => { instance.props.text = text },
+    clearContainer: (container: Host) => { container.children = [] }, detachDeletedInstance: () => undefined,
+    scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
+  })
+  const root = renderer.createContainer(host, 0, null, false, null, '', (error: unknown) => { throw error }, null)
+  const flush = (callback = () => undefined as void) => {
+    renderer.flushSync(callback)
+    for (let i = 0; i < 10; i++) {
+      if (!renderer.flushPassiveEffects()) return
+      renderer.flushSync(() => undefined)
+    }
+    assert.fail('Frame-owner effects did not settle')
+  }
+  let harness: any
+  try {
+    const outfile = path.join(directory, 'frame-owners.mjs')
+    const fiberEntry = path.join(projectRoot, 'node_modules/@react-three/fiber/dist/events-d0566a2e.cjs.dev.js')
+    await build({
+      stdin: { contents: `export { Hud } from './node_modules/@react-three/drei/core/Hud.js'; export { EffectComposer } from './node_modules/@react-three/postprocessing/dist/EffectComposer.js'; export { harness, FrameRoot } from 'fixture-fiber-owner'`, resolveDir: projectRoot, loader: 'js' },
+      outfile, bundle: true, format: 'esm', platform: 'node',
+      plugins: [{ name: 'frame-owner-cpu-boundary', setup(api) {
+        api.onResolve({ filter: /^installed-fiber-owner$/ }, () => ({ path: fiberEntry, external: true }))
+        api.onResolve({ filter: /^(@react-three\/fiber|fixture-fiber-owner)$/ }, () => ({ path: 'fiber', namespace: 'frame-fixture' }))
+        api.onLoad({ filter: /^fiber$/, namespace: 'frame-fixture' }, () => ({ loader: 'js', resolveDir: projectRoot, contents: `
+          import React from 'react'
+          import * as THREE from 'three'
+          import * as Fiber from 'installed-fiber-owner'
+          const PortalScene = React.createContext(null)
+          export const harness = { events: [], buffer: [], canvas: {}, scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera() }
+          harness.gl = {
+            autoClear: true, toneMapping: THREE.ACESFilmicToneMapping,
+            setPixelRatio() {}, setSize() {},
+            clearDepth() { harness.events.push(['clear-depth', this.autoClear]) },
+            render(scene) {
+              const owner = scene === harness.scene ? 'base' : 'hud'
+              harness.events.push([owner, this.autoClear])
+              if (this.autoClear) harness.buffer = []
+              harness.buffer.push(owner)
+            },
+          }
+          // createRoot only allocates the installed store/container; never configure a renderer.
+          Fiber.createRoot(harness.canvas)
+          harness.store = Fiber.roots.get(harness.canvas).store
+          harness.store.setState({ gl: harness.gl, scene: harness.scene, camera: harness.camera, frameloop: 'never' })
+          harness.frame = () => { harness.events = []; harness.buffer = []; Fiber.advance(1, false, harness.store.getState()) }
+          harness.cleanup = () => { harness.store.getState().clock.stop(); Fiber.roots.delete(harness.canvas) }
+          export const useFrame = Fiber.useFrame
+          export function useThree(selector) {
+            const scene = React.useContext(PortalScene) || harness.scene
+            const state = { ...harness.store.getState(), scene }
+            return selector ? selector(state) : state
+          }
+          export const createPortal = (children, scene) => React.createElement(PortalScene.Provider, { value: scene }, children)
+          export const FrameRoot = ({ children }) => React.createElement(Fiber.context.Provider, { value: harness.store }, children)
+        ` }))
+        api.onResolve({ filter: /^postprocessing$/ }, () => ({ path: 'passes', namespace: 'frame-fixture' }))
+        api.onLoad({ filter: /^passes$/, namespace: 'frame-fixture' }, () => ({ loader: 'js', resolveDir: projectRoot, contents: `
+          import { harness } from 'fixture-fiber-owner'
+          export class Pass {}
+          export class Effect { getAttributes() { return 0 } }
+          export class RenderPass extends Pass {}
+          export class NormalPass extends Pass {}
+          export class DepthDownsamplingPass extends Pass {}
+          export class EffectPass extends Pass {}
+          export const EffectAttribute = { CONVOLUTION: 1 }
+          export class EffectComposer {
+            constructor(gl) { this.gl = gl }
+            addPass() {} removePass() {} setSize() {}
+            render() {
+              harness.events.push(['composer', this.gl.autoClear])
+              harness.buffer = ['composed'] // Synthetic color-buffer marker, not an Outline shader.
+            }
+          }
+        ` }))
+        api.onResolve({ filter: /^three-stdlib$/ }, () => ({ path: 'capability', namespace: 'frame-fixture' }))
+        api.onLoad({ filter: /^capability$/, namespace: 'frame-fixture' }, () => ({ loader: 'js', contents: 'export const isWebGL2Available = () => false' }))
+        api.onResolve({ filter: /^(react(?:\/.*)?|three)$/ }, args => ({ path: require.resolve(args.path), external: true }))
+      } }],
+    })
+    const owners = await import(pathToFileURL(outfile).href)
+    harness = owners.harness
+    const render = (withComposer: boolean, hudFirst = false, priority = module.resolveViewer3DViewportGizmoRenderPriority(withComposer)) => {
+      const composer = withComposer ? h(owners.EffectComposer, { key: 'composer', autoClear: false, renderPriority: module.VIEWER3D_SELECTION_OUTLINE_RENDER_PRIORITY }) : null
+      const hud = h(owners.Hud, { key: 'hud', renderPriority: priority })
+      flush(() => renderer.updateContainer(h(owners.FrameRoot, null, ...(hudFirst ? [hud, composer] : [composer, hud])), root, null))
+    }
+    const frame = (withComposer: boolean, previousAutoClear: boolean) => {
+      harness.gl.autoClear = previousAutoClear
+      harness.frame()
+      assert.deepEqual(harness.events, withComposer
+        ? [['composer', false], ['clear-depth', false], ['hud', false]]
+        : [['base', true], ['clear-depth', false], ['hud', false]])
+      assert.deepEqual(harness.buffer, [withComposer ? 'composed' : 'base', 'hud'])
+      assert.equal(harness.gl.autoClear, previousAutoClear, 'Both installed owners restore the incoming clear policy')
+    }
+    for (const hudFirst of [false, true]) {
+      for (const previousAutoClear of [false, true]) {
+        render(false, hudFirst); frame(false, previousAutoClear)
+        render(true, hudFirst); frame(true, previousAutoClear)
+        assert.deepEqual(harness.store.getState().internal.subscribers.map((subscriber: any) => subscriber.priority), [1, 2])
+        render(false, hudFirst); frame(false, previousAutoClear)
+        flush(() => renderer.updateContainer(null, root, null))
+        assert.equal(harness.store.getState().internal.priority, 0, 'Unmount releases every manual frame owner')
+      }
+    }
+    // Negative control reproduces literal CORE122's duplicate-priority destructive redraw.
+    render(true, false, module.VIEWER3D_VIEWPORT_GIZMO_RENDER_PRIORITY)
+    harness.frame()
+    assert.deepEqual(harness.events, [['composer', false], ['base', true], ['clear-depth', false], ['hud', false]])
+    assert.deepEqual(harness.buffer, ['base', 'hud'], 'Hud(1) clears the synthetic composed marker')
+    flush(() => renderer.updateContainer(null, root, null))
+    assert.equal(harness.store.getState().internal.priority, 0)
+    harness.frame()
+    assert.deepEqual(harness.events, [['base', harness.gl.autoClear]], 'Installed R3F resumes its default base renderer after all owners unmount')
+  } finally {
+    flush(() => renderer.updateContainer(null, root, null))
+    harness?.cleanup()
+    await rm(directory, { recursive: true, force: true })
     await cleanup()
   }
 })

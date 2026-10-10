@@ -382,12 +382,25 @@ def _normalize_model_inventory(value: object) -> dict:
     return result
 
 
-def _normalize_process_ports(value: object) -> tuple[list[dict] | None, list[dict]]:
+def _normalize_process_ports(value: object) -> tuple[list[str] | list[dict] | None, list[dict]]:
     if not isinstance(value, list):
         return None, [
             _discovery_error(
                 "invalid_process_ports",
                 "A discovered process has an invalid inputs list.",
+                retryable=True,
+            )
+        ]
+
+    # The current Electron producer preserves positional strings unless a
+    # complete, unambiguous input_contract opts the node into named ports.
+    if all(isinstance(port, str) for port in value):
+        if all(port.strip() for port in value):
+            return list(value), []
+        return None, [
+            _discovery_error(
+                "invalid_process_port",
+                "A discovered process has an invalid positional input kind.",
                 retryable=True,
             )
         ]
@@ -588,6 +601,18 @@ def _normalize_process_inventory(value: object) -> dict:
             errors.extend(port_errors)
             if ports is not None:
                 process["inputs"] = ports
+        if "input_labels" in item:
+            labels = item["input_labels"]
+            if isinstance(labels, list) and all(isinstance(label, str) for label in labels):
+                process["input_labels"] = list(labels)
+            else:
+                errors.append(
+                    _discovery_error(
+                        "invalid_process_labels",
+                        "A discovered process has an invalid input-label list.",
+                        retryable=True,
+                    )
+                )
         if "automation" in item:
             automation, automation_valid = _normalize_automation_metadata(item["automation"])
             if not automation_valid:
@@ -912,13 +937,24 @@ async def _stream_llm_round(
                     upstream_status=response.status_code,
                 )
 
-            async for raw_line in response.aiter_lines():
-                line = raw_line.strip()
-                if not line or line.startswith(":") or line.startswith("event:"):
+            event_data: list[str] = []
+            async for line in response.aiter_lines():
+                # HTTPX also yields its unfinished final line at EOF. Dispatch
+                # only on the SSE blank-line delimiter, never on that flush.
+                if line != "":
+                    if line.startswith(":"):
+                        continue
+                    field, separator, value = line.partition(":")
+                    if separator and value.startswith(" "):
+                        value = value[1:]
+                    if field == "data":
+                        event_data.append(value)
+                    # event/id/retry and other fields are framing metadata.
                     continue
-                if not line.startswith("data:"):
-                    raise LlmBoundaryError(502, "llm_malformed_stream", "The LLM returned malformed streaming data.", False)
-                data = line[5:].strip()
+                if not event_data:
+                    continue
+                data = "\n".join(event_data)
+                event_data.clear()
                 if data == "[DONE]":
                     break
                 try:
@@ -956,6 +992,13 @@ async def _stream_llm_round(
                 if finish_reason is not None:
                     if not isinstance(finish_reason, str):
                         raise _invalid_stream("The LLM returned an invalid finish reason in its streaming response.")
+                    if finish_reason in {"length", "content_filter"}:
+                        raise LlmBoundaryError(
+                            502,
+                            "llm_incomplete_stream",
+                            "The LLM ended the response before successfully completing it. Try again.",
+                            finish_reason == "length",
+                        )
                     terminal_frame = frame
                     break
     except LlmBoundaryError:
@@ -1236,10 +1279,9 @@ async def agent_chat(request: AgentChatRequest):
     finally:
         if slot is not None:
             slot.release()
-
-    # After the release: unload_all() spares a held slot, so unloading while
-    # still holding ours would keep the agent's own model on the GPU.
-    await _unload_llm_after_workflow(request, actions_done)
+        # After the release: unload_all() spares a held slot. A failed turn may
+        # still carry a completed workflow action, which also needs the GPU.
+        await _unload_llm_after_workflow(request, actions_done)
 
     if final is None:
         final = AgentChatResponse(message="Reached maximum tool iterations.", actions=actions_done)

@@ -20,7 +20,7 @@ class _ScriptedServer:
     def _handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/chat/completions"):
             self.requests.append({"headers": dict(request.headers), "body": json.loads(request.content)})
-            return httpx.Response(200, json=self._chat.pop(0))
+            return httpx.Response(200, text=_sse(self._chat.pop(0)), headers={"content-type": "text/event-stream"})
         return httpx.Response(404, json={})
 
     def __call__(self, *args, **kwargs):
@@ -43,6 +43,16 @@ def _assistant(content: str = "", tool_calls=None) -> dict:
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return {"choices": [{"message": msg}]}
+
+
+def _sse(body: dict) -> str:
+    message = body["choices"][0]["message"]
+    delta = dict(message)
+    if "tool_calls" in delta:
+        delta["tool_calls"] = [{"index": index, **call} for index, call in enumerate(delta["tool_calls"])]
+    return "data: " + json.dumps({"choices": [{
+        "delta": delta, "finish_reason": "tool_calls" if delta.get("tool_calls") else "stop",
+    }]}) + "\n\ndata: [DONE]\n\n"
 
 
 _RUN_WF1 = {"id": "call_1", "type": "function", "function": {"name": "run_workflow", "arguments": '{"workflow_id": "wf1"}'}}
@@ -141,7 +151,7 @@ class ExternalProviderTests(unittest.TestCase):
             bodies.append(body)
             if isinstance(body["messages"][1]["content"], list):
                 return httpx.Response(400, json={"error": {"message": "image input not supported"}})
-            return httpx.Response(200, json=_assistant(content="ok"))
+            return httpx.Response(200, text=_sse(_assistant(content="ok")), headers={"content-type": "text/event-stream"})
 
         real = httpx.AsyncClient
         request = agent.AgentChatRequest(
@@ -155,7 +165,7 @@ class ExternalProviderTests(unittest.TestCase):
         self.assertEqual(len(bodies), 2)
         self.assertIn("what is this", bodies[1]["messages"][1]["content"])
 
-    def test_provider_error_shows_its_message_not_raw_json(self) -> None:
+    def test_provider_error_is_structured_and_never_echoes_upstream_body(self) -> None:
         def handler(_: httpx.Request) -> httpx.Response:
             return httpx.Response(401, json={"error": {"message": "Incorrect API key provided.", "type": "invalid_request_error"}})
 
@@ -165,8 +175,13 @@ class ExternalProviderTests(unittest.TestCase):
             provider=agent.ProviderConfig(type="external", base_url="https://llm.test/v1", api_key="bad"),
         )
         with mock.patch.object(agent.httpx, "AsyncClient", lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k)):
-            response = asyncio.run(agent.agent_chat(request))
-        self.assertEqual(response.message, "LLM error (401): Incorrect API key provided.")
+            with self.assertRaises(agent.HTTPException) as raised:
+                asyncio.run(agent.agent_chat(request))
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail["code"], "llm_upstream_error")
+        self.assertFalse(raised.exception.detail["retryable"])
+        self.assertEqual(raised.exception.detail["actions"], [])
+        self.assertNotIn("Incorrect API key", raised.exception.detail["message"])
 
     def test_missing_provider_url_is_reported(self) -> None:
         request = agent.AgentChatRequest(

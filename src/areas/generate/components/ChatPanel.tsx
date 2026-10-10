@@ -279,7 +279,7 @@ export default function ChatPanel(): JSX.Element {
 
   const workflows     = useWorkflowsStore((s) => s.workflows)
   const saveWorkflow  = useWorkflowsStore((s) => s.save)
-  const setActiveWorkflow = useWorkflowsStore((s) => s.setActive)
+  const openWorkflow = useWorkflowsStore((s) => s.openWorkflow)
   const { modelExtensions, processExtensions } = useExtensionsStore()
   const runWorkflow   = useWorkflowRunStore((s) => s.run)
   const runState      = useWorkflowRunStore((s) => s.runState)
@@ -414,7 +414,7 @@ export default function ChatPanel(): JSX.Element {
           const now = new Date().toISOString()
           const wf: Workflow = { ...draft, id: crypto.randomUUID(), createdAt: now, updatedAt: now }
           const res = await saveWorkflow(wf)
-          if (res.success) setActiveWorkflow(wf.id)
+          if (res.success) openWorkflow(wf.id)
         }
       }
     } catch (e: unknown) {

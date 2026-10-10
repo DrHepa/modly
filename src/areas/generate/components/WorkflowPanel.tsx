@@ -1140,7 +1140,7 @@ export default function WorkflowPanel() {
               </div>
               {selectedId && (
                 <button
-                  onClick={() => { useWorkflowsStore.getState().setActive(selectedId!); navigate('workflows') }}
+                  onClick={() => { useWorkflowsStore.getState().openWorkflow(selectedId!); navigate('workflows') }}
                   title="Edit workflow"
                   className="shrink-0 p-1.5 rounded-lg border border-zinc-700 bg-zinc-800/60 text-zinc-400
                              hover:text-zinc-100 hover:bg-zinc-700 hover:border-zinc-600 transition-colors"

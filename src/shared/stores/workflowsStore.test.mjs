@@ -2,14 +2,23 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildSync } from 'esbuild'
 import { createRequire } from 'node:module'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-// Bundle the store with its real zustand dependency; the only other import is a
-// type-only one (electron.d) which esbuild erases. The store reads the global
-// `window.electron.workflows.*` bridge, which we stub per test.
+// Bundle the store and tab-session helper with the real zustand dependency.
+// Storage is private to each load in this isolated test process; the Electron
+// workflows bridge is stubbed per test.
 function loadStore() {
+  const storage = new Map()
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => { storage.set(key, value) },
+      removeItem: (key) => { storage.delete(key) },
+    },
+  })
   const outfile = join(mkdtempSync(join(tmpdir(), 'modly-wfstore-test-')), 'workflowsStore.cjs')
   const require = createRequire(import.meta.url)
   const result = buildSync({
@@ -95,11 +104,17 @@ test('save inserts a new workflow at the front, updates an existing one in place
 test('save does not touch state when the bridge reports failure', async () => {
   const useStore = loadStore()
   stubBridge({ save: async () => ({ success: false, error: 'nope' }) })
-  useStore.setState({ workflows: [migrated('a')] })
+  useStore.setState({ workflows: [migrated('a')], openIds: ['a'], activeId: 'a' })
+  useStore.getState().openWorkflow('a')
+  const persistedBefore = localStorage.getItem('modly-workflow-tab-session')
 
   const result = await useStore.getState().save(migrated('z'))
+  if (result.success) useStore.getState().openWorkflow('z')
   assert.equal(result.success, false)
   assert.deepEqual(useStore.getState().workflows.map((w) => w.id), ['a'])
+  assert.deepEqual(useStore.getState().openIds, ['a'])
+  assert.equal(useStore.getState().activeId, 'a')
+  assert.equal(localStorage.getItem('modly-workflow-tab-session'), persistedBefore)
 })
 
 // ─── remove(): filter + active reset ────────────────────────────────────────────
@@ -138,11 +153,68 @@ test('importFile migrates, moves the workflow to the front, and makes it active'
   assert.deepEqual(workflows[0].nodes.map((n) => n.type), ['inputNode', 'extensionNode'])
 })
 
-test('setActive updates only activeId', () => {
+test('setActive updates only activeId for an already-open workflow', () => {
   const useStore = loadStore()
   stubBridge()
-  useStore.setState({ workflows: [migrated('a')], activeId: null })
+  useStore.setState({ workflows: [migrated('a')], openIds: ['a'], activeId: null })
 
   useStore.getState().setActive('a')
   assert.equal(useStore.getState().activeId, 'a')
+})
+
+
+test('openWorkflow opens a saved closed workflow without duplicating or reordering open tabs', () => {
+  const source = readFileSync(resolve('src/areas/generate/components/WorkflowPanel.tsx'), 'utf8')
+  assert.match(source, /useWorkflowsStore\.getState\(\)\.openWorkflow\(selectedId!\); navigate\('workflows'\)/)
+
+  const useStore = loadStore()
+  stubBridge()
+  useStore.setState({ workflows: [migrated('a'), migrated('b'), migrated('c')], openIds: ['b', 'a'], activeId: 'b' })
+
+  useStore.getState().openWorkflow('a')
+  assert.deepEqual(useStore.getState().openIds, ['b', 'a'])
+  assert.equal(useStore.getState().activeId, 'a')
+  assert.deepEqual(JSON.parse(localStorage.getItem('modly-workflow-tab-session')), { version: 1, openIds: ['b', 'a'], activeId: 'a' })
+
+  useStore.getState().openWorkflow('c')
+  assert.deepEqual(useStore.getState().openIds, ['b', 'a', 'c'])
+  assert.equal(useStore.getState().activeId, 'c')
+  assert.deepEqual(JSON.parse(localStorage.getItem('modly-workflow-tab-session')), { version: 1, openIds: ['b', 'a', 'c'], activeId: 'c' })
+})
+
+test('successful create saves before opening the new workflow and persists existing tab order', async () => {
+  const source = readFileSync(resolve('src/areas/generate/components/ChatPanel.tsx'), 'utf8')
+  assert.match(source, /const openWorkflow = useWorkflowsStore\(\(s\) => s\.openWorkflow\)/)
+  assert.match(source, /const res = await saveWorkflow\(wf\)\s+if \(res\.success\) openWorkflow\(wf\.id\)/)
+
+  const useStore = loadStore()
+  stubBridge({ save: async () => ({ success: true }) })
+  useStore.setState({ workflows: [migrated('a'), migrated('b')], openIds: ['b', 'a'], activeId: 'b' })
+  useStore.getState().openWorkflow('b')
+  const persistedBefore = localStorage.getItem('modly-workflow-tab-session')
+  const wf = migrated('new')
+
+  const result = await useStore.getState().save(wf)
+  assert.equal(result.success, true)
+  assert.deepEqual(useStore.getState().workflows.map((w) => w.id), ['new', 'a', 'b'])
+  assert.deepEqual(useStore.getState().openIds, ['b', 'a'])
+  assert.equal(useStore.getState().activeId, 'b')
+  assert.equal(localStorage.getItem('modly-workflow-tab-session'), persistedBefore)
+  if (result.success) useStore.getState().openWorkflow(wf.id)
+  assert.deepEqual(useStore.getState().openIds, ['b', 'a', 'new'])
+  assert.equal(useStore.getState().activeId, 'new')
+  assert.deepEqual(JSON.parse(localStorage.getItem('modly-workflow-tab-session')), { version: 1, openIds: ['b', 'a', 'new'], activeId: 'new' })
+})
+
+test('setActive rejects saved closed workflow ids without changing tabs or persistence', () => {
+  const useStore = loadStore()
+  stubBridge()
+  useStore.setState({ workflows: [migrated('a'), migrated('closed')], openIds: ['a'], activeId: 'a' })
+  useStore.getState().openWorkflow('a')
+  const persistedBefore = localStorage.getItem('modly-workflow-tab-session')
+
+  useStore.getState().setActive('closed')
+  assert.deepEqual(useStore.getState().openIds, ['a'])
+  assert.equal(useStore.getState().activeId, 'a')
+  assert.equal(localStorage.getItem('modly-workflow-tab-session'), persistedBefore)
 })

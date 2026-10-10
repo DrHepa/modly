@@ -1807,7 +1807,7 @@ async function listProductionWorldsFiles(root: string): Promise<string[]> {
   return files.flat()
 }
 // Real React lifecycle on a CPU mutation host; the canvas alone is substituted.
-type Host = { type: string; props: any; children: Host[]; object3D?: THREE.Object3D; tagName?: string; focus?: () => void; contains?: (value: unknown) => boolean; closest?: () => null }
+type Host = { type: string; props: any; children: Host[]; hidden?: boolean; authoredVisible?: boolean; object3D?: THREE.Object3D; tagName?: string; focus?: () => void; contains?: (value: unknown) => boolean; closest?: () => null }
 class CpuEvents {
   listeners = new Map<string, Set<(event: any) => void>>()
   addEventListener(type: string, callback: (event: any) => void) { const set = this.listeners.get(type) ?? new Set(); set.add(callback); this.listeners.set(type, set) }
@@ -1831,9 +1831,30 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
   const controls = { target: new THREE.Vector3(), maxDistance: 500, update: () => { camera.lookAt(controls.target); camera.updateMatrixWorld() }, saveState: () => undefined }
   controls.update()
   const frames = new Set<(state: { camera: THREE.PerspectiveCamera }, delta: number) => void>()
+  const isHidden = (node: Host) => node.hidden || node.props.visible === false || node.object3D?.visible === false
+  const visibilityEvents: Array<{ type: 'hide' | 'unhide' | 'hideText' | 'unhideText'; node: Host }> = []
   const bounds = { refreshes: 0, box: new THREE.Box3(), refresh() {
     this.refreshes++; this.box.makeEmpty()
+    // Match Box3's conservative geometry/world-matrix path, but mask invisible subtrees.
+    const visitObject = (object: THREE.Object3D) => {
+      if (!object.visible) return
+      object.updateWorldMatrix(false, false)
+      const candidate = object as THREE.Object3D & { geometry?: THREE.BufferGeometry; boundingBox?: THREE.Box3 | null; computeBoundingBox?: () => void }
+      if (candidate.geometry) {
+        let box: THREE.Box3
+        if (candidate.boundingBox !== undefined) {
+          if (candidate.boundingBox === null) candidate.computeBoundingBox!()
+          box = candidate.boundingBox!
+        } else {
+          if (candidate.geometry.boundingBox === null) candidate.geometry.computeBoundingBox()
+          box = candidate.geometry.boundingBox!
+        }
+        this.box.union(box.clone().applyMatrix4(object.matrixWorld))
+      }
+      object.children.forEach(visitObject)
+    }
     const visit = (node: Host, parentMatrix = new THREE.Matrix4()) => {
+      if (isHidden(node)) return
       const matrix = parentMatrix.clone().multiply(new THREE.Matrix4().compose(new THREE.Vector3(...(node.props.position ?? [0, 0, 0]) as [number, number, number]), new THREE.Quaternion().setFromEuler(new THREE.Euler(...(node.props.rotation ?? [0, 0, 0]) as [number, number, number])), new THREE.Vector3(...(node.props.scale ?? [1, 1, 1]) as [number, number, number])))
       const geometry = node.props.geometry as THREE.BufferGeometry | undefined
       if (geometry) {
@@ -1842,7 +1863,7 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
           this.box.union(geometry.boundingBox.clone().applyMatrix4(matrix))
         }
       }
-      if (node.props.object instanceof THREE.Object3D) this.box.union(new THREE.Box3().setFromObject(node.props.object))
+      if (node.props.object instanceof THREE.Object3D) visitObject(node.props.object)
       node.children.forEach(child => visit(child, matrix))
     }
     const fitRoot = find(n => n.type === 'cpuBounds'); if (fitRoot) visit(fitRoot); return this
@@ -1858,6 +1879,9 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
   const remove = (p: Host, c: Host) => { const i = p.children.indexOf(c); if (i >= 0) p.children.splice(i, 1); if (p.object3D && c.object3D) p.object3D.remove(c.object3D) }
   const append = (p: Host, c: Host) => { remove(p, c); p.children.push(c); if (p.object3D && c.object3D) p.object3D.add(c.object3D) }
   const insert = (p: Host, c: Host, b: Host) => { remove(p, c); p.children.splice(p.children.indexOf(b), 0, c); if (p.object3D && c.object3D) p.object3D.add(c.object3D) }
+  const syncVisibility = (node: Host) => {
+    if (node.object3D) node.object3D.visible = !node.hidden && (typeof node.props.visible === 'boolean' ? node.props.visible : node.authoredVisible ?? true)
+  }
   const syncObject = (node: Host) => {
     const object = node.object3D
     if (!object) return
@@ -1865,6 +1889,7 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     object.rotation.fromArray([...(node.props.rotation ?? [0, 0, 0]), 'XYZ'])
     object.scale.fromArray(node.props.scale ?? [1, 1, 1])
     object.userData = node.props.userData ?? {}
+    syncVisibility(node)
   }
   const renderer = require(reconcilerPath)({
     now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
@@ -1876,6 +1901,7 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
       if (type === 'mesh') node.object3D = new THREE.Mesh(props.geometry)
       if (type === 'points') node.object3D = new THREE.Points(props.geometry)
       if (type === 'primitive') node.object3D = props.object
+      node.authoredVisible = node.object3D?.visible
       syncObject(node)
       node.focus = () => { documentEvents.activeElement = node }
       node.contains = value => value === node || (type === 'section' && value === canvas) || node.children.some(child => child.contains?.(value))
@@ -1887,6 +1913,13 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     finalizeInitialChildren: () => false, shouldSetTextContent: () => false, prepareUpdate: () => true,
     commitUpdate: (x: Host, _p: unknown, _t: string, _old: unknown, props: any) => { x.props = props; syncObject(x) },
     commitTextUpdate: (x: Host, _old: string, text: string) => { x.props.text = text },
+    hideInstance: (x: Host) => {
+      if (!x.hidden && x.object3D && typeof x.props.visible !== 'boolean') x.authoredVisible = x.object3D.visible
+      x.hidden = true; syncVisibility(x); visibilityEvents.push({ type: 'hide', node: x })
+    },
+    unhideInstance: (x: Host, props: any) => { x.props = props; x.hidden = false; syncVisibility(x); visibilityEvents.push({ type: 'unhide', node: x }) },
+    hideTextInstance: (x: Host) => { x.hidden = true; visibilityEvents.push({ type: 'hideText', node: x }) },
+    unhideTextInstance: (x: Host, text: string) => { x.props.text = text; x.hidden = false; visibilityEvents.push({ type: 'unhideText', node: x }) },
     clearContainer: (x: Host) => { x.children = [] }, detachDeletedInstance: () => undefined,
     scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
   })
@@ -1899,9 +1932,9 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
   }
   const settle = async () => { for (let i = 0; i < 8; i++) { await Promise.resolve(); flush() } }
   function find(predicate: (n: Host) => boolean, node = host): Host | undefined { if (predicate(node)) return node; for (const child of node.children) { const found = find(predicate, child); if (found) return found } }
-  const text = (n: Host): string => n.type === '#text' ? n.props.text : n.children.map(text).join('')
+  const text = (n: Host): string => isHidden(n) ? '' : n.type === '#text' ? n.props.text : n.children.map(text).join('')
   const button = (label: string) => { const n = find(n => n.type === 'button' && (n.props['aria-label'] === label || text(n) === label)); assert.ok(n, label); return n }
-  return { render, flush, settle, find, button, camera, controls, canvas, captures, bounds, windowEvents, documentEvents, frames,
+  return { render, flush, settle, find, button, camera, controls, canvas, captures, bounds, windowEvents, documentEvents, frames, visibilityEvents, visibleText: () => text(host),
     frame: (delta = 1) => { for (const callback of frames) callback({ camera }, delta); flush() },
     click: (label: string) => { const n = button(label); assert.ok(!n.props.disabled, label); flush(() => n.props.onClick()) } }
 }
@@ -2298,4 +2331,60 @@ test('WorldsViewer authored initial view survives deferred GLTF and PLY settleme
     cpu.camera.position.set(90, 80, 70); cpu.controls.target.set(9, 8, 7); cpu.click('Reset camera')
     assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
   } finally { cpu.render(null); globalThis.fetch = previousFetch; globals.__worldsGltf = previousGltf; geometry.dispose(); material.dispose(); await cleanup() }
+})
+
+
+test('CPU host installed Suspense hides and reveals retained objects and text without overriding authored visibility', async () => {
+  const cpu = cpuHost(), outer = new THREE.Group(), geometry = new THREE.BoxGeometry(2, 2, 2), material = new THREE.MeshBasicMaterial()
+  const visibleMesh = new THREE.Mesh(geometry, material), propHiddenMesh = new THREE.Mesh(geometry, material), objectHiddenMesh = new THREE.Mesh(geometry, material)
+  objectHiddenMesh.visible = false // Authored state exists before the renderer mounts this borrowed object.
+  let suspended = false, resolve!: () => void, geometryDisposals = 0, materialDisposals = 0
+  const pending = new Promise<void>(done => { resolve = done })
+  geometry.addEventListener('dispose', () => geometryDisposals++)
+  material.addEventListener('dispose', () => materialDisposals++)
+  function Readiness() { if (suspended) throw pending; return null }
+  const view = (label: string) => createElement('cpuBounds', null, createElement('primitive', { object: outer },
+    createElement(React.Suspense, { fallback: createElement('span', null, 'fallback') },
+      createElement('group', { key: 'visible', visible: true, 'data-visibility-control': 'primary' }, createElement('primitive', { object: visibleMesh, position: [4, 0, 0] })),
+      createElement('primitive', { key: 'prop-hidden', object: propHiddenMesh, visible: false, position: [100, 0, 0] }),
+      createElement('primitive', { key: 'object-hidden', object: objectHiddenMesh, position: [200, 0, 0] }),
+      label, createElement(Readiness, { key: 'readiness' }))))
+  try {
+    cpu.render(view('primary-before'))
+    const primary = cpu.find(n => n.props['data-visibility-control'] === 'primary'), text = cpu.find(n => n.type === '#text' && n.props.text === 'primary-before')
+    assert.ok(primary?.object3D); assert.ok(text)
+    const retainedGroup = primary.object3D, retainedChildren = outer.children.slice()
+    assert.equal(visibleMesh.parent, retainedGroup); assert.equal(retainedGroup.parent, outer)
+    assert.equal(propHiddenMesh.visible, false); assert.equal(objectHiddenMesh.visible, false)
+    assert.equal(cpu.visibleText(), 'primary-before')
+    cpu.bounds.refresh()
+    assert.deepEqual(cpu.bounds.box.min.toArray(), [3, -1, -1]); assert.deepEqual(cpu.bounds.box.max.toArray(), [5, 1, 1])
+
+    suspended = true; cpu.render(view('primary-before'))
+    assert.ok(cpu.visibilityEvents.some(event => event.type === 'hide' && event.node === primary), 'installed reconciler must invoke host hide, not a manually toggled fixture flag')
+    assert.ok(cpu.visibilityEvents.some(event => event.type === 'hideText' && event.node === text), 'direct primary text must exercise the installed text callback')
+    assert.equal(primary.hidden, true); assert.equal(retainedGroup.visible, false); assert.equal(text.hidden, true)
+    assert.equal(visibleMesh.visible, true, 'React masks the topmost host; the retained child keeps its authored visibility')
+    assert.equal(cpu.find(n => n.props.object === visibleMesh)?.hidden, undefined)
+    assert.deepEqual(outer.children, retainedChildren); assert.equal(visibleMesh.parent, retainedGroup)
+    assert.equal(cpu.visibleText(), 'fallback')
+    cpu.bounds.refresh(); assert.equal(cpu.bounds.box.isEmpty(), true, 'an enclosing visible primitive must not remeasure hidden descendants')
+
+    cpu.render(view('primary-after'))
+    assert.equal(retainedGroup.visible, false, 'host prop commits while suspended must not reveal the retained object')
+    assert.equal(cpu.visibleText(), 'fallback'); assert.equal(propHiddenMesh.visible, false); assert.equal(objectHiddenMesh.visible, false)
+    suspended = false; resolve(); await cpu.settle()
+    assert.ok(cpu.visibilityEvents.some(event => event.type === 'unhide' && event.node === primary))
+    assert.ok(cpu.visibilityEvents.some(event => event.type === 'unhideText' && event.node === text))
+    assert.equal(cpu.find(n => n.props['data-visibility-control'] === 'primary'), primary)
+    assert.equal(primary.hidden, false); assert.equal(retainedGroup.visible, true); assert.equal(text.hidden, false)
+    assert.equal(cpu.visibleText(), 'primary-after', 'reveal restores current text, not the pre-suspension string')
+    assert.equal(propHiddenMesh.visible, false, 'explicit authored visible=false must survive reveal')
+    assert.equal(objectHiddenMesh.visible, false, 'borrowed Object3D authored visible=false must survive reveal without a visible prop')
+    assert.deepEqual(outer.children, retainedChildren); assert.equal(visibleMesh.parent, retainedGroup)
+    assert.equal(visibleMesh.geometry, geometry); assert.equal(visibleMesh.material, material)
+    assert.equal(geometryDisposals, 0); assert.equal(materialDisposals, 0, 'hide/reveal retains resources rather than replacing or disposing them')
+    cpu.bounds.refresh()
+    assert.deepEqual(cpu.bounds.box.min.toArray(), [3, -1, -1]); assert.deepEqual(cpu.bounds.box.max.toArray(), [5, 1, 1])
+  } finally { suspended = false; resolve(); cpu.render(null); geometry.dispose(); material.dispose() }
 })

@@ -4,7 +4,7 @@ import time
 import os
 import json
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from services.extension_process import ExtensionProcess
 from services.generator_registry import (
@@ -66,8 +66,7 @@ class LegacyGenerator:
 
 class RecordingExtensionProcess(ExtensionProcess):
     def __init__(self, model_id: str):
-        self.MODEL_ID = model_id
-        self.model_id = model_id
+        super().__init__(Path("/unused/inert-extension"), {"id": model_id})
         self.stop_calls = 0
         self.unload_calls = 0
         self.load_calls = 0
@@ -75,6 +74,7 @@ class RecordingExtensionProcess(ExtensionProcess):
 
     def stop(self) -> None:
         self.stop_calls += 1
+        super().stop()
 
     def unload(self) -> None:
         self.unload_calls += 1
@@ -84,7 +84,14 @@ class RecordingExtensionProcess(ExtensionProcess):
 
     def readiness_status(self) -> dict:
         self.readiness_calls += 1
-        return {"ok": True, "machine_code": "ready"}
+        return super().readiness_status()
+
+    def _send(self, request: dict) -> None:
+        assert request["action"] == "runtime_readiness"
+        self._route_readiness_reply(self._proc, {
+            "type": "runtime_readiness", "id": request["id"],
+            "status": {"ok": True, "machine_code": "ready"},
+        })
 
 
 class RecordingDirectGenerator:
@@ -93,9 +100,14 @@ class RecordingDirectGenerator:
 
     def __init__(self):
         self.unload_calls = 0
+        self.loaded = True
 
     def unload(self) -> None:
         self.unload_calls += 1
+        self.loaded = False
+
+    def is_loaded(self) -> bool:
+        return self.loaded
 
 
 def _registry(model_id: str, generator) -> GeneratorRegistry:
@@ -844,13 +856,13 @@ def test_registry_reload_stops_old_extension_process_before_rebuilding(monkeypat
     registry._errors = {"runtime-ext/text-to-image": "old error"}
 
     initialized = []
-    monkeypatch.setattr(registry, "initialize", lambda: initialized.append(True))
+    monkeypatch.setattr(registry, "initialize", lambda authorization: initialized.append(authorization))
 
     registry.reload()
 
     assert old_process.stop_calls == 1
     assert old_process.unload_calls == 0
-    assert initialized == [True]
+    assert initialized == [()]
 
 
 def test_registry_shutdown_stops_model_runners_and_unloads_direct_generators():
@@ -861,28 +873,47 @@ def test_registry_shutdown_stops_model_runners_and_unloads_direct_generators():
         "runtime-ext/text-to-image": extension_process,
         "legacy-ext/image-to-mesh": direct_generator,
     }
-    registry._runtime_readiness_cache = {"runtime-ext/text-to-image": (time.monotonic(), {"ok": True})}
-    registry._runtime_readiness_inflight = {"runtime-ext/text-to-image": object()}
+    identity = registry._runtime_identity("runtime-ext/text-to-image")
+    pending = Future()
+    epoch = registry._runtime_readiness_epoch
+    registry._runtime_readiness_cache = {identity: (time.monotonic(), {"ok": True})}
+    registry._runtime_readiness_inflight = {identity: pending}
 
     registry.shutdown_all()
 
     assert extension_process.stop_calls == 1
     assert extension_process.unload_calls == 0
     assert direct_generator.unload_calls == 1
+    assert direct_generator.is_loaded() is False
     assert registry._runtime_readiness_cache == {}
     assert registry._runtime_readiness_inflight == {}
+    assert pending.cancelled()
+    assert registry._runtime_readiness_epoch > epoch
 
 
-def test_runtime_readiness_startup_path_starts_pid_without_loading_weights(monkeypatch):
+def test_runtime_readiness_uses_existing_pid_without_starting_or_loading_weights(monkeypatch):
     process = RecordingExtensionProcess("runtime-ext/text-to-image")
     registry = GeneratorRegistry()
     registry._generators = {"runtime-ext/text-to-image": process}
     registry._manifests = {"runtime-ext/text-to-image": {"id": "runtime-ext/text-to-image", "name": "Runtime"}}
 
-    monkeypatch.setattr(registry, "_sync_generator_model_dir", lambda model_id: process)
+    def forbidden_start():
+        raise AssertionError("Diagnostics must not launch a model worker")
 
-    readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])
+    monkeypatch.setattr(process, "_start", forbidden_start)
+    monkeypatch.setattr(process, "_ensure_started", forbidden_start)
+    try:
+        cold = registry.runtime_readiness(["runtime-ext/text-to-image"])
+        assert cold["runtime-ext/text-to-image"]["machine_code"] == "runtime_not_running"
+        assert process._proc is None
+        assert process.readiness_calls == 1
+        assert process.load_calls == 0
 
-    assert readiness["runtime-ext/text-to-image"]["machine_code"] == "ready"
-    assert process.readiness_calls == 1
-    assert process.load_calls == 0
+        process._proc = worker = FakeReadinessWorker()
+        readiness = registry.runtime_readiness(["runtime-ext/text-to-image"])
+        assert readiness["runtime-ext/text-to-image"]["machine_code"] == "ready"
+        assert process.readiness_calls == 2
+        assert process.load_calls == 0
+        assert process._proc is worker and worker.poll() is None
+    finally:
+        registry._runtime_readiness_executor.shutdown(wait=True)

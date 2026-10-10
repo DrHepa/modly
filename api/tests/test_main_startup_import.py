@@ -37,7 +37,13 @@ def test_lifespan_uses_explicit_registry_shutdown(monkeypatch):
         def shutdown_all(self):
             calls.append("shutdown_all")
 
+    class FakeLlamaPool:
+        def unload_all(self, force=False):
+            assert force is True
+            calls.append("llm_unload_all")
+
     monkeypatch.setattr("services.generator_registry.generator_registry", FakeRegistry())
+    monkeypatch.setattr("services.llm_server.llama_pool", FakeLlamaPool())
 
     async def exercise() -> None:
         async with main.lifespan(object()):
@@ -45,4 +51,4 @@ def test_lifespan_uses_explicit_registry_shutdown(monkeypatch):
 
     asyncio.run(exercise())
 
-    assert calls == ["initialize", "shutdown_all"]
+    assert calls == ["initialize", "shutdown_all", "llm_unload_all"]

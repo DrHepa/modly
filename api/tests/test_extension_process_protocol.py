@@ -2,6 +2,7 @@
 import io
 import json
 import queue
+import threading
 
 import pytest
 
@@ -717,70 +718,80 @@ def test_extension_process_start_waits_for_ready_and_keeps_live_pid(monkeypatch,
     assert process.is_loaded() is False
 
 
-def test_extension_process_stop_graceful_path_and_kill_fallback_do_not_leak(monkeypatch, tmp_path):
+def test_extension_process_stop_reaps_live_and_already_exited_workers_without_leaks(monkeypatch, tmp_path):
     sent: list[dict] = []
 
-    class GracefulProc:
+    class ReapedProc:
         def __init__(self):
-            self.wait_calls: list[float] = []
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            self.wait_calls.append(timeout)
-            return 0
-
-    graceful = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
-    graceful._proc = GracefulProc()
-    graceful._loaded = True
-    graceful._queue.put({"type": "ready"})
-    monkeypatch.setattr(graceful, "_send", sent.append)
-
-    graceful.stop()
-
-    assert sent == [{"action": "shutdown"}]
-    assert graceful._proc is None
-    assert graceful._loaded is False
-    assert graceful._queue.empty()
-
-    class KillProc:
-        def __init__(self):
+            self.dead = False
             self.kill_calls = 0
             self.wait_calls: list[float] = []
 
         def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            self.wait_calls.append(timeout)
-            if len(self.wait_calls) == 1:
-                raise TimeoutError("stuck")
-            return 0
+            return 0 if self.dead else None
 
         def kill(self):
             self.kill_calls += 1
+            self.dead = True
 
-    kill_sent: list[dict] = []
-    fallback = ExtensionProcess(tmp_path, {"id": "runtime-ext/mesh"})
-    fallback._proc = KillProc()
-    fallback._loaded = True
-    fallback._queue.put({"type": "ready"})
-    monkeypatch.setattr(fallback, "_send", kill_sent.append)
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            assert self.dead
+            return 0
 
-    fallback.stop()
+    live = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
+    live._proc = worker = ReapedProc()
+    live._loaded = True
+    live._queue.put({"type": "ready"})
+    monkeypatch.setattr(live, "_send", sent.append)
 
-    assert kill_sent == [{"action": "shutdown"}]
-    assert fallback._proc is None
-    assert fallback._loaded is False
-    assert fallback._queue.empty()
+    live.stop()
+
+    assert sent == []
+    assert worker.kill_calls == 1
+    assert worker.wait_calls == [5]
+    assert worker.poll() == 0
+    assert live._proc is None
+    assert live._loaded is False
+    assert live._queue.get_nowait() is None
+    assert live._queue.empty()
+
+    class ExitedProc:
+        def poll(self):
+            return 0
+
+        def kill(self):
+            raise AssertionError("An exited worker must not be killed again")
+
+        def wait(self, timeout=None):
+            raise AssertionError("An already-exited worker does not need another wait")
+
+    exited_sent: list[dict] = []
+    exited = ExtensionProcess(tmp_path, {"id": "runtime-ext/mesh"})
+    exited._proc = ExitedProc()
+    exited._loaded = True
+    exited._queue.put({"type": "ready"})
+    monkeypatch.setattr(exited, "_send", exited_sent.append)
+
+    exited.stop()
+
+    assert exited_sent == []
+    assert exited._proc is None
+    assert exited._loaded is False
+    assert exited._queue.get_nowait() is None
+    assert exited._queue.empty()
 
 
-def test_extension_process_concurrent_readiness_and_load_start_one_pid(monkeypatch, tmp_path):
+def test_extension_process_load_starts_one_pid_after_cold_readiness_declines(monkeypatch, tmp_path):
+    from services.extension_process import RuntimeReadinessUnavailable
+
     process = ExtensionProcess(tmp_path, {"id": "runtime-ext/text-to-image"})
     start_calls = 0
+    start_entered = threading.Event()
     ready_release = threading.Event()
+    readiness_entered = threading.Event()
     sent: list[dict] = []
+    errors: list[BaseException] = []
 
     class RunningProc:
         pid = 999
@@ -788,36 +799,72 @@ def test_extension_process_concurrent_readiness_and_load_start_one_pid(monkeypat
         def poll(self):
             return None
 
+    worker = RunningProc()
+
     def fake_start() -> None:
         nonlocal start_calls
         start_calls += 1
-        ready_release.wait(timeout=1)
-        process._proc = RunningProc()
+        start_entered.set()
+        assert ready_release.wait(timeout=1)
+        process._proc = worker
 
-    responses = iter([
-        {"type": "runtime_readiness", "status": {"ok": True, "machine_code": "ready"}},
-        {"type": "loaded"},
-    ])
+    def send(request: dict) -> None:
+        sent.append(request)
+        if request["action"] == "load":
+            process._queue.put({"type": "loaded"})
+        else:
+            assert request["action"] == "runtime_readiness"
+            process._route_readiness_reply(worker, {
+                "type": "runtime_readiness", "id": request["id"],
+                "status": {"ok": True, "machine_code": "ready"},
+            })
 
     monkeypatch.setattr(process, "_start", fake_start)
-    monkeypatch.setattr(process, "_send", sent.append)
-    monkeypatch.setattr(process, "_recv", lambda timeout=None: next(responses))
+    monkeypatch.setattr(process, "_send", send)
+
+    with pytest.raises(RuntimeReadinessUnavailable, match="diagnostics do not start"):
+        process.readiness_status()
+    assert start_calls == 0
+    assert sent == []
 
     readiness_result = {}
 
     def run_readiness() -> None:
-        readiness_result.update(process.readiness_status())
+        readiness_entered.set()
+        try:
+            readiness_result.update(process.readiness_status())
+        except BaseException as exc:
+            errors.append(exc)
 
+    def run_load() -> None:
+        try:
+            process.load()
+        except BaseException as exc:
+            errors.append(exc)
+
+    load_thread = threading.Thread(target=run_load)
     readiness_thread = threading.Thread(target=run_readiness)
-    load_thread = threading.Thread(target=process.load)
-
-    readiness_thread.start()
     load_thread.start()
-    time.sleep(0.05)
-    ready_release.set()
-    readiness_thread.join(timeout=1)
-    load_thread.join(timeout=1)
+    try:
+        assert start_entered.wait(timeout=1)
+        assert process._invocation_lock.locked()
+        readiness_thread.start()
+        assert readiness_entered.wait(timeout=1)
+        assert sent == []
+    finally:
+        ready_release.set()
+        load_thread.join(timeout=1)
+        if readiness_thread.ident is not None:
+            readiness_thread.join(timeout=1)
 
+    assert not load_thread.is_alive() and not readiness_thread.is_alive()
+    assert errors == []
     assert start_calls == 1
+    assert process._proc is worker and process._proc.pid == 999
+    assert process.is_loaded() is True
     assert readiness_result == {"ok": True, "machine_code": "ready"}
-    assert sent == [{"action": "runtime_readiness"}, {"action": "load"}]
+    assert len(sent) == 2
+    assert sent[0] == {"action": "load"}
+    assert sent[1]["action"] == "runtime_readiness"
+    assert sent[1]["id"].startswith("readiness:")
+    assert process._queue.empty()

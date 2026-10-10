@@ -31,17 +31,17 @@ def test_generation_endpoints_keep_dot_segment_collections_in_workspace(
     monkeypatch,
 ):
     from services.generator_registry import generator_registry
-    from routers import generation
+    jobs = api_modules["generation_jobs"]
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = declared_input
     workspace_dir = api_modules["workspace_dir"]
     captured = {}
 
-    def capture_job(*args, **kwargs):
-        captured["collection"] = kwargs.get("collection", args[-1])
-        return SimpleNamespace(job_id="safe-job")
+    async def capture_job(job_id, model_input, params, collection, output_kind, model_id):
+        captured["collection"] = collection
 
-    monkeypatch.setattr(generation, f"create_from_{endpoint}_job", capture_job)
+    monkeypatch.setattr(jobs, "uuid", SimpleNamespace(uuid4=lambda: "safe-job"))
+    monkeypatch.setattr(jobs, "_run_generation", capture_job)
 
     if endpoint == "image":
         response = client.post(
@@ -67,13 +67,14 @@ def test_generation_endpoints_keep_dot_segment_collections_in_workspace(
         elif endpoint == "text":
             payload["prompt"] = "Create a safe mesh"
         elif endpoint == "scene":
-            scene_path = workspace_dir / "Scenes" / "safe.json"
-            scene_path.parent.mkdir(parents=True)
+            scene_dir = workspace_dir / "Scenes" / "safe"
+            scene_dir.mkdir(parents=True)
+            scene_path = scene_dir / "scene-manifest.json"
             scene_path.write_text(
-                '{"schema":"modly.scene-manifest.v1","sceneRoot":"root.glb"}',
+                '{"schema":"modly.scene-manifest.v1","sceneRoot":".","assets":[]}',
                 encoding="utf-8",
             )
-            payload["scene_path"] = "Scenes/safe.json"
+            payload["scene_path"] = "Scenes/safe/scene-manifest.json"
         response = client.post(f"/generate/from-{endpoint}", json=payload)
 
     assert response.status_code == 200
@@ -92,7 +93,7 @@ def test_direct_generation_job_sanitizes_dot_segment_collection(
     asyncio.run(
         jobs._run_generation(
             job.job_id,
-            image_bytes=b"image",
+            model_input=b"image",
             params={"filename": "direct-safe.glb"},
             collection=collection,
         )

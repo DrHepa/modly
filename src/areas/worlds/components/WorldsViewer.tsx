@@ -205,7 +205,9 @@ type WorldsGltfSceneInstance = {
   dispose: () => void
 }
 
-const worldsManagedBoundsTreeRefCounts = new WeakMap<THREE.BufferGeometry, number>()
+const worldsManagedBoundsTrees = new WeakMap<THREE.BufferGeometry, { tree: unknown; owners: number }>()
+const worldsOwnedSceneMaterials = new WeakMap<THREE.Object3D, Set<THREE.Material>>()
+const worldsPendingSceneDisposals = new WeakMap<THREE.Object3D, object>()
 
 function isWorldsMeshObject(object: THREE.Object3D): object is THREE.Mesh {
   return (object as THREE.Object3D & { isMesh?: boolean }).isMesh === true
@@ -1381,16 +1383,21 @@ function GltfSceneObject({ item, onSettled, playbackRef, onAnimationMetadata, on
   } | null>(null)
   const key = worldSceneItemKey(item)
   useEffect(() => {
+    const releaseMaterials = retainWorldsSceneInstanceMaterials(scene)
+    const boundsTreeBuild = scheduleWorldsSceneBoundsTreeBuild(scene)
+    return () => {
+      boundsTreeBuild.release()
+      releaseMaterials()
+    }
+  }, [scene])
+  useEffect(() => {
     scene.traverse((child) => {
       child.userData.worldsSceneItemId = item.id
     })
     onSettled(key, 'ready')
     onBoundsChange()
-    return () => {
-      onSettled(key, null)
-      instance.dispose()
-    }
-  }, [instance, item.id, key, onSettled, onBoundsChange, scene])
+    return () => onSettled(key, null)
+  }, [item.id, key, onSettled, onBoundsChange, scene])
   useEffect(() => {
     const animation = item.animation
     poseClipRef.current = null
@@ -1918,31 +1925,56 @@ export function cloneWorldsSceneMaterialsForInstance(target: THREE.Object3D): Se
   return ownedMaterials
 }
 
+export function disposeWorldsSceneInstanceMaterials(target: THREE.Object3D): void {
+  worldsPendingSceneDisposals.delete(target)
+  const materials = worldsOwnedSceneMaterials.get(target)
+  worldsOwnedSceneMaterials.delete(target)
+  materials?.forEach((material) => material.dispose())
+}
+
+export function retainWorldsSceneInstanceMaterials(target: THREE.Object3D): () => void {
+  worldsPendingSceneDisposals.delete(target)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const operation = {}
+    worldsPendingSceneDisposals.set(target, operation)
+    queueMicrotask(() => {
+      if (worldsPendingSceneDisposals.get(target) !== operation) return
+      disposeWorldsSceneInstanceMaterials(target)
+    })
+  }
+}
+
 export function acquireWorldsManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
-  const existingCount = worldsManagedBoundsTreeRefCounts.get(geometry)
-  if (existingCount) {
-    worldsManagedBoundsTreeRefCounts.set(geometry, existingCount + 1)
+  const target = geometry as THREE.BufferGeometry & { boundsTree?: unknown }
+  const owner = worldsManagedBoundsTrees.get(geometry)
+  if (owner && target.boundsTree === owner.tree) {
+    owner.owners += 1
     return true
   }
+  if (target.boundsTree) return false
 
-  if ((geometry as { boundsTree?: unknown }).boundsTree) return false
-
-  ;(geometry as any).computeBoundsTree?.()
-  if (!(geometry as { boundsTree?: unknown }).boundsTree) return false
-  worldsManagedBoundsTreeRefCounts.set(geometry, 1)
+  // Shared loader geometry keeps its authored index order intact.
+  try {
+    ;(geometry as any).computeBoundsTree?.({ indirect: true })
+  } catch (error) {
+    console.warn('[WorldsViewer] BVH acceleration unavailable for geometry:', error)
+    return false
+  }
+  if (!target.boundsTree) return false
+  worldsManagedBoundsTrees.set(geometry, { tree: target.boundsTree, owners: 1 })
   return true
 }
 
-export function releaseWorldsManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
-  const existingCount = worldsManagedBoundsTreeRefCounts.get(geometry)
-  if (!existingCount) return false
-  if (existingCount > 1) {
-    worldsManagedBoundsTreeRefCounts.set(geometry, existingCount - 1)
-    return false
-  }
-
+export function releaseWorldsManagedBoundsTree(geometry: THREE.BufferGeometry, expectedTree?: unknown): boolean {
+  const owner = worldsManagedBoundsTrees.get(geometry)
+  if (!owner || (expectedTree !== undefined && owner.tree !== expectedTree)) return false
+  if (--owner.owners > 0) return false
+  worldsManagedBoundsTrees.delete(geometry)
+  if ((geometry as THREE.BufferGeometry & { boundsTree?: unknown }).boundsTree !== owner.tree) return false
   ;(geometry as any).disposeBoundsTree?.()
-  worldsManagedBoundsTreeRefCounts.delete(geometry)
   return true
 }
 
@@ -1950,7 +1982,7 @@ export function scheduleWorldsSceneBoundsTreeBuild(
   target: THREE.Object3D,
   schedule: WorldsDeferredTaskScheduler = scheduleWorldsDeferredTask,
 ): { cancel: () => void; release: () => void } {
-  const acquiredGeometries = new Set<THREE.BufferGeometry>()
+  const acquiredGeometries = new Map<THREE.BufferGeometry, unknown>()
   let released = false
   const scheduled = schedule(() => {
     if (released) return
@@ -1959,7 +1991,9 @@ export function scheduleWorldsSceneBoundsTreeBuild(
       if (!isWorldsMeshObject(child)) return
       const geometry = child.geometry
       if (!geometry || acquiredGeometries.has(geometry)) return
-      if (acquireWorldsManagedBoundsTree(geometry)) acquiredGeometries.add(geometry)
+      if (acquireWorldsManagedBoundsTree(geometry)) {
+        acquiredGeometries.set(geometry, (geometry as THREE.BufferGeometry & { boundsTree?: unknown }).boundsTree)
+      }
     })
   })
 
@@ -1967,34 +2001,33 @@ export function scheduleWorldsSceneBoundsTreeBuild(
     if (released) return
     released = true
     scheduled.cancel()
-    acquiredGeometries.forEach((geometry) => {
-      releaseWorldsManagedBoundsTree(geometry)
+    acquiredGeometries.forEach((tree, geometry) => {
+      releaseWorldsManagedBoundsTree(geometry, tree)
     })
     acquiredGeometries.clear()
   }
 
   return {
-    cancel: () => {
-      scheduled.cancel()
-      released = true
-    },
+    cancel: release,
     release,
   }
 }
 
 export function createWorldsGltfSceneInstance(
   sourceScene: THREE.Object3D,
-  schedule: WorldsDeferredTaskScheduler = scheduleWorldsDeferredTask,
+  schedule?: WorldsDeferredTaskScheduler,
 ): WorldsGltfSceneInstance {
   const scene = cloneSkeletonScene(sourceScene)
-  const ownedMaterials = cloneWorldsSceneMaterialsForInstance(scene)
-  const boundsTreeBuild = scheduleWorldsSceneBoundsTreeBuild(scene, schedule)
+  worldsOwnedSceneMaterials.set(scene, cloneWorldsSceneMaterialsForInstance(scene))
+  // Mounted instances acquire acceleration in the effect, never during render.
+  // Explicit schedulers keep the standalone resource-helper contract available.
+  const boundsTreeBuild = schedule ? scheduleWorldsSceneBoundsTreeBuild(scene, schedule) : null
 
   return {
     scene,
     dispose: () => {
-      boundsTreeBuild.release()
-      ownedMaterials.forEach((material) => material.dispose())
+      boundsTreeBuild?.release()
+      disposeWorldsSceneInstanceMaterials(scene)
     },
   }
 }

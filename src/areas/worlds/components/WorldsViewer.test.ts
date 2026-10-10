@@ -1820,7 +1820,7 @@ class CpuEvents {
   }
   get listenerCount() { return [...this.listeners.values()].reduce((n, set) => n + set.size, 0) }
 }
-function cpuHost() {
+function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
   const globals = globalThis as any
   const previous = { window: globals.window, document: globals.document, cpu: globals.__worldsCpu }
   const windowEvents = new CpuEvents(), documentEvents = Object.assign(new CpuEvents(), { activeElement: null as any, hidden: false })
@@ -1891,7 +1891,7 @@ function cpuHost() {
     scheduleTimeout: setTimeout, cancelTimeout: clearTimeout, noTimeout: -1,
   })
   const host: Host = { type: 'root', props: {}, children: [] }
-  const root = renderer.createContainer(host, 0, null, false, null, '', (e: unknown) => { throw e }, null)
+  const root = renderer.createContainer(host, strictEffects ? 1 : 0, null, strictEffects, null, '', (e: unknown) => { throw e }, null)
   const flush = (fn = () => {}) => { renderer.flushSync(fn); for (let i = 0; i < 12; i++) { if (!renderer.flushPassiveEffects()) return; renderer.flushSync(() => {}) } assert.fail('Effects did not settle') }
   const render = (node: ReturnType<typeof createElement> | null) => {
     install(); flush(() => renderer.updateContainer(node, root, null))
@@ -2145,4 +2145,157 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
   } finally {
     await cleanup()
   }
+})
+
+test('WorldsViewer instance construction is render-pure and cloned-material disposal is idempotent', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const source = new THREE.Group(), material = new THREE.MeshBasicMaterial({ side: THREE.FrontSide })
+  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: () => void }
+  let builds = 0, sourceDisposals = 0, cloneDisposals = 0
+  geometry.computeBoundsTree = () => { builds++; geometry.boundsTree = {} }
+  material.addEventListener('dispose', () => sourceDisposals++)
+  source.add(new THREE.Mesh(geometry, material))
+  try {
+    const instance = module.createWorldsGltfSceneInstance(source)
+    const clone = instance.scene.children[0] as THREE.Mesh
+    ;(clone.material as THREE.Material).addEventListener('dispose', () => cloneDisposals++)
+    assert.notEqual(instance.scene, source); assert.notEqual(clone.material, material)
+    assert.equal(clone.geometry, geometry)
+    await Promise.resolve()
+    assert.equal(builds, 0, 'uncommitted render must not acquire cached geometry acceleration')
+    assert.equal(geometry.boundsTree, undefined)
+    assert.equal(material.side, THREE.FrontSide)
+    instance.dispose(); instance.dispose()
+    assert.equal(cloneDisposals, 1); assert.equal(sourceDisposals, 0)
+  } finally { geometry.dispose(); material.dispose(); await cleanup() }
+})
+
+test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects replay without disposing its live material', async () => {
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ strictEffects: true })
+  const globals = globalThis as any, previousGltf = globals.__worldsGltf
+  const source = new THREE.Group(), material = new THREE.MeshBasicMaterial({ side: THREE.FrontSide })
+  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  let builds = 0, releases = 0, sourceDisposals = 0, setups = 0, cleanups = 0
+  const cloneDisposals = new Map<THREE.Material, number>(), idle: Array<() => void> = [], cancelled = new Set<number>()
+  const originalClone = material.clone.bind(material)
+  material.clone = () => {
+    const clone = originalClone(); cloneDisposals.set(clone, 0)
+    clone.addEventListener('dispose', () => cloneDisposals.set(clone, cloneDisposals.get(clone)! + 1))
+    return clone
+  }
+  material.addEventListener('dispose', () => sourceDisposals++)
+  geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = {} }
+  geometry.disposeBoundsTree = () => { releases++; delete geometry.boundsTree }
+  source.add(new THREE.Mesh(geometry, material))
+  Object.assign(cpu.windowEvents, {
+    requestIdleCallback: (callback: () => void) => { idle.push(callback); return idle.length },
+    cancelIdleCallback: (id: number) => { cancelled.add(id) },
+  })
+  globals.__worldsGltf = () => ({ scene: source })
+  function ReplayProbe() { React.useEffect(() => { setups++; return () => { cleanups++ } }, []); return null }
+  try {
+    cpu.render(createElement(React.Fragment, null, createElement(ReplayProbe), createElement(module.WorldsViewer, { items: [item('glb', 'synthetic.glb')] })))
+    assert.equal(setups, 2); assert.equal(cleanups, 1, 'positive control must prove real effect replay, not a normal remount')
+    const primitive = cpu.find(n => n.type === 'primitive'); assert.ok(primitive)
+    const mountedScene = primitive.props.object as THREE.Group, mountedMaterial = (mountedScene.children[0] as THREE.Mesh).material as THREE.Material
+    assert.notEqual(mountedScene, source); assert.equal(source.parent, null)
+    await cpu.settle()
+    assert.equal(cloneDisposals.get(mountedMaterial), 0, 'cleanup replay must not dispose the still-mounted material')
+    assert.equal(builds, 0); assert.ok(cancelled.size > 0, 'replay must cancel the first effect-owned task')
+    idle.forEach(callback => callback()) // Deliberately deliver cancelled callbacks too.
+    assert.equal(builds, 1); assert.ok(geometry.boundsTree)
+    cpu.render(null); await cpu.settle()
+    assert.equal(releases, 1); assert.equal(geometry.boundsTree, undefined)
+    assert.equal(cloneDisposals.get(mountedMaterial), 1); assert.equal(sourceDisposals, 0)
+    assert.equal(material.side, THREE.FrontSide); assert.equal(cleanups, 2)
+    idle.forEach(callback => callback()); assert.equal(builds, 1, 'late callbacks after unmount must not resurrect acceleration')
+  } finally { cpu.render(null); globals.__worldsGltf = previousGltf; geometry.dispose(); material.dispose(); await cleanup() }
+})
+
+test('WorldsViewer scheduled BVH cancellation releases exact shared owners and preserves foreign replacement trees', async () => {
+  const { module, cleanup } = await loadViewerModule()
+  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  const material = new THREE.MeshBasicMaterial(), source = new THREE.Group(), scheduled: Array<() => void> = []
+  let builds = 0, releases = 0
+  geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = { build: builds } }
+  geometry.disposeBoundsTree = () => { releases++; delete geometry.boundsTree }
+  source.add(new THREE.Mesh(geometry, material), new THREE.Mesh(geometry, material))
+  const schedule = (callback: () => void) => { scheduled.push(callback); return { cancel: () => undefined } }
+  try {
+    const a = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule), b = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
+    scheduled.splice(0).forEach(run => run()); assert.equal(builds, 1)
+    a.cancel(); a.release(); assert.equal(releases, 0, 'one live shared owner remains')
+    b.cancel(); b.release(); assert.equal(releases, 1, 'cancel after build must release, not leak')
+    const c = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
+    scheduled.splice(0).forEach(run => run())
+    const foreign = {}; geometry.boundsTree = foreign; c.release()
+    assert.equal(geometry.boundsTree, foreign); assert.equal(releases, 1)
+    const d = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
+    scheduled.splice(0).forEach(run => run()); d.release()
+    assert.equal(geometry.boundsTree, foreign); assert.equal(builds, 2, 'foreign tree must never be claimed')
+    delete geometry.boundsTree
+    const old = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
+    scheduled.splice(0).forEach(run => run()); delete geometry.boundsTree
+    const fresh = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
+    scheduled.splice(0).forEach(run => run()); const freshTree = geometry.boundsTree
+    old.release(); assert.equal(geometry.boundsTree, freshTree); assert.equal(releases, 1, 'stale task must not decrement a new tree owner')
+    fresh.release(); assert.equal(releases, 2); assert.equal(geometry.boundsTree, undefined)
+  } finally { geometry.dispose(); material.dispose(); await cleanup() }
+})
+
+test('WorldsViewer installed BVH construction keeps synthetic authored index and position buffers intact', async () => {
+  const { module, cleanup } = await loadViewerModule(), geometry = new THREE.BufferGeometry()
+  const positions: number[] = [], indices: number[] = []
+  for (let i = 0; i < 48; i++) { const x = (i * 17) % 48; positions.push(x, 0, 0, x + 0.4, 0, 0, x, 0.4, 0); indices.push(i * 3, i * 3 + 1, i * 3 + 2) }
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3)); geometry.setIndex(indices)
+  const index = geometry.index!, position = geometry.getAttribute('position'), authoredIndices = Array.from(index.array), authoredPositions = Array.from(position.array)
+  let geometryDisposals = 0; geometry.addEventListener('dispose', () => geometryDisposals++)
+  try {
+    assert.equal(module.acquireWorldsManagedBoundsTree(geometry), true)
+    assert.ok((geometry as any).boundsTree, 'positive control must build the installed BVH, not a fake')
+    assert.equal(geometry.index, index); assert.equal(geometry.getAttribute('position'), position)
+    assert.deepEqual(Array.from(index.array), authoredIndices); assert.deepEqual(Array.from(position.array), authoredPositions)
+    assert.equal(module.releaseWorldsManagedBoundsTree(geometry), true)
+    assert.equal((geometry as any).boundsTree, null); assert.equal(geometryDisposals, 0, 'shared geometry is borrowed, never disposed')
+  } finally { module.releaseWorldsManagedBoundsTree(geometry); geometry.dispose(); await cleanup() }
+})
+
+test('WorldsViewer optional BVH failures preserve valid sibling acceleration and ordinary mesh raycasting', async t => {
+  const { module, cleanup } = await loadViewerModule(), source = new THREE.Group(), material = new THREE.MeshBasicMaterial()
+  const rejected = new THREE.BoxGeometry() as THREE.BufferGeometry & { computeBoundsTree?: () => void }, valid = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  const warnings: unknown[][] = [], scheduled: Array<() => void> = []; let releases = 0
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args) })
+  rejected.computeBoundsTree = () => { throw new Error('Synthetic unsupported geometry') }
+  valid.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); valid.boundsTree = {} }
+  valid.disposeBoundsTree = () => { releases++; delete valid.boundsTree }
+  const rejectedMesh = new THREE.Mesh(rejected, material); source.add(rejectedMesh, new THREE.Mesh(valid, material))
+  try {
+    const task = module.scheduleWorldsSceneBoundsTreeBuild(source, callback => { scheduled.push(callback); return { cancel: () => undefined } })
+    assert.doesNotThrow(() => scheduled[0]()); assert.equal(warnings.length, 1); assert.ok(valid.boundsTree)
+    const hits = new THREE.Raycaster(new THREE.Vector3(0, 0, 2), new THREE.Vector3(0, 0, -1)).intersectObject(rejectedMesh)
+    assert.ok(hits.length > 0, 'failed optional acceleration retains installed fallback raycasting')
+    task.release(); assert.equal(releases, 1)
+  } finally { rejected.dispose(); valid.dispose(); material.dispose(); await cleanup() }
+})
+
+test('WorldsViewer authored initial view survives deferred GLTF and PLY settlement, navigation and reset', async () => {
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
+  const globals = globalThis as any, previousGltf = globals.__worldsGltf, scene = new THREE.Group()
+  const geometry = new THREE.BoxGeometry(), material = new THREE.MeshBasicMaterial(); scene.add(new THREE.Mesh(geometry, material))
+  let gltfReady = false, resolveGltf!: () => void, resolvePly!: (response: Response) => void
+  const pendingGltf = new Promise<void>(resolve => { resolveGltf = resolve })
+  globals.__worldsGltf = () => { if (!gltfReady) throw pendingGltf; return { scene } }
+  globalThis.fetch = (() => new Promise<Response>(resolve => { resolvePly = resolve })) as typeof fetch
+  const initialView = { position: [30, 20, 40], target: [7, 1, -3], up: [0, 1, 0] } as const
+  try {
+    cpu.render(createElement(module.WorldsViewer, { items: [item('glb', 'delayed.glb'), item('ply-points', 'blob:delayed')], initialView }))
+    assert.equal(cpu.bounds.refreshes, 0)
+    resolvePly(new Response(await readFile(pointsFixture))); await cpu.settle()
+    assert.equal(cpu.bounds.refreshes, 0, 'one real mounted PLY must not bypass pending GLTF')
+    gltfReady = true; resolveGltf(); await cpu.settle()
+    assert.ok(cpu.find(n => n.type === 'primitive')); assert.ok(cpu.bounds.refreshes > 0)
+    assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
+    cpu.camera.position.set(90, 80, 70); cpu.controls.target.set(9, 8, 7); cpu.click('Reset camera')
+    assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
+  } finally { cpu.render(null); globalThis.fetch = previousFetch; globals.__worldsGltf = previousGltf; geometry.dispose(); material.dispose(); await cleanup() }
 })

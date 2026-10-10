@@ -100,35 +100,87 @@ function cloneViewer3DMaterial<T extends THREE.Material>(material: T): T {
   return material.clone() as T
 }
 
+const viewer3DOwnedMaterials = new WeakMap<THREE.Object3D, Set<THREE.Material>>()
+const viewer3DOwnedSkeletons = new WeakMap<THREE.Object3D, Set<THREE.Skeleton>>()
+const viewer3DPendingDisposals = new WeakMap<THREE.Object3D, object>()
+const viewer3DManagedBoundsTrees = new WeakMap<THREE.BufferGeometry, { tree: unknown; owners: number }>()
+
 export function cloneViewer3DLoadedScene<T extends THREE.Object3D>(source: T): T {
   const clone = cloneSkeleton(source) as T
+  // Match the existing pristine-export owner: UUID tracks bind inside this root.
+  const preserveBindingIds = (original: THREE.Object3D, instance: THREE.Object3D): void => {
+    instance.uuid = original.uuid
+    original.children.forEach((child, index) => preserveBindingIds(child, instance.children[index]))
+  }
+  preserveBindingIds(source, clone)
+  const ownedMaterials = new Set<THREE.Material>()
+  const ownedSkeletons = new Set<THREE.Skeleton>()
   clone.traverse((child) => {
+    if (child instanceof THREE.SkinnedMesh) ownedSkeletons.add(child.skeleton)
     if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
     child.material = Array.isArray(child.material)
       ? child.material.map((material) => cloneViewer3DMaterial(material))
       : cloneViewer3DMaterial(child.material)
-    child.userData.originalMaterial = child.material
+    ;(Array.isArray(child.material) ? child.material : [child.material]).forEach(material => ownedMaterials.add(material))
   })
+  viewer3DOwnedMaterials.set(clone, ownedMaterials)
+  viewer3DOwnedSkeletons.set(clone, ownedSkeletons)
   return clone
 }
 
 export function disposeViewer3DOwnedSceneResources(scene: THREE.Object3D): void {
-  const disposed = new Set<THREE.Material>()
+  const ownedMaterials = viewer3DOwnedMaterials.get(scene)
+  viewer3DOwnedMaterials.delete(scene)
+  ownedMaterials?.forEach(material => material.dispose())
+  const ownedSkeletons = viewer3DOwnedSkeletons.get(scene)
+  viewer3DOwnedSkeletons.delete(scene)
+  ownedSkeletons?.forEach(skeleton => skeleton.dispose())
+}
 
-  const disposeMaterial = (material: THREE.Material | undefined): void => {
-    if (!material || disposed.has(material)) return
-    disposed.add(material)
-    material.dispose()
+export function retainViewer3DOwnedSceneResources(scene: THREE.Object3D): () => void {
+  viewer3DPendingDisposals.delete(scene)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const operation = {}
+    viewer3DPendingDisposals.set(scene, operation)
+    queueMicrotask(() => {
+      if (viewer3DPendingDisposals.get(scene) !== operation) return
+      viewer3DPendingDisposals.delete(scene)
+      disposeViewer3DOwnedSceneResources(scene)
+    })
   }
+}
 
-  scene.traverse((child) => {
-    if (!(child instanceof THREE.Mesh || child instanceof THREE.Points)) return
-    const materials = Array.isArray(child.material) ? child.material : [child.material]
-    materials.forEach(disposeMaterial)
+export function acquireViewer3DManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
+  const target = geometry as THREE.BufferGeometry & { boundsTree?: unknown }
+  const owner = viewer3DManagedBoundsTrees.get(geometry)
+  if (owner && target.boundsTree === owner.tree) {
+    owner.owners += 1
+    return true
+  }
+  if (target.boundsTree) return false
+  // Indirect construction keeps authored triangle-index order intact.
+  try {
+    ;(geometry as any).computeBoundsTree?.({ indirect: true })
+  } catch (error) {
+    console.warn('[Viewer3D] BVH acceleration unavailable for geometry:', error)
+    return false
+  }
+  if (!target.boundsTree) return false
+  viewer3DManagedBoundsTrees.set(geometry, { tree: target.boundsTree, owners: 1 })
+  return true
+}
 
-    const originalMaterial = child.userData.originalMaterial as THREE.Material | THREE.Material[] | undefined
-    ;(Array.isArray(originalMaterial) ? originalMaterial : [originalMaterial]).forEach(disposeMaterial)
-  })
+export function releaseViewer3DManagedBoundsTree(geometry: THREE.BufferGeometry): boolean {
+  const owner = viewer3DManagedBoundsTrees.get(geometry)
+  if (!owner) return false
+  if (--owner.owners > 0) return false
+  viewer3DManagedBoundsTrees.delete(geometry)
+  if ((geometry as THREE.BufferGeometry & { boundsTree?: unknown }).boundsTree !== owner.tree) return false
+  ;(geometry as any).disposeBoundsTree?.()
+  return true
 }
 
 export function hasViewer3DRenderableContent(object: THREE.Object3D | null | undefined): boolean {
@@ -796,7 +848,6 @@ function SceneMeshModel({
   animations: readonly THREE.AnimationClip[]
 }): JSX.Element {
   const captured = useRef(false)
-  const bvhGeometriesRef = useRef<Set<THREE.BufferGeometry>>(new Set())
   const { gl } = useThree()
   const originals = useMemo(() => {
     const originalMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
@@ -835,7 +886,7 @@ function SceneMeshModel({
   // Dispose only the per-instance cloned materials we own. Loader caches and
   // shared geometries stay intact so StrictMode remounts do not invalidate them.
   useEffect(() => {
-    return () => disposeViewer3DOwnedSceneResources(scene)
+    return retainViewer3DOwnedSceneResources(scene)
   }, [scene])
 
   useEffect(() => {
@@ -854,26 +905,25 @@ function SceneMeshModel({
     if (!shouldEnableViewer3DBvh({ editMode, landmarkPicking })) return
 
     let cancelled = false
-    let timeoutId: number | null = null
+    let timeoutId: ReturnType<typeof globalThis.setTimeout> | null = null
     let idleId: number | null = null
+    const built = new Set<THREE.BufferGeometry>()
+    const geometries = new Set<THREE.BufferGeometry>()
+    originals.originalGeometries.forEach((geometry, mesh) => {
+      if (!(mesh instanceof THREE.SkinnedMesh)) geometries.add(geometry)
+    })
 
     const build = () => {
       if (cancelled) return
-      const built = new Set<THREE.BufferGeometry>()
-      scene.traverse((child) => {
-        if (!(child instanceof THREE.Mesh)) return
-        const geometry = child.geometry
-        if (built.has(geometry)) return
-        ;(geometry as any).computeBoundsTree?.()
-        built.add(geometry)
+      geometries.forEach(geometry => {
+        if (acquireViewer3DManagedBoundsTree(geometry)) built.add(geometry)
       })
-      bvhGeometriesRef.current = built
     }
 
     if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
       idleId = window.requestIdleCallback(() => build())
     } else {
-      timeoutId = window.setTimeout(build, 0)
+      timeoutId = globalThis.setTimeout(build, 0)
     }
 
     return () => {
@@ -881,13 +931,11 @@ function SceneMeshModel({
       if (idleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
         window.cancelIdleCallback(idleId)
       }
-      if (timeoutId !== null && typeof window !== 'undefined') window.clearTimeout(timeoutId)
-      bvhGeometriesRef.current.forEach((geometry) => {
-        ;(geometry as any).disposeBoundsTree?.()
-      })
-      bvhGeometriesRef.current = new Set()
+      if (timeoutId !== null) globalThis.clearTimeout(timeoutId)
+      built.forEach(releaseViewer3DManagedBoundsTree)
+      built.clear()
     }
-  }, [editMode, landmarkPicking, scene])
+  }, [editMode, landmarkPicking, scene, originals])
 
   // Preserve authored transforms. Only collect stats when the loaded scene changes.
   useEffect(() => {

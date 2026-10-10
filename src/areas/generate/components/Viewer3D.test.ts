@@ -181,6 +181,127 @@ test('Viewer3D clones loaded scenes and disposes only owned instance materials',
   }
 })
 
+test('Viewer3D cloned skeleton UUID tracks animate owned Bones without touching cached Bones', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const source = new THREE.Group(), bone = new THREE.Bone()
+    const mesh = new THREE.SkinnedMesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial())
+    source.add(bone, mesh); mesh.bind(new THREE.Skeleton([bone]))
+    const instance = module.cloneViewer3DLoadedScene(source) as THREE.Group
+    const ownedBone = instance.getObjectByProperty('uuid', bone.uuid) as THREE.Bone
+    const ownedMesh = instance.children[1] as THREE.SkinnedMesh
+    assert.notEqual(ownedBone, bone)
+    assert.equal(ownedMesh.skeleton.bones[0], ownedBone)
+    const rotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2)
+    const clip = new THREE.AnimationClip('uuid-owner', 1, [new THREE.QuaternionKeyframeTrack(`${bone.uuid}.quaternion`, [0, 1], [0, 0, 0, 1, ...rotation.toArray()])])
+    const mixer = new THREE.AnimationMixer(instance)
+    mixer.clipAction(clip).play(); mixer.update(0.5)
+    assert.notEqual(ownedBone.quaternion.x, 0)
+    assert.equal(bone.quaternion.x, 0)
+    mixer.stopAllAction(); mixer.uncacheRoot(instance)
+    const ownedSkeleton = ownedMesh.skeleton
+    ownedSkeleton.computeBoneTexture()
+    const ownedTexture = ownedSkeleton.boneTexture!
+    const cachedTexture = new THREE.DataTexture()
+    mesh.skeleton.boneTexture = cachedTexture
+    let ownedTextureDisposals = 0, cachedTextureDisposals = 0
+    ownedTexture.addEventListener('dispose', () => { ownedTextureDisposals++ })
+    cachedTexture.addEventListener('dispose', () => { cachedTextureDisposals++ })
+    // Teardown must use its captured owner, not a current borrowed replacement.
+    ownedMesh.skeleton = mesh.skeleton
+    const release = module.retainViewer3DOwnedSceneResources(instance)
+    release()
+    const releaseReplay = module.retainViewer3DOwnedSceneResources(instance)
+    await Promise.resolve()
+    assert.equal(ownedSkeleton.boneTexture, ownedTexture)
+    assert.equal(ownedTextureDisposals, 0)
+    releaseReplay(); await Promise.resolve()
+    module.disposeViewer3DOwnedSceneResources(instance)
+    assert.equal(ownedSkeleton.boneTexture, null)
+    assert.equal(ownedTextureDisposals, 1)
+    assert.equal(mesh.skeleton.boneTexture, cachedTexture)
+    assert.equal(cachedTextureDisposals, 0)
+  } finally { await cleanup() }
+})
+
+test('Viewer3D material cleanup survives effect replay and never consumes transient or cached resources', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const material = new THREE.MeshStandardMaterial(), geometry = new THREE.BoxGeometry()
+    let cachedDisposals = 0, geometryDisposals = 0, ownedDisposals = 0, transientDisposals = 0
+    material.dispose = () => { cachedDisposals++ }; geometry.dispose = () => { geometryDisposals++ }
+    const source = new THREE.Group(); source.add(new THREE.Mesh(geometry, material))
+    const instance = module.cloneViewer3DLoadedScene(source) as THREE.Group
+    const mesh = instance.children[0] as THREE.Mesh
+    ;(mesh.material as THREE.Material).dispose = () => { ownedDisposals++ }
+    const transient = new THREE.MeshNormalMaterial(); transient.dispose = () => { transientDisposals++ }
+    mesh.material = transient
+    const release = module.retainViewer3DOwnedSceneResources(instance)
+    release()
+    const releaseReplay = module.retainViewer3DOwnedSceneResources(instance)
+    await Promise.resolve()
+    assert.equal(ownedDisposals, 0)
+    releaseReplay(); await Promise.resolve()
+    module.disposeViewer3DOwnedSceneResources(instance)
+    assert.equal(ownedDisposals, 1)
+    assert.equal(cachedDisposals, 0); assert.equal(geometryDisposals, 0); assert.equal(transientDisposals, 0)
+  } finally { await cleanup() }
+})
+
+test('Viewer3D managed BVH references keep foreign trees and release only the exact last-owned tree', async () => {
+  const { module, cleanup } = await loadViewer3DModule()
+  try {
+    const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+    const tree = {}, foreignTree = {}
+    let builds = 0, releases = 0
+    geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = tree }
+    geometry.disposeBoundsTree = () => { assert.equal(geometry.boundsTree, tree); releases++; delete geometry.boundsTree }
+    assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
+    assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
+    assert.equal(builds, 1)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), false)
+    assert.equal(geometry.boundsTree, tree)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), true)
+    assert.equal(releases, 1)
+    geometry.boundsTree = foreignTree
+    assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), false)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), false)
+    assert.equal(geometry.boundsTree, foreignTree)
+    delete geometry.boundsTree
+    assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
+    geometry.boundsTree = foreignTree
+    assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), false)
+    assert.equal(geometry.boundsTree, foreignTree); assert.equal(releases, 1)
+  } finally { await cleanup() }
+})
+
+test('Viewer3D optional BVH construction failures preserve fallback raycasting', async t => {
+  const { module, cleanup } = await loadViewer3DModule()
+  const warnings: unknown[][] = []
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args) })
+  try {
+    const rejected = new THREE.BoxGeometry() as THREE.BufferGeometry & { computeBoundsTree?: () => void; boundsTree?: unknown }
+    rejected.computeBoundsTree = () => { throw new Error('Synthetic unsupported geometry') }
+    assert.equal(module.acquireViewer3DManagedBoundsTree(rejected), false)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(rejected), false)
+    assert.equal(rejected.boundsTree, undefined)
+    const source = new THREE.Group(); source.add(new THREE.Mesh(rejected, new THREE.MeshBasicMaterial()))
+    assert.equal(module.hasViewer3DRenderableContent(source), true, "Optional acceleration must not reject the renderable mesh")
+    // Exercise the installed constructor's missing-position rejection with CPU data only.
+    assert.equal(module.acquireViewer3DManagedBoundsTree(new THREE.BufferGeometry()), false)
+    assert.equal(warnings.length, 2)
+    const externalTree = {}; rejected.boundsTree = externalTree
+    assert.equal(module.acquireViewer3DManagedBoundsTree(rejected), false)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(rejected), false)
+    assert.equal(rejected.boundsTree, externalTree)
+    assert.equal(warnings.length, 2, "External trees are not rebuilt or rejected")
+    const supported = new THREE.BoxGeometry()
+    assert.equal(module.acquireViewer3DManagedBoundsTree(supported), true)
+    assert.equal(module.releaseViewer3DManagedBoundsTree(supported), true)
+    assert.equal((supported as THREE.BufferGeometry & { boundsTree?: unknown }).boundsTree, null)
+  } finally { await cleanup() }
+})
+
 test('Viewer3D camera framing resolves finite bounds for tiny huge and offset meshes without changing object transforms', async () => {
   const { module, cleanup } = await loadViewer3DModule()
 
@@ -244,7 +365,7 @@ test('Viewer3D viewport gizmos render only when a real renderable object is load
   }
 })
 
-test('Viewer3D local DreamCube regression GLB parses and reports finite bounds when present', { skip: !existsSync(dreamCubeRegressionGlbPath) }, async () => {
+test('Viewer3D local DreamCube regression GLB parses and reports finite bounds when present', { skip: process.env.MODLY_VIEWER3D_PRIVATE_ASSET_REGRESSION !== '1' || !existsSync(dreamCubeRegressionGlbPath) }, async () => {
   const bytes = readFileSync(dreamCubeRegressionGlbPath)
   const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
   const loader = new GLTFLoader()
@@ -6245,19 +6366,25 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       plugins: [{ name: 'mounted-cpu-adapters', setup(builder) {
         builder.onResolve({ filter: /^(@react-three\/(fiber|drei|postprocessing)|\.\/SplatViewer)$/ }, () => ({ path: 'adapters', namespace: 'fixture' }))
         builder.onLoad({ filter: /^adapters$/, namespace: 'fixture' }, () => ({ loader: 'js', resolveDir: projectRoot, contents: `
-          import { createElement, forwardRef } from 'react'
-          export const harness = { gltf: new Map() }
+          import { createElement, forwardRef, useImperativeHandle, useMemo } from 'react'
+          import * as THREE from 'three'
+          export const harness = { gltf: new Map(), camera: new THREE.PerspectiveCamera(45, 1, 0.01, 1000), invalidations: 0 }
           export const Canvas = props => createElement('test-canvas', null, props.children)
           export const useFrame = () => undefined
           export function useGLTF(url) { const asset = harness.gltf.get(url); if (!asset) throw new Error('Missing fixture ' + url); return asset }
           useGLTF.clear = () => undefined
           export const useLoader = () => { throw new Error('Unexpected non-GLTF load') }
           useLoader.clear = () => undefined
-          export const useThree = () => ({ gl: { domElement: { toDataURL: () => '', getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) } } })
+          export const useThree = () => ({ camera: harness.camera, size: { width: 100, height: 100 }, invalidate: () => { harness.invalidations++ }, gl: { domElement: { toDataURL: () => '', getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) } } })
           export const useGizmoContext = () => ({})
           export const Environment = () => null, GizmoHelper = () => null, Lightformer = () => null
           const host = props => createElement('test-adapter', props, props.children)
-          export const Html = host, OrbitControls = host, EffectComposer = host, Outline = host, Selection = host, Select = host
+          export const Html = host, EffectComposer = host, Outline = host, Selection = host, Select = host
+          export const OrbitControls = forwardRef(function OrbitControls(props, ref) {
+            const controls = useMemo(() => ({ target: new THREE.Vector3(), minDistance: 0, maxDistance: Infinity, update: () => undefined }), [])
+            useImperativeHandle(ref, () => controls, [controls])
+            return host(props)
+          })
           export default forwardRef(function SplatViewer(props, ref) { return createElement('test-splat', props) })
         ` }))
         builder.onResolve({ filter: /^@shared\/hooks\/useGeneration$/ }, () => ({ path: 'generation', namespace: 'fixture' }))
@@ -6289,12 +6416,35 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       const walk = (fiber: any): any => !fiber ? undefined : fiber.type?.name === name ? fiber.memoizedProps : walk(fiber.child) ?? walk(fiber.sibling)
       const props = walk(root.current); assert.ok(props, `Missing mounted component ${name}`); return props
     }
+    // Preserve positive physical-owner checks while keeping loader assets inert.
+    const sceneInstances = new WeakMap<THREE.Object3D, THREE.Object3D>()
+    const instanceFor = (loadedAsset: ReturnType<typeof asset>): any => {
+      const scene = component('SceneMeshModel').scene as THREE.Object3D
+      assert.notEqual(scene, loadedAsset.scene, 'The mounted owner is an isolated instance, not the loader cache')
+      assert.equal(scene.uuid, loadedAsset.scene.uuid, 'The instance must correspond to the exact expected loader source')
+      const previous = sceneInstances.get(loadedAsset.scene)
+      if (previous) assert.equal(scene, previous, 'Unchanged mounted source retains the exact instance across panel operations')
+      else sceneInstances.set(loadedAsset.scene, scene)
+      const root = scene.getObjectByProperty('uuid', loadedAsset.root.uuid)
+      const child = scene.getObjectByProperty('uuid', loadedAsset.child.uuid)
+      const mesh = scene.getObjectByProperty('uuid', loadedAsset.mesh.uuid) as THREE.SkinnedMesh | undefined
+      if (mesh?.skeleton) {
+        assert.notEqual(mesh.skeleton, loadedAsset.mesh.skeleton)
+        assert.equal(mesh.geometry, loadedAsset.mesh.geometry)
+        mesh.skeleton.bones.forEach((bone, index) => {
+          assert.notEqual(bone, loadedAsset.mesh.skeleton.bones[index])
+          assert.equal(bone.uuid, loadedAsset.mesh.skeleton.bones[index].uuid)
+          assert.equal(scene.getObjectByProperty('uuid', bone.uuid), bone)
+        })
+      }
+      return { scene, root, child, mesh }
+    }
     const click = (title: string) => flush(() => {
       const button = find(host, node => node.type === 'button' && node.props.title === title)
       assert.ok(button, `Missing button ${title}`); button.props.onClick()
     })
     render(); await settle()
-    return { host, harness, source, preview, component, click, render, useWorkflowRunStore, useAppStore, fetches,
+    return { host, harness, source, preview, component, instanceFor, click, render, useWorkflowRunStore, useAppStore, fetches,
       switchTo: (url: string) => flush(() => job(url)), panel: () => component('PoseClipPanel') }
   }
 
@@ -6309,8 +6459,9 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
         [field]: field.endsWith('artifacts') ? [{ path: 'generated.glb', role: 'animated-output' }] : 'generated.glb' })))
       await settle()
       assert.equal(view.component('GltfMeshModel').url, previewUrl)
-      assert.equal(view.component('SceneMeshModel').scene, view.preview.scene)
+      assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.preview).scene)
       assert.notEqual(view.component('SceneMeshModel').scene, generated.scene)
+      assert.notEqual(view.component('SceneMeshModel').scene.uuid, generated.scene.uuid)
       assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
     })
   }
@@ -6323,19 +6474,19 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       artifacts: [{ path: 'animated.glb', role: 'animated-output' }, { path: 'source.glb', role: 'source' }] })))
     await settle()
     assert.equal(view.component('GltfMeshModel').url, colocated)
-    assert.equal(view.component('SceneMeshModel').scene, source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(source).scene)
     view.click('Open Rig Editor (2 bones)'); await settle()
     const rig = () => view.component('RigEditorPanel')
     const id = rig().summary.bones.find((bone: any) => bone.originalName === 'root').boneId
     flush(() => rig().onSelectBone(id)); flush(() => rig().onAliasChange(id, 'Authored Alias'))
-    const bones = [...source.mesh.skeleton.bones], names = bones.map(bone => bone.name)
+    const bones = [...view.instanceFor(source).mesh.skeleton.bones], names = bones.map(bone => bone.name)
     assert.ok(find(view.host, node => node.type === '#text' && /source-rig authoring fallback/.test(String(node.props.text))))
     view.click('Close Rig Editor (2 bones)'); await settle()
     view.click('Open Rig Editor (2 bones)'); await settle()
-    assert.equal(view.component('SceneMeshModel').scene, source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(source).scene)
     assert.equal(rig().aliasesDirty, true); assert.equal(rig().effectiveNaming.byBoneId[id].label, 'Authored Alias')
     assert.equal(rig().humanoidReview.presentation.canPromote, false)
-    assert.deepEqual(source.mesh.skeleton.bones, bones); assert.deepEqual(bones.map(bone => bone.name), names)
+    assert.deepEqual(view.instanceFor(source).mesh.skeleton.bones, bones); assert.deepEqual(bones.map(bone => bone.name), names)
     assert.equal(view.fetches.length, 1, 'source hasRig and panel visibility do not revoke the preview decision')
   })
   await suite.test('compact Pose Clip rail shares Rig Editor targets and acts on actual source Bones without retired surfaces', async t => {
@@ -6348,19 +6499,22 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     flush(() => rig.onSelectBone(id))
     view.click('Open Pose/Clip (2 bones)'); await settle()
     assert.equal(view.panel().selectedBoneId, id)
-    const original = view.source.child.quaternion.clone()
+    const instance = view.instanceFor(view.source)
+    const original = instance.child.quaternion.clone()
+    const loaderOriginal = view.source.child.quaternion.clone()
     view.click('Rotate selected target +X')
-    assert.equal(view.source.child.quaternion.equals(original), false)
+    assert.equal(instance.child.quaternion.equals(original), false)
+    assert.equal(view.source.child.quaternion.equals(loaderOriginal), true, 'Pose edits must not mutate cached Bones')
     view.click('Capture pose keyframe')
     assert.equal(view.panel().keyframes.length, 1)
     assert.equal(view.panel().keyframes[0].boneId, id)
     view.click('Play Pose/Clip preview'); assert.equal(view.panel().previewState, 'playing')
     view.click('Pause Pose/Clip preview'); assert.equal(view.panel().previewState, 'paused')
-    view.click('Reset selected target pose'); assert.equal(view.source.child.quaternion.equals(original), true)
+    view.click('Reset selected target pose'); assert.equal(instance.child.quaternion.equals(original), true)
     view.click('Reset Pose/Clip preview'); assert.equal(view.panel().currentTimeSeconds, 0)
     assert.equal(view.panel().canSaveSidecar, false, 'No physical writer means no save capability')
     assert.equal(find(view.host, node => node.props.title === 'Expand Pose/Clip drawer'), undefined)
-    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.source).scene)
   })
   // Explicit Motion Retarget artifact-preview/animated-selection dispatch was
   // removed in original57. Its helper tests above remain; no hidden UI is rebuilt.
@@ -6368,7 +6522,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     const second = deferred()
     let fetchCount = 0, parsedSecondResponse = false
     const view = await mount(t, { fetch: () => ++fetchCount === 1 ? Promise.resolve(response()) : second.promise })
-    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.source).scene)
     assert.equal(view.component('GltfMeshModel').url, sourceUrl)
     assert.deepEqual(view.fetches, [['/workspace/Workflows/kimodo/run/metadata.json']])
     const artifact = { id: 'old-input', versionId: 'old-version', kind: 'mesh', uri: previewUrl,
@@ -6384,13 +6538,13 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       ['/workspace/Workflows/kimodo/run/metadata.json'],
     ])
     assert.equal(view.component('GltfMeshModel').url, previewUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene, 'The retired checkpoint cannot retain source authoring authority')
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.preview).scene, 'The retired checkpoint cannot retain source authoring authority')
     assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
     second.resolve({ ok: true, json: async () => { parsedSecondResponse = true; return degraded() } })
     await settle()
     assert.equal(parsedSecondResponse, true, 'The second read completed rather than merely remaining pending')
     assert.equal(view.component('GltfMeshModel').url, previewUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.preview.scene, 'Late metadata cannot recover retired source authority')
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.preview).scene, 'Late metadata cannot recover retired source authority')
     assert.equal(view.component('ViewerEditToolbar').rigEditorControls, undefined)
     assert.equal(view.fetches.length, 2, 'The fenced completion must not cause a read loop')
   })
@@ -6402,7 +6556,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     first.resolve(response()); await settle(); second.resolve(response()); await settle()
     assert.ok(count >= 2)
     assert.equal(view.component('GltfMeshModel').url, previewUrl)
-    assert.equal(view.component('SceneMeshModel').scene, replacement.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(replacement).scene)
   })
   await suite.test('delayed configured root cannot select source after execution replacement', async t => {
     const rootResult = deferred(), nextMetadata = deferred(); let roots = 0, fetches = 0
@@ -6424,7 +6578,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     // Root discovery triggers a second metadata pass before source loading.
     await settle()
     assert.equal(view.component('GltfMeshModel').url, sourceUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.source).scene)
   })
   await suite.test('automatic no-rig serve-file fallback discovers the configured root without opening a panel', async t => {
     const root = path.join(tmpdir(), 'configured-workspace'), reads: string[] = []
@@ -6433,7 +6587,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     await settle()
     assert.equal(reads.length, 1)
     assert.equal(view.component('GltfMeshModel').url, sourceUrl)
-    assert.equal(view.component('SceneMeshModel').scene, view.source.scene)
+    assert.equal(view.component('SceneMeshModel').scene, view.instanceFor(view.source).scene)
     assert.equal(find(view.host, node => node.props['aria-label'] === 'Pose/Clip action rail'), undefined)
     assert.equal(view.component('ViewerEditToolbar').motionRetargetControls, undefined)
   })
@@ -6472,7 +6626,8 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       view.click('Open Rig Editor (2 bones)'); await settle()
       const rig = view.component('RigEditorPanel'), id = rig.summary.bones.find((bone: any) => bone.originalName === 'root').boneId
       flush(() => rig.onSelectBone(id)); view.click('Open Pose/Clip (2 bones)'); await settle()
-      const old = view.panel(), count = reads.length
+      const old = view.panel(), count = reads.length, retiredRoot = view.instanceFor(view.source).root
+      const retiredQuaternion = retiredRoot.quaternion.clone()
       const pending = old.onLoadSidecar(); await settle()
       assert.equal(reads.length, count + 1)
       if (replacementKind === 'scene') { asset(view.harness, sourceUrl); view.render(); await settle() }
@@ -6484,6 +6639,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
       await old.onLoadSidecar(); flush(() => old.onRotateSelectedTarget(id, 'x', 30)); await settle()
       assert.equal(reads.length, callsAfterReplacement)
       assert.equal(view.harness.gltf.get(sourceUrl).scene.children[0].quaternion.x, 0)
+      assert.equal(retiredRoot.quaternion.equals(retiredQuaternion), true, 'Retained callbacks cannot mutate the retired live Bone owner')
       if (replacementKind === 'port') {
         const state = view.panel()
         flush(() => { old.onCurrentTimeChange(1); old.onPreviewPause(); old.onPreviewReset(); old.onResetSelectedTarget(id) })
@@ -6590,6 +6746,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     assert.deepEqual(view.panel().keyframes, saved)
     assert.equal(view.panel().canSaveSidecar, false)
     assert.equal(replacement.root.quaternion.x, 0, 'Hydration does not acquire live Bone ownership')
+    assert.equal(view.instanceFor(replacement).root.quaternion.x, 0, 'Hydration leaves the current live Bone unchanged too')
   })
   for (const missing of [false, true]) {
     await suite.test(missing ? 'source load failure leaves authoring closed' : 'source without rig leaves authoring closed without oscillation', async t => {
@@ -6654,6 +6811,7 @@ test('Viewer3D mounted degraded-bundle ownership', async suite => {
     assert.deepEqual(await service.readHumanoidDraftSidecar({ workspaceDir, meshWorkspacePath: 'Workflows/rig.glb' }), before)
     for (const [name, text] of Object.entries(files)) assert.equal(await readFile(path.join(dir, name), 'utf8'), text)
     assert.equal(rig().humanoidReview.presentation.canPromote, false); assert.equal(view.source.root.name, 'root')
+    assert.equal(view.instanceFor(view.source).root.name, 'root', 'Alias persistence preserves the current live Bone name too')
     const replacement = asset(view.harness, sourceUrl); replacement.root.name = 'replacementRoot'; view.render(); await settle()
     view.click('Open Rig Editor (2 bones)'); await until(() => rig().loadState !== 'loading')
     assert.equal(rig().aliasesDirty, false); assert.deepEqual(rig().renamePlan.aliases, {})

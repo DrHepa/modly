@@ -40,8 +40,8 @@ async function loadViewerModule() {
         import { forwardRef, useEffect, useImperativeHandle } from 'react'
         export const Canvas = ({children}) => children
         export const Bounds = ({children}) => <cpuBounds>{children}</cpuBounds>
-        export const Html = Canvas, GizmoHelper = Canvas, TransformControls = Canvas
-        export const GizmoViewport = () => null
+        export const Html = Canvas, GizmoHelper = Canvas, TransformControls = Canvas, Environment = Canvas
+        export const GizmoViewport = () => null, Lightformer = () => null
         export const useThree = () => globalThis.__worldsCpu
         export const useBounds = () => globalThis.__worldsCpu.bounds
         export const useFrame = callback => { useEffect(() => { const frames = globalThis.__worldsCpu.frames; frames.add(callback); return () => frames.delete(callback) }) }
@@ -1846,7 +1846,7 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
       node.children.forEach(child => visit(child, matrix))
     }
     const fitRoot = find(n => n.type === 'cpuBounds'); if (fitRoot) visit(fitRoot); return this
-  }, getSize() { return { box: this.box.clone(), center: this.box.getCenter(new THREE.Vector3()), distance: this.box.getSize(new THREE.Vector3()).length() * 2 } } }
+  }, getSize() { return { box: this.box.clone(), size: this.box.getSize(new THREE.Vector3()), center: this.box.getCenter(new THREE.Vector3()), distance: this.box.getSize(new THREE.Vector3()).length() * 2 } } }
   const state = { camera, controls, frames, bounds, gl: { domElement: canvas } }
   const install = () => { globals.window = windowEvents; globals.document = documentEvents; globals.__worldsCpu = state }
   install()

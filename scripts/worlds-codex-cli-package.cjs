@@ -8,7 +8,7 @@ const { isAbsolute, join, parse, resolve, sep } = require('node:path')
 // These are source-owned package inputs, not credentials or a remote trust root.
 // A reviewed CLI or skill edit must update its exact byte receipt here.
 const FILES = Object.freeze([
-  Object.freeze({ name: 'agent.py', size: 82680, sha256: 'b357faf33f17a3ae3c8c57ee20456e8881898f39994a6bb221406fedd35c1a97' }),
+  Object.freeze({ name: 'agent.py', size: 83146, sha256: 'c905749ba81c32c49d451ff3f54c6f902346d2ce1cdb74f3b5f3756d97127bb0' }),
   Object.freeze({ name: 'SKILL.md', size: 10411, sha256: '8c5818dc17d0de694ef2462193d4158082eb269030edb9e99431f817a66af05d' }),
 ])
 

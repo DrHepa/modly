@@ -217,6 +217,9 @@ beforeEach(() => {
       readFileBase64: async (filePath: string) => {
         fsReadCalls.push(filePath)
         if (readFile) return readFile(filePath)
+        if (filePath.endsWith('/scene-manifest.json')) return Buffer.from(JSON.stringify({
+          schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [],
+        })).toString('base64')
         if (filePath.endsWith('/capture-manifest.json')) return Buffer.from(JSON.stringify({
           schema: 'modly.capture-manifest.v1', captureRoot: '.', kind: 'frames',
           frames: [{ index: 0, path: 'frame.png', width: 1, height: 1, byteSize: 1 }],
@@ -234,7 +237,7 @@ beforeEach(() => {
   const module = { exports: {} as { useWorkflowRunStore: WorkflowRunStore; buildModelGenerationRequest: typeof buildModelGenerationRequest; shouldUsePreviousNodeFallback: typeof shouldUsePreviousNodeFallback; useWorldsSceneStore: typeof useWorldsSceneStore } }
   vm.runInNewContext(storeBundle, {
     module, exports: module.exports, require: createRequire(import.meta.url), fixture, window,
-    process, console: { ...console, warn: (...args: unknown[]) => warnings.push(args.map(String).join(' ')) }, crypto, Blob, FormData, atob, URL, fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
+    process, structuredClone: globalThis.structuredClone, console: { ...console, warn: (...args: unknown[]) => warnings.push(args.map(String).join(' ')) }, crypto, Blob, FormData, atob, URL, fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args),
     // Polling delay is inert; each client is a bounded in-memory fixture.
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay === 5000 ? delay : 0), clearTimeout, TextDecoder,
   })
@@ -927,9 +930,39 @@ for (const reversed of [false, true]) {
       assert.deepEqual(JSON.parse(String(posts[0].get('params'))), {})
       assert.deepEqual(posts[0].getAll('secondary_image_slot'), ['2', '3', '4'])
       assert.deepEqual(posts[0].getAll('secondary_image_handle'), ['left', 'back', 'right'])
+      assert.deepEqual(posts[0].getAll('secondary_image').map((file) => (file as File).name), ['left.png', 'back.png', 'right.png'])
+      assert.equal(workflow.edges.find((edge) => edge.source === 'legacy')?.targetHandle, undefined)
+      if (withFront) assert.equal(workflow.edges.find((edge) => edge.source === 'front')?.targetHandle, 'front')
     })
   }
 }
+
+test('named MODEL explicit primary retains same-rank last write over positional and legacy aliases', async () => {
+  const ext = createNamedImageModelExtension()
+  const workflow = createMultiInputWorkflow({
+    node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
+    imageSources: [
+      { id: 'first-front', filePath: '/first-front.png', targetHandle: 'front' },
+      { id: 'positional-alias', filePath: '/positional.png', targetHandle: 'input-0' },
+      { id: 'last-front', filePath: '/last-front.png', targetHandle: 'front' },
+      { id: 'legacy-last', filePath: '/legacy-last.png' },
+    ],
+  })
+  const importedHandles = workflow.edges.map((edge) => edge.targetHandle)
+  const posts = captureImageRequests()
+  await useWorkflowRunStore.getState().run(workflow, [ext])
+  assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
+  assert.equal(posts.length, 1)
+  assert.equal((posts[0].get('image') as File).name, 'last-front.png')
+  assert.equal(await (posts[0].get('image') as File).text(), 'fs-bytes')
+  assert.deepEqual(fsReadCalls, ['/last-front.png'])
+  assert.deepEqual(JSON.parse(String(posts[0].get('params'))), {})
+  assert.deepEqual(posts[0].getAll('secondary_image'), [])
+  assert.deepEqual(posts[0].getAll('secondary_image_slot'), [])
+  assert.deepEqual(posts[0].getAll('secondary_image_handle'), [])
+  assert.deepEqual(workflow.edges.map((edge) => edge.targetHandle), importedHandles)
+  assert.deepEqual(runProcessCalls, [])
+})
 
 test('named MODEL primary resolves a legacy image through preview and Wait before resuming', async () => {
   appState.selectedImagePath = undefined
@@ -958,7 +991,7 @@ test('named MODEL primary resolves a legacy image through preview and Wait befor
 })
 
 for (const targetHandle of [null, '', 'unknown', 0, false]) {
-  test(`named MODEL primary treats only nullish imported handles as untargeted (${JSON.stringify(targetHandle)})`, async () => {
+  test(`named MODEL primary retains missing and stale imported target normalization (${JSON.stringify(targetHandle)})`, async () => {
     const ext = createNamedImageModelExtension()
     const workflow = createMultiInputWorkflow({
       node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: {} }),
@@ -970,8 +1003,10 @@ for (const targetHandle of [null, '', 'unknown', 0, false]) {
     await useWorkflowRunStore.getState().run(workflow, [ext])
     assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
     assert.equal(posts.length, 1)
-    assert.equal((posts[0].get('image') as File).name, targetHandle === null ? 'legacy.png' : 'placeholder.png')
-    assert.deepEqual(fsReadCalls, targetHandle === null ? ['/legacy.png'] : [])
+    assert.equal((posts[0].get('image') as File).name, 'legacy.png')
+    assert.equal(await (posts[0].get('image') as File).text(), 'fs-bytes')
+    assert.deepEqual(fsReadCalls, ['/legacy.png'])
+    assert.equal(workflow.edges[0].targetHandle, targetHandle, 'Imported workflow handle must not be rewritten')
   })
 }
 
@@ -1243,7 +1278,7 @@ test('named MODEL fallback accepts selected bytes without a path and retains pri
   assert.equal(params.right_image_path, '/stale.png', 'Routing must not mutate the saved workflow')
 })
 
-test('named MODEL image ports do not consume mesh outputs or undeclared side handles', async () => {
+test('named MODEL image ports filter incompatible mesh and retain stale-target primary fallback', async () => {
   const ext = createNamedImageModelExtension({ inputs: [{ name: 'front', type: 'image' }] })
   const workflow = createMultiInputWorkflow({
     node: createNode('model', 'extensionNode', { extensionId: ext.id, enabled: true, params: { left_image_path: 'user-left' } }),
@@ -1256,9 +1291,15 @@ test('named MODEL image ports do not consume mesh outputs or undeclared side han
   const posts = captureImageRequests()
   await useWorkflowRunStore.getState().run(workflow, [ext])
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
-  assert.equal((posts[0].get('image') as File).name, 'placeholder.png')
+  assert.equal(posts.length, 1)
+  assert.equal((posts[0].get('image') as File).name, 'side.png')
+  assert.equal(await (posts[0].get('image') as File).text(), 'fs-bytes')
   assert.deepEqual(JSON.parse(String(posts[0].get('params'))), { left_image_path: 'user-left' })
-  assert.deepEqual(fsReadCalls, [])
+  assert.deepEqual(fsReadCalls, ['/side.png'])
+  assert.deepEqual(posts[0].getAll('secondary_image'), [])
+  assert.deepEqual(posts[0].getAll('secondary_image_slot'), [])
+  assert.deepEqual(posts[0].getAll('secondary_image_handle'), [])
+  assert.equal(workflow.edges.find((edge) => edge.source === 'undeclared')?.targetHandle, 'left')
 })
 
 for (const inputs of [undefined, ['image', 'image'], [{ name: 'reference', type: 'image' }]] satisfies WorkflowExtension['inputs'][]) {
@@ -1992,7 +2033,8 @@ test('workflowRunStore accepts model image-to-video outputs and records video ar
   assert.equal(runProcessCalls.length, 0)
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
   assert.equal(useWorkflowRunStore.getState().nodeArtifacts['model-node']?.kind, 'video')
-  assert.deepEqual(useWorkflowRunStore.getState().nodeVideoOutputs, {
+  // Serializable DTOs originate in the VM; normalize only their realm before full equality.
+  assert.deepEqual(structuredClone(useWorkflowRunStore.getState().nodeVideoOutputs), {
     'model-node': '/workspace/Workflows/generated.mp4',
   })
 })
@@ -4660,7 +4702,7 @@ test('workflowRunStore dispatches scene-capability model nodes to /generate/from
 
   assert.equal(postCalls.length, 1)
   assert.equal(postCalls[0].path, '/generate/from-artifact')
-  assert.deepEqual(postCalls[0].data, {
+  assert.deepEqual(structuredClone(postCalls[0].data), {
     input_kind: 'scene',
     input_path: 'Default/worlds/hero-scene/scene-manifest.json',
     model_id: ext.id,
@@ -4673,8 +4715,9 @@ test('workflowRunStore dispatches scene-capability model nodes to /generate/from
   assert.deepEqual(fsReadCalls, ['/workspace/Default/worlds/hero-scene/scene-manifest.json'])
   assert.equal(runProcessCalls.length, 0)
   assert.equal(useWorkflowRunStore.getState().runState.status, 'done')
-  assert.equal(useWorkflowRunStore.getState().runState.outputUrl, '/workspace/output/world.scene.json')
-  assert.deepEqual(useWorkflowRunStore.getState().nodeArtifacts['scene-source']?.legacy, {
+  assert.equal(useWorkflowRunStore.getState().runState.outputPath, '/workspace/output/world.scene.json')
+    assert.equal(useWorkflowRunStore.getState().runState.outputUrl, undefined)
+  assert.deepEqual(structuredClone(useWorkflowRunStore.getState().nodeArtifacts['scene-source']?.legacy), {
     filePath: '/workspace/Default/worlds/hero-scene/scene-manifest.json',
     outputType: 'scene',
   })
@@ -4709,7 +4752,7 @@ test('workflowRunStore dispatches Load Capture to a capture model through the ty
   }
   await useWorkflowRunStore.getState().run(workflow, [ext])
   assert.equal(postCalls[0].path, '/generate/from-artifact')
-  assert.deepEqual(postCalls[0].data, {
+  assert.deepEqual(structuredClone(postCalls[0].data), {
     input_kind: 'capture', input_path: 'Captures/chair/capture-manifest.json',
     model_id: ext.id, collection: 'Workflows', remesh: 'none', enable_texture: false,
     texture_resolution: 1024, params: { num_views: 4 },
@@ -4749,7 +4792,7 @@ test('workflowRunStore dispatches Load Capture to Pixal3D scene-from-estimates a
   }
   await useWorkflowRunStore.getState().run(workflow, [ext])
   assert.equal(postCalls[0].path, '/generate/from-artifact')
-  assert.deepEqual(postCalls[0].data, {
+  assert.deepEqual(structuredClone(postCalls[0].data), {
     input_kind: 'capture', input_path: 'Captures/room/capture-manifest.json',
     model_id: ext.id, collection: 'Workflows', remesh: 'none', enable_texture: false,
     texture_resolution: 1024, params: { track_min_length: 3 },
@@ -4797,7 +4840,7 @@ test('workflowRunStore rejects legacy persisted video inputs before process runP
   await useWorkflowRunStore.getState().run(workflow, [ext])
 
   assert.equal(useWorkflowRunStore.getState().runState.status, 'error')
-  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /type.*video|video.*type|expected.*image|image.*video/i)
+  assert.match(useWorkflowRunStore.getState().runState.error ?? '', /^Error: Port "reference_image" requires image input data\.$/)
   assert.deepEqual(runProcessCalls, [])
 })
 

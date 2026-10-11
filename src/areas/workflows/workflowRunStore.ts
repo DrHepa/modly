@@ -202,6 +202,8 @@ interface RunContext {
   checkpointRevision: number
   reviewRequests: Map<string, symbol>
   workflow:           Workflow
+  /** Imported handles before runtime compatibility normalization; never persisted. */
+  originalTargetHandles: Map<string, WFEdge['targetHandle']>
   allExtensions:      WorkflowExtension[]
   client:             AxiosInstance
   workspaceDir:       string
@@ -871,6 +873,7 @@ async function executeExtensionNode(
     const primaryName = hasViewLayout && namedModelImagePorts.has('front') ? 'front' : imagePortNames[0]
     const routedImages = new Map<string, string>()
     let legacyImagePath: string | undefined
+    let explicitDeclaredPrimaryPath: string | undefined
     for (const edge of incomingEdges) {
       const src = resolveSource(edge)
       if (src?.text !== undefined && src.text.trim().length > 0) nodeInputText = src.text
@@ -880,10 +883,16 @@ async function executeExtensionNode(
         legacyImagePath ??= src.filePath
         continue
       }
-      if (namedModelImagePorts.has(handle)) routedImages.set(handle, src.filePath)
+      if (namedModelImagePorts.has(handle)) {
+        routedImages.set(handle, src.filePath)
+        if (handle === primaryName && ctx.originalTargetHandles.get(edge.id) === primaryName) {
+          explicitDeclaredPrimaryPath = src.filePath
+        }
+      }
     }
-    // Named primary wins regardless of edge order; physical secondary gaps stay reserved.
-    nodeInputPath = routedImages.get(primaryName) ?? legacyImagePath
+    // Explicit declared primary outranks normalized legacy aliases; same-rank last write remains.
+    // Physical secondary gaps and compatibility fallback stay unchanged.
+    nodeInputPath = explicitDeclaredPrimaryPath ?? routedImages.get(primaryName) ?? legacyImagePath
     if (hasNamedProcessInputs(ext.inputs)) {
       ext.inputs.forEach((port, index) => {
         if (port.name === primaryName) primaryImagePort = { slot: index + 1, handle: port.name }
@@ -1544,6 +1553,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
     pausedGroup:      [],
 
     async run(workflow, allExtensions, overrideImageData?) {
+      const originalTargetHandles = new Map(workflow.edges.map((edge) => [edge.id, edge.targetHandle]))
       const normalizedEdges = normalizeWorkflowEdges({ nodes: workflow.nodes, edges: workflow.edges, allExtensions })
       const activeGraph = deriveActiveWorkflowGraph(workflow.nodes, normalizedEdges.edges)
       workflow = { ...workflow, ...activeGraph }
@@ -1761,7 +1771,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         if (epoch !== executionEpoch || _cancel.current) return
         const ctx: RunContext = {
           runId, epoch, jobId, checkpoints: new Map(), nodeArtifacts: new Map(), outputRevisions: new Map(), checkpointRevision: 0, reviewRequests: new Map(),
-          workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
+          workflow, originalTargetHandles, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
           overrideImageData, nodeOutputs, nodeMap, ordered, branches, waitIds, parentWait, iteratorFiles,
         }
         _ctx.current = ctx

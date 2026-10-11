@@ -1092,7 +1092,7 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: [],
     })
 
-    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb')), {
+    assert.deepEqual(byPath.get('Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb'), {
       id: 'library:Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
       workspacePath: 'Workflows/worldsculpt-5a9cc08eaf924e988e527f75137ea8c4/scene.glb',
       displayName: 'scene.glb',
@@ -1132,10 +1132,11 @@ test('lists workspace asset library entries with projected registry metadata, si
       })
     }
 
-    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/mystery.ply')), {
-      id: 'Workflows/generated/mystery.ply',
+    assert.deepEqual(byPath.get('Workflows/generated/mystery.ply'), {
+      id: 'library:Workflows/generated/mystery.ply',
       workspacePath: 'Workflows/generated/mystery.ply',
       displayName: 'mystery.ply',
+      plyHeader: { status: 'complete', content: 'ply\nformat ascii 1.0\nelement vertex 3\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n' },
       sourceScope: 'workflows',
       capability: 'mesh',
       state: 'ready',
@@ -1144,10 +1145,11 @@ test('lists workspace asset library entries with projected registry metadata, si
       warnings: [],
     })
 
-    assert.deepEqual(stripAssetLibraryEntryTimestamps(byPath.get('Workflows/generated/point-cloud.ply')), {
-      id: 'Workflows/generated/point-cloud.ply',
+    assert.deepEqual(byPath.get('Workflows/generated/point-cloud.ply'), {
+      id: 'library:Workflows/generated/point-cloud.ply',
       workspacePath: 'Workflows/generated/point-cloud.ply',
       displayName: 'point-cloud.ply',
+      plyHeader: { status: 'complete', content: 'ply\nformat binary_little_endian 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n' },
       sourceScope: 'workflows',
       state: 'unknown-metadata',
       plyKind: 'gaussian',

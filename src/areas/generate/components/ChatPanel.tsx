@@ -2655,7 +2655,7 @@ export default function ChatPanel({ worlds }: { worlds?: WorldAiChatAdapter } = 
                           </svg>
                         )}
                       </button>
-                    ))}
+                    )))}
                   {worlds && isConfiguredOpenAiModelId(openAiModel) ? <button type="button" aria-pressed={worldProvider === 'openai'}
                     onClick={() => selectWorldModel('openai', openAiModel)}
                     className="w-full min-h-7 px-3 py-2 text-left text-[11px] text-zinc-300 hover:bg-zinc-800 focus-visible:outline-2 focus-visible:outline-accent">

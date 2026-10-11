@@ -660,7 +660,7 @@ test('scene route rejects malformed JSON and non-object requests before dispatch
   const origin = bridge.getOrigin()
   assert.ok(origin)
   for (const body of ['{', '[]', 'null', '"mesh.glb"']) {
-    const response = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`, {
+    const response: Response = await fetch(`${origin}${SCENE_IMPORT_MESH_HTTP_BRIDGE_PATH}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
     })
     assert.equal(response.status, 400)

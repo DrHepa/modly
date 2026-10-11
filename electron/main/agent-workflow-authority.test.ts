@@ -10,7 +10,7 @@ import {
   validateAgentWorkspaceSource,
   type AgentWorkflowAuthorityDependencies,
 } from './agent-workflow-authority.ts'
-import type { ListedExtension } from './automation-capabilities.ts'
+import { parseExtensionManifest, type ListedExtension } from './automation-capabilities.ts'
 import {
   AGENT_WORKFLOW_GRAPH_SCHEMA,
   AGENT_WORKFLOW_GRAPH_VERSION,
@@ -39,20 +39,17 @@ function extension(
   } = {},
 ): ListedExtension {
   return {
-    type: 'process',
-    id,
-    name: id,
+    ...parseExtensionManifest({
+      type: 'process', id, name: id, entry: 'processor.py',
+      nodes: [{
+        id: nodeId, name: nodeId,
+        input: options.input ?? 'mesh', output: options.output ?? 'mesh',
+        ...(options.inputs ? { inputs: options.inputs } : {}),
+        params_schema: options.paramsSchema ?? [],
+      }],
+    }, id, new Set(), false),
     trusted: true,
     builtin: false,
-    entry: 'processor.py',
-    nodes: [{
-      id: nodeId,
-      name: nodeId,
-      input: (options.input ?? 'mesh') as never,
-      output: (options.output ?? 'mesh') as never,
-      ...(options.inputs ? { inputs: options.inputs as never } : {}),
-      paramsSchema: options.paramsSchema ?? [],
-    }],
   }
 }
 
@@ -62,19 +59,17 @@ function modelExtension(
   options: { input?: string, output?: string, inputs?: Array<{ name: string, type: string, required?: boolean }> } = {},
 ): ListedExtension {
   return {
-    type: 'model',
-    id,
-    name: id,
+    ...parseExtensionManifest({
+      type: 'model', id, name: id,
+      nodes: [{
+        id: nodeId, name: nodeId,
+        input: options.input ?? 'image', output: options.output ?? 'mesh',
+        ...(options.inputs ? { inputs: options.inputs } : {}),
+        params_schema: [],
+      }],
+    }, id, new Set(), false),
     trusted: true,
     builtin: false,
-    nodes: [{
-      id: nodeId,
-      name: nodeId,
-      input: (options.input ?? 'image') as never,
-      output: (options.output ?? 'mesh') as never,
-      ...(options.inputs ? { inputs: options.inputs as never } : {}),
-      paramsSchema: [],
-    }],
   }
 }
 

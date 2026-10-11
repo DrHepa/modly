@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { createElectronApi } from './electron-api.ts'
+import type { WorldsSceneManifestWriteRequest } from '../../src/shared/types/electron.d'
 
 test('preload exposes scoped workspace library list/read/open methods', async () => {
   const calls: Array<{ channel: string, payload?: unknown }> = []
@@ -195,7 +196,7 @@ test('preload exposes scoped Worlds scene manifest writer IPC channel', async ()
   const request = {
     workspacePath: 'Exports/Worlds/scene-manifest.json',
     manifest: { schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] },
-  } as const
+  } satisfies WorldsSceneManifestWriteRequest
   const result = await api.workspace.worlds.writeSceneManifest(request)
 
   assert.deepEqual(result, { success: true, workspacePath: 'Exports/Worlds/scene-manifest.json' })

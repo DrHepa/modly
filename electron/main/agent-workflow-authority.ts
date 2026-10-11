@@ -408,7 +408,7 @@ function inputPorts(node: ListedExtensionNode): InputPort[] {
 }
 
 function assertSupportedVideoExtensionShape(node: IndexedExtensionNode): void {
-  const hasVideoArrayInput = Array.isArray(node.inputs) && node.inputs.some((port) => port?.type === 'video')
+  const hasVideoArrayInput = Array.isArray(node.inputs) && node.inputs.some((port) => typeof port === 'object' && port !== null && port.type === 'video')
   if (node.extensionType === 'process' && node.output === 'video') throw new GraphInvalidError()
   if (hasVideoArrayInput) throw new GraphInvalidError()
   if (node.extensionType === 'process' && node.input === 'video') throw new GraphInvalidError()

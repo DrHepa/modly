@@ -287,9 +287,7 @@ test('artifact inspector opens, hashes, and executes only the retained pinned ex
     _testOnlyRunPinnedWorldFfmpegExtractor,
     validateWorldFfmpegExtractorContract,
   } = await import('./world-ffmpeg-artifact-inspector.mjs')
-  const scratch = join(process.cwd(), 'node_modules', '.cache')
-  await mkdir(scratch, { recursive: true })
-  const root = await mkdtemp(join(scratch, 'modly-pinned-extractor-'))
+  const root = await mkdtemp(join(tmpdir(), 'modly-pinned-extractor-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const cache = join(root, 'cache')
   const toolDirectory = join(cache, '7zip@1.0.0', 'fixture', 'bin')
@@ -5464,3 +5462,224 @@ test('FFmpeg retirement native lstat witness requires zero failures after compet
     } finally { clearTimeout(drainTimer); clearTimeout(watchdog) }
   }
 })
+
+async function witnessCompletedIntentHandoff(t, scenario, variant, iteration) {
+  let api, root, target, cancellationError, readerBefore, readerAfter, writerChanged
+  const names = ['readerScanned', 'writerScanned', 'releaseReaderScan', 'releaseWriterScan',
+    'writerManifestReady', 'releaseWriterExecute', 'readerClaimMoved', 'writerIntentMoved',
+    'releaseReaderClaim', 'readerReady', 'writerChanged', 'releaseNative', 'releaseWriterFinish']
+  const gates = Object.fromEntries(names.map((name) => [name, retirementReadGate()]))
+  const cancellation = retirementReadGate(), producers = [], events = [], sequence = [], scans = {}
+  const fail = (error) => {
+    cancellationError ??= error
+    cancellation.reject(cancellationError)
+    for (const gate of Object.values(gates)) gate.reject(cancellationError)
+  }
+  const check = () => { if (cancellationError) throw cancellationError }
+  const own = (operation) => {
+    const promise = Promise.resolve().then(() => { check(); return operation() })
+    producers.push(promise); promise.catch(fail)
+    return promise
+  }
+  const wait = async (promise) => {
+    check(); const result = await Promise.race([promise, cancellation.promise]); check(); return result
+  }
+  const stat = async (path) => {
+    check()
+    try { return retirementWitnessStat(await lstat(path, { bigint: true })) }
+    catch (error) { if (error?.code === 'ENOENT') return null; throw error }
+  }
+  const watchdog = setTimeout(() => fail(new Error('Completed intent handoff producer deadline.')), 30_000)
+  const setup = own(async () => {
+    api = await import('./world-ffmpeg-owned-garbage.mjs'); check()
+    root = await mkdtemp(join(tmpdir(), 'modly-completed-intent-handoff-')); check()
+    for (let index = 0; index < 65; index += 1) {
+      check(); const path = join(root, 'authority'); await writeFile(path, ''); check()
+      const handle = await open(path, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+      let result, claimPath
+      try {
+        result = await api.quarantineAndReclaimWorldFfmpegFile({ path, retainedHandle: handle,
+          label: 'completed-intent-handoff', nowMs: 1000 + index, maximumBytes: 1,
+          durability: { platform: 'win32' }, afterClaimDurable(details) { claimPath = details.claimPath } })
+      } finally { await handle.close() }
+      if (index === 0) {
+        const claim = JSON.parse(await readFile(claimPath, 'utf8'))
+        target = { claimName: basename(claimPath), token: claim.token }
+      }
+      check(); await rm(dirname(result.quarantinePath), { recursive: true })
+    }
+  })
+  try {
+    await wait(setup)
+    target.source = join(root, `.WORLD_FFMPEG_GC.intent-${target.token}.v1.json`)
+    target.directory = join(root, `.WORLD_FFMPEG_GC.retirement-private-${target.token}`)
+    target.destination = join(target.directory, 'intent.v1.json')
+    target.tombstone = join(target.directory, 'tombstone.v1.json')
+    target.manifest = join(root, `.WORLD_FFMPEG_GC.retirement-${target.token}.v1.json`)
+    target.alias = join(root, 'displaced-intent.alias')
+    const original = await readFile(target.source)
+    const input = { parentDirectory: root, minimumAgeMs: 0, maximumEntries: 1, maximumBytes: 1,
+      durability: { platform: 'win32' }, beforeLedgerRetirement: check, beforeLedgerReclaim: check,
+      beforeLedgerFinalDelete: check, beforeLedgerRetirementDirectoryDelete: check,
+      beforeLedgerRetirementManifestDelete: check }
+    const retainScan = (actor) => async ({ anchorNames }) => {
+      check(); scans[actor] = [...anchorNames].sort()
+      assert.equal(scans[actor].length, 65)
+      assert.ok(scans[actor].includes(target.claimName))
+      sequence.push(`${actor}-retained-65`); gates[`${actor}Scanned`].resolve()
+      await wait(gates[actor === 'reader' ? 'releaseReaderScan' : 'releaseWriterScan'].promise)
+    }
+    const changeSnapshot = async (candidate) => {
+      writerChanged = { operationPath: candidate.path, operationManifest: candidate.manifestPath,
+        source: await stat(target.source), destination: await stat(target.destination),
+        manifest: await stat(target.manifest), directory: await stat(target.directory),
+        tombstone: await stat(target.tombstone), alias: await stat(target.alias) }
+      sequence.push(`writer-${variant}`); gates.writerChanged.resolve()
+      await wait(gates.releaseWriterFinish.promise)
+    }
+    const writer = own(() => api.recoverWorldFfmpegOwnedGarbage({ ...input,
+      afterCompletedAnchorScan: retainScan('writer'),
+      async afterLedgerRetirementIntentDurable({ manifestPath }) {
+        if (manifestPath !== target.manifest) return
+        sequence.push('writer-manifest-live'); gates.writerManifestReady.resolve()
+        await wait(gates.releaseWriterExecute.promise)
+      },
+      async afterLedgerRetirementMove(candidate) {
+        if (scenario !== 'executor-destination-intent' || candidate.destination !== target.destination) return
+        sequence.push('writer-intent-moved'); gates.writerIntentMoved.resolve()
+        await wait(gates.readerReady.promise)
+      },
+      async afterLedgerFinalCheck(candidate) {
+        if (variant === 'unlinked' || candidate.path !== target.destination) return
+        check()
+        if (variant === 'still-linked') { await link(target.destination, target.alias); await unlink(target.destination) }
+        else await rename(target.destination, target.alias)
+        await changeSnapshot(candidate)
+      },
+      async afterLedgerFinalDelete(candidate) {
+        if (variant !== 'unlinked' || candidate.path !== target.destination) return
+        await changeSnapshot(candidate)
+      },
+    }))
+    const reader = own(() => api._testOnlyRecoverWorldFfmpegOwnedGarbageWithLstatWitness({ ...input,
+      afterCompletedAnchorScan: retainScan('reader'),
+      async afterLedgerRetirementMove(candidate) {
+        if (scenario !== 'executor-destination-intent' || candidate.role !== 'claim') return
+        sequence.push('reader-claim-moved'); gates.readerClaimMoved.resolve()
+        await wait(gates.releaseReaderClaim.promise)
+      },
+    }, {
+      scenario, actor: 'reader', claimName: target.claimName, token: target.token,
+      async beforeLstat(event) {
+        check(); readerBefore = event; events.push(event)
+        sequence.push('reader-before-native'); gates.readerReady.resolve()
+        await wait(gates.releaseNative.promise)
+      },
+      afterLstat(event) {
+        check(); readerAfter = event; events.push(event); sequence.push(event.stage)
+      },
+    }))
+    await wait(Promise.all([gates.readerScanned.promise, gates.writerScanned.promise]))
+    assert.deepEqual(scans.reader, scans.writer, 'both recoveries must retain the same 65 immutable anchors first')
+    gates.releaseWriterScan.resolve(); await wait(gates.writerManifestReady.promise)
+    gates.releaseReaderScan.resolve()
+    if (scenario === 'executor-destination-intent') {
+      await wait(gates.readerClaimMoved.promise); gates.releaseWriterExecute.resolve()
+      await wait(gates.writerIntentMoved.promise); gates.releaseReaderClaim.resolve()
+    } else {
+      await wait(gates.readerReady.promise); gates.releaseWriterExecute.resolve()
+    }
+    await wait(gates.writerChanged.promise)
+    assert.equal(writerChanged.source, null); assert.equal(writerChanged.destination, null)
+    assert.equal(writerChanged.operationPath, target.destination)
+    assert.equal(writerChanged.operationManifest, target.manifest)
+    assert.equal(writerChanged.manifest.nlink, '1'); assert.ok(writerChanged.directory)
+    assert.equal(writerChanged.tombstone.nlink, '1', 'peer must still hold the live generation at the handoff')
+    gates.releaseNative.resolve()
+    const readerReport = await wait(reader)
+    // Native qualification is required BEFORE report assertions on both RED and GREEN sources.
+    assert.equal(events.length, 2)
+    assert.equal(readerBefore.stage, 'before-native'); assert.equal(readerBefore.path, target.destination)
+    assert.equal(readerAfter.stage, 'native-error'); assert.equal(readerAfter.nativeError.code, 'ENOENT')
+    assert.equal(readerAfter.nativeError.syscall, 'lstat'); assert.equal(readerAfter.nativeError.path, target.destination)
+    assert.match(readerAfter.nativeError.stack, /ledgerRetirementNativeLstat/)
+    assert.match(readerAfter.nativeError.stack, /executeLedgerRetirement/)
+    assert.equal(readerAfter.operation, 'original imported node:fs/promises.lstat(path, { bigint: true })')
+    assert.equal(readerAfter.actor, 'reader'); assert.equal(readerAfter.role, 'intent')
+    assert.equal(readerAfter.targetHandleAcquired, scenario === 'executor-post-move-intent')
+    assert.equal(readerBefore.retainedAnchorHeld.nlink, '1')
+    assert.equal(readerAfter.retainedAnchorHeld.nlink, variant === 'unlinked' ? '0' : '1')
+    assert.equal(readerAfter.retainedAnchorHeld.size, String(original.byteLength))
+    assert.equal(readerAfter.manifestHeld.nlink, '1'); assert.equal(readerAfter.manifestPathStat.nlink, '1')
+    assert.equal(readerAfter.directoryPathStat.ino, readerAfter.directoryHeld.ino)
+    assert.equal(readerAfter.manifestDigest, readerBefore.manifestDigest)
+    for (const key of ['dev', 'ino', 'birthtimeNs', 'mode', 'size']) {
+      assert.equal(readerAfter.retainedAnchorHeld[key], readerBefore.retainedAnchorHeld[key])
+    }
+    if (scenario === 'executor-destination-intent') {
+      assert.equal(readerBefore.observedSource, null)
+      assert.equal(readerBefore.observedDestination.ino, readerBefore.retainedAnchorHeld.ino)
+    }
+    assert.ok(Object.isFrozen(readerBefore)); assert.ok(Object.isFrozen(readerAfter.nativeError))
+    gates.releaseWriterFinish.resolve()
+    const writerReport = await wait(writer)
+    const diagnostic = { scenario, variant, iteration, target, sequence, events, writerChanged,
+      retainedAnchorCounts: { reader: scans.reader.length, writer: scans.writer.length },
+      readerReport, writerReport, historicalPrivateIntentCallsite: 'UNPROVEN' }
+    assert.ok(Buffer.byteLength(JSON.stringify(diagnostic)) <= 32 * 1024)
+    t.diagnostic(JSON.stringify(diagnostic))
+    if (variant === 'unlinked') {
+      assert.equal(readerReport.failures.length, 0, JSON.stringify(diagnostic))
+      assert.equal(writerReport.failures.length, 0, JSON.stringify(diagnostic))
+      const remaining = await readdir(root)
+      assert.equal(remaining.filter((name) => /^\.WORLD_FFMPEG_GC\.claim-/.test(name)).length, 64)
+      assert.equal(remaining.filter((name) => /^\.WORLD_FFMPEG_GC\.intent-/.test(name)).length, 64)
+      assert.equal(remaining.filter((name) => /^\.WORLD_FFMPEG_GC\.tombstone-/.test(name)).length, 64)
+      assert.equal(remaining.some((name) => /\.retirement/.test(name)), false)
+      assert.equal(remaining.length, 192, 'bounded retained ledger must stay intact')
+    } else {
+      assert.ok(readerReport.failures.length > 0, JSON.stringify(diagnostic))
+      assert.ok(writerReport.failures.length > 0, JSON.stringify(diagnostic))
+      assert.deepEqual(await readFile(target.alias), original, 'linked/displaced authority must not be deleted or truncated')
+      const alias = await stat(target.alias)
+      assert.equal(alias.nlink, '1')
+      for (const key of ['dev', 'ino', 'birthtimeNs', 'mode', 'size']) {
+        assert.equal(alias[key], readerBefore.retainedAnchorHeld[key])
+      }
+      assert.ok(await stat(target.manifest)); assert.ok(await stat(target.directory))
+      assert.ok(await stat(target.tombstone))
+      assert.equal(await stat(target.destination), null); assert.equal(await stat(target.source), null)
+    }
+  } finally {
+    const failure = cancellationError
+    clearTimeout(watchdog); fail(new Error('Completed intent handoff teardown.'))
+    let drainTimer, drainExpired = false
+    try {
+      const drainAndCleanup = Promise.allSettled(producers).then(async () => {
+        if (drainExpired) return
+        await Promise.allSettled(Object.values(gates).map((gate) => gate.promise))
+        if (root) await rm(root, { recursive: true, force: true })
+      })
+      await Promise.race([drainAndCleanup, new Promise((_, reject) => {
+        drainTimer = setTimeout(() => {
+          drainExpired = true
+          reject(new Error(`Completed intent handoff drain deadline; no removal before drain: ${root}`))
+        }, 5000)
+      })])
+      if (failure) throw failure
+    } catch (error) {
+      if (failure && error !== failure) throw new AggregateError([failure, error], 'Handoff cancellation and drain failed; undrained root preserved.')
+      throw error
+    } finally { clearTimeout(drainTimer); clearTimeout(watchdog) }
+  }
+}
+
+for (const scenario of ['executor-destination-intent', 'executor-post-move-intent']) {
+  for (const variant of ['unlinked', 'still-linked', 'displaced']) {
+    test(`FFmpeg completed intent native lstat handoff ${scenario} ${variant}`, async (t) => {
+      for (let iteration = 0; iteration < 2; iteration += 1) {
+        await witnessCompletedIntentHandoff(t, scenario, variant, iteration)
+      }
+    })
+  }
+}

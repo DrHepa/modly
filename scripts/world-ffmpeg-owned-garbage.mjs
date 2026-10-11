@@ -41,6 +41,7 @@ const MAXIMUM_RECOVERY_METADATA_BYTES = 128 * 1024 * 1024
 const MAXIMUM_RECOVERY_FAILURES = 64
 const incompleteAuthorityReads = new WeakMap()
 const retirementReadProofs = new WeakMap()
+const nativeLedgerLstatFailures = new WeakSet()
 const RETIRED_LEDGER_GENERATION = Symbol('retired-ledger-generation')
 
 async function scanGarbageParent(parent, preflight = false) {
@@ -377,7 +378,8 @@ export function _testOnlyRecoverWorldFfmpegOwnedGarbageWithLstatWitness(input, s
     throw new Error('Lstat witness requires exact own data properties.')
   }
   const captured = Object.fromEntries(keys.map((key) => [key, descriptors[key].value]))
-  if (captured.scenario !== 'executor-source-claim' || typeof captured.actor !== 'string'
+  if (!['executor-source-claim', 'executor-destination-intent', 'executor-post-move-intent'].includes(captured.scenario)
+    || typeof captured.actor !== 'string'
     || !/^[a-zA-Z0-9_-]{1,64}$/.test(captured.actor)
     || typeof captured.claimName !== 'string' || !CLAIM_PATTERN.test(captured.claimName)
     || typeof captured.token !== 'string' || !/^[a-f0-9]{32}$/.test(captured.token)
@@ -390,10 +392,14 @@ export function _testOnlyRecoverWorldFfmpegOwnedGarbageWithLstatWitness(input, s
 async function emitLstatWitness(context, callback, stage, nativeError = null) {
   const { witness, manifest, directoryHandle, terminalValues } = context
   const snapshot = Object.freeze({ scenario: witness.spec.scenario, actor: witness.spec.actor,
-    claimName: witness.spec.claimName, token: witness.spec.token, role: 'claim', phase: 'executor-source', stage,
-    caller: 'executeLedgerRetirement -> validateLedgerRetirementEntryPath -> validateLedgerAuthorityPath',
+    claimName: witness.spec.claimName, token: witness.spec.token, role: context.role ?? 'claim',
+    phase: context.phase ?? 'executor-source', stage,
+    caller: context.caller ?? 'executeLedgerRetirement -> validateLedgerRetirementEntryPath -> validateLedgerAuthorityPath',
     operation: 'original imported node:fs/promises.lstat(path, { bigint: true })', path: context.path,
-    targetHandleAcquired: false, observedSource: readWitnessStat(context.sourceInfo),
+    targetHandleAcquired: context.targetHandleAcquired ?? false, observedSource: readWitnessStat(context.sourceInfo),
+    observedDestination: readWitnessStat(context.destinationInfo),
+    retainedAnchorHeld: context.retainedAnchor
+      ? readWitnessStat(await context.retainedAnchor.handle.stat({ bigint: true })) : null,
     manifestPath: context.manifestPath, directoryPath: context.directoryPath,
     manifestBytesComplete: true, manifestDigest: sha256Bytes(manifest.bytes),
     manifestHeld: readWitnessStat(await manifest.handle.stat({ bigint: true })),
@@ -2168,6 +2174,69 @@ async function recoverLedgerRetirementTransactions(parent, input, failures, name
   return Object.freeze({ blocked })
 }
 
+function qualifyCompletedDestinationLstatWitness(witness, scenario, context) {
+  const { parent, value, entry, destination, activeRecord } = context
+  if (!witness || witness.spec.scenario !== scenario || entry.role !== 'intent'
+    || value.claimName !== witness.spec.claimName) return undefined
+  if (witness.used || witness.parent !== parent || value.token !== witness.spec.token
+    || destination !== join(parent, `.WORLD_FFMPEG_GC.retirement-private-${value.token}`, 'intent.v1.json')) {
+    throw new Error('Lstat witness target context conflicts.')
+  }
+  const retainedAnchor = activeRecord?.retainedAuthorities.find((retained) => retained.role === entry.role)
+  if (!retainedAnchor) throw new Error('Destination lstat witness requires an existing completed anchor.')
+  witness.used = true
+  return { ...context, witness, path: destination, retainedAnchor, role: entry.role,
+    phase: scenario === 'executor-destination-intent' ? 'executor-destination' : 'executor-post-move',
+    caller: scenario === 'executor-destination-intent'
+      ? 'executeLedgerRetirement -> validateLedgerRetirementEntryPath -> validateLedgerAuthorityPath'
+      : 'executeLedgerRetirement -> ledgerRetirementNativeLstat',
+    targetHandleAcquired: scenario === 'executor-post-move-intent' }
+}
+
+// Only the original native destination lstat failure can enter this proof. The
+// immutable scan anchor supplies authority; absent pathnames never create it.
+async function reconcileCompletedDestinationLstat(error, context) {
+  const { activeRecord: record, parent, value, entry, destination, manifestPath, manifest,
+    directoryPath, directoryHandle, callerBounds } = context
+  if (!nativeLedgerLstatFailures.has(error) || error.code !== 'ENOENT'
+    || error.syscall !== 'lstat' || error.path !== destination || !record || entry.kind !== 'file') return false
+  nativeLedgerLstatFailures.delete(error)
+  if (record.parent !== parent || dirname(record.claimPath) !== parent || record.token !== value.token
+    || value.claimName !== basename(record.claimPath) || value.createdAtMs !== record.createdAtMs
+    || value.maximumEntries !== record.intent.maximumEntries || value.maximumBytes !== record.intent.maximumBytes
+    || value.plannedEntries !== record.intent.plannedEntries || value.plannedBytes !== record.intent.plannedBytes
+    || value.directoryName !== basename(directoryPath)
+    || JSON.stringify(value.entries) !== JSON.stringify(record.entries)) return false
+  const retained = record.retainedAuthorities.find((owner) => owner.kind === 'file' && owner.role === entry.role
+    && JSON.stringify(owner.authority) === JSON.stringify(entry.authority))
+  if (!retained) return false
+  const sourcePath = join(parent, entry.sourceName)
+  const before = await retained.handle.stat({ bigint: true })
+  if (!sameUnlinkedLedgerFileAuthority(before, entry.authority)
+    || before.size !== BigInt(entry.authority.size)
+    || await optionalLstat(sourcePath) || await optionalLstat(destination)) return false
+  const bytes = await readExactHandle(retained.handle, entry.authority.size)
+  if (sha256Bytes(bytes) !== entry.sha256) return false
+  const terminal = retirementTerminalBinding(parent, value, new Map([
+    ['claim', record.claim], ['intent', record.intent], ['tombstone', record.completion],
+  ]))
+  if (!terminal || !sameParentDirectoryAuthority(await optionalLstat(parent), record.parentIdentity)) return false
+  const proof = { parent, value, manifestPath, manifest, directoryPath, directoryHandle, terminal, callerBounds }
+  const manifestBefore = await readRetainedRetirementManifest(proof)
+  if (manifestBefore.nlink !== 1n
+    || !samePrivateDirectory(await directoryHandle.stat({ bigint: true }), await optionalLstat(directoryPath))) return false
+  await requireRetirementTuple(proof, record.retainedAuthorities.filter((owner) => owner.kind === 'file'))
+  const manifestAfter = await readRetainedRetirementManifest(proof)
+  const after = await retained.handle.stat({ bigint: true })
+  return manifestAfter.nlink === 1n
+    && JSON.stringify(readWitnessStat(manifestBefore)) === JSON.stringify(readWitnessStat(manifestAfter))
+    && JSON.stringify(readWitnessStat(before)) === JSON.stringify(readWitnessStat(after))
+    && after.size === BigInt(entry.authority.size) && sameUnlinkedLedgerFileAuthority(after, entry.authority)
+    && sameParentDirectoryAuthority(await optionalLstat(parent), record.parentIdentity)
+    && samePrivateDirectory(await directoryHandle.stat({ bigint: true }), await optionalLstat(directoryPath))
+    && !(await optionalLstat(sourcePath)) && !(await optionalLstat(destination))
+}
+
 async function executeLedgerRetirement(manifestPath, input, witness, activeRecord) {
   const manifest = await readStablePublicationFile(
     manifestPath, MAXIMUM_RETIREMENT_BYTES, 'completed cleanup ledger retirement intent',
@@ -2229,7 +2298,16 @@ async function executeLedgerRetirement(manifestPath, input, witness, activeRecor
       }
       if (!sourceInfo) {
         if (destinationInfo) {
-          const openedDestination = await validateLedgerRetirementEntryPath(destination, entry, true)
+          const handoff = { activeRecord, parent, value, entry, destination, sourceInfo, destinationInfo,
+            manifestPath, manifest, directoryPath, directoryHandle, terminalValues, callerBounds }
+          const destinationLstatContext = qualifyCompletedDestinationLstatWitness(witness, 'executor-destination-intent', handoff)
+          let openedDestination
+          try {
+            openedDestination = await validateLedgerRetirementEntryPath(destination, entry, true, false, destinationLstatContext)
+          } catch (error) {
+            if (await reconcileCompletedDestinationLstat(error, handoff)) continue
+            throw error
+          }
           try { captureRetirementTerminalValue(terminalValues, entry, openedDestination.bytes) }
           finally { await openedDestination.handle.close() }
         }
@@ -2298,7 +2376,14 @@ async function executeLedgerRetirement(manifestPath, input, witness, activeRecor
           if (racedSource || !racedDestination
             || !sameLedgerRetirementEntryAuthority(racedDestination, entry, false)) throw error
         }
-        const moved = await lstat(destination, { bigint: true })
+        const handoff = { activeRecord, parent, value, entry, destination, sourceInfo, destinationInfo,
+          manifestPath, manifest, directoryPath, directoryHandle, terminalValues, callerBounds }
+        const destinationLstatContext = qualifyCompletedDestinationLstatWitness(witness, 'executor-post-move-intent', handoff)
+        let moved
+        try { moved = await ledgerRetirementNativeLstat(destination, destinationLstatContext) } catch (error) {
+          if (await reconcileCompletedDestinationLstat(error, handoff)) continue
+          throw error
+        }
         if (!sameLedgerRetirementEntryAuthority(moved, entry, false)) {
           throw new Error('World FFmpeg completed cleanup ledger retirement moved a foreign authority.')
         }
@@ -2575,13 +2660,13 @@ function completedLedgerFinalUnlinkError(retained, pathInfo) {
   return error
 }
 
-async function validateLedgerAuthorityPath(path, entry, allowReclaimed, writable = false, context, retirementOperation, lstatContext) {
-  if (context && (!allowReclaimed || !['claim', 'intent', 'tombstone'].includes(entry.role))) throw new Error('Invalid read witness phase.')
+async function ledgerRetirementNativeLstat(path, lstatContext) {
   let pathInfo
   if (lstatContext) await emitLstatWitness(lstatContext, lstatContext.witness.spec.beforeLstat, 'before-native')
   try {
     pathInfo = await lstat(path, { bigint: true })
   } catch (error) {
+    if (error?.code === 'ENOENT') nativeLedgerLstatFailures.add(error)
     if (lstatContext) {
       try {
         const nativeError = Object.freeze(Object.fromEntries(['name', 'message', 'code', 'syscall', 'path', 'stack']
@@ -2599,6 +2684,12 @@ async function validateLedgerAuthorityPath(path, entry, allowReclaimed, writable
     throw error
   }
   if (lstatContext) await emitLstatWitness(lstatContext, lstatContext.witness.spec.afterLstat, 'native-success')
+  return pathInfo
+}
+
+async function validateLedgerAuthorityPath(path, entry, allowReclaimed, writable = false, context, retirementOperation, lstatContext) {
+  if (context && (!allowReclaimed || !['claim', 'intent', 'tombstone'].includes(entry.role))) throw new Error('Invalid read witness phase.')
+  const pathInfo = await ledgerRetirementNativeLstat(path, lstatContext)
   if (!sameLedgerFileAuthority(pathInfo, entry.authority, allowReclaimed)) {
     throw new Error('World FFmpeg completed cleanup ledger authority is foreign or hard-linked.')
   }

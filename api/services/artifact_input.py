@@ -9,7 +9,8 @@ SUPPORTED_ARTIFACT_INPUTS = frozenset({"scene", "capture", "video"})
 # Transport parameters set by the host; callers must not be able to forge them.
 RESERVED_ARTIFACT_PARAMS = frozenset({
     "artifact_path", "input_kind", "input_path", "scene_path", "scene_manifest_path",
-    "capture_path", "capture_manifest_path", "video_path",
+    "capture_path", "capture_manifest_path", "video_path", "input_video_path",
+    "typed_input_path",
 })
 
 

@@ -20,6 +20,7 @@ from services.generation_jobs import (
     require_model_id,
     require_model_input,
     validate_model_id,
+    validate_client_generation_params,
     validate_image_upload,
     read_validated_image_upload,
     snapshot_legacy_secondary_images,
@@ -82,6 +83,9 @@ async def create_from_image_run(
     validate_secondary_image_metadata(
         model_id, secondary_slots, secondary_handles,
         primary_image_slot=primary_image_slot, primary_image_handle=primary_image_handle,
+    )
+    model_params = validate_client_generation_params(
+        model_id, model_params, extra_server_managed=frozenset({"mesh_path"})
     )
     image_budget = ImageRequestBudget()
     image_bytes, _suffix = await read_validated_image_upload(image, image_budget)

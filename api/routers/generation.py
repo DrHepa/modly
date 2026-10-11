@@ -107,6 +107,9 @@ async def generate_from_image(
         primary_image_slot=primary_image_slot, primary_image_handle=primary_image_handle,
     )
 
+    model_params = validate_client_generation_params(
+        model_id, model_params, extra_server_managed=frozenset({"mesh_path"})
+    )
     image_budget = ImageRequestBudget()
     image_bytes, _primary_suffix = await read_validated_image_upload(image, image_budget)
     staged_secondary_images: list[tuple[int, str, bytes, str]] = []
@@ -218,10 +221,18 @@ async def generate_from_artifact(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    if artifact.kind in ("capture", "video"):
+        validated_params = validate_client_generation_params(
+            request.model_id, request.params,
+            extra_server_managed=RESERVED_ARTIFACT_PARAMS | frozenset({"mesh_path"}),
+        )
+    else:
+        validated_params = request.params
+
     # The compatibility route historically exposed input_scene_path too. Strip
     # that transport alias on both routes; only the validated typed input owns it.
     params = {
-        k: v for k, v in request.params.items()
+        k: v for k, v in validated_params.items()
         if k not in RESERVED_ARTIFACT_PARAMS and k != "input_scene_path"
     }
     params = {"remesh": request.remesh, "enable_texture": request.enable_texture,

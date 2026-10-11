@@ -9,6 +9,7 @@ def _select_video_model(api_modules):
     from services.generator_registry import generator_registry
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "video"
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("inputs", None)
 
 
 def _capture_video_generation(api_modules, monkeypatch):
@@ -179,7 +180,7 @@ def test_generate_from_video_artifact_rejects_model_input_mismatch(
 
     assert response.status_code == 400
     assert response.json()["detail"] == (
-        "Model 'demo/fake' expects input 'image' but this endpoint received 'video'."
+        "Model demo/fake does not accept video input"
     )
     assert api_modules["generation_jobs"]._jobs == {}
 
@@ -240,7 +241,7 @@ def test_video_route_pins_current_queue_abi_without_request_time_activation(api_
         {"remesh": "quad", "enable_texture": False, "texture_resolution": 1024, "quality": "draft"},
         "VideoRuns", "video", model_id,
     )
-    assert queued.kwargs == {}
+    assert queued.kwargs == {"private_input_dir": None}
 
     # Cancelling before execution must not activate or invoke this queued model.
     cancelled = jobs.cancel_job(response["job_id"])

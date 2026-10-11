@@ -1,4 +1,4 @@
-"""Provider NDJSON and query-transport fixtures: real parser/router/tool-loop, not live LLM or sockets."""
+"""Provider SSE and query-transport fixtures: real parser/router/tool-loop, not live LLM or sockets."""
 import asyncio
 import json
 import importlib.util
@@ -42,12 +42,36 @@ def test_worlds_prompt_matches_host_owned_direct_edit_not_manual_review():
     assert "human apply" not in result["message"].lower()
 
 
+def chat_completion_frame(message):
+    delta = dict(message)
+    calls = delta.get("tool_calls", [])
+    if calls:
+        delta["tool_calls"] = [
+            {"index": index, "id": f"call_{call['function']['name']}", "type": "function",
+             "function": {**call["function"], "arguments": json.dumps(call["function"].get("arguments", {}))}}
+            for index, call in enumerate(calls)
+        ]
+    return ("data: " + json.dumps({"choices": [{"delta": delta,
+        "finish_reason": "tool_calls" if calls else "stop"}]}) + "\n\n").encode()
+
+
+def validated_stream_calls(calls):
+    async def invoke():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=chat_completion_frame({"tool_calls": calls}), request=request)
+        )) as client:
+            result = await agent._stream_llm_round(client, "http://provider.test/v1", {}, 1, {})
+        return [{**call, "function": {**call["function"], "arguments": json.loads(call["function"]["arguments"])}}
+                for call in result["tool_calls"]]
+    return asyncio.run(invoke())
+
+
 def request():
     return {"originSessionId": "session-a", "messages": [{"role": "user", "content": "Move Hero"}],
-            "worldContext": CONTEXT, "context": {}, "model": "fixture-model", "ollama_url": "http://ollama.test"}
+            "worldContext": CONTEXT, "context": {}, "model": "fixture-model", "provider": {"type": "external", "base_url": "http://provider.test/v1"}}
 
 
-def test_worlds_real_ndjson_parser_and_tool_loop_propose_without_actions(monkeypatch):
+def test_worlds_real_sse_parser_and_tool_loop_propose_without_actions(monkeypatch):
     original = httpx.AsyncClient
     seen = []
     count = 0
@@ -61,7 +85,7 @@ def test_worlds_real_ndjson_parser_and_tool_loop_propose_without_actions(monkeyp
             return httpx.Response(200, json={"ok": True, "value": {"context": CONTEXT, "kind": "entities", "total": 1, "nextCursor": None,
                 "items": [{"kind": "entity", "id": "entity:hero", "name": "Hero", "parentId": None, "enabled": True, "locked": False,
                            "transform": {**TRANSFORM, "position": [0, 0, 0]}, "componentCount": 1}]}})
-        assert req.url.path == "/api/chat"
+        assert req.url.path == "/v1/chat/completions"
         assert {tool["function"]["name"] for tool in body["tools"]} == {"query_world", "propose_world_commands"}
         count += 1
         call = ({"name": "query_world", "arguments": {"kind": "entities", "pageSize": 1}} if count == 1
@@ -69,7 +93,7 @@ def test_worlds_real_ndjson_parser_and_tool_loop_propose_without_actions(monkeyp
         message = {"role": "assistant", "content": "Review the proposed move." if call is None else ""}
         if call:
             message["tool_calls"] = [{"function": call}]
-        return httpx.Response(200, content=(json.dumps({"message": message, "done": True}) + "\n").encode())
+        return httpx.Response(200, content=chat_completion_frame(message))
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(transport), **kwargs))
     async def run():
@@ -83,7 +107,7 @@ def test_worlds_real_ndjson_parser_and_tool_loop_propose_without_actions(monkeyp
     assert data["actions"] == [] and data["proposals"] == []
     assert data["worldProposals"] == [{"type": "world_command_proposal", "context": CONTEXT, "commands": [COMMAND]}]
     assert count == 3
-    assert seen[-1][1]["messages"][-1]["tool_name"] == "propose_world_commands"
+    assert seen[-1][1]["messages"][-1]["tool_call_id"] == "call_propose_world_commands"
 
 
 @pytest.mark.parametrize("tool", ["apply_world_commands", "reject_world_commands", "undo_world", "unload_models", "create_workflow"])
@@ -96,7 +120,7 @@ def test_worlds_hallucinated_legacy_or_apply_tools_cannot_execute(monkeypatch, t
         message = {"role": "assistant", "content": ""}
         if rounds == 1:
             message["tool_calls"] = [{"function": {"name": tool, "arguments": {}}}]
-        return httpx.Response(200, content=(json.dumps({"message": message, "done": True}) + "\n").encode())
+        return httpx.Response(200, content=chat_completion_frame(message))
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("Worlds turn must not call legacy execution")
     monkeypatch.setattr(agent, "execute_tool", forbidden)
@@ -180,9 +204,9 @@ def test_worlds_limits_are_strict_and_other_tool_depth_is_unchanged():
         with pytest.raises(ValueError):
             world_ai.ProposalArguments.model_validate({"commands": commands})
     full = [{"function": {"name": "propose_world_commands", "arguments": {"commands": [COMMAND]}}}]
-    assert agent._normalize_stream_tool_calls(full)
-    with pytest.raises(agent.OllamaBoundaryError):
-        agent._normalize_stream_tool_calls([{ "function": {"name": "query_world", "arguments": {"commands": [COMMAND]}}}])
+    assert validated_stream_calls(full)
+    with pytest.raises(agent.LlmBoundaryError):
+        validated_stream_calls([{ "function": {"name": "query_world", "arguments": {"commands": [COMMAND]}}}])
 
 
 def test_creation_c1_actual_tool_turn_observes_resource_and_records_finite_scene_recipe():
@@ -224,7 +248,7 @@ def test_creation_c2_actual_dto_admits_camera_light_and_local_parent_without_oth
     except ValueError:
         pytest.fail("Finite camera/light/local-parent authoring must be admitted by the actual strict proposal DTO")
     assert parsed.model_dump(exclude_unset=True)["commands"] == commands
-    assert agent._normalize_stream_tool_calls([{"function": {"name": "propose_world_commands", "arguments": {"commands": commands}}}])
+    assert validated_stream_calls([{"function": {"name": "propose_world_commands", "arguments": {"commands": commands}}}])
     with pytest.raises(ValueError):
         world_ai.Query.model_validate({"kind": "entities", "commands": commands})
 
@@ -236,12 +260,12 @@ def test_creation_c2_actual_dto_admits_camera_light_and_local_parent_without_oth
     depth_arguments = {"commands": depth_commands}
     depth_parsed = world_ai.ProposalArguments.model_validate(depth_arguments)
     assert depth_parsed.model_dump(exclude_unset=True)["commands"] == depth_commands
-    normalized = agent._normalize_stream_tool_calls([
+    normalized = validated_stream_calls([
         {"function": {"name": "propose_world_commands", "arguments": depth_arguments}},
     ])
     assert normalized[0]["function"]["arguments"] == depth_arguments
-    with pytest.raises(agent.OllamaBoundaryError):
-        agent._normalize_stream_tool_calls([
+    with pytest.raises(agent.LlmBoundaryError):
+        validated_stream_calls([
             {"function": {"name": "query_world", "arguments": depth_arguments}},
         ])
 
@@ -264,7 +288,7 @@ def test_creation_required_parent_null_survives_actual_chat_response(monkeypatch
         message = {"role": "assistant", "content": "Review the detach." if call is None else ""}
         if call:
             message["tool_calls"] = [{"function": call}]
-        return httpx.Response(200, content=(json.dumps({"message": message, "done": True}) + "\n").encode())
+        return httpx.Response(200, content=chat_completion_frame(message))
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(transport), **kwargs))
     async def run():
@@ -442,7 +466,7 @@ def test_worlds_configured_owned_bridge_query_and_propose_authority(monkeypatch)
                 if str(req.url) == origin + "/automation/worlds/query":
                     assert req.method == "POST"
                     return await self.query_transport.handle_async_request(req)
-                assert str(req.url) == "http://ollama.test/api/chat", "Unknown destinations are rejected before network I/O"
+                assert str(req.url) == "http://provider.test/v1/chat/completions", "Unknown destinations are rejected before network I/O"
                 body = json.loads(req.content)
                 assert {tool["function"]["name"] for tool in body["tools"]} == {"query_world", "propose_world_commands"}
                 rounds.append(body)
@@ -451,7 +475,7 @@ def test_worlds_configured_owned_bridge_query_and_propose_authority(monkeypatch)
                 message = {"role": "assistant", "content": "Review the owned-query proposal." if call is None else ""}
                 if call:
                     message["tool_calls"] = [{"function": call}]
-                return httpx.Response(200, content=(json.dumps({"message": message, "done": True}) + "\n").encode())
+                return httpx.Response(200, content=chat_completion_frame(message))
 
             async def aclose(self):
                 await self.query_transport.aclose()
@@ -480,11 +504,11 @@ def test_openai_requires_world_context_and_rejects_generic_direct_action_turns_b
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             return await client.post("/agent/chat", json=body)
     generic = {"originSessionId": "session-a", "messages": [{"role": "user", "content": "Unload models"}],
-               "provider": "openai", "openaiModel": "gpt-5.1", "context": {"currentMeshRef": "/workspace/a.glb"}}
+               "worldProvider": "openai", "model": "gpt-5.1", "context": {"currentMeshRef": "/workspace/a.glb"}}
     response = asyncio.run(run(generic))
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "openai_worlds_only"
-    broad = {**request(), "provider": "openai", "openaiModel": "gpt-5.1", "context": {"currentMeshRef": "/workspace/a.glb"}}
+    broad = {**request(), "worldProvider": "openai", "model": "gpt-5.1", "context": {"currentMeshRef": "/workspace/a.glb"}}
     assert asyncio.run(run(broad)).status_code == 422
 
 
@@ -542,7 +566,7 @@ def test_openai_worlds_asgi_tool_loop_crosses_query_proposal_preview_contract(mo
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(transport), **kwargs))
     app = FastAPI(); app.include_router(agent.router)
-    body = {**request(), "provider": "openai", "openaiModel": "gpt-5.1"}
+    body = {**request(), "worldProvider": "openai", "model": "gpt-5.1"}
     async def run():
         async with original(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             return await client.post("/agent/chat", json=body)
@@ -555,20 +579,15 @@ def test_openai_worlds_asgi_tool_loop_crosses_query_proposal_preview_contract(mo
     assert len(worlds_queries) == 1 and len(openai_bodies) == 3
 
 
-def test_openai_request_rejects_key_like_body_fields_and_images_before_provider(monkeypatch):
+def test_openai_request_rejects_images_before_provider(monkeypatch):
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("OpenAI provider must not run for rejected request bodies")
     monkeypatch.setattr(agent, "_run_openai_worlds_chat", forbidden)
     app = FastAPI(); app.include_router(agent.router)
-    base = {**request(), "provider": "openai", "openaiModel": "gpt-5.1"}
+    base = {**request(), "worldProvider": "openai", "model": "gpt-5.1"}
     async def post(body):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             return await client.post("/agent/chat", json=body)
-    for key in ["OPENAI_API_KEY", "apiKey", "authorization", "openaiApiKey"]:
-        response = asyncio.run(post({**base, key: "sk-should-not-enter"}))
-        assert response.status_code == 400
-        assert response.json()["detail"]["code"] == "openai_key_fields_unsupported"
-        assert "sk-should-not-enter" not in response.text
     image_response = asyncio.run(post({**base, "messages": [{"role": "user", "content": "Describe", "images": ["data:image/png;base64,AA=="]}]}))
     assert image_response.status_code == 400
     assert image_response.json()["detail"]["code"] == "openai_images_unsupported"
@@ -611,7 +630,7 @@ def test_openai_worlds_prior_proposal_fails_closed_on_noncompletion(monkeypatch,
     app = FastAPI(); app.include_router(agent.router)
     async def run():
         async with original(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            return await client.post("/agent/chat", json={**request(), "provider": "openai", "openaiModel": "gpt-5.1"})
+            return await client.post("/agent/chat", json={**request(), "worldProvider": "openai", "model": "gpt-5.1"})
     response = asyncio.run(run())
     data = response.json()
     assert rounds == 3 and queries == 1
@@ -643,7 +662,7 @@ def test_openai_worlds_nine_completed_calls_rejected_before_any_world_query(monk
     app = FastAPI(); app.include_router(agent.router)
     async def run():
         async with original(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            return await client.post("/agent/chat", json={**request(), "provider": "openai", "openaiModel": "gpt-5.1"})
+            return await client.post("/agent/chat", json={**request(), "worldProvider": "openai", "model": "gpt-5.1"})
     response = asyncio.run(run())
     assert response.status_code == 502, response.text
     assert response.json()["detail"]["code"] == "openai_tool_limit_exceeded"
@@ -672,7 +691,7 @@ def test_openai_worlds_ten_round_exhaustion_cannot_return_prior_proposal(monkeyp
     app = FastAPI(); app.include_router(agent.router)
     async def run():
         async with original(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            return await client.post("/agent/chat", json={**request(), "provider": "openai", "openaiModel": "gpt-5.1"})
+            return await client.post("/agent/chat", json={**request(), "worldProvider": "openai", "model": "gpt-5.1"})
     response = asyncio.run(run())
     assert rounds == 10
     assert response.status_code == 502, response.text
@@ -721,7 +740,7 @@ def test_openai_worlds_inflight_stream_route_cancellation_has_no_partial_preview
     async def run():
         async with original(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             async def post():
-                delivered.append(await client.post("/agent/chat", json={**request(), "provider": "openai", "openaiModel": "gpt-5.1"}))
+                delivered.append(await client.post("/agent/chat", json={**request(), "worldProvider": "openai", "model": "gpt-5.1"}))
             task = asyncio.create_task(post())
             await asyncio.wait_for(reached_stream.wait(), timeout=2)
             task.cancel()

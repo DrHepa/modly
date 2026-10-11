@@ -1115,7 +1115,8 @@ def test_https_download_assets_rejects_mismatched_target_owner_before_streaming(
         "canonical_model_dir",
         lambda model_id: tmp_path / "demo" / "shared-owner",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(*_args, **_kwargs):
         calls.append("streamed")
@@ -1160,7 +1161,8 @@ def test_https_download_assets_rejects_unsafe_target_owner_before_streaming(monk
         "canonical_model_dir",
         lambda model_id: tmp_path / "demo" / "generate",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(*_args, **_kwargs):
         calls.append("streamed")
@@ -1200,7 +1202,8 @@ def test_https_download_assets_endpoint_uses_owner_scoped_control_for_cancel(mon
         "canonical_model_dir",
         lambda model_id: tmp_path / "demo" / "shared-owner",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(owner_dir, model_id, resolved_plan, check_download_control=None, **_kwargs):
         assert owner_dir == tmp_path / "demo/shared-owner"

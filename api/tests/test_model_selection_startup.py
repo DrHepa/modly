@@ -5,7 +5,8 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI
+from conftest import PNG_BYTES
 
 import services.generation_jobs as generation_jobs
 import services.generator_registry as registry_module
@@ -49,6 +50,7 @@ def make_registry(monkeypatch, tmp_path: Path, selected: str, order: tuple[str, 
     monkeypatch.setattr(registry_module, "MODELS_DIR", tmp_path / "models")
     monkeypatch.setattr(registry_module, "WORKSPACE_DIR", tmp_path / "workspace")
     NoLoadGenerator.instances.clear()
+    (tmp_path / "extension").mkdir(exist_ok=True)
     entries = {
         model_id: (
             NoLoadGenerator,
@@ -57,7 +59,9 @@ def make_registry(monkeypatch, tmp_path: Path, selected: str, order: tuple[str, 
         )
         for model_id in order
     }
-    monkeypatch.setattr(registry_module, "_discover_extensions", lambda: entries)
+    monkeypatch.setattr(registry_module, "_discover_extensions", lambda manager, _authorization: (
+        {key: (*entry, manager.register(entry[2])) for key, entry in entries.items()}, {},
+    ))
     registry = GeneratorRegistry()
     registry.initialize()
     return registry
@@ -104,8 +108,6 @@ def test_unselected_status_and_omitted_job_are_clear_without_creating_work(
 
     registry = make_registry(monkeypatch, tmp_path, "", (MODEL_B, MODEL_A))
     monkeypatch.setattr(model_router, "generator_registry", registry)
-    monkeypatch.setattr(generation_router, "generator_registry", registry)
-    monkeypatch.setattr(workflow_router, "generator_registry", registry)
     monkeypatch.setattr(generation_jobs, "generator_registry", registry)
     jobs_before = set(generation_jobs._jobs)
     app = FastAPI()
@@ -130,17 +132,17 @@ def test_unselected_status_and_omitted_job_are_clear_without_creating_work(
             for path in ("/generate/from-image", "/workflow-runs/from-image"):
                 response = await client.post(
                     path,
-                    files={"image": ("input.png", b"image", "image/png")},
+                    files={"image": ("input.png", PNG_BYTES, "image/png")},
                 )
                 assert response.status_code == 400
-                assert "No model selected" in response.text
+                assert "Unknown model" in response.text
+                assert "sf3d" in response.text
             for path in ("/generate/from-text", "/workflow-runs/from-text"):
                 response = await client.post(path, json={"prompt": "A small statue"})
                 assert response.status_code == 400
-                assert "No model selected" in response.text
+                assert "Unknown model" in response.text
+                assert "sf3d" in response.text
 
-            with pytest.raises(HTTPException, match="No model selected"):
-                generation_jobs.create_from_image_job(BackgroundTasks(), b"image", {})
             assert set(generation_jobs._jobs) == jobs_before
 
             switched = await client.post(f"/model/switch?model_id={MODEL_A}")
@@ -169,6 +171,7 @@ def test_invalid_selected_id_with_no_usable_generators_is_unselected_before_jobs
         def __init__(self, model_dir, outputs_dir):
             raise RuntimeError("fixture cannot instantiate")
 
+    (tmp_path / "extension").mkdir(exist_ok=True)
     entries = {} if discovery_case == "empty" else {
         MODEL_A: (
             FailingGenerator,
@@ -176,7 +179,9 @@ def test_invalid_selected_id_with_no_usable_generators_is_unselected_before_jobs
             tmp_path / "extension",
         )
     }
-    monkeypatch.setattr(registry_module, "_discover_extensions", lambda: entries)
+    monkeypatch.setattr(registry_module, "_discover_extensions", lambda manager, _authorization: (
+        {key: (*entry, manager.register(entry[2])) for key, entry in entries.items()}, {},
+    ))
     registry = GeneratorRegistry()
     registry.initialize()
     monkeypatch.setattr(model_router, "generator_registry", registry)
@@ -199,8 +204,6 @@ def test_invalid_selected_id_with_no_usable_generators_is_unselected_before_jobs
         assert registry._active_id is None
         assert registry.all_status() == []
         asyncio.run(check_status())
-        with pytest.raises(HTTPException, match="No model selected"):
-            generation_jobs.create_from_image_job(BackgroundTasks(), b"image", {})
         assert set(generation_jobs._jobs) == jobs_before
     finally:
         registry._runtime_readiness_executor.shutdown(wait=False)

@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 
 from routers import agent
@@ -13,7 +14,20 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def completed_calls(calls):
+    """Mock the completed boundary, including correlated IDs and JSON arguments."""
+    return [
+        {"id": call.get("id", f"fixture_call_{index}"), "type": "function", "function": {
+            "name": call["function"]["name"],
+            "arguments": json.dumps(call["function"].get("arguments", {})),
+        }}
+        for index, call in enumerate(calls)
+    ]
+
+
 def chat_request(**values):
+    values.setdefault("model", "test-external")
+    values.setdefault("provider", agent.ProviderConfig(type="external", base_url="http://provider.test/v1"))
     messages = values.pop("messages", [])
     capabilities = values.pop("capabilities", [])
     origin_session_id = values.pop("originSessionId", "session-a")
@@ -37,6 +51,18 @@ def chat_request(**values):
         capabilities=capabilities,
         **values,
     )
+
+
+async def validated_stream_calls(calls):
+    wire = "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+        {"index": index, **call} for index, call in enumerate(completed_calls(calls))
+    ]}, "finish_reason": "tool_calls"}]}) + "\n\n"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, text=wire, request=request)
+    )) as client:
+        result = await agent._stream_llm_round(client, "http://provider.test/v1", {}, 1, {})
+    return [{**call, "function": {**call["function"], "arguments": json.loads(call["function"]["arguments"])}}
+            for call in result["tool_calls"]]
 
 
 def branch_graph(pair_count: int = 12) -> dict:
@@ -130,9 +156,9 @@ def test_prompt_discloses_only_the_direct_allowlist_and_keeps_process_mcp_action
 def test_stream_boundary_preserves_a_complete_create_workflow_graph():
     graph = branch_graph()
 
-    normalized = agent._normalize_stream_tool_calls([{
+    normalized = run(validated_stream_calls([{
         "function": {"name": "create_workflow", "arguments": {"graph": graph}},
-    }])
+    }]))
 
     assert normalized[0]["function"]["arguments"]["graph"] == graph
 
@@ -273,13 +299,13 @@ def test_success_and_terminal_serialization_preserve_the_public_workflow_graph_d
 def test_second_direct_tool_call_suppresses_the_entire_executable_batch(monkeypatch, tool_calls):
     rounds = []
 
-    async def fake_stream(_client, _url, payload, round_number):
+    async def fake_stream(_client, _url, payload, round_number, _headers):
         rounds.append(json.loads(json.dumps(payload)))
         if round_number == 1:
-            return {"role": "assistant", "content": "", "tool_calls": tool_calls}
+            return {"role": "assistant", "content": "", "tool_calls": completed_calls(tool_calls)}
         return {"role": "assistant", "content": "No direct action was retained."}
 
-    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "_stream_llm_round", fake_stream)
     response = run(agent.agent_chat(chat_request(
         messages=[],
         context={"workflows": [{"id": "workflow-1", "name": "Ready workflow"}]},
@@ -290,16 +316,16 @@ def test_second_direct_tool_call_suppresses_the_entire_executable_batch(monkeypa
 
 
 def test_second_direct_tool_call_in_a_later_round_still_suppresses_the_batch(monkeypatch):
-    async def fake_stream(_client, _url, _payload, round_number):
+    async def fake_stream(_client, _url, _payload, round_number, _headers):
         if round_number in {1, 2}:
             return {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"function": {"name": "unload_models", "arguments": {}}}],
+                "tool_calls": completed_calls([{"function": {"name": "unload_models", "arguments": {}}}]),
             }
         return {"role": "assistant", "content": "No direct action was retained."}
 
-    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "_stream_llm_round", fake_stream)
     response = run(agent.agent_chat(chat_request(messages=[])))
 
     assert response.actions == []
@@ -314,22 +340,22 @@ def test_governed_proposal_does_not_count_as_a_second_direct_action(monkeypatch)
         inputHints=[],
     )
 
-    async def fake_stream(_client, _url, _payload, round_number):
+    async def fake_stream(_client, _url, _payload, round_number, _headers):
         if round_number == 1:
             return {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [
+                "tool_calls": completed_calls([
                     {"function": {"name": "unload_models", "arguments": {}}},
                     {"function": {"name": "propose_capability_action", "arguments": {
                         "capability_id": "text-to-cad/generate",
                         "arguments": {"input": "chair"},
                     }}},
-                ],
+                ]),
             }
         return {"role": "assistant", "content": "Recorded separately."}
 
-    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "_stream_llm_round", fake_stream)
     response = run(agent.agent_chat(chat_request(messages=[], capabilities=[capability])))
 
     assert [action.tool for action in response.actions] == ["unload_models"]
@@ -337,22 +363,22 @@ def test_governed_proposal_does_not_count_as_a_second_direct_action(monkeypatch)
 
 
 def test_terminal_error_after_a_second_direct_call_contains_no_executable_batch(monkeypatch):
-    async def fake_stream(_client, _url, _payload, round_number):
+    async def fake_stream(_client, _url, _payload, round_number, _headers):
         if round_number == 1:
             return {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [
+                "tool_calls": completed_calls([
                     {"function": {"name": "unload_models", "arguments": {}}},
                     {"function": {"name": "smooth_mesh", "arguments": {
                         "asset_ref": "/workspace/a.glb",
                         "iterations": 1,
                     }}},
-                ],
+                ]),
             }
-        raise agent.OllamaBoundaryError(504, "ollama_timeout", "Ollama stopped sending data.", True)
+        raise agent.LlmBoundaryError(504, "llm_timeout", "The provider stopped sending data.", True)
 
-    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "_stream_llm_round", fake_stream)
     with pytest.raises(agent.HTTPException) as raised:
         run(agent.agent_chat(chat_request(
             messages=[],
@@ -381,21 +407,21 @@ def test_server_action_batch_serialization_is_atomic_and_cumulatively_bounded():
     assert agent.AgentChatResponse(message="oversized", actions=oversized).actions == []
 
 
-def test_direct_action_is_returned_once_when_a_later_ollama_round_times_out(monkeypatch):
-    async def fake_stream(_client, _url, _payload, round_number):
+def test_direct_action_is_returned_once_when_a_later_llm_round_times_out(monkeypatch):
+    async def fake_stream(_client, _url, _payload, round_number, _headers):
         if round_number == 1:
             return {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"function": {"name": "unload_models", "arguments": {}}}],
+                "tool_calls": completed_calls([{"function": {"name": "unload_models", "arguments": {}}}]),
             }
-        raise agent.OllamaBoundaryError(504, "ollama_timeout", "Ollama stopped sending data.", True)
+        raise agent.LlmBoundaryError(504, "llm_timeout", "The provider stopped sending data.", True)
 
-    monkeypatch.setattr(agent, "_stream_ollama_round", fake_stream)
+    monkeypatch.setattr(agent, "_stream_llm_round", fake_stream)
     with pytest.raises(agent.HTTPException) as raised:
         run(agent.agent_chat(chat_request(messages=[])))
 
-    assert raised.value.detail["code"] == "ollama_timeout"
+    assert raised.value.detail["code"] == "llm_timeout"
     assert len(raised.value.detail["actions"]) == 1
     action = raised.value.detail["actions"][0]
     assert action["tool"] == "unload_models"

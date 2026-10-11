@@ -242,6 +242,7 @@ def test_generate_routes_preserve_existing_input_transport_and_none_contract(cli
     assert image_mismatch.status_code == 200
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "scene"
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("inputs", None)
     scene_manifest = api_modules["workspace_dir"] / "Worlds" / "hero" / "scene-manifest.json"
     scene_manifest.parent.mkdir(parents=True, exist_ok=True)
     original_generate = api_modules["fake_generator"].generate
@@ -301,6 +302,7 @@ def test_generate_from_artifact_routes_validated_capture_and_rejects_reserved_pa
         "provenance": {"source": "test", "ordering": "manifest-index"},
     }))
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = "capture"
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("inputs", None)
     captured = {}
 
     def generate(model_input, params, progress_cb=None, cancel_event=None):
@@ -402,6 +404,7 @@ def scene_contract(api_modules, monkeypatch):
     }
     scene_manifest.write_text(json.dumps(document), encoding="utf-8")
     generator_registry._manifests[api_modules["valid_model_id"]].update(input="scene", output="mesh")
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("inputs", None)
     captured = []
     original_generate = api_modules["fake_generator"].generate
 
@@ -452,8 +455,8 @@ def test_scene_routes_strip_transport_aliases_without_dropping_model_params(
     assert client.get(f"/generate/status/{response.json()['job_id']}").json()["status"] == "done"
     expected = {"steps": 7, "custom_path": "legitimate", "metadata": {"input_scene_path": "opaque"},
                 "scene_manifest_path": str(scene_manifest.resolve())}
-    if route == "from-scene":
-        expected.update(remesh="quad", enable_texture=False, texture_resolution=1024)
+    expected.update(remesh="quad" if route == "from-scene" else "none",
+                    enable_texture=False, texture_resolution=1024)
     assert captured[0][2] == expected
     assert payload["params"]["input_scene_path"] == "spoofed"
 

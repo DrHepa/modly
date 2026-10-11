@@ -100,7 +100,7 @@ def _multipart(*, model_id: str, secondaries: list[tuple[int, str]]):
     return fields
 
 
-def test_secondary_uploads_preserve_slot_gaps_and_are_cleaned_after_success(
+def test_secondary_uploads_preserve_physical_slot_with_dense_paths_and_cleanup(
     client, api_modules, monkeypatch
 ):
     generator = api_modules["fake_generator"]
@@ -111,12 +111,13 @@ def test_secondary_uploads_preserve_slot_gaps_and_are_cleaned_after_success(
     def generate(image_bytes, params, progress_cb=None, cancel_event=None):
         paths = params["extra_image_paths"]
         captured["paths"] = list(paths)
-        assert paths[0] is None
-        staged = paths[1]
+        assert len(paths) == 1
+        staged = paths[0]
         assert staged is not None
         staged_path = Path(staged)
         assert staged_path.parent.parent == workspace / ".modly-private-inputs"
         assert staged_path.is_file()
+        assert staged_path.name.startswith("slot-3-image_3")
         assert stat.S_IMODE(staged_path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(staged_path.stat().st_mode) == 0o600
         return original_generate(image_bytes, params, progress_cb, cancel_event)
@@ -131,7 +132,7 @@ def test_secondary_uploads_preserve_slot_gaps_and_are_cleaned_after_success(
     )
 
     assert response.status_code == 200
-    assert captured["paths"][0] is None
+    assert len(captured["paths"]) == 1
     assert not (workspace / ".modly-private-inputs" / response.json()["job_id"]).exists()
 
 
@@ -144,7 +145,7 @@ def test_workflow_run_from_image_has_multipart_secondary_parity(
     original_generate = generator.generate
 
     def generate(image_bytes, params, progress_cb=None, cancel_event=None):
-        captured["secondary"] = Path(params["extra_image_paths"][1])
+        captured["secondary"] = Path(params["extra_image_paths"][0])
         assert captured["secondary"].is_file()
         return original_generate(image_bytes, params, progress_cb, cancel_event)
 
@@ -239,7 +240,7 @@ def test_secondary_upload_cleanup_runs_after_pre_execution_cancel(api_modules):
     asyncio.run(
         jobs._run_generation(
             job.job_id,
-            image_bytes=PNG_BYTES,
+            model_input=PNG_BYTES,
             params=params,
             model_id=api_modules["valid_model_id"],
             private_input_dir=private_dir,
@@ -595,11 +596,13 @@ def test_pixal3d_worldsculpt_scene_aliases_are_injected_only_by_typed_route(
     generator = api_modules["fake_generator"]
     original_generate = generator.generate
 
-    def generate(image_bytes, params, progress_cb=None, cancel_event=None):
+    def generate_artifact(kind, path, params, progress_cb=None, cancel_event=None):
+        assert kind == "scene"
+        assert path == scene.resolve()
         captured.append(dict(params))
-        return original_generate(image_bytes, params, progress_cb, cancel_event)
+        return original_generate(b"scene", params, progress_cb, cancel_event)
 
-    monkeypatch.setattr(generator, "generate", generate)
+    monkeypatch.setattr(generator, "generate_artifact", generate_artifact, raising=False)
     response = client.post(route, json={
         "scene_path": "Worlds/pixal/scene-manifest.json",
         "model_id": api_modules["valid_model_id"],
@@ -609,8 +612,9 @@ def test_pixal3d_worldsculpt_scene_aliases_are_injected_only_by_typed_route(
     assert response.status_code == expected_status
     assert response.json()[id_key]
     assert captured[-1]["face_budget"] == 1_000_000
-    assert captured[-1]["scene_path"] == "Worlds/pixal/scene-manifest.json"
-    assert captured[-1]["input_scene_path"] == "Worlds/pixal/scene-manifest.json"
+    assert captured[-1]["scene_manifest_path"] == str(scene.resolve())
+    assert "scene_path" not in captured[-1]
+    assert "input_scene_path" not in captured[-1]
 
 
 @pytest.mark.parametrize("route, expected_status", [
@@ -688,8 +692,8 @@ def test_legacy_workspace_images_are_snapshotted_with_gaps_and_cleaned(
 
     def generate(image_bytes, params, progress_cb=None, cancel_event=None):
         captured["paths"] = list(params["extra_image_paths"])
-        assert captured["paths"][0] is None
-        staged = Path(captured["paths"][1])
+        assert len(captured["paths"]) == 1
+        staged = Path(captured["paths"][0])
         assert staged.is_file()
         assert staged.name == "legacy-secondary.png"
         assert staged != legacy
@@ -710,8 +714,8 @@ def test_legacy_workspace_images_are_snapshotted_with_gaps_and_cleaned(
     )
 
     assert response.status_code == expected_status
-    assert captured["paths"][0] is None
-    assert not Path(captured["paths"][1]).exists()
+    assert len(captured["paths"]) == 1
+    assert not Path(captured["paths"][0]).exists()
     assert not (workspace / ".modly-private-inputs" / response.json()[id_key]).exists()
     assert legacy.is_file()
 
@@ -1297,8 +1301,8 @@ def test_declared_camel_list_image_alias_receives_only_custody_paths(
     )
 
     assert response.status_code == 200
-    assert captured["referenceImagePaths"][0] is None
-    assert not Path(captured["referenceImagePaths"][1]).exists()
+    assert len(captured["referenceImagePaths"]) == 1
+    assert not Path(captured["referenceImagePaths"][0]).exists()
 
 
 @pytest.mark.parametrize("route, expected_status", [
@@ -1509,8 +1513,8 @@ def test_input_contract_names_legacy_image_slots_and_preserves_generic_runtime_a
     )
 
     assert response.status_code == 200
-    assert captured["extra_image_paths"][0] is None
-    assert not Path(captured["extra_image_paths"][1]).exists()
+    assert len(captured["extra_image_paths"]) == 1
+    assert not Path(captured["extra_image_paths"][0]).exists()
     assert set(captured).isdisjoint({"back_image_path", "back_image_paths"})
 
 
@@ -1587,7 +1591,9 @@ def test_registry_projects_node_input_contract(api_modules, monkeypatch, tmp_pat
     )
     monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", extension_dir.parent)
 
-    discovered = registry_module._discover_extensions()
+    manager = registry_module._LegacyImportManager()
+    discovered, errors = registry_module._discover_extensions(manager)
+    assert errors == {}
 
     assert discovered["contract-extension/generate"][1]["input_contract"] == input_contract
 
@@ -1660,9 +1666,16 @@ def test_stale_custody_sweep_recovers_prior_abrupt_shutdown(api_modules):
     stale = api_modules["workspace_dir"] / ".modly-private-inputs" / "stale-job"
     stale.mkdir(parents=True)
     (stale / "partial.png").write_bytes(PNG_BYTES)
+    (stale / jobs.PRIVATE_INPUT_OWNERSHIP_MARKER).write_bytes(
+        jobs.PRIVATE_INPUT_OWNERSHIP_PREFIX + stale.name.encode("utf-8")
+    )
+    unrelated = stale.parent / "preexisting-user-data"
+    unrelated.mkdir()
+    (unrelated / "keep.png").write_bytes(PNG_BYTES)
 
     assert jobs.sweep_stale_private_inputs() == []
     assert not stale.exists()
+    assert (unrelated / "keep.png").read_bytes() == PNG_BYTES
 
 
 def test_shutdown_sweeps_custody_even_when_registry_shutdown_fails(api_modules, monkeypatch):

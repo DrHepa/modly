@@ -447,7 +447,9 @@ def test_registry_prefers_structured_hf_downloads_over_legacy_metadata(monkeypat
     monkeypatch.setattr(
         registry_module,
         "_discover_extensions",
-        lambda: {"demo/generate": (DummyGenerator, manifest, ext_dir)},
+        lambda manager, _authorization: ({
+            "demo/generate": (DummyGenerator, manifest, ext_dir, manager.register(ext_dir)),
+        }, {}),
     )
 
     registry = registry_module.GeneratorRegistry()
@@ -458,7 +460,7 @@ def test_registry_prefers_structured_hf_downloads_over_legacy_metadata(monkeypat
     assert registry.get_legacy_hf_download_plan("demo/generate") == {}
 
 
-def test_registry_still_rejects_genuinely_conflicting_download_plan_kinds(monkeypatch, tmp_path: Path):
+def test_registry_rejects_malformed_https_metadata_with_structured_hf_downloads(monkeypatch, tmp_path: Path):
     import services.generator_registry as registry_module
     from services.generators.base import BaseGenerator
 
@@ -481,14 +483,55 @@ def test_registry_still_rejects_genuinely_conflicting_download_plan_kinds(monkey
     monkeypatch.setattr(
         registry_module,
         "_discover_extensions",
-        lambda: {"demo/generate": (DummyGenerator, manifest, ext_dir)},
+        lambda manager, _authorization: ({
+            "demo/generate": (DummyGenerator, manifest, ext_dir, manager.register(ext_dir)),
+        }, {}),
     )
 
     registry = registry_module.GeneratorRegistry()
     registry.initialize()
 
     assert "demo/generate" not in registry._generators
-    assert "conflicting download plan kinds" in registry.load_errors()["demo/generate"]
+    assert "missing required fields" in registry.load_errors()["demo/generate"]
+    assert "filename" in registry.load_errors()["demo/generate"]
+
+
+def test_registry_accepts_valid_mixed_structured_hf_and_https_downloads(monkeypatch, tmp_path: Path):
+    import services.generator_registry as registry_module
+    from services.generators.base import BaseGenerator
+
+    class DummyGenerator(BaseGenerator):
+        def load(self):
+            self._model = object()
+
+        def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):
+            return self.outputs_dir / "dummy.glb"
+
+    manifest = {
+        "id": "demo/generate",
+        "name": "Demo",
+        "https_downloads": [{"url": "https://assets.example.com/model.bin", "filename": "model.bin",
+                             "size_bytes": 5, "sha256": hashlib.sha256(b"model").hexdigest()}],
+        "hf_downloads": _plan({"path": "weights/model.bin"}),
+        "weight_owner_id": "generate",
+    }
+    ext_dir = tmp_path / "extension"
+    ext_dir.mkdir()
+    monkeypatch.setattr(
+        registry_module,
+        "_discover_extensions",
+        lambda manager, _authorization: ({
+            "demo/generate": (DummyGenerator, manifest, ext_dir, manager.register(ext_dir)),
+        }, {}),
+    )
+
+    registry = registry_module.GeneratorRegistry()
+    registry.initialize()
+
+    generator = registry.get_generator("demo/generate")
+    assert generator.hf_downloads == manifest["hf_downloads"]
+    assert generator.https_downloads == manifest["https_downloads"]
+    assert "demo/generate" not in registry.load_errors()
 
 
 def test_discovery_skips_process_extension_before_requiring_generator(monkeypatch, tmp_path: Path, capsys):
@@ -502,7 +545,8 @@ def test_discovery_skips_process_extension_before_requiring_generator(monkeypatc
     )
     monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", tmp_path)
 
-    assert registry_module._discover_extensions() == {}
+    entries, errors = registry_module._discover_extensions(registry_module._LegacyImportManager())
+    assert entries == {}
     output = capsys.readouterr().out
     assert "type 'process' is not handled" in output
     assert "missing generator.py" not in output
@@ -514,12 +558,13 @@ def test_discovery_rejects_model_extension_without_generator(monkeypatch, tmp_pa
     extension = tmp_path / "model-extension"
     extension.mkdir()
     (extension / "manifest.json").write_text(
-        json.dumps({"id": "model-extension", "type": "model"}),
+        json.dumps({"id": "model-extension", "type": "model", "generator_class": "MissingGenerator"}),
         encoding="utf-8",
     )
     monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", tmp_path)
 
-    assert registry_module._discover_extensions() == {}
+    entries, errors = registry_module._discover_extensions(registry_module._LegacyImportManager())
+    assert entries == {}
     assert "missing generator.py" in capsys.readouterr().out
 
 
@@ -559,7 +604,9 @@ def test_registry_preserves_legacy_hf_include_prefixes_for_download_planning(mon
     monkeypatch.setattr(
         registry_module,
         "_discover_extensions",
-        lambda: {"demo/generate": (DummyGenerator, manifest, ext_dir)},
+        lambda manager, _authorization: ({
+            "demo/generate": (DummyGenerator, manifest, ext_dir, manager.register(ext_dir)),
+        }, {}),
     )
 
     registry = registry_module.GeneratorRegistry()
@@ -691,7 +738,8 @@ def test_hf_download_assets_rejects_mismatched_target_owner_before_streaming(mon
         "canonical_model_dir",
         lambda model_id: tmp_path / "cube3d" / "shared-owner",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(*_args, **_kwargs):
         calls.append("streamed")
@@ -735,7 +783,8 @@ def test_hf_download_assets_rejects_unsafe_target_owner_before_streaming(monkeyp
         "canonical_model_dir",
         lambda model_id: tmp_path / "cube3d" / "generate",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(*_args, **_kwargs):
         calls.append("streamed")
@@ -775,7 +824,8 @@ def test_hf_download_assets_endpoint_uses_owner_scoped_control_for_cancel(monkey
         "canonical_model_dir",
         lambda model_id: tmp_path / "cube3d" / "shared-owner",
     )
-    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(model_router, "MODELS_DIR", tmp_path / "obsolete-root")
+    monkeypatch.setattr(model_router.registry_module, "MODELS_DIR", tmp_path)
 
     async def fake_stream(owner_dir, resolved_plan, token=None, check_download_control=None, **_kwargs):
         assert owner_dir == tmp_path / "cube3d/shared-owner"

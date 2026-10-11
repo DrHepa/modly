@@ -33,10 +33,11 @@ def test_generation_endpoints_keep_dot_segment_collections_in_workspace(
     jobs = api_modules["generation_jobs"]
 
     generator_registry._manifests[api_modules["valid_model_id"]]["input"] = declared_input
+    generator_registry._manifests[api_modules["valid_model_id"]].pop("inputs", None)
     workspace_dir = api_modules["workspace_dir"]
     captured = {}
 
-    async def capture_job(job_id, model_input, params, collection, output_kind, model_id):
+    async def capture_job(job_id, model_input, params, collection, output_kind, model_id, *, private_input_dir=None):
         captured["collection"] = collection
 
     monkeypatch.setattr(jobs, "uuid", SimpleNamespace(uuid4=lambda: "safe-job"))

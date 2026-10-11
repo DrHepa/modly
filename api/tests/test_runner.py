@@ -450,7 +450,7 @@ class GenerationInputProtocolTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(getattr(received[0][0], "kind", None), "video")
         self.assertEqual(getattr(received[0][0], "path", None), video_path.resolve())
-        self.assertIsNone(getattr(received[0][0], "snapshot", None))
+        self.assertEqual(getattr(received[0][0], "snapshot", None), snapshot)
         self.assertEqual(received[0][1], {"quality": "draft"})
         self.assertTrue(any(
             message == {

@@ -275,24 +275,38 @@ class MultiSourceRouterTests(unittest.TestCase):
     def test_removal_unload_requires_confirmed_process_stop(self):
         from unittest.mock import Mock
         from services.extension_process import ExtensionProcess
+        registry = model_router.registry_module.GeneratorRegistry()
         gen = Mock(spec=ExtensionProcess)
-        with patch.object(model_router.generator_registry, "get_generator", return_value=gen):
-            self.assertEqual(asyncio.run(model_router.unload_model("demo/a")), {"unloaded": True})
-            gen.stop.assert_called_once()
-            gen.unload.assert_not_called()
-            gen.stop.side_effect = RuntimeError("still running")
-            with self.assertRaisesRegex(RuntimeError, "still running"):
-                asyncio.run(model_router.unload_model("demo/a"))
+        registry._generators["demo/a"] = gen
+        try:
+            with patch.object(model_router, "generator_registry", registry):
+                self.assertEqual(asyncio.run(model_router.unload_model("demo/a")), {"unloaded": True})
+                gen.stop.assert_called_once()
+                gen.unload.assert_not_called()
+                gen.stop.side_effect = RuntimeError("still running")
+                with self.assertRaisesRegex(RuntimeError, "still running"):
+                    asyncio.run(model_router.unload_model("demo/a"))
+                self.assertEqual(gen.stop.call_count, 2)
+                gen.unload.assert_not_called()
+        finally:
+            registry._runtime_readiness_executor.shutdown(wait=True)
 
     def test_removal_rejects_direct_generator_that_remains_loaded(self):
         from unittest.mock import Mock
         from fastapi import HTTPException
+        registry = model_router.registry_module.GeneratorRegistry()
         gen = Mock()
         gen.is_loaded.return_value = True
-        with patch.object(model_router.generator_registry, "get_generator", return_value=gen):
-            with self.assertRaises(HTTPException) as error:
-                asyncio.run(model_router.unload_model("demo/a"))
-            self.assertEqual(error.exception.status_code, 409)
+        registry._generators["demo/a"] = gen
+        try:
+            with patch.object(model_router, "generator_registry", registry):
+                with self.assertRaises(HTTPException) as error:
+                    asyncio.run(model_router.unload_model("demo/a"))
+                self.assertEqual(error.exception.status_code, 409)
+                gen.unload.assert_called_once()
+                self.assertIs(registry._generators["demo/a"], gen)
+        finally:
+            registry._runtime_readiness_executor.shutdown(wait=True)
 
     def test_composite_model_unload_route_uses_path_converter(self) -> None:
         paths = {route.path for route in model_router.router.routes}
@@ -501,6 +515,9 @@ class MultiSourceRouterTests(unittest.TestCase):
         class LegacyRegistry:
             def get_legacy_hf_download_plan(self, _model_id):
                 return {"repo_id": "org/model", "hf_skip_prefixes": [], "hf_include_prefixes": []}
+
+            def get_manifest(self, _model_id):
+                return {}
 
             def canonical_model_dir(self, _model_id):
                 return self.models_dir / "demo" / "../outside"

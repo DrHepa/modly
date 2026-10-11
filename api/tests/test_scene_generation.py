@@ -59,7 +59,7 @@ class SceneGenerationTests(unittest.TestCase):
         self.assertFalse(self.registry.switched)
 
     def test_generic_route_rejects_unsupported_kind_and_model_mismatch(self):
-        for kind in ("video", "capture", "image"):
+        for kind in ("image",):
             with self.subTest(kind=kind), self.assertRaises(ValidationError):
                 GenerateFromArtifactRequest(
                     input_kind=kind, input_path="Workflows/room", model_id="demo/scene")
@@ -68,6 +68,45 @@ class SceneGenerationTests(unittest.TestCase):
             asyncio.run(generation_router.generate_from_artifact(GenerateFromArtifactRequest(
                 input_kind="scene", input_path="Workflows/room", model_id="demo/image"), BackgroundTasks()))
         self.assertEqual(caught.exception.status_code, 400)
+
+    def test_generic_route_accepts_video_and_capture_with_matching_models(self):
+        clip = self.workspace / "Workflows" / "clip.mp4"
+        clip.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2")
+        capture_dir = self.workspace / "Captures" / "clip"
+        capture_dir.mkdir(parents=True)
+        captured_clip = capture_dir / "clip.mp4"
+        captured_clip.write_bytes(clip.read_bytes())
+        capture_manifest = capture_dir / "capture-manifest.json"
+        capture_manifest.write_text(json.dumps({
+            "schema": "modly.capture-manifest.v1", "captureRoot": ".", "kind": "video",
+            "video": {"path": "clip.mp4", "byteSize": captured_clip.stat().st_size,
+                      "width": 1, "height": 1, "frameCount": 1},
+            "provenance": {"source": "unit-test", "ordering": "decode-index"},
+        }))
+        for kind, relative, expected_path in (
+            ("video", "Workflows/clip.mp4", clip),
+            ("capture", "Captures/clip", capture_manifest),
+        ):
+            with self.subTest(kind=kind):
+                self.registry.get_manifest = lambda _model_id, kind=kind: {"input": kind}
+                request = GenerateFromArtifactRequest(
+                    input_kind=kind, input_path=relative, model_id=f"demo/{kind}")
+                tasks = BackgroundTasks()
+                result = asyncio.run(generation_router.generate_from_artifact(request, tasks))
+                queued = tasks.tasks[0]
+                self.assertEqual(queued.args[1].kind, kind)
+                self.assertEqual(queued.args[1].path, expected_path.resolve())
+                self.assertEqual(queued.args[5], f"demo/{kind}")
+                self.assertEqual(result["job_id"], queued.args[0])
+                if kind == "video":
+                    self.assertIsNotNone(queued.args[1].snapshot)
+                else:
+                    self.assertEqual(queued.args[2]["capture_manifest_path"], str(capture_manifest.resolve()))
+                self.registry.get_manifest = lambda _model_id: {"input": "scene"}
+                with self.assertRaises(HTTPException) as caught:
+                    asyncio.run(generation_router.generate_from_artifact(request, BackgroundTasks()))
+                self.assertEqual(caught.exception.status_code, 400)
+                self.assertFalse(self.registry.switched)
 
     def test_rejects_traversal_before_switch_or_queue(self):
         with self.assertRaises(HTTPException):

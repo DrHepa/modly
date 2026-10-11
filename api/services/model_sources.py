@@ -338,6 +338,7 @@ def resolve_source_destination(models_dir: Path, model_id: str, destination: str
     candidate = model_root if safe_destination == "." else model_root.joinpath(*safe_destination.split("/"))
     if _path_has_symlink(model_root, candidate):
         raise ValueError("Source destination resolves through a symlink")
+    _reject_existing_non_directories(candidate)
     return candidate
 
 

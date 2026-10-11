@@ -24,15 +24,28 @@ class _FakeGenerator:
         return out
 
 
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR"
+    b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+    b"\x90wS\xde"
+    b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
+    b"\xf6\x178U"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
 class _FakeUpload:
     """Minimal UploadFile stand-in: an image content-type and readable bytes."""
 
-    def __init__(self, content_type: str = "image/png", data: bytes = b"\x89PNG\r\n") -> None:
+    def __init__(self, content_type: str = "image/png", data: bytes = PNG_BYTES) -> None:
         self.content_type = content_type
         self._data = data
 
-    async def read(self) -> bytes:
-        return self._data
+    async def read(self, size: int = -1) -> bytes:
+        data = self._data if size < 0 else self._data[:size]
+        self._data = b"" if size < 0 else self._data[size:]
+        return data
 
 
 class _FakeRegistry:
@@ -161,6 +174,12 @@ class GenerateFromImageWorkspaceTests(unittest.TestCase):
             generation_router.generate_from_image(
                 background,
                 image=_FakeUpload(),
+                secondary_image=None,
+                secondary_image_slot=None,
+                secondary_image_handle=None,
+                primary_image_slot=None,
+                primary_image_handle=None,
+                mesh_path=None,
                 model_id="sf3d",
                 collection="MyColl",
                 remesh="quad",

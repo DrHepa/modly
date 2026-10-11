@@ -653,6 +653,7 @@ class GeneratorRegistryDiscoveryTests(unittest.TestCase):
         self.registry.initialize()
         model_id = "live-before-repair/generate"
         self.assertIn(model_id, self.registry._generators)
+        self.registry.switch_model(model_id)
 
         self._write_registration_capability("live-before-repair")
 

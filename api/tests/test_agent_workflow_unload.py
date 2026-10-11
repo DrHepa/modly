@@ -110,13 +110,14 @@ class WorkflowVramUnloadTests(unittest.TestCase):
 
     def test_a_single_system_message_leads_the_conversation(self) -> None:
         # Qwen3.5's template rejects a system message anywhere but first (HTTP 400).
-        context = {"currentMeshPath": "/tmp/a.glb", "extensions": [{"id": "remesh", "name": "Remesh"}]}
+        context = {"currentMeshRef": "/workspace/a.glb", "meshTriangles": 456}
         scripted, *_ = _run_local([_assistant(content="ok")], context)
         roles = [m["role"] for m in scripted.requests[0]["body"]["messages"]]
         self.assertEqual(roles, ["system", "user"])
         system = scripted.requests[0]["body"]["messages"][0]["content"]
-        self.assertIn("Current mesh path: /tmp/a.glb", system)
-        self.assertIn("remesh", system)
+        self.assertIn("Current mesh reference: /workspace/a.glb", system)
+        self.assertIn("Current mesh triangles: 456", system)
+        self.assertNotIn("/tmp/a.glb", system)
 
     def test_tool_result_answers_its_call_id(self) -> None:
         chat = [_assistant(tool_calls=[_RUN_WF1]), _assistant(content="done")]

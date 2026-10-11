@@ -33,13 +33,13 @@ class SceneArtifactParamTests(unittest.TestCase):
             }), encoding="utf-8")
             captured = {}
 
-            def fake_create_job(background_tasks, input_kind, artifact_path, params, collection="Default", *, artifact_snapshot=None, model_id=None):
+            def fake_create_job(background_tasks, model_input, params, collection="Default", output_kind="mesh", model_id=None):
                 captured.update({
-                    "input_kind": input_kind,
-                    "artifact_path": artifact_path,
+                    "input_kind": model_input.kind,
+                    "artifact_path": model_input.path,
                     "params": dict(params),
                     "collection": collection,
-                    "artifact_snapshot": artifact_snapshot,
+                    "artifact_snapshot": model_input.snapshot,
                     "model_id": model_id,
                 })
                 return type("Job", (), {"job_id": "scene-job"})()
@@ -52,7 +52,7 @@ class SceneArtifactParamTests(unittest.TestCase):
                      "params_schema": [{"id": "quality", "type": "string"}],
                  }}, create=True), \
                  mock.patch.object(generator_registry, "switch_model", lambda model_id: None), \
-                 mock.patch.object(generation, "create_from_artifact_job", fake_create_job):
+                 mock.patch.object(generation, "create_generation_job", fake_create_job):
                 result = asyncio.run(generation.generate_from_artifact(GenerateFromArtifactRequest(
                     input_kind="scene",
                     input_path="Worlds/hero",
@@ -73,13 +73,13 @@ class SceneArtifactParamTests(unittest.TestCase):
                 "enable_texture": False,
                 "texture_resolution": 1024,
                 "scene_manifest_path": str(manifest.resolve()),
-                "scene_path": "Worlds/hero/scene-manifest.json",
-                "input_scene_path": "Worlds/hero/scene-manifest.json",
             })
+            self.assertNotIn("scene_path", captured["params"])
+            self.assertNotIn("input_scene_path", captured["params"])
 
 
     def test_artifact_jobs_use_queued_model_id_not_later_active_model(self) -> None:
-        from services.capture_input import TypedModelInput
+        from services.artifact_input import TypedArtifactInput
         from services.generator_registry import generator_registry
         from services import generation_jobs
 
@@ -100,17 +100,23 @@ class SceneArtifactParamTests(unittest.TestCase):
             def __init__(self, name: str) -> None:
                 self.name = name
                 self.outputs_dir = workspace
+                self._loaded = True
 
             def is_loaded(self) -> bool:
-                return True
+                return self._loaded
 
             def is_downloaded(self) -> bool:
                 return True
 
             def load(self) -> None:
-                raise AssertionError("loaded generators should not reload")
+                self._loaded = True
 
-            def generate(self, generation_input, params, progress_cb=None, cancel_event=None):
+            def unload(self) -> None:
+                self._loaded = False
+
+            def generate_artifact(self, kind, path, params, progress_cb=None, cancel_event=None):
+                if kind != "scene" or path != manifest.resolve():
+                    raise AssertionError("queued scene input changed before generation")
                 calls.append(self.name)
                 output = self.outputs_dir / params["filename"]
                 output.write_bytes(b"glb")
@@ -121,8 +127,7 @@ class SceneArtifactParamTests(unittest.TestCase):
         generation_jobs._cancel_events.clear()
         gen_a = RaceGenerator("race/a")
         gen_b = RaceGenerator("race/b")
-        with mock.patch.object(generation_jobs, "WORKSPACE_DIR", workspace), \
-             mock.patch("services.generator_registry.WORKSPACE_DIR", workspace), \
+        with mock.patch("services.generator_registry.WORKSPACE_DIR", workspace), \
              mock.patch.object(generator_registry, "_generators", {"race/a": gen_a, "race/b": gen_b}, create=True), \
              mock.patch.object(generator_registry, "_manifests", {
                  "race/a": {"id": "race/a", "name": "Race A", "input": "scene"},
@@ -136,14 +141,14 @@ class SceneArtifactParamTests(unittest.TestCase):
                 await asyncio.gather(
                     generation_jobs._run_generation(
                         job_a.job_id,
-                        generation_input=TypedModelInput("scene", manifest),
+                        model_input=TypedArtifactInput("scene", manifest.resolve()),
                         params={"filename": "a.glb"},
                         collection="Race",
                         model_id="race/a",
                     ),
                     generation_jobs._run_generation(
                         job_b.job_id,
-                        generation_input=TypedModelInput("scene", manifest),
+                        model_input=TypedArtifactInput("scene", manifest.resolve()),
                         params={"filename": "b.glb"},
                         collection="Race",
                         model_id="race/b",
@@ -174,12 +179,21 @@ class SceneArtifactParamTests(unittest.TestCase):
             def __init__(self, model_dir, outputs_dir):
                 self.model_dir = model_dir
                 self.outputs_dir = outputs_dir
+                self._loaded = False
+
+            def is_loaded(self):
+                return self._loaded
+
+            def load(self):
+                self._loaded = True
 
             def params_schema(self):
                 return []
 
-            def generate(self, generation_input, params, progress_cb, cancel_event):
-                received.append((generation_input, params))
+            def generate_artifact(self, kind, path, params, progress_cb, cancel_event):
+                if kind != "scene":
+                    raise AssertionError("scene envelope lost its typed kind")
+                received.append((path, params))
                 output = workspace / "output.glb"
                 output.write_bytes(b"glb")
                 return output
@@ -211,13 +225,14 @@ class SceneArtifactParamTests(unittest.TestCase):
              mock.patch.object(runner, "load_generator", return_value=FakeGenerator), \
              mock.patch.object(runner, "send", side_effect=sent.append), \
              mock.patch.object(runner, "recv", return_value=messages), \
-             mock.patch.object(runner, "MODLY_WORKSPACE_DIR", workspace, create=True):
+             mock.patch.object(runner, "WORKSPACE_DIR", workspace):
             runner.main()
 
+        # Only scene_manifest_path is authoritative. The runner's open params
+        # retain this undeclared legacy-looking key without promoting it to a path.
         self.assertEqual(received, [(manifest.resolve(), {
             "quality": "draft",
             "scene_manifest_path": str(manifest.resolve()),
-            "scene_path": "Worlds/hero/scene-manifest.json",
-            "input_scene_path": "Worlds/hero/scene-manifest.json",
+            "input_scene_path": "Forged/input.json",
         })])
         self.assertTrue(any(message.get("type") == "done" and message.get("id") == "scene-request" for message in sent))

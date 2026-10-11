@@ -89,6 +89,7 @@ function isPreview(value: unknown): boolean {
   if (value.kind === 'none') return true
   if (value.kind === '3d-model') return value.viewerKind === 'glb' || value.viewerKind === 'gltf'
   if (!Number.isFinite(value.byteLength) || value.byteLength < 0) return false
+  if (value.kind === 'audio') return ['wav', 'mp3', 'ogg', 'flac'].includes(value.audioKind) && typeof value.sourceUrl === 'string'
   if (value.kind === 'text') return typeof value.content === 'string' && typeof value.truncated === 'boolean'
   return value.kind === 'binary' && typeof value.binaryKind === 'string' && typeof value.message === 'string'
 }

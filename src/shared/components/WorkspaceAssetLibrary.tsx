@@ -327,24 +327,24 @@ export function WorkspaceAssetLibraryPopover<Entry extends WorkspaceAssetLibrary
                               {group.entries.map((entry) => {
                                 const selected = entry.id === selectedEntryId
                                 return (
-                                  <button
-                                    key={entry.id}
-                                    type="button"
-                                    role="listitem"
-                                    aria-pressed={selected}
-                                    aria-label={`Select library asset ${entry.displayName}`}
-                                    onClick={() => onSelectEntry(entry.id)}
-                                    className={`w-full text-left px-4 py-2 border-t border-zinc-800 first:border-t-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400
-                                      ${selected
-                                        ? 'bg-violet-500/10 text-zinc-100'
-                                        : 'text-zinc-300 hover:bg-zinc-800/80'
-                                      }`}
-                                  >
-                                    <div className="flex items-center justify-between gap-2">
-                                      <span className="text-xs font-medium">{entry.displayName}</span>
-                                      <span className="text-[10px] uppercase tracking-wider text-zinc-500">{formatWorkspaceAssetLibraryBadge(entry)}</span>
-                                    </div>
-                                  </button>
+                                  <div key={entry.id} role="listitem" className="border-t border-zinc-800 first:border-t-0">
+                                    <button
+                                      type="button"
+                                      aria-pressed={selected}
+                                      aria-label={`Select library asset ${entry.displayName}`}
+                                      onClick={() => onSelectEntry(entry.id)}
+                                      className={`w-full text-left px-4 py-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400
+                                        ${selected
+                                          ? 'bg-violet-500/10 text-zinc-100'
+                                          : 'text-zinc-300 hover:bg-zinc-800/80'
+                                        }`}
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span className="text-xs font-medium">{entry.displayName}</span>
+                                        <span className="text-[10px] uppercase tracking-wider text-zinc-500">{formatWorkspaceAssetLibraryBadge(entry)}</span>
+                                      </div>
+                                    </button>
+                                  </div>
                                 )
                               })}
                             </div>

@@ -124,7 +124,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function isSafePreviewReference(value: unknown): value is string {
-  return isSafeRelativePath(value)
+  if (typeof value !== 'string') return false
+  return isSafeRelativePath(value.trim().replace(/\\/g, '/'))
 }
 
 function isSceneManifestPreview(value: unknown): value is SceneArtifactManifestPreview {
@@ -147,7 +148,9 @@ function isSceneManifestInitialView(value: unknown): value is SceneArtifactManif
 }
 
 function normalizeSceneRoot(sceneRoot: unknown): string | undefined {
-  return isSafeRelativePath(sceneRoot, true) ? sceneRoot.replace(/\\/g, '/') : undefined
+  if (typeof sceneRoot !== 'string') return undefined
+  const normalized = sceneRoot.trim().replace(/\\/g, '/')
+  return isSafeRelativePath(normalized, true) ? normalized : undefined
 }
 
 export function validateSceneManifest(manifest: unknown): { ok: true; manifest: SceneArtifactManifestV1; sceneRoot: string } | { ok: false; error: string } {

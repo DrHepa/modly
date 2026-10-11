@@ -92,7 +92,7 @@ export async function openWorldAssetLibraryRenderable(request: AssetLibraryOpenR
 
 export function readWorldAssetLibraryAudio(request: AssetLibraryReadRequest): Promise<WorldAssetLibraryAudioReadResult> {
   if (!isCanonicalSafeWorkspacePath(request.workspacePath) || request.sourceWorkspacePath) {
-    return Promise.reject(new Error('Unsafe workspace asset-library path.'))
+    return Promise.reject(new Error('World asset library service requires a safe workspace-relative path.'))
   }
   return readAssetLibraryEntry(request).then((result) => projectWorldAssetLibraryAudioReadResult(result, request.workspacePath))
 }

@@ -30,6 +30,7 @@ export interface ModelOwnershipDescriptor {
 export function describeModelOwnership(
   extensionId: string,
   nodes: readonly { id?: unknown; weight_owner_id?: unknown }[],
+  policy: 'storage' | 'discovery' = 'storage',
 ): ModelOwnershipDescriptor[] {
   const owners = nodes.map((node) => ({
     capabilityId: `${extensionId}/${node.id}`,
@@ -37,21 +38,32 @@ export function describeModelOwnership(
       ? String(node.id)
       : safeModelSourceId(node.weight_owner_id, 'weight_owner_id'),
   }))
+  // Explicit participation protects the entire exact owner group, even when
+  // its declaration appears after implicitly self-owned capabilities.
+  const protectedOwners = new Set(owners.filter((_, index) => nodes[index].weight_owner_id !== undefined)
+    .map(({ ownerId }) => ownerId))
   // IDs are ASCII under the existing source/node contract. Compare every
   // canonical and legacy root with the same portable identity, without
   // rewriting its spelling or merging independently declared owners.
-  const roots = new Map<string, { spelling: string; ownerId: string }>()
+  const roots = new Map<string, { spelling: string; ownerId: string }[]>()
   for (const { ownerId, capabilityId } of owners) {
     for (const spelling of [`${extensionId}/${ownerId}`, capabilityId]) {
       const key = spelling.toLowerCase()
-      const previous = roots.get(key)
-      if (previous && previous.spelling !== spelling) {
-        throw new Error(`weight roots "${previous.spelling}" and "${spelling}" are not portable-unique`)
+      const previousRoots = roots.get(key) ?? []
+      for (const previous of previousRoots) {
+        // Visibility alone never certifies a portable storage layout. Only
+        // distinct implicit owners are exempt during model discovery.
+        if (policy === 'discovery' && previous.ownerId !== ownerId
+          && !protectedOwners.has(previous.ownerId) && !protectedOwners.has(ownerId)) continue
+        if (previous.spelling !== spelling) {
+          throw new Error(`weight roots "${previous.spelling}" and "${spelling}" are not portable-unique`)
+        }
+        if (previous.ownerId !== ownerId) {
+          throw new Error(`weight owner "${ownerId}" overlaps another owner's legacy path`)
+        }
       }
-      if (previous && previous.ownerId !== ownerId) {
-        throw new Error(`weight owner "${ownerId}" overlaps another owner's legacy path`)
-      }
-      roots.set(key, { spelling, ownerId })
+      previousRoots.push({ spelling, ownerId })
+      roots.set(key, previousRoots)
     }
   }
   return owners.map(({ capabilityId, ownerId }) => {

@@ -41,8 +41,8 @@ from services.model_sources import (
     safe_source_id,
     weight_group_sources_are_downloaded,
 )
-from services.hf_download_assets import validate_hf_downloads, hf_download_assets_ready
-from services.https_download_assets import validate_https_downloads, https_download_assets_ready
+from services.hf_download_assets import HfDownloadManifestError, validate_hf_downloads, hf_download_assets_ready
+from services.https_download_assets import HttpsDownloadManifestError, validate_https_downloads, https_download_assets_ready
 from services.model_sources import resolve_model_root, safe_owner_model_id
 from services.capture_input import _declared_input_type, _iter_declared_input_types
 
@@ -450,6 +450,30 @@ def _consume_registration_validation_capability(
     return extension_id, state_path, destination_path
 
 
+def _validate_weight_owner_roots(
+    legacy_paths_by_owner: Dict[str, list[str]],
+    implicit_discovery_owners: Optional[set[str]] = None,
+) -> None:
+    """Compare the complete root graph; discovery exemptions never grant writes."""
+    roots: Dict[str, list[Tuple[str, str]]] = {}
+    for owner, legacy_paths in legacy_paths_by_owner.items():
+        for spelling in [owner, *legacy_paths]:
+            key = spelling.lower()
+            previous_roots = roots.setdefault(key, [])
+            for previous_spelling, previous_owner in previous_roots:
+                if (implicit_discovery_owners is not None and previous_owner != owner
+                        and previous_owner in implicit_discovery_owners
+                        and owner in implicit_discovery_owners):
+                    continue
+                if previous_spelling != spelling:
+                    raise ValueError(
+                        f"weight roots {previous_spelling!r} and {spelling!r} are not portable-unique"
+                    )
+                if previous_owner != owner:
+                    raise ValueError(f"weight owner {owner!r} overlaps another owner's legacy path")
+            previous_roots.append((spelling, owner))
+
+
 def _discover_extensions(
     legacy_imports: _LegacyImportManager,
     registration_authorization: Tuple[RegistrationValidationAuthorization, ...] = (),
@@ -655,28 +679,22 @@ def _discover_extensions(
                     cls_or_None = getattr(module, class_name)
 
             legacy_paths_by_owner: Dict[str, list[str]] = {}
+            protected_owners: set[str] = set()
             for node in nodes:
                 owner_id = node.get("weight_owner_id", node["id"])
                 if "weight_owner_id" in node:
                     owner_id = safe_source_id(owner_id, "weight_owner_id")
                 weight_owner_id = f"{ext_id}/{owner_id}"
+                if "weight_owner_id" in node:
+                    protected_owners.add(weight_owner_id)
                 legacy_paths_by_owner.setdefault(weight_owner_id, []).append(f"{ext_id}/{node['id']}")
 
-            # Existing node/source IDs are ASCII. Use the same portable identity
-            # for canonical roots and every alias as the Electron planner does;
-            # never lowercase paths on disk or merge differently-spelled roots.
-            roots: Dict[str, Tuple[str, str]] = {}
-            for owner, legacy_paths in legacy_paths_by_owner.items():
-                for spelling in [owner, *legacy_paths]:
-                    key = spelling.lower()
-                    previous = roots.get(key)
-                    if previous and previous[0] != spelling:
-                        raise ValueError(
-                            f"weight roots {previous[0]!r} and {spelling!r} are not portable-unique"
-                        )
-                    if previous and previous[1] != owner:
-                        raise ValueError(f"weight owner {owner!r} overlaps another owner's legacy path")
-                    roots[key] = (spelling, owner)
+            # Preserve every exact implicit owner during read-only discovery;
+            # an explicit declaration protects its complete owner group.
+            _validate_weight_owner_roots(
+                legacy_paths_by_owner,
+                set(legacy_paths_by_owner) - protected_owners,
+            )
 
             if nodes:
                 for node in nodes:
@@ -1129,9 +1147,40 @@ class GeneratorRegistry:
             raise KeyError(f"No manifest for model ID: '{model_id}'")
         return self._manifests[model_id]
 
+    def _assert_download_ownership(self, model_id: str) -> dict:
+        """Revalidate all declared roots before returning a write-owned plan."""
+        manifest = self.get_manifest(model_id)
+        bundle_id = manifest.get("bundle_id") or manifest.get("ext_id") or model_id.split("/", 1)[0]
+        roots: Dict[str, list[str]] = {}
+        nodes = manifest.get("nodes")
+        if isinstance(nodes, list) and nodes:
+            # Normalized node metadata retains the full original declaration.
+            # Missing runtimes can omit siblings from _manifests, never from
+            # the storage graph that authorizes their canonical/legacy roots.
+            for node in nodes:
+                owner_id = node.get("weight_owner_id", node["id"])
+                if "weight_owner_id" in node:
+                    owner_id = safe_source_id(owner_id, "weight_owner_id")
+                owner = f"{bundle_id}/{owner_id}"
+                roots.setdefault(owner, []).append(f"{bundle_id}/{node['id']}")
+        else:
+            with self._path_publication_lock:
+                declared = list(self._manifests.items())
+            for candidate_id, candidate in declared:
+                candidate_bundle = candidate.get("bundle_id") or candidate.get("ext_id") or candidate_id.split("/", 1)[0]
+                if candidate_bundle != bundle_id:
+                    continue
+                owner = candidate.get("weight_owner_id") or candidate_id
+                roots.setdefault(owner, []).extend(candidate.get("legacy_paths", [candidate_id]))
+        _validate_weight_owner_roots(roots)
+        return manifest
+
     def get_hf_download_plan(self, model_id: str) -> list[dict]:
         """Returns the validated manifest-owned asset plan for a canonical model ID."""
-        manifest = self.get_manifest(model_id)
+        try:
+            manifest = self._assert_download_ownership(model_id)
+        except ValueError as error:
+            raise HfDownloadManifestError(str(error)) from error
         plan = manifest.get("hf_downloads", [])
         return validate_hf_downloads(
             plan,
@@ -1140,7 +1189,10 @@ class GeneratorRegistry:
 
     def get_https_download_plan(self, model_id: str) -> list[dict]:
         """Return the exact HTTPS asset plan owned by a canonical model ID."""
-        manifest = self.get_manifest(model_id)
+        try:
+            manifest = self._assert_download_ownership(model_id)
+        except ValueError as error:
+            raise HttpsDownloadManifestError(str(error)) from error
         plan = manifest.get("https_downloads", [])
         return validate_https_downloads(
             plan,
@@ -1149,7 +1201,7 @@ class GeneratorRegistry:
 
     def get_model_sources_plan(self, model_id: str) -> list[dict]:
         """Return the exact manifest-owned multi-source plan for a canonical model ID."""
-        manifest = self.get_manifest(model_id)
+        manifest = self._assert_download_ownership(model_id)
         plan = manifest.get("model_sources", [])
         return normalize_model_sources({"model_sources": plan}) if plan else []
 
@@ -1165,7 +1217,7 @@ class GeneratorRegistry:
             if not candidates:
                 raise ValueError("No installed model references the requested weight group")
             model_id = candidates[0]
-        manifest = self.get_manifest(model_id)
+        manifest = self._assert_download_ownership(model_id)
         parts = target_owner_id.split("/")
         if len(parts) != 3 or parts[1] != "_shared":
             raise ValueError("Shared target must be extension/_shared/group")
@@ -1188,7 +1240,7 @@ class GeneratorRegistry:
 
     def get_legacy_hf_download_plan(self, model_id: str) -> dict:
         """Return the exact manifest-owned legacy Hugging Face plan."""
-        manifest = self.get_manifest(model_id)
+        manifest = self._assert_download_ownership(model_id)
         repo_id = manifest.get("hf_repo", "")
         if repo_id in (None, ""):
             return {}
@@ -1206,7 +1258,7 @@ class GeneratorRegistry:
             if (not isinstance(download_check, str) or not download_check
                     or "\\" in download_check or Path(download_check).is_absolute()):
                 raise ValueError(f"{model_id}.download_check must be a safe relative path")
-            owner = self.canonical_model_dir(model_id)
+            owner = canonical_model_dir(MODELS_DIR, {"id": model_id, **manifest})
             extension_root = MODELS_DIR / manifest.get("ext_id", model_id.split("/", 1)[0])
             try:
                 (owner / download_check).resolve().relative_to(extension_root.resolve())

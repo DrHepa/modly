@@ -141,7 +141,7 @@ function installedSharedGroups(
   }))
 }
 
-function parseManifest(raw: string, extensionId: string, nodeId: string): InstalledModelDownloadPlan {
+function parseManifest(raw: string, extensionId: string, nodeId: string, validateStorageOwnership = false): InstalledModelDownloadPlan {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -173,7 +173,7 @@ function parseManifest(raw: string, extensionId: string, nodeId: string): Instal
 
   const node = matches[0]
   const modelId = `${extensionId}/${nodeId}`
-  const ownership = nodes.some((candidate) => candidate.weight_owner_id !== undefined)
+  const ownership = validateStorageOwnership || nodes.some((candidate) => candidate.weight_owner_id !== undefined)
     ? describeModelOwnership(extensionId, nodes).find((candidate) => candidate.capabilityId === modelId)
     : undefined
   const weightVariants = normalizeWeightVariants(node, node.params_schema ?? manifest.params_schema)
@@ -326,6 +326,7 @@ export async function resolveInstalledModelDownloadPlan(args: {
   userExtensionsDir: string
   builtinExtensionsDir: string
   blockedExtensionIds?: ReadonlySet<string>
+  validateStorageOwnership?: boolean
 }): Promise<InstalledModelDownloadPlan> {
   try {
     if (typeof args.modelId !== 'string') throw new Error('Model id must be a string')
@@ -353,7 +354,7 @@ export async function resolveInstalledModelDownloadPlan(args: {
 
   const manifestPath = join(extensionPath, 'manifest.json')
   if (!existsSync(manifestPath)) throw new Error(`Extension "${extensionId}" has no manifest.json`)
-    return parseManifest(await readFile(manifestPath, 'utf-8'), extensionId, nodeId)
+    return parseManifest(await readFile(manifestPath, 'utf-8'), extensionId, nodeId, args.validateStorageOwnership)
   } catch (error) {
     if (error instanceof ModelAssetDownloadError) throw error
     throw new ModelAssetDownloadError({

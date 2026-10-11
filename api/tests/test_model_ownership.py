@@ -1,4 +1,5 @@
 import importlib
+from itertools import permutations
 import json
 import sys
 from pathlib import Path
@@ -749,3 +750,247 @@ def test_changed_model_root_stops_then_restarts_bound_child(bound_owner_runtime)
     result = json.loads(registry.get_ready_generator('demo/a').generate(b'', {}).read_text())
     assert result == {'root': str(private), 'constructor_root': str(private), 'payload': 'new root'}
     assert gen.outputs_dir == new_workspace
+
+
+# N1 discovery describes exact legacy identities; it does not provision weights.
+_N1_CASE_SPELLINGS = ("foo", "foO", "fOo", "fOO", "Foo", "FoO", "FOo", "FOO")
+_N1_CASE_ORDERS = tuple(
+    order[offset:] + order[:offset]
+    for order in (_N1_CASE_SPELLINGS, tuple(reversed(_N1_CASE_SPELLINGS)))
+    for offset in range(len(order))
+)
+_N1_SOURCE = {
+    "id": "payload", "provider": "huggingface", "repo_id": "org/model",
+    "destination": ".", "checks": ["weights.bin"],
+}
+_N1_LEGACY_METADATA = {
+    "plain": {},
+    "hf": {"hf_repo": "org/model", "download_check": "base.bin"},
+    "variants": {
+        "hf_repo": "org/model", "download_check": "base.bin",
+        "params_schema": [{"id": "variant", "type": "select", "options": ["small"]}],
+        "weight_variants": {
+            "param": "variant", "default": "small",
+            "options": [{"id": "small", "label": "small", "include_prefixes": ["small/"], "checks": ["small/weights.bin"]}],
+        },
+    },
+    "structured": {
+        "hf_downloads": [{
+            "repo_id": "org/model", "revision": "a" * 40, "target_subdir": "assets",
+            "files": [{"path": "weights.bin"}],
+        }],
+    },
+}
+
+
+def _n1_discover_manifest(monkeypatch, tmp_path, nodes, *, setup_required=False, empty_models=False, weight_groups=None):
+    extensions = tmp_path / "extensions"
+    extension = extensions / "n1-legacy-cases"
+    extension.mkdir(parents=True)
+    models = tmp_path / "models"
+    if empty_models:
+        models.mkdir()
+    manifest = {
+        "id": "n1-legacy-cases", "type": "model",
+        "generator_class": "N1DiscoveryFixture", "nodes": nodes,
+    }
+    if weight_groups is not None:
+        manifest["weight_groups"] = weight_groups
+    (extension / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (extension / "generator.py").write_text("class N1DiscoveryFixture: pass\n", encoding="utf-8")
+    if setup_required:
+        (extension / "setup.py").write_text("raise AssertionError('Discovery must not run setup')\n", encoding="utf-8")
+    monkeypatch.setattr(registry_module, "EXTENSIONS_DIR", extensions)
+    monkeypatch.setattr(registry_module, "MODELS_DIR", models)
+    monkeypatch.setattr(registry_module, "WORKSPACE_DIR", tmp_path / "workspace")
+    manager = registry_module._LegacyImportManager()
+    try:
+        # Actual CURRENT interface: manager argument and four-element entries.
+        discovered, errors = registry_module._discover_extensions(manager)
+        return discovered, errors, models, extension
+    finally:
+        manager.clear()
+
+
+@pytest.mark.parametrize("order", _N1_CASE_ORDERS, ids=lambda value: "-".join(value))
+@pytest.mark.parametrize("setup_required,empty_models", [(False, False), (True, True)], ids=["missing-model-root", "uninstalled-empty-model-root"])
+def test_n1_readonly_discovery_preserves_every_implicit_case_member(monkeypatch, tmp_path, order, setup_required, empty_models):
+    nodes = [{"id": node_id, **_N1_LEGACY_METADATA["hf"]} for node_id in order]
+    discovered, errors, models, extension = _n1_discover_manifest(
+        monkeypatch, tmp_path, nodes, setup_required=setup_required, empty_models=empty_models,
+    )
+    assert not errors, errors
+    assert list(discovered) == [f"n1-legacy-cases/{node_id}" for node_id in order]
+    for capability_id, (generator_class, metadata, extension_dir, legacy_context) in discovered.items():
+        assert metadata["id"] == metadata["capability_id"] == capability_id
+        assert metadata["weight_owner_id"] == capability_id
+        assert metadata["legacy_paths"] == [capability_id]
+        assert metadata["shared_owner"] is False
+        assert extension_dir == extension
+        assert (generator_class is None) is setup_required
+        assert (legacy_context is None) is setup_required
+    assert not (extension / "venv").exists()
+    assert models.exists() is empty_models
+    if empty_models:
+        assert list(models.iterdir()) == []
+
+
+@pytest.mark.parametrize("metadata", _N1_LEGACY_METADATA.values(), ids=_N1_LEGACY_METADATA.keys())
+def test_n1_readonly_discovery_keeps_unprovisioned_legacy_metadata(monkeypatch, tmp_path, metadata):
+    nodes = [{"id": node_id, **metadata} for node_id in ("Foo", "foo")]
+    discovered, errors, models, _ = _n1_discover_manifest(monkeypatch, tmp_path, nodes, setup_required=True)
+    assert not errors, errors
+    assert set(discovered) == {"n1-legacy-cases/Foo", "n1-legacy-cases/foo"}
+    for node in nodes:
+        _, actual, _, _ = discovered[f"n1-legacy-cases/{node['id']}"]
+        for field in metadata:
+            assert actual[field] == node[field]
+        assert actual["weight_owner_id"] == actual["capability_id"]
+    assert not models.exists()
+
+
+@pytest.mark.parametrize("order", tuple(permutations(("Foo", "foo", "other"))))
+def test_n1_readonly_discovery_unrelated_explicit_owner_does_not_hide_implicit_nodes(monkeypatch, tmp_path, order):
+    nodes = [{"id": node_id, **({"weight_owner_id": "Shared"} if node_id == "other" else {})} for node_id in order]
+    discovered, errors, _, _ = _n1_discover_manifest(monkeypatch, tmp_path, nodes, setup_required=True)
+    assert not errors, errors
+    assert set(discovered) == {f"n1-legacy-cases/{node_id}" for node_id in order}
+    for node_id in ("Foo", "foo"):
+        _, metadata, _, _ = discovered[f"n1-legacy-cases/{node_id}"]
+        assert metadata["weight_owner_id"] == f"n1-legacy-cases/{node_id}"
+        assert metadata["legacy_paths"] == [f"n1-legacy-cases/{node_id}"]
+    assert discovered["n1-legacy-cases/other"][1]["weight_owner_id"] == "n1-legacy-cases/Shared"
+
+
+@pytest.mark.parametrize("owner", ["FOO", "Foo", "foo"])
+@pytest.mark.parametrize("order", tuple(permutations(("Foo", "foo", "third"))))
+def test_n1_readonly_discovery_rejects_every_protected_third_member_order(monkeypatch, tmp_path, owner, order):
+    nodes = [{"id": node_id, **({"weight_owner_id": owner} if node_id == "third" else {})} for node_id in order]
+    discovered, errors, _, _ = _n1_discover_manifest(monkeypatch, tmp_path, nodes, setup_required=True)
+    assert not discovered
+    assert set(errors) == {f"n1-legacy-cases/{node_id}" for node_id in order}
+    assert all("portable" in error or "overlap" in error for error in errors.values())
+
+
+@pytest.mark.parametrize("managed_kind", ["model_sources", "shared_group"])
+@pytest.mark.parametrize("order", tuple(permutations(("Foo", "foo", "third"))))
+def test_n1_readonly_discovery_preserves_manifest_wide_managed_identity_guard(monkeypatch, tmp_path, managed_kind, order):
+    protected = {"model_sources": [_N1_SOURCE]} if managed_kind == "model_sources" else {"weight_groups": ["common"]}
+    nodes = [{"id": node_id, **(protected if node_id == "third" else {})} for node_id in order]
+    groups = [{"id": "common", "model_sources": [_N1_SOURCE]}] if managed_kind == "shared_group" else None
+    discovered, errors, _, _ = _n1_discover_manifest(monkeypatch, tmp_path, nodes, setup_required=True, weight_groups=groups)
+    assert not discovered
+    assert set(errors) == {f"n1-legacy-cases/{node_id}" for node_id in order}
+    assert all("portable" in error or "duplicate" in error for error in errors.values())
+
+
+@pytest.mark.parametrize("getter", ["get_hf_download_plan", "get_https_download_plan", "get_model_sources_plan", "get_legacy_hf_download_plan"])
+@pytest.mark.parametrize("order", [("Foo", "foo"), ("foo", "Foo")])
+@pytest.mark.parametrize("registered", ["all", "selected-only"])
+def test_n1_download_plan_rejects_readonly_case_collisions(monkeypatch, tmp_path, getter, order, registered):
+    discovered, errors, models, _ = _n1_discover_manifest(
+        monkeypatch, tmp_path, [{"id": node_id, **_N1_LEGACY_METADATA["hf"]} for node_id in order], setup_required=True,
+    )
+    assert not errors, errors
+    registry = GeneratorRegistry()
+    # Publish actual normalized discovery metadata, not a mocked plan/schema.
+    registry._manifests.update({model_id: entry[1] for model_id, entry in discovered.items()
+                                if registered == "all" or model_id.endswith("/Foo")})
+    try:
+        for model_id in registry._manifests:
+            assert registry.get_manifest(model_id)["capability_id"] == model_id
+            with pytest.raises(ValueError, match="portable-unique|overlaps"):
+                getattr(registry, getter)(model_id)
+        assert not models.exists()
+    finally:
+        registry._runtime_readiness_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("getter,metadata", [
+    ("get_hf_download_plan", _N1_LEGACY_METADATA["structured"]),
+    ("get_https_download_plan", {"https_downloads": [{"url": "https://assets.example/weights.bin", "filename": "weights.bin", "size_bytes": 1, "sha256": "a" * 64}]}),
+    ("get_legacy_hf_download_plan", _N1_LEGACY_METADATA["hf"]),
+    ("get_model_sources_plan", {"model_sources": [_N1_SOURCE]}),
+])
+def test_n1_download_plan_preserves_safe_exact_owner(monkeypatch, tmp_path, getter, metadata):
+    discovered, errors, models, _ = _n1_discover_manifest(
+        monkeypatch, tmp_path, [{"id": "Foo", **metadata}], setup_required=True,
+    )
+    assert not errors, errors
+    registry = GeneratorRegistry()
+    registry._manifests.update({model_id: entry[1] for model_id, entry in discovered.items()})
+    try:
+        plan = getattr(registry, getter)("n1-legacy-cases/Foo")
+        assert plan
+        assert registry.get_manifest("n1-legacy-cases/Foo")["weight_owner_id"] == "n1-legacy-cases/Foo"
+        assert not models.exists()
+    finally:
+        registry._runtime_readiness_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("route_name", ["hf_download_assets", "https_download_assets"])
+def test_n1_download_plan_storage_denial_uses_nonretryable_validation_contract(monkeypatch, tmp_path, route_name):
+    import asyncio
+    from fastapi import HTTPException
+    from routers import model as model_router
+
+    discovered, errors, models, _ = _n1_discover_manifest(
+        monkeypatch, tmp_path, [{"id": node_id, **_N1_LEGACY_METADATA["hf"]} for node_id in ("Foo", "foo")], setup_required=True,
+    )
+    assert not errors, errors
+    registry = GeneratorRegistry()
+    registry._manifests.update({model_id: entry[1] for model_id, entry in discovered.items()})
+    monkeypatch.setattr(model_router, "generator_registry", registry)
+    try:
+        kwargs = {"model_id": "n1-legacy-cases/Foo", "target_owner_id": None}
+        if route_name == "hf_download_assets":
+            kwargs["authorization"] = None
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(getattr(model_router, route_name)(**kwargs))
+        assert caught.value.status_code == 422
+        assert caught.value.detail["code"] == "source_plan_invalid"
+        assert caught.value.detail["stage"] == "validate"
+        assert caught.value.detail["retryable"] is False
+        assert "portable-unique" in caught.value.detail["message"]
+        assert not models.exists()
+    finally:
+        registry._runtime_readiness_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("getter,metadata", [
+    ("get_hf_download_plan", _N1_LEGACY_METADATA["structured"]),
+    ("get_https_download_plan", {"https_downloads": [{"url": "https://assets.example/weights.bin", "filename": "weights.bin", "size_bytes": 1, "sha256": "a" * 64}]}),
+    ("get_legacy_hf_download_plan", _N1_LEGACY_METADATA["hf"]),
+    ("get_model_sources_plan", {"model_sources": [_N1_SOURCE]}),
+    ("get_weight_group_sources_plan", {"weight_groups": ["common"]}),
+])
+def test_n1_download_plan_consumes_the_exact_validated_manifest_snapshot(monkeypatch, tmp_path, getter, metadata):
+    groups = [{"id": "common", "model_sources": [_N1_SOURCE]}] if getter == "get_weight_group_sources_plan" else None
+    discovered, errors, _, _ = _n1_discover_manifest(
+        monkeypatch, tmp_path, [{"id": "Foo", **metadata}], setup_required=True, weight_groups=groups,
+    )
+    assert not errors, errors
+    registry = GeneratorRegistry()
+    registry._manifests.update({model_id: entry[1] for model_id, entry in discovered.items()})
+    model_id = "n1-legacy-cases/Foo"
+    arguments = (model_id, "n1-legacy-cases/_shared/common") if groups else (model_id,)
+    try:
+        expected = getattr(registry, getter)(*arguments)
+        original = registry._assert_download_ownership
+        validated = registry.get_manifest(model_id)
+
+        def replace_after_validation(selected_id):
+            snapshot = original(selected_id)
+            assert snapshot is validated
+            registry._manifests[selected_id] = {
+                **snapshot, "nodes": [{"id": node_id, **metadata} for node_id in ("Foo", "foo")],
+                "hf_downloads": [], "https_downloads": [], "model_sources": [],
+                "weight_groups": [], "hf_repo": "org/replacement",
+            }
+            return snapshot
+
+        monkeypatch.setattr(registry, "_assert_download_ownership", replace_after_validation)
+        assert getattr(registry, getter)(*arguments) == expected
+        assert registry.get_manifest(model_id) is not validated
+    finally:
+        registry._runtime_readiness_executor.shutdown(wait=True)

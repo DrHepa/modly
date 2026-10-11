@@ -5,13 +5,13 @@ import { createRequire } from 'node:module'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, URL } from 'node:url'
 import vm from 'node:vm'
 
 const require = createRequire(import.meta.url)
 function moduleFromCode(code, dependencies = require) {
   const module = { exports: {} }
-  vm.runInNewContext(code, { module, exports: module.exports, require: dependencies, process, console, Buffer, setTimeout, clearTimeout })
+  vm.runInNewContext(code, { module, exports: module.exports, require: dependencies, process, console, Buffer, URL, setTimeout, clearTimeout })
   return module.exports
 }
 function loadModule(path) {
@@ -413,5 +413,155 @@ for (const legacyMetadata of [{}, { hf_repo: 'org/fallback', download_check: 'le
     assert.equal(existsSync(join(owner, 'legacy.bin')), false)
     rmSync(join(owner, 'assets/model.pt'))
     await assertDownloadedNode(f, false)
+  })
+}
+
+
+// Focused N1 coverage binds actual IPC closures, without the unrelated startup
+// graph or its legacy fixture stubs. Manifest discovery/planning stay real.
+function n1StorageFixture(t, nodes, afterPlanResolution) {
+  const root = mkdtempSync(join(tmpdir(), 'modly-n1-storage-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const settings = { modelsDir: join(root, 'models'), extensionsDir: join(root, 'extensions') }
+  mkdirSync(join(settings.extensionsDir, 'demo'), { recursive: true })
+  writeFileSync(join(settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({ id: 'demo', type: 'model', nodes }))
+  const effects = { reserve: 0, unload: 0, download: 0, remove: 0, cleanup: 0 }
+  const handlers = new Map()
+  const text = readFileSync('electron/main/ipc-handlers.ts', 'utf8')
+  function section(start, end) {
+    const from = text.indexOf(start), to = text.indexOf(end, from + start.length)
+    assert.ok(from >= 0 && to > from, `Missing actual N1 IPC closure: ${start}`)
+    return text.slice(from, to)
+  }
+  const compiled = transformSync(`
+function bind(deps) {
+  const { app, getSettings, getBuiltinExtensionsDir, listVisibleExtensions,
+    resolveModelOwnership, describeModelOwnership, resolveInstalledModelDownloadPlan,
+    activeExtensionInstalls, ipcMain, ModelAssetDownloadError,
+    legacyDownloadSteps, privateModelStorageId, resolveModelRoot, resolveWeightStorageRoot,
+    areModelSourcesDownloadedAtRoot, downloadModelFromHF, downloadModelSourcesFromHF,
+    downloadModelAssetsFromHF, downloadModelAssetsFromHttps, removePartialDownloadArtifacts,
+    weightOperations, unloadForRemoval, rmWithRetry, notifyWeightChange,
+    parseLegacyModelDownloadPayloadContract } = deps
+  const activeDownloads = new Map(), interruptedTargets = new Map()
+  const LOCKED_MODEL_FILES_ERROR = 'locked'
+  ${section('function modelAssetDownloadResult(', 'function createFallbackOwnership(')}
+  ${section('function createFallbackOwnership(', 'const rmWithRetry =')}
+  ${section('  const resolveModelPlan =', '  const LOCKED_MODEL_FILES_ERROR =')}
+  ${section('  const handleStructuredModelAssetDownload =', '  // Logging from renderer')}
+  ${section("  ipcMain.handle('model:delete',", "  ipcMain.handle('model:showInFolder'")}
+  ${section("  ipcMain.handle('model:downloadAssets'", "  ipcMain.handle('model:pauseDownload'")}
+  ${section("  ipcMain.handle('model:cancelDownload'", '  // Export mesh to GLB')}
+  return { activeDownloads, interruptedTargets }
+}`, { loader: 'ts', format: 'cjs' }).code
+  const operations = new realOperations.ModelWeightOperations()
+  const download = async () => { effects.download += 1 }
+  const state = moduleFromCode(compiled + '; module.exports = bind;')({
+    ...realSources, ...realPlan, ...realOwnership,
+    resolveInstalledModelDownloadPlan: async (args) => {
+      const plan = await realPlan.resolveInstalledModelDownloadPlan(args)
+      afterPlanResolution?.(args, plan)
+      return plan
+    },
+    listVisibleExtensions: realCapabilities.listVisibleExtensions,
+    app: { getPath: () => root }, getSettings: () => settings,
+    getBuiltinExtensionsDir: () => join(root, 'builtin'), activeExtensionInstalls: new Set(),
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    ModelAssetDownloadError: class extends Error { constructor(failure) { super(failure.message); this.failure = failure } },
+    parseLegacyModelDownloadPayloadContract: loadModule('electron/main/model-download-ipc-contract.ts').parseLegacyModelDownloadPayload,
+    downloadModelFromHF: download, downloadModelSourcesFromHF: download,
+    downloadModelAssetsFromHF: download, downloadModelAssetsFromHttps: download,
+    weightOperations: {
+      acquire(...args) { effects.reserve += 1; return operations.acquire(...args) },
+      remove(...args) { effects.reserve += 1; return operations.remove(...args) },
+    },
+    unloadForRemoval: async () => { effects.unload += 1 },
+    rmWithRetry: async () => { effects.remove += 1; return { ok: true } },
+    removePartialDownloadArtifacts: async () => { effects.cleanup += 1 },
+    notifyWeightChange: () => {},
+  })
+  const event = { sender: { send: () => {} } }
+  return { settings, state, effects,
+    invoke: (name, ...args) => handlers.get(`model:${name}`)(event, ...args),
+    visible: () => realCapabilities.listVisibleExtensions({ builtinDir: join(root, 'builtin'), userExtensionsDir: settings.extensionsDir, trustedRepos: new Set() }),
+  }
+}
+
+const n1LegacyWriteMetadata = {
+  hf_repo: 'org/model', download_check: 'base.bin',
+  params_schema: [{ id: 'variant', type: 'select', options: ['small'] }],
+  weight_variants: { param: 'variant', default: 'small', options: [{ id: 'small', include_prefixes: ['small/'], checks: ['small/weights.bin'] }] },
+}
+for (const order of [['Foo', 'foo'], ['foo', 'Foo']]) {
+  for (const action of ['download', 'downloadAssets', 'downloadHttpsAssets', 'delete', 'deleteWeightVariant', 'cancelDownload']) {
+    test(`N1 storage boundary rejects ${action} after visible case discovery: ${order.join(',')}`, async (t) => {
+      const metadata = action === 'downloadAssets' ? { hf_downloads: structuredHfAssets }
+        : action === 'downloadHttpsAssets' ? { https_downloads: [{ url: 'https://assets.example/weights.bin', filename: 'weights.bin', size_bytes: 1, sha256: 'a'.repeat(64) }] }
+          : n1LegacyWriteMetadata
+      const f = n1StorageFixture(t, order.map((id) => ({ id, ...metadata })))
+      assert.deepEqual(Array.from((await f.visible())[0].nodes, (node) => node.id), order)
+      const modelId = 'demo/Foo'
+      const payload = action === 'downloadAssets' || action === 'downloadHttpsAssets' ? { modelId } : modelId
+      const result = await f.invoke(action, payload, ...(action === 'deleteWeightVariant' ? ['small'] : []))
+      assert.equal(result.success, false)
+      assert.match(result.error, /portable-unique|overlaps/)
+      assert.deepEqual(f.effects, { reserve: 0, unload: 0, download: 0, remove: 0, cleanup: 0 })
+      assert.equal(f.state.activeDownloads.size, 0)
+      assert.equal(f.state.interruptedTargets.size, 0)
+      assert.equal(existsSync(f.settings.modelsDir), false)
+    })
+  }
+}
+
+test('N1 storage boundary preserves safe exact-case ordinary downloads', async (t) => {
+  const f = n1StorageFixture(t, [{ id: 'Foo', ...n1LegacyWriteMetadata }])
+  assert.deepEqual(Array.from((await f.visible())[0].nodes, (node) => node.id), ['Foo'])
+  assert.equal((await f.invoke('download', 'demo/Foo', 'small')).success, true)
+  assert.equal(f.effects.reserve, 1)
+  assert.equal(f.effects.download, 2)
+  assert.equal(f.state.activeDownloads.size, 0)
+})
+
+for (const action of ['download', 'downloadAssets', 'downloadHttpsAssets', 'delete', 'deleteWeightVariant', 'cancelDownload']) {
+  test(`N1 storage boundary rejects ${action} from user collision despite safe builtin duplicate`, async (t) => {
+    const metadata = action === 'downloadAssets' ? { hf_downloads: structuredHfAssets }
+      : action === 'downloadHttpsAssets' ? { https_downloads: [{ url: 'https://assets.example/weights.bin', filename: 'weights.bin', size_bytes: 1, sha256: 'a'.repeat(64) }] }
+        : n1LegacyWriteMetadata
+    const f = n1StorageFixture(t, ['Foo', 'foo'].map((id) => ({ id, ...metadata })))
+    const builtin = join(f.settings.extensionsDir, '..', 'builtin', 'demo')
+    mkdirSync(builtin, { recursive: true })
+    writeFileSync(join(builtin, 'manifest.json'), JSON.stringify({ id: 'demo', type: 'model', nodes: [{ id: 'Foo', ...metadata }] }))
+    assert.deepEqual(Array.from(await f.visible(), (extension) => Array.from(extension.nodes, (node) => node.id)), [['Foo'], ['Foo', 'foo']])
+    const payload = action === 'downloadAssets' || action === 'downloadHttpsAssets' ? { modelId: 'demo/Foo' } : 'demo/Foo'
+    const result = await f.invoke(action, payload, ...(action === 'deleteWeightVariant' ? ['small'] : []))
+    assert.equal(result.success, false)
+    assert.match(result.error, /portable-unique|overlaps/)
+    assert.deepEqual(f.effects, { reserve: 0, unload: 0, download: 0, remove: 0, cleanup: 0 })
+    assert.equal(f.state.activeDownloads.size, 0)
+    assert.equal(f.state.interruptedTargets.size, 0)
+    assert.equal(existsSync(f.settings.modelsDir), false)
+  })
+}
+
+for (const action of ['download', 'delete', 'deleteWeightVariant', 'cancelDownload']) {
+  test(`N1 storage boundary revalidates ${action} when manifest changes after strict read`, async (t) => {
+    let reads = 0
+    const f = n1StorageFixture(t, [{ id: 'Foo', ...n1LegacyWriteMetadata }], (args) => {
+      reads += 1
+      assert.equal(args.validateStorageOwnership, true)
+      if (reads === 1) {
+        writeFileSync(join(f.settings.extensionsDir, 'demo/manifest.json'), JSON.stringify({
+          id: 'demo', type: 'model', nodes: ['Foo', 'foo'].map((id) => ({ id, ...n1LegacyWriteMetadata })),
+        }))
+      }
+    })
+    const result = await f.invoke(action, 'demo/Foo', ...(action === 'deleteWeightVariant' ? ['small'] : []))
+    assert.equal(result.success, false)
+    assert.match(result.error, /portable-unique|overlaps/)
+    assert.equal(reads, 1) // The subsequent real resolver rejects before returning a plan.
+    assert.deepEqual(f.effects, { reserve: 0, unload: 0, download: 0, remove: 0, cleanup: 0 })
+    assert.equal(f.state.activeDownloads.size, 0)
+    assert.equal(f.state.interruptedTargets.size, 0)
+    assert.equal(existsSync(f.settings.modelsDir), false)
   })
 }

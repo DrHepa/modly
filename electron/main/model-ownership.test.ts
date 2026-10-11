@@ -5,10 +5,12 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import type { ParsedManifest } from './automation-capabilities'
 
-const { parseExtensionManifest } = await import(new URL('./automation-capabilities.ts', import.meta.url).href)
+const { parseExtensionManifest }: typeof import('./automation-capabilities') = await import(new URL('./automation-capabilities.ts', import.meta.url).href)
 const {
   createOwnerScopedDeletePlan,
+  describeModelOwnership,
   createExtensionUninstallCleanupPlan,
   deleteOwnedModelPaths,
   getCanonicalModelPath,
@@ -1010,4 +1012,110 @@ test('owner-scoped readiness accepts a valid existing model directory', async ()
       legacyPaths: ['valid-model/generate'], downloadCheck: 'weights.bin',
     }), true)
   })
+})
+
+
+// N1 pure model parsing is visibility, not installed-state or write authority.
+const n1CaseSpellings = ['foo', 'foO', 'fOo', 'fOO', 'Foo', 'FoO', 'FOo', 'FOO']
+const n1CaseOrders = [n1CaseSpellings, [...n1CaseSpellings].reverse()].flatMap((spellings) =>
+  spellings.map((_, offset) => [...spellings.slice(offset), ...spellings.slice(0, offset)]),
+)
+const n1ThreeNodeOrders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+const n1Source = { id: 'payload', provider: 'huggingface', repo_id: 'org/model', destination: '.', checks: ['weights.bin'] }
+const n1LegacyMetadata: Array<[string, Partial<NonNullable<ParsedManifest['nodes']>[number]>]> = [
+  ['plain', {}],
+  ['hf', { hf_repo: 'org/model', download_check: 'base.bin' }],
+  ['variants', {
+    hf_repo: 'org/model', download_check: 'base.bin',
+    params_schema: [{ id: 'variant', type: 'select', options: ['small'] }],
+    weight_variants: {
+      param: 'variant', default: 'small',
+      options: [{ id: 'small', label: 'small', include_prefixes: ['small/'], checks: ['small/weights.bin'] }],
+    },
+  }],
+  ['structured', {
+    hf_downloads: [{ repo_id: 'org/model', revision: 'a'.repeat(40), target_subdir: 'assets', files: [{ path: 'weights.bin' }] }],
+  }],
+]
+
+for (const order of n1CaseOrders) {
+  test(`N1 read-only discovery retains every implicit case member: ${order.join(',')}`, () => {
+    const parsed = parseExtensionManifest({
+      id: 'n1-legacy-cases', type: 'model',
+      nodes: order.map((id) => ({ id, hf_repo: 'org/model', download_check: 'base.bin' })),
+    }, 'n1-legacy-cases', new Set(), false)
+    assert.deepEqual(parsed.nodes.map((node) => ({
+      id: node.id, capabilityId: node.capabilityId, weightOwnerId: node.weightOwnerId,
+      sharedOwner: node.sharedOwner, legacyPaths: node.legacyPaths,
+    })), order.map((id) => ({
+      id, capabilityId: `n1-legacy-cases/${id}`, weightOwnerId: `n1-legacy-cases/${id}`,
+      sharedOwner: false, legacyPaths: [`n1-legacy-cases/${id}`],
+    })))
+  })
+}
+
+for (const [label, metadata] of n1LegacyMetadata) {
+  test(`N1 read-only discovery keeps unprovisioned legacy metadata: ${label}`, () => {
+    const parsed = parseExtensionManifest({
+      id: 'n1-legacy-cases', type: 'model',
+      nodes: ['Foo', 'foo'].map((id) => ({ ...metadata, id })),
+    }, 'n1-legacy-cases', new Set(), false)
+    assert.deepEqual(parsed.nodes.map((node) => node.capabilityId), ['n1-legacy-cases/Foo', 'n1-legacy-cases/foo'])
+    for (const node of parsed.nodes) {
+      assert.equal(node.weightOwnerId, node.capabilityId)
+      assert.deepEqual(node.legacyPaths, [node.capabilityId])
+      if (metadata.hf_repo) assert.equal(node.hfRepo, metadata.hf_repo)
+      if (metadata.download_check) assert.equal(node.downloadCheck, metadata.download_check)
+      if (metadata.weight_variants) assert.deepEqual(node.weightVariants, {
+        param: 'variant', default: 'small',
+        options: [{ id: 'small', label: 'small', sizeGb: undefined, vramGb: undefined }],
+      })
+      if (metadata.hf_downloads) {
+        assert.deepEqual(node.hfDownloads, [{ repoId: 'org/model', revision: 'a'.repeat(40), targetSubdir: 'assets', files: [{ path: 'weights.bin' }] }])
+      }
+    }
+  })
+}
+
+for (const order of n1ThreeNodeOrders) {
+  test(`N1 read-only discovery unrelated explicit owner leaves implicit cases visible: ${order.join(',')}`, () => {
+    const nodes = [{ id: 'Foo' }, { id: 'foo' }, { id: 'other', weight_owner_id: 'Shared' }]
+    const parsed = parseExtensionManifest({ id: 'n1-legacy-cases', type: 'model', nodes: order.map((index) => nodes[index]) }, 'n1-legacy-cases', new Set())
+    assert.equal(parsed.nodes.length, 3)
+    for (const id of ['Foo', 'foo']) {
+      const node = parsed.nodes.find((candidate) => candidate.id === id)
+      assert.ok(node)
+      assert.equal(node.weightOwnerId, `n1-legacy-cases/${id}`)
+      assert.deepEqual(node.legacyPaths, [`n1-legacy-cases/${id}`])
+    }
+    assert.equal(parsed.nodes.find((node) => node.id === 'other')?.weightOwnerId, 'n1-legacy-cases/Shared')
+  })
+}
+
+for (const owner of ['FOO', 'Foo', 'foo']) {
+  for (const order of n1ThreeNodeOrders) {
+    test(`N1 read-only discovery rejects protected third member: ${owner}/${order.join(',')}`, () => {
+      const nodes = [{ id: 'Foo' }, { id: 'foo' }, { id: 'third', weight_owner_id: owner }]
+      assert.throws(() => parseExtensionManifest({
+        id: 'n1-legacy-cases', type: 'model', nodes: order.map((index) => nodes[index]),
+      }, 'n1-legacy-cases', new Set()), /portable|overlap/i)
+    })
+  }
+}
+
+for (const managedKind of ['model_sources', 'shared_group']) {
+  for (const order of n1ThreeNodeOrders) {
+    test(`N1 read-only discovery retains managed manifest-wide identity guard: ${managedKind}/${order.join(',')}`, () => {
+      const third = managedKind === 'model_sources' ? { id: 'third', model_sources: [n1Source] } : { id: 'third', weight_groups: ['common'] }
+      const nodes = [{ id: 'Foo' }, { id: 'foo' }, third]
+      assert.throws(() => parseExtensionManifest({
+        id: 'n1-legacy-cases', type: 'model', nodes: order.map((index) => nodes[index]),
+        ...(managedKind === 'shared_group' ? { weight_groups: [{ id: 'common', model_sources: [n1Source] }] } : {}),
+      }, 'n1-legacy-cases', new Set()), /portable|duplicate/i)
+    })
+  }
+}
+
+test('N1 read-only discovery does not relax the default strict storage owner helper', () => {
+  assert.throws(() => describeModelOwnership('n1-legacy-cases', n1CaseSpellings.map((id) => ({ id }))), /portable|overlap/i)
 })

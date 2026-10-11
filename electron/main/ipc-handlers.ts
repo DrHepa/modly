@@ -243,8 +243,29 @@ async function listModelExtensions(userData: string) {
   })
 }
 
-async function resolveOwnershipContext(userData: string, capabilityId: string) {
+async function resolveOwnershipContext(userData: string, capabilityId: string, forStorage = false) {
   const extensions = await listModelExtensions(userData)
+  if (forStorage) {
+    // Use the same installed user-first manifest selection as the write plan,
+    // never a builtin-first visibility descriptor for a same-id user install.
+    const plan = await resolveInstalledModelDownloadPlan({
+      modelId: capabilityId,
+      userExtensionsDir: getSettings(userData).extensionsDir,
+      builtinExtensionsDir: getBuiltinExtensionsDir(),
+      blockedExtensionIds: activeExtensionInstalls,
+      validateStorageOwnership: true,
+    })
+    if (!plan.ownership) {
+      throw new Error(`Model ownership is unavailable or not portable-unique for storage: ${capabilityId}`)
+    }
+    const ownership = {
+      ...plan.ownership,
+      ...(plan.kind === 'hf-assets' ? { hfDownloads: plan.hfDownloads } : {}),
+      ...(plan.kind === 'https-assets' ? { httpsDownloads: plan.httpsDownloads } : {}),
+    }
+    return { extensions, ownership,
+      siblingCapabilityIds: ownership.legacyPaths.filter((id) => id !== capabilityId) }
+  }
   const ownership = resolveModelOwnership(extensions, capabilityId) ?? createFallbackOwnership(capabilityId)
   const siblingCapabilityIds = extensions
     .filter((extension) => extension.type === 'model')
@@ -506,11 +527,12 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     }
     await unloadForRemoval(modelIds)
   }
-  const resolveModelPlan = (modelId: unknown) => resolveInstalledModelDownloadPlan({
+  const resolveModelPlan = (modelId: unknown, validateStorageOwnership = false) => resolveInstalledModelDownloadPlan({
     modelId,
     userExtensionsDir: getSettings(app.getPath('userData')).extensionsDir,
     builtinExtensionsDir: getBuiltinExtensionsDir(),
     blockedExtensionIds: activeExtensionInstalls,
+    validateStorageOwnership,
   })
   const ownerPeers = (plan: Awaited<ReturnType<typeof resolveModelPlan>>) =>
     plan.ownership?.legacyPaths.filter((id) => id !== plan.modelId) ?? []
@@ -702,7 +724,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       if (activeExtensionInstalls.has(extensionId)) {
         throw new Error(`Extension "${extensionId}" is being installed or repaired`)
       }
-      const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      const { ownership } = await resolveOwnershipContext(app.getPath('userData'), modelId, true)
       targetOwnerId = ownership.weightOwnerId
       const modelsDir = getSettings(app.getPath('userData')).modelsDir
       targetRoots = [...new Set([ownership.weightOwnerId, ...ownership.legacyPaths])]
@@ -985,9 +1007,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     }
     let targets: string[]
     try {
-      const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(app.getPath('userData'), modelId)
+      const { ownership, siblingCapabilityIds } = await resolveOwnershipContext(app.getPath('userData'), modelId, true)
       const structured = Boolean(ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
-      const plan = structured ? null : await resolveModelPlan(modelId)
+      const plan = structured ? null : await resolveModelPlan(modelId, true)
       const peers = plan ? ownerPeers(plan) : siblingCapabilityIds
       if (peers.length > 0) {
         const warning = plan ? ownerDeleteWarning(plan)
@@ -1027,7 +1049,8 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       return { success: false, error: 'Cannot remove model weights while their download is active' }
     }
     try {
-      const plan = await resolveModelPlan(modelId)
+      await resolveOwnershipContext(app.getPath('userData'), modelId, true)
+      const plan = await resolveModelPlan(modelId, true)
       if (ownerPeers(plan).length > 0) return { success: false, error: ownerDeleteWarning(plan) }
       const variant = plan.kind === 'legacy'
         ? plan.weightVariants?.options.find((option) => option.id === variantId)
@@ -1286,7 +1309,8 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       let plan: Awaited<ReturnType<typeof resolveInstalledModelDownloadPlan>>
       let legacySteps: ReturnType<typeof legacyDownloadSteps> = []
       try {
-        plan = await resolveModelPlan(modelId)
+        await resolveOwnershipContext(app.getPath('userData'), modelId, true)
+        plan = await resolveModelPlan(modelId, true)
         if (requireMultiSource && plan.kind !== 'multi-source') {
           throw new Error(`Model node "${modelId}" does not declare model_sources`)
         }
@@ -1463,9 +1487,15 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           clearTimeout(timer)
         }
       }
-      const roots = (active?.targetRoots.length ? active.targetRoots : interruptedTargets.get(modelId)) ?? [resolveModelRoot(
-        getSettings(app.getPath('userData')).modelsDir, (await resolveModelPlan(modelId)).ownership?.weightOwnerId ?? modelId,
-      )]
+      let roots = active?.targetRoots.length ? active.targetRoots : interruptedTargets.get(modelId)
+      if (!roots) {
+        // Pinned sessions retain their authorised targets. A fallback cleanup
+        // must never infer write authority from a read-only descriptor.
+        await resolveOwnershipContext(app.getPath('userData'), modelId, true)
+        roots = [resolveModelRoot(
+          getSettings(app.getPath('userData')).modelsDir, (await resolveModelPlan(modelId, true)).ownership?.weightOwnerId ?? modelId,
+        )]
+      }
       // Another sibling may have resumed these targets after our session stopped.
       const release = weightOperations.acquire(`cancelling ${modelId}`, roots)
       try {

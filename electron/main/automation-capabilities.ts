@@ -691,7 +691,7 @@ export function parseExtensionManifest(
   if (weightGroups || parsed.nodes?.some((node) => node.model_sources !== undefined || node.weight_groups !== undefined)) {
     validateModelNodeIds(parsed.nodes ?? [])
   }
-  const ownership = describeModelOwnership(common.id, parsed.nodes ?? [])
+  const ownership = describeModelOwnership(common.id, parsed.nodes ?? [], parsed.type === 'process' ? 'storage' : 'discovery')
   const nodes = (parsed.nodes ?? []).map((n, index) => {
     if (options.governedAgentKinds && n.agent !== undefined && n.input !== undefined && n.input !== 'none'
       && !GOVERNED_AGENT_ARTIFACT_KINDS.has(n.input as ArtifactKind)) {

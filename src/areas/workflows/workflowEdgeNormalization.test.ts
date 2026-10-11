@@ -3,8 +3,8 @@ import test from 'node:test'
 import type { WFEdge, WFNode } from '../../shared/types/electron.d'
 import type { WorkflowExtension } from './mockExtensions.ts'
 
-const { normalizeWorkflowEdges } = await import(new URL('./workflowEdgeNormalization.ts', import.meta.url).href)
-const { buildProcessExecutionInput } = await import(new URL('./processExecution.ts', import.meta.url).href)
+const { normalizeWorkflowEdges } = await import(new URL('./workflowEdgeNormalization.ts', import.meta.url).href) as typeof import('./workflowEdgeNormalization.ts')
+const { buildProcessExecutionInput } = await import(new URL('./processExecution.ts', import.meta.url).href) as typeof import('./processExecution.ts')
 
 function createNode(id: string, type: WFNode['type'], data: WFNode['data'] = { enabled: true, params: {} }): WFNode {
   return {

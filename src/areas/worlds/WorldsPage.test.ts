@@ -11,6 +11,7 @@ import React, { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import { normalizeWorldsSelectedSceneItemIds, toggleWorldsSelectedSceneItem, useWorldsSceneStore } from './worldsSceneStore.ts'
+import type { WorldSceneItem } from './worldRenderableResolver.ts'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const worldsRoot = path.join(projectRoot, 'src/areas/worlds')
@@ -223,7 +224,7 @@ function asset(id: string, name: string) {
       role: 'asset',
       visible: true,
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
-    },
+    } satisfies WorldSceneItem,
   }
 }
 

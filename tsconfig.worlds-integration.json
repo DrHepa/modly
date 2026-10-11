@@ -9,7 +9,8 @@
   "files": [
     "src/areas/worlds/components/WorldsWorkbench.diskWorkflow.test.ts",
     "src/areas/worlds/components/WorldsWorkbench.playablePortalLoop.mounted.test.ts",
-    "src/areas/worlds/editor/worldEditorRepositoryIntegration.test.ts"
+    "src/areas/worlds/editor/worldEditorRepositoryIntegration.test.ts",
+    "src/areas/workflows/processPorts.test.ts"
   ],
   "include": ["src/vite-env.d.ts", "src/shared/types/**/*.d.ts"],
   "exclude": []

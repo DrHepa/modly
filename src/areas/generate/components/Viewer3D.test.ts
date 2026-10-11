@@ -9,8 +9,25 @@ import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build, type Plugin } from 'esbuild'
 import * as THREE from 'three'
+import { MeshBVH, type BVHOptions } from 'three-mesh-bvh'
 import { createMotionRetargetSession, type CreateMotionRetargetSessionInput } from '../motionRetargetPlan.ts'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+
+interface RootBvhFixtureFields {
+  boundsTree: MeshBVH
+  computeBoundsTree: (options?: BVHOptions) => MeshBVH
+}
+
+function defineRootBvhFixtureField<K extends keyof RootBvhFixtureFields>(
+  geometry: THREE.BufferGeometry,
+  key: K,
+  value: RootBvhFixtureFields[K],
+): void {
+  const descriptor: TypedPropertyDescriptor<RootBvhFixtureFields[K]> = {
+    value, configurable: true, writable: true, enumerable: true,
+  }
+  Object.defineProperty(geometry, key, descriptor)
+}
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const viewer3DEntry = path.join(projectRoot, 'src/areas/generate/components/Viewer3D.tsx')
@@ -251,10 +268,10 @@ test('Viewer3D material cleanup survives effect replay and never consumes transi
 test('Viewer3D managed BVH references keep foreign trees and release only the exact last-owned tree', async () => {
   const { module, cleanup } = await loadViewer3DModule()
   try {
-    const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
-    const tree = {}, foreignTree = {}
+    const geometry = new THREE.BoxGeometry()
+    const tree = new MeshBVH(geometry, { indirect: true }), foreignTree = new MeshBVH(geometry, { indirect: true })
     let builds = 0, releases = 0
-    geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = tree }
+    defineRootBvhFixtureField(geometry, 'computeBoundsTree', options => { assert.deepEqual(options, { indirect: true }); builds++; defineRootBvhFixtureField(geometry, 'boundsTree', tree); return tree })
     geometry.disposeBoundsTree = () => { assert.equal(geometry.boundsTree, tree); releases++; delete geometry.boundsTree }
     assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
     assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
@@ -263,13 +280,13 @@ test('Viewer3D managed BVH references keep foreign trees and release only the ex
     assert.equal(geometry.boundsTree, tree)
     assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), true)
     assert.equal(releases, 1)
-    geometry.boundsTree = foreignTree
+    defineRootBvhFixtureField(geometry, 'boundsTree', foreignTree)
     assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), false)
     assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), false)
     assert.equal(geometry.boundsTree, foreignTree)
     delete geometry.boundsTree
     assert.equal(module.acquireViewer3DManagedBoundsTree(geometry), true)
-    geometry.boundsTree = foreignTree
+    defineRootBvhFixtureField(geometry, 'boundsTree', foreignTree)
     assert.equal(module.releaseViewer3DManagedBoundsTree(geometry), false)
     assert.equal(geometry.boundsTree, foreignTree); assert.equal(releases, 1)
   } finally { await cleanup() }
@@ -280,7 +297,7 @@ test('Viewer3D optional BVH construction failures preserve fallback raycasting',
   const warnings: unknown[][] = []
   t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args) })
   try {
-    const rejected = new THREE.BoxGeometry() as THREE.BufferGeometry & { computeBoundsTree?: () => void; boundsTree?: unknown }
+    const rejected = new THREE.BoxGeometry()
     rejected.computeBoundsTree = () => { throw new Error('Synthetic unsupported geometry') }
     assert.equal(module.acquireViewer3DManagedBoundsTree(rejected), false)
     assert.equal(module.releaseViewer3DManagedBoundsTree(rejected), false)
@@ -290,7 +307,7 @@ test('Viewer3D optional BVH construction failures preserve fallback raycasting',
     // Exercise the installed constructor's missing-position rejection with CPU data only.
     assert.equal(module.acquireViewer3DManagedBoundsTree(new THREE.BufferGeometry()), false)
     assert.equal(warnings.length, 2)
-    const externalTree = {}; rejected.boundsTree = externalTree
+    const externalTree = new MeshBVH(rejected, { indirect: true }); defineRootBvhFixtureField(rejected, 'boundsTree', externalTree)
     assert.equal(module.acquireViewer3DManagedBoundsTree(rejected), false)
     assert.equal(module.releaseViewer3DManagedBoundsTree(rejected), false)
     assert.equal(rejected.boundsTree, externalTree)

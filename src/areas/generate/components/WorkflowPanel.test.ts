@@ -629,7 +629,6 @@ test('WorkflowRunFooter renders the real Generate CTA for unpinned paused landma
   const html = await renderWorkflowRunFooter({
     primaryAction: { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Finish all landmarks to continue', disabled: true },
     runState: { status: 'paused', blockIndex: 0, blockTotal: 1, blockProgress: 0, blockStep: '' },
-    runValidationIssue: null,
     isRunning: true,
     onGenerate: () => {},
     onCancel: () => {},
@@ -645,7 +644,6 @@ test('WorkflowRunFooter renders enabled Continue and Clear for completed unpinne
   const html = await renderWorkflowRunFooter({
     primaryAction: { kind: 'continue-landmarks', nodeId: 'landmarks-node', label: 'Continue workflow', disabled: false },
     runState: { status: 'paused', blockIndex: 0, blockTotal: 1, blockProgress: 0, blockStep: '' },
-    runValidationIssue: null,
     isRunning: true,
     landmarkClearAction: { kind: 'clear-landmarks', owner: { nodeId: 'landmarks-node', runId: 'run', inputArtifactId: 'mesh', inputVersionId: 'v1', revision: 1 }, disabled: false },
     onGenerate: () => {},

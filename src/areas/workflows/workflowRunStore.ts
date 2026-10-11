@@ -1773,6 +1773,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         // re-iterations then execute only those members and skip everything else in
         // the range. null = first pass / no active loop (run all nodes once).
         let activeLoopBody: Set<string> | null = null
+        const getActiveLoopBody = (): Set<string> | null => activeLoopBody
 
         // End-of-body handler for While containers. Called after each pre-phase node;
         // when the index is a loop's last body node, it either jumps back (auto N× or
@@ -1876,7 +1877,8 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
           if (!isCurrentContext(ctx)) return
           const node = preExecExtNodes[i]
           // During a loop replay, only re-run the active loop's body members.
-          if (activeLoopBody && !activeLoopBody.has(node.id)) continue
+          const loopBody = getActiveLoopBody()
+          if (loopBody && !loopBody.has(node.id)) continue
           set((s) => ({
             activeNodeId: node.id,
             runState: { ...s.runState, blockIndex: stepsDone, blockProgress: 0, blockStep: 'Starting…' },

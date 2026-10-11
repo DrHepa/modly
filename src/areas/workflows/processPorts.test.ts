@@ -108,7 +108,10 @@ for (const type of ['model', 'process']) {
       validateInstallManifest(manifest, { hasEntryFile: () => true, hasGeneratorFile: () => true }, 'inert label fixture')
       const parsed = parseExtensionManifest(manifest, 'label-boundary', new Set(), false)
       assert.equal(parsed.type, type)
-      const [owner] = parsed.type === 'model' ? buildAllWorkflowExtensions([parsed], []) : buildAllWorkflowExtensions([], [parsed])
+      const nodes = parsed.nodes.map(node => ({ ...node, paramsSchema: [], paramDefaults: {} }))
+      const [owner] = parsed.type === 'model'
+        ? buildAllWorkflowExtensions([{ ...parsed, nodes }], [])
+        : buildAllWorkflowExtensions([], [{ ...parsed, nodes }])
       const ports = getProcessTargetPorts(owner)
       assert.deepEqual(ports, [
         { name: 'stable-front', type: 'image', required: false, isLegacy: false },

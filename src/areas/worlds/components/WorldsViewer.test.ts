@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 import { createElement } from 'react'
 import * as THREE from 'three'
+import { MeshBVH, type BVHOptions } from 'three-mesh-bvh'
 
 import { build } from 'esbuild'
 import type { ComponentType, ReactElement, Ref } from 'react'
@@ -31,6 +32,22 @@ import type { WorldEditorRunCollisionInput } from '../editor/worldEditorRunColli
 const require = createRequire(import.meta.url)
 const React = require('react') as typeof import('react')
 const Reconciler = require('react-reconciler')
+
+interface RootBvhFixtureFields {
+  boundsTree: MeshBVH
+  computeBoundsTree: (options?: BVHOptions) => MeshBVH
+}
+
+function defineRootBvhFixtureField<K extends keyof RootBvhFixtureFields>(
+  geometry: THREE.BufferGeometry,
+  key: K,
+  value: RootBvhFixtureFields[K],
+): void {
+  const descriptor: TypedPropertyDescriptor<RootBvhFixtureFields[K]> = {
+    value, configurable: true, writable: true, enumerable: true,
+  }
+  Object.defineProperty(geometry, key, descriptor)
+}
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const worldsRoot = path.join(projectRoot, 'src/areas/worlds')
@@ -3888,7 +3905,8 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     const object = node.object3D
     if (!object) return
     object.position.fromArray(node.props.position ?? [0, 0, 0])
-    object.rotation.fromArray([...(node.props.rotation ?? [0, 0, 0]), 'XYZ'])
+    const rotation = node.props.rotation ?? [0, 0, 0]
+    object.rotation.fromArray([rotation[0], rotation[1], rotation[2], 'XYZ'])
     object.scale.fromArray(node.props.scale ?? [1, 1, 1])
     object.userData = node.props.userData ?? {}
     syncVisibility(node)
@@ -4185,9 +4203,9 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
 test('WorldsViewer instance construction is render-pure and cloned-material disposal is idempotent', async () => {
   const { module, cleanup } = await loadViewerModule()
   const source = new THREE.Group(), material = new THREE.MeshBasicMaterial({ side: THREE.FrontSide })
-  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: () => void }
+  const geometry = new THREE.BoxGeometry()
   let builds = 0, sourceDisposals = 0, cloneDisposals = 0
-  geometry.computeBoundsTree = () => { builds++; geometry.boundsTree = {} }
+  defineRootBvhFixtureField(geometry, 'computeBoundsTree', () => { builds++; const tree = new MeshBVH(geometry, { indirect: true }); defineRootBvhFixtureField(geometry, 'boundsTree', tree); return tree })
   material.addEventListener('dispose', () => sourceDisposals++)
   source.add(new THREE.Mesh(geometry, material))
   try {
@@ -4209,7 +4227,7 @@ test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects rep
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ strictEffects: true })
   const globals = globalThis as any, previousGltf = globals.__worldsGltf
   const source = new THREE.Group(), material = new THREE.MeshBasicMaterial({ side: THREE.FrontSide })
-  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  const geometry = new THREE.BoxGeometry()
   let builds = 0, releases = 0, sourceDisposals = 0, setups = 0, cleanups = 0
   const cloneDisposals = new Map<THREE.Material, number>(), idle: Array<() => void> = [], cancelled = new Set<number>()
   const originalClone = material.clone.bind(material)
@@ -4219,7 +4237,7 @@ test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects rep
     return clone
   }
   material.addEventListener('dispose', () => sourceDisposals++)
-  geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = {} }
+  defineRootBvhFixtureField(geometry, 'computeBoundsTree', options => { assert.deepEqual(options, { indirect: true }); builds++; const tree = new MeshBVH(geometry, { indirect: true }); defineRootBvhFixtureField(geometry, 'boundsTree', tree); return tree })
   geometry.disposeBoundsTree = () => { releases++; delete geometry.boundsTree }
   source.add(new THREE.Mesh(geometry, material))
   Object.assign(cpu.windowEvents, {
@@ -4249,10 +4267,10 @@ test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects rep
 
 test('WorldsViewer scheduled BVH cancellation releases exact shared owners and preserves foreign replacement trees', async () => {
   const { module, cleanup } = await loadViewerModule()
-  const geometry = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  const geometry = new THREE.BoxGeometry()
   const material = new THREE.MeshBasicMaterial(), source = new THREE.Group(), scheduled: Array<() => void> = []
   let builds = 0, releases = 0
-  geometry.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); builds++; geometry.boundsTree = { build: builds } }
+  defineRootBvhFixtureField(geometry, 'computeBoundsTree', options => { assert.deepEqual(options, { indirect: true }); builds++; const tree = new MeshBVH(geometry, { indirect: true }); defineRootBvhFixtureField(geometry, 'boundsTree', tree); return tree })
   geometry.disposeBoundsTree = () => { releases++; delete geometry.boundsTree }
   source.add(new THREE.Mesh(geometry, material), new THREE.Mesh(geometry, material))
   const schedule = (callback: () => void) => { scheduled.push(callback); return { cancel: () => undefined } }
@@ -4263,7 +4281,7 @@ test('WorldsViewer scheduled BVH cancellation releases exact shared owners and p
     b.cancel(); b.release(); assert.equal(releases, 1, 'cancel after build must release, not leak')
     const c = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
     scheduled.splice(0).forEach(run => run())
-    const foreign = {}; geometry.boundsTree = foreign; c.release()
+    const foreign = new MeshBVH(geometry, { indirect: true }); defineRootBvhFixtureField(geometry, 'boundsTree', foreign); c.release()
     assert.equal(geometry.boundsTree, foreign); assert.equal(releases, 1)
     const d = module.scheduleWorldsSceneBoundsTreeBuild(source, schedule)
     scheduled.splice(0).forEach(run => run()); d.release()
@@ -4297,15 +4315,15 @@ test('WorldsViewer installed BVH construction keeps synthetic authored index and
 
 test('WorldsViewer optional BVH failures preserve valid sibling acceleration and ordinary mesh raycasting', async t => {
   const { module, cleanup } = await loadViewerModule(), source = new THREE.Group(), material = new THREE.MeshBasicMaterial()
-  const rejected = new THREE.BoxGeometry() as THREE.BufferGeometry & { computeBoundsTree?: () => void }, valid = new THREE.BoxGeometry() as THREE.BufferGeometry & { boundsTree?: unknown; computeBoundsTree?: (options: unknown) => void; disposeBoundsTree?: () => void }
+  const rejected = new THREE.BoxGeometry(), valid = new THREE.BoxGeometry()
   const warnings: unknown[][] = [], scheduled: Array<() => void> = []; let releases = 0
   t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args) })
   rejected.computeBoundsTree = () => { throw new Error('Synthetic unsupported geometry') }
-  valid.computeBoundsTree = options => { assert.deepEqual(options, { indirect: true }); valid.boundsTree = {} }
+  defineRootBvhFixtureField(valid, 'computeBoundsTree', options => { assert.deepEqual(options, { indirect: true }); const tree = new MeshBVH(valid, { indirect: true }); defineRootBvhFixtureField(valid, 'boundsTree', tree); return tree })
   valid.disposeBoundsTree = () => { releases++; delete valid.boundsTree }
   const rejectedMesh = new THREE.Mesh(rejected, material); source.add(rejectedMesh, new THREE.Mesh(valid, material))
   try {
-    const task = module.scheduleWorldsSceneBoundsTreeBuild(source, callback => { scheduled.push(callback); return { cancel: () => undefined } })
+    const task = module.scheduleWorldsSceneBoundsTreeBuild(source, (callback: () => void) => { scheduled.push(callback); return { cancel: () => undefined } })
     assert.doesNotThrow(() => scheduled[0]()); assert.equal(warnings.length, 1); assert.ok(valid.boundsTree)
     const hits = new THREE.Raycaster(new THREE.Vector3(0, 0, 2), new THREE.Vector3(0, 0, -1)).intersectObject(rejectedMesh)
     assert.ok(hits.length > 0, 'failed optional acceleration retains installed fallback raycasting')

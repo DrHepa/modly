@@ -293,7 +293,7 @@ function createNamedImageModelExtension(overrides: Partial<WorkflowExtension> = 
   })
 }
 
-function createPositionalImageModelExtension(overrides: ModelWorkflowExtensionOverrides = {}): ModelWorkflowExtension {
+function createPositionalImageModelExtension(overrides: Partial<WorkflowExtension> = {}): WorkflowExtension {
   return createWorkflowExtension({
     id: 'legacy/dreamstyle',
     extensionId: 'legacy',
@@ -4405,7 +4405,9 @@ test('buildModelGenerationRequest creates a workspace-relative video request and
   })
 
   assert.deepEqual(new Set(Reflect.ownKeys(request)), new Set(['kind', 'videoPath', 'params']))
-  assert.deepEqual(new Set(Reflect.ownKeys(request.params as object)), new Set(['quality']))
+  assert.equal(request.kind, 'video')
+  if (request.kind !== 'video') throw new Error('Expected the video request variant')
+  assert.deepEqual(new Set(Reflect.ownKeys(request.params)), new Set(['quality']))
   assert.deepEqual(structuredClone(request), {
     kind: 'video',
     videoPath: 'Workflows/Inputs/Videos/turntable.mp4',
@@ -4421,7 +4423,9 @@ test('buildModelGenerationRequest creates a workspace-relative video request and
   })
 
   assert.deepEqual(new Set(Reflect.ownKeys(collidingPrefixRequest)), new Set(['kind', 'videoPath', 'params']))
-  assert.deepEqual(new Set(Reflect.ownKeys(collidingPrefixRequest.params as object)), new Set(['quality']))
+  assert.equal(collidingPrefixRequest.kind, 'video')
+  if (collidingPrefixRequest.kind !== 'video') throw new Error('Expected the video request variant')
+  assert.deepEqual(new Set(Reflect.ownKeys(collidingPrefixRequest.params)), new Set(['quality']))
   assert.deepEqual(structuredClone(collidingPrefixRequest), {
     kind: 'video',
     videoPath: '/workspace2/Workflows/Inputs/Videos/turntable.mp4',

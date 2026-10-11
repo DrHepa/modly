@@ -10,6 +10,7 @@ import { build, type Plugin } from 'esbuild'
 import { JSDOM } from 'jsdom'
 import React from 'react'
 import ts from 'typescript'
+import type { AgentSession, AgentSessionsApi } from '../../../shared/types/agentSessions.ts'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
 const chatPanelEntry = path.join(projectRoot, 'src/areas/generate/components/ChatPanel.tsx')
@@ -54,9 +55,10 @@ async function loadChatPanelModule(options: { agentSettings?: Record<string, unk
   const tempDir = await mkdtemp(path.join(tmpdir(), 'modly-chat-panel-'))
   const outfile = path.join(tempDir, 'ChatPanel.bundle.mjs')
   const previousLocalStorage = globalThis.localStorage
-  globalThis.localStorage = localStorageMock()
+  const fixtureLocalStorage = localStorageMock()
+  globalThis.localStorage = fixtureLocalStorage
   if (options.agentSettings) {
-    globalThis.localStorage.setItem('modly-agent-settings', JSON.stringify({ state: options.agentSettings, version: 0 }))
+    globalThis.localStorage.setItem('modly-agent-settings', JSON.stringify({ state: options.agentSettings, version: 3 }))
   }
 
   try {
@@ -85,11 +87,17 @@ async function loadChatPanelModule(options: { agentSettings?: Record<string, unk
       plugins: [aliasPlugin()],
     })
     const module = await import(pathToFileURL(outfile).href)
+    await module.useAgentStore.persist.rehydrate()
+    assert.equal(module.useAgentStore.persist.hasHydrated(), true)
     return {
       module,
       async cleanup() {
-        if (previousLocalStorage === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
-        else globalThis.localStorage = previousLocalStorage
+        // Let already-queued fixture persistence complete before releasing its storage.
+        await Promise.resolve()
+        if (globalThis.localStorage === fixtureLocalStorage) {
+          if (previousLocalStorage === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
+          else globalThis.localStorage = previousLocalStorage
+        }
         await rm(tempDir, { recursive: true, force: true })
       },
     }
@@ -1025,10 +1033,37 @@ test('protected turn context failures degrade to empty context and no proposal a
       accept: async () => {},
     })
     assert.equal(leaseCalls, 0)
-    await assert.rejects(module.resolveOptionalAgentProtectedContext({
+    let protectedCallbacks = 0
+    const oversizedContext = await module.resolveOptionalAgentProtectedContext({
       ...base,
       userText: 'x'.repeat(4_097),
+      listCapabilities: async () => { protectedCallbacks++; return { capabilities: [], errors: [] } },
+      listCompletedArtifacts: async () => { protectedCallbacks++; return [] },
+      resolveSkillContexts: async () => { protectedCallbacks++; return { resolutionHash: 'a'.repeat(64), contexts: [] } },
+    })
+    assert.deepEqual(oversizedContext, {
+      capabilities: [], completedArtifacts: [], skillContexts: [],
+      resolutionHash: null, proposalAuthorityAvailable: false,
+    })
+    const ordinaryReply = await module.runAgentChatWithOptionalProposalAuthority({
+      proposalAuthorityAvailable: oversizedContext.proposalAuthorityAvailable,
+      leaseModel: async () => { leaseCalls++; throw new Error('must not lease without protected context') },
+      send: async (modelLeaseId: string | null) => {
+        assert.equal(modelLeaseId, null)
+        return { message: 'Ordinary chat still completes.' }
+      },
+      accept: async () => {},
+    })
+    assert.deepEqual(ordinaryReply, { response: { message: 'Ordinary chat still completes.' }, modelLeaseId: null })
+    assert.equal(leaseCalls, 0)
+    await assert.rejects(module.resolveAgentSkillContextsForTurn({
+      originSessionId: base.originSessionId,
+      userText: 'x'.repeat(4_097),
+      capabilityRefs: [],
+      isCurrent: base.isCurrent,
+      resolve: async () => { protectedCallbacks++; return { resolutionHash: 'a'.repeat(64), contexts: [] } },
     }), /too long/i)
+    assert.equal(protectedCallbacks, 0)
   } finally {
     await cleanup()
   }
@@ -1240,8 +1275,45 @@ for (const provider of ['local', 'custom'] as const) {
         Object.defineProperty(globalThis, key, { value, configurable: true, writable: true })
       }
       dom.window.HTMLElement.prototype.scrollIntoView = () => {}
+      const session: AgentSession = {
+        id: `session-${provider}`, title: 'Provider fixture', revision: 1,
+        createdAt: '2026-08-01T00:00:00.000Z', updatedAt: '2026-08-01T00:00:00.000Z',
+        expiresAt: '2026-08-08T00:00:00.000Z', messages: [], attachments: [],
+      }
+      const attachmentBytes = new Map<string, Uint8Array>()
+      const sessionApi: Pick<AgentSessionsApi, 'list' | 'read' | 'appendMessage' | 'addAttachment' | 'readAttachment'> = {
+        async list() {
+          const { messages, attachments, ...summary } = session
+          return { sessions: [{ ...summary, messageCount: messages.length, attachmentCount: attachments.length }],
+            activeSessionId: session.id, readOnly: false }
+        },
+        async read({ sessionId }) { assert.equal(sessionId, session.id); return structuredClone(session) },
+        async appendMessage({ sessionId, expectedRevision, message }) {
+          assert.equal(sessionId, session.id); assert.equal(expectedRevision, session.revision)
+          session.messages.push({ ...message, attachmentIds: message.attachmentIds ?? [], summaries: message.summaries ?? [] })
+          session.revision++
+          return structuredClone(session)
+        },
+        async addAttachment({ sessionId, expectedRevision, attachment }) {
+          assert.equal(sessionId, session.id); assert.equal(expectedRevision, session.revision)
+          assert.equal(attachment.mimeType, 'image/png')
+          const id = `attachment-${session.attachments.length}`
+          attachmentBytes.set(id, attachment.bytes.slice())
+          session.attachments.push({ id, name: attachment.name, mimeType: 'image/png', sizeBytes: attachment.bytes.byteLength })
+          session.revision++
+          return structuredClone(session)
+        },
+        async readAttachment({ sessionId, attachmentId }) {
+          assert.equal(sessionId, session.id)
+          const bytes = attachmentBytes.get(attachmentId); assert.ok(bytes)
+          return bytes.slice()
+        },
+      }
+      Object.defineProperty(dom.window, 'electron', { value: { agentSessions: sessionApi }, configurable: true })
       loaded = await loadChatPanelModule()
       const { module } = loaded
+      await module.useAgentSessionsStore.getState().initialize()
+      assert.equal(module.useAgentSessionsStore.getState().activeSession?.id, session.id)
       module.useAppStore.setState({ apiUrl: 'http://backend.fixture.test' })
       module.useLlmModelsStore.setState({
         fetchedApiUrl: 'http://backend.fixture.test',
@@ -1281,7 +1353,9 @@ for (const provider of ['local', 'custom'] as const) {
         assert.ok(container.textContent?.includes('change the model in Settings'))
       }
       const fileInput = container.querySelector('input[type=file]')!
-      Object.defineProperty(fileInput, 'files', { value: [new dom.window.File(['synthetic'], 'fixture.png', { type: 'image/png' })] })
+      const attachmentFile = new dom.window.File([Uint8Array.from([0, 0, 0])], 'fixture.png', { type: 'image/png' })
+      Object.defineProperty(attachmentFile, 'arrayBuffer', { value: async () => Uint8Array.from([0, 0, 0]).buffer })
+      Object.defineProperty(fileInput, 'files', { value: [attachmentFile] })
       await React.act(async () => { fileInput.dispatchEvent(new dom.window.Event('change', { bubbles: true })) })
       const textarea = container.querySelector('textarea')!
       const setValue = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value')!.set!
@@ -1300,6 +1374,11 @@ for (const provider of ['local', 'custom'] as const) {
         : { type: 'external', base_url: 'https://custom.fixture.test/compatible', api_key: 'fixture-key' })
       assert.deepEqual((calls[0].messages as Array<{ images?: string[] }>)[0].images, [dataUrl])
       assert.equal('ollama_url' in calls[0], false)
+      assert.equal(session.messages[0].role, 'user')
+      assert.equal(session.messages[0].content, 'Inspect this image.')
+      assert.deepEqual(session.messages[0].attachmentIds, ['attachment-0'])
+      assert.deepEqual(attachmentBytes.get('attachment-0'), Uint8Array.from([0, 0, 0]))
+      assert.equal(session.messages.at(-1)?.content, 'Fixture response.')
     } finally {
       if (root) await React.act(async () => { root!.unmount() })
       await loaded?.cleanup()
@@ -1509,19 +1588,39 @@ test('failed-send attachment rollback surfaces cleanup failure as recoverable', 
   }
 })
 
-test('worlds_openai_selector_is_remote_labeled_and_generic_chat_stays_ollama_only', async () => {
-  const [{ createElement }, { renderToStaticMarkup }] = await Promise.all([
-    import('react'),
-    import('react-dom/server'),
-  ])
-  const { module: worldsModule, cleanup: cleanupWorlds } = await loadChatPanelModule({
-    agentSettings: { worldsProvider: 'openai', worldsOpenAiModel: 'gpt-5.1' },
-  })
+test('persisted Worlds OpenAI and generic custom selections render their current client labels', async () => {
+  const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://fixture.test/' })
+  const globals: Record<string, unknown> = {
+    window: dom.window, document: dom.window.document, navigator: dom.window.navigator,
+    HTMLElement: dom.window.HTMLElement, HTMLTextAreaElement: dom.window.HTMLTextAreaElement,
+    Node: dom.window.Node, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true,
+  }
+  const previous = new Map(Object.keys(globals).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  const previousFetch = globalThis.fetch
+  let root: ReturnType<typeof import('react-dom/client').createRoot> | undefined
+  let loaded: Awaited<ReturnType<typeof loadChatPanelModule>> | undefined
   try {
-    worldsModule.useAgentStore.setState({ worldsProvider: 'openai', worldsOpenAiModel: 'gpt-5.1' })
+    for (const [key, value] of Object.entries(globals)) {
+      Object.defineProperty(globalThis, key, { value, configurable: true, writable: true })
+    }
+    dom.window.HTMLElement.prototype.scrollIntoView = () => {}
+    globalThis.fetch = async () => { throw new Error('selection fixture must not perform network requests') }
+    const { createRoot } = await import('react-dom/client')
+    const container = dom.window.document.createElement('div')
+    dom.window.document.body.appendChild(container)
+    loaded = await loadChatPanelModule({
+      agentSettings: { provider: 'openai', worldsProvider: 'openai', worldsOpenAiModel: 'gpt-5.1',
+        external: { openai: { model: 'gpt-5.1', apiKey: '' } } },
+    })
+    const worldsModule = loaded.module
+    assert.equal(worldsModule.useAgentStore.getState().provider, 'openai')
+    assert.equal(worldsModule.useAgentStore.getState().worldsProvider, 'openai')
+    assert.equal(worldsModule.useAgentStore.getState().worldsOpenAiModel, 'gpt-5.1')
+    worldsModule.useAgentSessionsStore.setState({ initialized: true, initialize: async () => {} })
+    worldsModule.useLlmModelsStore.setState({ fetchModels: async () => {} })
     const noop = () => undefined
     const worlds = {
-      begin: () => { throw new Error('server render must not begin a request') },
+      begin: () => { throw new Error('selection fixture must not begin a request') },
       accept: async () => undefined,
       fail: noop,
       apply: async () => undefined,
@@ -1532,25 +1631,47 @@ test('worlds_openai_selector_is_remote_labeled_and_generic_chat_stays_ollama_onl
       subscribe: () => noop,
       dispose: noop,
     }
-    const html = renderToStaticMarkup(createElement(worldsModule.default, { worlds }))
-    assert.match(html, /aria-label="Select AI model, Ollama/)
+    root = createRoot(container)
+    await React.act(async () => { root!.render(React.createElement(worldsModule.default, { worlds })) })
+    const html = container.innerHTML
+    assert.match(html, /aria-label="Select AI model, OpenAI gpt-5\.1 remote"/)
+    assert.match(html, /OpenAI · gpt-5\.1 · Remote/)
     assert.match(html, /placeholder="Ask about this scene…"[^>]*placeholder-zinc-300|placeholder-zinc-300[^>]*placeholder="Ask about this scene…"/)
-    assert.match(html, /text-zinc-300[^>]*>Ask about this scene<br\/>or change it directly/)
+    assert.match(html, /text-zinc-300[^>]*>Ask about this scene<br\s*\/?>or change it directly/)
     assert.match(html, /text-zinc-300[^>]*>Shift\+Enter for new line/)
     assert.doesNotMatch(html, /aria-label="Worlds AI provider"/)
-  } finally {
-    await cleanupWorlds()
-  }
+    await React.act(async () => { root!.unmount() })
+    root = undefined
+    await loaded.cleanup()
+    loaded = undefined
 
-  const { module: genericModule, cleanup: cleanupGeneric } = await loadChatPanelModule()
-  try {
-    const html = renderToStaticMarkup(createElement(genericModule.default))
-    assert.doesNotMatch(html, /OpenAI ·/)
-    assert.doesNotMatch(html, /OpenAI sends this scene request to a remote provider/)
-    assert.doesNotMatch(html, /Ask OpenAI \(remote\)/)
-    assert.match(html, /placeholder-zinc-600/)
+    loaded = await loadChatPanelModule({
+      agentSettings: { provider: 'custom', external: {
+        custom: { model: 'generic-chat-model', baseUrl: 'https://fixture.test/v1', apiKey: '' },
+      } },
+    })
+    const genericModule = loaded.module
+    assert.equal(genericModule.useAgentStore.getState().provider, 'custom')
+    assert.equal(genericModule.useAgentStore.getState().external.custom.model, 'generic-chat-model')
+    genericModule.useAgentSessionsStore.setState({ initialized: true, initialize: async () => {} })
+    genericModule.useLlmModelsStore.setState({ fetchModels: async () => {} })
+    root = createRoot(container)
+    await React.act(async () => { root!.render(React.createElement(genericModule.default)) })
+    const genericHtml = container.innerHTML
+    assert.match(genericHtml, /aria-label="Select AI model, Custom endpoint generic-chat-model"/)
+    assert.doesNotMatch(genericHtml, /OpenAI ·/)
+    assert.doesNotMatch(genericHtml, /OpenAI sends this scene request to a remote provider/)
+    assert.doesNotMatch(genericHtml, /Ask OpenAI \(remote\)/)
+    assert.match(genericHtml, /placeholder-zinc-600/)
   } finally {
-    await cleanupGeneric()
+    if (root) await React.act(async () => { root!.unmount() })
+    await loaded?.cleanup()
+    globalThis.fetch = previousFetch
+    for (const [key, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+    dom.window.close()
   }
 })
 
@@ -1689,6 +1810,8 @@ test('mounted Worlds compact picker lists discovered Ollama models and configure
   const worlds = { begin() { throw new Error('not sent') }, accept: async () => undefined, fail() {}, apply: async () => undefined,
     reject() {}, undo: async () => undefined, cancel() {}, getState: () => ({ status: 'idle', message: '' }), subscribe: () => () => {}, dispose() {} }
   try {
+    module.useAgentStore.setState({ provider: 'ollama', worldsProvider: 'ollama',
+      external: { ollama: { model: 'qwen3:8b', apiKey: '' } }, worldsOpenAiModel: 'gpt-5.1' })
     module.useAgentSessionsStore.setState({ initialized: true, activeSession: null, sessions: [], initialize: async () => undefined })
     render(React.createElement(module.default, { worlds }))
     assert.match(String(find(rootHost, (node) => node.type === 'p' && nodeText(node).includes('Ask about this scene'))?.props.className), /text-zinc-300/)

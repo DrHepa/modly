@@ -23,6 +23,7 @@ test('integration typecheck owns the real test and ambient roots without weakeni
   const diskWorkflowTest = 'src/areas/worlds/components/WorldsWorkbench.diskWorkflow.test.ts'
   const playablePortalLoopMountedTest = 'src/areas/worlds/components/WorldsWorkbench.playablePortalLoop.mounted.test.ts'
   const integrationTest = 'src/areas/worlds/editor/worldEditorRepositoryIntegration.test.ts'
+  const processPortsTest = 'src/areas/workflows/processPorts.test.ts'
   assert.equal(web.compilerOptions.composite, true)
   assert.deepEqual(web.include, ['src/**/*'])
   assert.deepEqual(web.exclude, [
@@ -31,12 +32,13 @@ test('integration typecheck owns the real test and ambient roots without weakeni
     diskWorkflowTest,
     playablePortalLoopMountedTest,
     integrationTest,
+    processPortsTest,
   ])
   assert.equal(integration.extends, './tsconfig.web.json')
   assert.deepEqual(integration.compilerOptions, {
     composite: false, incremental: false, noEmit: true, types: ['node'],
   })
-  assert.deepEqual(integration.files, [diskWorkflowTest, playablePortalLoopMountedTest, integrationTest])
+  assert.deepEqual(integration.files, [diskWorkflowTest, playablePortalLoopMountedTest, integrationTest, processPortsTest])
   assert.deepEqual(integration.include, ['src/vite-env.d.ts', 'src/shared/types/**/*.d.ts'])
   assert.ok(
     !integration.files.some((entry) => entry.includes('*'))

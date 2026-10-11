@@ -145,6 +145,7 @@ const TYPESCRIPT_TEST_FILES = [
 ]
 
 const TYPESCRIPT_MJS_TEST_FILES = new Set([
+  'electron/main/automation-http-bridge.test.mjs',
   'scripts/worlds-ai-electron-fixture.test.mjs',
   'scripts/worlds-authoring-electron-fixture/guards.test.mjs',
   'scripts/worlds-character-electron-fixture.test.mjs',
@@ -296,9 +297,77 @@ async function runInvocation(invocation, repositoryRoot, spawnProcess) {
   })
 }
 
+// Diagnostic collection waits for the child close boundary, not descendant drainage.
+async function collectInvocationResult(invocation, repositoryRoot, spawnProcess) {
+  const outcome = { code: null, signal: null, spawnError: null, started: false }
+  const recordSpawnError = (error) => {
+    outcome.spawnError = {
+      message: error instanceof Error ? error.message : String(error),
+      code: error && typeof error === 'object' && 'code' in error ? String(error.code) : null,
+    }
+  }
+  return new Promise((resolvePromise) => {
+    let child
+    try {
+      child = spawnProcess(process.execPath, invocation.args, {
+        cwd: repositoryRoot,
+        env: process.env,
+        stdio: 'inherit',
+      })
+    } catch (error) {
+      recordSpawnError(error)
+      resolvePromise(outcome)
+      return
+    }
+    child.once('spawn', () => { outcome.started = true })
+    child.once('error', recordSpawnError)
+    child.once('close', (code, signal) => {
+      outcome.code = code
+      outcome.signal = signal
+      resolvePromise(outcome)
+    })
+  })
+}
+
+async function collectNodeTestPlan(plan, repositoryRoot, spawnProcess, write) {
+  const outcomes = []
+  for (const [index, invocation] of plan.entries()) {
+    write(`[test:node] ${index + 1}/${plan.length} ${invocation.phase}: ${invocation.file}\n`)
+    const result = await collectInvocationResult(invocation, repositoryRoot, spawnProcess)
+    const passed = result.started && result.code === 0 && result.signal === null && result.spawnError === null
+    outcomes.push({ phase: invocation.phase, file: invocation.file, ...result, passed })
+    if (!passed && invocation.file === 'scripts/worlds-authoring-electron-fixture/guards.test.mjs') break
+  }
+  const summary = {
+    planned: plan.length,
+    attempted: outcomes.length,
+    launched: outcomes.filter((outcome) => outcome.started).length,
+    pass: outcomes.filter((outcome) => outcome.passed).length,
+    fail: outcomes.filter((outcome) => !outcome.passed).length,
+    unrun: plan.length - outcomes.length,
+    unrunFiles: plan.slice(outcomes.length).map((invocation) => invocation.file),
+    outcomes,
+  }
+  write(`[test:node] collection ${JSON.stringify(summary)}\n`)
+  if (summary.fail > 0 || summary.unrun > 0) {
+    const error = new Error('Node diagnostic collection failed or left declared files unrun')
+    error.exitCode = 1
+    error.summary = summary
+    throw error
+  }
+  return summary
+}
+
+export function parseNodeTestArguments(args) {
+  if (args.length === 0) return false
+  if (args.length === 1 && args[0] === '--collect-failures') return true
+  throw new Error('Unsupported Node test arguments; expected no arguments or --collect-failures')
+}
+
 export async function runNodeTestPlan(plan, repositoryRoot, options = {}) {
   const spawnProcess = options.spawnProcess ?? spawn
   const write = options.write ?? ((value) => process.stdout.write(value))
+  if (options.collectFailures === true) return collectNodeTestPlan(plan, repositoryRoot, spawnProcess, write)
   for (const [index, invocation] of plan.entries()) {
     write(`[test:node] ${index + 1}/${plan.length} ${invocation.phase}: ${invocation.file}\n`)
     await runInvocation(invocation, repositoryRoot, spawnProcess)
@@ -314,13 +383,16 @@ export async function runNodeTests(repositoryRootUrl = new URL('../', import.met
   await dispatchProof({ createNodeTestPlan, runNodeTestPlan })
   const repositoryRoot = resolve(fileURLToPath(repositoryRootUrl))
   const plan = await createNodeTestPlan(repositoryRootUrl)
-  await runNodeTestPlan(plan, repositoryRoot, options.runnerOptions)
+  await runNodeTestPlan(plan, repositoryRoot, options.collectFailures === true
+    ? { ...options.runnerOptions, collectFailures: true }
+    : options.runnerOptions)
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null
 if (invokedPath === import.meta.url) {
   try {
-    await runNodeTests()
+    const collectFailures = parseNodeTestArguments(process.argv.slice(2))
+    await runNodeTests(undefined, { collectFailures })
   } catch (error) {
     console.error(error instanceof Error ? error.message : error)
     process.exitCode = error && typeof error === 'object' && Number.isInteger(error.exitCode)

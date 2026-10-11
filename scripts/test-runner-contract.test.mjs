@@ -320,6 +320,7 @@ test('canonical Python command explicitly registers the focused pytest function 
     'tests/test_agent_worlds.py',
     'tests/test_collection_safety.py',
     'tests/test_extension_process_protocol.py',
+    'tests/test_focused_latent_regressions.py',
     'tests/test_generation_compat.py',
     'tests/test_generation_inputs.py',
     'tests/test_hf_download_assets.py',
@@ -342,6 +343,40 @@ test('canonical runner includes every required changed test exactly once', async
     assert.equal(matches[0].phase, required.phase, required.file)
     assert.equal(matches[0].args.at(-1), required.file, required.file)
   }
+  const addedSuites = [
+    { file: 'src/areas/generate/orcaSlicerLink.test.ts', phase: 'typescript' },
+    { file: 'electron/main/automation-capabilities-rebase.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/bounded-file-reader.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/copy-runtime.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/extension-install-recovery.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/gpu-detect.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/model-weight-ipc.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/process-runner-rebase.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/process-runner-worker-exit.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/process-runner.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/settings-store.test.mjs', phase: 'mjs' },
+    { file: 'electron/main/setup-launcher.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/settings/components/agentSettingsSync.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/components/WorkflowParamControl.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/mockExtensions.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/slotInputs.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/workflowParamCompatibility.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/workflowSceneRun.test.mjs', phase: 'mjs' },
+    { file: 'src/areas/workflows/workflowSceneSource.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/components/ui/agentGrade.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/components/ui/vramFit.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/stores/extensionsStore.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/stores/llmModelsStore.react.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/stores/llmModelsStore.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/utils/paramPicker.test.mjs', phase: 'mjs' },
+    { file: 'src/shared/utils/weightVariants.test.mjs', phase: 'mjs' },
+  ]
+  for (const required of addedSuites) {
+    const matches = plan.filter(({ file }) => file === required.file)
+    assert.equal(matches.length, 1, required.file)
+    assert.equal(matches[0].phase, required.phase, required.file)
+  }
+
 })
 
 test('canonical main requires an ordinary-Node full proof before per-file dispatch', async (t) => {
@@ -384,7 +419,7 @@ test('canonical main requires an ordinary-Node full proof before per-file dispat
     events.push('mock-proof-end')
   } })
   const plan = await createNodeTestPlan()
-  assert.equal(plan.length, 224)
+  assert.equal(plan.length, 250)
   assert.deepEqual(events, ['mock-proof-start', 'mock-proof-end', ...plan.map(({ file }) => file)])
   assert.equal(starts, plan.length)
   assert.equal(output.length, plan.length)
@@ -539,11 +574,11 @@ test('Worlds script registration preserves canonical membership and includes Nod
   const aiFiles = ['src/areas/worlds/core/worldAiContract.test.ts', 'src/areas/worlds/editor/worldAiChatAdapter.test.ts',
     'src/areas/worlds/components/WorldsAiDrawer.test.ts', 'electron/main/automation-http-bridge.test.ts', 'scripts/worlds-ai-electron-fixture.test.mjs']
   for (const file of aiFiles) assert.equal(plan.filter((entry) => entry.file === file).length, 1, file)
-  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 219)
-  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 223)
-  assert.equal(plan.length, 224)
-  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 184)
-  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 40)
+  assert.equal(plan.filter(({ file }) => !aiFiles.includes(file)).length, 245)
+  assert.equal(plan.filter(({ file }) => file !== 'scripts/worlds-ai-electron-fixture.test.mjs').length, 249)
+  assert.equal(plan.length, 250)
+  assert.equal(plan.filter(({ phase }) => phase === 'typescript').length, 185)
+  assert.equal(plan.filter(({ phase }) => phase === 'mjs').length, 65)
   assert.equal(new Set(plan.map(({ file }) => file)).size, plan.length)
   assert.equal((await collectWorldsTypeScriptTests()).length, 93)
 })
@@ -552,6 +587,7 @@ test('Worlds MJS fixture entries receive TypeScript loader arguments without cha
   const { createNodeTestPlan } = await import('./run-node-tests.mjs')
   const plan = await createNodeTestPlan()
   const typescriptMjsFixtures = [
+    'electron/main/automation-http-bridge.test.mjs',
     'scripts/worlds-ai-electron-fixture.test.mjs',
     'scripts/worlds-authoring-electron-fixture/guards.test.mjs',
     'scripts/worlds-character-electron-fixture.test.mjs',
@@ -693,4 +729,190 @@ test('Worlds TypeScript discovery is recursive, sorted, scoped, and accepts 128 
     collectWorldsTypeScriptTests(pathToFileURL(`${repositoryRoot}/`)),
     /Worlds test discovery exceeds its 128-file safety bound/,
   )
+})
+
+
+test('Node collection accepts only the exact optional CLI argument', async () => {
+  const { parseNodeTestArguments } = await import('./run-node-tests.mjs')
+  assert.equal(parseNodeTestArguments([]), false)
+  assert.equal(parseNodeTestArguments(['--collect-failures']), true)
+  for (const args of [['--collect-failures=true'], ['--unknown'], ['--collect-failures', '--collect-failures'], ['file.test.mjs']]) {
+    assert.throws(() => parseNodeTestArguments(args), /Unsupported Node test arguments/)
+  }
+})
+
+test('Node collection is serial through close and records every ordinary outcome without laundering failures', async () => {
+  const { runNodeTestPlan } = await import('./run-node-tests.mjs')
+  const files = ['pass.test.mjs', 'exit.test.mjs', 'signal.test.mjs', 'spawn.test.mjs', 'last.test.mjs']
+  const plan = files.map((file) => ({ phase: 'mjs', file, args: ['--test', '--test-concurrency=1', file] }))
+  const starts = [], output = []
+  let active = 0, maximumActive = 0
+  await assert.rejects(runNodeTestPlan(plan, '/repo', {
+    collectFailures: true,
+    write: (value) => output.push(value),
+    spawnProcess(executable, args, options) {
+      assert.equal(executable, process.execPath)
+      assert.deepEqual(args, plan[starts.length].args)
+      assert.equal(options.cwd, '/repo')
+      assert.equal(options.env, process.env)
+      assert.equal(options.stdio, 'inherit')
+      const file = args.at(-1), child = new EventEmitter()
+      starts.push(file)
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      setImmediate(() => {
+        if (file === 'spawn.test.mjs') {
+          const error = new Error('fixture ENOENT'); error.code = 'ENOENT'
+          child.emit('error', error)
+        } else {
+          child.emit('spawn')
+          child.emit('exit', file === 'exit.test.mjs' ? 7 : file === 'signal.test.mjs' ? null : 0,
+            file === 'signal.test.mjs' ? 'SIGTERM' : null)
+        }
+        // A new invocation must not start after exit/error while this child's close is pending.
+        setImmediate(() => {
+          assert.equal(starts.length, files.indexOf(file) + 1)
+          active -= 1
+          child.emit('close', file === 'exit.test.mjs' ? 7 : ['signal.test.mjs', 'spawn.test.mjs'].includes(file) ? null : 0,
+            file === 'signal.test.mjs' ? 'SIGTERM' : null)
+        })
+      })
+      return child
+    },
+  }), (error) => {
+    assert.equal(error.exitCode, 1)
+    assert.deepEqual({ ...error.summary, outcomes: undefined }, {
+      planned: 5, attempted: 5, launched: 4, pass: 2, fail: 3, unrun: 0, unrunFiles: [], outcomes: undefined,
+    })
+    assert.deepEqual(error.summary.outcomes.map(({ file, code, signal, spawnError, started, passed }) => (
+      { file, code, signal, spawnError, started, passed }
+    )), [
+      { file: files[0], code: 0, signal: null, spawnError: null, started: true, passed: true },
+      { file: files[1], code: 7, signal: null, spawnError: null, started: true, passed: false },
+      { file: files[2], code: null, signal: 'SIGTERM', spawnError: null, started: true, passed: false },
+      { file: files[3], code: null, signal: null, spawnError: { message: 'fixture ENOENT', code: 'ENOENT' }, started: false, passed: false },
+      { file: files[4], code: 0, signal: null, spawnError: null, started: true, passed: true },
+    ])
+    return true
+  })
+  assert.deepEqual(starts, files)
+  assert.equal(active, 0)
+  assert.equal(maximumActive, 1)
+  assert.equal(output.length, plan.length + 1)
+  assert.match(output.at(-1), /"planned":5,"attempted":5,"launched":4,"pass":2,"fail":3,"unrun":0,"unrunFiles":\[\]/)
+})
+
+test('Node collection returns zero only for a complete successful plan', async () => {
+  const { runNodeTestPlan } = await import('./run-node-tests.mjs')
+  const plan = [{ phase: 'mjs', file: 'control.test.mjs', args: ['--test', 'control.test.mjs'] }]
+  const summary = await runNodeTestPlan(plan, '/repo', {
+    collectFailures: true, write: () => undefined,
+    spawnProcess() {
+      const child = new EventEmitter()
+      setImmediate(() => { child.emit('spawn'); child.emit('close', 0, null) })
+      return child
+    },
+  })
+  assert.equal(summary.planned, 1)
+  assert.equal(summary.attempted, 1)
+  assert.equal(summary.launched, 1)
+  assert.equal(summary.pass, 1)
+  assert.equal(summary.fail, 0)
+  assert.equal(summary.unrun, 0)
+  assert.deepEqual(summary.unrunFiles, [])
+})
+
+test('Node collection aborts on a failed authoring guard and reports declared unrun files', async () => {
+  const { runNodeTestPlan } = await import('./run-node-tests.mjs')
+  const files = ['ordinary.test.mjs', 'scripts/worlds-authoring-electron-fixture/guards.test.mjs', 'unrun.test.mjs']
+  const plan = files.map((file) => ({ phase: 'mjs', file, args: ['--test', file] }))
+  const starts = []
+  await assert.rejects(runNodeTestPlan(plan, '/repo', {
+    collectFailures: true, write: () => undefined,
+    spawnProcess(_executable, args) {
+      starts.push(args.at(-1))
+      const child = new EventEmitter()
+      setImmediate(() => { child.emit('spawn'); child.emit('close', starts.length === 2 ? 9 : 0, null) })
+      return child
+    },
+  }), (error) => {
+    assert.equal(error.exitCode, 1)
+    assert.equal(error.summary.planned, 3)
+    assert.equal(error.summary.attempted, 2)
+    assert.equal(error.summary.launched, 2)
+    assert.equal(error.summary.pass, 1)
+    assert.equal(error.summary.fail, 1)
+    assert.equal(error.summary.unrun, 1)
+    assert.deepEqual(error.summary.unrunFiles, [files[2]])
+    return true
+  })
+  assert.deepEqual(starts, files.slice(0, 2))
+})
+
+test('Node default dispatch stays fail-fast and proof failure blocks collection before admission', async () => {
+  const { runNodeTestPlan, runNodeTests } = await import('./run-node-tests.mjs')
+  const plan = ['first.test.mjs', 'unrun.test.mjs'].map((file) => ({ phase: 'mjs', file, args: ['--test', file] }))
+  let starts = 0
+  const output = []
+  const spawnProcess = () => {
+    starts += 1
+    const child = new EventEmitter()
+    setImmediate(() => child.emit('exit', 7, null))
+    return child
+  }
+  await assert.rejects(runNodeTestPlan(plan, '/repo', { spawnProcess, write: (value) => output.push(value) }),
+    (error) => error.exitCode === 7)
+  assert.equal(starts, 1)
+  assert.equal(output.length, 1)
+  starts = 0; output.length = 0
+  const proofError = new Error('mandatory proof failed')
+  await assert.rejects(runNodeTests(undefined, {
+    collectFailures: true,
+    dispatchProof: async () => { throw proofError },
+    runnerOptions: { spawnProcess, write: (value) => output.push(value) },
+  }), (error) => error === proofError)
+  assert.equal(starts, 0)
+  assert.deepEqual(output, [])
+})
+
+
+test('Node collection records a synchronous spawn refusal and continues only without a live child', async () => {
+  const { runNodeTestPlan } = await import('./run-node-tests.mjs')
+  const plan = ['refused.test.mjs', 'control.test.mjs'].map((file) => ({ phase: 'mjs', file, args: ['--test', file] }))
+  let attempts = 0
+  await assert.rejects(runNodeTestPlan(plan, '/repo', {
+    collectFailures: true, write: () => undefined,
+    spawnProcess() {
+      if (++attempts === 1) throw new Error('spawn refused synchronously')
+      const child = new EventEmitter()
+      setImmediate(() => { child.emit('spawn'); child.emit('close', 0, null) })
+      return child
+    },
+  }), (error) => {
+    assert.equal(error.exitCode, 1)
+    assert.equal(error.summary.attempted, 2)
+    assert.equal(error.summary.launched, 1)
+    assert.equal(error.summary.pass, 1)
+    assert.equal(error.summary.fail, 1)
+    assert.equal(error.summary.unrun, 0)
+    assert.deepEqual(error.summary.outcomes[0], {
+      phase: 'mjs', file: plan[0].file, code: null, signal: null,
+      spawnError: { message: 'spawn refused synchronously', code: null }, started: false, passed: false,
+    })
+    return true
+  })
+})
+
+// Keep the named MJS entry in its existing phase; only its TS dependency argv changes.
+test('automation HTTP bridge MJS executes once with the existing TypeScript loader', async () => {
+  const { createNodeTestPlan } = await import('./run-node-tests.mjs')
+  const plan = await createNodeTestPlan()
+  const entries = plan.filter(({ file }) => file === 'electron/main/automation-http-bridge.test.mjs')
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].phase, 'mjs')
+  assert.deepEqual(entries[0].args, [
+    '--test', '--test-concurrency=1', '--experimental-strip-types',
+    '--experimental-loader', './scripts/node-ts-extensionless-loader.mjs',
+    'electron/main/automation-http-bridge.test.mjs',
+  ])
 })

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { EXT_INCOMPLETE_MARKER, EXT_REGISTRATION_PENDING_MARKER } from './extension-path-guard.ts'
+import { beginExtensionRegistrationTransaction } from './extension-install-recovery.ts'
 
 import {
   AgentMcpManifestError,
@@ -449,3 +451,67 @@ test('discovery rejects symlinked and oversized manifest files before parsing', 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+
+test('M1 MCP lifecycle ignores valid staging and backup copies without hiding the healthy binding', async () => {
+  const target = await extensionFixture()
+  const builtinDir = join(target.root, 'builtin')
+  try {
+    await mkdir(builtinDir)
+    await writeFile(join(target.extensionDir, 'manifest.json'), JSON.stringify({
+      id: 'fixture-extension', type: 'process', entry: 'processor.js', nodes: [], mcp: manifest(),
+    }))
+    const options = { builtinDir, userExtensionsDir: target.root }
+    const healthy = await discoverGovernedMcpTools(options)
+    assert.equal(healthy.tools.length, 1)
+    for (const prefix of ['.modly-staging-', '.modly-backup-']) {
+      await cp(target.extensionDir, join(target.root, `${prefix}fixture-extension-123`), { recursive: true })
+    }
+    const discovered = await discoverGovernedMcpTools(options)
+    assert.deepEqual(discovered.tools.map((binding) => binding.tool.capabilityId), ['fixture-extension/write-artifact'])
+    assert.equal(discovered.tools[0].extensionDir, target.extensionDir)
+    assert.equal(discovered.tools[0].tool.capabilityBindingHash, healthy.tools[0].tool.capabilityBindingHash)
+    assert.equal(discovered.errors.some((error) => error.code === 'MCP_ID_COLLISION'), false)
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+for (const linked of [false, true]) {
+  for (const pendingKind of ['incomplete', 'destination-pending', 'root-pending'] as const) {
+    test(`M1 MCP lifecycle excludes ${pendingKind} from discovery, local link=${linked}`, async () => {
+      const target = await extensionFixture()
+      const builtinDir = join(target.root, 'builtin')
+      const userDir = join(target.root, 'user')
+      let sourceDir = target.extensionDir
+      try {
+        await mkdir(builtinDir)
+        await mkdir(userDir)
+        await writeFile(join(sourceDir, 'manifest.json'), JSON.stringify({
+          id: 'fixture-extension', type: 'process', entry: 'processor.js', nodes: [], mcp: manifest(),
+        }))
+        const configuredDir = join(userDir, 'fixture-extension')
+        if (linked) {
+          await symlink(sourceDir, configuredDir, process.platform === 'win32' ? 'junction' : 'dir')
+        } else {
+          await rename(sourceDir, configuredDir)
+          sourceDir = configuredDir
+        }
+        const options = { builtinDir, userExtensionsDir: userDir }
+        const healthy = await discoverGovernedMcpTools(options)
+        assert.equal(healthy.tools.length, 1)
+        assert.equal(healthy.tools[0].extensionDir, sourceDir)
+        if (pendingKind === 'root-pending') {
+          const pending = await beginExtensionRegistrationTransaction(userDir, 'fixture-extension', '123')
+          assert.equal(pending.ok, true)
+        } else {
+          await writeFile(join(sourceDir, pendingKind === 'incomplete' ? EXT_INCOMPLETE_MARKER : EXT_REGISTRATION_PENDING_MARKER), '')
+        }
+        const discovered = await discoverGovernedMcpTools(options)
+        assert.deepEqual(discovered.tools, [])
+      } finally {
+        await rm(target.root, { recursive: true, force: true })
+      }
+    })
+  }
+}

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, truncate, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { EXT_INCOMPLETE_MARKER, EXT_REGISTRATION_PENDING_MARKER } from './extension-path-guard.ts'
+import { beginExtensionRegistrationTransaction } from './extension-install-recovery.ts'
 
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -19,7 +21,7 @@ import {
   validateMcpArguments,
   type McpTransportFactory,
 } from './agent-mcp-broker.ts'
-import { listAgentCapabilities } from './automation-capabilities.ts'
+import { activeExtensionInstalls, listAgentCapabilities } from './automation-capabilities.ts'
 import type { AgentActionExecutorRequest } from './agent-actions-service.ts'
 import type { AgentCapabilitySnapshotV1 } from '../../src/shared/types/agentActions.ts'
 
@@ -868,4 +870,127 @@ test('broker source has no renderer IPC or legacy extensions:runProcess path', a
   assert.doesNotMatch(source, /sourceHandle = await open\(source/)
   const preload = await readFile(new URL('../preload/electron-api.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(preload, /['"]mcp:|callMcp|runMcp|serverId/)
+})
+
+
+for (const linked of [false, true]) {
+  for (const pendingKind of ['incomplete', 'destination-pending', 'root-pending'] as const) {
+    test(`M1 MCP lifecycle rejects an already-bound ${pendingKind} fixture before transport, local link=${linked}`, async () => {
+      const target = await fixture()
+      let sourceDir = join(target.userDir, 'fixture-mcp')
+      let transports = 0
+      let calls = 0
+      let workspaceLookups = 0
+      try {
+        if (linked) {
+          const configuredDir = sourceDir
+          sourceDir = join(target.root, 'local-source')
+          await rename(configuredDir, sourceDir)
+          await symlink(sourceDir, configuredDir, process.platform === 'win32' ? 'junction' : 'dir')
+        }
+        // Obtain the current real inventory/binding after any source relocation.
+        const inventory = await listAgentCapabilities({
+          builtinDir: target.builtinDir, userExtensionsDir: target.userDir, trustedRepos: new Set(),
+        })
+        assert.equal(inventory.capabilities.length, 1)
+        const capability = inventory.capabilities[0]
+        assert.equal(capability.execution?.kind, 'mcp_tool')
+        if (pendingKind === 'root-pending') {
+          const pending = await beginExtensionRegistrationTransaction(target.userDir, 'fixture-mcp', '123')
+          assert.equal(pending.ok, true)
+        } else {
+          await writeFile(join(sourceDir, pendingKind === 'incomplete' ? EXT_INCOMPLETE_MARKER : EXT_REGISTRATION_PENDING_MARKER), '')
+        }
+        const baseFactory = serverFactory({ onCall: async () => {
+          calls += 1
+          return { content: [], structuredContent: { artifacts: [embeddedArtifact('hello')] } }
+        } })
+        const executor = createAgentMcpExecutor({
+          discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+          getWorkspaceRoot: async () => { workspaceLookups += 1; return target.workspaceDir },
+          transportFactory: async (context) => { transports += 1; return baseFactory(context) },
+        })
+        await assert.rejects(executor(request(capability)), (error: unknown) => {
+          assert.ok(error instanceof AgentMcpBrokerError)
+          assert.equal(error.code, 'capability_stale')
+          return true
+        })
+        assert.equal(transports, 0)
+        assert.equal(calls, 0)
+        assert.equal(workspaceLookups, 0)
+        await assert.rejects(readdir(join(target.workspaceDir, 'Workflows', 'agent-actions')), { code: 'ENOENT' })
+      } finally {
+        await rm(target.root, { recursive: true, force: true })
+      }
+    })
+  }
+}
+
+test('M1 MCP lifecycle rechecks pending registration after discovery before transport creation', async () => {
+  const target = await fixture()
+  let transports = 0
+  try {
+    const baseFactory = serverFactory({ onCall: async () => ({ content: [], structuredContent: { artifacts: [embeddedArtifact('hello')] } }) })
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: async () => {
+        const pending = await beginExtensionRegistrationTransaction(target.userDir, 'fixture-mcp', '123')
+        assert.equal(pending.ok, true)
+        return target.workspaceDir
+      },
+      transportFactory: async (context) => { transports += 1; return baseFactory(context) },
+    })
+    await assert.rejects(executor(request(target.capability)), (error: unknown) => {
+      assert.ok(error instanceof AgentMcpBrokerError)
+      assert.equal(error.code, 'capability_stale')
+      return true
+    })
+    assert.equal(transports, 0)
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('M1 MCP lifecycle rechecks pending registration after tools/list before tools/call', async () => {
+  const target = await fixture()
+  let calls = 0
+  let closed = 0
+  try {
+    const executor = createAgentMcpExecutor({
+      discovery: { builtinDir: target.builtinDir, userExtensionsDir: target.userDir },
+      getWorkspaceRoot: async () => target.workspaceDir,
+      transportFactory: serverFactory({
+        onList: async () => {
+          const pending = await beginExtensionRegistrationTransaction(target.userDir, 'fixture-mcp', '123')
+          assert.equal(pending.ok, true)
+        },
+        onCall: async () => { calls += 1; return { content: [], structuredContent: { artifacts: [embeddedArtifact('hello')] } } },
+        onClose: () => { closed += 1 },
+      }),
+    })
+    await assert.rejects(executor(request(target.capability)), (error: unknown) => {
+      assert.ok(error instanceof AgentMcpBrokerError)
+      assert.equal(error.code, 'capability_stale')
+      return true
+    })
+    assert.equal(calls, 0)
+    assert.equal(closed, 1)
+    await assert.rejects(readdir(join(target.workspaceDir, 'Workflows', 'agent-actions', 'action-mcp-fixture')), { code: 'ENOENT' })
+  } finally {
+    await rm(target.root, { recursive: true, force: true })
+  }
+})
+
+test('M1 MCP lifecycle does not blacklist a healthy extension for an active-only flag', async () => {
+  const target = await fixture()
+  activeExtensionInstalls.add('fixture-mcp')
+  try {
+    const inventory = await listAgentCapabilities({
+      builtinDir: target.builtinDir, userExtensionsDir: target.userDir, trustedRepos: new Set(),
+    })
+    assert.deepEqual(inventory.capabilities.map((capability) => capability.id), ['fixture-mcp/write-text'])
+  } finally {
+    activeExtensionInstalls.delete('fixture-mcp')
+    await rm(target.root, { recursive: true, force: true })
+  }
 })

@@ -14,7 +14,11 @@ import type {
   JsonValue,
 } from '../../src/shared/types/agentActions.ts'
 import { canonicalJson, sha256Canonical } from './agent-trust-contracts.ts'
-import { assertSafeExtensionId, assertSafeOwnershipSegment } from './extension-path-guard.ts'
+import {
+  EXT_INCOMPLETE_MARKER, EXT_REGISTRATION_PENDING_MARKER,
+  assertSafeExtensionId, assertSafeOwnershipSegment, isInternalExtensionDirName,
+} from './extension-path-guard.ts'
+import { parseExtensionRegistrationPendingName } from './extension-install-recovery.ts'
 import {
   AgentHostRuntimeError,
   bindAgentHostRuntime,
@@ -819,6 +823,25 @@ export async function bindMcpManifest(
   return { schema: MCP_SCHEMA, transport: 'stdio', servers }
 }
 
+async function isMcpExtensionPending(root: string, entryName: string, extensionDir: string, extensionId = entryName): Promise<boolean> {
+  // Root-side transactions keep locally linked source trees untouched. A
+  // marker hides executable authority whether its install is active or interrupted.
+  const pending = (await readdir(root)).some((name) => {
+    const id = parseExtensionRegistrationPendingName(name)?.extensionId
+    return id === entryName || id === extensionId
+  })
+  if (pending) return true
+  for (const marker of [EXT_INCOMPLETE_MARKER, EXT_REGISTRATION_PENDING_MARKER]) {
+    try {
+      await lstat(join(extensionDir, marker))
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  return false
+}
+
 async function discoverRoot(
   root: string,
   rootKind: DiscoveredMcpTool['rootKind'],
@@ -832,6 +855,7 @@ async function discoverRoot(
     return { tools, errors: [{ code: 'MCP_MANIFEST_INVALID', message: 'An extension root could not be inspected for MCP declarations.' }] }
   }
   for (const entry of entries) {
+    if (isInternalExtensionDirName(entry.name)) continue
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
     const configuredExtensionDir = join(root, entry.name)
     try {
@@ -842,8 +866,10 @@ async function discoverRoot(
       const extensionManifest = record(raw, 'Extension manifest')
       if (extensionManifest.type !== 'process' || extensionManifest.mcp === undefined) continue
       const extensionId = assertSafeExtensionId(typeof extensionManifest.id === 'string' ? extensionManifest.id : entry.name)
+      if (await isMcpExtensionPending(root, entry.name, extensionDir, extensionId)) continue
       const normalized = normalizeMcpManifest(extensionManifest.mcp, extensionId)
       const bound = await bindMcpManifest(normalized, extensionDir, { hostRuntimes })
+      if (await isMcpExtensionPending(root, entry.name, extensionDir, extensionId)) continue
       const name = typeof extensionManifest.name === 'string' && extensionManifest.name.trim() ? extensionManifest.name.trim() : extensionId
       const version = typeof extensionManifest.version === 'string' && extensionManifest.version.trim() ? extensionManifest.version.trim() : undefined
       for (const server of bound.servers) {

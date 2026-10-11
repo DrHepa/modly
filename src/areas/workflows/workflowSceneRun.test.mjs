@@ -31,10 +31,14 @@ writeFileSync(outfile, (await build({
 const { useWorkflowRunStore } = createRequire(import.meta.url)(outfile)
 
 test('scene model uses typed artifact route and preserves scene output', async () => {
-  const posts = []
+  const posts = [], sceneReads = []
   globalThis.window = { electron: {
     settings: { get: async () => ({ workspaceDir: '/workspace' }) },
-    fs: { deleteDirectory: async () => ({ success: true }), listFiles: async () => [], readFileBase64: async () => { throw new Error('scene must not be read as image bytes') } },
+    fs: { deleteDirectory: async () => ({ success: true }), listFiles: async () => [], readFileBase64: async (path) => {
+      assert.equal(path, '/workspace/Workflows/input/scene-manifest.json')
+      sceneReads.push(path)
+      return Buffer.from(JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] })).toString('base64')
+    } },
   } }
   globalThis.__sceneClient = {
     post: async (url, body) => { posts.push({ url, body }); return { data: { job_id: 'scene-job' } } },
@@ -43,13 +47,14 @@ test('scene model uses typed artifact route and preserves scene output', async (
   const workflow = {
     id: 'wf', name: 'Scene', description: '', createdAt: '', updatedAt: '',
     nodes: [
-      { id: 'source', type: 'sceneNode', position: { x: 0, y: 0 }, data: { enabled: true, params: { manifestPath: 'Workflows/input/scene-manifest.json' } } },
+      { id: 'source', type: 'sceneNode', position: { x: 0, y: 0 }, data: { enabled: true, params: { path: 'Workflows/input/scene-manifest.json' } } },
       { id: 'model', type: 'extensionNode', position: { x: 1, y: 0 }, data: { enabled: true, extensionId: 'pixal/world', params: {} } },
     ],
     edges: [{ id: 'e', source: 'source', target: 'model' }],
   }
   const extension = { id: 'pixal/world', name: 'World', type: 'model', input: 'scene', output: 'scene', params: [] }
   await useWorkflowRunStore.getState().run(workflow, [extension])
+  assert.deepEqual(sceneReads, ['/workspace/Workflows/input/scene-manifest.json'])
   assert.equal(posts[0].url, '/generate/from-artifact')
   assert.deepEqual(posts[0].body, {
     input_kind: 'scene', input_path: 'Workflows/input/scene-manifest.json',

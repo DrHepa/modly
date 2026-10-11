@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import test from 'node:test'
+import test, { after } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const source = (name) => readFile(new URL(`./worlds-ai-electron-fixture/${name}`, import.meta.url), 'utf8')
@@ -665,11 +665,19 @@ test('startup main CJS build preserves a genuine import meta URL and rejects uns
   await assert.rejects(transform('console.log(import.meta.unhandled)', options), /import.meta/)
 })
 
+const startupVmRoots = new Set()
+after(async () => { await Promise.all([...startupVmRoots].map((root) => rm(root, { recursive: true, force: true }))) })
+
 async function startupHarness({ argvChange, envChange, failImport = false, failWrite = false, noTransfer = false, tamper, appMismatch = false, switchMismatch = false, emitStartupFailure = false } = {}) {
   const fs = await import('node:fs'); const vm = await import('node:vm'); const { createRequire } = await import('node:module'); const { EventEmitter } = await import('node:events')
   const { prepareNativeState } = await import('./worlds-ai-electron-fixture.mjs')
   const root = await mkdtemp('/tmp/modly-worlds-ai-ui-startup-contract-')
+  startupVmRoots.add(root)
   const launch = await prepareNativeState(root)
+  // Inert VM-only identity; this fixture never executes Electron.
+  const vmExecutable = path.join(root, 'electron')
+  await writeFile(vmExecutable, 'VM contract only; never executed', { mode: 0o600 })
+  launch.argv[0] = vmExecutable
   const bootstrap = await source('bootstrap.cjs')
   const outputs = {}
   for (const name of ['bootstrap.cjs', 'main.cjs', 'preload.cjs', 'renderer/index.html', 'backend/backend.py', 'backend/routers/agent.py', 'backend/routers/world_ai.py', 'backend/routers/__init__.py', 'backend/services/__init__.py', 'backend/services/agent_providers/__init__.py', 'backend/services/agent_providers/openai.py']) {

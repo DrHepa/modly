@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { build } from 'esbuild'
+import { build, type Plugin } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
@@ -12,6 +13,19 @@ import { createValidWorldSnapshot } from '../core/_testFixtures.ts'
 import { createRuntimeWorldSnapshot } from '../runtime/_testFixtures.ts'
 
 const projectRoot = path.resolve(import.meta.dirname, '../../../..')
+
+function sourceAnchoredRuntimePlugin(): Plugin {
+  return {
+    name: 'source-anchored-runtime',
+    setup(buildApi) {
+      const runtimeExternals = ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime']
+      buildApi.onResolve({ filter: /^[^./]/ }, (args) => {
+        if (!runtimeExternals.some((name) => args.path === name || args.path.startsWith(`${name}/`))) return null
+        return { path: fileURLToPath(import.meta.resolve(args.path)), external: true }
+      })
+    },
+  }
+}
 
 test('Worlds exposes compact accessible no-code gameplay authoring without arbitrary scripts', async () => {
   const sceneDock = await readFile(path.join(import.meta.dirname, 'WorldsSceneDock.tsx'), 'utf8')
@@ -52,13 +66,13 @@ test('Worlds exposes compact accessible no-code gameplay authoring without arbit
 })
 
 test('Worlds Inspector exposes labeled character, capsule, kinematic and axis binding controls', async () => {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-character-ui-test-'))
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-worlds-character-ui-test-'))
   try {
     const result = await build({
       entryPoints: [path.join(import.meta.dirname, 'WorldsInspector.tsx')],
       bundle: true, write: false, format: 'esm', platform: 'node',
       tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-      external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime'],
+      plugins: [sourceAnchoredRuntimePlugin()],
     })
     const outfile = path.join(tempDir, 'WorldsInspector.bundle.mjs')
     await writeFile(outfile, result.outputFiles[0].text)
@@ -87,7 +101,7 @@ test('Worlds Inspector exposes labeled character, capsule, kinematic and axis bi
 })
 
 test('Worlds Inspector exposes primitive collider authoring and keeps unsupported mesh resources disabled without text drafts', async () => {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-primitive-collider-ui-test-'))
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-worlds-primitive-collider-ui-test-'))
   try {
     const result = await build({
       entryPoints: [path.join(import.meta.dirname, 'WorldsInspector.tsx')],
@@ -96,7 +110,7 @@ test('Worlds Inspector exposes primitive collider authoring and keeps unsupporte
       format: 'esm',
       platform: 'node',
       tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-      external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime'],
+      plugins: [sourceAnchoredRuntimePlugin()],
     })
     const outfile = path.join(tempDir, 'WorldsInspector.bundle.mjs')
     await writeFile(outfile, result.outputFiles[0].text)
@@ -133,7 +147,7 @@ test('Worlds Inspector exposes primitive collider authoring and keeps unsupporte
 })
 
 test('Worlds Inspector renders the complete authored gameplay fixture without invalid draft controls', async () => {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-authoring-ui-test-'))
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-worlds-authoring-ui-test-'))
   try {
     const result = await build({
       entryPoints: [path.join(import.meta.dirname, 'WorldsInspector.tsx')],
@@ -142,7 +156,7 @@ test('Worlds Inspector renders the complete authored gameplay fixture without in
       format: 'esm',
       platform: 'node',
       tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-      external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime'],
+      plugins: [sourceAnchoredRuntimePlugin()],
     })
     const outfile = path.join(tempDir, 'WorldsInspector.bundle.mjs')
     await writeFile(outfile, result.outputFiles[0].text)

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { build, type Plugin } from 'esbuild'
 import { createElement } from 'react'
@@ -17,6 +18,11 @@ function stubDreiPlugin(): Plugin {
   return {
     name: 'stub-drei-transform-controls',
     setup(buildApi) {
+      const runtimeExternals = ['react', 'react-dom/server', 'react/jsx-runtime', 'three']
+      buildApi.onResolve({ filter: /^[^./]/ }, (args) => {
+        if (!runtimeExternals.some((name) => args.path === name || args.path.startsWith(`${name}/`))) return null
+        return { path: fileURLToPath(import.meta.resolve(args.path)), external: true }
+      })
       buildApi.onResolve({ filter: /^@react-three\/drei$/ }, () => ({ path: 'drei-transform-controls-stub', namespace: 'stub' }))
       buildApi.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({
         loader: 'tsx',
@@ -38,26 +44,30 @@ function stubDreiPlugin(): Plugin {
 }
 
 async function loadCollisionSurfaceLayerModule() {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-world-collision-surface-layer-test-'))
-  const outfile = path.join(tempDir, 'WorldCollisionSurfaceLayer.bundle.mjs')
-  const result = await build({
-    entryPoints: [componentEntry],
-    bundle: true,
-    write: false,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    plugins: [stubDreiPlugin()],
-    external: ['react', 'react-dom/server', 'react/jsx-runtime', 'three'],
-  })
-  await writeFile(outfile, result.outputFiles[0].text)
-  return {
-    source: result.outputFiles[0].text,
-    componentSource: await readFile(componentEntry, 'utf8'),
-    module: await import(pathToFileURL(outfile).href),
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true })
-    },
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-world-collision-surface-layer-test-'))
+  try {
+    const outfile = path.join(tempDir, 'WorldCollisionSurfaceLayer.bundle.mjs')
+    const result = await build({
+      entryPoints: [componentEntry],
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [stubDreiPlugin()],
+    })
+    await writeFile(outfile, result.outputFiles[0].text)
+    return {
+      source: result.outputFiles[0].text,
+      componentSource: await readFile(componentEntry, 'utf8'),
+      module: await import(pathToFileURL(outfile).href),
+      async cleanup() {
+        await rm(tempDir, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 

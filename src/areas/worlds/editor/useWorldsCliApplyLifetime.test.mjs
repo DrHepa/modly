@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import React, { act, createElement } from 'react'
 import Reconciler from 'react-reconciler'
 import { build } from 'esbuild'
@@ -94,14 +95,14 @@ test('mounted drawer lifetime sends cancellation on conditional unmount without 
 })
 
 test('mounted sidebar keeps Worlds selected and visibly announces a failed leave ACK', async () => {
-  const cache = join(process.cwd(), 'node_modules', '.cache')
-  await mkdir(cache, { recursive: true })
-  const directory = await mkdtemp(join(cache, `worlds-sidebar-${randomUUID()}-`))
+  const directory = await mkdtemp(join(tmpdir(), `worlds-sidebar-${randomUUID()}-`))
   const outfile = join(directory, 'sidebar.mjs')
   try {
     await build({ stdin: { contents: `export { default as Sidebar } from '${process.cwd()}/src/shared/components/layout/Sidebar.tsx';\nexport { useNavStore, registerWorldsLeaveGuard } from '${process.cwd()}/src/shared/stores/navStore.ts';`,
       loader: 'tsx', resolveDir: process.cwd() }, bundle: true, alias: { '@shared': join(process.cwd(), 'src/shared') },
-      external: ['react', 'react/jsx-runtime', 'zustand'], platform: 'node', format: 'esm', jsx: 'automatic', outfile, logLevel: 'silent' })
+      plugins: [{ name: 'source-owned-react', setup(build) {
+        build.onResolve({ filter: /^(react|react\/jsx-runtime|zustand)$/ }, (args) => ({ path: fileURLToPath(import.meta.resolve(args.path)), external: true }))
+      } }], platform: 'node', format: 'esm', jsx: 'automatic', outfile, logLevel: 'silent' })
     const { Sidebar, useNavStore: sidebarNav, registerWorldsLeaveGuard: sidebarGuard } = await import(`${pathToFileURL(outfile).href}?${randomUUID()}`)
     const container = { children: [] }
     const root = renderer.createContainer(container, 0, null, false, null, '', console.error, null)

@@ -18,7 +18,7 @@ test('Add to Worlds is wired as a mesh terminal without changing Add to Scene', 
   assert.match(processExecutionSource, /node\.type === 'outputNode' \|\| node\.type === 'addToWorldsNode'/)
   assert.match(nodeBehaviorsSource, /outputNode:\s*\{\s*sceneOutput: true,\s*branchConsumer: true\s*\}/)
   assert.match(runStoreSource, /interface RunContext\s*\{[^}]*nodeOutputs:\s*Map<string, NodeOutput>[^}]*nodeMap:\s*Map<string, WFNode>/)
-  assert.match(nodeBehaviorsSource, /addToSceneNode:\s*\{[^}]*sceneOutput: true/ )
+  assert.match(nodeTypesSource, /outputNode: AddToSceneNode/)
   assert.match(runStoreSource, /targetType === 'addToWorldsNode'/)
   assert.match(runStoreSource, /isSceneOutput\(targetType\)/)
   assert.match(runStoreSource, /const runId = crypto\.randomUUID\(\)\s*const jobId = runId/)

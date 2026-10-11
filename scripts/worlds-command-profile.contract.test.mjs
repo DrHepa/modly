@@ -4,6 +4,7 @@ import test from 'node:test'
 import { createHash, randomBytes } from 'node:crypto'
 import { appendFile, lstat, mkdir, mkdtemp, readdir, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import * as diagnostic from './worlds-command-profile.mjs'
 import { success } from './worlds-command-latency.mjs'
@@ -15,7 +16,6 @@ import { createDeterministicWorldEditorIdentityGenerator } from '../src/areas/wo
 import { canonicalWorldCommandBatchPayload, fingerprintWorldCommandBatch } from '../src/areas/worlds/core/worldCommands.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const TESTS = join(ROOT, 'docs/worlds-engine-evidence/2026-09-09/current-command-cost-map/storage-binding-remediation/contract-tests')
 const LABEL = 'SYNTHETIC_PROFILER_FOR_CONTRACT_ONLY'
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
 const save = (root, name, value) => writeFile(join(root, name), `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
@@ -159,8 +159,8 @@ async function customIds(evidence) {
 }
 
 test('real default-sync52 and independent scene IDs retain canonical bodies; SYNTHETIC profiler NOT CPU evidence', async (t) => {
-  await mkdir(TESTS, { recursive: true, mode: 0o700 }); await safeDirectory(TESTS)
-  const evidence = await mkdtemp(join(TESTS, 'contract-'))
+  const evidence = await mkdtemp(join(tmpdir(), 'modly-command-profile-contract-'))
+  await safeDirectory(evidence)
   const wrapper = { schema: 'worlds-command-profile-contract-test-v1', instrumentation: LABEL, cpuEvidence: 'NOT_CPU_EVIDENCE',
     performanceAcceptance: 'NOT_ASSESSED', app: 'REAL_CONTROLLER_NORMALIZING_SERVICE_DEFAULT_SYNC_REPOSITORY',
     custody: 'REAL_INSPECTOR_BOUNDED_READER_CAS', evidence, argv: process.argv, execArgv: process.execArgv, status: 'PENDING' }

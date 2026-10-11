@@ -250,24 +250,27 @@ test('world asset library reads safe audio through preview authority without ope
 })
 
 test('world asset library service fails safely when IPC success payload omits entries', async () => {
+  let response: unknown = { success: true }
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
     value: {
       electron: {
         workspace: {
           library: {
-            list: async () => ({ success: true }),
+            list: async () => response,
           },
         },
       },
     },
   })
 
-  const result = await listWorldAssetLibraryRenderables(API_URL)
-  assert.deepEqual(result, {
-    success: false,
-    error: 'Workspace asset-library returned an invalid entries payload.',
-  })
+  await assert.rejects(() => listWorldAssetLibraryRenderables(API_URL), /Invalid asset library entries\./)
+  response = { success: true, entries: null }
+  await assert.rejects(() => listWorldAssetLibraryRenderables(API_URL), /Invalid asset library entries\./)
+  response = { success: true, entries: [] }
+  assert.deepEqual(await listWorldAssetLibraryRenderables(API_URL), { success: true, assets: [] })
+  response = { success: false, error: 'Fixture library unavailable' }
+  assert.deepEqual(await listWorldAssetLibraryRenderables(API_URL), { success: false, error: 'Fixture library unavailable' })
 })
 
 test('world asset library service opens safe Workflows renderables and rejects unsafe requests before preload', async () => {

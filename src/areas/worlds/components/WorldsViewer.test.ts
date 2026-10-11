@@ -61,7 +61,7 @@ type Host = {
   type: string; props: Record<string, any>; children: Host[]; object?: THREE.Object3D
   parent?: Host; resource?: THREE.BufferGeometry | THREE.Material; focus?: () => void
   hidden?: boolean; authoredVisible?: boolean; object3D?: THREE.Object3D; tagName?: string
-  ownerDocument?: NavigationTestDocument
+  ownerDocument?: NavigationTestDocument | CpuDocument
   addEventListener?: (type: string, listener: NavigationTestListener | null) => void
   removeEventListener?: (type: string, listener: NavigationTestListener | null) => void
   emit?: (type: string, event?: NavigationTestEvent) => NavigationTestEvent
@@ -102,46 +102,53 @@ function requireWorldsCameraFitSnapshot(ref: WorldsCameraFitSnapshotRef): Worlds
 
 async function loadViewerModule() {
   const tempDir = await mkdtemp(path.join(tmpdir(), 'modly-worlds-viewer-test-'))
-  const outfile = path.join(tempDir, 'WorldsViewer.bundle.mjs')
-  const result = await build({
-    entryPoints: [viewerEntry],
-    bundle: true,
-    write: false,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    plugins: [{ name: 'cpu-rendering-boundary', setup(api) {
-      api.onResolve({ filter: /^@react-three\/(fiber|drei)$/ }, args => ({ path: args.path, namespace: 'cpu' }))
-      api.onLoad({ filter: /.*/, namespace: 'cpu' }, () => ({ loader: 'tsx', contents: `
-        import { forwardRef, useEffect, useImperativeHandle } from 'react'
-        export const Canvas = ({children}) => children
-        export const Bounds = ({children}) => <cpuBounds>{children}</cpuBounds>
-        export const Html = Canvas, GizmoHelper = Canvas, TransformControls = Canvas, Environment = Canvas
-        export const GizmoViewport = () => null, Lightformer = () => null
-        export const useThree = () => globalThis.__worldsCpu
-        export const useBounds = () => globalThis.__worldsCpu.bounds
-        export const useFrame = callback => { useEffect(() => { const frames = globalThis.__worldsCpu.frames; frames.add(callback); return () => frames.delete(callback) }) }
-        export const OrbitControls = forwardRef((_props, ref) => { useImperativeHandle(ref, () => globalThis.__worldsCpu.controls); return null })
-        export const useGLTF = url => globalThis.__worldsGltf(url)
-      ` }))
-      api.onResolve({ filter: /^@react-three\/postprocessing$/ }, () => ({ path: 'postprocessing', namespace: 'cpu-postprocessing' }))
-      api.onLoad({ filter: /.*/, namespace: 'cpu-postprocessing' }, () => ({ loader: 'tsx', contents: `
-        export const Selection = ({children}) => children
-        export const Select = Selection
-        export const EffectComposer = () => null
-        export const Outline = () => null
-      ` }))
-      api.onResolve({ filter: /^(react(?:\/.*)?|three(?:\/.*)?)$/ }, args => ({ path: fileURLToPath(import.meta.resolve(args.path)), external: true }))
-    } }],
-  })
-  const source = result.outputFiles[0].text
-  await writeFile(outfile, source)
-  return {
-    source,
-    module: await import(pathToFileURL(outfile).href),
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true })
-    },
+  try {
+    const outfile = path.join(tempDir, 'WorldsViewer.bundle.mjs')
+    const result = await build({
+      entryPoints: [viewerEntry],
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [{ name: 'cpu-rendering-boundary', setup(api) {
+        api.onResolve({ filter: /^@react-three\/(fiber|drei)$/ }, args => ({ path: args.path, namespace: 'cpu' }))
+        api.onLoad({ filter: /.*/, namespace: 'cpu' }, () => ({ loader: 'tsx', contents: `
+          import { forwardRef, useEffect, useImperativeHandle } from 'react'
+          export const Canvas = ({children}) => children
+          export const Bounds = ({children}) => <cpuBounds>{children}</cpuBounds>
+          export const Html = Canvas, GizmoHelper = Canvas, TransformControls = Canvas, Environment = Canvas
+          export const GizmoViewport = () => null, Lightformer = () => null
+          export const useThree = selector => typeof selector === 'function' ? selector(globalThis.__worldsCpu) : globalThis.__worldsCpu
+          export const useBounds = () => globalThis.__worldsCpu.bounds
+          export const useFrame = callback => { useEffect(() => { const frames = globalThis.__worldsCpu.frames; frames.add(callback); return () => frames.delete(callback) }) }
+          export const OrbitControls = forwardRef((_props, ref) => { useImperativeHandle(ref, () => globalThis.__worldsCpu.controls); return null })
+          export const useGLTF = url => globalThis.__worldsGltf(url)
+        ` }))
+        api.onResolve({ filter: /^@react-three\/postprocessing$/ }, () => ({ path: 'postprocessing', namespace: 'cpu-postprocessing' }))
+        api.onLoad({ filter: /.*/, namespace: 'cpu-postprocessing' }, () => ({ loader: 'tsx', contents: `
+          import { createContext } from 'react'
+          export const selectionContext = createContext(null)
+          export const Selection = ({children}) => children
+          export const Select = Selection
+          export const EffectComposer = () => null
+          export const Outline = () => null
+        ` }))
+        api.onResolve({ filter: /^(react(?:-dom)?(?:\/.*)?|three(?:\/.*)?)$/ }, args => ({ path: fileURLToPath(import.meta.resolve(args.path)), external: true }))
+      } }],
+    })
+    const source = result.outputFiles[0].text
+    await writeFile(outfile, source)
+    return {
+      source,
+      module: await import(pathToFileURL(outfile).href),
+      async cleanup() {
+        await rm(tempDir, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 
@@ -191,25 +198,39 @@ test('PLY viewer keeps supported newline combinations and rejects binary offset 
   } finally { await cleanup() }
 })
 async function loadModeControlModule() {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-mode-control-test-'))
-  const outfile = path.join(tempDir, 'WorldsViewportModeControl.bundle.mjs')
-  const result = await build({
-    entryPoints: [modeControlEntry],
-    bundle: true,
-    write: false,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime'],
-  })
-  const source = result.outputFiles[0].text
-  await writeFile(outfile, source)
-  return {
-    source,
-    module: await import(pathToFileURL(outfile).href),
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true })
-    },
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-worlds-mode-control-test-'))
+  try {
+    const outfile = path.join(tempDir, 'WorldsViewportModeControl.bundle.mjs')
+    const result = await build({
+      entryPoints: [modeControlEntry],
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [{
+        name: 'source-anchored-runtime',
+        setup(buildApi) {
+          const runtimeExternals = ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime']
+          buildApi.onResolve({ filter: /^[^./]/ }, (args) => {
+            if (!runtimeExternals.some((name) => args.path === name || args.path.startsWith(`${name}/`))) return null
+            return { path: fileURLToPath(import.meta.resolve(args.path)), external: true }
+          })
+        },
+      }],
+    })
+    const source = result.outputFiles[0].text
+    await writeFile(outfile, source)
+    return {
+      source,
+      module: await import(pathToFileURL(outfile).href),
+      async cleanup() {
+        await rm(tempDir, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 
@@ -230,40 +251,49 @@ type NavigationControlsTestModule = {
 }
 
 async function loadNavigationControlsModule() {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-worlds-navigation-controls-test-'))
-  const outfile = path.join(tempDir, 'WorldsViewportNavigationControls.bundle.mjs')
-  const result = await build({
-    stdin: {
-      contents: `export { WorldsViewportNavigationControls } from './src/areas/worlds/components/WorldsViewportNavigationControls.tsx'; export { configureNavigationTestThree, advanceNavigationTestFrame } from '@react-three/fiber';`,
-      resolveDir: projectRoot,
-      sourcefile: 'WorldsViewportNavigationControls.test-entry.tsx',
-      loader: 'tsx',
-    },
-    bundle: true,
-    write: false,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    external: ['react', 'react/jsx-runtime', 'three'],
-    plugins: [{
-      name: 'worlds-navigation-controls-test-fiber',
-      setup(build) {
-        build.onResolve({ filter: /^@react-three\/fiber$/ }, () => ({ path: '@react-three/fiber', namespace: 'worlds-navigation-test' }))
-        build.onLoad({ filter: /.*/, namespace: 'worlds-navigation-test' }, () => ({
-          loader: 'js',
-          contents: `let state = null; let frame = null;
-            export function configureNavigationTestThree(next) { state = next; frame = null; }
-            export function useThree() { if (!state) throw new Error('navigation test state is not configured'); return state; }
-            export function useFrame(callback) { frame = callback; }
-            export function advanceNavigationTestFrame(delta) { if (!frame) throw new Error('navigation frame callback is not mounted'); frame({}, delta); }`,
-        }))
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-worlds-navigation-controls-test-'))
+  try {
+    const outfile = path.join(tempDir, 'WorldsViewportNavigationControls.bundle.mjs')
+    const result = await build({
+      stdin: {
+        contents: `export { WorldsViewportNavigationControls } from './src/areas/worlds/components/WorldsViewportNavigationControls.tsx'; export { configureNavigationTestThree, advanceNavigationTestFrame } from '@react-three/fiber';`,
+        resolveDir: projectRoot,
+        sourcefile: 'WorldsViewportNavigationControls.test-entry.tsx',
+        loader: 'tsx',
       },
-    }],
-  })
-  await writeFile(outfile, result.outputFiles[0].text)
-  return {
-    module: await import(pathToFileURL(outfile).href) as NavigationControlsTestModule,
-    async cleanup() { await rm(tempDir, { recursive: true, force: true }) },
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [{
+        name: 'worlds-navigation-controls-test-fiber',
+        setup(build) {
+          const runtimeExternals = ['react', 'react/jsx-runtime', 'three']
+          build.onResolve({ filter: /^[^./]/ }, (args) => {
+            if (!runtimeExternals.some((name) => args.path === name || args.path.startsWith(`${name}/`))) return null
+            return { path: fileURLToPath(import.meta.resolve(args.path)), external: true }
+          })
+          build.onResolve({ filter: /^@react-three\/fiber$/ }, () => ({ path: '@react-three/fiber', namespace: 'worlds-navigation-test' }))
+          build.onLoad({ filter: /.*/, namespace: 'worlds-navigation-test' }, () => ({
+            loader: 'js',
+            contents: `let state = null; let frame = null;
+              export function configureNavigationTestThree(next) { state = next; frame = null; }
+              export function useThree() { if (!state) throw new Error('navigation test state is not configured'); return state; }
+              export function useFrame(callback) { frame = callback; }
+              export function advanceNavigationTestFrame(delta) { if (!frame) throw new Error('navigation frame callback is not mounted'); frame({}, delta); }`,
+          }))
+        },
+      }],
+    })
+    await writeFile(outfile, result.outputFiles[0].text)
+    return {
+      module: await import(pathToFileURL(outfile).href) as NavigationControlsTestModule,
+      async cleanup() { await rm(tempDir, { recursive: true, force: true }) },
+    }
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 
@@ -393,6 +423,7 @@ async function loadViewerInteractionModule(withGeometry = false, withFitCamera =
     plugins: [{
       name: 'worlds-viewer-interaction-mocks',
       setup(build) {
+        build.onResolve({ filter: /^three(?:\/.*)?$/ }, args => ({ path: fileURLToPath(import.meta.resolve(args.path)), external: true }))
         if (withFitCamera || withNavigation) build.onLoad({ filter: /WorldsViewer\.tsx$/ }, async () => ({
           contents: `${await readFile(viewerEntry, 'utf8')}\nexport { SceneFitController as TestSceneFitController, WorldSceneItemErrorBoundary as TestRenderBoundary, PlySceneObject as TestPlySceneObject };\nexport const testUpdateRenderLoadState = (...args) => updateWorldsRenderLoadState(...args);\nexport { fitTestCamera, fitTestBoundsCalls, navigationTestDom } from '@react-three/fiber';`,
           loader: 'tsx', resolveDir: path.dirname(viewerEntry),
@@ -959,11 +990,36 @@ test('mounted editor Viewer preserves unrelated model bounds and true anchor inv
     assert.deepEqual(rig.canonicalCalls, [])
     await rig.select(null)
     assert.equal(c.position.x, 6, 'selection cancellation restores the authoritative pose')
+    const hitbox = findHost(rig.host.container, (node) => node.props.name === 'entity:c selection hitbox')?.object
+    const b = findHost(rig.host.container, (node) => node.props.name === 'entity:b')?.object
+    assert.ok(hitbox); assert.ok(b)
+    assert.equal(hitbox.position.x, 6)
+    const traverseB = b.traverse.bind(b)
+    let unchangedThirdWalks = 0
+    b.traverse = (visitor) => { unchangedThirdWalks += 1; traverseB(visitor) }
     const moved = structuredClone(rig.controller.getState().session!.snapshot)
     moved.scenes[0].entities[2].transform.position[0] = 9
     moved.project.revision += 1
     await rig.publish(moved)
     assert.deepEqual(useWorldsSceneStore.getState().sceneItemAnchors['entity:c'], [9, 0, 0])
+    assert.equal(hitbox.position.x, 9, 'an authoritative pose-only edit refreshes the non-active item hitbox')
+    assert.equal(unchangedThirdWalks, 0, 'local invalidation must not traverse the unchanged third item')
+    const materialChange = structuredClone(moved)
+    const bRenderable = materialChange.scenes[0].entities[1].components.find(component => component.type === 'renderable')
+    assert.ok(bRenderable?.type === 'renderable')
+    bRenderable.material = { baseColor: '#123456', metallic: 0.25, roughness: 0.2, opacity: 0.4 }
+    bRenderable.castShadow = true; bRenderable.receiveShadow = true
+    materialChange.project.revision += 1
+    walks = 0
+    await rig.publish(materialChange)
+    const bMesh = b.getObjectByProperty('isMesh', true)
+    assert.ok(bMesh instanceof THREE.Mesh)
+    assert.ok(bMesh.material instanceof THREE.MeshStandardMaterial)
+    assert.equal(bMesh.material.color.getHexString(), '123456')
+    assert.equal(bMesh.material.metalness, 0.25); assert.equal(bMesh.material.roughness, 0.2)
+    assert.equal(bMesh.material.opacity, 0.4); assert.equal(bMesh.material.transparent, true)
+    assert.equal(bMesh.castShadow, true); assert.equal(bMesh.receiveShadow, true)
+    assert.equal(walks, 0, 'a real B material change must not remeasure unchanged C')
     const changedContent = structuredClone(moved)
     changedContent.project.resources[0].workspacePath = 'Exports/wide.glb'
     changedContent.project.revision += 1
@@ -3011,16 +3067,32 @@ test('WorldsViewer settled render failures release first-fit readiness but real 
     assert.equal(module.measureWorldsSceneCameraBounds([ready, replacement], objectsRef.current, loadsRef.current), null)
     const ply = item('ply-mesh', 'failed.ply')
     let resolveRetry!: (value: Response) => void
-    globalThis.fetch = async () => new Response(null, { status: 404 })
+    const fetchSignals: Array<AbortSignal | null> = []
+    let fetchCalls = 0
+    globalThis.fetch = async (_input, init) => {
+      fetchCalls += 1; fetchSignals.push(init?.signal ?? null)
+      return new Response(null, { status: 404 })
+    }
     plyHost.render(createElement(interaction.TestRenderBoundary, { item: ply, onRenderLoadStateChange: report,
       children: createElement(interaction.TestPlySceneObject, { item: ply, onBoundsChange() {} }) }))
     await settleMounted(plyHost)
     assert.ok(findHost(plyHost.container, (node) => node.props.role === 'status' && node.children.some((child) => child.props.value === 'Unable to load PLY: 404')))
     assert.ok(module.measureWorldsSceneCameraBounds([ready, ply], objectsRef.current, loadsRef.current), 'terminal PLY failure does not freeze ready geometry')
-    globalThis.fetch = (() => new Promise<Response>((resolve) => { resolveRetry = resolve })) as typeof fetch
+    assert.equal(fetchCalls, 1)
+    const failedPlyAttempt = loadsRef.current.get(ply.id).attempt
+    globalThis.fetch = (_input, init) => {
+      fetchCalls += 1; fetchSignals.push(init?.signal ?? null)
+      return new Promise<Response>((resolve) => { resolveRetry = resolve })
+    }
     const retryItem = { ...ply }
     plyHost.render(createElement(interaction.TestRenderBoundary, { item: retryItem, onRenderLoadStateChange: report,
       children: createElement(interaction.TestPlySceneObject, { item: retryItem, onBoundsChange() {} }) }))
+    await settleMounted(plyHost)
+    assert.equal(fetchCalls, 2, 'the same-source, same-pose failed-item intent starts exactly one held retry')
+    assert.equal(loadsRef.current.get(ply.id).status, 'loading', 'the actual retry effect publishes loading before fit')
+    assert.notStrictEqual(loadsRef.current.get(ply.id).attempt, failedPlyAttempt)
+    assert.equal(fetchSignals[0]?.aborted, true, 'the previous attempt was physically retired')
+    assert.equal(fetchSignals[1]?.aborted, false, 'the held retry still owns its live resource')
     assert.equal(module.measureWorldsSceneCameraBounds([ready, retryItem], objectsRef.current, loadsRef.current), null, 'actual same-source retry clears failure and remains pending')
     resolveRetry({ ok: true, arrayBuffer: async () => { const bytes = await readFile(meshFixture); return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) } } as Response)
     await settleMounted(plyHost)
@@ -3828,26 +3900,66 @@ async function listProductionWorldsFiles(root: string): Promise<string[]> {
 }
 // Real React lifecycle on a CPU mutation host; the canvas alone is substituted.
 class CpuEvents {
-  listeners = new Map<string, Set<(event: any) => void>>()
-  addEventListener(type: string, callback: (event: any) => void) { const set = this.listeners.get(type) ?? new Set(); set.add(callback); this.listeners.set(type, set) }
-  removeEventListener(type: string, callback: (event: any) => void) { this.listeners.get(type)?.delete(callback) }
+  listeners = new Map<string, Set<NavigationTestListener>>()
+  addEventListener(type: string, callback: NavigationTestListener | null) {
+    if (!callback) return
+    const set = this.listeners.get(type) ?? new Set<NavigationTestListener>()
+    set.add(callback); this.listeners.set(type, set)
+  }
+  removeEventListener(type: string, callback: NavigationTestListener | null) {
+    if (callback) this.listeners.get(type)?.delete(callback)
+  }
   emit(type: string, props: Record<string, unknown> = {}) {
     const event = { type, target: this, pointerId: 1, button: 0, buttons: 1, movementX: 0, movementY: 0, clientX: 0, clientY: 0, prevented: false, stopped: false,
       preventDefault() { this.prevented = true }, stopPropagation() { this.stopped = true }, stopImmediatePropagation() { this.stopped = true }, ...props }
-    for (const callback of this.listeners.get(type) ?? []) callback(event)
+    for (const callback of this.listeners.get(type) ?? []) {
+      if (typeof callback === 'function') callback(event as unknown as Event)
+      else callback.handleEvent(event as unknown as Event)
+    }
     return event
   }
   get listenerCount() { return [...this.listeners.values()].reduce((n, set) => n + set.size, 0) }
 }
-function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
+class CpuNode extends CpuEvents {
+  readonly ownerDocument: CpuDocument
+  constructor(ownerDocument: CpuDocument) { super(); this.ownerDocument = ownerDocument }
+}
+class CpuWindow extends CpuEvents {
+  readonly Node = CpuNode
+  readonly document: CpuDocument
+  constructor(document: CpuDocument) { super(); this.document = document }
+}
+type CpuFocusTarget = { tagName: string; isContentEditable?: boolean; closest?: () => { role: string } | null }
+class CpuDocument extends CpuEvents {
+  readonly defaultView = new CpuWindow(this)
+  activeElement: Host | CpuNode | CpuFocusTarget | null = null
+  pointerLockElement: CpuNode | null = null
+  hidden = false
+  exitPointerLock = (): void => {
+    this.pointerLockElement = null
+    this.emit('pointerlockchange')
+  }
+}
+function cpuHost({ strictEffects = false, pointerLockAvailable = false }: { strictEffects?: boolean; pointerLockAvailable?: boolean } = {}) {
   const globals = globalThis as any
   const previous = { window: globals.window, document: globals.document, cpu: globals.__worldsCpu }
-  const windowEvents = new CpuEvents(), documentEvents = Object.assign(new CpuEvents(), { activeElement: null as any, hidden: false })
+  const documentEvents = new CpuDocument(), windowEvents = documentEvents.defaultView
   const captures = new Set<number>()
-  const canvas = Object.assign(new CpuEvents(), { tagName: 'CANVAS', closest: () => null,
+  const canvas = Object.assign(new CpuNode(documentEvents), { tagName: 'CANVAS', closest: () => null,
     setPointerCapture: (id: number) => captures.add(id), hasPointerCapture: (id: number) => captures.has(id), releasePointerCapture: (id: number) => captures.delete(id) })
+  const pointerLockRequests = { count: 0 }
+  // Optional positive capability: only an actual production request grants this owned canvas lock.
+  // The default CPU owner remains unavailable/unlocked for existing negative-path cases.
+  if (pointerLockAvailable) Object.defineProperty(canvas, 'requestPointerLock', { value: () => {
+    pointerLockRequests.count += 1
+    return Promise.resolve().then(() => {
+      documentEvents.pointerLockElement = canvas
+      documentEvents.emit('pointerlockchange')
+    })
+  } })
   const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500); camera.position.set(2.4, 1.8, 2.8)
-  const controls = { target: new THREE.Vector3(), maxDistance: 500, update: () => { camera.lookAt(controls.target); camera.updateMatrixWorld() }, saveState: () => undefined }
+  const cameraStateSaves = { count: 0 }
+  const controls = { target: new THREE.Vector3(), maxDistance: 500, update: () => { camera.lookAt(controls.target); camera.updateMatrixWorld() }, saveState: () => { cameraStateSaves.count += 1 } }
   controls.update()
   const frames = new Set<(state: { camera: THREE.PerspectiveCamera }, delta: number) => void>()
   const isHidden = (node: Host) => node.hidden || node.props.visible === false || node.object3D?.visible === false
@@ -3887,7 +3999,34 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     }
     const fitRoot = find(n => n.type === 'cpuBounds'); if (fitRoot) visit(fitRoot); return this
   }, getSize() { return { box: this.box.clone(), size: this.box.getSize(new THREE.Vector3()), center: this.box.getCenter(new THREE.Vector3()), distance: this.box.getSize(new THREE.Vector3()).length() * 2 } } }
-  const state = { camera, controls, frames, bounds, gl: { domElement: canvas } }
+  // The real graphics controller observes an unmeasured CPU surface, not a WebGL capability claim.
+  const scene = new THREE.Scene(), size = { width: 0, height: 0 }
+  let pixelRatio = 1
+  const pixelRatioUpdates: number[] = [], dprUpdates: number[] = [], graphicsDiagnostics: string[] = []
+  const capabilityContext = {
+    MAX_TEXTURE_SIZE: 0x0d33,
+    MAX_RENDERBUFFER_SIZE: 0x84e8,
+    MAX_CUBE_MAP_TEXTURE_SIZE: 0x851c,
+    MAX_VIEWPORT_DIMS: 0x0d3a,
+    getParameter: (parameter: number) => parameter === 0x0d3a ? [0, 0] : 0,
+    getExtension: (_name: string) => null,
+    isContextLost: () => false,
+  }
+  const gl = {
+    domElement: canvas,
+    outputColorSpace: THREE.SRGBColorSpace,
+    toneMapping: THREE.NoToneMapping,
+    toneMappingExposure: 1,
+    shadowMap: { enabled: false, type: THREE.PCFShadowMap },
+    capabilities: { maxSamples: 0 },
+    getContext: () => capabilityContext,
+    getPixelRatio: () => pixelRatio,
+    setPixelRatio: (value: number) => { pixelRatio = value; pixelRatioUpdates.push(value) },
+  }
+  const setDpr = (value: number) => { dprUpdates.push(value); gl.setPixelRatio(value) }
+  const onGraphicsDiagnostic = (message: string) => { graphicsDiagnostics.push(message) }
+  const onGraphicsFailure = (failure: unknown) => { assert.fail(`Unexpected CPU graphics failure: ${String(failure)}`) }
+  const state = { camera, controls, frames, bounds, scene, size, setDpr, gl }
   const install = () => { globals.window = windowEvents; globals.document = documentEvents; globals.__worldsCpu = state }
   install()
   const reconcilerPath = fileURLToPath(import.meta.resolve('react-reconciler'))
@@ -3911,12 +4050,42 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     object.userData = node.props.userData ?? {}
     syncVisibility(node)
   }
+  // Installed Fiber compares arrays shallowly and object/handler owners by reference.
+  // Children/key/ref do not replay THREE properties during an unrelated host commit.
+  const equalHostProp = (left: unknown, right: unknown): boolean => {
+    if (typeof left !== typeof right || !!left !== !!right) return false
+    if (left === right) return true
+    if (!Array.isArray(left) || !Array.isArray(right)) return false
+    for (const key in left) if (!(key in right)) return false
+    for (const key in right) if (Reflect.get(left, key) !== Reflect.get(right, key)) return false
+    return true
+  }
+  const diffHostProps = (oldProps: Host['props'], props: Host['props']): Set<string> | null => {
+    const changes = new Set<string>()
+    for (const key of new Set([...Object.keys(oldProps), ...Object.keys(props)])) {
+      if (key === 'children' || key === 'key' || key === 'ref') continue
+      if (!Object.hasOwn(props, key) || !equalHostProp(props[key], oldProps[key])) changes.add(key)
+    }
+    return changes.size ? changes : null
+  }
+  const applyObjectChanges = (node: Host, changes: Set<string>): void => {
+    const object = node.object3D
+    if (!object) return
+    if (changes.has('position')) object.position.fromArray(node.props.position ?? [0, 0, 0])
+    if (changes.has('rotation')) {
+      const rotation = node.props.rotation ?? [0, 0, 0]
+      object.rotation.fromArray([rotation[0], rotation[1], rotation[2], 'XYZ'])
+    }
+    if (changes.has('scale')) object.scale.fromArray(node.props.scale ?? [1, 1, 1])
+    if (changes.has('userData')) object.userData = node.props.userData ?? {}
+    if (changes.has('visible')) syncVisibility(node)
+  }
   const renderer = require(reconcilerPath)({
     now: Date.now, supportsMutation: true, isPrimaryRenderer: false,
     getRootHostContext: () => context, getChildHostContext: () => context, getPublicInstance: (x: Host) => x.object3D ?? x,
     prepareForCommit: () => null, resetAfterCommit: () => undefined,
     createInstance: (type: string, props: any) => {
-      const node: Host = { type, props, children: [], tagName: type.toUpperCase(), closest: () => null }
+      const node: Host = Object.assign(new CpuNode(documentEvents), { type, props, children: [], tagName: type.toUpperCase(), closest: () => null })
       if (type === 'group') node.object3D = new THREE.Group()
       if (type === 'mesh') node.object3D = new THREE.Mesh(props.geometry)
       if (type === 'points') node.object3D = new THREE.Points(props.geometry)
@@ -3930,8 +4099,9 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
     createTextInstance: (text: string) => ({ type: '#text', props: { text }, children: [] }),
     appendInitialChild: append, appendChild: append, appendChildToContainer: append,
     removeChild: remove, removeChildFromContainer: remove, insertBefore: insert, insertInContainerBefore: insert,
-    finalizeInitialChildren: () => false, shouldSetTextContent: () => false, prepareUpdate: () => true,
-    commitUpdate: (x: Host, _p: unknown, _t: string, _old: unknown, props: any) => { x.props = props; syncObject(x) },
+    finalizeInitialChildren: () => false, shouldSetTextContent: () => false,
+    prepareUpdate: (_node: Host, _type: string, oldProps: Host['props'], props: Host['props']) => diffHostProps(oldProps, props),
+    commitUpdate: (x: Host, changes: Set<string>, _t: string, _old: unknown, props: Host['props']) => { x.props = props; applyObjectChanges(x, changes) },
     commitTextUpdate: (x: Host, _old: string, text: string) => { x.props.text = text },
     hideInstance: (x: Host) => {
       if (!x.hidden && x.object3D && typeof x.props.visible !== 'boolean') x.authoredVisible = x.object3D.visible
@@ -3954,18 +4124,19 @@ function cpuHost({ strictEffects = false }: { strictEffects?: boolean } = {}) {
   function find(predicate: (n: Host) => boolean, node = host): Host | undefined { if (predicate(node)) return node; for (const child of node.children) { const found = find(predicate, child); if (found) return found } }
   const text = (n: Host): string => isHidden(n) ? '' : n.type === '#text' ? n.props.text : n.children.map(text).join('')
   const button = (label: string) => { const n = find(n => n.type === 'button' && (n.props['aria-label'] === label || text(n) === label)); assert.ok(n, label); return n }
-  return { render, flush, settle, find, button, camera, controls, canvas, captures, bounds, windowEvents, documentEvents, frames, visibilityEvents, visibleText: () => text(host),
+  return { render, flush, settle, find, button, camera, controls, cameraStateSaves, canvas, captures, bounds, windowEvents, documentEvents, pointerLockRequests, frames, visibilityEvents, graphicsDiagnostics, onGraphicsDiagnostic, onGraphicsFailure, pixelRatioUpdates, dprUpdates, visibleText: () => text(host),
     frame: (delta = 1) => { for (const callback of frames) callback({ camera }, delta); flush() },
     click: (label: string) => { const n = button(label); assert.ok(!n.props.disabled, label); flush(() => n.props.onClick()) } }
 }
 
 test('mounted PLY fetch ignores transforms, cancels replaced loads and disposes only owned geometry', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule()
   const cpu = cpuHost(), previousFetch = globalThis.fetch
   const requests: Array<{ signal: AbortSignal; resolve: (r: Response) => void }> = []
   const bytes = await readFile(pointsFixture)
   globalThis.fetch = ((_url: unknown, init: RequestInit) => new Promise<Response>(resolve => requests.push({ signal: init.signal as AbortSignal, resolve }))) as typeof fetch
-  const render = (value: WorldSceneItem) => cpu.render(createElement(module.WorldsViewer, { items: [value] }))
+  const render = (value: WorldSceneItem) => cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [value] }))
   try {
     const first = item('ply-mesh', 'blob:first'); render(first)
     render({ ...first, transform: { ...first.transform, position: [9, 0, 0] } })
@@ -3989,7 +4160,56 @@ test('mounted PLY fetch ignores transforms, cancels replaced loads and disposes 
   } finally { cpu.render(null); globalThis.fetch = previousFetch; await cleanup() }
 })
 
+test('mounted PLY resource retirement and failed-item retry keep stale hitboxes ineligible', async () => {
+  const project = projectDocument()
+  const { module, cleanup } = await loadViewerModule()
+  const cpu = cpuHost(), previousFetch = globalThis.fetch
+  const requests: Array<{ signal: AbortSignal; resolve: (response: Response) => void }> = []
+  globalThis.fetch = (_url, init) => {
+    assert.ok(init?.signal)
+    const signal = init.signal
+    return new Promise(resolve => requests.push({ signal, resolve }))
+  }
+  const value = item('ply-points', 'blob:item-retry')
+  const hitbox = () => {
+    const node = cpu.find(n => n.props.name === `${value.id} selection hitbox`)
+    assert.ok(node?.object3D)
+    return node.object3D
+  }
+  try {
+    const bytes = await readFile(pointsFixture)
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [value] }))
+    requests[0].resolve(new Response(bytes)); await cpu.settle()
+    const points = cpu.find(n => n.type === 'points'); assert.ok(points)
+    const geometry = points.props.geometry
+    assert.ok(geometry instanceof THREE.BufferGeometry)
+    let disposed = 0
+    geometry.addEventListener('dispose', () => disposed++)
+    assert.equal(hitbox().visible, true, 'a ready item has measured selectable geometry')
+    const replacement = { ...value, url: 'blob:failed-replacement' }
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [replacement] })); await cpu.settle()
+    assert.equal(requests.length, 2, 'a changed actual source reaches a new real fetch')
+    assert.equal(requests[0].signal.aborted, true)
+    assert.equal(disposed, 1, 'the retired owned geometry is disposed once')
+    assert.equal(cpu.find(n => n.type === 'points'), undefined)
+    assert.equal(hitbox().visible, false, 'a pending retry cannot select the previous geometry bounds')
+    requests[1].resolve(new Response('failed resource', { status: 404 })); await cpu.settle()
+    assert.equal(hitbox().visible, false)
+    const moved: WorldSceneItem = { ...replacement, transform: { ...replacement.transform, position: [9, 0, 0] } }
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [moved] })); await cpu.settle()
+    assert.equal(requests.length, 2, 'a pose edit alone must not retry even a failed resource')
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [{ ...moved }] })); await cpu.settle()
+    assert.equal(requests.length, 3, 'a new same-source failed-item intent reaches the actual retry')
+    assert.equal(requests[1].signal.aborted, true)
+    assert.equal(hitbox().visible, false)
+    requests[2].resolve(new Response(bytes)); await cpu.settle()
+    assert.equal(hitbox().visible, true, 'only the newly committed geometry re-enables the hitbox')
+    assert.equal(disposed, 1)
+  } finally { cpu.render(null); globalThis.fetch = previousFetch; await cleanup() }
+})
+
 test('mounted GLTF instances do not share scene parents and errors recover when the URL changes', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule()
   const cpu = cpuHost(), scene = new THREE.Group()
   const globals = globalThis as typeof globalThis & { __worldsGltf?: (url: string) => { scene: THREE.Group } }
@@ -3997,82 +4217,125 @@ test('mounted GLTF instances do not share scene parents and errors recover when 
   globals.__worldsGltf = url => { if (url === 'bad.glb') throw new Error('Expected GLTF load error'); return { scene } }
   try {
     const a = item('glb', 'same.glb'), b = { ...a, id: 'second' }
-    cpu.render(createElement(module.WorldsViewer, { items: [a, b] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [a, b] }))
     const one = cpu.find(n => n.type === 'primitive'); assert.ok(one)
     const two = cpu.find(n => n.type === 'primitive' && n !== one); assert.ok(two)
     assert.notEqual(one.props.object, two.props.object); assert.notEqual(one.props.object, scene)
-    cpu.render(createElement(module.WorldsViewer, { items: [{ ...a, url: 'bad.glb' }] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [{ ...a, url: 'bad.glb' }] }))
     assert.ok(cpu.find(n => n.props.role === 'status'))
-    cpu.render(createElement(module.WorldsViewer, { items: [{ ...a, url: 'good.glb' }] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [{ ...a, url: 'good.glb' }] }))
     assert.ok(cpu.find(n => n.type === 'primitive'), 'changed URL resets the item error boundary')
   } finally { cpu.render(null); globals.__worldsGltf = previous; await cleanup() }
 })
 
 test('deferred PLY geometry is fitted only after mounting, then movement and reset preserve the loaded snapshot', async () => {
-  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
-  let resolve!: (response: Response) => void
-  globalThis.fetch = (() => new Promise<Response>(r => { resolve = r })) as typeof fetch
+  const project = projectDocument()
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ pointerLockAvailable: true }), previousFetch = globalThis.fetch
+  let resolve!: (response: Response) => void, fetchCalls = 0
+  globalThis.fetch = (() => { fetchCalls++; return new Promise<Response>(r => { resolve = r }) }) as typeof fetch
   try {
     const value = { ...item('ply-points', 'blob:deferred'), transform: { position: [7, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } } as WorldSceneItem
-    cpu.render(createElement(module.WorldsViewer, { items: [value] }))
-    assert.equal(cpu.bounds.refreshes, 0, 'loading status must not become the fitted scene')
+    const pendingPosition = cpu.camera.position.clone(), pendingTarget = cpu.controls.target.clone()
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [value] }))
+    assert.equal(cpu.bounds.refreshes, 0, 'no aggregate measurement is used')
+    assert.equal(cpu.cameraStateSaves.count, 0, 'loading status must not become the fitted scene')
+    assert.deepEqual(cpu.camera.position.toArray(), pendingPosition.toArray())
+    assert.deepEqual(cpu.controls.target.toArray(), pendingTarget.toArray())
+    assert.ok(cpu.graphicsDiagnostics.some(message => message.includes('Viewport has zero CSS size; no graphics targets or frame will be rendered.')))
     resolve(new Response(await readFile(pointsFixture))); await cpu.settle()
-    assert.ok(cpu.find(n => n.type === 'points')); assert.equal(cpu.bounds.refreshes, 1)
+    assert.ok(cpu.find(n => n.type === 'points')); assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 1)
     const fittedPosition = cpu.camera.position.clone(), fittedTarget = cpu.controls.target.clone()
     assert.equal(fittedTarget.x, 7)
     const near = cpu.camera.near, far = cpu.camera.far, maxDistance = cpu.controls.maxDistance
-    cpu.find(n => n.type === 'section')!.focus!()
-    cpu.windowEvents.emit('keydown', { code: 'KeyW', target: cpu.documentEvents.activeElement }); cpu.frame(0.5)
+    cpu.click('Fly')
+    assert.equal(cpu.button('Fly').props['aria-checked'], true)
+    assert.equal(cpu.documentEvents.pointerLockElement, null, 'mode choice alone must not fabricate pointer capture')
+    const section = cpu.find(n => n.type === 'section')!
+    assert.ok(section instanceof CpuNode, 'the key owner is the real scoped CPU node')
+    section.focus!()
+    cpu.canvas.emit('pointerdown')
+    await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 1, 'the actual production pointer handler requested the owner capability')
+    assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    section.emit('keydown', { code: 'KeyW', target: section }); cpu.frame(0.5)
     assert.ok(cpu.camera.position.distanceTo(fittedPosition) > 0.1)
-    assert.ok(cpu.camera.position.clone().sub(fittedPosition).distanceTo(cpu.controls.target.clone().sub(fittedTarget)) < 1e-9)
-    cpu.windowEvents.emit('keyup', { code: 'KeyW' })
-    cpu.click('Reset camera')
+    assert.deepEqual(cpu.controls.target.toArray(), fittedTarget.toArray(), 'Fly moves the camera, not the retained Inspect target')
+    section.emit('keyup', { code: 'KeyW', target: section })
+    const movedPosition = cpu.camera.position.clone(), movedDirection = cpu.camera.getWorldDirection(new THREE.Vector3())
+    const handoffDistance = fittedPosition.distanceTo(fittedTarget)
+    cpu.click('Inspect')
+    assert.equal(cpu.button('Inspect').props['aria-checked'], true)
+    assert.equal(cpu.documentEvents.pointerLockElement, null, 'returning to Inspect releases the requested capture')
+    assert.deepEqual(cpu.camera.position.toArray(), movedPosition.toArray())
+    assert.ok(cpu.controls.target.distanceTo(movedPosition.clone().addScaledVector(movedDirection, handoffDistance)) < 1e-9, 'Inspect receives the real view direction and retained orbit distance')
+    cpu.click('Frame scene')
     assert.deepEqual(cpu.camera.position.toArray(), fittedPosition.toArray()); assert.deepEqual(cpu.controls.target.toArray(), fittedTarget.toArray())
     assert.deepEqual([cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance], [near, far, maxDistance])
-    cpu.render(createElement(module.WorldsViewer, { items: [{ ...value, transform: { ...value.transform, position: [10, 0, 0] } }] }))
-    assert.equal(cpu.bounds.refreshes, 1, 'transform-only render must not fight navigation')
+    assert.equal(cpu.cameraStateSaves.count, 2, 'reset reapplies the retained fitted snapshot')
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [{ ...value, transform: { ...value.transform, position: [10, 0, 0] } }] }))
+    assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 2, 'transform-only render must not fight navigation')
+    assert.equal(fetchCalls, 1, 'a pose edit does not refetch the resource')
   } finally { cpu.render(null); globalThis.fetch = previousFetch; await cleanup() }
 })
 
 test('same-identity URL replacement cannot reset to old bounds or accept a late cancelled fit', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
   const requests: Array<{ resolve: (response: Response) => void; signal: AbortSignal }> = []
   globalThis.fetch = ((_url: unknown, init: RequestInit) => new Promise<Response>(resolve => requests.push({ resolve, signal: init.signal as AbortSignal }))) as typeof fetch
   try {
     const first = item('ply-points', 'blob:first')
-    const render = (url: string, x: number) => cpu.render(createElement(module.WorldsViewer, { items: [{ ...first, url, transform: { ...first.transform, position: [x, 0, 0] } }] }))
+    const render = (url: string, x: number) => cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [{ ...first, url, transform: { ...first.transform, position: [x, 0, 0] } }] }))
     render('blob:first', 0); requests[0].resolve(new Response(await readFile(pointsFixture))); await cpu.settle()
+    assert.equal(cpu.cameraStateSaves.count, 1); assert.equal(cpu.bounds.refreshes, 0)
     render('blob:cancelled', 10); render('blob:latest', 20)
     assert.equal(requests[1].signal.aborted, true)
-    cpu.camera.position.set(90, 80, 70); cpu.click('Reset camera')
+    cpu.camera.position.set(90, 80, 70); cpu.click('Frame scene')
     assert.deepEqual(cpu.camera.position.toArray(), [90, 80, 70], 'pending replacement must not restore old fit')
+    assert.equal(cpu.cameraStateSaves.count, 1)
     requests[2].resolve(new Response(await readFile(pointsFixture))); await cpu.settle()
     assert.equal(cpu.controls.target.x, 20)
-    const latest = cpu.camera.position.clone(), count = cpu.bounds.refreshes
+    const latest = cpu.camera.position.clone(), latestTarget = cpu.controls.target.clone()
+    const latestLimits = [cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance]
+    const count = cpu.cameraStateSaves.count
+    assert.equal(count, 2)
     requests[1].resolve(new Response(await readFile(meshFixture))); await cpu.settle()
-    assert.deepEqual(cpu.camera.position.toArray(), latest.toArray()); assert.equal(cpu.bounds.refreshes, count)
-    cpu.camera.position.set(1, 2, 3); cpu.click('Reset camera'); assert.deepEqual(cpu.camera.position.toArray(), latest.toArray())
+    assert.deepEqual(cpu.camera.position.toArray(), latest.toArray())
+    assert.deepEqual(cpu.controls.target.toArray(), latestTarget.toArray())
+    assert.deepEqual([cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance], latestLimits)
+    assert.equal(cpu.cameraStateSaves.count, count); assert.equal(cpu.bounds.refreshes, 0)
+    cpu.camera.position.set(1, 2, 3); cpu.controls.target.set(4, 5, 6); cpu.click('Frame scene')
+    assert.deepEqual(cpu.camera.position.toArray(), latest.toArray())
+    assert.deepEqual(cpu.controls.target.toArray(), latestTarget.toArray())
+    assert.deepEqual([cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance], latestLimits)
+    assert.equal(cpu.cameraStateSaves.count, count + 1); assert.equal(cpu.bounds.refreshes, 0)
   } finally { cpu.render(null); globalThis.fetch = previousFetch; await cleanup() }
 })
 
 test('scene fit waits for every visible PLY geometry and includes their mounted transforms', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
   const requests: Array<(response: Response) => void> = []
   globalThis.fetch = (() => new Promise<Response>(resolve => requests.push(resolve))) as typeof fetch
   try {
     const first = item('ply-points', 'blob:one')
     const second = { ...item('ply-points', 'blob:two'), transform: { ...first.transform, position: [10, 0, 0] } } as WorldSceneItem
-    cpu.render(createElement(module.WorldsViewer, { items: [first, second] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [first, second] }))
     const bytes = await readFile(pointsFixture)
     requests[1](new Response(bytes)); await cpu.settle()
-    assert.equal(cpu.bounds.refreshes, 0, 'partially mounted geometry must not establish the reset snapshot')
+    assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 0, 'partially mounted geometry must not establish the reset snapshot')
     requests[0](new Response(bytes)); await cpu.settle()
-    assert.equal(cpu.bounds.refreshes, 1)
+    assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 1)
     assert.equal(cpu.controls.target.x, 5, 'fit contains both real geometry bounds and their transforms')
   } finally { cpu.render(null); globalThis.fetch = previousFetch; await cleanup() }
 })
 
 test('failed PLY and GLTF settle without blocking fit and reset of valid geometry while other loads remain pending', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
   const globals = globalThis as typeof globalThis & { __worldsGltf?: (url: string) => { scene: THREE.Group } }
   const previousGltf = globals.__worldsGltf
@@ -4081,87 +4344,165 @@ test('failed PLY and GLTF settle without blocking fit and reset of valid geometr
   globals.__worldsGltf = () => { throw new Error('Expected GLTF failure') }
   try {
     const valid = { ...item('ply-points', 'blob:valid'), transform: { position: [7, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] } } as WorldSceneItem
-    cpu.render(createElement(module.WorldsViewer, { items: [valid, item('ply-points', 'blob:failed'), item('ply-points', 'blob:pending'), item('glb', 'bad.glb')] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [valid, item('ply-points', 'blob:failed'), item('ply-points', 'blob:pending'), item('glb', 'bad.glb')] }))
     requests[0](new Response(await readFile(pointsFixture))); await cpu.settle()
     requests[1](new Response('failure', { status: 404 })); await cpu.settle()
-    assert.equal(cpu.bounds.refreshes, 0, 'failed loads settle but cannot bypass another pending load')
+    assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 0, 'failed loads settle but cannot bypass another pending load')
     requests[2](new Response('failure', { status: 404 })); await cpu.settle()
-    assert.equal(cpu.bounds.refreshes, 1)
+    assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 1)
     assert.equal(cpu.controls.target.x, 7, 'only valid mounted geometry contributes to the fitted bounds')
     const fitted = cpu.camera.position.clone(), target = cpu.controls.target.clone()
-    cpu.camera.position.set(90, 80, 70); cpu.click('Reset camera')
+    const fittedLimits = [cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance]
+    cpu.camera.position.set(90, 80, 70); cpu.click('Frame scene')
     assert.deepEqual(cpu.camera.position.toArray(), fitted.toArray())
     assert.deepEqual(cpu.controls.target.toArray(), target.toArray())
+    assert.deepEqual([cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance], fittedLimits)
+    assert.equal(cpu.cameraStateSaves.count, 2); assert.equal(cpu.bounds.refreshes, 0)
   } finally { cpu.render(null); globalThis.fetch = previousFetch; globals.__worldsGltf = previousGltf; await cleanup() }
 })
 
-test('left drag explicitly focuses the viewer for keyboard movement while right drag remains native', async () => {
-  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost()
+test('left click focuses the viewer and requests Fly capture for keyboard movement while right click remains native', async () => {
+  const project = projectDocument()
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ pointerLockAvailable: true })
   try {
-    cpu.render(createElement(module.WorldsViewer, { items: [] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [] }))
     const section = cpu.find(n => n.type === 'section')!
+    assert.ok(section.emit, 'the actual scoped CPU section must expose native event dispatch')
+    const emitSection = section.emit.bind(section)
+    assert.equal(cpu.button('Inspect').props['aria-checked'], true)
     const right = cpu.canvas.emit('pointerdown', { button: 2, buttons: 2 })
     assert.equal(right.prevented, false); assert.equal(right.stopped, false)
     const left = cpu.canvas.emit('pointerdown')
-    assert.equal(cpu.documentEvents.activeElement, section, 'captured left drag must not rely on stopped bubbling to focus')
+    section.props.onPointerDown?.({ target: cpu.canvas, currentTarget: section })
+    assert.equal(cpu.documentEvents.activeElement, section, 'the actual section pointer handler focuses an Inspect canvas click')
     assert.equal(left.prevented, false); assert.equal(cpu.captures.size, 0, 'a click remains available for selection')
-    const drag = cpu.canvas.emit('pointermove', { clientX: 4, movementX: 4 }); assert.equal(drag.prevented, true); assert.ok(cpu.captures.has(1))
+    assert.equal(left.stopped, false)
+    assert.equal(cpu.pointerLockRequests.count, 0); assert.equal(cpu.documentEvents.pointerLockElement, null)
+    cpu.click('Fly')
+    assert.equal(cpu.button('Fly').props['aria-checked'], true)
+    cpu.button('Fly').focus!()
+    assert.equal(cpu.documentEvents.activeElement, cpu.button('Fly'))
+    assert.equal(cpu.documentEvents.pointerLockElement, null, 'mode choice alone remains unlocked')
+    const flyRight = cpu.canvas.emit('pointerdown', { button: 2, buttons: 2 })
+    assert.equal(flyRight.prevented, false); assert.equal(flyRight.stopped, false)
+    assert.equal(cpu.documentEvents.activeElement, cpu.button('Fly'))
+    assert.equal(cpu.pointerLockRequests.count, 0); assert.equal(cpu.captures.size, 0)
+    const flyLeft = cpu.canvas.emit('pointerdown')
+    assert.equal(cpu.documentEvents.activeElement, section, 'the actual capture request restores section keyboard focus')
+    assert.equal(flyLeft.prevented, false); assert.equal(flyLeft.stopped, false)
+    await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 1)
+    assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    assert.equal(cpu.captures.size, 0, 'pointer lock never substitutes DOM drag capture')
     const before = cpu.camera.position.clone()
-    cpu.windowEvents.emit('keydown', { code: 'KeyW', target: section }); cpu.frame(0.1)
+    emitSection('keydown', { code: 'KeyW', target: section }); cpu.frame(0.1)
     assert.ok(cpu.camera.position.distanceTo(before) > 0)
-  } finally { cpu.render(null); assert.equal(cpu.canvas.listenerCount, 0); assert.equal(cpu.windowEvents.listenerCount, 0); assert.equal(cpu.documentEvents.listenerCount, 0); assert.equal(cpu.frames.size, 0); assert.equal(cpu.captures.size, 0); await cleanup() }
+    emitSection('keyup', { code: 'KeyW', target: section })
+  } finally { cpu.render(null); assert.equal(cpu.documentEvents.pointerLockElement, null); assert.equal(cpu.canvas.listenerCount, 0); assert.equal(cpu.windowEvents.listenerCount, 0); assert.equal(cpu.documentEvents.listenerCount, 0); assert.equal(cpu.frames.size, 0); assert.equal(cpu.captures.size, 0); await cleanup() }
 })
 
-test('mouse look owns one pointer, clamps pitch and releases on cancel, lost capture and unmount', async () => {
-  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost()
+test('mouse look owns requested canvas pointer lock, clamps pitch and releases on lock loss, blur and unmount', async () => {
+  const project = projectDocument()
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ pointerLockAvailable: true })
   try {
-    cpu.render(createElement(module.WorldsViewer, { items: [] }))
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [] }))
+    cpu.click('Fly')
+    assert.equal(cpu.button('Fly').props['aria-checked'], true)
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
+    const unlocked = cpu.camera.quaternion.clone()
+    cpu.documentEvents.emit('mousemove', { movementX: 30 }); cpu.frame(0.1)
+    assert.ok(cpu.camera.quaternion.equals(unlocked), 'unlocked owner-document movement cannot move the camera')
     cpu.canvas.emit('pointerdown', { pointerId: 7 })
+    await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 1); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    cpu.frame(0.1)
     const before = cpu.camera.quaternion.clone()
     cpu.canvas.emit('pointermove', { pointerId: 8, movementX: 100 })
-    assert.ok(cpu.camera.quaternion.equals(before), 'another pointer cannot move the owned camera')
-    cpu.canvas.emit('pointermove', { pointerId: 7, clientX: 4, movementX: 30, movementY: 100000 })
+    cpu.frame(0.1)
+    assert.ok(cpu.camera.quaternion.equals(before), 'native drag events cannot move the pointer-lock-owned camera')
+    cpu.documentEvents.emit('mousemove', { movementX: 30, movementY: 100000 }); cpu.frame(0.1)
+    assert.ok(!cpu.camera.quaternion.equals(before), 'the actual owner-document mouse input changes the production camera pose')
     const pitch = new THREE.Euler().setFromQuaternion(cpu.camera.quaternion, 'YXZ').x
     assert.ok(Math.abs(pitch) <= Math.PI / 2 - 0.05 + 1e-9)
     const direction = cpu.camera.getWorldDirection(new THREE.Vector3())
+    cpu.click('Inspect')
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
     assert.ok(direction.distanceTo(cpu.controls.target.clone().sub(cpu.camera.position).normalize()) < 1e-9)
-    cpu.canvas.emit('pointercancel', { pointerId: 7 }); assert.equal(cpu.captures.size, 0)
-    const cancelled = cpu.camera.quaternion.clone(); cpu.canvas.emit('pointermove', { pointerId: 7, movementX: 30 }); assert.ok(cpu.camera.quaternion.equals(cancelled))
-    cpu.canvas.emit('pointerdown', { pointerId: 9 }); cpu.captures.delete(9); cpu.canvas.emit('lostpointercapture', { pointerId: 9 })
-    cpu.canvas.emit('pointermove', { pointerId: 9, movementX: 30 }); assert.ok(cpu.camera.quaternion.equals(cancelled))
-    cpu.canvas.emit('pointerdown', { pointerId: 10 }); cpu.canvas.emit('pointermove', { pointerId: 10, clientX: 4 }); assert.ok(cpu.captures.has(10)); cpu.render(null); assert.equal(cpu.captures.size, 0)
+    cpu.click('Fly'); cpu.canvas.emit('pointerdown', { pointerId: 9 }); await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 2); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    cpu.documentEvents.exitPointerLock(); cpu.flush()
+    assert.equal(cpu.documentEvents.pointerLockElement, null); assert.equal(cpu.captures.size, 0)
+    const cancelled = cpu.camera.quaternion.clone()
+    cpu.documentEvents.emit('mousemove', { movementX: 30 }); cpu.frame(0.1)
+    assert.ok(cpu.camera.quaternion.equals(cancelled), 'lost pointer lock rejects subsequent mouse look')
+    cpu.canvas.emit('pointerdown', { pointerId: 10 }); await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 3); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    cpu.windowEvents.emit('blur'); cpu.flush()
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
+    cpu.documentEvents.emit('mousemove', { movementX: 30 }); cpu.frame(0.1)
+    assert.ok(cpu.camera.quaternion.equals(cancelled), 'owner-window blur releases mouse ownership')
+    cpu.canvas.emit('pointerdown', { pointerId: 11 }); await cpu.settle()
+    assert.equal(cpu.pointerLockRequests.count, 4); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    cpu.documentEvents.emit('mousemove', { movementX: 30 }); cpu.frame(0.1)
+    assert.ok(!cpu.camera.quaternion.equals(cancelled)); assert.equal(cpu.captures.size, 0)
+    cpu.render(null); assert.equal(cpu.documentEvents.pointerLockElement, null); assert.equal(cpu.captures.size, 0)
   } finally { cpu.render(null); await cleanup() }
 })
 
 test('keyboard aliases remain independently held and blur prevents stuck movement', async () => {
-  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost()
+  const project = projectDocument()
+  const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ pointerLockAvailable: true })
   try {
-    cpu.render(createElement(module.WorldsViewer, { items: [] })); const section = cpu.find(n => n.type === 'section')!; section.focus!()
-    cpu.windowEvents.emit('keydown', { code: 'KeyW', target: section }); cpu.windowEvents.emit('keydown', { code: 'ArrowUp', target: section }); cpu.windowEvents.emit('keyup', { code: 'KeyW' })
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [] })); const section = cpu.find(n => n.type === 'section')!
+    assert.ok(section.emit, 'the actual scoped CPU section must expose native event dispatch')
+    const emitSection = section.emit.bind(section)
+    cpu.click('Fly'); cpu.canvas.emit('pointerdown'); await cpu.settle()
+    assert.equal(cpu.documentEvents.activeElement, section); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    emitSection('keydown', { code: 'KeyW', target: section }); emitSection('keydown', { code: 'ArrowUp', target: section }); emitSection('keyup', { code: 'KeyW', target: section })
     const before = cpu.camera.position.clone(); cpu.frame(0.1)
     assert.ok(cpu.camera.position.distanceTo(before) > 0, 'ArrowUp remains held after W release')
-    cpu.windowEvents.emit('blur'); section.focus!(); const blurred = cpu.camera.position.clone(); cpu.frame(0.1)
+    cpu.windowEvents.emit('blur'); cpu.flush()
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
+    section.focus!(); cpu.canvas.emit('pointerdown'); await cpu.settle()
+    assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+    const blurred = cpu.camera.position.clone(); cpu.frame(0.1)
     assert.deepEqual(cpu.camera.position.toArray(), blurred.toArray())
-    cpu.windowEvents.emit('keydown', { code: 'KeyW', target: section }); cpu.documentEvents.emit('visibilitychange'); cpu.frame(0.1)
+    emitSection('keydown', { code: 'KeyW', target: section })
+    cpu.documentEvents.hidden = true; cpu.documentEvents.emit('visibilitychange'); cpu.flush()
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
+    cpu.documentEvents.hidden = false; cpu.documentEvents.emit('visibilitychange')
+    cpu.canvas.emit('pointerdown'); await cpu.settle(); cpu.frame(0.1)
     assert.deepEqual(cpu.camera.position.toArray(), blurred.toArray())
-    cpu.windowEvents.emit('keydown', { code: 'KeyW', target: section })
-    cpu.documentEvents.activeElement = { tagName: 'INPUT' }; cpu.documentEvents.emit('focusin')
-    section.focus!(); cpu.frame(0.1)
+    emitSection('keydown', { code: 'KeyW', target: section })
+    const editable = { tagName: 'INPUT' }
+    cpu.documentEvents.activeElement = editable; emitSection('blur', { target: section, relatedTarget: editable }); cpu.flush()
+    assert.equal(cpu.documentEvents.pointerLockElement, null)
+    section.focus!(); cpu.canvas.emit('pointerdown'); await cpu.settle(); cpu.frame(0.1)
     assert.deepEqual(cpu.camera.position.toArray(), blurred.toArray(), 'returning from editable focus must not restore previously held keys')
-  } finally { cpu.render(null); await cleanup() }
+    assert.equal(cpu.pointerLockRequests.count, 4); assert.equal(cpu.documentEvents.pointerLockElement, cpu.canvas)
+  } finally { cpu.render(null); assert.equal(cpu.documentEvents.pointerLockElement, null); await cleanup() }
 })
 
 test('overlay and editable or dialog focus keep their native keyboard and pointer ownership', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost()
   try {
-    cpu.render(createElement(module.WorldsViewer, { items: [] })); const section = cpu.find(n => n.type === 'section')!, select = cpu.find(n => n.type === 'select')!
+    const surface = createWorldCollisionSurfacePreset('rectangle', { id: 'focus-surface' })
+    assert.ok(surface)
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [], collisionSurfaces: [surface] }))
+    const section = cpu.find(n => n.type === 'section')!, select = cpu.find(n => n.type === 'select' && n.props['aria-label'] === 'Select world asset')
+    assert.ok(select, 'the real nonempty authoring toolbar must expose its native asset selector')
+    assert.ok(section.emit, 'the actual scoped CPU section must expose native event dispatch')
+    const emitSection = section.emit.bind(section)
     select.focus!(); section.props.onPointerDown?.({ target: select, currentTarget: section })
     assert.equal(cpu.documentEvents.activeElement, select, 'selector click must retain focus')
-    for (const target of [select, cpu.button('Reset camera'), { tagName: 'INPUT' }, { tagName: 'DIV', isContentEditable: true }, { tagName: 'DIV', closest: () => ({ role: 'dialog' }) }]) {
+    for (const target of [select, cpu.button('Frame scene'), { tagName: 'INPUT' }, { tagName: 'DIV', isContentEditable: true }, { tagName: 'DIV', closest: () => ({ role: 'dialog' }) }]) {
       cpu.documentEvents.activeElement = target
-      const before = cpu.camera.position.clone(), event = cpu.windowEvents.emit('keydown', { code: 'Space', target })
+      const before = cpu.camera.position.clone(), event = emitSection('keydown', { code: 'Space', target })
       cpu.frame(0.1); assert.equal(event.prevented, false); assert.deepEqual(cpu.camera.position.toArray(), before.toArray())
-      cpu.windowEvents.emit('keyup', { code: 'Space' })
+      emitSection('keyup', { code: 'Space', target })
     }
   } finally { cpu.render(null); await cleanup() }
 })
@@ -4181,12 +4522,12 @@ test('WorldsViewer fits bounds only on scene load or intentional reset', async (
     assert.equal(viewerSource.includes('cameraFitSnapshotRef'), true)
     assert.equal(viewerSource.includes('resetToken={cameraState.resetToken}'), true)
     assert.equal(viewerSource.includes('cameraFitSnapshotRef={cameraFitSnapshotRef}'), true)
-    assert.equal(viewerSource.includes('bounds.refresh()'), true)
-    assert.equal(viewerSource.includes('bounds.getSize()'), true)
+    assert.equal(viewerSource.includes('bounds.refresh()'), false)
+    assert.equal(viewerSource.includes('measureWorldsSceneCameraBounds(sceneItems,'), true)
     assert.equal(viewerSource.includes('WORLDS_DEFAULT_CAMERA_POSITION'), true)
-    assert.equal(viewerSource.includes('if (!ready || cameraFitSnapshotRef.current?.fitKey === fitKey) return'), true)
-    assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = snapshot'), true)
-    assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = null'), true)
+    assert.equal(viewerSource.includes('boundsFitKeyRef.current !== fitKey'), true)
+    assert.equal(viewerSource.includes('cameraFitSnapshotRef.current = resolveAndApplyWorldsCameraFitSnapshot('), true)
+    assert.equal(viewerSource.includes('if (!snapshot || snapshot.fitKey !== fitKey) return'), true)
     assert.equal(viewerSource.includes('controls.target.copy(snapshot.target)'), true)
     assert.equal(viewerSource.includes('controls.saveState?.()'), true)
     assert.equal(viewerSource.includes('refresh().clip().fit()'), false)
@@ -4224,6 +4565,7 @@ test('WorldsViewer instance construction is render-pure and cloned-material disp
 })
 
 test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects replay without disposing its live material', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost({ strictEffects: true })
   const globals = globalThis as any, previousGltf = globals.__worldsGltf
   const source = new THREE.Group(), material = new THREE.MeshBasicMaterial({ side: THREE.FrontSide })
@@ -4247,7 +4589,9 @@ test('mounted Worlds GLTF reacquires deferred BVH through real StrictEffects rep
   globals.__worldsGltf = () => ({ scene: source })
   function ReplayProbe() { React.useEffect(() => { setups++; return () => { cleanups++ } }, []); return null }
   try {
-    cpu.render(createElement(React.Fragment, null, createElement(ReplayProbe), createElement(module.WorldsViewer, { items: [item('glb', 'synthetic.glb')] })))
+    await React.act(async () => {
+      cpu.render(createElement(React.Fragment, null, createElement(ReplayProbe), createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [item('glb', 'synthetic.glb')] })))
+    })
     assert.equal(setups, 2); assert.equal(cleanups, 1, 'positive control must prove real effect replay, not a normal remount')
     const primitive = cpu.find(n => n.type === 'primitive'); assert.ok(primitive)
     const mountedScene = primitive.props.object as THREE.Group, mountedMaterial = (mountedScene.children[0] as THREE.Mesh).material as THREE.Material
@@ -4332,6 +4676,7 @@ test('WorldsViewer optional BVH failures preserve valid sibling acceleration and
 })
 
 test('WorldsViewer authored initial view survives deferred GLTF and PLY settlement, navigation and reset', async () => {
+  const project = projectDocument()
   const { module, cleanup } = await loadViewerModule(), cpu = cpuHost(), previousFetch = globalThis.fetch
   const globals = globalThis as any, previousGltf = globals.__worldsGltf, scene = new THREE.Group()
   const geometry = new THREE.BoxGeometry(), material = new THREE.MeshBasicMaterial(); scene.add(new THREE.Mesh(geometry, material))
@@ -4341,15 +4686,26 @@ test('WorldsViewer authored initial view survives deferred GLTF and PLY settleme
   globalThis.fetch = (() => new Promise<Response>(resolve => { resolvePly = resolve })) as typeof fetch
   const initialView = { position: [30, 20, 40], target: [7, 1, -3], up: [0, 1, 0] } as const
   try {
-    cpu.render(createElement(module.WorldsViewer, { items: [item('glb', 'delayed.glb'), item('ply-points', 'blob:delayed')], initialView }))
-    assert.equal(cpu.bounds.refreshes, 0)
+    cpu.render(createElement(module.WorldsViewer, { project, onGraphicsFailure: cpu.onGraphicsFailure, onGraphicsDiagnostic: cpu.onGraphicsDiagnostic, items: [item('glb', 'delayed.glb'), item('ply-points', 'blob:delayed')], initialView }))
+    assert.equal(cpu.bounds.refreshes, 0); assert.equal(cpu.cameraStateSaves.count, 1)
+    assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
+    assert.deepEqual(cpu.camera.up.toArray(), initialView.up)
     resolvePly(new Response(await readFile(pointsFixture))); await cpu.settle()
-    assert.equal(cpu.bounds.refreshes, 0, 'one real mounted PLY must not bypass pending GLTF')
+    assert.equal(cpu.bounds.refreshes, 0, 'no aggregate measurement replaces the authored view')
+    assert.equal(cpu.cameraStateSaves.count, 1, 'one real mounted PLY must not bypass pending GLTF')
+    assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
+    assert.deepEqual(cpu.camera.up.toArray(), initialView.up)
     gltfReady = true; resolveGltf(); await cpu.settle()
-    assert.ok(cpu.find(n => n.type === 'primitive')); assert.ok(cpu.bounds.refreshes > 0)
+    assert.ok(cpu.find(n => n.type === 'primitive')); assert.equal(cpu.bounds.refreshes, 0)
+    assert.equal(cpu.cameraStateSaves.count, 1, 'settlement preserves the authored camera snapshot')
     assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
-    cpu.camera.position.set(90, 80, 70); cpu.controls.target.set(9, 8, 7); cpu.click('Reset camera')
+    assert.deepEqual(cpu.camera.up.toArray(), initialView.up)
+    const fittedLimits = [cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance]
+    cpu.camera.position.set(90, 80, 70); cpu.controls.target.set(9, 8, 7); cpu.camera.up.set(0, 0, 1); cpu.click('Frame scene')
     assert.deepEqual(cpu.camera.position.toArray(), initialView.position); assert.deepEqual(cpu.controls.target.toArray(), initialView.target)
+    assert.deepEqual(cpu.camera.up.toArray(), initialView.up)
+    assert.deepEqual([cpu.camera.near, cpu.camera.far, cpu.controls.maxDistance], fittedLimits)
+    assert.equal(cpu.cameraStateSaves.count, 2); assert.equal(cpu.bounds.refreshes, 0)
   } finally { cpu.render(null); globalThis.fetch = previousFetch; globals.__worldsGltf = previousGltf; geometry.dispose(); material.dispose(); await cleanup() }
 })
 

@@ -211,6 +211,7 @@ test('ARM upstream 7za symlink permits only its pinned local 7zz ELF target', as
   elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1])
   elf.writeUInt16LE(183, 18)
   await writeFile(binary, elf, { mode: 0o755 })
+  await chmod(binary, 0o755)
   await symlink('7zz', alias)
   const contract = {
     source: { release: '7zip@1.0.0', filename: '7zip-linux-arm64.tar.gz', member: 'bin/7za' },
@@ -261,9 +262,11 @@ test('ARM upstream 7za symlink permits only its pinned local 7zz ELF target', as
   assert.equal(spawned, 1)
   await rm(binary)
   await writeFile(binary, elf, { mode: 0o755 })
+  await chmod(binary, 0o755)
   await assert.rejects(run(async () => {
     await rm(binary)
     await writeFile(binary, elf, { mode: 0o755 })
+    await chmod(binary, 0o755)
   }), /changed during execution/i)
   assert.equal(spawned, 2)
 })

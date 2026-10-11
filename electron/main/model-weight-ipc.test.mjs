@@ -27,7 +27,7 @@ const realGuard = loadModule('electron/main/extension-path-guard.ts')
 const realOperations = loadModule('electron/main/model-weight-operations.ts')
 const realOwnership = loadModule('electron/main/model-ownership.ts')
 const realCapabilities = loadModule('electron/main/automation-capabilities.ts')
-const ipcCode = transformSync(readFileSync('electron/main/ipc-handlers.ts', 'utf8'), { loader: 'ts', format: 'cjs' }).code
+const ipcText = readFileSync('electron/main/ipc-handlers.ts', 'utf8')
 const downloaderCode = transformSync(readFileSync('electron/main/model-downloader.ts', 'utf8'), { loader: 'ts', format: 'cjs' }).code
 const source = { id: 'weights', provider: 'huggingface', repo_id: 'org/base', destination: '.', checks: ['weights.bin'] }
 function deferred() {
@@ -49,39 +49,80 @@ function fixture(t) {
   const hooks = {
     unload: async () => ({ data: { unloaded: true } }),
     listModels: async () => ({ data: [{ id: 'demo/a' }, { id: 'demo/b' }, { id: 'other/generate' }] }),
+    resolvePlan: realPlan.resolveInstalledModelDownloadPlan,
     download: async (id) => {
       const dir = realSources.resolveWeightStorageRoot(settings.modelsDir, id)
       mkdirSync(dir, { recursive: true })
       writeFileSync(join(dir, 'weights.bin'), 'complete')
     },
   }
-  const stub = new Proxy({}, { get: () => () => {} })
   const deps = (name) => {
-    if (name === 'electron') return { ipcMain: { handle: (id, fn) => handlers.set(id, fn), on: () => {} }, app: { getPath: () => root, on: () => {} } }
-    if (name === 'axios') return {
-      post: (...args) => hooks.unload(...args),
-      get: (...args) => hooks.listModels(...args),
-      isAxiosError: (err) => Boolean(err?.isAxiosError),
-    }
-    if (name === './automation-capabilities') return { ...realCapabilities, activeExtensionInstalls: new Set() }
+    if (name === './settings-store') return { getSettings: () => settings }
     if (name === './model-ownership') return realOwnership
-    if (name === './model-sources') return realSources
-    if (name === './model-download-plan') return realPlan
-    if (name === './extension-path-guard') return realGuard
-    if (name === './model-weight-operations') return realOperations
-    if (name === './settings-store') return { getSettings: () => settings, setSettings: (_, patch) => Object.assign(settings, patch) }
-    if (name === './builtin-sync') return { getBuiltinExtensionsDir: () => join(root, 'builtin') }
-    if (name === './python-bridge') return { API_BASE_URL: 'http://test' }
-    if (name === './model-downloader') return {
-      ...downloader,
-      downloadModelSourcesFromHF: async (...args) => { calls.push(args[0]); await hooks.download(...args) },
-    }
-    if (name === './extension-install-recovery') return { rmWithRetry: async (dir) => { removed.push(dir); rmSync(dir, { recursive: true, force: true }); return { ok: true } } }
-    if (name.startsWith('./') || name === 'electron-updater') return stub
+    if (name === './model-sources.ts') return realSources
+    if (name === './model-download-events.ts') return loadModule('electron/main/model-download-events.ts')
+    if (name === './hf-token') return { getHfToken: () => '' }
+    if (name === './logger') return { logger: { info() {}, warn() {}, error() {} } }
+    if (name.startsWith('./')) return {}
     return require(name)
   }
   const downloader = moduleFromCode(downloaderCode, deps)
-  moduleFromCode(ipcCode, deps).setupIpcHandlers({}, () => ({ webContents: { send: (...event) => events.push(event) } }))
+  function section(start, end) {
+    const from = ipcText.indexOf(start), to = ipcText.indexOf(end, from + start.length)
+    assert.ok(from >= 0 && to > from, `Missing actual model IPC closure: ${start}`)
+    return ipcText.slice(from, to)
+  }
+  const bound = transformSync(`function bind(deps) {
+    const { app, getSettings, setSettings, getBuiltinExtensionsDir, ipcMain,
+      listVisibleExtensions, activeExtensionInstalls, resolveModelOwnership,
+      resolveInstalledModelDownloadPlan, resolveInstalledExtensionSharedWeightGroups,
+      privateModelStorageId, legacyDownloadSteps, ModelWeightOperations,
+      isOwnedModelDownloaded, listDownloadedModelCapabilities, listDownloadedModels,
+      isModelDownloaded, installedWeightVariants, areModelSourcesDownloaded,
+      areWeightGroupSourcesDownloaded, areModelSourcesDownloadedAtRoot,
+      resolveModelRoot, resolveWeightStorageRoot, resolveWeightGroupRoot,
+      resolveExtensionModelRoot, assertSafeExtensionId, modelHasLocalData,
+      weightStorageHasLocalData, getCanonicalModelPath, listWeightVariantFiles,
+      existsSync, rmAsync, join, ModelAssetDownloadError, downloadModelSourcesFromHF,
+      downloadModelFromHF, downloadModelAssetsFromHF, downloadModelAssetsFromHttps,
+      parseLegacyModelDownloadPayloadContract, mapDownloadProgressToCapability,
+      removePartialDownloadArtifacts, rmWithRetry, axios, API_BASE_URL,
+      setHfToken, getHfToken, process } = deps
+    const activeDownloads = new Map(), interruptedTargets = new Map()
+    const weightOperations = new ModelWeightOperations()
+    const notifyWeightChange = () => deps.notifyWeightChange()
+    ${section('function modelAssetDownloadResult(', 'function createFallbackOwnership(')}
+    ${section('function createFallbackOwnership(', 'const rmWithRetry =')}
+    ${section('  const backendUnreachable =', '  const LOCKED_MODEL_FILES_ERROR =')}
+    const LOCKED_MODEL_FILES_ERROR = 'locked'
+    ${section('  const handleStructuredModelAssetDownload =', '  // Logging from renderer')}
+    ${section("  ipcMain.handle('model:delete',", "  ipcMain.handle('model:showInFolder'")}
+    ${section("  ipcMain.handle('model:listDownloaded'", "  ipcMain.handle('model:activeDownloads'")}
+    ${section("  ipcMain.handle('model:activeDownloads'", '  // Export mesh to GLB')}
+    ${section("  ipcMain.handle('settings:set'", '  // Directory picker')}
+    ${section("  ipcMain.handle('api:updatePaths'", '  // ── Workflows ─')}
+  }`, { loader: 'ts', format: 'cjs' }).code
+  const { rm: rmAsync } = require('node:fs/promises')
+  moduleFromCode(bound + '; module.exports = bind;')({
+    ...realSources, ...realPlan, ...realOwnership, ...realGuard, ...realOperations, ...downloader,
+    resolveInstalledModelDownloadPlan: (...args) => hooks.resolvePlan(...args),
+    app: { getPath: () => root }, getSettings: () => settings,
+    setSettings: (_, patch) => Object.assign(settings, patch),
+    getBuiltinExtensionsDir: () => join(root, 'builtin'),
+    listVisibleExtensions: realCapabilities.listVisibleExtensions, activeExtensionInstalls: new Set(),
+    ipcMain: { handle: (id, fn) => handlers.set(id, fn) }, existsSync, join, rmAsync, process,
+    axios: { post: (...args) => hooks.unload(...args), get: (...args) => hooks.listModels(...args), isAxiosError: (error) => Boolean(error?.isAxiosError) },
+    API_BASE_URL: 'http://test',
+    downloadModelSourcesFromHF: async (capabilityId, targetOwnerId, onProgress) => {
+      calls.push(targetOwnerId); await hooks.download(targetOwnerId, onProgress)
+    },
+    rmWithRetry: async (dir) => { removed.push(dir); rmSync(dir, { recursive: true, force: true }); return { ok: true } },
+    parseLegacyModelDownloadPayloadContract: loadModule('electron/main/model-download-ipc-contract.ts').parseLegacyModelDownloadPayload,
+    notifyWeightChange: () => events.push(['model:weightsChanged']), setHfToken: () => {}, getHfToken: () => '',
+  })
+  for (const name of ['deleteSharedGroup', 'deleteExtensionWeights', 'download', 'pauseDownload', 'cancelDownload', 'isDownloaded', 'listDownloaded']) {
+    assert.equal(typeof handlers.get(`model:${name}`), 'function', `Actual handler ${name} must be registered`)
+  }
   const event = { sender: { send: (...args) => events.push(args) } }
   const invoke = (name, ...args) => handlers.get(`model:${name}`)(event, ...args)
   return { settings, hooks, invoke, removed, events, calls, handlers, root }
@@ -227,6 +268,50 @@ test('model path changes are rejected while weights are reserved', async (t) => 
   assert.equal((await f.handlers.get('api:updatePaths')(null, { modelsDir: join(f.root, 'new') })).success, false)
   finish.resolve()
   await downloading
+})
+
+test('pending installed-plan lookup pins model paths before the first target lease', async (t) => {
+  const f = fixture(t), entered = deferred(), finish = deferred()
+  const realResolve = f.hooks.resolvePlan
+  f.hooks.resolvePlan = async (...args) => { entered.resolve(); await finish.promise; return realResolve(...args) }
+  const downloading = f.invoke('download', 'demo/a')
+  try {
+    await entered.promise
+    const modelsDir = f.settings.modelsDir
+    await assert.rejects(f.handlers.get('settings:set')(null, { modelsDir: join(f.root, 'changed') }), /busy/)
+    assert.equal((await f.handlers.get('api:updatePaths')(null, { modelsDir: join(f.root, 'changed') })).success, false)
+    assert.equal(f.settings.modelsDir, modelsDir)
+    assert.deepEqual(f.calls, [], 'No transfer may precede strict plan admission')
+  } finally { finish.resolve() }
+  assert.equal((await downloading).success, true)
+})
+
+test('later multi-source stage skips a private target completed by a sibling during its shared transfer', async (t) => {
+  const f = ownerFixture(t), entered = deferred(), finish = deferred()
+  const realDownload = f.hooks.download
+  f.hooks.download = async (id, onProgress) => {
+    if (id === 'demo/_shared/base') { entered.resolve(); await finish.promise }
+    await realDownload(id, onProgress)
+  }
+  const first = f.invoke('download', 'demo/a')
+  try {
+    await Promise.race([entered.promise, first.then(result => { throw new Error(`Shared stage never entered: ${JSON.stringify(result)}`) })])
+    assert.deepEqual(f.calls, ['demo/_shared/base'])
+    assert.equal((await f.invoke('download', 'demo/b')).success, true, 'the sibling can complete its separately leased private target')
+    assert.deepEqual(f.calls, ['demo/_shared/base', 'demo/private'])
+    assert.equal(await f.invoke('isDownloaded', 'demo/b'), true)
+    assert.equal(await f.invoke('isDownloaded', 'demo/a'), false, 'the still-pending shared source remains required')
+  } finally { finish.resolve() }
+  assert.equal((await first).success, true)
+  assert.deepEqual(f.calls, ['demo/_shared/base', 'demo/private'], 'the first request must not transfer the now-complete private target again')
+  assert.equal(f.calls.filter(id => id === 'demo/private').length, 1)
+  assert.equal(await f.invoke('isDownloaded', 'demo/a'), true)
+  assert.equal(await f.invoke('isDownloaded', 'demo/b'), true)
+  assert.equal(readFileSync(join(f.settings.modelsDir, 'demo/private/weights.bin'), 'utf8'), 'complete')
+  assert.ok(f.events.some(([name, progress]) => name === 'model:downloadProgress' && progress.capabilityId === 'demo/a' && progress.percent === 100))
+  assert.equal((await f.invoke('deleteExtensionWeights', 'demo')).success, true, 'actual request and physical leases settle before owner-root removal')
+  assert.equal((await f.invoke('download', 'demo/b')).success, true, 'the settled request slot permits a genuine new transfer')
+  assert.deepEqual(f.calls, ['demo/_shared/base', 'demo/private', 'demo/private'])
 })
 
 function ownerFixture(t) {

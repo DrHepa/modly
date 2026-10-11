@@ -21,10 +21,13 @@ function compile(source) {
 // Only their filesystem, manifest, settings and ownership boundaries are mocked.
 const source = readFileSync(new URL('./ipc-handlers.ts', import.meta.url), 'utf8')
 const create = new Function(`${compile(`function create(deps) {
-  const { ipcMain, app, getSettings, getBuiltinExtensionsDir, listModelExtensions,
-    listDownloadedModelCapabilities, listDownloadedModels,
-    resolveInstalledModelDownloadPlan, resolveOwnershipContext,
-    areModelSourcesDownloaded, areWeightGroupSourcesDownloaded, isOwnedModelDownloaded } = deps;
+  const { ipcMain, app, getSettings, getBuiltinExtensionsDir, listVisibleExtensions,
+    listDownloadedModelCapabilities, listDownloadedModels, resolveModelOwnership,
+    resolveInstalledModelDownloadPlan, resolveOwnershipContext, activeExtensionInstalls,
+    privateModelStorageId, areModelSourcesDownloaded, areWeightGroupSourcesDownloaded,
+    isOwnedModelDownloaded, isModelDownloaded, installedWeightVariants } = deps;
+  ${section(source, 'function createFallbackOwnership(', 'async function listModelExtensions(')}
+  ${section(source, '  const resolveModelPlan =', '  const LOCKED_MODEL_FILES_ERROR =')}
   ${section(source, "  ipcMain.handle('model:listDownloaded'", "  ipcMain.handle('model:hasLocalData'")}
 }`)}; return create;`)()
 
@@ -71,18 +74,27 @@ function harness({
     app: { getPath: () => '/mock/user-data' },
     getSettings: () => ({ modelsDir: '/mock/models', extensionsDir: '/mock/extensions' }),
     getBuiltinExtensionsDir: () => '/mock/builtins',
-    listModelExtensions: async () => structuredClone(extensions),
+    listVisibleExtensions: async () => structuredClone(extensions),
+    activeExtensionInstalls: new Set(),
+    privateModelStorageId: (_, plan) => plan.ownership?.weightOwnerId ?? plan.modelId,
+    installedWeightVariants: () => [],
+    isModelDownloaded: () => legacyReady,
+    resolveModelOwnership: (_, modelId) => {
+      if (ownerErrors.has(modelId)) throw new Error('Invalid ownership')
+      return { capabilityId: modelId, weightOwnerId: owners.get(modelId) ?? modelId, legacyPaths: [modelId] }
+    },
     listDownloadedModelCapabilities: () => structuredClone(collected),
     listDownloadedModels: rawFallback,
     resolveInstalledModelDownloadPlan: async (request) => {
       calls.plans.push(request)
       const found = plans.get(request.modelId)
       if (!found || found instanceof Error) throw found ?? new Error('No installed plan')
-      return found
+      return { ...found, modelId: request.modelId, nodeId: request.modelId.split('/').at(-1),
+        ownership: { capabilityId: request.modelId, weightOwnerId: owners.get(request.modelId) ?? request.modelId, legacyPaths: [request.modelId] } }
     },
     resolveOwnershipContext: async (_, modelId) => {
       if (ownerErrors.has(modelId)) throw new Error('Invalid ownership')
-      return { ownership: { capabilityId: modelId, weightOwnerId: owners.get(modelId) ?? modelId, legacyPaths: [modelId] } }
+      return { extensions: structuredClone(extensions), ownership: { capabilityId: modelId, weightOwnerId: owners.get(modelId) ?? modelId, legacyPaths: [modelId] } }
     },
     areModelSourcesDownloaded: (modelsDir, ownerId, sources) => {
       calls.private.push({ modelsDir, ownerId, sources })
@@ -168,8 +180,8 @@ for (const failure of ['resolve', 'ownership', 'inconsistent-kind']) {
     const legacy = row('fixture/legacy', { name: 'Legacy' })
     const h = harness({ extensions: [{ id: 'fixture', type: 'model', nodes: [node(), node('legacy', { hasModelSources: false })] }],
       collected: [row(), legacy], ownerErrors: new Set(failure === 'ownership' ? [id] : []),
-      plans: new Map([[id, failure === 'resolve' ? new Error('Bad plan') : failure === 'inconsistent-kind' ? { kind: 'legacy-hf' } : plan()],
-        ['fixture/legacy', { kind: 'legacy-hf' }]]) })
+      plans: new Map([[id, failure === 'resolve' ? new Error('Bad plan') : failure === 'inconsistent-kind' ? { kind: 'legacy' } : plan()],
+        ['fixture/legacy', { kind: 'legacy' }]]) })
     assert.deepEqual(await h.list(), [legacy])
   })
 }

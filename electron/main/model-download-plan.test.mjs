@@ -372,7 +372,7 @@ test('prefers structured HF assets over legacy hints without rejecting supported
       modelId: 'cube3d/generate', userExtensionsDir: fixture.user, builtinExtensionsDir: fixture.builtin,
     })
     assert.equal(plan.kind, 'hf-assets')
-    assert.equal(plan.hfDownloads[0].repo_id, 'owner/structured')
+    assert.equal(plan.hfDownloads[0].repoId, 'owner/structured')
 
   } finally {
     rmSync(fixture.root, { recursive: true, force: true })

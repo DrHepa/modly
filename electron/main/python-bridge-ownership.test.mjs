@@ -105,14 +105,14 @@ setTimeout(() => {
 `, { mode: 0o700 })
 
 const fakeModules = {
-  child_process: `export const spawn = (...args) => {
+  child_process: `export const execFileSync = () => { throw new Error('Unexpected Windows taskkill in Linux ownership fixture') }; export const spawn = (...args) => {
     const child = require('node:child_process').spawn(...args)
     globalThis.__bridgeTestSpawned?.push(child)
     return child
   }`,
-  electron: `export const app = { getPath: () => globalThis.__bridgeTestRoot, getAppPath: () => ${JSON.stringify(resolve('.'))}, isPackaged: false }`,
-  './settings-store': `export const getSettings = () => ({ modelsDir: globalThis.__bridgeTestRoot, workspaceDir: globalThis.__bridgeTestRoot, extensionsDir: globalThis.__bridgeTestRoot, hfToken: '' })`,
-  './logger': `export const logger = { python() {} }`,
+  electron: `export const app = { getPath: () => globalThis.__bridgeTestRoot, getAppPath: () => ${JSON.stringify(resolve('.'))}, isPackaged: false }; export const safeStorage = { isEncryptionAvailable: () => false, encryptString() { throw new Error('Unexpected token encryption') }, decryptString() { throw new Error('Unexpected token decryption') } }`,
+  './settings-store': `const patch = {}; export const getSettings = () => ({ modelsDir: globalThis.__bridgeTestRoot, workspaceDir: globalThis.__bridgeTestRoot, extensionsDir: globalThis.__bridgeTestRoot, hfToken: '', ...patch }); export const setSettings = (_, values) => Object.assign(patch, values); export const ensureAgentDir = () => { const dir = require('node:path').join(globalThis.__bridgeTestRoot, 'agent'); require('node:fs').mkdirSync(dir, { recursive: true }); patch.agentDir = dir; return dir }`,
+  './logger': `export const logger = { python() {}, warn() {}, info() {}, error() {} }`,
   './python-setup': `export const cleanPythonEnv = () => ({ ...process.env }); export const getVenvPythonExe = () => globalThis.__bridgeTestPython`,
   'fs/promises': `export const readFile = (...args) => {
     if (globalThis.__bridgeTestDenyProc && String(args[0]).startsWith('/proc/')) throw Object.assign(new Error('test-denied proc'), { code: 'EACCES' })

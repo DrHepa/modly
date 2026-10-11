@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
+import { ModelWeightOperations } from './model-weight-operations.ts'
 
 const source = readFileSync(new URL('./ipc-handlers.ts', import.meta.url), 'utf8')
 const nodeId = 'fixture/generate'
@@ -19,16 +20,18 @@ const compiled = ts.transpileModule(`
 function create(deps) {
   const { ipcMain, app, getSettings, getBuiltinExtensionsDir,
     parseLegacyModelDownloadPayloadContract, resolveOwnershipContext,
-    resolveInstalledModelDownloadPlan, areWeightGroupSourcesDownloaded,
-    areModelSourcesDownloaded, downloadModelSourcesFromHF,
-    mapDownloadProgressToCapability, ModelAssetDownloadError, axios,
-    API_BASE_URL, resolveModelRoot, resolveWeightGroupRoot,
+    resolveInstalledModelDownloadPlan, activeExtensionInstalls,
+    areModelSourcesDownloadedAtRoot, downloadModelSourcesFromHF,
+    ModelAssetDownloadError, axios, weightOperations, notifyWeightChange,
+    API_BASE_URL, resolveModelRoot, resolveWeightStorageRoot,
     removePartialDownloadArtifacts } = deps;
   ${section('function modelAssetDownloadResult(', 'function createFallbackOwnership(')}
-  ${section('  type TrackedDownloadProgress =', '  const getWorldsWorkspaceRoot =')}
-  ${section("  ipcMain.handle('model:downloadSources'", "  ipcMain.handle('model:download',")}
+  ${section('  type ActiveDownload =', '  const getWorldsWorkspaceRoot =')}
+  const interruptedTargets = new Map();
+  ${section('  const resolveModelPlan =', '  const ownerPeers =')}
+  ${section('  const downloadInstalledModel =', "  ipcMain.handle('model:pauseDownload'")}
   ${section("  ipcMain.handle('model:pauseDownload'", '  // Export mesh to GLB')}
-  return {activeDownloads, activeDownloadSettlements, localDownloadControls, activeWeightTargets};
+  return { activeDownloads, interruptedTargets };
 }`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
 const create = new Function(`${compiled}; return create;`)()
 
@@ -43,7 +46,7 @@ function ownership(modelId, ownerId = modelId) {
 }
 
 function plan({ groups = [], sources = [{ repoId: 'fixture/weights' }] } = {}) {
-  return { kind: 'multi-source', extensionId: 'fixture', sources, sharedGroups: groups }
+  return { kind: 'multi-source', extensionId: 'fixture', sources, sharedGroups: groups.map((group) => ({ id: group.targetId.split('/').at(-1), ...group })) }
 }
 
 async function until(predicate) {
@@ -58,16 +61,31 @@ function harness({ resolveOwner = async (_, modelId) => ownership(modelId),
   const posts = []
   const removed = []
   const events = []
+  const owners = new Map()
+  const operations = new ModelWeightOperations()
+  const activeExtensionInstalls = new Set()
   const state = create({
     ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
     app: { getPath: () => '/mock/user-data' },
     getSettings: () => ({ modelsDir: '/mock/models', extensionsDir: '/mock/extensions' }),
     getBuiltinExtensionsDir: () => '/mock/builtins',
     parseLegacyModelDownloadPayloadContract: (payload) => ({ modelId: payload.modelId }),
-    resolveOwnershipContext: resolveOwner,
-    resolveInstalledModelDownloadPlan: resolvePlan,
-    areWeightGroupSourcesDownloaded: () => false,
-    areModelSourcesDownloaded: () => false,
+    resolveOwnershipContext: async (...args) => {
+      const result = await resolveOwner(...args); owners.set(args[1], result.ownership); return result
+    },
+    resolveInstalledModelDownloadPlan: async (request) => {
+      assert.equal(request.userExtensionsDir, '/mock/extensions')
+      assert.equal(request.builtinExtensionsDir, '/mock/builtins')
+      assert.strictEqual(request.blockedExtensionIds, activeExtensionInstalls)
+      assert.equal(request.validateStorageOwnership, true, 'Every actual mutation lookup must retain strict admission')
+      return {
+        ...await resolvePlan(request), modelId: request.modelId, nodeId: request.modelId.split('/').at(-1),
+        ownership: owners.get(request.modelId),
+      }
+    },
+    activeExtensionInstalls,
+    weightOperations: operations, notifyWeightChange: () => {},
+    areModelSourcesDownloadedAtRoot: () => false,
     downloadModelSourcesFromHF: async (...args) => { calls.push(args); await download(...args) },
     mapDownloadProgressToCapability: (modelId, progress) => ({ modelId, ...progress }),
     ModelAssetDownloadError: class extends Error {
@@ -76,15 +94,19 @@ function harness({ resolveOwner = async (_, modelId) => ownership(modelId),
     axios: { post: async (...args) => { posts.push(args); await post(...args) } },
     API_BASE_URL: 'http://mock.invalid',
     resolveModelRoot: (_, modelId) => modelId,
-    resolveWeightGroupRoot: (_, extensionId, groupId) => `${extensionId}/_shared/${groupId}`,
+    resolveWeightStorageRoot: (_, id) => id,
     removePartialDownloadArtifacts: async (path) => { removed.push(path) },
   })
   const event = { sender: { send: (...args) => events.push(args) } }
   return { ...state, calls, posts, removed, events,
+    // These are read-only views of the actual request owner, not replacement maps.
+    request: (id) => state.activeDownloads.get(id),
+    target: (id) => [...state.activeDownloads.values()].find((active) => active.currentTargetId === id),
     start: (modelId = nodeId) => handlers.get('model:downloadSources')(event, { modelId }),
     control: (action, modelId = nodeId) => handlers.get(`model:${action}Download`)(event, modelId),
     assertReleased() {
-      for (const map of Object.values(state)) assert.equal(map.size, 0, 'Reservation/control state leaked')
+      assert.equal(state.activeDownloads.size, 0, 'Request owner leaked')
+      assert.equal(operations.busy, false, 'Physical target lease leaked')
     },
   }
 }
@@ -105,13 +127,13 @@ test('same-node pending request rejects duplicate without overwriting its reserv
   let ownerCalls = 0
   const h = harness({ resolveOwner: async (_, id) => { ownerCalls += 1; await gate.promise; return ownership(id) } })
   const first = h.start()
-  const reserved = h.activeDownloadSettlements.get(nodeId)
+  const reserved = h.request(nodeId)?.done
   try {
     const duplicate = h.start()
-    await until(() => ownerCalls > 1 || h.activeDownloadSettlements.get(nodeId) === reserved)
+    await until(() => ownerCalls > 1 || h.request(nodeId)?.done === reserved)
     assert.equal(ownerCalls, 1)
     assert.equal((await duplicate).failure.code, 'download_in_progress')
-    assert.equal(h.activeDownloadSettlements.get(nodeId), reserved)
+    assert.equal(h.request(nodeId)?.done, reserved)
   } finally { gate.resolve(); await first }
   assert.equal(h.calls.length, 1)
   h.assertReleased()
@@ -123,12 +145,12 @@ test('same-node in-flight request rejects duplicate and preserves active progres
   const first = h.start()
   try {
     await until(() => h.calls.length === 1)
-    const control = h.localDownloadControls.get(nodeId)
-    const reservation = h.activeDownloadSettlements.get(nodeId)
+    const control = h.request(nodeId)
+    const reservation = h.request(nodeId)?.done
     assert.equal((await h.start()).failure.code, 'download_in_progress')
     assert.equal(h.calls.length, 1)
-    assert.equal(h.localDownloadControls.get(nodeId), control)
-    assert.equal(h.activeDownloadSettlements.get(nodeId), reservation)
+    assert.equal(h.request(nodeId), control)
+    assert.equal(h.request(nodeId)?.done, reservation)
     assert.equal(h.activeDownloads.has(nodeId), true)
   } finally { gate.resolve(); await first }
   h.assertReleased()
@@ -141,11 +163,11 @@ test('competing shared-owner request rejects without clearing the active owner s
   const first = h.start('fixture/first')
   try {
     await until(() => h.calls.length === 1)
-    const control = h.localDownloadControls.get(owner)
+    const control = h.target(owner)
     assert.equal((await h.start('fixture/second')).failure.code, 'download_in_progress')
     assert.equal(h.calls.length, 1)
-    assert.equal(h.activeDownloads.has(owner), true)
-    assert.equal(h.localDownloadControls.get(owner), control)
+    assert.equal((h.target(owner) !== undefined), true)
+    assert.equal(h.target(owner), control)
   } finally { gate.resolve(); await first }
   h.assertReleased()
   assert.deepEqual(await h.start('fixture/second'), { success: true })
@@ -159,10 +181,10 @@ test('competing shared-group request still rejects while its target is reserved'
   const first = h.start('fixture/first')
   try {
     await until(() => h.calls.length === 1)
-    const control = h.localDownloadControls.get(targetId)
+    const control = h.target(targetId)
     assert.equal((await h.start('fixture/second')).failure.code, 'download_in_progress')
-    assert.equal(h.activeDownloads.has(targetId), true)
-    assert.equal(h.localDownloadControls.get(targetId), control)
+    assert.equal((h.target(targetId) !== undefined), true)
+    assert.equal(h.target(targetId), control)
     assert.equal(h.calls.length, 1)
   } finally { gate.resolve(); await first }
   h.assertReleased()
@@ -192,11 +214,12 @@ for (const action of ['cancel', 'pause']) {
     const first = h.start()
     let settled = false
     const controlled = h.control(action).then((result) => { settled = true; return result })
-    await until(() => h.posts.length === 1)
+    await until(() => h.request(nodeId)?.stopRequested === action)
+    assert.equal(h.posts.length, 0, 'No backend control exists before a real transfer')
     assert.equal(settled, false)
-    assert.equal(h.localDownloadControls.get(nodeId)[action], true)
+    assert.equal(h.request(nodeId).stopRequested, action)
     gate.resolve()
-    assert.deepEqual(await first, { success: true })
+    assert.deepEqual(await first, { success: false, paused: action === 'pause', cancelled: action === 'cancel' })
     assert.deepEqual(await controlled, { success: true })
     assert.equal(h.calls.length, 0)
     h.assertReleased()
@@ -213,7 +236,7 @@ test('cancel during a shared group releases both reservations without starting t
   const first = h.start()
   await until(() => h.calls.length === 1)
   assert.deepEqual(await h.control('cancel'), { success: true })
-  assert.deepEqual(await first, { success: true })
+  assert.deepEqual(await first, { success: false, cancelled: true })
   assert.equal(h.calls.length, 1)
   assert.equal(h.posts[0][2].params.model_id, targetId)
   h.assertReleased()
@@ -239,17 +262,17 @@ test('staggered shared plans reject a later occupied target without stealing its
     await until(() => h.calls.length === 1)
     right = h.start('fixture/right')
     await until(() => h.calls.length === 2)
-    const progress = h.activeDownloads.get(sharedId)
-    const control = h.localDownloadControls.get(sharedId)
-    const settlement = h.activeDownloadSettlements.get(sharedId)
+    const progress = h.target(sharedId)?.progress
+    const control = h.target(sharedId)
+    const settlement = h.target(sharedId)?.done
     first.resolve()
-    await until(() => h.calls.length === 3 || !h.activeDownloadSettlements.has('fixture/left'))
+    await until(() => h.calls.length === 3 || !(h.request('fixture/left') !== undefined))
     assert.equal(h.calls.length, 2, 'The occupied later target must not start twice')
     assert.equal((await left).failure.code, 'download_in_progress')
-    assert.equal(h.activeDownloads.get(sharedId), progress)
-    assert.equal(h.localDownloadControls.get(sharedId), control)
-    assert.equal(h.activeDownloadSettlements.get(sharedId), settlement)
-    assert.equal(h.activeDownloadSettlements.has('fixture/right'), true)
+    assert.equal(h.target(sharedId)?.progress, progress)
+    assert.equal(h.target(sharedId), control)
+    assert.equal(h.target(sharedId)?.done, settlement)
+    assert.equal((h.request('fixture/right') !== undefined), true)
   } finally { first.resolve(); shared.resolve(); await left; if (right) await right }
   h.assertReleased()
 })
@@ -278,19 +301,19 @@ for (const failFirst of [true, false]) {
       await until(() => h.calls.length === 1)
       right = h.start('fixture/right')
       await until(() => h.calls.length === 2)
-      const progress = h.activeDownloads.get(ownerId)
-      const control = h.localDownloadControls.get(ownerId)
-      const settlement = h.activeDownloadSettlements.get(ownerId)
+      const progress = h.target(ownerId)?.progress
+      const control = h.target(ownerId)
+      const settlement = h.target(ownerId)?.done
       first.resolve()
-      await until(() => h.calls.length === 3 || !h.activeDownloadSettlements.has('fixture/left'))
+      await until(() => h.calls.length === 3 || !(h.request('fixture/left') !== undefined))
       assert.equal(h.calls.length, 2, 'A later private target must not replace the foreign owner')
       const result = await left
       assert.equal(result.success, false)
       if (!failFirst) assert.equal(result.failure.code, 'download_in_progress')
-      assert.equal(h.activeDownloads.get(ownerId), progress, 'Failure must not clear foreign progress')
-      assert.equal(h.localDownloadControls.get(ownerId), control)
-      assert.equal(h.activeDownloadSettlements.get(ownerId), settlement)
-      assert.equal(h.activeDownloadSettlements.has('fixture/right'), true)
+      assert.equal(h.target(ownerId)?.progress, progress, 'Failure must not clear foreign progress')
+      assert.equal(h.target(ownerId), control)
+      assert.equal(h.target(ownerId)?.done, settlement)
+      assert.equal((h.request('fixture/right') !== undefined), true)
     } finally { first.resolve(); foreign.resolve(); await left; if (right) await right }
     h.assertReleased()
   })

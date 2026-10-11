@@ -737,8 +737,8 @@ export function parseExtensionManifest(
     }
     const hasModelAssets = Boolean(modelSources || groupRefs?.length || httpsDownloads || hfDownloads || n.hf_repo || n.download_check || n.weight_owner_id)
     const agentResult = extensionType === 'process'
-      && isProcessPortType(n.input, options.governedAgentKinds === true)
-      && isProcessPortType(n.output, options.governedAgentKinds === true)
+      && isProcessPortType(n.input, true)
+      && isProcessPortType(n.output, true)
       ? normalizeAgentCapabilityDeclarationResult(n.agent, capabilityId, parsed.entry ?? 'processor.js')
       : {}
 

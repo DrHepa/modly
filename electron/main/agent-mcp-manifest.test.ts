@@ -195,7 +195,7 @@ test('binds typed artifact inputs and bounded file outputs while rejecting a cur
 })
 
 test('host runtime tree identity is complete, content-bound, bounded, and never trusts the current uid', async () => {
-  const root = await mkdtemp(join(process.cwd(), '.modly-host-runtime-test-'))
+  const root = await mkdtemp(join(tmpdir(), '.modly-host-runtime-test-'))
   const runtimeRoot = join(root, 'runtime')
   const currentUid = process.getuid?.()
   assert.equal(typeof currentUid, 'number')

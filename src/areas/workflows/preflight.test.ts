@@ -82,14 +82,14 @@ test('preflight accepts scene outputs for scene workflow consumers', () => {
   assert.deepEqual(issues, [])
 })
 
-test('preflight allows model video outputs and fails closed for process video IO', () => {
+test('preflight accepts ordinary process video IO and enforces required named ports and source types', () => {
   const workflow = createWorkflow([
     createNode('video-source', 'extensionNode', { extensionId: 'ext/video-producer', enabled: true, params: {} }),
     createNode('video-consumer', 'extensionNode', { extensionId: 'ext/video-consumer', enabled: true, params: {} }),
     createNode('named-video-consumer', 'extensionNode', { extensionId: 'ext/named-video-consumer', enabled: true, params: {} }),
   ])
 
-  const issues = validateWorkflowPreflight(workflow, [
+  const extensions: WorkflowExtension[] = [
     createModelExtension({
       id: 'ext/video-producer',
       nodeId: 'video-producer',
@@ -112,11 +112,34 @@ test('preflight allows model video outputs and fails closed for process video IO
       output: 'mesh',
       inputs: [{ name: 'clip', type: 'video' }],
     }),
-  ])
+  ]
 
-  assert.equal(issues.some((issue: { key: string }) => issue.key === 'video-source:unsupported-video-shape'), false)
-  assert.equal(issues.some((issue: { key: string }) => issue.key === 'video-consumer:unsupported-video-shape'), true)
-  assert.equal(issues.some((issue: { key: string }) => issue.key === 'named-video-consumer:unsupported-video-shape'), true)
+  assert.deepEqual(validateWorkflowPreflight(workflow, extensions), [{
+    key: 'named-video-consumer:missing-required-port:clip',
+    nodeId: 'named-video-consumer',
+    message: 'Required port "clip" is missing.',
+  }])
+  const wiredWorkflow: Workflow = {
+    ...workflow,
+    edges: [...workflow.edges, {
+      id: 'edge-clip', source: 'video-source', target: 'named-video-consumer', targetHandle: 'clip',
+    }],
+  }
+  assert.deepEqual(validateWorkflowPreflight(wiredWorkflow, extensions), [])
+  const incompatibleExtensions = extensions.map((extension) => extension.id === 'ext/video-producer'
+    ? { ...extension, output: 'mesh' }
+    : extension)
+  assert.deepEqual(validateWorkflowPreflight(wiredWorkflow, incompatibleExtensions).map((issue: { key: string }) => issue.key), [
+    'video-consumer:missing:video',
+    'video-consumer:type:edge-1',
+    'named-video-consumer:type-mismatch:clip',
+  ])
+  assert.deepEqual(validateWorkflowPreflight({ ...wiredWorkflow, edges: workflow.edges }, incompatibleExtensions)
+    .map((issue: { key: string }) => issue.key), [
+    'video-consumer:missing:video',
+    'video-consumer:type:edge-1',
+    'named-video-consumer:missing-required-port:clip',
+  ])
 
   const modelWorkflow = createWorkflow([
     createNode('image-source', 'imageNode', { enabled: true, params: { filePath: 'Workflows/Inputs/image.png' } }),

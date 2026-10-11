@@ -243,10 +243,7 @@ test('PROCESS Agent discovery preserves governed CAD artifact ports and derives 
 
   try {
     const rawManifest = JSON.parse(await readFile(join(extensionDir, 'manifest.json'), 'utf8'))
-    assert.throws(
-      () => parseExtensionManifest(rawManifest, 'cad-chain', new Set()),
-      /must be one of: image, text, mesh, scene, capture, audio, video, none/i,
-    )
+    const ordinaryParsed = parseExtensionManifest(rawManifest, 'cad-chain', new Set())
     const parsed = parseExtensionManifest(rawManifest, 'cad-chain', new Set(), false, {
       governedAgentKinds: true,
     })
@@ -260,6 +257,24 @@ test('PROCESS Agent discovery preserves governed CAD artifact ports and derives 
         { name: 'source', type: 'source', required: true },
       ] },
     ])
+    assert.deepEqual(ordinaryParsed.nodes.map((node) => ({
+      id: node.id, input: node.input, output: node.output, inputs: node.inputs,
+    })), parsed.nodes.map((node) => ({
+      id: node.id, input: node.input, output: node.output, inputs: node.inputs,
+    })))
+    assert.deepEqual(ordinaryParsed.nodes.map((node) => node.agent), rawManifest.nodes.map((node: { agent: unknown }) => node.agent))
+    const customManifest = {
+      ...rawManifest,
+      nodes: [{ ...rawManifest.nodes[0], input: 'custom-plan' }],
+    }
+    const ordinaryCustom = parseExtensionManifest(customManifest, 'cad-chain', new Set())
+    assert.equal(ordinaryCustom.nodes.length, 1)
+    assert.equal(ordinaryCustom.nodes[0].input, 'custom-plan')
+    assert.equal(ordinaryCustom.nodes[0].agent, undefined)
+    assert.throws(
+      () => parseExtensionManifest(customManifest, 'cad-chain', new Set(), false, { governedAgentKinds: true }),
+      /must be one of: image, text, mesh, scene, capture, audio, video, none/i,
+    )
     const inventory = await listAgentCapabilities({ builtinDir, userExtensionsDir: userDir, trustedRepos: new Set() })
     assert.deepEqual(inventory.errors, [])
     assert.deepEqual(inventory.capabilities.map((capability) => ({

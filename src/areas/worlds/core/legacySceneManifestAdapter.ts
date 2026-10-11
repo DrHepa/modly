@@ -586,7 +586,8 @@ function shortenIdWithSuffix(base: string, suffix: string, maximumLength: number
   if (direct.length <= maximumLength && (maximumLength !== WORLD_ID_MAX_LENGTH || isWorldCanonicalId(direct))) return direct
   const digest = `~${fnv1a32(base)}`
   const prefixLength = Math.max(1, maximumLength - digest.length - suffix.length)
-  return `${base.slice(0, prefixLength)}${digest}${suffix}`
+  const prefix = maximumLength === WORLD_ID_MAX_LENGTH ? base.replace(/[\/\\]/g, '_') : base
+  return `${prefix.slice(0, prefixLength)}${digest}${suffix}`
 }
 
 function fnv1a32(value: string): string {

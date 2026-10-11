@@ -516,6 +516,7 @@ export function WorldsViewer({
                     item={item}
                     onSettled={onItemSettled}
                     selected={selectedItemIdSet.has(item.id)}
+                    selectionEnabled={inspectAuthoringEnabled}
                     boundsVersion={item.id === selectedItemId ? selectedBoundsVersion : 0}
                     playbackRef={playbackRef}
                     onSelectItem={inspectAuthoringEnabled ? selectSceneItemFromCanvas : () => undefined}
@@ -542,9 +543,6 @@ export function WorldsViewer({
               />
             ) : null}
           </Selection>
-          {inspectAuthoringEnabled ? visibleItems.map((item) => (
-            <WorldsSelectionHitbox key={item.id} itemId={item.id} targetRef={{ current: sceneObjectsRef.current.get(item.id) ?? null }} boundsVersion={selectedBoundsVersion + sceneObjectVersion} onSelectItem={selectSceneItemFromCanvas} onFocusItem={focusSceneItemFromCanvas} />
-          )) : null}
           {inspectAuthoringEnabled ? selectedSceneObjects.secondaryObjects.map((object) => (
             <WorldsSelectionSilhouette
               key={object.uuid}
@@ -1075,6 +1073,7 @@ function WorldSceneItemObject({
   item,
   onSettled,
   selected,
+  selectionEnabled,
   boundsVersion,
   playbackRef,
   onSelectItem,
@@ -1088,6 +1087,7 @@ function WorldSceneItemObject({
   item: WorldSceneItem
   onSettled: WorldSceneItemSettlement
   selected: boolean
+  selectionEnabled: boolean
   boundsVersion: number
   playbackRef: MutableRefObject<WorldsPlaybackRef>
   onSelectItem: (itemId: string | null, options?: { toggle?: boolean }) => void
@@ -1204,6 +1204,7 @@ function WorldSceneItemObject({
           <WorldSceneItemGeometry item={item} onSettled={onSettled} playbackRef={playbackRef} timelineAnimationTimeSeconds={timelineAnimationTimeSeconds} onAnimationMetadata={onAnimationMetadata} onBoundsChange={invalidateBounds} />
         </group>
       </Select>
+      {selectionEnabled ? <WorldsSelectionHitbox itemId={item.id} targetRef={groupRef} poseKey={`${item.transform.position.join(",")}|${item.transform.rotation.join(",")}|${item.transform.scale.join(",")}`} boundsVersion={boundsVersion + contentVersion} onSelectItem={onSelectItem} onFocusItem={onFocusItem} /> : null}
     </>
   )
 }
@@ -1492,12 +1493,14 @@ function WorldsPendingSurfacePlacementController({
 function WorldsSelectionHitbox({
   itemId,
   targetRef,
+  poseKey,
   boundsVersion,
   onSelectItem,
   onFocusItem,
 }: {
   itemId: string
   targetRef: RefObject<THREE.Object3D | null>
+  poseKey: string
   boundsVersion: number
   onSelectItem: (itemId: string | null, options?: { toggle?: boolean }) => void
   onFocusItem: (itemId: string) => void
@@ -1539,7 +1542,7 @@ function WorldsSelectionHitbox({
     hitbox.visible = true
     hitbox.position.copy(bounds.center)
     hitbox.scale.copy(bounds.size)
-  }, [boundsVersion, targetRef])
+  }, [boundsVersion, poseKey, targetRef])
 
   return (
     <mesh
@@ -1586,6 +1589,19 @@ function PlySceneObject({ item, onSettled = ignoreWorldSceneItemSettlement, onBo
   const reportLoadState = useContext(WorldsRenderLoadContext)
   const activeAttemptRef = useRef<object | null>(null)
   const modelAttemptRef = useRef<object | null>(null)
+  const [retryRevision, setRetryRevision] = useState(0)
+  const poseKey = `${item.transform.position.join(',')}|${item.transform.rotation.join(',')}|${item.transform.scale.join(',')}`
+  const previousItemRef = useRef({ item, id: item.id, workspacePath: item.workspacePath, url: item.url, kind: item.kind, poseKey })
+
+  // A new failed-item intent may retry its resource; ordinary pose projection must not retire it.
+  useEffect(() => {
+    const previous = previousItemRef.current
+    previousItemRef.current = { item, id: item.id, workspacePath: item.workspacePath, url: item.url, kind: item.kind, poseKey }
+    if (error !== null && previous.item !== item && previous.id === item.id && previous.workspacePath === item.workspacePath
+      && previous.url === item.url && previous.kind === item.kind && previous.poseKey === poseKey) {
+      setRetryRevision((revision) => revision + 1)
+    }
+  }, [item, poseKey, error])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1622,7 +1638,7 @@ function PlySceneObject({ item, onSettled = ignoreWorldSceneItemSettlement, onBo
       ownedModel?.geometry.dispose()
       reportLoadState('removed', attempt)
     }
-  }, [item.url, item.kind, reportLoadState])
+  }, [item.id, item.workspacePath, item.url, item.kind, reportLoadState, retryRevision])
 
   const key = worldSceneItemKey(item)
   useEffect(() => {
@@ -1630,6 +1646,9 @@ function PlySceneObject({ item, onSettled = ignoreWorldSceneItemSettlement, onBo
       onSettled(key, 'ready')
       onBoundsChange()
       if (activeAttemptRef.current) reportLoadState('ready', activeAttemptRef.current)
+    } else {
+      // The committed loading/failure branch has retired this item's owned geometry.
+      onBoundsChange()
     }
     return () => onSettled(key, null)
   }, [model, key, onSettled, onBoundsChange, reportLoadState])
@@ -1723,10 +1742,19 @@ function GltfSceneInstanceObject({ item, instance, onSettled, playbackRef, timel
     onBoundsChange()
     return () => onSettled(key, null)
   }, [item.id, key, onSettled, onBoundsChange, scene])
+  const hasMaterial = item.material !== undefined
+  const baseColor = item.material?.baseColor
+  const metallic = item.material?.metallic
+  const roughness = item.material?.roughness
+  const opacity = item.material?.opacity
+  const projectedMaterial = useMemo(() => {
+    if (!hasMaterial || baseColor === undefined || metallic === undefined || roughness === undefined || opacity === undefined) return undefined
+    return { baseColor, metallic, roughness, opacity }
+  }, [hasMaterial, baseColor, metallic, roughness, opacity])
   useEffect(() => {
-    applyWorldsRenderableProjection(scene, item.material, item.castShadow, item.receiveShadow)
+    applyWorldsRenderableProjection(scene, projectedMaterial, item.castShadow, item.receiveShadow)
     onBoundsChange()
-  }, [item.castShadow, item.material, item.receiveShadow, onBoundsChange, scene])
+  }, [item.castShadow, projectedMaterial, item.receiveShadow, onBoundsChange, scene])
   useEffect(() => {
     const animation = animationRef.current
     poseClipRef.current = null

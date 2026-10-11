@@ -15,7 +15,9 @@ import uuid
 from typing import Annotated, Literal, NoReturn, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from routers import world_ai
 from services.agent_providers.openai import OpenAIBoundaryError, build_openai_request, stream_openai_round
@@ -23,7 +25,26 @@ from services.agent_providers.openai import OpenAIBoundaryError, build_openai_re
 from services import llm_server
 from services.llm_server import llama_pool
 
-router = APIRouter(prefix="/agent", tags=["agent"])
+class _AgentValidationRoute(APIRoute):
+    """Keep Agent validation diagnostics without echoing the submitted body."""
+
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def safe_handler(request: Request) -> Response:
+            try:
+                return await original_handler(request)
+            except RequestValidationError as error:
+                diagnostics = [
+                    {"loc": item["loc"], "type": item["type"], "msg": item["msg"]}
+                    for item in error.errors()
+                ]
+                raise RequestValidationError(diagnostics) from None
+
+        return safe_handler
+
+
+router = APIRouter(prefix="/agent", tags=["agent"], route_class=_AgentValidationRoute)
 
 MODLY_API = "http://localhost:8765"
 

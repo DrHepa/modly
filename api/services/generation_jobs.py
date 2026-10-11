@@ -1137,6 +1137,12 @@ def create_generation_job(
     primary_image_slot: Optional[int] = None,
     primary_image_handle: Optional[str] = None,
 ) -> JobStatus:
+    # Capture selection at admission so queued work cannot follow a later switch.
+    # Reading the ID does not activate or load a generator.
+    if model_id is None:
+        model_id = generator_registry._active_id
+        if not model_id:
+            raise HTTPException(400, "No model selected. Select a model before generating.")
     job = create_job()
     private_input_dir: Optional[Path] = None
     try:

@@ -342,13 +342,16 @@ class ExtensionProcess:
 
     def is_downloaded(self) -> bool:
         if self.https_downloads:
-            return https_download_assets_ready(
+            if not https_download_assets_ready(
                 self.model_dir,
                 self.model_id,
                 self.https_downloads,
-            )
+            ):
+                return False
         if self.hf_downloads:
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
+        if self.https_downloads:
+            return True
         if self.download_check:
             import os
             if self.model_dir.is_symlink() or not isinstance(self.download_check, str) or Path(self.download_check).is_absolute() or "\\" in self.download_check:

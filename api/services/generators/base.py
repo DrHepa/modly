@@ -113,15 +113,18 @@ class BaseGenerator(ABC):
         if self.https_downloads:
             from services.https_download_assets import https_download_assets_ready
 
-            return https_download_assets_ready(
+            if not https_download_assets_ready(
                 self.model_dir,
                 self.model_id,
                 self.https_downloads,
-            )
+            ):
+                return False
         if self.hf_downloads:
             from services.hf_download_assets import hf_download_assets_ready
 
             return hf_download_assets_ready(self.model_dir, self.hf_downloads)
+        if self.https_downloads:
+            return True
         if self.download_check:
             from services.download_check import safe_download_check_exists
 

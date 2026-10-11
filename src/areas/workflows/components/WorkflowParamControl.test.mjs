@@ -158,10 +158,12 @@ test('actual file-select effect lists filtered dir_from files, ignores stale loa
 import ts from 'typescript'
 import { transformSync } from 'esbuild'
 import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 const require = createRequire(import.meta.url)
 function loadPure(file) {
   const mod = { exports: {} }
-  vm.runInNewContext(buildSync({ entryPoints: [file], bundle: true, platform: 'node', format: 'cjs', write: false }).outputFiles[0].text, { module: mod, exports: mod.exports, require })
+  vm.runInNewContext(buildSync({ entryPoints: [file], bundle: true, platform: 'node', format: 'cjs', write: false, define: { 'import.meta.url': JSON.stringify(pathToFileURL(resolve(file)).href) }, logOverride: { 'empty-import-meta': 'error' } }).outputFiles[0].text, { module: mod, exports: mod.exports, require })
   return mod.exports
 }
 const state = loadPure('src/areas/workflows/components/workflowParamControlState.ts')
@@ -177,6 +179,7 @@ function actualOwner(file, functionName, constants, env, callback = false) {
   let body
   const declarations = []
   function visit(node) {
+    if (callback && ts.isFunctionDeclaration(node) && node.name?.text === 'isRecord') declarations.push(node.getText(ast))
     if (!callback && ts.isFunctionDeclaration(node) && node.name?.text === functionName) body = node.getText(ast).replace(/^export default /, '')
     if (ts.isVariableDeclaration(node)) {
       if (constants.includes(node.name.getText(ast))) declarations.push(`const ${node.getText(ast)};`)
@@ -186,6 +189,7 @@ function actualOwner(file, functionName, constants, env, callback = false) {
   }
   visit(ast)
   assert.ok(body, `${functionName} not found`)
+  if (callback && functionName === 'patchNode') assert.ok(declarations.some((source) => source.startsWith('function isRecord')), 'actual patchNode isRecord companion missing')
   const code = transformSync(`${declarations.join('\n')}\n${body}\n globalThis.result = ${functionName}`, { loader: 'tsx', jsx: 'automatic', format: 'cjs' }).code
   const additions = { exports: {} }
   vm.runInNewContext(buildSync({
@@ -312,9 +316,10 @@ test('mounted ExtensionNode shows named labels and fallbacks without changing ha
       const original = JSON.stringify(extension)
       const h = mountControl(props, Node)
       try {
-        assert.deepEqual(h.all().filter((node) => node.type === 'span').map((node) => node.props.children), [fixture.labels[0], 'mesh', ...fixture.labels.slice(1)], type)
+        assert.deepEqual(h.all().filter((node) => node.type === 'span' && node.props.className?.includes('inline-flex')).map((node) => node.props.children), [fixture.labels[0], 'mesh', ...fixture.labels.slice(1)], type)
         const handleIds = () => h.all().filter((node) => node.type === 'handle' && node.props.type === 'target').map((node) => node.props.id)
         assert.deepEqual(handleIds(), fixture.handles)
+        if (fixture.inputs.some((port) => typeof port === 'object' && port.required === false)) assert.ok(h.all().some((node) => node.type === 'span' && node.props.children === 'optional'))
         h.update(props)
         assert.deepEqual(handleIds(), fixture.handles)
         assert.equal(JSON.stringify(extension), original)
@@ -326,8 +331,8 @@ test('mounted ExtensionNode shows named labels and fallbacks without changing ha
 
 for (const type of ['model', 'process']) {
   test(`mounted ${type} manifest boundary safely displays raw names without rewriting handle identity`, async () => {
-    const { validateInstallManifest } = await import('../../../../electron/main/extension-install-utils.ts')
-    const { parseExtensionManifest } = await import('../../../../electron/main/automation-capabilities.ts')
+    const { validateInstallManifest } = loadPure('electron/main/extension-install-utils.ts')
+    const { parseExtensionManifest } = loadPure('electron/main/automation-capabilities.ts')
     for (const name of [0, 1, false, true, null, ['unexpected'], { raw: 'name' }, ' stable ']) {
       for (const display of [{}, { label: 'Named label' }, { inputLabels: ['Slot override'] }, { inputLabels: [''] }, { inputLabels: ['   '] }]) {
         const manifest = JSON.parse(JSON.stringify({
@@ -358,7 +363,8 @@ for (const type of ['model', 'process']) {
         const expected = display.inputLabels?.[0] ?? (display.label ? 'Named label (image)' : typeof name === 'string' ? 'stable (image)' : 'image')
         const h = mountControl(props, Node)
         try {
-          assert.deepEqual(h.all().filter((node) => node.type === 'span').map((node) => node.props.children), [expected, 'mesh'])
+          assert.deepEqual(h.all().filter((node) => node.type === 'span' && node.props.className?.includes('inline-flex')).map((node) => node.props.children), [expected, 'mesh'])
+          assert.ok(h.all().some((node) => node.type === 'span' && node.props.children === 'optional'))
           assert.equal(h.find((node) => node.type === 'handle' && node.props.type === 'target').props.id, owner.inputs[0].name ?? 'input-0')
           // The PROCESS normalizer creates the outer port in the fixture's VM realm.
           assert.deepEqual({ ...owner.inputs[0] }, { ...original.nodes[0].inputs[0], required: false })
@@ -380,7 +386,8 @@ test('numeric strings remain visible through real shared numeric controls withou
   }
   let selected
   Control({ param: { id: 'select', label: 'Select', type: 'select', default: 0, options: [{ value: 0, label: '0' }, { value: 1, label: '1' }] }, value: 0, onChange: (value) => { selected = value } }).props.onChange({ target: { value: '1' } })
-  assert.equal(selected, '1')
+  assert.equal(selected, 1)
+  assert.equal(typeof selected, 'number')
 })
 
 // Mount real React hooks and keyed reconciliation using the installed renderer.

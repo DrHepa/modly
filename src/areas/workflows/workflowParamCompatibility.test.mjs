@@ -1,16 +1,23 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { Buffer } from 'node:buffer'
 import { buildSync } from 'esbuild'
 import { createRequire } from 'node:module'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const require = createRequire(import.meta.url)
 function load(file) {
-  const out = join(mkdtempSync(join(tmpdir(), 'modly-param-compat-')), 'module.cjs')
-  writeFileSync(out, buildSync({ entryPoints: [resolve(file)], bundle: true, platform: 'node', format: 'cjs', write: false }).outputFiles[0].text)
-  return require(out)
+  const directory = mkdtempSync(join(tmpdir(), 'modly-param-compat-'))
+  const out = join(directory, 'module.cjs')
+  try {
+    writeFileSync(out, buildSync({ entryPoints: [resolve(file)], bundle: true, platform: 'node', format: 'cjs', write: false,
+      define: { 'import.meta.url': JSON.stringify(pathToFileURL(resolve(file)).href) }, logOverride: { 'empty-import-meta': 'error' },
+    }).outputFiles[0].text)
+    return require(out)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
 }
 const schema = load('src/areas/workflows/workflowParamSchema.ts')
 const state = load('src/areas/workflows/components/workflowParamControlState.ts')
@@ -145,17 +152,24 @@ test('unsupported display types retain raw runtime defaults and inherited overri
         get: async () => ({ data: { status: 'done', progress: 100, output_url: '/workspace/Workflows/result/scene-manifest.json' } }),
       },
     }
+    const sceneReads = []
+    const sceneJson = JSON.stringify({ schema: 'modly.scene-manifest.v1', sceneRoot: '.', assets: [] })
     const window = { electron: { settings: { get: async () => ({ workspaceDir: '/workspace' }) }, fs: {
       deleteDirectory: async () => ({ success: true }), listFiles: async () => [],
-      readFileBase64: async () => { throw new Error('scene input must not read image bytes') },
+      readFileBase64: async (filePath) => {
+        sceneReads.push(filePath)
+        assert.equal(filePath, '/workspace/Workflows/input/scene-manifest.json', 'only the live source manifest may be read')
+        return Buffer.from(sceneJson, 'utf8').toString('base64')
+      },
     } } }
     const module = { exports: {} }
-    vm.runInNewContext(bundle, { module, exports: module.exports, require, fixture, window, process, console, crypto, Blob, FormData, atob, setTimeout, clearTimeout })
+    vm.runInNewContext(bundle, { module, exports: module.exports, require, fixture, window, process, console, crypto, Blob, FormData, atob, structuredClone, TextDecoder, setTimeout, clearTimeout })
     const store = module.exports.useWorkflowRunStore
     await store.getState().run({ id: 'wf', name: 'Scene', description: '', createdAt: '', updatedAt: '', nodes: [
-      { id: 'source', type: 'sceneNode', position: { x: 0, y: 0 }, data: { enabled: true, params: { manifestPath: 'Workflows/input/scene-manifest.json' } } },
+      { id: 'source', type: 'sceneNode', position: { x: 0, y: 0 }, data: { enabled: true, params: { path: 'Workflows/input/scene-manifest.json' } } },
       { id: 'model', type: 'extensionNode', position: { x: 1, y: 0 }, data: { enabled: true, extensionId: 'pack/run', params: scenario.supplied } },
     ], edges: [{ id: 'e', source: 'source', target: 'model' }] }, extensions)
+    assert.deepEqual(sceneReads, ['/workspace/Workflows/input/scene-manifest.json'])
     assert.equal(store.getState().runState.status, 'done', store.getState().runState.error)
     assert.equal(posts[0].url, '/generate/from-artifact')
     assert.deepEqual(JSON.parse(JSON.stringify(posts[0].body.params)), scenario.expected, scenario.name)

@@ -185,8 +185,11 @@ test('openWorkflow opens a saved closed workflow without duplicating or reorderi
 
 test('successful create saves before opening the new workflow and persists existing tab order', async () => {
   const source = readFileSync(resolve('src/areas/generate/components/ChatPanel.tsx'), 'utf8')
-  assert.match(source, /const openWorkflow = useWorkflowsStore\(\(s\) => s\.openWorkflow\)/)
-  assert.match(source, /const res = await saveWorkflow\(wf\)\s+if \(res\.success\) openWorkflow\(wf\.id\)/)
+  assert.match(source, /createWorkflow: \(request\) => window\.electron\.agentWorkflows\.create\(request\)/)
+  assert.match(source, /reloadWorkflows: \(\) => useWorkflowsStore\.getState\(\)\.load\(\)/)
+  assert.match(source, /openWorkflow: \(workflowId\) => useWorkflowsStore\.getState\(\)\.openWorkflow\(workflowId\)/)
+  const actions = readFileSync(resolve('src/areas/generate/agentDirectActions.ts'), 'utf8')
+  assert.match(actions, /const result = await dependencies\.createWorkflow\([\s\S]*?if \(!result\.ok\) throw[\s\S]*?if \(dependencies\.isCurrent\(\)\) \{\s+await dependencies\.reloadWorkflows\(\)\s+if \(dependencies\.isCurrent\(\)\) dependencies\.openWorkflow\(workflow\.id\)/)
 
   const useStore = loadStore()
   stubBridge({ save: async () => ({ success: true }) })

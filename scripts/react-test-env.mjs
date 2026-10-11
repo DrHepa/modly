@@ -14,7 +14,9 @@
 import { JSDOM } from 'jsdom'
 import { buildSync } from 'esbuild'
 import { createRequire } from 'node:module'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 
 /** Install a DOM into the globals React expects. Call once, at module scope. */
@@ -49,22 +51,24 @@ export function setupDom() {
  * which reads as a bug in the code under test and is not one.
  */
 export function loadModule(entryPath) {
-  // Inside the project, not the system temp dir: the bundle keeps `react` as a
-  // bare require, and that only resolves from a path under this node_modules.
-  const cacheRoot = resolve('node_modules/.cache/modly-react-tests')
-  mkdirSync(cacheRoot, { recursive: true })
-  const outfile = join(mkdtempSync(join(cacheRoot, 'm-')), 'module.cjs')
-  const result = buildSync({
-    entryPoints: [resolve(entryPath)],
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    jsx: 'automatic',
-    external: ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime'],
-    write: false,
-  })
-  writeFileSync(outfile, result.outputFiles[0].text, 'utf8')
-  return createRequire(import.meta.url)(outfile)
+  const directory = mkdtempSync(join(tmpdir(), 'modly-react-tests-'))
+  const outfile = join(directory, 'module.cjs')
+  const alias = Object.fromEntries(['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime']
+    .map((id) => [id, fileURLToPath(import.meta.resolve(id))]))
+  try {
+    const result = buildSync({
+      entryPoints: [resolve(entryPath)],
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      jsx: 'automatic',
+      alias,
+      external: Object.values(alias),
+      write: false,
+    })
+    writeFileSync(outfile, result.outputFiles[0].text, 'utf8')
+    return createRequire(import.meta.url)(outfile)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
 }
 
 /**

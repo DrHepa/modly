@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { existsSync, statSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build, type Plugin } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -24,6 +25,11 @@ function aliasPlugin(): Plugin {
   return {
     name: 'modly-aliases',
     setup(buildApi) {
+      const runtimeExternals = ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime', 'zustand']
+      buildApi.onResolve({ filter: /^[^./]/ }, (args) => {
+        if (!runtimeExternals.some((name) => args.path === name || args.path.startsWith(`${name}/`))) return null
+        return { path: fileURLToPath(import.meta.resolve(args.path)), external: true }
+      })
       buildApi.onResolve({ filter: /^@shared\// }, (args) => ({
         path: resolvePath(path.join(projectRoot, 'src/shared', args.path.slice('@shared/'.length))),
       }))
@@ -32,25 +38,29 @@ function aliasPlugin(): Plugin {
 }
 
 async function loadSidebarModule() {
-  const tempDir = await mkdtemp(path.join(projectRoot, '.tmp-sidebar-test-'))
-  const outfile = path.join(tempDir, 'Sidebar.bundle.mjs')
+  const tempDir = await mkdtemp(path.join(tmpdir(), '.tmp-sidebar-test-'))
+  try {
+    const outfile = path.join(tempDir, 'Sidebar.bundle.mjs')
 
-  await build({
-    entryPoints: [sidebarEntry],
-    outfile,
-    bundle: true,
-    format: 'esm',
-    platform: 'node',
-    tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
-    plugins: [aliasPlugin()],
-    external: ['react', 'react-dom', 'react-dom/server', 'react/jsx-runtime', 'zustand'],
-  })
+    await build({
+      entryPoints: [sidebarEntry],
+      outfile,
+      bundle: true,
+      format: 'esm',
+      platform: 'node',
+      tsconfig: path.join(projectRoot, 'tsconfig.web.json'),
+      plugins: [aliasPlugin()],
+    })
 
-  return {
-    module: await import(pathToFileURL(outfile).href),
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true })
-    },
+    return {
+      module: await import(pathToFileURL(outfile).href),
+      async cleanup() {
+        await rm(tempDir, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true })
+    throw error
   }
 }
 

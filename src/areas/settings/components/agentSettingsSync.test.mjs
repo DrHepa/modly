@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import test from 'node:test'
-import { transformSync } from 'esbuild'
+import { buildSync, transformSync } from 'esbuild'
+import { pathToFileURL } from 'node:url'
 import React from 'react'
 import Reconciler from 'react-reconciler'
 import { create } from 'zustand'
@@ -50,7 +51,40 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
     getItem: () => hydrate ? JSON.stringify({ version: 3, state: hydrate }) : null,
     setItem: (...args) => writes.push(args), removeItem() {},
   }
-  const window = { electron: { secureStore: { decrypt: () => decrypt.promise, encrypt: async (key) => `encrypted:${key}` } } }
+  const sourceRoot = process.env.MODLY_AGENT_SYNC_SOURCE_ROOT ?? root
+  let session = {
+    id: 'settings-session', title: 'Settings fixture', revision: 1,
+    createdAt: '2026-10-11T00:00:00.000Z', updatedAt: '2026-10-11T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z',
+    messages: [], attachments: [],
+  }
+  const sessionApi = {
+    list: async () => {
+      const { messages, attachments, ...metadata } = session
+      return { sessions: [{ ...metadata, messageCount: messages.length, attachmentCount: attachments.length }], activeSessionId: session.id, readOnly: false }
+    },
+    read: async ({ sessionId }) => { assert.equal(sessionId, session.id); return structuredClone(session) },
+    appendMessage: async ({ sessionId, expectedRevision, message }) => {
+      assert.equal(sessionId, session.id)
+      assert.equal(expectedRevision, session.revision, 'fixture must exercise current revisioned persistence')
+      assert.ok(!session.messages.some((entry) => entry.id === message.id))
+      session = { ...session, revision: session.revision + 1, messages: [...session.messages, { attachmentIds: [], summaries: [], ...structuredClone(message) }] }
+      return structuredClone(session)
+    },
+    create: async () => assert.fail('Session creation is outside the settings fixture'),
+    activate: async () => assert.fail('Session switching is outside the settings fixture'),
+    rename: async () => assert.fail('Session rename is outside the settings fixture'),
+    delete: async () => assert.fail('Session deletion is outside the settings fixture'),
+    addAttachment: async () => assert.fail('Attachment writes are outside the settings fixture'),
+    removeAttachment: async () => assert.fail('Attachment deletion is outside the settings fixture'),
+    readAttachment: async () => assert.fail('Settings messages have no attachments'),
+  }
+  const protectedContextUnavailable = async () => { throw new Error('Protected Agent context is unavailable in this ordinary settings fixture') }
+  const window = { electron: {
+    secureStore: { decrypt: () => decrypt.promise, encrypt: async (key) => `encrypted:${key}` },
+    agentSessions: sessionApi,
+    agentCapabilities: { list: protectedContextUnavailable, resolveSkillContexts: protectedContextUnavailable },
+    agentActions: { list: protectedContextUnavailable, leaseModel: protectedContextUnavailable },
+  } }
   const fetch = (url, options) => {
     if (url.endsWith('/agent/external/models')) {
       const response = deferred()
@@ -72,9 +106,15 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
     localCalls.push(url)
     return Promise.resolve({ ok: true, json: async () => local[suffix] })
   }
-  const load = (file, imports = {}, sourceRoot = root) => {
+  const load = (file, imports = {}, sourceRoot = root, bundle = false) => {
     const module = { exports: {} }
-    const code = transformSync(readFileSync(path.join(sourceRoot, file), 'utf8'), { loader: 'tsx', jsx: 'automatic', format: 'cjs' }).code
+    const entry = path.join(sourceRoot, file)
+    const code = bundle ? buildSync({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', write: false,
+      external: ['react', 'react/*', 'zustand', 'axios'],
+      alias: { '@shared': path.join(sourceRoot, 'src/shared'), '@areas': path.join(sourceRoot, 'src/areas') },
+      define: { 'import.meta.url': JSON.stringify(pathToFileURL(entry).href) }, logOverride: { 'empty-import-meta': 'error' },
+    }).outputFiles[0].text : transformSync(readFileSync(entry, 'utf8'), { loader: path.extname(entry) === '.tsx' ? 'tsx' : 'ts', jsx: 'automatic', format: 'cjs' }).code
     // Keep promises in the same realm: Zustand's storage adapter checks
     // `instanceof Promise`, so a VM realm would not exercise real hydration.
     new Function('module', 'exports', 'require', 'window', 'localStorage', 'fetch', 'document', code)(
@@ -91,7 +131,21 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
     writes.length = 0
   }
   const app = create(() => ({ apiUrl: 'http://fixture.invalid', currentJob: null, meshStats: null }))
+  const { createAgentSessionsStore } = load('src/shared/stores/agentSessionsStore.ts', {}, sourceRoot)
+  const sessions = createAgentSessionsStore(sessionApi)
+  await sessions.getState().initialize()
+  assert.equal(sessions.getState().activeSession.id, session.id)
+  assert.equal(sessions.getState().initialized, true)
+  const sessionImports = { '@shared/stores/agentSessionsStore': { useAgentSessionsStore: sessions } }
   const imports = {
+    ...sessionImports,
+    '@shared/hooks/useApi': load('src/shared/hooks/useApi.ts', { '../stores/appStore.ts': { useAppStore: app } }, sourceRoot),
+    '@areas/workflows/preflight': load('src/areas/workflows/preflight.ts', {}, sourceRoot, true),
+    '../agentDirectActions': load('src/areas/generate/agentDirectActions.ts', {}, sourceRoot),
+    '@shared/utils/agentModels': load('src/shared/utils/agentModels.ts', {}, sourceRoot),
+    './AgentSessionHistory': load('src/areas/generate/components/AgentSessionHistory.tsx', sessionImports, sourceRoot),
+    '@shared/types/artifacts': load('src/shared/types/artifacts.ts', {}, sourceRoot),
+    '../../worlds/editor/worldAiChatAdapter.ts': load('src/areas/worlds/editor/worldAiChatAdapter.ts', {}, sourceRoot, true),
     '@shared/stores/agentStore': agent,
     '@shared/stores/appStore': { useAppStore: app },
     '@shared/ui': load('src/shared/ui/index.tsx'),
@@ -107,7 +161,6 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
     '@areas/workflows/workflowRunStore': { useWorkflowRunStore: create(() => ({ runState: { status: 'idle' } })) },
     '@areas/workflows/mockExtensions': { buildAllWorkflowExtensions: () => [] },
   }
-  const sourceRoot = process.env.MODLY_AGENT_SYNC_SOURCE_ROOT ?? root
   const Settings = load('src/areas/settings/components/AgentSection.tsx', imports, sourceRoot).AgentSection
   const Chat = load('src/areas/generate/components/ChatPanel.tsx', imports, sourceRoot).default
   const host = { type: 'root', props: {}, children: [] }
@@ -116,6 +169,7 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
   t.after(unmount)
   flush(() => renderer.updateContainer(React.createElement(React.Fragment, null, React.createElement(Settings), React.createElement(Chat)), container, null))
   await settle()
+  assert.ok(sessions.getState().activeSession, 'real current session must remain active after mount')
   const nodes = () => all(host)
   const button = (label) => { const node = nodes().find((n) => n.type === 'button' && (n.props.title === label || text(n) === label)); assert.ok(node, `Missing button: ${label}`); return node }
   const click = (label) => flush(() => button(label).props.onClick())
@@ -128,12 +182,19 @@ async function mount(t, { provider = 'custom', external = {}, hydrate = null } =
   const change = (label, value) => flush(() => field(label).props.onChange({ target: { value } }))
   const finish = async (request, models, ok = true) => { request.resolve({ ok, json: async () => ({ models }) }); await settle() }
   const send = async () => {
-    let textarea = nodes().find((n) => n.type === 'textarea')
+    const textarea = nodes().find((n) => n.type === 'textarea')
     flush(() => textarea.props.onChange({ target: { value: 'Fixture prompt' } }))
-    textarea = nodes().find((n) => n.type === 'textarea')
-    flush(() => textarea.props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }))
+    const index = chats.length
+    const sendButton = nodes().find((node) => node.type === 'button' && node.props['aria-label'] === 'Send message')
+    assert.ok(sendButton, 'Real chat send control must be mounted')
+    assert.equal(sendButton.props.disabled, false, 'Real chat must be ready to send')
+    let completion
+    flush(() => { completion = sendButton.props.onClick() })
+    assert.ok(completion && typeof completion.then === 'function', 'Real send must expose its completion')
+    await completion
     await settle()
-    return chats.at(-1)
+    assert.equal(chats.length, index + 1, 'Each send must capture exactly one new real request')
+    return chats[index]
   }
   return { agent: agent.useAgentStore, app, host, nodes, button, click, field, change, pending, finish, send, writes, localCalls, decrypt, unmount }
 }

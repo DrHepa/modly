@@ -71,12 +71,14 @@ export type InstalledModelDownloadPlan = { ownership?: ModelOwnershipDescriptor 
   extensionId: string
   nodeId: string
   hfDownloads: HfDownloadDescriptor[]
+  weightVariants?: WeightVariants
 } | {
   kind: 'https-assets'
   modelId: string
   extensionId: string
   nodeId: string
   httpsDownloads: HttpsDownloadAsset[]
+  weightVariants?: WeightVariants
 } | {
   kind: 'multi-source'
   modelId: string
@@ -188,9 +190,9 @@ function parseManifest(raw: string, extensionId: string, nodeId: string, validat
   ))
   if (!sources && sharedGroups.length === 0) {
     const httpsDownloads = normalizeHttpsDownloads(node.https_downloads, 'https_downloads')
-    if (httpsDownloads) return { ...(ownership ? { ownership } : {}), kind: 'https-assets', modelId, extensionId, nodeId, httpsDownloads }
+    if (httpsDownloads) return { ...(ownership ? { ownership } : {}), ...(weightVariants ? { weightVariants } : {}), kind: 'https-assets', modelId, extensionId, nodeId, httpsDownloads }
     const hfDownloads = normalizeHfDownloads(node.hf_downloads, 'hf_downloads')
-    if (hfDownloads) return { ...(ownership ? { ownership } : {}), kind: 'hf-assets', modelId, extensionId, nodeId, hfDownloads }
+    if (hfDownloads) return { ...(ownership ? { ownership } : {}), ...(weightVariants ? { weightVariants } : {}), kind: 'hf-assets', modelId, extensionId, nodeId, hfDownloads }
   }
   if (sources || sharedGroups.length > 0) {
     if (sharedGroups.length > 0 && node.hf_repo !== undefined) {

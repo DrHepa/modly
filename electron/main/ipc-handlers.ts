@@ -545,7 +545,8 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       return privateReady && plan.sharedGroups.every((group) => areWeightGroupSourcesDownloaded(modelsDir, plan.extensionId, group))
     }
     if (plan.kind === 'hf-assets' || plan.kind === 'https-assets') {
-      return plan.ownership ? isOwnedModelDownloaded(modelsDir, plan.ownership) : false
+      return !!plan.ownership && isOwnedModelDownloaded(modelsDir, plan.ownership)
+        && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
     }
     return isModelDownloaded(modelsDir, storageId, plan.downloadCheck)
       && (!plan.weightVariants || installedWeightVariants(modelsDir, storageId, plan.weightVariants).length > 0)
@@ -1116,37 +1117,54 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     })
     const models = extensions.filter((extension) => extension.type === 'model' && !extension.corrupted)
     if (models.length === 0) return listDownloadedModels(settings.modelsDir)
-    // Directory presence supplies size only, never source/group/variant readiness.
-    const sizes = new Map(listDownloadedModelCapabilities(settings.modelsDir, models).map((candidate) => [candidate.id, candidate.size_gb]))
-    const ready = await Promise.all(models.flatMap((extension) => extension.nodes.map(async (node) => {
-      const id = `${extension.id}/${node.id}`
+    // Preserve collector metadata, but never use directory presence as managed readiness.
+    const rows = new Map(listDownloadedModelCapabilities(settings.modelsDir, models).map((candidate) => [candidate.id, candidate]))
+    await Promise.all(models.flatMap((extension) => extension.nodes.map(async (node) => {
+      const id = node.capabilityId ?? `${extension.id}/${node.id}`
+      const original = rows.get(id)
+      const managed = Boolean(node.hasModelSources || node.weightGroups?.length || node.weightVariants)
       try {
-        const ownership = resolveModelOwnership(models, id)
-        const requiresUpstreamPlan = Boolean(node.hasModelSources || node.weightGroups?.length || node.weightVariants)
-        const downloaded = ownership && (ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
-          ? isOwnedModelDownloaded(settings.modelsDir, ownership)
-            && (!requiresUpstreamPlan || planDownloaded(settings.modelsDir, await resolveModelPlan(id)))
-          : planDownloaded(settings.modelsDir, await resolveModelPlan(id))
-        return downloaded ? { id, name: node.name, size_gb: sizes.get(id) ?? 0 } : null
-      } catch { return null }
+        const ownership = resolveModelOwnership(models, id) ?? createFallbackOwnership(id)
+        let downloaded: boolean
+        try {
+          const plan = await resolveModelPlan(id)
+          if ((node.hasModelSources || node.weightGroups?.length) && plan.kind !== 'multi-source') {
+            rows.delete(id)
+            return
+          }
+          downloaded = planDownloaded(settings.modelsDir, plan.ownership ? plan : { ...plan, ownership })
+            && (!(ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
+              || isOwnedModelDownloaded(settings.modelsDir, ownership))
+        } catch {
+          // Historical aliases remain readable without granting any write authority.
+          if (managed) { rows.delete(id); return }
+          downloaded = original !== undefined || isOwnedModelDownloaded(settings.modelsDir, ownership)
+        }
+        if (downloaded) rows.set(id, original ?? { id, name: node.name, size_gb: 0 })
+        else rows.delete(id)
+      } catch { rows.delete(id) }
     })))
-    return ready.filter((candidate) => candidate !== null)
+    return rows.size ? [...rows.values()] : listDownloadedModels(settings.modelsDir)
   })
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
     try {
       const userData = app.getPath('userData')
       const { ownership, extensions } = await resolveOwnershipContext(userData, modelId)
-      if (ownership.httpsDownloads?.length || ownership.hfDownloads?.length) {
-        const node = extensions.flatMap((extension) => extension.type === 'model'
-          ? extension.nodes.filter((candidate) => (candidate.capabilityId ?? `${extension.id}/${candidate.id}`) === modelId)
-          : [])[0]
-        const requiresUpstreamPlan = Boolean(node?.hasModelSources || node?.weightGroups?.length || node?.weightVariants)
-        const modelsDir = getSettings(userData).modelsDir
-        return isOwnedModelDownloaded(modelsDir, ownership)
-          && (!requiresUpstreamPlan || planDownloaded(modelsDir, await resolveModelPlan(modelId)))
+      const node = extensions.flatMap((extension) => extension.type === 'model'
+        ? extension.nodes.filter((candidate) => (candidate.capabilityId ?? `${extension.id}/${candidate.id}`) === modelId)
+        : [])[0]
+      const managed = Boolean(node?.hasModelSources || node?.weightGroups?.length || node?.weightVariants)
+      const modelsDir = getSettings(userData).modelsDir
+      try {
+        const plan = await resolveModelPlan(modelId)
+        if ((node?.hasModelSources || node?.weightGroups?.length) && plan.kind !== 'multi-source') return false
+        return planDownloaded(modelsDir, plan.ownership ? plan : { ...plan, ownership })
+          && (!(ownership.httpsDownloads?.length || ownership.hfDownloads?.length)
+            || isOwnedModelDownloaded(modelsDir, ownership))
+      } catch {
+        return !managed && isOwnedModelDownloaded(modelsDir, ownership)
       }
-      return planDownloaded(getSettings(userData).modelsDir, await resolveModelPlan(modelId))
     } catch {
       return false
     }
@@ -1213,6 +1231,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
       })
       const group = groups.find((candidate) => candidate.id === groupId)
       if (!group) return { success: false, error: `Unknown shared weight group: ${groupId}` }
+      if (group.dependentModelIds.some((id) => activeDownloads.has(id))) {
+        return { success: false, error: 'Model weights are busy: a dependent capability is downloading' }
+      }
       const groupRoot = resolveWeightGroupRoot(
         getSettings(app.getPath('userData')).modelsDir,
         extensionId,
@@ -1293,9 +1314,10 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
     requestedVariantId?: string | null,
     requireMultiSource = false,
   ) => {
-    if (activeDownloads.has(modelId)) {
-      return { success: false, error: 'Download already in progress' }
-    }
+    const inProgress = (message = 'Download already in progress') => modelAssetDownloadResult(new ModelAssetDownloadError({
+      code: 'download_in_progress', stage: 'download', message, retryable: true,
+    }))
+    if (activeDownloads.has(modelId)) return inProgress()
     const variantId = requestedVariantId ?? undefined
     let finish!: () => void
     const done = new Promise<void>((resolveDone) => { finish = resolveDone })
@@ -1332,7 +1354,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         return { success: false, error: String(err) }
       }
       if (activeDownloads.get(modelId) !== active) {
-        return { success: false, error: 'Download already in progress' }
+        return inProgress()
       }
       if (active.stopRequested) {
         return { success: false, paused: active.stopRequested === 'pause', cancelled: active.stopRequested === 'cancel' }
@@ -1354,21 +1376,20 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
             }] : []),
           ]
         : []
-      const targetRoots = plan.kind === 'multi-source'
-        ? allTargets.map((target) => resolveWeightStorageRoot(modelsDir, target.targetId))
-        : [resolveModelRoot(modelsDir, privateTargetId)]
-      let release: () => void
-      try {
-        release = weightOperations.acquire(`downloading ${modelId}`, targetRoots)
-      } catch (err) {
-        return { success: false, error: String(err) }
+      // Legacy variant passes share one root lease. Multi-source targets are
+      // acquired only at their own stage, never while waiting for an earlier target.
+      let releaseLegacy: (() => void) | undefined
+      if (plan.kind === 'legacy') {
+        const roots = [resolveModelRoot(modelsDir, privateTargetId)]
+        try { releaseLegacy = weightOperations.acquire(`downloading ${modelId}`, roots) }
+        catch (error) { return inProgress(String(error)) }
+        active.targetRoots = roots
+        interruptedTargets.set(modelId, roots)
       }
       const managedTargets = allTargets.filter((target) => !areModelSourcesDownloadedAtRoot(
         resolveWeightStorageRoot(modelsDir, target.targetId), target.sources,
       ))
 
-      active.targetRoots = targetRoots
-      interruptedTargets.set(modelId, targetRoots)
       try {
         const onProgress = (progress: DownloadProgress) => {
           active.progress = { ...progress, variantId }
@@ -1380,21 +1401,40 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           }
           for (const [index, target] of managedTargets.entries()) {
             if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
+            // Installed manifests can change during an earlier transfer. Revalidate
+            // storage authority before acquiring this stage's pinned physical root.
+            await resolveModelPlan(modelId, true)
+            if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
+            const root = resolveWeightStorageRoot(modelsDir, target.targetId)
+            // A sibling may have completed this later target while the earlier stage awaited.
+            if (areModelSourcesDownloadedAtRoot(root, target.sources)) continue
+            let releaseTarget: () => void
+            try { releaseTarget = weightOperations.acquire(`downloading ${modelId}`, [root]) }
+            catch (error) { throw new ModelAssetDownloadError({
+              code: 'download_in_progress', stage: 'download', message: String(error), retryable: true,
+            }) }
             active.currentTargetId = target.targetId
-            await downloadModelSourcesFromHF(modelId, target.targetId, (progress) => {
-              if (progress.paused) active.stopRequested = 'pause'
-              if (progress.cancelled) active.stopRequested = 'cancel' 
-              const aggregatePercent = Math.min(
-                99,
-                Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
-              )
-              onProgress({
-                ...progress,
-                percent: aggregatePercent,
-                status: progress.status ? `${target.label} · ${progress.status}` : target.label,
+            active.targetRoots.push(root)
+            interruptedTargets.set(modelId, [...active.targetRoots])
+            try {
+              await downloadModelSourcesFromHF(modelId, target.targetId, (progress) => {
+                if (progress.paused) active.stopRequested = 'pause'
+                if (progress.cancelled) active.stopRequested = 'cancel'
+                const aggregatePercent = Math.min(
+                  99,
+                  Math.round(((index + progress.percent / 100) / managedTargets.length) * 100),
+                )
+                onProgress({
+                  ...progress,
+                  percent: aggregatePercent,
+                  status: progress.status ? `${target.label} · ${progress.status}` : target.label,
+                })
               })
-            })
-            notifyWeightChange()
+            } finally {
+              active.currentTargetId = undefined
+              releaseTarget()
+              notifyWeightChange()
+            }
           }
           if (active.stopRequested) throw new Error(`Model download ${active.stopRequested === 'pause' ? 'paused' : 'cancelled'}`)
           if (managedTargets.length > 0) onProgress({ percent: 100, status: 'done' })
@@ -1429,10 +1469,10 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
           event.sender.send('model:downloadProgress', { capabilityId: modelId, modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
           return { success: false, cancelled: true }
         }
-        return { success: false, error: String(err) }
+        return modelAssetDownloadResult(err)
       } finally {
         if (activeDownloads.get(modelId) === active) activeDownloads.delete(modelId)
-        release()
+        releaseLegacy?.()
         notifyWeightChange()
       }
     } finally {
@@ -1451,13 +1491,23 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
   ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const active = activeDownloads.get(modelId)
-      const targetId = active?.currentTargetId
-      if (!active || !targetId) return { success: false, error: 'No active download target' }
+      if (!active) return { success: false, error: 'No active download target' }
       active.stopRequested = 'pause'
-      await axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
-        params: { model_id: targetId },
-        timeout: 5000,
+      const targetId = active.currentTargetId
+      // A pending lookup has no backend transfer. Posting a fabricated target
+      // would create a paused backend control that poisons the next request.
+      if (targetId) await axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
+        params: { model_id: targetId }, timeout: 5000,
       })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          active.done,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Timed out waiting for the download to stop')), 30_000)
+          }),
+        ])
+      } finally { clearTimeout(timer) }
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -1488,6 +1538,9 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
         }
       }
       let roots = active?.targetRoots.length ? active.targetRoots : interruptedTargets.get(modelId)
+      // A stopped pending request never acquired a storage root; it has nothing
+      // to clean. Inactive legacy cleanup still requires strict write admission.
+      if (active && !roots) return { success: true }
       if (!roots) {
         // Pinned sessions retain their authorised targets. A fallback cleanup
         // must never infer write authority from a read-only descriptor.
@@ -1620,7 +1673,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
   })
 
   ipcMain.handle('settings:set', async (_event, patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string; hfToken?: string }) => {
-    if (patch.modelsDir !== undefined && weightOperations.busy) {
+    if (patch.modelsDir !== undefined && (weightOperations.busy || activeDownloads.size > 0)) {
       throw new Error('Cannot change model storage while model weights are busy')
     }
     const { hfToken, ...dirs } = patch
@@ -2339,7 +2392,7 @@ export async function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: Wi
   // Update FastAPI paths at runtime (without restarting)
   ipcMain.handle('api:updatePaths', async (_event, patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string }) => {
     try {
-      if (patch.modelsDir !== undefined && weightOperations.busy) {
+      if (patch.modelsDir !== undefined && (weightOperations.busy || activeDownloads.size > 0)) {
         throw new Error('Cannot change model storage while model weights are busy')
       }
       await axios.post(`${API_BASE_URL}/settings/paths`, {

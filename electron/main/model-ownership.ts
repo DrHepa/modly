@@ -562,22 +562,21 @@ export function isOwnedModelDownloaded(
     )
 
     if (ownership.hasModelSources) {
-      return ownership.modelSources?.length
-        ? areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, ownership.modelSources)
-        : false
+      if (!ownership.modelSources?.length
+        || !areModelSourcesDownloaded(modelsDir, ownership.weightOwnerId, ownership.modelSources)) return false
     }
 
     if (ownership.httpsDownloads?.length) {
-      return isHttpsDownloadReady(
+      if (!isHttpsDownloadReady(
         rootPath,
         ownerPath,
         ownership.capabilityId,
         ownership.httpsDownloads,
-      )
+      )) return false
     }
 
     if (ownership.hfDownloads?.length) {
-      return ownership.hfDownloads.every((descriptor) => descriptor.files.every((file) => {
+      if (!ownership.hfDownloads.every((descriptor) => descriptor.files.every((file) => {
         const assetPath = resolvePath(ownerPath, descriptor.targetSubdir, file.path)
         return isVerifiedFile(
           rootPath,
@@ -587,8 +586,10 @@ export function isOwnedModelDownloaded(
           undefined,
           file.sha256,
         )
-      }))
+      }))) return false
     }
+
+    if (ownership.hasModelSources || ownership.httpsDownloads?.length || ownership.hfDownloads?.length) return true
 
     if (ownership.downloadCheck?.trim()) {
       return isLegacyDownloadCheckReady(rootPath, ownerPath, ownership.downloadCheck)

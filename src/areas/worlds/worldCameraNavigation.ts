@@ -29,6 +29,7 @@ export type WorldsMovementDirection = 'forward' | 'backward' | 'left' | 'right' 
 export type WorldsMovementKeyState = Partial<Record<WorldsMovementDirection, boolean>>
 
 export type WorldsNavigationKeyState = WorldsMovementKeyState & {
+  pressedCodes?: readonly string[]
   rollLeft?: boolean
   rollRight?: boolean
   boost?: boolean
@@ -309,16 +310,19 @@ export function updateWorldsViewportNavigationKeys(
     || (mode === 'fly' && (code === 'Space' || code === 'ControlLeft' || code === 'ControlRight' || code === 'KeyQ' || code === 'KeyE'))
     || (mode === 'run' && code === 'Space')
   if (!modeKey) return keys
-  const next = { ...keys }
-  if (direction) next[direction] = pressed
-  if (code === 'ShiftLeft' || code === 'ShiftRight') next.boost = pressed
+  const pressedCodes = pressed
+    ? [...new Set([...(keys.pressedCodes ?? []), code])]
+    : (keys.pressedCodes ?? []).filter(heldCode => heldCode !== code)
+  const next = { ...keys, pressedCodes }
+  if (direction) next[direction] = pressedCodes.some(heldCode => viewportPlanarDirection(heldCode) === direction)
+  if (code === 'ShiftLeft' || code === 'ShiftRight') next.boost = pressedCodes.includes('ShiftLeft') || pressedCodes.includes('ShiftRight')
   if (mode === 'fly') {
-    if (code === 'Space') next.up = pressed
-    if (code === 'ControlLeft' || code === 'ControlRight') next.down = pressed
-    if (code === 'KeyQ') next.rollLeft = pressed
-    if (code === 'KeyE') next.rollRight = pressed
+    if (code === 'Space') next.up = pressedCodes.includes('Space')
+    if (code === 'ControlLeft' || code === 'ControlRight') next.down = pressedCodes.includes('ControlLeft') || pressedCodes.includes('ControlRight')
+    if (code === 'KeyQ') next.rollLeft = pressedCodes.includes('KeyQ')
+    if (code === 'KeyE') next.rollRight = pressedCodes.includes('KeyE')
   } else if (code === 'Space') {
-    next.jump = pressed
+    next.jump = pressedCodes.includes('Space')
   }
   return next
 }

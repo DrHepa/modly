@@ -107,6 +107,7 @@ test('viewport navigation keys keep Fly vertical motion, roll, and boost unambig
 
   assert.equal(keys.jump, undefined)
   assert.deepEqual(keys, {
+    pressedCodes: ['ShiftLeft', 'ControlLeft', 'Space', 'KeyQ'],
     boost: true,
     down: true,
     up: true,
@@ -122,12 +123,45 @@ test('viewport navigation keys expose grounded Run input without Fly-only leakag
   keys = updateWorldsViewportNavigationKeys(keys, 'run', 'KeyW', true)
 
   assert.deepEqual(keys, {
+    pressedCodes: ['ShiftRight', 'Space', 'KeyW'],
     boost: true,
     jump: true,
     forward: true,
   })
   assert.deepEqual(updateWorldsViewportNavigationKeys(keys, 'inspect', 'KeyS', true), keys)
   assert.strictEqual(updateWorldsViewportNavigationKeys(keys, 'run', 'KeyQ', true), keys)
+})
+
+test('viewport navigation preserves independently held aliases until both codes release', () => {
+  const aliases = [
+    ['KeyW', 'ArrowUp', 'forward'],
+    ['KeyS', 'ArrowDown', 'backward'],
+    ['KeyA', 'ArrowLeft', 'left'],
+    ['KeyD', 'ArrowRight', 'right'],
+    ['ShiftLeft', 'ShiftRight', 'boost'],
+  ] as const
+  for (const mode of ['fly', 'run'] as const) {
+    for (const [first, second, direction] of aliases) {
+      let keys = updateWorldsViewportNavigationKeys({}, mode, first, true)
+      keys = updateWorldsViewportNavigationKeys(keys, mode, first, true)
+      assert.deepEqual(keys.pressedCodes, [first], 'auto-repeat does not create another owner')
+      keys = updateWorldsViewportNavigationKeys(keys, mode, second, true)
+      keys = updateWorldsViewportNavigationKeys(keys, mode, first, false)
+      assert.equal(keys[direction], true, `${mode}: ${second} remains held after ${first} release`)
+      assert.deepEqual(keys.pressedCodes, [second])
+      keys = updateWorldsViewportNavigationKeys(keys, mode, second, false)
+      assert.equal(keys[direction], false)
+      assert.deepEqual(keys.pressedCodes, [])
+    }
+  }
+  let keys = updateWorldsViewportNavigationKeys({}, 'fly', 'ControlLeft', true)
+  keys = updateWorldsViewportNavigationKeys(keys, 'fly', 'ControlRight', true)
+  keys = updateWorldsViewportNavigationKeys(keys, 'fly', 'ControlRight', false)
+  assert.equal(keys.down, true)
+  keys = updateWorldsViewportNavigationKeys(keys, 'fly', 'ControlLeft', false)
+  assert.equal(keys.down, false)
+  const afterOwnershipLoss = updateWorldsViewportNavigationKeys({}, 'fly', 'ArrowUp', false)
+  assert.equal(afterOwnershipLoss.forward, false, 'a cleared ownership state cannot resurrect held aliases')
 })
 
 test('Fly navigation uses camera-local up after roll for full 6DOF translation', () => {
